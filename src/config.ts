@@ -68,7 +68,7 @@ export function resolveConfig(env: Env): Config {
 
   const announceChannelId = required("ANNOUNCE_CHANNEL_ID");
 
-  const githubRepo = optional("GITHUB_REPO") ?? "nazumods/wow";
+  const githubRepo = optional("GITHUB_REPO") ?? "roshne/rackbops-discord-bot";
   // Repos whose releases get announced. Distinct from githubRepo (self-update's anchor);
   // an empty/unset WATCHED_REPOS falls back to just githubRepo, i.e. the prior behavior.
   const watchedRepos = list("WATCHED_REPOS");

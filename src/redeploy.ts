@@ -33,7 +33,6 @@ import {
 } from "./handoff";
 import { beginHandoff, endHandoff } from "./restart";
 
-const BOT_PATH = "apps/warbandeer-discord";
 const POLL_MS = 2_000;
 /** Per-sha image tags kept around. More than one is what makes rolling back to a *previous*
  *  build possible at all; a small number is what stops that filling the box's disk. */
@@ -54,9 +53,9 @@ export function replacementName(inspectedName: string): string {
   return `${canonicalName(inspectedName)}-next`;
 }
 
-/** A git URL the daemon can fetch a build context from, with the bot's own subdir as root. */
+/** A git URL the daemon can fetch a build context from: the whole repo at the target branch. */
 export function buildRemote(repo: string, branch: string): string {
-  return `https://github.com/${repo}.git#${branch}:${BOT_PATH}`;
+  return `https://github.com/${repo}.git#${branch}`;
 }
 
 /** The compose-built image tag, plus a per-sha tag that keeps an older build addressable. */

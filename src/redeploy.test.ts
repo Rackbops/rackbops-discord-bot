@@ -51,14 +51,14 @@ describe("naming", () => {
 });
 
 describe("buildRemote", () => {
-  test("points the daemon at the bot's own subdir on the target branch", () => {
-    expect(buildRemote("nazumods/wow", "main")).toBe(
-      "https://github.com/nazumods/wow.git#main:apps/warbandeer-discord",
+  test("points the daemon at the whole repo on the target branch", () => {
+    expect(buildRemote("roshne/rackbops-discord-bot", "main")).toBe(
+      "https://github.com/roshne/rackbops-discord-bot.git#main",
     );
   });
 
   test("carries a branch with slashes through intact", () => {
-    expect(buildRemote("nazumods/wow", "feat/x")).toContain("#feat/x:");
+    expect(buildRemote("roshne/rackbops-discord-bot", "feat/x")).toContain("#feat/x");
   });
 });
 

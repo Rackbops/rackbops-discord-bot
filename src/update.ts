@@ -3,18 +3,16 @@ import { state, saveState, type PendingUpdateReport } from "./state";
 import { handoffActive, requestRestart } from "./restart";
 import { redeploy, redeployAvailable, type RedeployResult } from "./redeploy";
 
-// Self-update detection. The bot has no releases of its own (apps/ is excluded from
-// the release pipeline), so "am I stale?" is answered against the newest commit on the
-// default branch that touched the bot's own directory.
+// Self-update detection. The bot has no releases of its own, so "am I stale?" is answered
+// against the newest commit on `config.botBranch` (in `config.githubRepo`, the whole repo —
+// this fork lives at its root, not a monorepo subdirectory, so no path filter is needed).
 //
 // The question is ANCESTRY, not equality (#871). GIT_SHA is baked as `git rev-parse HEAD`
-// — the tip you built from — which is only occasionally the last bot-touching commit,
-// because non-bot commits land on main most days. Asking "is my sha THE newest bot commit"
-// therefore called a correct, up-to-date deploy stale as its normal state: one pointless
-// exit-75 per deploy under AUTO_UPDATE, and every admin /update forcing another. Asking
-// "does my build CONTAIN the newest bot commit" is the question that was always meant.
-
-const BOT_PATH = "apps/warbandeer-discord";
+// — the tip you built from — which is only occasionally the newest commit on the branch,
+// because a build can lag behind commits landed after it. Asking "is my sha THE newest
+// commit" therefore called a correct, up-to-date deploy stale as its normal state: one
+// pointless exit-75 per deploy under AUTO_UPDATE, and every admin /update forcing another.
+// Asking "does my build CONTAIN the newest commit" is the question that was always meant.
 
 export type UpdateDecision =
   /** Can't tell: no GIT_SHA baked in, or the sha baked in isn't on the remote to compare against. */
@@ -117,12 +115,12 @@ function apiHeaders(): Record<string, string> {
   return headers;
 }
 
-/** Newest commit touching the bot's directory on `config.botBranch`. */
+/** Newest commit on `config.botBranch`. */
 export async function fetchLatestBotSha(): Promise<string> {
   const headers = apiHeaders();
   const res = await fetch(
     `https://api.github.com/repos/${config.githubRepo}/commits` +
-      `?sha=${encodeURIComponent(config.botBranch)}&path=${encodeURIComponent(BOT_PATH)}&per_page=1`,
+      `?sha=${encodeURIComponent(config.botBranch)}&per_page=1`,
     { headers },
   );
   // 404 here is usually BOT_BRANCH naming a branch that doesn't exist on the remote.
@@ -133,7 +131,7 @@ export async function fetchLatestBotSha(): Promise<string> {
   }
   const data = (await res.json()) as { sha: string }[];
   const sha = data[0]?.sha;
-  if (!sha) throw new Error(`No commits found for ${BOT_PATH} on ${config.botBranch}`);
+  if (!sha) throw new Error(`No commits found on ${config.botBranch}`);
   return sha;
 }
 
