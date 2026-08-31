@@ -1,11 +1,20 @@
 # Bot ops helper
 
+> **Fork note.** This script and doc were extracted, with history, from
+> [nazumods/wow](https://github.com/nazumods/wow) — credit to
+> [Nazuraki](https://github.com/nazumods) for the original design. The consumers described
+> below — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops** tabs, and the shared
+> `apps/bot-ops` backend — live in the original monorepo and `roshne/wow-companion`, not in
+> this repo. The script itself is still fully usable on its own: SSH to a box running this
+> bot and invoke it directly (see **Run directly on the box** below).
+
 `bot-ops.sh` is the **only** privileged surface behind the **Ops** tab — shipped by two apps
-(`apps/warbandeer-desktop` here and `roshne/wow-companion`), which share one backend in
-[`apps/bot-ops`](../../bot-ops/README.md). Neither app runs docker or edits the bot's `.env`
-itself — they SSH to the box and invoke this script, one subcommand at a time. Keeping the
-whitelist and the apply logic here (versioned, reviewable) means **bot secrets never leave the
-box**.
+(`apps/warbandeer-desktop` and `roshne/wow-companion`, neither part of this repo — see the
+Fork note above), which share one backend in `apps/bot-ops` in the original monorepo
+(`nazumods/wow`, not linkable from here since it isn't part of this fork). Neither app runs
+docker or edits the bot's `.env` itself — they SSH to the box and invoke this script, one
+subcommand at a time. Keeping the whitelist and the apply logic here (versioned, reviewable)
+means **bot secrets never leave the box**.
 
 This script is the **authority** on which keys may be written; `apps/bot-ops`'s `OPS_FIELDS` only
 mirrors it for display. Add a key here first — a key added only to the module is rejected at apply

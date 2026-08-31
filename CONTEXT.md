@@ -3,8 +3,14 @@
 > **Purpose:** Discord bot (Bun + TypeScript, discord.js v14) for the guild channel:
 > DMF open/close + reset timers (`/dmf`, `/reset`), weekly-reset announcement, a
 > continuous realm up/down watch via the Blizzard API (`/status`), GitHub release
-> announcements for this repo, and a `/report` command that files GitHub issues from Discord.
-> Not an addon — lives in `apps/`, excluded from the release pipeline.
+> announcements for watched repos, and a `/report` command that files GitHub issues from Discord.
+>
+> **Fork.** Extracted with full history from [nazumods/wow](https://github.com/nazumods/wow)'s
+> `apps/warbandeer-discord` — designed and built there by
+> [Nazuraki](https://github.com/nazumods), who gets full credit for the original bot and
+> every gotcha documented below. This repo is now the bot's own root (no monorepo, no addon
+> release pipeline); a couple of code paths still assume the old monorepo subpath — see the
+> **Fork gotchas** entry below.
 
 ## File Map
 
@@ -43,7 +49,7 @@
 | `Dockerfile` | `oven/bun:1-slim` (Debian — Intl IANA timezones), prod-only install, non-root `bun` user, `VOLUME /app/data`, `ARG/ENV GIT_SHA`, `ENTRYPOINT entrypoint.sh` |
 | `entrypoint.sh` | Root→`bun` drop when compose starts the container as root: joins the socket's group by reading its GID off the socket (`setpriv --groups`), execs the CMD; a plain exec under `USER bun` |
 | `docker-compose.yml` | `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build`: `env_file: .env`, `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports |
-| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface for the desktop app's **Ops** tab (`apps/warbandeer-desktop`): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Secrets are never read/written (whitelist excludes them); env-set backs up then `-p warbandeer-discord-debug up -d --force-recreate`. The only privileged surface — the desktop app just SSHes to it |
+| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Secrets are never read/written (whitelist excludes them); env-set backs up then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
 
 ## Behavior
 
@@ -72,6 +78,25 @@
 
 ## Gotchas
 
+- **Fork gotchas.** This repo was extracted, with history, from `nazumods/wow`'s
+  `apps/warbandeer-discord` — see the top-of-file note for full credit to Nazuraki. Three
+  things didn't come over automatically and are open work, not done:
+  - `BOT_PATH` in `src/update.ts` and `src/redeploy.ts` still hardcodes
+    `"apps/warbandeer-discord"` — correct for the monorepo layout, wrong for this repo's root
+    layout. Left at the default `GITHUB_REPO=nazumods/wow`, self-update still works, but it
+    tracks and rebuilds the **original upstream bot**, not this fork's own commits. Repoint
+    `GITHUB_REPO` at this fork without also fixing `BOT_PATH` and self-update breaks:
+    `fetchLatestBotSha` finds zero commits touching that path here and throws `No commits
+    found for apps/warbandeer-discord on <branch>`, and `buildRemote`'s git context points at
+    a subdirectory that doesn't exist in this repo's layout.
+  - `ops/bot-ops.sh`'s consumers — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops**
+    tabs, plus the shared `apps/bot-ops` backend — live in the original monorepo and
+    `roshne/wow-companion`, not here. The script itself still works over a direct SSH
+    invocation (see `ops/README.md`'s "Run directly on the box" example).
+  - No CI: `.github/workflows/discord-bot-test.yml` lived at the monorepo root, so the
+    path-scoped extraction didn't carry it over. `bun run check` + `bun test` (referenced
+    elsewhere in this doc as CI-enforced) need to be run by hand until a workflow is added
+    here.
 - **The redeploy order is inverted on purpose (#879), and the reason is a kernel boundary.** Every
   "shut down, then have something bring the replacement up" variant dies on the same thing: a
   detached process (`setsid`, double fork, `Bun.spawn({ detached: true })`) leaves its *parent*, not
@@ -198,8 +223,11 @@
   survive the exit (a Discord reply, a state write) has to run inside `withCritical()`. The
   `/update` handler wraps its `checkForUpdate` for exactly this reason; without it the process
   dies before `editReply` lands.
-- Run `bun run check` (tsc) and `bun test` after changes — CI runs both on every PR/push
-  touching this app (`.github/workflows/discord-bot-test.yml`, path-scoped). No lint beyond tsc.
+- Run `bun run check` (tsc) and `bun test` after changes. In the original monorepo CI ran
+  both on every PR/push touching this app (`.github/workflows/discord-bot-test.yml`,
+  path-scoped) — that workflow lived at the monorepo root, so it wasn't carried over by the
+  fork's extraction (see **Fork gotchas**); this repo has no CI yet, so run both by hand.
+  No lint beyond tsc.
 - **`cloudflared` currently has nothing to route to** — the bot exposes no HTTP port yet
   (that's the desktop-app API work, tracked separately). It's pure plumbing for now: an
   opt-in sidecar (`--profile tunnel`) that joins the bot's Compose network, so a future
