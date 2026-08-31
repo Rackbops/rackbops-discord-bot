@@ -14,7 +14,7 @@ Discord bot for the guild channel: WoW timers and announcements.
 - **Darkmoon Faire** — `/dmf` shows when the Faire opens/closes; announces in the channel when it opens (first Sunday of each month, computed in realm-local time with DST handled).
 - **Resets** — `/reset` shows the next daily and weekly reset; announces the weekly reset when it happens.
 - **Server status** — continuously polls the Blizzard API for your realm's status and announces whenever it goes **down** or comes back **up** — for any outage, not just weekly-reset maintenance. `/status` checks the realm on demand.
-- **Release notifications** — polls GitHub and announces new releases. Watches `GITHUB_REPO` by default — still `nazumods/wow` (this fork's origin) out of the box — or any list of repos you configure via `WATCHED_REPOS` (e.g. `roshne/ActionBarMaster` too).
+- **Release notifications** — polls GitHub and announces new releases. Watches `GITHUB_REPO` by default (this fork, `roshne/rackbops-discord-bot`), or any list of repos you configure via `WATCHED_REPOS` (e.g. `roshne/ActionBarMaster` too).
 - **Self-update** — `/update` (admins only) builds the latest code and moves the bot onto it, with nothing outside Discord involved. It verifies the new build before retiring the old one, so a bad build leaves the bot running, and messages you with the build it actually landed on. See [Self-update](#self-update).
 - **Transmog import strings** — `/transmog <character> <realm>` returns a `/customset v1 …` string for what a character is wearing, pasteable into `/collected outfit import`. For the characters you *can't* inspect in-game: offline, another realm, or a name someone pasted in chat. Needs the same Blizzard API credentials as realm status. Two caveats it states in every reply: weapon illusions aren't in the profile data, and profile data is a snapshot from the character's **last logout** — so someone online right now reports what they wore last session.
 - **Issue reports** — `/report` lets members with a configured role file a GitHub issue (Title + Description via a popup form) straight into the mapped project's repo (`wow`, `abm`), labeled `automated` and noting who filed it. The confirmation posts **in the channel the report was filed from**, carrying the title, the description and the issue link, so the channel can see what's been raised.
@@ -51,14 +51,6 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
    `GIT_SHA` bakes the current commit into the image so the bot can tell when it's running stale code. It's optional — without it everything works except self-update.
 
 ## Self-update
-
-> **Fork caveat.** The staleness check and rebuild below both assume the bot's code lives at
-> `apps/warbandeer-discord` inside `GITHUB_REPO` (`BOT_PATH` in `src/update.ts` /
-> `src/redeploy.ts`) — true of the original monorepo layout, not of this repo's root layout.
-> Left at the default `GITHUB_REPO=nazumods/wow`, `/update` correctly tracks and rebuilds the
-> **original upstream bot**, not this fork's own commits. Point `GITHUB_REPO` at this fork
-> without also fixing `BOT_PATH` and self-update finds no commits to compare against. See
-> CONTEXT.md's Gotchas for the full note — this is open work, not done.
 
 `/update` (admins only) takes the bot all the way to the new build on its own. Nothing outside the container is involved: no host service, no SSH session, nobody running `--build`.
 

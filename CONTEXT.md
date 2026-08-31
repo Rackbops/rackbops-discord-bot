@@ -9,8 +9,8 @@
 > `apps/warbandeer-discord` — designed and built there by
 > [Nazuraki](https://github.com/nazumods), who gets full credit for the original bot and
 > every gotcha documented below. This repo is now the bot's own root (no monorepo, no addon
-> release pipeline); a couple of code paths still assume the old monorepo subpath — see the
-> **Fork gotchas** entry below.
+> release pipeline); self-update was repointed at this fork accordingly — see the **Fork
+> gotchas** entry below for what's still open.
 
 ## File Map
 
@@ -25,7 +25,7 @@
 | `src/github.test.ts` | bun tests for pure `decideReleaseAnnouncements`: silent seed on never-polled, unseen-only oldest-first, no-op when nothing new, first release of a zero-release repo. Plus `fetchReleases` against a stubbed `globalThis.fetch` (payload mapping, draft filter, tag fallback, `null` on 404, `[]` on a releaseless repo, throws on 401/403/429/5xx) and `createReachabilityLog` (once per standing failure, silent when healthy, recovery, per-repo independence) |
 | `src/state.test.ts` | bun tests for pure `normalizeSeenReleaseIds`: legacy-array migration under the default repo, empty array → `{}`, keyed map/`undefined` pass-through |
 | `src/commands.test.ts` | bun tests for `isAdmin` (allowlist hit/miss, fails closed, whole-id match) + `bareName()` (strips the prefix, no-op when unset, passes an unprefixed name through unmangled) + `updateReply()` (names the target build; no longer asks the reader to check whether it changed; both `disabled` reasons — a missing `GIT_SHA` vs. an unpublished one, which is named) |
-| `src/update.ts` | Self-update: pure `decideUpdate()` + `sameSha()`, `fetchLatestBotSha()` (newest `config.botBranch` commit touching `apps/warbandeer-discord`), `fetchShaRelation()` (the `ShaRelation` ancestry answer from `GET /compare/{latest}...{running}`; 404 → `unpublished`, any other failure → `unknown`, never throws), stateful `checkForUpdate({ force, requester })` answering `busy` while a handoff is in flight (guard before any state write — see the gotcha), returning a `DisabledReason` when it disables — and, on `restart`, routing through `applyUpdate()`: a self-contained `redeploy()` when the daemon socket is mounted, else the original exit-75 fallback so a deployment on an older compose file keeps working. A failed redeploy clears `attemptedUpdateToSha` + `pendingUpdateReport` again, since the restart never happened — leaving them would owe a follow-up for nothing and let the anti-loop guard suppress the next genuine attempt; pure `buildUpdateReport()` returns the `PendingUpdateReport` to persist across the restart, or `undefined` when there's no requester (which is what keeps an `AUTO_UPDATE` exit silent) |
+| `src/update.ts` | Self-update: pure `decideUpdate()` + `sameSha()`, `fetchLatestBotSha()` (newest `config.botBranch` commit on `config.githubRepo`), `fetchShaRelation()` (the `ShaRelation` ancestry answer from `GET /compare/{latest}...{running}`; 404 → `unpublished`, any other failure → `unknown`, never throws), stateful `checkForUpdate({ force, requester })` answering `busy` while a handoff is in flight (guard before any state write — see the gotcha), returning a `DisabledReason` when it disables — and, on `restart`, routing through `applyUpdate()`: a self-contained `redeploy()` when the daemon socket is mounted, else the original exit-75 fallback so a deployment on an older compose file keeps working. A failed redeploy clears `attemptedUpdateToSha` + `pendingUpdateReport` again, since the restart never happened — leaving them would owe a follow-up for nothing and let the anti-loop guard suppress the next genuine attempt; pure `buildUpdateReport()` returns the `PendingUpdateReport` to persist across the restart, or `undefined` when there's no requester (which is what keeps an `AUTO_UPDATE` exit silent) |
 | `src/update.test.ts` | bun tests for `decideUpdate`/`sameSha`: staleness, short-sha prefixes, anti-loop suppression, `force`; the ancestry matrix (`ahead`/`identical` → current, `behind`/`diverged` → restart, `unpublished` → disabled and outranking both suppression and `force`, `unknown` → pre-#871 fallback, equality shortcut winning before any relation is read); `fetchShaRelation` against a stubbed `fetch` (each status, 404, 500, a rejected fetch, an unrecognised status, and the `latest...running` argument order); plus `buildUpdateReport` (records requester + both shas; no requester → no report) |
 | `src/updateReport.ts` | The follow-up owed after a `/update`-initiated restart. Pure `decideUpdateOutcome()` (`updated`/`noop`/`unexpected`/`unknown` by comparing the running `GIT_SHA` against the report's `toSha`/`fromSha`), `updateOutcomeMessage()`, `tokenUsable()` (15-min interaction-token window), `reportTooOld()` (24 h); `deliverUpdateReport()` walks interaction follow-up → DM → channel with injected deliverers, logging and falling through on each failure; `reportUpdateOutcome(client)` is the boot entry point |
 | `src/updateReport.test.ts` | bun tests for the four outcomes (incl. short-sha tolerance and a missing `GIT_SHA`), per-outcome message content, the token/staleness windows, and the delivery fallback order — including "every route fails" resolving to `none` rather than throwing |
@@ -35,7 +35,7 @@
 | `src/docker.test.ts` | bun tests for `parseContainerId` (both mountinfo layouts, short-id rejection) and `parseBuildOutput` (the 200-with-an-error case, `errorDetail.message` preference, non-JSON noise), plus stubbed-`fetch` daemon calls: ping, build query construction (remote + both tags + build-arg), and 304/404 on stop/remove being success rather than errors |
 | `src/handoff.ts` | The handoff contract, kept free of I/O so it tests as pure logic: `bootMode(env)` (presence of `HANDOFF_FROM` *is* the standby instruction), the marker file in the shared volume (its own file, never `state.json` — one writer, one reader), `decideHandoffOutcome()` → `ready`/`failed`/`timeout`/`waiting` (plus `stalled`, decided not by it but by outliving `RETIREMENT_DEADLINE_MS` — see the gotcha), deadlines, `handoffFailureMessage()`. The marker is read before the container state on purpose: a replacement that signalled `ready` is already stopping the original, so what it *said* must outrank how it currently looks |
 | `src/handoff.test.ts` | bun tests for `bootMode` (incl. an empty `HANDOFF_FROM` staying normal), the full `decideHandoffOutcome` matrix, the three ready-marker-wins races (mid-stop, already gone, expired deadline), and `handoffFailureMessage` always saying the current build is still running |
-| `src/redeploy.ts` | The swap itself. `redeploy(sha)`: quiesce → build (`buildRemote()` = `…/wow.git#<branch>:apps/warbandeer-discord`, tagged `:latest` + `:<sha7>`) → prune → create + start the replacement → poll until `decideHandoffOutcome()` settles; **returns only on failure**, since a successful handoff kills this process mid-await — observing `ready` starts a bounded wait for that death, and outliving it demotes the outcome to `stalled` (reclaim + report) rather than quiescing forever. Pure `buildCreateSpec()` derives the replacement entirely from the original's own inspect (compose labels replicated, mounts re-bound, `User` carried over, `GIT_SHA` **dropped** so the new image's baked sha wins), `imageTags()`, `selectImagesToPrune()` (sha-shaped tags of this repo only — `:latest` and hand-named rollback targets are never candidates), `replacementName()`. `retireOriginal()` is the replacement's side: stop + **remove** (an exited container would be respawned on its old image by `restart: unless-stopped`) then take the canonical name |
+| `src/redeploy.ts` | The swap itself. `redeploy(sha)`: quiesce → build (`buildRemote()` = `…/<repo>.git#<branch>`, the whole repo at the target branch, tagged `:latest` + `:<sha7>`) → prune → create + start the replacement → poll until `decideHandoffOutcome()` settles; **returns only on failure**, since a successful handoff kills this process mid-await — observing `ready` starts a bounded wait for that death, and outliving it demotes the outcome to `stalled` (reclaim + report) rather than quiescing forever. Pure `buildCreateSpec()` derives the replacement entirely from the original's own inspect (compose labels replicated, mounts re-bound, `User` carried over, `GIT_SHA` **dropped** so the new image's baked sha wins), `imageTags()`, `selectImagesToPrune()` (sha-shaped tags of this repo only — `:latest` and hand-named rollback targets are never candidates), `replacementName()`. `retireOriginal()` is the replacement's side: stop + **remove** (an exited container would be respawned on its old image by `restart: unless-stopped`) then take the canonical name |
 | `src/redeploy.test.ts` | bun tests for naming, `buildRemote`, `imageTags`, `selectImagesToPrune` (keep-newest-N oldest-first, the never-prune set, untagged images), and `buildCreateSpec` — label replication, `HANDOFF_FROM` injection with no stacking, the `GIT_SHA` drop, both binds, `User`, restart-policy default, network |
 | `src/state.ts` | Announcement dedup state, persisted to `data/state.json` (gitignored). `seenReleaseIds` is keyed per `owner/repo`; pure `normalizeSeenReleaseIds()` migrates the legacy global array (single-repo era) under `config.githubRepo` on load; `saveState` caps each repo's list at 100. `attemptedUpdateToSha` guards the self-update exit loop; `pendingUpdateReport` (`PendingUpdateReport`: `fromSha`, `toSha`, `userId`, `channelId?`, `applicationId?`, `interactionToken?`, `requestedAt`) is the `/update` follow-up owed on next boot — purely additive, so an old `state.json` simply lacks the key |
 | `src/wow/dmf.ts` | DMF schedule math: first Sunday of month 00:01 in `config.dmfTimezone`, one week; IANA-timezone-correct (two-pass DST conversion) |
@@ -66,7 +66,7 @@
   anything published while the bot was offline. Each repo in `config.watchedRepos` is polled
   independently; a repo's first-ever poll (its key absent from `seenReleaseIds`) seeds silently.
 - **Self-update** asks whether the baked-in `GIT_SHA` **contains** the newest `BOT_BRANCH` (default
-  `main`) commit touching the bot's dir (flat 15-min cadence + startup, only when `AUTO_UPDATE=true`;
+  `main`) commit on `GITHUB_REPO` (flat 15-min cadence + startup, only when `AUTO_UPDATE=true`;
   `/update` checks on demand with `force`). Stale → persist `attemptedUpdateToSha`, then exit 75
   for the orchestrator to respawn. `/update` is gated on the `ADMIN_USER_IDS` allowlist and fails
   closed when empty.
@@ -79,16 +79,19 @@
 ## Gotchas
 
 - **Fork gotchas.** This repo was extracted, with history, from `nazumods/wow`'s
-  `apps/warbandeer-discord` — see the top-of-file note for full credit to Nazuraki. Three
-  things didn't come over automatically and are open work, not done:
-  - `BOT_PATH` in `src/update.ts` and `src/redeploy.ts` still hardcodes
-    `"apps/warbandeer-discord"` — correct for the monorepo layout, wrong for this repo's root
-    layout. Left at the default `GITHUB_REPO=nazumods/wow`, self-update still works, but it
-    tracks and rebuilds the **original upstream bot**, not this fork's own commits. Repoint
-    `GITHUB_REPO` at this fork without also fixing `BOT_PATH` and self-update breaks:
-    `fetchLatestBotSha` finds zero commits touching that path here and throws `No commits
-    found for apps/warbandeer-discord on <branch>`, and `buildRemote`'s git context points at
-    a subdirectory that doesn't exist in this repo's layout.
+  `apps/warbandeer-discord` — see the top-of-file note for full credit to Nazuraki.
+  `GITHUB_REPO` now defaults to this fork (`roshne/rackbops-discord-bot`), and self-update no
+  longer path-filters (`BOT_PATH` is gone from `src/update.ts` / `src/redeploy.ts` — the whole
+  repo is the bot now, so `fetchLatestBotSha` compares against the newest commit on the branch,
+  full stop, and `buildRemote` builds from the repo root with no subdirectory). Two things
+  still didn't come over automatically and remain open work — plus one pre-existing
+  constraint that now bites differently:
+  - **Self-update's rebuild needs `GITHUB_REPO` to be publicly clonable** (see the Self-update
+    section above — the daemon's remote git build context has no credential support). This
+    repo is **private**, so `/update`'s rebuild step fails until either the repo is made
+    public or self-update is run via the socket-less fallback (manual `--build` / an
+    external image updater) instead. Not a bug introduced by the fork — the original bot has
+    the same constraint, it just happened to already be public.
   - `ops/bot-ops.sh`'s consumers — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops**
     tabs, plus the shared `apps/bot-ops` backend — live in the original monorepo and
     `roshne/wow-companion`, not here. The script itself still works over a direct SSH

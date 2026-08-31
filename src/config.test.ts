@@ -53,7 +53,7 @@ describe("resolveConfig", () => {
   });
 
   test("watchedRepos defaults to just the configured GITHUB_REPO", () => {
-    expect(resolveConfig(base).watchedRepos).toEqual(["nazumods/wow"]);
+    expect(resolveConfig(base).watchedRepos).toEqual(["roshne/rackbops-discord-bot"]);
     expect(resolveConfig({ ...base, GITHUB_REPO: "acme/thing" }).watchedRepos).toEqual([
       "acme/thing",
     ]);
@@ -69,8 +69,12 @@ describe("resolveConfig", () => {
   });
 
   test("an empty WATCHED_REPOS falls back to GITHUB_REPO", () => {
-    expect(resolveConfig({ ...base, WATCHED_REPOS: "" }).watchedRepos).toEqual(["nazumods/wow"]);
-    expect(resolveConfig({ ...base, WATCHED_REPOS: " , " }).watchedRepos).toEqual(["nazumods/wow"]);
+    expect(resolveConfig({ ...base, WATCHED_REPOS: "" }).watchedRepos).toEqual([
+      "roshne/rackbops-discord-bot",
+    ]);
+    expect(resolveConfig({ ...base, WATCHED_REPOS: " , " }).watchedRepos).toEqual([
+      "roshne/rackbops-discord-bot",
+    ]);
   });
 });
 
