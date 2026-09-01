@@ -1,12 +1,63 @@
 import { describe, expect, test } from "bun:test";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
   buildInvocation,
+  createAccessJwtVerifier,
+  extractAccessJwt,
   extractBearerToken,
   handleRequest,
   isAuthorized,
+  isRequestAuthorized,
+  normalizeTeamDomain,
   tokensMatch,
   type BotOpsResult,
+  type HandlerConfig,
 } from "./server";
+
+const TEAM_DOMAIN = "test-team.cloudflareaccess.com";
+const AUD = "test-application-aud";
+const KID = "test-key-1";
+
+// Generated once for the whole file — a real RSA keypair and a real local (no-network) JWKS, so
+// every test below exercises jose's actual signature/aud/iss/exp verification, not a mock of it.
+const { publicKey, privateKey } = await generateKeyPair("RS256");
+const jwk = await exportJWK(publicKey);
+jwk.kid = KID;
+jwk.alg = "RS256";
+const jwks = createLocalJWKSet({ keys: [jwk] });
+
+// A second, separate keypair/JWKS for the algorithm-pin test below, whose JWK deliberately omits
+// `alg` — with it present (as jwk above has), jose's own key-selection already narrows candidate
+// keys to RS256 regardless of createAccessJwtVerifier's explicit `algorithms` option, which would
+// mask whether that option does anything. Omitting it here means the option is the only thing
+// standing between an RS384-signed token and acceptance, so this genuinely exercises that line —
+// verified by temporarily deleting it from server.ts and confirming this exact test then fails.
+const { publicKey: unpinnedPublicKey, privateKey: unpinnedPrivateKey } = await generateKeyPair("RS384");
+const unpinnedJwk = await exportJWK(unpinnedPublicKey);
+const unpinnedJwks = createLocalJWKSet({ keys: [unpinnedJwk] });
+
+interface TokenOverrides {
+  iss?: string;
+  aud?: string;
+  omitSub?: boolean;
+  expiresInSeconds?: number;
+}
+
+async function signToken(overrides: TokenOverrides = {}): Promise<string> {
+  const { iss = `https://${TEAM_DOMAIN}`, aud = AUD, omitSub = false, expiresInSeconds = 3600 } = overrides;
+  let builder = new SignJWT({}).setProtectedHeader({ alg: "RS256", kid: KID }).setIssuedAt().setIssuer(iss).setAudience(aud);
+  if (!omitSub) builder = builder.setSubject("user@example.com");
+  builder = builder.setExpirationTime(Math.floor(Date.now() / 1000) + expiresInSeconds);
+  return builder.sign(privateKey);
+}
+
+function tamperSignature(jwt: string): string {
+  const parts = jwt.split(".");
+  const sig = parts[2] ?? "";
+  const flippedChar = sig[0] === "A" ? "B" : "A";
+  parts[2] = flippedChar + sig.slice(1);
+  return parts.join(".");
+}
 
 describe("tokensMatch", () => {
   test("equal tokens match", () => {
@@ -62,6 +113,214 @@ describe("isAuthorized", () => {
 
   test("false for an empty bearer value, never treated as matching an empty expected token", () => {
     expect(isAuthorized("Bearer ", "")).toBe(false);
+  });
+});
+
+describe("extractAccessJwt", () => {
+  test("extracts the header value when present", () => {
+    const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "abc.def.ghi" } });
+    expect(extractAccessJwt(req)).toBe("abc.def.ghi");
+  });
+
+  test("undefined when the header is absent", () => {
+    expect(extractAccessJwt(new Request("http://x/"))).toBeUndefined();
+  });
+});
+
+describe("normalizeTeamDomain", () => {
+  test("a correct lowercase hostname passes through unchanged", () => {
+    expect(normalizeTeamDomain("test-team.cloudflareaccess.com")).toBe("test-team.cloudflareaccess.com");
+  });
+
+  test("mixed case is lowercased, not rejected", () => {
+    expect(normalizeTeamDomain("Test-Team.CloudflareAccess.COM")).toBe("test-team.cloudflareaccess.com");
+  });
+
+  test("leading/trailing whitespace is trimmed", () => {
+    expect(normalizeTeamDomain("  test-team.cloudflareaccess.com  ")).toBe("test-team.cloudflareaccess.com");
+  });
+
+  test("an accidental https:// prefix is rejected, not silently accepted as a garbage host", () => {
+    expect(() => normalizeTeamDomain("https://test-team.cloudflareaccess.com")).toThrow();
+  });
+
+  test("a bogus port is rejected, not silently accepted by matching the port-inclusive host", () => {
+    expect(() => normalizeTeamDomain("test-team.cloudflareaccess.com:1234")).toThrow();
+  });
+
+  test("a trailing path is rejected", () => {
+    expect(() => normalizeTeamDomain("test-team.cloudflareaccess.com/extra")).toThrow();
+  });
+
+  test("empty or whitespace-only input is rejected", () => {
+    expect(() => normalizeTeamDomain("")).toThrow();
+    expect(() => normalizeTeamDomain("   ")).toThrow();
+  });
+});
+
+describe("createAccessJwtVerifier", () => {
+  const verify = createAccessJwtVerifier(jwks, TEAM_DOMAIN, AUD);
+
+  test("a valid token resolves the identity", async () => {
+    const jwt = await signToken();
+    expect(await verify(jwt)).toEqual({ sub: "user@example.com", email: undefined });
+  });
+
+  test("an expired token resolves null", async () => {
+    const jwt = await signToken({ expiresInSeconds: -10 });
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("the wrong audience resolves null", async () => {
+    const jwt = await signToken({ aud: "some-other-application" });
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("the wrong issuer resolves null", async () => {
+    const jwt = await signToken({ iss: "https://someone-elses-team.cloudflareaccess.com" });
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("a tampered signature resolves null", async () => {
+    const jwt = tamperSignature(await signToken());
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("a malformed token string resolves null, doesn't throw", async () => {
+    expect(await verify("not-a-jwt")).toBeNull();
+    expect(await verify("")).toBeNull();
+  });
+
+  test("a token missing the sub claim resolves null", async () => {
+    const jwt = await signToken({ omitSub: true });
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("an alg:none token with otherwise-valid claims is rejected, not accepted on claims alone", async () => {
+    // Hand-built rather than signed — the forged, unsigned shape an algorithm-confusion attack
+    // would submit. Rejected here by jose's own hardcoded refusal of "none", independent of the
+    // `algorithms: ["RS256"]` option — see the next test for one that actually depends on it.
+    const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from(
+      JSON.stringify({
+        iss: `https://${TEAM_DOMAIN}`,
+        aud: AUD,
+        sub: "user@example.com",
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      }),
+    ).toString("base64url");
+    const jwt = `${header}.${payload}.`;
+    expect(await verify(jwt)).toBeNull();
+  });
+
+  test("a differently-signed-but-validly-signed token is rejected by the algorithm pin", async () => {
+    // Unlike the alg:none case above, this token is genuinely, correctly signed — just with
+    // RS384 instead of RS256, against a JWKS entry with no `alg` field of its own to narrow
+    // candidate keys. Without createAccessJwtVerifier's explicit `algorithms: ["RS256"]` option,
+    // jose would find this key a valid candidate and accept it; deleting that option makes this
+    // test start failing (confirmed by hand before committing this).
+    const jwt = await new SignJWT({})
+      .setProtectedHeader({ alg: "RS384" })
+      .setIssuedAt()
+      .setIssuer(`https://${TEAM_DOMAIN}`)
+      .setAudience(AUD)
+      .setSubject("user@example.com")
+      .setExpirationTime(Math.floor(Date.now() / 1000) + 3600)
+      .sign(unpinnedPrivateKey);
+    const unpinnedVerify = createAccessJwtVerifier(unpinnedJwks, TEAM_DOMAIN, AUD);
+    expect(await unpinnedVerify(jwt)).toBeNull();
+  });
+});
+
+describe("isRequestAuthorized", () => {
+  const TOKEN = "the-real-token";
+  const INDEX_HTML = "<html></html>";
+  const fakeRunBotOps = async (): Promise<BotOpsResult> => ({ exitCode: 0, stdout: "", stderr: "" });
+
+  function baseConfig(overrides: Partial<HandlerConfig> = {}): HandlerConfig {
+    return { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps, ...overrides };
+  }
+
+  test("bearer matches, no Access header -> true", async () => {
+    const req = new Request("http://x/", { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(await isRequestAuthorized(req, baseConfig())).toBe(true);
+  });
+
+  test("a verified Access JWT authorizes on its own, bearer missing or wrong", async () => {
+    const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    const verifyAccessJwt = async () => ({ sub: "user@example.com" });
+    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(true);
+  });
+
+  test("an Access header with no verifier configured is inert — falls to the bearer check", async () => {
+    const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    expect(await isRequestAuthorized(req, baseConfig())).toBe(false);
+    const reqWithBearer = new Request("http://x/", {
+      headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(await isRequestAuthorized(reqWithBearer, baseConfig())).toBe(true);
+  });
+
+  test("a JWT that fails verification falls through to the bearer check", async () => {
+    const verifyAccessJwt = async () => null;
+    const req = new Request("http://x/", {
+      headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(true);
+    const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    expect(await isRequestAuthorized(reqNoBearer, baseConfig({ verifyAccessJwt }))).toBe(false);
+  });
+
+  test("both fail -> false", async () => {
+    const verifyAccessJwt = async () => null;
+    const req = new Request("http://x/", {
+      headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: "Bearer wrong" },
+    });
+    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(false);
+  });
+});
+
+describe("handleRequest — real Cloudflare Access JWT", () => {
+  const TOKEN = "the-real-token";
+  const INDEX_HTML = "<html></html>";
+  const verifyAccessJwt = createAccessJwtVerifier(jwks, TEAM_DOMAIN, AUD);
+
+  function config(): HandlerConfig {
+    return {
+      adminToken: TOKEN,
+      indexHtml: INDEX_HTML,
+      runBotOps: async () => ({ exitCode: 0, stdout: '{"running":true}', stderr: "" }),
+      verifyAccessJwt,
+    };
+  }
+
+  test("a valid real JWT authorizes with no bearer token sent at all", async () => {
+    const jwt = await signToken();
+    const res = await handleRequest(new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }), config());
+    expect(res.status).toBe(200);
+  });
+
+  test("an expired real JWT with no bearer token is unauthorized", async () => {
+    const jwt = await signToken({ expiresInSeconds: -10 });
+    const res = await handleRequest(new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }), config());
+    expect(res.status).toBe(401);
+  });
+
+  test("a tampered real JWT with no bearer token is unauthorized", async () => {
+    const jwt = tamperSignature(await signToken());
+    const res = await handleRequest(new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }), config());
+    expect(res.status).toBe(401);
+  });
+
+  test("a tampered real JWT alongside a correct bearer token still authorizes (fallback engages)", async () => {
+    const jwt = tamperSignature(await signToken());
+    const res = await handleRequest(
+      new Request("http://x/api/status", {
+        headers: { "Cf-Access-Jwt-Assertion": jwt, Authorization: `Bearer ${TOKEN}` },
+      }),
+      config(),
+    );
+    expect(res.status).toBe(200);
   });
 });
 
