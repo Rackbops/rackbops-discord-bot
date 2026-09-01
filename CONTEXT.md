@@ -48,8 +48,9 @@
 | `src/github.ts` | GitHub API client: `fetchReleases(repo)` (drafts filtered; returns `null` on a 404 — the repo is missing or invisible to `GITHUB_TOKEN`, which GitHub reports identically — while 401/403/429/5xx still throw, and a releaseless repo is a plain `[]`) + `createReachabilityLog()` (edge-triggered per-repo tracker: `observe(repo, reachable)` → `"lost"` / `"recovered"` / `null`, in-memory so a restart re-reports once) + pure `decideReleaseAnnouncements(releases, seen)` (seed-silently on `seen===undefined`, else announce unseen oldest-first) + `createIssue` / idempotent `ensureLabel` for `/report` (both need `GITHUB_TOKEN` with issues:write) |
 | `Dockerfile` | `oven/bun:1-slim` (Debian — Intl IANA timezones), prod-only install, non-root `bun` user, `VOLUME /app/data`, `ARG/ENV GIT_SHA`, `ENTRYPOINT entrypoint.sh` |
 | `entrypoint.sh` | Root→`bun` drop when compose starts the container as root: joins the socket's group by reading its GID off the socket (`setpriv --groups`), execs the CMD; a plain exec under `USER bun` |
-| `docker-compose.yml` | `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build`: `env_file: .env`, `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports |
-| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Secrets are never read/written (whitelist excludes them); env-set backs up then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
+| `docker-compose.yml` | Local dev: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` — `build.context`/`container_name`/`env_file` default to `.`/`warbandeer-discord`/`.env` respectively. A deployed instance overrides all three per-invocation via `BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER`/`BOT_ENV_FILE` (see the config-dir gotcha) — never persisted in `.env`. `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports |
+| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Takes `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` as required inputs (see the config-dir gotcha) — no fallback to its own script location. Secrets are never read/written (whitelist excludes them); env-set backs up to `<config-dir>/backups/` then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
+| `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run) and the Dockge-managed stack dir (compose file, always refreshed), then prints the initial `up -d --build` invocation. See `ops/README.md` |
 
 ## Behavior
 
@@ -83,23 +84,48 @@
   `GITHUB_REPO` now defaults to this fork (`roshne/rackbops-discord-bot`), and self-update no
   longer path-filters (`BOT_PATH` is gone from `src/update.ts` / `src/redeploy.ts` — the whole
   repo is the bot now, so `fetchLatestBotSha` compares against the newest commit on the branch,
-  full stop, and `buildRemote` builds from the repo root with no subdirectory). Two things
-  still didn't come over automatically and remain open work — plus one pre-existing
-  constraint that now bites differently:
-  - **Self-update's rebuild needs `GITHUB_REPO` to be publicly clonable** (see the Self-update
-    section above — the daemon's remote git build context has no credential support). This
-    repo is **private**, so `/update`'s rebuild step fails until either the repo is made
-    public or self-update is run via the socket-less fallback (manual `--build` / an
-    external image updater) instead. Not a bug introduced by the fork — the original bot has
-    the same constraint, it just happened to already be public.
+  full stop, and `buildRemote` builds from the repo root with no subdirectory). Remaining open
+  work from the fork extraction:
+  - ~~Self-update's rebuild needs `GITHUB_REPO` to be publicly clonable~~ — **resolved**: this
+    repo is public (`roshne/rackbops-discord-bot`), so the daemon's remote git build context
+    (no credential support) already works, for both self-update and the no-clone deploy model
+    below.
   - `ops/bot-ops.sh`'s consumers — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops**
     tabs, plus the shared `apps/bot-ops` backend — live in the original monorepo and
     `roshne/wow-companion`, not here. The script itself still works over a direct SSH
-    invocation (see `ops/README.md`'s "Run directly on the box" example).
+    invocation (see `ops/README.md`'s "Run directly on the box" example) — but a caller now
+    must also pass `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` (see the config-dir gotcha
+    below), which neither app's `ops.json` has a field for yet. Tracked as
+    [roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197) (the design
+    doc's Q4: `opsCmd`/`configDir` fields).
   - No CI: `.github/workflows/discord-bot-test.yml` lived at the monorepo root, so the
     path-scoped extraction didn't carry it over. `bun run check` + `bun test` (referenced
     elsewhere in this doc as CI-enforced) need to be run by hand until a workflow is added
     here.
+- **Config dir and compose file are two independent, required locations — never derived from
+  each other or from a checkout.** `/opt/rackbops-discord-bot/<instance>/` holds `.env` +
+  `backups/` (operator-precious, never auto-migrated — see `ops/README.md`); `.env` is never
+  edited by anything but `ops/bot-ops.sh env-set` or the operator by hand. The **compose file**
+  lives separately, at `/opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml`, purely
+  so Dockge (nucbox's stack manager) lists and manages it — Dockge only recognises a compose
+  file at a path under its own `DOCKGE_STACKS_DIR`, and doesn't care where anything that file
+  references lives. `ops/bot-ops.sh` takes both as required env vars
+  (`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`) with no fallback to its own script location —
+  that assumption broke the moment the two stopped being the same directory. `ops/install.sh`
+  bootstraps a fresh instance's layout; see `ops/README.md` for the full runbook.
+- **`docker-compose.yml`'s three interpolation vars (`BOT_BUILD_CONTEXT`, `BOT_OPS_CONTAINER`,
+  `BOT_ENV_FILE`) are all supplied per-invocation, on the command line — none are ever written
+  into `.env`.** `ops/bot-ops.sh` exports `BOT_ENV_FILE` inline on every `docker compose` call
+  it makes (`cmd_restart`, `cmd_env_set`) and inherits `BOT_OPS_CONTAINER` from its own caller;
+  neither of those ever passes `--build`, so `BOT_BUILD_CONTEXT` is irrelevant to them.
+  `ops/install.sh`'s printed bootstrap command is the one place that sets `BOT_BUILD_CONTEXT`,
+  as a one-shot shell prefix on that single `up -d --build` invocation — unset (the default in
+  `build.context: ${BOT_BUILD_CONTEXT:-.}`), it's `.`, so `docker compose up -d --build` run
+  directly from this checkout for local dev is unchanged. A future manual rebuild against a
+  deployed instance needs the same var re-supplied by hand (see `ops/install.sh`'s output) —
+  there's nothing to read it back from. Self-update's own rebuilds (`src/redeploy.ts`) were
+  already remote-context-based before any of this, via the Docker Engine API directly, not
+  `docker compose` — untouched by it.
 - **The redeploy order is inverted on purpose (#879), and the reason is a kernel boundary.** Every
   "shut down, then have something bring the replacement up" variant dies on the same thing: a
   detached process (`setsid`, double fork, `Bun.spawn({ detached: true })`) leaves its *parent*, not
