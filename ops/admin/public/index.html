@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
-<title>Bot Admin</title>
+<title>Bot Admin — __INSTANCE_NAME__</title>
 <style>
   :root {
     color-scheme: light dark;
@@ -76,13 +76,36 @@
   .msg { font-size: 12px; margin-top: 8px; }
   .msg.error { color: var(--danger); }
   .msg.ok { color: var(--ok); }
+  .panel-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 20px; }
+  .panel-header h1 { margin: 0; }
+  /* The instance this panel manages — a wrong-instance guard, so it's deliberately prominent and
+     present on both the gate and the app, not just the browser tab title. */
+  .instance-badge {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    background: #0d0f13;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px 10px;
+    letter-spacing: 0.02em;
+    /* Never let a long, unbroken instance name push a horizontal scrollbar — wrap it instead,
+       especially in the narrow 360px gate. */
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
+  #gate .panel-header { justify-content: center; }
 </style>
 </head>
 <body>
 
 <div id="gate" hidden>
-  <h1>Bot Admin</h1>
+  <div class="panel-header">
+    <h1>Bot Admin</h1>
+    <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
+  </div>
   <p style="color: var(--muted)">Paste the admin token to continue.</p>
   <input id="token-input" type="password" placeholder="Admin token" autocomplete="off" />
   <div class="row" style="margin-top: 10px; justify-content: center">
@@ -91,7 +114,10 @@
 </div>
 
 <main id="app" hidden>
-  <h1>Bot Admin</h1>
+  <div class="panel-header">
+    <h1>Bot Admin</h1>
+    <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
+  </div>
 
   <section id="status-section">
     <h2>Status</h2>
