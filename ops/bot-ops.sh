@@ -213,12 +213,31 @@ cmd_env_set() {
   # Backups live in the config dir's own backups/ subdirectory, never beside .env in a checkout —
   # mkdir -p is defensive here in case a fresh config dir was hand-created without it.
   mkdir -p "$CONFIG_DIR/backups"
+
+  # .env and its backups must stay owned by the deploy user: day-2 SSH ops and redeploys read
+  # .env as that (non-root) user, but env-set usually runs from the admin container AS ROOT (it
+  # needs the docker socket), whose mktemp/install/mv below would otherwise leave every rewrite
+  # root-owned — silently locking the deploy user out on each save (issue #20). Restore ownership
+  # to CONFIG_DIR's own owner (install.sh chowns it to the deploy user), by NUMERIC uid:gid since
+  # the container has no matching username. On the next real settings change this self-heals a
+  # .env already flipped to root, and is a harmless no-op when env-set is instead run directly as
+  # the deploy user. Each chown is `|| warn`-guarded so a refused chown (non-root, target already
+  # correctly owned) can't abort env-set under `set -e` after the write already happened.
+  local target_owner
+  target_owner="$(stat -c '%u:%g' "$CONFIG_DIR")"
+  # backups/ itself may have just been created by the defensive mkdir above (root-owned in the
+  # container context) — chown it too, else a later deploy-user run can't write a backup into it.
+  chown "$target_owner" "$CONFIG_DIR/backups" \
+    || echo "bot-ops: warning: couldn't set backups/ ownership to $target_owner" >&2
+
   local backup="$CONFIG_DIR/backups/.env.bak.$(date +%Y%m%d-%H%M%S)"
   # Pin the backup to 0600 rather than inheriting .env's mode. `cp` would copy that mode, which is
   # only safe while .env is itself owner-only — and a .env recreated by hand or by a fresh deploy
   # picks up the umask (0664 under the usual 002) instead. This file holds DISCORD_TOKEN and
   # BLIZZARD_CLIENT_SECRET, so its exposure shouldn't depend on the source being right.
   install -m 600 "$ENV_FILE" "$backup"
+  chown "$target_owner" "$backup" \
+    || echo "bot-ops: warning: couldn't set backup ownership to $target_owner" >&2
 
   # Rewrite .env: replace matching KEY= lines in place, preserve everything else verbatim,
   # append any changed key that wasn't already present.
@@ -245,6 +264,8 @@ cmd_env_set() {
   # correct by accident, and silently narrowing for anyone who set .env to 0640 on purpose. Saying
   # 0600 outright makes the intent the contract.
   chmod 600 "$ENV_FILE"
+  chown "$target_owner" "$ENV_FILE" \
+    || echo "bot-ops: warning: couldn't restore .env ownership to $target_owner" >&2
 
   # Apply: recreate the container so the new env is loaded (a plain restart would not reload it).
   # Deliberately NO --build: a self-update (#879) tags its freshly built image as the same
