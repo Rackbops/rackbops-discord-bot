@@ -159,6 +159,30 @@ export function buildInvocation(
   return undefined;
 }
 
+/** HTML-escapes a string for insertion into an HTML text/attribute context. */
+export function escapeHtml(s: string): string {
+  return s.replace(
+    /[&<>"']/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] as string,
+  );
+}
+
+/**
+ * Bakes the instance name into every `__INSTANCE_NAME__` placeholder in the served HTML, once at
+ * startup. Templated (not fetched at runtime from an /api/instance call) so the instance is
+ * visible on the raw page immediately — including the locked gate, before any auth or any backend
+ * call — which is the whole point of showing it: a guard against acting on the wrong instance's
+ * tab. Escaped because, although BOT_OPS_PROJECT is operator-set deploy config rather than
+ * attacker input, it reaches this string in an HTML context and must not be able to inject markup.
+ */
+export function renderIndexHtml(template: string, instanceName: string): string {
+  const escaped = escapeHtml(instanceName);
+  // Replacement passed as a function, not a string: in a string replacement `$&`, `$\``, `$'`,
+  // `$$` are special sequences, so a name containing a `$` would otherwise be mangled. A function
+  // return value is inserted verbatim, sidestepping that entirely.
+  return template.replaceAll("__INSTANCE_NAME__", () => escaped);
+}
+
 export interface HandlerConfig {
   adminToken: string;
   indexHtml: string;
@@ -236,7 +260,18 @@ if (import.meta.main) {
     process.exit(1);
   }
 
-  const indexHtml = await Bun.file(new URL("./public/index.html", import.meta.url)).text();
+  // BOT_OPS_PROJECT is the compose project (e.g. rackbops-discord-bot-debug) — the canonical
+  // per-instance identity, already in this container's env (docker-compose.yml passes it, with
+  // its own compose-level default). Fall back to the container name, then to a loud placeholder.
+  // That placeholder only surfaces when the server runs OUTSIDE compose (e.g. a bare
+  // `bun run server.ts`) with nothing set — under compose the compose default fills in first.
+  const instanceName =
+    process.env.BOT_OPS_PROJECT?.trim() || process.env.BOT_OPS_CONTAINER?.trim() || "unnamed instance";
+  const indexHtml = renderIndexHtml(
+    await Bun.file(new URL("./public/index.html", import.meta.url)).text(),
+    instanceName,
+  );
+  console.log(`[admin] serving admin panel for instance "${instanceName}"`);
 
   const runBotOps = async (invocation: BotOpsInvocation): Promise<BotOpsResult> => {
     const proc = Bun.spawn(["bash", BOT_OPS_SH, ...invocation.args], {

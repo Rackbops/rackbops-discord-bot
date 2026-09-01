@@ -3,6 +3,7 @@ import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
   buildInvocation,
   createAccessJwtVerifier,
+  escapeHtml,
   extractAccessJwt,
   extractBearerToken,
   handleRequest,
@@ -11,6 +12,7 @@ import {
   isRequestAuthorized,
   normalizeTeamDomain,
   parseAllowedEmails,
+  renderIndexHtml,
   tokensMatch,
   type BotOpsResult,
   type HandlerConfig,
@@ -419,6 +421,42 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
       config(),
     );
     expect(res.status).toBe(200);
+  });
+});
+
+describe("escapeHtml", () => {
+  test("escapes the five HTML-significant characters", () => {
+    expect(escapeHtml(`<a href="x" foo='y'>&`)).toBe("&lt;a href=&quot;x&quot; foo=&#39;y&#39;&gt;&amp;");
+  });
+
+  test("leaves an ordinary instance name untouched", () => {
+    expect(escapeHtml("rackbops-discord-bot-debug")).toBe("rackbops-discord-bot-debug");
+  });
+});
+
+describe("renderIndexHtml", () => {
+  test("replaces every __INSTANCE_NAME__ placeholder with the escaped name", () => {
+    const template = "<title>Bot Admin — __INSTANCE_NAME__</title><span>__INSTANCE_NAME__</span>";
+    expect(renderIndexHtml(template, "prod-bot")).toBe(
+      "<title>Bot Admin — prod-bot</title><span>prod-bot</span>",
+    );
+  });
+
+  test("escapes a name containing markup so it can't inject into the page", () => {
+    expect(renderIndexHtml("<span>__INSTANCE_NAME__</span>", '<img src=x onerror="alert(1)">')).toBe(
+      "<span>&lt;img src=x onerror=&quot;alert(1)&quot;&gt;</span>",
+    );
+  });
+
+  test("a template with no placeholder is returned unchanged", () => {
+    expect(renderIndexHtml("<title>Bot Admin</title>", "whatever")).toBe("<title>Bot Admin</title>");
+  });
+
+  test("a name containing $-sequences is inserted literally, not treated as a replacement pattern", () => {
+    // `$&`/`$$`/`$\`` are special in a replaceAll replacement *string*; the name must still render
+    // verbatim (after HTML-escaping), which is why the replacement is a function, not a string.
+    expect(renderIndexHtml("<span>__INSTANCE_NAME__</span>", "a$$b")).toBe("<span>a$$b</span>");
+    expect(renderIndexHtml("<span>__INSTANCE_NAME__</span>", "$&z")).toBe("<span>$&amp;z</span>");
   });
 });
 
