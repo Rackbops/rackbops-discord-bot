@@ -1,19 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
+  auditLogLine,
+  authorizeRequest,
   buildInvocation,
   createAccessJwtVerifier,
+  describeAction,
+  describeActor,
   escapeHtml,
   extractAccessJwt,
   extractBearerToken,
   handleRequest,
   isAuthorized,
   isEmailAllowed,
-  isRequestAuthorized,
   normalizeTeamDomain,
   parseAllowedEmails,
+  parseChangedKeys,
   renderIndexHtml,
   tokensMatch,
+  type Authorization,
+  type BotOpsInvocation,
   type BotOpsResult,
   type HandlerConfig,
 } from "./server";
@@ -214,9 +220,21 @@ describe("normalizeTeamDomain", () => {
 describe("createAccessJwtVerifier", () => {
   const verify = createAccessJwtVerifier(jwks, TEAM_DOMAIN, AUD);
 
-  test("a valid token resolves the identity", async () => {
+  test("a valid token resolves the identity, with the full claims attached", async () => {
     const jwt = await signToken();
-    expect(await verify(jwt)).toEqual({ sub: "user@example.com", email: undefined });
+    const result = await verify(jwt);
+    expect(result?.sub).toBe("user@example.com");
+    expect(result?.email).toBeUndefined();
+    // The full verified payload is carried through for the panel's Identity view.
+    expect(result?.claims).toMatchObject({ sub: "user@example.com", iss: `https://${TEAM_DOMAIN}`, aud: AUD });
+    expect(typeof result?.claims?.exp).toBe("number");
+  });
+
+  test("the identity's email claim is carried when present", async () => {
+    const jwt = await signToken({ email: "roshne@gmail.com" });
+    const result = await verify(jwt);
+    expect(result?.email).toBe("roshne@gmail.com");
+    expect(result?.claims?.email).toBe("roshne@gmail.com");
   });
 
   test("an expired token resolves null", async () => {
@@ -285,7 +303,7 @@ describe("createAccessJwtVerifier", () => {
   });
 });
 
-describe("isRequestAuthorized", () => {
+describe("authorizeRequest", () => {
   const TOKEN = "the-real-token";
   const INDEX_HTML = "<html></html>";
   const fakeRunBotOps = async (): Promise<BotOpsResult> => ({ exitCode: 0, stdout: "", stderr: "" });
@@ -294,24 +312,33 @@ describe("isRequestAuthorized", () => {
     return { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps, ...overrides };
   }
 
-  test("bearer matches, no Access header -> true", async () => {
+  test("bearer matches, no Access header -> via bearer, no email", async () => {
     const req = new Request("http://x/", { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(await isRequestAuthorized(req, baseConfig())).toBe(true);
+    expect(await authorizeRequest(req, baseConfig())).toEqual({ via: "bearer" });
   });
 
-  test("a verified Access JWT authorizes on its own, bearer missing or wrong", async () => {
+  test("a verified Access JWT authorizes on its own and carries the email", async () => {
+    const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    const verifyAccessJwt = async () => ({ sub: "user@example.com", email: "user@example.com" });
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({
+      via: "jwt",
+      email: "user@example.com",
+    });
+  });
+
+  test("a verified JWT with no email claim authorizes via jwt with email undefined", async () => {
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
     const verifyAccessJwt = async () => ({ sub: "user@example.com" });
-    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(true);
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({ via: "jwt", email: undefined });
   });
 
   test("an Access header with no verifier configured is inert — falls to the bearer check", async () => {
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await isRequestAuthorized(req, baseConfig())).toBe(false);
+    expect(await authorizeRequest(req, baseConfig())).toBeNull();
     const reqWithBearer = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await isRequestAuthorized(reqWithBearer, baseConfig())).toBe(true);
+    expect(await authorizeRequest(reqWithBearer, baseConfig())).toEqual({ via: "bearer" });
   });
 
   test("a JWT that fails verification falls through to the bearer check", async () => {
@@ -319,24 +346,27 @@ describe("isRequestAuthorized", () => {
     const req = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(true);
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({ via: "bearer" });
     const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await isRequestAuthorized(reqNoBearer, baseConfig({ verifyAccessJwt }))).toBe(false);
+    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt }))).toBeNull();
   });
 
-  test("both fail -> false", async () => {
+  test("both fail -> null", async () => {
     const verifyAccessJwt = async () => null;
     const req = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: "Bearer wrong" },
     });
-    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(false);
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toBeNull();
   });
 
-  test("a verified JWT for an allow-listed email authorizes on its own", async () => {
+  test("a verified JWT for an allow-listed email authorizes on its own, carrying the email", async () => {
     const verifyAccessJwt = async () => ({ sub: "x", email: "roshne@gmail.com" });
     const adminAllowedEmails = new Set(["roshne@gmail.com"]);
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(true);
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toEqual({
+      via: "jwt",
+      email: "roshne@gmail.com",
+    });
   });
 
   test("a verified JWT for a non-allow-listed email falls through to the bearer check", async () => {
@@ -345,9 +375,58 @@ describe("isRequestAuthorized", () => {
     const reqWithBearer = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await isRequestAuthorized(reqWithBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(true);
+    expect(await authorizeRequest(reqWithBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toEqual({
+      via: "bearer",
+    });
     const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await isRequestAuthorized(reqNoBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(false);
+    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBeNull();
+  });
+});
+
+describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () => {
+  const okRestart: BotOpsInvocation = { args: ["restart"], contentType: "text/plain" };
+  const okEnvSet: BotOpsInvocation = { args: ["env-set"], stdin: "", contentType: "application/json" };
+  const ok = (stdout = ""): BotOpsResult => ({ exitCode: 0, stdout, stderr: "" });
+
+  test("describeActor names the email when present, else the auth path", () => {
+    expect(describeActor({ via: "jwt", email: "roshne@gmail.com" })).toBe("roshne@gmail.com");
+    expect(describeActor({ via: "jwt" })).toBe("an Access session (no email claim)");
+    expect(describeActor({ via: "bearer" })).toBe("the ADMIN_TOKEN bearer token");
+  });
+
+  test("parseChangedKeys pulls string keys from env-set JSON, tolerating anything else", () => {
+    expect(parseChangedKeys('{"changed":["BOT_BRANCH","WOW_REALM"]}')).toEqual(["BOT_BRANCH", "WOW_REALM"]);
+    expect(parseChangedKeys('{"changed":[]}')).toEqual([]);
+    expect(parseChangedKeys("{}")).toEqual([]);
+    expect(parseChangedKeys("not json")).toEqual([]);
+    expect(parseChangedKeys('{"changed":[1,"OK",null]}')).toEqual(["OK"]);
+  });
+
+  test("describeAction names env-set's changed keys, and restart plainly", () => {
+    expect(describeAction(okEnvSet, '{"changed":["BOT_BRANCH"]}')).toBe("env-set (changed: BOT_BRANCH)");
+    expect(describeAction(okEnvSet, '{"changed":[]}')).toBe("env-set (no changes)");
+    expect(describeAction(okRestart, "")).toBe("restart");
+  });
+
+  test("auditLogLine logs successful mutations with the actor", () => {
+    expect(auditLogLine(okRestart, ok(), { via: "jwt", email: "roshne@gmail.com" })).toBe(
+      "[admin] restart by roshne@gmail.com",
+    );
+    expect(auditLogLine(okEnvSet, ok('{"changed":["GUILD_ID"]}'), { via: "bearer" })).toBe(
+      "[admin] env-set (changed: GUILD_ID) by the ADMIN_TOKEN bearer token",
+    );
+  });
+
+  test("auditLogLine returns null for reads and for failures (logged elsewhere)", () => {
+    const status: BotOpsInvocation = { args: ["status"], contentType: "application/json" };
+    const logs: BotOpsInvocation = { args: ["logs"], contentType: "text/plain" };
+    const envGet: BotOpsInvocation = { args: ["env-get"], contentType: "application/json" };
+    const auth: Authorization = { via: "jwt", email: "roshne@gmail.com" };
+    expect(auditLogLine(status, ok("{}"), auth)).toBeNull();
+    expect(auditLogLine(logs, ok(""), auth)).toBeNull();
+    expect(auditLogLine(envGet, ok("{}"), auth)).toBeNull();
+    // a mutation that FAILED (non-zero exit) isn't logged here — the error path logs it instead
+    expect(auditLogLine(okRestart, { exitCode: 1, stdout: "", stderr: "boom" }, auth)).toBeNull();
   });
 });
 
@@ -598,5 +677,43 @@ describe("handleRequest", () => {
       runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
     });
     expect(res.status).toBe(404);
+  });
+
+  test("GET /api/whoami reports the verified email and full claims on the JWT path, without touching bot-ops.sh", async () => {
+    let botOpsCalls = 0;
+    const claims = { sub: "roshne@gmail.com", email: "roshne@gmail.com", iss: "https://team.example", aud: "aud", exp: 123 };
+    const res = await handleRequest(
+      new Request("http://x/api/whoami", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } }),
+      {
+        adminToken: TOKEN,
+        indexHtml: INDEX_HTML,
+        runBotOps: async () => {
+          botOpsCalls++;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        verifyAccessJwt: async () => ({ sub: "roshne@gmail.com", email: "roshne@gmail.com", claims }),
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ via: "jwt", email: "roshne@gmail.com", claims });
+    expect(botOpsCalls).toBe(0); // whoami is server-native, never shells out
+  });
+
+  test("GET /api/whoami on the bearer path reports via:bearer with null email and null claims", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/whoami", { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }) },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ via: "bearer", email: null, claims: null });
+  });
+
+  test("GET /api/whoami still requires auth", async () => {
+    const res = await handleRequest(new Request("http://x/api/whoami"), {
+      adminToken: TOKEN,
+      indexHtml: INDEX_HTML,
+      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+    expect(res.status).toBe(401);
   });
 });

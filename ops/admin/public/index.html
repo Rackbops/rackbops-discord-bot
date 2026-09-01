@@ -95,6 +95,9 @@
     max-width: 100%;
     overflow-wrap: anywhere;
   }
+  /* Who the panel authenticated as — pushed to the far end of the header row; wraps under on
+     narrow screens (the header is flex-wrap). */
+  .whoami { margin-left: auto; font-size: 12px; color: var(--muted); }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
   #gate .panel-header { justify-content: center; }
 </style>
@@ -117,6 +120,7 @@
   <div class="panel-header">
     <h1>Bot Admin</h1>
     <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
+    <span id="whoami" class="whoami"></span>
   </div>
 
   <section id="status-section">
@@ -146,6 +150,14 @@
       <button id="save-env">Save changes</button>
     </div>
     <div id="env-msg" class="msg"></div>
+  </section>
+
+  <section id="identity-section">
+    <h2>Identity</h2>
+    <p style="color: var(--muted); margin: 0 0 10px">
+      Everything Cloudflare Access hands this panel about you, from the verified Access token.
+    </p>
+    <dl class="status-grid" id="identity-grid"><dt>Loading…</dt></dl>
   </section>
 </main>
 
@@ -193,8 +205,59 @@
   function showApp() {
     gate.hidden = true;
     app.hidden = false;
+    loadWhoami();
     loadStatus();
     loadEnv();
+  }
+
+  // JWT claims that are unix-second timestamps — humanized in the Identity view.
+  const TIME_CLAIMS = new Set(["iat", "exp", "nbf", "auth_time"]);
+
+  function formatClaimValue(key, value) {
+    if (TIME_CLAIMS.has(key) && typeof value === "number") {
+      return new Date(value * 1000).toISOString() + " (" + value + ")";
+    }
+    return typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
+  }
+
+  // Populates the header "signed in as" summary and the Identity section from /api/whoami. An
+  // Access session shows its email + every claim the token carries; the identity-blind bearer
+  // path has no per-user profile to show. textContent for all claim values — they're server-
+  // supplied but this keeps them inert regardless.
+  async function loadWhoami() {
+    const el = document.getElementById("whoami");
+    const grid = document.getElementById("identity-grid");
+    try {
+      const who = await (await api("/api/whoami")).json();
+      el.textContent = who.email
+        ? "signed in as " + who.email
+        : who.via === "jwt"
+          ? "signed in via Access"
+          : "signed in via admin token";
+      grid.innerHTML = "";
+      if (who.claims && typeof who.claims === "object") {
+        for (const key of Object.keys(who.claims).sort()) {
+          const dt = document.createElement("dt");
+          dt.textContent = key;
+          const dd = document.createElement("dd");
+          dd.textContent = formatClaimValue(key, who.claims[key]);
+          grid.appendChild(dt);
+          grid.appendChild(dd);
+        }
+      } else {
+        const dt = document.createElement("dt");
+        dt.textContent = "identity";
+        const dd = document.createElement("dd");
+        dd.textContent = "authenticated via the admin token — no per-user Access profile to show";
+        grid.appendChild(dt);
+        grid.appendChild(dd);
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") {
+        el.textContent = "";
+        grid.innerHTML = "<dt>Error</dt><dd>" + escapeHtml(e.message) + "</dd>";
+      }
+    }
   }
 
   document.getElementById("unlock").addEventListener("click", () => {
