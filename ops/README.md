@@ -196,14 +196,19 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    primary check once both are set — most requests behind a configured Access application never
    need the bearer prompt at all, since Access attaches the header transparently.
 
-   **Optional narrowing: `ADMIN_ALLOWED_EMAILS`** (comma-separated, in `.env`) restricts which
-   *verified* identities the JWT check accepts, on top of whatever Cloudflare Access's own edge
-   policy already allows through. Useful when an Access application's policy is shared across
-   several tools — e.g. the same "Allow trusted users" policy might also gate Dockge — and you
-   want a narrower set of people able to act on this bot specifically. Blank means no extra
-   narrowing (any identity Access already let through authorizes, matching the behavior before
-   this option existed); never applied to the bearer-token fallback, which stays identity-blind
-   by design.
+   **Optional narrowing — the admin allow-list.** Restricts which *verified* identities the JWT
+   check accepts, on top of whatever Cloudflare Access's own edge policy already allows through.
+   Useful when an Access application's policy is shared across several tools — e.g. the same
+   "Allow trusted users" policy might also gate Dockge — and you want a narrower set of people
+   able to act on this bot specifically. It's the union of two sources: **`ADMIN_ALLOWED_EMAILS`**
+   (comma-separated, in `.env`) — the permanent *bootstrap* floor, editable only on the box — plus
+   a **dynamic list managed live from the panel's Admins section**, persisted to `admins.json`
+   beside `.env`. With both empty there's no narrowing (any identity Access already let through
+   authorizes); adding even one admin (env or panel) turns narrowing on. You can't lock everyone
+   out: bootstrap admins can't be removed from the panel, you can't remove yourself, and — when
+   there's no bootstrap floor at all — the panel refuses to remove the last remaining admin
+   (which would silently reopen it to everyone). Never applied to the bearer-token fallback, which
+   stays identity-blind by design.
 
    **Fallback: a bearer token** (`ADMIN_TOKEN` in `.env`, generated once by `ops/install.sh` at
    bootstrap and printed to the terminal — copy it into the panel's unlock prompt on first
@@ -214,13 +219,20 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    Access header is present at all. Either check alone is sufficient (OR, not AND) — a valid
    JWT is evaluated first and, when present and valid, the bearer token is never consulted.
 
-**What it exposes — `bot-ops.sh`'s five operations plus one read-only, server-native route:**
-`GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`, `POST /api/env`, and
-`GET /api/whoami` — which reflects the requester's own verified Access identity (who they're
-signed in as, plus the JWT's claims for the panel's Identity view) and never shells out to
-`bot-ops.sh`. No rebuild/deploy capability lives here — that stays Discord's `/update`. The config
-form on the page is rendered from whatever `GET /api/env` returns, so it can never drift from this
-script's own `ALLOWED` whitelist above.
+**What it exposes — `bot-ops.sh`'s five operations plus a few read-only or self-contained,
+server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`,
+`POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
+they're signed in as, plus the JWT's claims for the panel's Identity view), and
+`GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
+above). The `/api/whoami` and `/api/admins` routes never shell out to `bot-ops.sh`; `/api/admins`
+manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
+routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
+which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
+rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don't rewrite it to
+the internal origin or same-origin browser writes would be wrongly blocked.
+No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
+page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
+`ALLOWED` whitelist above.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
