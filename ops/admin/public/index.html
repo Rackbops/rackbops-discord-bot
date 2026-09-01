@@ -74,6 +74,10 @@
     word-break: break-all;
     font-size: 12px;
   }
+  pre.nowrap { white-space: pre; word-break: normal; }
+  input[type="checkbox"] { width: auto; margin: 0; vertical-align: middle; }
+  .inline-check { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
+  #logs-filter { flex: 1 1 160px; width: auto; min-width: 140px; }
   .msg { font-size: 12px; margin-top: 8px; }
   .msg.error { color: var(--danger); }
   .msg.ok { color: var(--ok); }
@@ -144,10 +148,13 @@
   <section>
     <h2>Logs</h2>
     <div class="row">
-      <input id="logs-n" type="number" value="200" min="1" max="5000" style="width: 90px" />
+      <input id="logs-n" type="number" value="200" min="1" max="5000" style="width: 90px" aria-label="Number of log lines to load" />
       <button id="load-logs">Load</button>
+      <input id="logs-filter" type="text" placeholder="Filter loaded lines…" autocomplete="off" aria-label="Filter loaded log lines" />
+      <label class="inline-check"><input type="checkbox" id="logs-wrap" checked /> Wrap</label>
     </div>
-    <pre id="logs-out" style="margin-top: 10px">(not loaded)</pre>
+    <div id="logs-meta" class="field-hint" style="margin-top: 6px"></div>
+    <pre id="logs-out" style="margin-top: 6px">(not loaded)</pre>
   </section>
 
   <section>
@@ -441,6 +448,37 @@
     }),
   );
 
+  // The full text of the last successful log load, kept so the filter re-derives from the whole
+  // batch (clearing the filter restores every line) rather than from whatever is currently on
+  // screen. null = nothing loaded yet.
+  let loadedLogs = null;
+
+  function renderLogs() {
+    const out = document.getElementById("logs-out");
+    const meta = document.getElementById("logs-meta");
+    if (loadedLogs === null) { out.textContent = "(not loaded)"; meta.textContent = ""; return; }
+    const q = document.getElementById("logs-filter").value.trim().toLowerCase();
+    if (!q) {
+      out.textContent = loadedLogs || "(no log output)";
+      meta.textContent = "";
+      return;
+    }
+    // docker logs terminates the batch with a trailing newline; drop it so the line count (and
+    // the "of N" denominator) isn't inflated by one empty trailing element, and an empty batch
+    // counts as 0 lines rather than 1.
+    const stripped = loadedLogs.replace(/\n$/, "");
+    const allLines = stripped === "" ? [] : stripped.split("\n");
+    const matched = allLines.filter((l) => l.toLowerCase().includes(q));
+    out.textContent = matched.length ? matched.join("\n") : '(no lines match "' + q + '")';
+    meta.textContent = matched.length + " of " + allLines.length + " lines match";
+  }
+
+  // Newest lines are last (docker logs order), so "scroll to bottom" == show the most recent.
+  function scrollLogsToBottom() {
+    const out = document.getElementById("logs-out");
+    out.scrollTop = out.scrollHeight;
+  }
+
   document.getElementById("load-logs").addEventListener("click", (e) =>
     withBusy(e.currentTarget, async () => {
       const out = document.getElementById("logs-out");
@@ -448,12 +486,34 @@
       out.textContent = "Loading…";
       try {
         const res = await api("/api/logs?n=" + encodeURIComponent(n));
-        out.textContent = await res.text();
+        loadedLogs = await res.text();
+        renderLogs();
+        // Land on the newest lines on load — but not when a filter is active, so this matches the
+        // filter input's own "matches read from the top" resting position.
+        if (!document.getElementById("logs-filter").value.trim()) scrollLogsToBottom();
       } catch (e2) {
-        if (e2.message !== "unauthorized") out.textContent = "Error: " + e2.message;
+        if (e2.message !== "unauthorized") {
+          loadedLogs = null;
+          document.getElementById("logs-meta").textContent = ""; // don't leave a stale match count above the error
+          out.textContent = "Error: " + e2.message;
+        }
       }
     }),
   );
+
+  // Filter re-renders in place from the full batch. On a live filter the view resets to the top
+  // (setting textContent zeroes scrollTop) so matches read from the start; clearing it restores
+  // the full log and jumps back to the newest line.
+  document.getElementById("logs-filter").addEventListener("input", () => {
+    renderLogs();
+    if (!document.getElementById("logs-filter").value.trim()) scrollLogsToBottom();
+  });
+
+  // Wrap on (default) = long lines wrap; off = one entry per line with horizontal scroll, easier
+  // to scan structured or stacktrace output.
+  document.getElementById("logs-wrap").addEventListener("change", (e) => {
+    document.getElementById("logs-out").classList.toggle("nowrap", !e.target.checked);
+  });
 
   // Per-field UI hints and richer controls. Keys NOT listed here render as a plain text input, so
   // this is purely additive — a field bot-ops.sh adds to its ALLOWED map still shows up (as text),
