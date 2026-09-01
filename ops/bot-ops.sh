@@ -69,9 +69,9 @@ ENV_FILE="$CONFIG_DIR/.env"
 # omitted by env-get. Each key pairs with a validation regex (empty string is always allowed —
 # it clears the key back to its documented default).
 declare -A ALLOWED=(
+  [DISCORD_SERVER_ID]='^[0-9]{5,25}$'
   [ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
   [RELEASE_ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
-  [GUILD_ID]='^[0-9]{5,25}$'
   [REPORT_ROLE_ID]='^[0-9]{5,25}$'
   [ADMIN_USER_IDS]='^[0-9]{5,25}(,[0-9]{5,25})*$'
   [WOW_REALM]='^[a-z0-9-]{1,40}$'
@@ -81,6 +81,24 @@ declare -A ALLOWED=(
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
+)
+
+# Display order for env-get's output — a plain indexed array, not ALLOWED's own iteration order,
+# which as a bash associative array is unspecified (hash-bucket order, not declaration order).
+# Must contain exactly the same keys as ALLOWED; cmd_env_get asserts this so the two can't drift.
+ALLOWED_ORDER=(
+  DISCORD_SERVER_ID
+  ANNOUNCE_CHANNEL_ID
+  RELEASE_ANNOUNCE_CHANNEL_ID
+  REPORT_ROLE_ID
+  ADMIN_USER_IDS
+  WOW_REALM
+  WOW_REGION
+  WATCHED_REPOS
+  DMF_TIMEZONE
+  AUTO_UPDATE
+  BOT_BRANCH
+  COMMAND_PREFIX
 )
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
@@ -130,11 +148,28 @@ cmd_restart() {
 cmd_env_get() {
   need jq
   [ -f "$ENV_FILE" ] || die "env-get: $ENV_FILE not found"
-  local args=() key
-  for key in "${!ALLOWED[@]}"; do
+  # ALLOWED_ORDER must name exactly ALLOWED's keys, each exactly once — a key added to one and
+  # not the other would otherwise silently drop it from the panel (missing from ALLOWED_ORDER) or
+  # crash on an unset array element (missing from ALLOWED, present in ALLOWED_ORDER). A duplicate
+  # in ALLOWED_ORDER is checked explicitly (not just "same length as ALLOWED") — a length-and-
+  # membership check alone would pass for e.g. one key duplicated and a different key dropped,
+  # since the count still matches and every listed key still exists in ALLOWED.
+  local key
+  declare -A seen=()
+  for key in "${ALLOWED_ORDER[@]}"; do
+    [[ -n "${ALLOWED[$key]+x}" ]] || die "env-get: '$key' is in ALLOWED_ORDER but not ALLOWED"
+    [[ -z "${seen[$key]+x}" ]] || die "env-get: '$key' appears more than once in ALLOWED_ORDER"
+    seen["$key"]=1
+  done
+  (( ${#seen[@]} == ${#ALLOWED[@]} )) \
+    || die "env-get: ALLOWED_ORDER (${#seen[@]} unique) and ALLOWED (${#ALLOWED[@]}) have drifted"
+  local args=()
+  for key in "${ALLOWED_ORDER[@]}"; do
     args+=(--arg "$key" "$(env_value "$key")")
   done
-  # Build a {KEY: value, ...} object over exactly the allowlisted keys.
+  # Build a {KEY: value, ...} object over exactly the allowlisted keys, in ALLOWED_ORDER's order —
+  # jq preserves --arg insertion order in $ARGS.named, and the admin panel's front-end renders
+  # this object's keys in the order it receives them rather than re-sorting.
   jq -n "${args[@]}" '$ARGS.named'
 }
 
