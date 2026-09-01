@@ -195,6 +195,15 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    primary check once both are set — most requests behind a configured Access application never
    need the bearer prompt at all, since Access attaches the header transparently.
 
+   **Optional narrowing: `ADMIN_ALLOWED_EMAILS`** (comma-separated, in `.env`) restricts which
+   *verified* identities the JWT check accepts, on top of whatever Cloudflare Access's own edge
+   policy already allows through. Useful when an Access application's policy is shared across
+   several tools — e.g. the same "Allow trusted users" policy might also gate Dockge — and you
+   want a narrower set of people able to act on this bot specifically. Blank means no extra
+   narrowing (any identity Access already let through authorizes, matching the behavior before
+   this option existed); never applied to the bearer-token fallback, which stays identity-blind
+   by design.
+
    **Fallback: a bearer token** (`ADMIN_TOKEN` in `.env`, generated once by `ops/install.sh` at
    bootstrap and printed to the terminal — copy it into the panel's unlock prompt on first
    visit, where it's kept in the browser's `localStorage`). Always required at startup
