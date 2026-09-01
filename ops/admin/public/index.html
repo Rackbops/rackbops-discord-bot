@@ -128,6 +128,15 @@
   "use strict";
 
   const TOKEN_KEY = "admin-token";
+  // Session-scoped (not localStorage): explicitly clicking Lock should stick across a reload of
+  // this same tab even though Cloudflare Access's own session cookie is untouched by it — a new
+  // tab/window re-authenticating via Access is expected SSO behavior, not something this page
+  // can or should override. Known limitation, not fixable from this file: a full browser
+  // quit-and-relaunch with "restore previous session" does NOT preserve sessionStorage on
+  // Chrome/Edge (Firefox does), so Lock's guarantee doesn't survive that specific path while the
+  // Access cookie is still valid — closing this fully needs server-side Access session
+  // revocation, which is Cloudflare's concern, not this page's.
+  const LOCKED_KEY = "admin-locked";
   const gate = document.getElementById("gate");
   const app = document.getElementById("app");
 
@@ -138,10 +147,10 @@
   // Every /api/* call goes through here. A 401 means the stored token is wrong or was rotated —
   // drop it and show the unlock gate again rather than leaving the page in a half-broken state.
   async function api(path, opts) {
-    const res = await fetch(path, {
-      ...opts,
-      headers: { ...(opts && opts.headers), Authorization: "Bearer " + getToken() },
-    });
+    const token = getToken();
+    const headers = { ...(opts && opts.headers) };
+    if (token) headers.Authorization = "Bearer " + token;
+    const res = await fetch(path, { ...opts, headers });
     if (res.status === 401) {
       clearToken();
       showGate();
@@ -166,6 +175,7 @@
     const v = document.getElementById("token-input").value.trim();
     if (!v) return;
     setToken(v);
+    sessionStorage.removeItem(LOCKED_KEY); // an explicit unlock overrides a prior explicit lock
     showApp();
   });
   document.getElementById("token-input").addEventListener("keydown", (e) => {
@@ -173,6 +183,7 @@
   });
   document.getElementById("lock").addEventListener("click", () => {
     clearToken();
+    sessionStorage.setItem(LOCKED_KEY, "1");
     showGate();
   });
 
@@ -270,7 +281,34 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
-  if (getToken()) showApp(); else showGate();
+  // No stored bearer token yet — before asking for one, check whether Cloudflare Access already
+  // authenticated this browser. A valid Cf-Access-Jwt-Assertion needs no client-side involvement
+  // at all (the edge attaches it transparently); this fetch carries no Authorization header of
+  // its own, only the Access session cookie via credentials: "include". Checks the response is
+  // genuinely our own JSON status shape, not just a 2xx — an Access redirect to a same-origin
+  // page (unlikely for this deployment, but not guaranteed by anything in this file) could
+  // otherwise resolve res.ok true without real auth. A hung request degrades to "not
+  // authenticated" after a few seconds rather than leaving the page blank forever.
+  async function hasAccessSession() {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      const res = await fetch("/api/status", { credentials: "include", signal: controller.signal });
+      if (!res.ok) return false;
+      const data = await res.json();
+      return typeof data.running === "boolean";
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  (async () => {
+    if (sessionStorage.getItem(LOCKED_KEY)) { showGate(); return; }
+    if (getToken() || (await hasAccessSession())) showApp();
+    else showGate();
+  })();
 })();
 </script>
 </body>
