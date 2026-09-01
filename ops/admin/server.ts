@@ -3,7 +3,7 @@
 // profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
 // the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
-// token as the fallback (OR, not AND — see isRequestAuthorized).
+// token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 
@@ -27,6 +27,10 @@ export function isAuthorized(authHeader: string | null, expectedToken: string): 
 export interface AccessIdentity {
   sub: string;
   email?: string;
+  /** The full verified JWT payload — surfaced so the panel can show an operator their own Access
+   * identity (all the claims Cloudflare Access hands us). Optional: test doubles and the
+   * bearer-token path don't carry it. */
+  claims?: Record<string, unknown>;
 }
 
 /** Never throws — resolves `null` for any failure (expired/malformed/wrong-aud/wrong-iss/bad
@@ -56,7 +60,7 @@ export function parseAllowedEmails(raw: string | undefined): Set<string> | undef
  * instance that hasn't set ADMIN_ALLOWED_EMAILS yet behaving exactly as it did before this
  * option existed. Once set, an identity with no email claim (or one outside the list) is not
  * allowed via this path — it still falls through to the bearer-token check in
- * isRequestAuthorized, deliberately: the allow-list narrows who a *JWT* can authorize, it doesn't
+ * authorizeRequest, deliberately: the allow-list narrows who a *JWT* can authorize, it doesn't
  * touch the bearer token's own break-glass role.
  */
 export function isEmailAllowed(email: string | undefined, allowedEmails: Set<string> | undefined): boolean {
@@ -107,7 +111,11 @@ export function createAccessJwtVerifier(
         algorithms: ["RS256"],
       });
       return typeof payload.sub === "string"
-        ? { sub: payload.sub, email: typeof payload.email === "string" ? payload.email : undefined }
+        ? {
+            sub: payload.sub,
+            email: typeof payload.email === "string" ? payload.email : undefined,
+            claims: { ...payload },
+          }
         : null;
     } catch {
       return null;
@@ -199,20 +207,78 @@ export interface HandlerConfig {
   adminAllowedEmails?: Set<string>;
 }
 
+/** How a request authorized, carried through so mutating actions can be attributed. `email` is
+ * present only on the JWT path when the token carried an email claim; the bearer path is
+ * identity-blind by design. */
+export interface Authorization {
+  via: "jwt" | "bearer";
+  email?: string;
+  /** The full verified JWT claims, on the jwt path — for the panel's identity/profile view. */
+  claims?: Record<string, unknown>;
+}
+
 /** Door 2, OR not AND: a valid Access JWT — from an identity the allow-list (if configured)
  * permits — authorizes on its own; the bearer token is the fallback for everything else JWT
  * auth doesn't cover (Access unconfigured, a transient JWKS-fetch failure, or an identity the
  * allow-list excludes) — checked whenever the JWT path doesn't succeed, for any reason, with no
- * classification of why. */
-export async function isRequestAuthorized(req: Request, config: HandlerConfig): Promise<boolean> {
+ * classification of why. Returns how it authorized (for attribution) or `null` if it didn't. */
+export async function authorizeRequest(req: Request, config: HandlerConfig): Promise<Authorization | null> {
   const jwt = extractAccessJwt(req);
   if (jwt && config.verifyAccessJwt) {
     const identity = await config.verifyAccessJwt(jwt);
     if (identity && isEmailAllowed(identity.email, config.adminAllowedEmails)) {
-      return true;
+      return { via: "jwt", email: identity.email, claims: identity.claims };
     }
   }
-  return isAuthorized(req.headers.get("Authorization"), config.adminToken);
+  if (isAuthorized(req.headers.get("Authorization"), config.adminToken)) {
+    return { via: "bearer" };
+  }
+  return null;
+}
+
+/** A one-line audit description of who performed an action. The email when the JWT carried one;
+ * otherwise a description of the path, since the bearer token and an email-less JWT genuinely
+ * have no identity to name. */
+export function describeActor(auth: Authorization): string {
+  if (auth.email) return auth.email;
+  return auth.via === "jwt" ? "an Access session (no email claim)" : "the ADMIN_TOKEN bearer token";
+}
+
+/** Best-effort: pulls the `changed` key list out of env-set's JSON stdout, so the audit line can
+ * name what was edited. Any parse failure (or a non-env-set action) yields an empty list rather
+ * than throwing — the log is a convenience, never a correctness dependency. */
+export function parseChangedKeys(stdout: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    const changed = (parsed as { changed?: unknown })?.changed;
+    return Array.isArray(changed) ? changed.filter((k): k is string => typeof k === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Human-readable action label for the audit log — `env-set` names the keys it changed. */
+export function describeAction(invocation: BotOpsInvocation, stdout: string): string {
+  const action = invocation.args[0] ?? "unknown";
+  if (action === "env-set") {
+    const changed = parseChangedKeys(stdout);
+    return changed.length > 0 ? `env-set (changed: ${changed.join(", ")})` : "env-set (no changes)";
+  }
+  return action;
+}
+
+/** The audit line for a *successful mutating* action (restart/env-set), or `null` for a read or a
+ * failure (reads aren't logged — they're low-value and re-fetched on demand; failures are logged
+ * separately on the error path). Pure and exported so which actions get attributed is test-pinned. */
+export function auditLogLine(
+  invocation: BotOpsInvocation,
+  result: BotOpsResult,
+  auth: Authorization,
+): string | null {
+  const action = invocation.args[0];
+  if (action !== "restart" && action !== "env-set") return null;
+  if (result.exitCode !== 0) return null;
+  return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
 }
 
 /** The whole request lifecycle, DI'd per CLAUDE.md's "keep I/O at the edges" convention (matches
@@ -230,8 +296,18 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   if (!url.pathname.startsWith("/api/")) {
     return new Response("not found", { status: 404 });
   }
-  if (!(await isRequestAuthorized(req, config))) {
+  const auth = await authorizeRequest(req, config);
+  if (!auth) {
     return new Response("unauthorized", { status: 401 });
+  }
+
+  // Server-native (not a bot-ops.sh subcommand): lets the page show who it authenticated as. `email`
+  // is null on the bearer path / an email-less JWT — the identity genuinely isn't known there.
+  if (req.method === "GET" && url.pathname === "/api/whoami") {
+    return new Response(
+      JSON.stringify({ via: auth.via, email: auth.email ?? null, claims: auth.claims ?? null }),
+      { headers: { "Content-Type": "application/json" } },
+    );
   }
 
   const body = req.method === "POST" ? await req.text() : undefined;
@@ -240,9 +316,15 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
 
   const result = await config.runBotOps(invocation);
   if (result.exitCode !== 0) {
-    console.error(`[admin] ${invocation.args[0]} failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+    console.error(
+      `[admin] ${invocation.args[0]} failed (exit ${result.exitCode}) — requested by ${describeActor(auth)}: ${result.stderr.trim()}`,
+    );
     return new Response(result.stderr.trim() || "bot-ops.sh failed", { status: 502 });
   }
+  // Attribute successful mutations (restart/env-set) — the audit trail today's who-changed-what
+  // incidents needed. Reads aren't logged (auditLogLine returns null): they're low-value here.
+  const audit = auditLogLine(invocation, result, auth);
+  if (audit) console.log(audit);
   return new Response(result.stdout, { headers: { "Content-Type": invocation.contentType } });
 }
 

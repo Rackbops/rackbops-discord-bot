@@ -214,11 +214,13 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    Access header is present at all. Either check alone is sufficient (OR, not AND) — a valid
    JWT is evaluated first and, when present and valid, the bearer token is never consulted.
 
-**What it exposes — exactly `bot-ops.sh`'s five operations, nothing new:** `GET /api/status`,
-`GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`, `POST /api/env`. No rebuild/deploy
-capability lives here — that stays Discord's `/update`. The config form on the page is rendered
-from whatever `GET /api/env` returns, so it can never drift from this script's own `ALLOWED`
-whitelist above.
+**What it exposes — `bot-ops.sh`'s five operations plus one read-only, server-native route:**
+`GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`, `POST /api/env`, and
+`GET /api/whoami` — which reflects the requester's own verified Access identity (who they're
+signed in as, plus the JWT's claims for the panel's Identity view) and never shells out to
+`bot-ops.sh`. No rebuild/deploy capability lives here — that stays Discord's `/update`. The config
+form on the page is rendered from whatever `GET /api/env` returns, so it can never drift from this
+script's own `ALLOWED` whitelist above.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
