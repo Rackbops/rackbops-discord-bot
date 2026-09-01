@@ -56,12 +56,12 @@ services:
     # Deliberately NOT `env_file: ${BOT_ENV_FILE:-.env}` like the bot service — that would load
     # every secret in the instance's .env (DISCORD_TOKEN, BLIZZARD_CLIENT_SECRET, GITHUB_TOKEN,
     # CLOUDFLARE_TUNNEL_TOKEN) into this container's process environment wholesale, even though
-    # server.ts only ever reads ADMIN_TOKEN and CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD
-    # — directly undermining the whole point of bot-ops.sh's own whitelist, which deliberately
-    # excludes secrets. Those three are instead named explicitly below and resolved through
-    # compose's own interpolation (which needs them exported into the invoking shell first — see
-    # ops/install.sh's printed command), so only those values ever reach this container, not the
-    # rest of the file.
+    # server.ts only ever reads ADMIN_TOKEN, CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD,
+    # and ADMIN_ALLOWED_EMAILS — directly undermining the whole point of bot-ops.sh's own
+    # whitelist, which deliberately excludes secrets. Those four are instead named explicitly
+    # below and resolved through compose's own interpolation (which needs them exported into the
+    # invoking shell first — see ops/install.sh's printed command), so only those values ever
+    # reach this container, not the rest of the file.
     #
     # BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE deliberately use a plain `:-` default here, NOT
     # `:?required` — compose interpolates and validates every service in the file up front,
@@ -77,6 +77,7 @@ services:
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - CLOUDFLARE_ACCESS_TEAM_DOMAIN=${CLOUDFLARE_ACCESS_TEAM_DOMAIN:-}
       - CLOUDFLARE_ACCESS_AUD=${CLOUDFLARE_ACCESS_AUD:-}
+      - ADMIN_ALLOWED_EMAILS=${ADMIN_ALLOWED_EMAILS:-}
       - BOT_OPS_CONFIG_DIR=${BOT_OPS_CONFIG_DIR:-}
       - BOT_OPS_COMPOSE_FILE=${BOT_OPS_COMPOSE_FILE:-}
       - BOT_OPS_PROJECT=${BOT_OPS_PROJECT:-warbandeer-discord-debug}

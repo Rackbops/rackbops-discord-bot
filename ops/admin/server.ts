@@ -38,6 +38,33 @@ export function extractAccessJwt(req: Request): string | undefined {
 }
 
 /**
+ * Parses a comma-separated `ADMIN_ALLOWED_EMAILS` value into a lowercase set, or `undefined` for
+ * an unset/blank value — matching `ADMIN_USER_IDS`'s existing comma-separated-list convention
+ * elsewhere in this repo. `undefined` (not an empty set) is the "not configured" sentinel so
+ * `isEmailAllowed` can tell "no allow-list at all" apart from "an allow-list of zero people".
+ */
+export function parseAllowedEmails(raw: string | undefined): Set<string> | undefined {
+  const emails = raw
+    ?.split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  return emails && emails.length > 0 ? new Set(emails) : undefined;
+}
+
+/**
+ * When no allow-list is configured, every verified identity is allowed — this is what keeps an
+ * instance that hasn't set ADMIN_ALLOWED_EMAILS yet behaving exactly as it did before this
+ * option existed. Once set, an identity with no email claim (or one outside the list) is not
+ * allowed via this path — it still falls through to the bearer-token check in
+ * isRequestAuthorized, deliberately: the allow-list narrows who a *JWT* can authorize, it doesn't
+ * touch the bearer token's own break-glass role.
+ */
+export function isEmailAllowed(email: string | undefined, allowedEmails: Set<string> | undefined): boolean {
+  if (!allowedEmails) return true;
+  return email !== undefined && allowedEmails.has(email.toLowerCase());
+}
+
+/**
  * Trims and lowercases a raw `CLOUDFLARE_ACCESS_TEAM_DOMAIN` value, then rejects anything that
  * isn't a bare hostname — throws on a value carrying a scheme, port, or path (e.g. pasted with an
  * "https://" prefix still on it), which `new URL(...)` alone would silently accept as a garbage
@@ -141,16 +168,25 @@ export interface HandlerConfig {
    * Cf-Access-Jwt-Assertion header is then never evaluated at all, closing any accidental-trust
    * gap outright rather than relying on a verifier that happens to always reject. */
   verifyAccessJwt?: VerifyAccessJwt;
+  /** Narrows who a *verified* JWT authorizes, on top of whatever Cloudflare Access's own edge
+   * policy already allows through — e.g. a shared "Allow trusted users" Access policy covers
+   * several apps' worth of people, only some of whom should be able to act on this one. Absent
+   * means no extra narrowing (see isEmailAllowed). Never applied to the bearer-token fallback. */
+  adminAllowedEmails?: Set<string>;
 }
 
-/** Door 2, OR not AND: a valid Access JWT authorizes on its own; the bearer token is the
- * fallback for when JWT verification can't run (Access unconfigured for this instance, or a
- * transient JWKS-fetch failure) — checked whenever the JWT path doesn't succeed, for any reason,
- * with no classification of why. */
+/** Door 2, OR not AND: a valid Access JWT — from an identity the allow-list (if configured)
+ * permits — authorizes on its own; the bearer token is the fallback for everything else JWT
+ * auth doesn't cover (Access unconfigured, a transient JWKS-fetch failure, or an identity the
+ * allow-list excludes) — checked whenever the JWT path doesn't succeed, for any reason, with no
+ * classification of why. */
 export async function isRequestAuthorized(req: Request, config: HandlerConfig): Promise<boolean> {
   const jwt = extractAccessJwt(req);
-  if (jwt && config.verifyAccessJwt && (await config.verifyAccessJwt(jwt))) {
-    return true;
+  if (jwt && config.verifyAccessJwt) {
+    const identity = await config.verifyAccessJwt(jwt);
+    if (identity && isEmailAllowed(identity.email, config.adminAllowedEmails)) {
+      return true;
+    }
   }
   return isAuthorized(req.headers.get("Authorization"), config.adminToken);
 }
@@ -237,7 +273,14 @@ if (import.meta.main) {
     console.log("[admin] Cloudflare Access JWT verification not configured — bearer-token-only auth");
   }
 
-  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt };
+  const adminAllowedEmails = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS);
+  if (adminAllowedEmails) {
+    console.log(`[admin] restricting JWT auth to ${adminAllowedEmails.size} allow-listed email(s)`);
+  } else {
+    console.log("[admin] ADMIN_ALLOWED_EMAILS not set — any identity Access already let through authorizes");
+  }
+
+  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt, adminAllowedEmails };
   Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
   console.log(`[admin] listening on :${PORT}`);
 }

@@ -7,8 +7,10 @@ import {
   extractBearerToken,
   handleRequest,
   isAuthorized,
+  isEmailAllowed,
   isRequestAuthorized,
   normalizeTeamDomain,
+  parseAllowedEmails,
   tokensMatch,
   type BotOpsResult,
   type HandlerConfig,
@@ -41,11 +43,16 @@ interface TokenOverrides {
   aud?: string;
   omitSub?: boolean;
   expiresInSeconds?: number;
+  email?: string;
 }
 
 async function signToken(overrides: TokenOverrides = {}): Promise<string> {
-  const { iss = `https://${TEAM_DOMAIN}`, aud = AUD, omitSub = false, expiresInSeconds = 3600 } = overrides;
-  let builder = new SignJWT({}).setProtectedHeader({ alg: "RS256", kid: KID }).setIssuedAt().setIssuer(iss).setAudience(aud);
+  const { iss = `https://${TEAM_DOMAIN}`, aud = AUD, omitSub = false, expiresInSeconds = 3600, email } = overrides;
+  let builder = new SignJWT(email !== undefined ? { email } : {})
+    .setProtectedHeader({ alg: "RS256", kid: KID })
+    .setIssuedAt()
+    .setIssuer(iss)
+    .setAudience(aud);
   if (!omitSub) builder = builder.setSubject("user@example.com");
   builder = builder.setExpirationTime(Math.floor(Date.now() / 1000) + expiresInSeconds);
   return builder.sign(privateKey);
@@ -124,6 +131,50 @@ describe("extractAccessJwt", () => {
 
   test("undefined when the header is absent", () => {
     expect(extractAccessJwt(new Request("http://x/"))).toBeUndefined();
+  });
+});
+
+describe("parseAllowedEmails", () => {
+  test("undefined for undefined, empty, or whitespace-only input", () => {
+    expect(parseAllowedEmails(undefined)).toBeUndefined();
+    expect(parseAllowedEmails("")).toBeUndefined();
+    expect(parseAllowedEmails("   ")).toBeUndefined();
+    expect(parseAllowedEmails(" , , ")).toBeUndefined();
+  });
+
+  test("a single email becomes a one-element, lowercased set", () => {
+    expect(parseAllowedEmails("Roshne@Gmail.com")).toEqual(new Set(["roshne@gmail.com"]));
+  });
+
+  test("a comma-separated list is split, trimmed, and lowercased", () => {
+    expect(parseAllowedEmails("a@x.com, B@Y.COM ,  c@z.com")).toEqual(new Set(["a@x.com", "b@y.com", "c@z.com"]));
+  });
+
+  test("blank entries in the list are dropped, not turned into an empty-string match", () => {
+    expect(parseAllowedEmails("a@x.com,,b@y.com,")).toEqual(new Set(["a@x.com", "b@y.com"]));
+  });
+});
+
+describe("isEmailAllowed", () => {
+  test("no allow-list configured -> any email (or none) is allowed", () => {
+    expect(isEmailAllowed("anyone@example.com", undefined)).toBe(true);
+    expect(isEmailAllowed(undefined, undefined)).toBe(true);
+  });
+
+  test("allow-list configured, email present and listed -> true", () => {
+    expect(isEmailAllowed("roshne@gmail.com", new Set(["roshne@gmail.com"]))).toBe(true);
+  });
+
+  test("allow-list configured, comparison is case-insensitive", () => {
+    expect(isEmailAllowed("Roshne@Gmail.com", new Set(["roshne@gmail.com"]))).toBe(true);
+  });
+
+  test("allow-list configured, email present but not listed -> false", () => {
+    expect(isEmailAllowed("nazuraki@gmail.com", new Set(["roshne@gmail.com"]))).toBe(false);
+  });
+
+  test("allow-list configured, no email claim on the identity -> false, not vacuously true", () => {
+    expect(isEmailAllowed(undefined, new Set(["roshne@gmail.com"]))).toBe(false);
   });
 });
 
@@ -278,6 +329,24 @@ describe("isRequestAuthorized", () => {
     });
     expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt }))).toBe(false);
   });
+
+  test("a verified JWT for an allow-listed email authorizes on its own", async () => {
+    const verifyAccessJwt = async () => ({ sub: "x", email: "roshne@gmail.com" });
+    const adminAllowedEmails = new Set(["roshne@gmail.com"]);
+    const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    expect(await isRequestAuthorized(req, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(true);
+  });
+
+  test("a verified JWT for a non-allow-listed email falls through to the bearer check", async () => {
+    const verifyAccessJwt = async () => ({ sub: "x", email: "nazuraki@gmail.com" });
+    const adminAllowedEmails = new Set(["roshne@gmail.com"]);
+    const reqWithBearer = new Request("http://x/", {
+      headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(await isRequestAuthorized(reqWithBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(true);
+    const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
+    expect(await isRequestAuthorized(reqNoBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBe(false);
+  });
 });
 
 describe("handleRequest — real Cloudflare Access JWT", () => {
@@ -304,6 +373,35 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
     const jwt = await signToken({ expiresInSeconds: -10 });
     const res = await handleRequest(new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }), config());
     expect(res.status).toBe(401);
+  });
+
+  test("a valid real JWT for an allow-listed email authorizes with no bearer token", async () => {
+    const jwt = await signToken({ email: "roshne@gmail.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
+      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+    );
+    expect(res.status).toBe(200);
+  });
+
+  test("a valid real JWT for a non-allow-listed email is unauthorized with no bearer token", async () => {
+    const jwt = await signToken({ email: "nazuraki@gmail.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
+      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("a valid real JWT for a non-allow-listed email still authorizes via a correct bearer token", async () => {
+    const jwt = await signToken({ email: "nazuraki@gmail.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", {
+        headers: { "Cf-Access-Jwt-Assertion": jwt, Authorization: `Bearer ${TOKEN}` },
+      }),
+      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+    );
+    expect(res.status).toBe(200);
   });
 
   test("a tampered real JWT with no bearer token is unauthorized", async () => {

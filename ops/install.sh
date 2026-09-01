@@ -146,15 +146,19 @@ install: next steps for '$INSTANCE'
      this up once Cloudflare Access is set up for this instance (see ops/README.md's Admin
      panel section) — it has no published host port, so until a tunnel routes to it, this
      just starts a sidecar reachable from nothing but the docker network it's on. ADMIN_TOKEN
-     and the two CLOUDFLARE_ACCESS_* vars are read out of .env just for this one command (not
-     the whole file) — the admin container never gets the rest of your secrets. Fill
-     CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD into .env in step 1 to have the panel
-     verify Access's own signed JWT directly (ADMIN_TOKEN then becomes a fallback, not the only
-     check) — leave them blank to keep ADMIN_TOKEN as the sole door-2 check for now:
+     and the CLOUDFLARE_ACCESS_*/ADMIN_ALLOWED_EMAILS vars are read out of .env just for this
+     one command (not the whole file) — the admin container never gets the rest of your
+     secrets. Fill CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD into .env in step 1 to
+     have the panel verify Access's own signed JWT directly (ADMIN_TOKEN then becomes a
+     fallback, not the only check) — leave them blank to keep ADMIN_TOKEN as the sole door-2
+     check for now. ADMIN_ALLOWED_EMAILS further narrows which verified identities the JWT
+     check accepts; leave it blank to allow any identity Access's own policy already lets
+     through:
 
      ADMIN_TOKEN=\$(grep '^ADMIN_TOKEN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
      CLOUDFLARE_ACCESS_TEAM_DOMAIN=\$(grep '^CLOUDFLARE_ACCESS_TEAM_DOMAIN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
      CLOUDFLARE_ACCESS_AUD=\$(grep '^CLOUDFLARE_ACCESS_AUD=' $CONFIG_DIR/.env | cut -d= -f2-) \\
+     ADMIN_ALLOWED_EMAILS=\$(grep '^ADMIN_ALLOWED_EMAILS=' $CONFIG_DIR/.env | cut -d= -f2-) \\
      ADMIN_BUILD_CONTEXT=$REPO_URL#$BRANCH:ops/admin \\
      BOT_OPS_CONFIG_DIR=$CONFIG_DIR \\
      BOT_OPS_COMPOSE_FILE=$STACK_DIR/docker-compose.yml \\
