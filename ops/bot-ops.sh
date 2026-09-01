@@ -22,6 +22,12 @@
 #     `-p` because it is NOT set in a non-interactive SSH shell's environment — a bare `docker
 #     compose` would default to the directory name and miss the running container. (Learned the hard
 #     way.) Both are validated to a safe charset since they're interpolated into docker commands.
+#   - BOT_OPS_CONFIG_DIR (holds .env + backups/) and BOT_OPS_COMPOSE_FILE (the deployed
+#     docker-compose.yml) are two independent, required inputs — no derived guessing between them.
+#     They differ under the current layout: the compose file lives under /opt/stacks/<name>/ (so
+#     Dockge manages it), while .env lives under /opt/rackbops-discord-bot/<instance>/ (config dir
+#     stays outside any git checkout — see ops/README.md). Neither is set here — a caller (a panel,
+#     or you by hand) must always pass both; there is no repo-relative fallback.
 #   - Secrets (DISCORD_TOKEN, BLIZZARD_CLIENT_SECRET, GITHUB_TOKEN, ...) are deliberately absent
 #     from ALLOWED. env-get never reads them out; env-set never writes them. Edit those by hand
 #     with nano on the box.
@@ -43,9 +49,21 @@ LOGS_MAX=5000
   exit 1
 }
 
-# Project dir = this script's parent's parent (ops/ lives inside the bot dir, beside .env).
-BOT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
-ENV_FILE="$BOT_DIR/.env"
+# Config dir (.env + backups/) and the deployed compose file are independent, required inputs —
+# see the design note above. No fallback to this script's own location: that assumption broke
+# once the compose file (Dockge-managed, /opt/stacks/) and the config dir (outside any checkout,
+# /opt/rackbops-discord-bot/) stopped being the same directory.
+CONFIG_DIR="${BOT_OPS_CONFIG_DIR:-}"
+[ -n "$CONFIG_DIR" ] || {
+  echo "bot-ops: BOT_OPS_CONFIG_DIR not set — point it at the instance's config dir (holds .env + backups/)" >&2
+  exit 1
+}
+COMPOSE_FILE="${BOT_OPS_COMPOSE_FILE:-}"
+[ -n "$COMPOSE_FILE" ] || {
+  echo "bot-ops: BOT_OPS_COMPOSE_FILE not set — point it at the deployed docker-compose.yml" >&2
+  exit 1
+}
+ENV_FILE="$CONFIG_DIR/.env"
 
 # Non-secret keys the panel may read and write. Anything not here is rejected by env-set and
 # omitted by env-get. Each key pairs with a validation regex (empty string is always allowed —
@@ -102,8 +120,10 @@ cmd_logs() {
 
 cmd_restart() {
   need docker
-  cd "$BOT_DIR"
-  docker compose -p "$PROJECT" restart 2>&1
+  # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
+  # different mechanism from the container's own runtime env, which env_file: itself supplies
+  # once that interpolation resolves.
+  BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" restart 2>&1
   echo "restarted $CONTAINER"
 }
 
@@ -155,7 +175,10 @@ cmd_env_set() {
     return 0
   fi
 
-  local backup="$ENV_FILE.bak.$(date +%Y%m%d-%H%M%S)"
+  # Backups live in the config dir's own backups/ subdirectory, never beside .env in a checkout —
+  # mkdir -p is defensive here in case a fresh config dir was hand-created without it.
+  mkdir -p "$CONFIG_DIR/backups"
+  local backup="$CONFIG_DIR/backups/.env.bak.$(date +%Y%m%d-%H%M%S)"
   # Pin the backup to 0600 rather than inheriting .env's mode. `cp` would copy that mode, which is
   # only safe while .env is itself owner-only — and a .env recreated by hand or by a fresh deploy
   # picks up the umask (0664 under the usual 002) instead. This file holds DISCORD_TOKEN and
@@ -193,9 +216,8 @@ cmd_env_set() {
   # `<project>-bot:latest` compose expects, so recreating without building reuses it. Adding
   # --build here would rebuild from whatever this checkout happens to be on, silently rolling
   # the bot back to older code every time someone edits a setting.
-  cd "$BOT_DIR"
   local recreate_log rc=0
-  recreate_log="$(docker compose -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
+  recreate_log="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
 
   local changed_json
   changed_json="$(printf '%s\n' "${!DIFF[@]}" | jq -R . | jq -s .)"
@@ -207,7 +229,8 @@ cmd_env_set() {
 }
 
 main() {
-  [ -f "$ENV_FILE" ] || die ".env not found at $ENV_FILE (is remoteDir correct?)"
+  [ -f "$ENV_FILE" ] || die ".env not found at $ENV_FILE (is BOT_OPS_CONFIG_DIR correct?)"
+  [ -f "$COMPOSE_FILE" ] || die "compose file not found at $COMPOSE_FILE (is BOT_OPS_COMPOSE_FILE correct?)"
   local sub="${1:-}"
   shift || true
   case "$sub" in

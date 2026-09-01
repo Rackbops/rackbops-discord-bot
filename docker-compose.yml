@@ -1,13 +1,29 @@
 services:
   bot:
     build:
-      context: .
+      # Defaults to the local checkout, unchanged for `docker compose up -d --build` here.
+      # A deployed instance instead supplies BOT_BUILD_CONTEXT as a shell var on the build
+      # invocation itself (e.g. https://github.com/roshne/rackbops-discord-bot.git#main) so the
+      # daemon fetches and builds the source itself — no checkout needed on that host at all.
+      # NOT persisted in .env: nothing rebuilds via `docker compose --build` after the initial
+      # bring-up (self-update's own rebuilds go through the Docker Engine API directly, in
+      # src/redeploy.ts, independent of this file). See ops/install.sh and ops/README.md.
+      context: ${BOT_BUILD_CONTEXT:-.}
       args:
-        # Pass the commit so the bot can tell when it's stale:
+        # Pass the commit so the bot can tell when it's stale. In a local checkout:
         #   GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
+        # With no checkout (BOT_BUILD_CONTEXT set to a remote), resolve it instead via:
+        #   GIT_SHA=$(git ls-remote <repo-url> refs/heads/<branch> | cut -f1)
         GIT_SHA: ${GIT_SHA:-}
-    container_name: warbandeer-discord
-    env_file: .env
+    # Defaults match the historical single-instance name; a deployed instance sets
+    # BOT_OPS_CONTAINER (already used by ops/bot-ops.sh) so debug and prod never collide
+    # on the same host.
+    container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}
+    # Defaults to a file beside this compose file (local dev, unchanged). A deployed
+    # instance's config dir lives elsewhere (/opt/rackbops-discord-bot/<instance>/.env,
+    # see ops/README.md), so ops/bot-ops.sh and ops/install.sh both export BOT_ENV_FILE
+    # to point here at its absolute path.
+    env_file: ${BOT_ENV_FILE:-.env}
     volumes:
       - state:/app/data
       # Self-update (#879): the bot builds its own replacement and hands off to it through the

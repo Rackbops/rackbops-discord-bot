@@ -42,13 +42,15 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
 
    `bun run dev` restarts on file changes; `bun run check` typechecks.
 
-   Or with **Docker** (reads the same `.env`; state persists in a named volume):
+   Or with **Docker**, from this checkout (reads the same `.env`; state persists in a named volume):
 
    ```
    GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build
    ```
 
    `GIT_SHA` bakes the current commit into the image so the bot can tell when it's running stale code. It's optional — without it everything works except self-update.
+
+   A host with **no checkout at all** — nothing but `git`, `docker`, and `curl` — can bootstrap directly from the public repo instead: see [`ops/README.md`](ops/README.md#bootstrapping-a-fresh-instance-no-checkout). That's also how debug/prod instances are meant to run day-to-day.
 
 ## Self-update
 
