@@ -234,13 +234,16 @@
 
   // Rendered from whatever GET /api/env returns, rather than a hardcoded field list — stays in
   // sync with ops/bot-ops.sh's own ALLOWED whitelist automatically, no drift between the two.
+  // Field order follows the response's own key order (not re-sorted) — bot-ops.sh's env-get
+  // emits keys in its own deliberate ALLOWED_ORDER, not alphabetically, so the most relevant
+  // fields can be placed first.
   async function loadEnv() {
     const container = document.getElementById("env-fields");
     try {
       const res = await api("/api/env");
       const env = await res.json();
       container.innerHTML = "";
-      for (const key of Object.keys(env).sort()) {
+      for (const key of Object.keys(env)) {
         const label = document.createElement("label");
         label.textContent = key;
         const input = document.createElement("input");

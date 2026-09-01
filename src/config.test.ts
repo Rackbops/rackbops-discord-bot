@@ -52,6 +52,11 @@ describe("resolveConfig", () => {
     expect(resolveConfig({ ...base, REPORT_ROLE_ID: "42" }).reportRoleId).toBe("42");
   });
 
+  test("DISCORD_SERVER_ID is optional and resolves to guildId", () => {
+    expect(resolveConfig(base).guildId).toBeUndefined();
+    expect(resolveConfig({ ...base, DISCORD_SERVER_ID: "999" }).guildId).toBe("999");
+  });
+
   test("watchedRepos defaults to just the configured GITHUB_REPO", () => {
     expect(resolveConfig(base).watchedRepos).toEqual(["roshne/rackbops-discord-bot"]);
     expect(resolveConfig({ ...base, GITHUB_REPO: "acme/thing" }).watchedRepos).toEqual([

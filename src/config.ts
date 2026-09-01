@@ -87,7 +87,7 @@ export function resolveConfig(env: Env): Config {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
     releaseAnnounceChannelId: optional("RELEASE_ANNOUNCE_CHANNEL_ID") ?? announceChannelId,
-    guildId: optional("GUILD_ID"),
+    guildId: optional("DISCORD_SERVER_ID"),
     region,
     realmSlug: optional("WOW_REALM"),
     blizzardClientId: optional("BLIZZARD_CLIENT_ID"),
