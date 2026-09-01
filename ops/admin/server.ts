@@ -69,6 +69,54 @@ export function isEmailAllowed(email: string | undefined, allowedEmails: Set<str
 }
 
 /**
+ * The allow-list is a union of two sources: `bootstrap` (from the ADMIN_ALLOWED_EMAILS env var —
+ * permanent, can't be edited from the panel, so it's the floor that keeps you from locking
+ * yourself out) and `dynamic` (managed live through the panel). An empty union stays `undefined`
+ * — the "no narrowing configured" sentinel that keeps a fresh instance behaving as it did before
+ * any allow-list existed (see isEmailAllowed).
+ */
+export function effectiveAllowlist(bootstrap: Set<string>, dynamic: Set<string>): Set<string> | undefined {
+  if (bootstrap.size === 0 && dynamic.size === 0) return undefined;
+  return new Set([...bootstrap, ...dynamic]);
+}
+
+/** Trims/lowercases and shape-checks an email for the admin list, or `null` if it doesn't look
+ * like one. Not RFC-exhaustive — just enough to reject obvious junk before it lands in the list. */
+export function normalizeAdminEmail(raw: string): string | null {
+  const email = raw.trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
+}
+
+/** Guardrails on removing an admin (emails already normalized): a bootstrap admin can't be
+ * removed from the panel (it's env-pinned — the whole point of the floor), and you can't remove
+ * yourself. Returns an error message to refuse with, or `null` if the removal is allowed. */
+export function adminRemovalError(
+  email: string,
+  bootstrap: Set<string>,
+  requesterEmail: string | undefined,
+): string | null {
+  if (bootstrap.has(email)) {
+    return "That admin is pinned via ADMIN_ALLOWED_EMAILS and can't be removed here — edit the env var on the box.";
+  }
+  if (requesterEmail && email === requesterEmail) {
+    return "You can't remove yourself.";
+  }
+  return null;
+}
+
+/**
+ * The panel-managed admin allow-list. `bootstrap` (env, permanent) plus a `dynamic` set persisted
+ * out-of-band. `readDynamic` is called fresh on every auth check so an add/remove takes effect
+ * immediately with no restart; the whole thing is injected (I/O at the edges) so the routing and
+ * management logic test without a real filesystem.
+ */
+export interface AdminStore {
+  bootstrap: Set<string>;
+  readDynamic: () => Promise<Set<string>>;
+  writeDynamic: (emails: Set<string>) => Promise<void>;
+}
+
+/**
  * Trims and lowercases a raw `CLOUDFLARE_ACCESS_TEAM_DOMAIN` value, then rejects anything that
  * isn't a bare hostname — throws on a value carrying a scheme, port, or path (e.g. pasted with an
  * "https://" prefix still on it), which `new URL(...)` alone would silently accept as a garbage
@@ -200,11 +248,11 @@ export interface HandlerConfig {
    * Cf-Access-Jwt-Assertion header is then never evaluated at all, closing any accidental-trust
    * gap outright rather than relying on a verifier that happens to always reject. */
   verifyAccessJwt?: VerifyAccessJwt;
-  /** Narrows who a *verified* JWT authorizes, on top of whatever Cloudflare Access's own edge
-   * policy already allows through — e.g. a shared "Allow trusted users" Access policy covers
-   * several apps' worth of people, only some of whom should be able to act on this one. Absent
-   * means no extra narrowing (see isEmailAllowed). Never applied to the bearer-token fallback. */
-  adminAllowedEmails?: Set<string>;
+  /** The panel-managed allow-list (bootstrap ∪ dynamic) that narrows who a *verified* JWT
+   * authorizes, on top of whatever Cloudflare Access's own edge policy already allows through, and
+   * the backing store for the add/remove-admins endpoints. Absent means no extra narrowing and no
+   * management endpoints. Never applied to the bearer-token fallback. */
+  adminStore?: AdminStore;
 }
 
 /** How a request authorized, carried through so mutating actions can be attributed. `email` is
@@ -221,12 +269,18 @@ export interface Authorization {
  * permits — authorizes on its own; the bearer token is the fallback for everything else JWT
  * auth doesn't cover (Access unconfigured, a transient JWKS-fetch failure, or an identity the
  * allow-list excludes) — checked whenever the JWT path doesn't succeed, for any reason, with no
- * classification of why. Returns how it authorized (for attribution) or `null` if it didn't. */
-export async function authorizeRequest(req: Request, config: HandlerConfig): Promise<Authorization | null> {
+ * classification of why. Returns how it authorized (for attribution) or `null` if it didn't. The
+ * effective allow-list is passed in (computed once, at the I/O edge, from the current store state)
+ * rather than read here, keeping this decision pure. */
+export async function authorizeRequest(
+  req: Request,
+  config: HandlerConfig,
+  allowedEmails: Set<string> | undefined,
+): Promise<Authorization | null> {
   const jwt = extractAccessJwt(req);
   if (jwt && config.verifyAccessJwt) {
     const identity = await config.verifyAccessJwt(jwt);
-    if (identity && isEmailAllowed(identity.email, config.adminAllowedEmails)) {
+    if (identity && isEmailAllowed(identity.email, allowedEmails)) {
       return { via: "jwt", email: identity.email, claims: identity.claims };
     }
   }
@@ -281,6 +335,82 @@ export function auditLogLine(
   return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
 }
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+/**
+ * CSRF guard for state-changing requests. The panel is reached through an ambient Cloudflare
+ * Access session cookie, so a cross-site page could otherwise ride it to POST/DELETE (e.g. add
+ * an admin, restart the bot) on a logged-in operator's behalf. A browser always sends `Origin`
+ * on a cross-origin write, so a present `Origin` whose host doesn't match this request's own host
+ * is a forgery — reject it. A missing `Origin` is a non-browser client (curl, the bearer-token
+ * CLI path) with no ambient cookie to abuse, so it's allowed. GETs aren't state-changing.
+ */
+export function isCrossSiteWrite(req: Request): boolean {
+  if (req.method !== "POST" && req.method !== "DELETE") return false;
+  const origin = req.headers.get("Origin");
+  if (!origin) return false;
+  try {
+    return new URL(origin).host !== new URL(req.url).host;
+  } catch {
+    return true; // a malformed Origin header is not something to trust
+  }
+}
+
+/**
+ * GET/POST/DELETE /api/admins — the panel's own allow-list management, all server-native (never
+ * shells out). GET lists bootstrap (env, permanent) and dynamic (panel-managed) admins. POST adds
+ * a dynamic admin (a no-op if it's already a bootstrap or dynamic admin). DELETE removes one,
+ * subject to adminRemovalError's guardrails. Reaching here at all means the requester already
+ * passed the auth check against the *current* allow-list, which is what enforces "any current
+ * admin can manage admins".
+ */
+export async function handleAdmins(req: Request, store: AdminStore, auth: Authorization): Promise<Response> {
+  const list = () =>
+    store
+      .readDynamic()
+      .then((dynamic) => jsonResponse({ bootstrap: [...store.bootstrap].sort(), dynamic: [...dynamic].sort() }));
+
+  if (req.method === "GET") return list();
+
+  if (req.method === "POST" || req.method === "DELETE") {
+    const parsed = (await req.json().catch(() => null)) as { email?: unknown } | null;
+    const email = normalizeAdminEmail(typeof parsed?.email === "string" ? parsed.email : "");
+    if (!email) return new Response("a valid email is required", { status: 400 });
+
+    const dynamic = await store.readDynamic();
+    try {
+      if (req.method === "POST") {
+        if (!store.bootstrap.has(email) && !dynamic.has(email)) {
+          dynamic.add(email);
+          await store.writeDynamic(dynamic);
+        }
+        return await list();
+      }
+      // DELETE
+      const err = adminRemovalError(email, store.bootstrap, auth.email?.toLowerCase());
+      if (err) return new Response(err, { status: 400 });
+      // Don't let the very last admin be removed with no env floor — that would silently revert the
+      // panel to "anyone Access allows" (effectiveAllowlist → undefined), the opposite of the intent.
+      if (store.bootstrap.size === 0 && dynamic.size === 1 && dynamic.has(email)) {
+        return new Response(
+          "That's the last admin and there's no ADMIN_ALLOWED_EMAILS floor — removing it would open the panel to everyone Access lets in. Add another admin, or set the env var, first.",
+          { status: 400 },
+        );
+      }
+      if (dynamic.delete(email)) await store.writeDynamic(dynamic);
+      return await list();
+    } catch (err) {
+      // A store write failure (e.g. no config dir to persist to) becomes a clean 502, not an
+      // unhandled throw out of the request handler.
+      return new Response(`couldn't save the admin list: ${err}`, { status: 502 });
+    }
+  }
+
+  return new Response("method not allowed", { status: 405 });
+}
+
 /** The whole request lifecycle, DI'd per CLAUDE.md's "keep I/O at the edges" convention (matches
  * updateReport.ts's injected-deliverer shape) — every dependency arrives as a parameter, nothing
  * is read from process.env or the filesystem inside this function. */
@@ -296,7 +426,17 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   if (!url.pathname.startsWith("/api/")) {
     return new Response("not found", { status: 404 });
   }
-  const auth = await authorizeRequest(req, config);
+  // Reject cross-site writes before auth even runs — a forged request must not be actioned no
+  // matter whose ambient Access session it rides.
+  if (isCrossSiteWrite(req)) {
+    return new Response("cross-site request blocked", { status: 403 });
+  }
+  // Compute the current allow-list once, here at the I/O edge (fresh store read so a just-made
+  // add/remove takes effect immediately), and pass it into the pure authorize decision.
+  const allowedEmails = config.adminStore
+    ? effectiveAllowlist(config.adminStore.bootstrap, await config.adminStore.readDynamic())
+    : undefined;
+  const auth = await authorizeRequest(req, config, allowedEmails);
   if (!auth) {
     return new Response("unauthorized", { status: 401 });
   }
@@ -308,6 +448,10 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
       JSON.stringify({ via: auth.via, email: auth.email ?? null, claims: auth.claims ?? null }),
       { headers: { "Content-Type": "application/json" } },
     );
+  }
+
+  if (url.pathname === "/api/admins" && config.adminStore) {
+    return handleAdmins(req, config.adminStore, auth);
   }
 
   const body = req.method === "POST" ? await req.text() : undefined;
@@ -390,14 +534,55 @@ if (import.meta.main) {
     console.log("[admin] Cloudflare Access JWT verification not configured — bearer-token-only auth");
   }
 
-  const adminAllowedEmails = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS);
-  if (adminAllowedEmails) {
-    console.log(`[admin] restricting JWT auth to ${adminAllowedEmails.size} allow-listed email(s)`);
+  // The allow-list: ADMIN_ALLOWED_EMAILS as the permanent bootstrap floor, plus a dynamic set the
+  // panel manages, persisted to admins.json in the config dir. The dynamic file lives beside .env
+  // (BOT_OPS_CONFIG_DIR); without a config dir the bootstrap still works but there's nowhere to
+  // persist changes, so writes fail loudly rather than silently dropping an added admin.
+  const bootstrap = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS) ?? new Set<string>();
+  const configDir = process.env.BOT_OPS_CONFIG_DIR?.trim();
+  const adminsFile = configDir ? `${configDir}/admins.json` : undefined;
+  const { chownSync, renameSync, statSync } = await import("node:fs");
+  const adminStore: AdminStore = {
+    bootstrap,
+    readDynamic: async () => {
+      if (!adminsFile) return new Set();
+      try {
+        const parsed: unknown = JSON.parse(await Bun.file(adminsFile).text());
+        const emails = (parsed as { emails?: unknown })?.emails;
+        return new Set(
+          (Array.isArray(emails) ? emails : [])
+            .filter((e): e is string => typeof e === "string")
+            .map((e) => e.trim().toLowerCase())
+            .filter(Boolean),
+        );
+      } catch {
+        // Absent (the common first-run case), unreadable, or malformed — treat as no dynamic admins.
+        return new Set();
+      }
+    },
+    writeDynamic: async (emails) => {
+      if (!adminsFile) throw new Error("BOT_OPS_CONFIG_DIR is not set — nowhere to persist admin changes");
+      const tmp = `${adminsFile}.tmp`;
+      await Bun.write(tmp, JSON.stringify({ emails: [...emails].sort() }, null, 2) + "\n");
+      renameSync(tmp, adminsFile); // atomic replace, so a crash never leaves a half-written list
+      // Preserve deploy-user ownership: this container runs as root, so a fresh admins.json would
+      // otherwise be root-owned — leaving the deploy user unable to edit it over SSH (same
+      // rationale as the bot-ops.sh env-set ownership fix, issue #20).
+      try {
+        const dir = statSync(configDir!);
+        chownSync(adminsFile, dir.uid, dir.gid);
+      } catch {
+        /* best-effort: as the deploy user directly, the file is already correctly owned */
+      }
+    },
+  };
+  if (bootstrap.size > 0) {
+    console.log(`[admin] ${bootstrap.size} bootstrap admin(s) from ADMIN_ALLOWED_EMAILS; more can be added in the panel`);
   } else {
-    console.log("[admin] ADMIN_ALLOWED_EMAILS not set — any identity Access already let through authorizes");
+    console.log("[admin] no ADMIN_ALLOWED_EMAILS bootstrap — any Access identity authorizes until admins are added");
   }
 
-  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt, adminAllowedEmails };
+  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt, adminStore };
   Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
   console.log(`[admin] listening on :${PORT}`);
 }

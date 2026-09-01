@@ -98,6 +98,12 @@
   /* Who the panel authenticated as — pushed to the far end of the header row; wraps under on
      narrow screens (the header is flex-wrap). */
   .whoami { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .admin-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .admin-row:last-child { border-bottom: none; }
+  .admin-row .email { flex: 1; word-break: break-all; }
+  .admin-row .tag { font-size: 11px; color: var(--muted); }
+  .admin-row button { background: #333; padding: 4px 10px; font-size: 12px; }
+  .admin-row button.danger { background: var(--danger); }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
   #gate .panel-header { justify-content: center; }
 </style>
@@ -150,6 +156,20 @@
       <button id="save-env">Save changes</button>
     </div>
     <div id="env-msg" class="msg"></div>
+  </section>
+
+  <section id="admins-section">
+    <h2>Admins</h2>
+    <p style="color: var(--muted); margin: 0 0 10px">
+      Who may use this panel — among people Cloudflare Access already lets reach it. Bootstrap
+      admins (from the <code>ADMIN_ALLOWED_EMAILS</code> env var) are permanent; edit them on the box.
+    </p>
+    <div id="admins-list">Loading…</div>
+    <div class="row" style="margin-top: 12px">
+      <input id="admin-email" type="email" placeholder="new-admin@example.com" autocomplete="off" style="max-width: 320px" />
+      <button id="add-admin">Add admin</button>
+    </div>
+    <div id="admins-msg" class="msg"></div>
   </section>
 
   <section id="identity-section">
@@ -208,6 +228,7 @@
     loadWhoami();
     loadStatus();
     loadEnv();
+    loadAdmins();
   }
 
   // JWT claims that are unix-second timestamps — humanized in the Identity view.
@@ -259,6 +280,103 @@
       }
     }
   }
+
+  // The admin allow-list. Bootstrap admins (from ADMIN_ALLOWED_EMAILS) render as permanent, no
+  // Remove button; dynamic ones get a Remove. All values via textContent — inert regardless.
+  async function loadAdmins() {
+    const container = document.getElementById("admins-list");
+    try {
+      const data = await (await api("/api/admins")).json();
+      const rows = [
+        ...data.bootstrap.map((email) => ({ email, permanent: true })),
+        ...data.dynamic.map((email) => ({ email, permanent: false })),
+      ];
+      container.innerHTML = "";
+      if (rows.length === 0) {
+        container.textContent = "No admins configured — anyone Cloudflare Access lets in can use this panel.";
+        return;
+      }
+      for (const { email, permanent } of rows) {
+        const row = document.createElement("div");
+        row.className = "admin-row";
+        const em = document.createElement("span");
+        em.className = "email";
+        em.textContent = email;
+        row.appendChild(em);
+        if (permanent) {
+          const tag = document.createElement("span");
+          tag.className = "tag";
+          tag.textContent = "permanent (env)";
+          row.appendChild(tag);
+        } else {
+          const btn = document.createElement("button");
+          btn.className = "danger";
+          btn.textContent = "Remove";
+          btn.addEventListener("click", () => removeAdmin(email));
+          row.appendChild(btn);
+        }
+        container.appendChild(row);
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    }
+  }
+
+  async function addAdmin() {
+    const input = document.getElementById("admin-email");
+    const msg = document.getElementById("admins-msg");
+    const email = input.value.trim();
+    if (!email) return;
+    msg.textContent = "Adding…";
+    msg.className = "msg";
+    try {
+      const res = await api("/api/admins", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      if (res.ok) {
+        input.value = "";
+        msg.textContent = "Added " + email + ".";
+        msg.className = "msg ok";
+        loadAdmins();
+      } else {
+        msg.textContent = "Failed: " + (await res.text());
+        msg.className = "msg error";
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    }
+  }
+
+  async function removeAdmin(email) {
+    if (!confirm("Remove admin " + email + "?")) return;
+    const msg = document.getElementById("admins-msg");
+    msg.textContent = "Removing…";
+    msg.className = "msg";
+    try {
+      const res = await api("/api/admins", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      if (res.ok) {
+        msg.textContent = "Removed " + email + ".";
+        msg.className = "msg ok";
+        loadAdmins();
+      } else {
+        msg.textContent = "Failed: " + (await res.text());
+        msg.className = "msg error";
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    }
+  }
+
+  document.getElementById("add-admin").addEventListener("click", addAdmin);
+  document.getElementById("admin-email").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") addAdmin();
+  });
 
   document.getElementById("unlock").addEventListener("click", () => {
     const v = document.getElementById("token-input").value.trim();

@@ -1,28 +1,48 @@
 import { describe, expect, test } from "bun:test";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
+  adminRemovalError,
   auditLogLine,
   authorizeRequest,
   buildInvocation,
   createAccessJwtVerifier,
   describeAction,
   describeActor,
+  effectiveAllowlist,
   escapeHtml,
   extractAccessJwt,
   extractBearerToken,
+  handleAdmins,
   handleRequest,
   isAuthorized,
+  isCrossSiteWrite,
   isEmailAllowed,
+  normalizeAdminEmail,
   normalizeTeamDomain,
   parseAllowedEmails,
   parseChangedKeys,
   renderIndexHtml,
   tokensMatch,
+  type AdminStore,
   type Authorization,
   type BotOpsInvocation,
   type BotOpsResult,
   type HandlerConfig,
 } from "./server";
+
+/** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set. */
+function makeStore(opts: { bootstrap?: string[]; dynamic?: string[] } = {}): AdminStore & { dynamic: Set<string> } {
+  const dynamic = new Set(opts.dynamic ?? []);
+  return {
+    bootstrap: new Set(opts.bootstrap ?? []),
+    dynamic,
+    readDynamic: async () => new Set(dynamic),
+    writeDynamic: async (emails) => {
+      dynamic.clear();
+      for (const e of emails) dynamic.add(e);
+    },
+  };
+}
 
 const TEAM_DOMAIN = "test-team.cloudflareaccess.com";
 const AUD = "test-application-aud";
@@ -186,6 +206,178 @@ describe("isEmailAllowed", () => {
   });
 });
 
+describe("effectiveAllowlist", () => {
+  test("both empty -> undefined (no narrowing)", () => {
+    expect(effectiveAllowlist(new Set(), new Set())).toBeUndefined();
+  });
+
+  test("unions bootstrap and dynamic, deduping", () => {
+    const result = effectiveAllowlist(new Set(["a@x.com", "b@x.com"]), new Set(["b@x.com", "c@x.com"]));
+    expect(result).toEqual(new Set(["a@x.com", "b@x.com", "c@x.com"]));
+  });
+
+  test("bootstrap-only or dynamic-only each narrow", () => {
+    expect(effectiveAllowlist(new Set(["a@x.com"]), new Set())).toEqual(new Set(["a@x.com"]));
+    expect(effectiveAllowlist(new Set(), new Set(["c@x.com"]))).toEqual(new Set(["c@x.com"]));
+  });
+});
+
+describe("normalizeAdminEmail", () => {
+  test("trims and lowercases a valid email", () => {
+    expect(normalizeAdminEmail("  Roshne@Gmail.COM ")).toBe("roshne@gmail.com");
+  });
+
+  test("rejects junk", () => {
+    expect(normalizeAdminEmail("")).toBeNull();
+    expect(normalizeAdminEmail("not-an-email")).toBeNull();
+    expect(normalizeAdminEmail("no@domain")).toBeNull();
+    expect(normalizeAdminEmail("has space@x.com")).toBeNull();
+    expect(normalizeAdminEmail("@x.com")).toBeNull();
+  });
+});
+
+describe("adminRemovalError", () => {
+  const bootstrap = new Set(["boss@x.com"]);
+
+  test("refuses removing a bootstrap admin", () => {
+    expect(adminRemovalError("boss@x.com", bootstrap, "other@x.com")).toMatch(/ADMIN_ALLOWED_EMAILS/);
+  });
+
+  test("refuses removing yourself", () => {
+    expect(adminRemovalError("me@x.com", bootstrap, "me@x.com")).toMatch(/yourself/);
+  });
+
+  test("allows removing another dynamic admin", () => {
+    expect(adminRemovalError("someone@x.com", bootstrap, "me@x.com")).toBeNull();
+  });
+
+  test("with no requester identity (bearer), only the bootstrap guard applies", () => {
+    expect(adminRemovalError("someone@x.com", bootstrap, undefined)).toBeNull();
+    expect(adminRemovalError("boss@x.com", bootstrap, undefined)).toMatch(/ADMIN_ALLOWED_EMAILS/);
+  });
+});
+
+describe("handleAdmins", () => {
+  const bearer: Authorization = { via: "bearer" };
+  const admin: Authorization = { via: "jwt", email: "me@x.com" };
+  const req = (method: string, body?: unknown) =>
+    new Request("http://x/api/admins", {
+      method,
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  test("GET lists bootstrap and dynamic, both sorted", async () => {
+    const store = makeStore({ bootstrap: ["b@x.com", "a@x.com"], dynamic: ["d@x.com", "c@x.com"] });
+    const res = await handleAdmins(req("GET"), store, bearer);
+    expect(await res.json()).toEqual({ bootstrap: ["a@x.com", "b@x.com"], dynamic: ["c@x.com", "d@x.com"] });
+  });
+
+  test("POST adds a normalized dynamic admin and persists it", async () => {
+    const store = makeStore({ bootstrap: ["boss@x.com"] });
+    const res = await handleAdmins(req("POST", { email: " New@X.com " }), store, admin);
+    expect(res.status).toBe(200);
+    expect(store.dynamic.has("new@x.com")).toBe(true);
+    expect(await res.json()).toEqual({ bootstrap: ["boss@x.com"], dynamic: ["new@x.com"] });
+  });
+
+  test("POST an email already in bootstrap is a no-op (stays permanent, not duplicated into dynamic)", async () => {
+    const store = makeStore({ bootstrap: ["boss@x.com"] });
+    await handleAdmins(req("POST", { email: "boss@x.com" }), store, admin);
+    expect(store.dynamic.size).toBe(0);
+  });
+
+  test("POST rejects an invalid email with 400 and writes nothing", async () => {
+    const store = makeStore();
+    const res = await handleAdmins(req("POST", { email: "nope" }), store, admin);
+    expect(res.status).toBe(400);
+    expect(store.dynamic.size).toBe(0);
+  });
+
+  test("DELETE removes a dynamic admin", async () => {
+    const store = makeStore({ dynamic: ["gone@x.com", "stay@x.com"] });
+    const res = await handleAdmins(req("DELETE", { email: "gone@x.com" }), store, admin);
+    expect(res.status).toBe(200);
+    expect(store.dynamic.has("gone@x.com")).toBe(false);
+    expect(store.dynamic.has("stay@x.com")).toBe(true);
+  });
+
+  test("DELETE refuses a bootstrap admin (400), leaving it in place", async () => {
+    const store = makeStore({ bootstrap: ["boss@x.com"], dynamic: ["d@x.com"] });
+    const res = await handleAdmins(req("DELETE", { email: "boss@x.com" }), store, admin);
+    expect(res.status).toBe(400);
+    expect(store.bootstrap.has("boss@x.com")).toBe(true);
+  });
+
+  test("DELETE refuses removing yourself (400)", async () => {
+    const store = makeStore({ dynamic: ["me@x.com"] });
+    const res = await handleAdmins(req("DELETE", { email: "me@x.com" }), store, admin);
+    expect(res.status).toBe(400);
+    expect(store.dynamic.has("me@x.com")).toBe(true);
+  });
+
+  test("a bearer requester (no identity) can still remove a dynamic admin", async () => {
+    const store = makeStore({ bootstrap: ["boss@x.com"], dynamic: ["someone@x.com"] });
+    const res = await handleAdmins(req("DELETE", { email: "someone@x.com" }), store, bearer);
+    expect(res.status).toBe(200);
+    expect(store.dynamic.has("someone@x.com")).toBe(false);
+  });
+
+  test("refuses removing the last admin when there's no bootstrap floor (would open to everyone)", async () => {
+    const store = makeStore({ dynamic: ["only@x.com"] }); // no bootstrap
+    const res = await handleAdmins(req("DELETE", { email: "only@x.com" }), store, bearer);
+    expect(res.status).toBe(400);
+    expect(store.dynamic.has("only@x.com")).toBe(true);
+  });
+
+  test("removing the last DYNAMIC admin is fine when a bootstrap floor remains", async () => {
+    const store = makeStore({ bootstrap: ["boss@x.com"], dynamic: ["only@x.com"] });
+    const res = await handleAdmins(req("DELETE", { email: "only@x.com" }), store, bearer);
+    expect(res.status).toBe(200);
+    expect(store.dynamic.size).toBe(0);
+  });
+
+  test("a store write failure surfaces as a 502, not an unhandled throw", async () => {
+    const store: AdminStore = {
+      bootstrap: new Set(["boss@x.com"]),
+      readDynamic: async () => new Set(),
+      writeDynamic: async () => {
+        throw new Error("no config dir");
+      },
+    };
+    const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
+    expect(res.status).toBe(502);
+  });
+});
+
+describe("isCrossSiteWrite", () => {
+  const write = (method: string, headers: Record<string, string> = {}) =>
+    new Request("http://panel.example/api/admins", { method, headers });
+
+  test("a GET is never a cross-site write, whatever the Origin", () => {
+    expect(isCrossSiteWrite(new Request("http://panel.example/api/status", { headers: { Origin: "http://evil.com" } }))).toBe(false);
+  });
+
+  test("a POST/DELETE with no Origin header is allowed (non-browser client)", () => {
+    expect(isCrossSiteWrite(write("POST"))).toBe(false);
+    expect(isCrossSiteWrite(write("DELETE"))).toBe(false);
+  });
+
+  test("a same-origin POST/DELETE is allowed", () => {
+    expect(isCrossSiteWrite(write("POST", { Origin: "http://panel.example" }))).toBe(false);
+    expect(isCrossSiteWrite(write("POST", { Origin: "https://panel.example" }))).toBe(false); // host matches; scheme not compared
+    expect(isCrossSiteWrite(write("DELETE", { Origin: "http://panel.example" }))).toBe(false);
+  });
+
+  test("a cross-origin POST/DELETE is blocked", () => {
+    expect(isCrossSiteWrite(write("POST", { Origin: "http://evil.com" }))).toBe(true);
+    expect(isCrossSiteWrite(write("DELETE", { Origin: "http://evil.com" }))).toBe(true);
+  });
+
+  test("a malformed Origin is treated as cross-site", () => {
+    expect(isCrossSiteWrite(write("POST", { Origin: "not a url" }))).toBe(true);
+  });
+});
+
 describe("normalizeTeamDomain", () => {
   test("a correct lowercase hostname passes through unchanged", () => {
     expect(normalizeTeamDomain("test-team.cloudflareaccess.com")).toBe("test-team.cloudflareaccess.com");
@@ -314,13 +506,13 @@ describe("authorizeRequest", () => {
 
   test("bearer matches, no Access header -> via bearer, no email", async () => {
     const req = new Request("http://x/", { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(await authorizeRequest(req, baseConfig())).toEqual({ via: "bearer" });
+    expect(await authorizeRequest(req, baseConfig(), undefined)).toEqual({ via: "bearer" });
   });
 
   test("a verified Access JWT authorizes on its own and carries the email", async () => {
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
     const verifyAccessJwt = async () => ({ sub: "user@example.com", email: "user@example.com" });
-    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }), undefined)).toEqual({
       via: "jwt",
       email: "user@example.com",
     });
@@ -329,16 +521,16 @@ describe("authorizeRequest", () => {
   test("a verified JWT with no email claim authorizes via jwt with email undefined", async () => {
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
     const verifyAccessJwt = async () => ({ sub: "user@example.com" });
-    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({ via: "jwt", email: undefined });
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }), undefined)).toEqual({ via: "jwt", email: undefined });
   });
 
   test("an Access header with no verifier configured is inert — falls to the bearer check", async () => {
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await authorizeRequest(req, baseConfig())).toBeNull();
+    expect(await authorizeRequest(req, baseConfig(), undefined)).toBeNull();
     const reqWithBearer = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await authorizeRequest(reqWithBearer, baseConfig())).toEqual({ via: "bearer" });
+    expect(await authorizeRequest(reqWithBearer, baseConfig(), undefined)).toEqual({ via: "bearer" });
   });
 
   test("a JWT that fails verification falls through to the bearer check", async () => {
@@ -346,9 +538,9 @@ describe("authorizeRequest", () => {
     const req = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toEqual({ via: "bearer" });
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }), undefined)).toEqual({ via: "bearer" });
     const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt }))).toBeNull();
+    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt }), undefined)).toBeNull();
   });
 
   test("both fail -> null", async () => {
@@ -356,14 +548,14 @@ describe("authorizeRequest", () => {
     const req = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: "Bearer wrong" },
     });
-    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }))).toBeNull();
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }), undefined)).toBeNull();
   });
 
   test("a verified JWT for an allow-listed email authorizes on its own, carrying the email", async () => {
     const verifyAccessJwt = async () => ({ sub: "x", email: "roshne@gmail.com" });
-    const adminAllowedEmails = new Set(["roshne@gmail.com"]);
+    const allowed = new Set(["roshne@gmail.com"]);
     const req = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toEqual({
+    expect(await authorizeRequest(req, baseConfig({ verifyAccessJwt }), allowed)).toEqual({
       via: "jwt",
       email: "roshne@gmail.com",
     });
@@ -371,15 +563,15 @@ describe("authorizeRequest", () => {
 
   test("a verified JWT for a non-allow-listed email falls through to the bearer check", async () => {
     const verifyAccessJwt = async () => ({ sub: "x", email: "nazuraki@gmail.com" });
-    const adminAllowedEmails = new Set(["roshne@gmail.com"]);
+    const allowed = new Set(["roshne@gmail.com"]);
     const reqWithBearer = new Request("http://x/", {
       headers: { "Cf-Access-Jwt-Assertion": "some-jwt", Authorization: `Bearer ${TOKEN}` },
     });
-    expect(await authorizeRequest(reqWithBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toEqual({
+    expect(await authorizeRequest(reqWithBearer, baseConfig({ verifyAccessJwt }), allowed)).toEqual({
       via: "bearer",
     });
     const reqNoBearer = new Request("http://x/", { headers: { "Cf-Access-Jwt-Assertion": "some-jwt" } });
-    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt, adminAllowedEmails }))).toBeNull();
+    expect(await authorizeRequest(reqNoBearer, baseConfig({ verifyAccessJwt }), allowed)).toBeNull();
   });
 });
 
@@ -460,7 +652,7 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
     const jwt = await signToken({ email: "roshne@gmail.com" });
     const res = await handleRequest(
       new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
-      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+      { ...config(), adminStore: makeStore({ bootstrap: ["roshne@gmail.com"] }) },
     );
     expect(res.status).toBe(200);
   });
@@ -469,9 +661,22 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
     const jwt = await signToken({ email: "nazuraki@gmail.com" });
     const res = await handleRequest(
       new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
-      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+      { ...config(), adminStore: makeStore({ bootstrap: ["roshne@gmail.com"] }) },
     );
     expect(res.status).toBe(401);
+  });
+
+  test("a dynamically-added admin's JWT authorizes (the dynamic allow-list takes effect live)", async () => {
+    // Bootstrap allows only roshne; nazuraki is added to the dynamic set — then nazuraki's JWT
+    // must authorize, with no restart, proving handleRequest reads the store fresh per request.
+    const store = makeStore({ bootstrap: ["roshne@gmail.com"] });
+    store.dynamic.add("nazuraki@gmail.com");
+    const jwt = await signToken({ email: "nazuraki@gmail.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
+      { ...config(), adminStore: store },
+    );
+    expect(res.status).toBe(200);
   });
 
   test("a valid real JWT for a non-allow-listed email still authorizes via a correct bearer token", async () => {
@@ -480,7 +685,7 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
       new Request("http://x/api/status", {
         headers: { "Cf-Access-Jwt-Assertion": jwt, Authorization: `Bearer ${TOKEN}` },
       }),
-      { ...config(), adminAllowedEmails: new Set(["roshne@gmail.com"]) },
+      { ...config(), adminStore: makeStore({ bootstrap: ["roshne@gmail.com"] }) },
     );
     expect(res.status).toBe(200);
   });
@@ -715,5 +920,79 @@ describe("handleRequest", () => {
       runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
     });
     expect(res.status).toBe(401);
+  });
+
+  test("authenticated GET /api/admins routes to the store and never shells out", async () => {
+    let botOpsCalls = 0;
+    const res = await handleRequest(
+      new Request("http://x/api/admins", { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      {
+        adminToken: TOKEN,
+        indexHtml: INDEX_HTML,
+        runBotOps: async () => {
+          botOpsCalls++;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+        adminStore: makeStore({ bootstrap: ["boss@x.com"], dynamic: ["d@x.com"] }),
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ bootstrap: ["boss@x.com"], dynamic: ["d@x.com"] });
+    expect(botOpsCalls).toBe(0);
+  });
+
+  test("/api/admins requires auth", async () => {
+    const res = await handleRequest(new Request("http://x/api/admins"), {
+      adminToken: TOKEN,
+      indexHtml: INDEX_HTML,
+      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+      adminStore: makeStore(),
+    });
+    expect(res.status).toBe(401);
+  });
+
+  test("/api/admins is a 404 when no adminStore is configured", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/admins", { headers: { Authorization: `Bearer ${TOKEN}` } }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }) },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  test("POST/DELETE /api/admins require auth (401 without it)", async () => {
+    for (const method of ["POST", "DELETE"]) {
+      const res = await handleRequest(
+        new Request("http://x/api/admins", { method, body: JSON.stringify({ email: "e@x.com" }) }),
+        { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }), adminStore: makeStore() },
+      );
+      expect(res.status).toBe(401);
+    }
+  });
+
+  test("a cross-site POST is blocked with 403 before auth even runs", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/admins", {
+        method: "POST",
+        // valid bearer, but a foreign Origin — the CSRF guard rejects it regardless.
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: "http://evil.example" },
+        body: JSON.stringify({ email: "attacker@evil.com" }),
+      }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }), adminStore: makeStore() },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("a same-origin POST passes the CSRF guard", async () => {
+    const store = makeStore();
+    const res = await handleRequest(
+      new Request("http://x/api/admins", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: "http://x" },
+        body: JSON.stringify({ email: "new@x.com" }),
+      }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }), adminStore: store },
+    );
+    expect(res.status).toBe(200);
+    expect(store.dynamic.has("new@x.com")).toBe(true);
   });
 });
