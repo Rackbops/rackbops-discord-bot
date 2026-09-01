@@ -37,6 +37,7 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found — install it f
 INSTANCE="${1:-}"
 BRANCH="${2:-main}"
 [[ "$INSTANCE" =~ ^[a-z0-9-]+$ ]] || die "usage: install.sh <instance> [branch] (instance: lowercase letters/digits/hyphens only)"
+[ "$INSTANCE" != "bin" ] || die "'bin' is reserved (it's the shared /opt/rackbops-discord-bot/bin/ scripts dir) — pick a different instance name"
 
 need git
 need curl
@@ -47,7 +48,28 @@ BIN_DIR="/opt/rackbops-discord-bot/bin"
 STACK_DIR="/opt/stacks/rackbops-discord-bot-$INSTANCE"
 PROJECT="rackbops-discord-bot-$INSTANCE"
 
-mkdir -p "$CONFIG_DIR/backups" "$BIN_DIR" "$STACK_DIR"
+# /opt is typically root-owned, so a brand-new top-level directory needs a one-time sudo
+# bootstrap to create and chown it to the running user — same "one-time sudo, nothing after
+# needs it" convention as app-config-deployment-foundation.md's service tier. Skipped entirely
+# once the directory both exists AND is already owned by us (e.g. a re-run, or /opt/stacks
+# itself, which pre-existing sibling stacks already made writable) — checking ownership, not
+# just existence, means a directory left root-owned by an interrupted prior run (mkdir
+# succeeded, chown didn't) self-heals on the next run instead of permanently masquerading as
+# already bootstrapped. sudo is only required, and only checked for, the one time it's about
+# to actually be used.
+bootstrap_dir() {
+  local dir="$1"
+  [ -d "$dir" ] && [ -O "$dir" ] && return 0
+  command -v sudo >/dev/null 2>&1 \
+    || die "$dir doesn't exist (or isn't owned by us) and 'sudo' isn't available to fix it — create it and chown it to $(id -u):$(id -g) yourself, then re-run"
+  sudo mkdir -p "$dir"
+  sudo chown "$(id -u):$(id -g)" "$dir"
+}
+bootstrap_dir "$CONFIG_DIR"
+bootstrap_dir "$BIN_DIR"
+bootstrap_dir "$STACK_DIR"
+
+mkdir -p "$CONFIG_DIR/backups"
 
 # Fetch $2 from $RAW_BASE/$BRANCH/$1 to a temp file, chmod it $3, then move it into place at $4
 # atomically — a curl failure (network drop, not just a bad HTTP status) aborts under `set -e`
