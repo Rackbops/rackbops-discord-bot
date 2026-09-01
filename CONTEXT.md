@@ -48,9 +48,10 @@
 | `src/github.ts` | GitHub API client: `fetchReleases(repo)` (drafts filtered; returns `null` on a 404 — the repo is missing or invisible to `GITHUB_TOKEN`, which GitHub reports identically — while 401/403/429/5xx still throw, and a releaseless repo is a plain `[]`) + `createReachabilityLog()` (edge-triggered per-repo tracker: `observe(repo, reachable)` → `"lost"` / `"recovered"` / `null`, in-memory so a restart re-reports once) + pure `decideReleaseAnnouncements(releases, seen)` (seed-silently on `seen===undefined`, else announce unseen oldest-first) + `createIssue` / idempotent `ensureLabel` for `/report` (both need `GITHUB_TOKEN` with issues:write) |
 | `Dockerfile` | `oven/bun:1-slim` (Debian — Intl IANA timezones), prod-only install, non-root `bun` user, `VOLUME /app/data`, `ARG/ENV GIT_SHA`, `ENTRYPOINT entrypoint.sh` |
 | `entrypoint.sh` | Root→`bun` drop when compose starts the container as root: joins the socket's group by reading its GID off the socket (`setpriv --groups`), execs the CMD; a plain exec under `USER bun` |
-| `docker-compose.yml` | Local dev: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` — `build.context`/`container_name`/`env_file` default to `.`/`warbandeer-discord`/`.env` respectively. A deployed instance overrides all three per-invocation via `BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER`/`BOT_ENV_FILE` (see the config-dir gotcha) — never persisted in `.env`. `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports |
+| `docker-compose.yml` | Local dev: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` — `build.context`/`container_name`/`env_file` default to `.`/`warbandeer-discord`/`.env` respectively. A deployed instance overrides all three per-invocation via `BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER`/`BOT_ENV_FILE` (see the config-dir gotcha) — never persisted in `.env`. `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports. Opt-in `admin` sidecar (`profiles: [admin]`, deploy-only — see `ops/admin/`) |
 | `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Takes `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` as required inputs (see the config-dir gotcha) — no fallback to its own script location. Secrets are never read/written (whitelist excludes them); env-set backs up to `<config-dir>/backups/` then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
-| `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run) and the Dockge-managed stack dir (compose file, always refreshed), then prints the initial `up -d --build` invocation. See `ops/README.md` |
+| `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run, `ADMIN_TOKEN` generated fresh into it), the shared `bin/bot-ops.sh`, and the Dockge-managed stack dir (compose file) — the latter two always refreshed. Prints the `up -d --build` invocation, plus the optional `--profile admin` one. See `ops/README.md` |
+| `ops/admin/` (`server.ts` + `public/index.html` + `Dockerfile`) | Small per-instance admin web panel — an authenticated, thin wrapper around `ops/bot-ops.sh`'s five operations, nothing new. `server.ts`'s auth check, route→subcommand mapping, and request handler are pure/DI'd (`HandlerConfig` injects `runBotOps`, matching `updateReport.ts`'s injected-deliverer shape) so `server.test.ts` covers them without a real subprocess; only the `import.meta.main` block at the bottom does real I/O (spawns `bot-ops.sh`, binds the port). `public/index.html` is a single self-contained file, no build step — its config form renders from whatever `GET /api/env` returns rather than a hardcoded field list. See `ops/README.md`'s Admin panel section for the two-door auth model |
 
 ## Behavior
 
@@ -126,6 +127,18 @@
   there's nothing to read it back from. Self-update's own rebuilds (`src/redeploy.ts`) were
   already remote-context-based before any of this, via the Docker Engine API directly, not
   `docker compose` — untouched by it.
+- **A profile-gated service still gets fully interpolated and validated at `docker compose
+  config` time, regardless of which `--profile` is active.** Profiles only filter which services
+  actually get *created/started*; the whole file is parsed and every service's variables
+  resolved up front. Verified live: an earlier draft of the `admin` service used
+  `${BOT_OPS_CONFIG_DIR:?required}` for its required vars, and a bare `docker compose up -d
+  --build` for **the bot service alone** — no `--profile admin` anywhere — failed immediately on
+  that error, since `admin`'s definition (unset vars and all) is still part of the same parse.
+  The fix: a plain `${VAR:-}` default on `admin`'s own vars, with the *volume mount sources*
+  falling back to an obviously-fake path (`/nonexistent-set-BOT_OPS_CONFIG_DIR`) instead of an
+  empty string, so a misconfigured `--profile admin` run still fails clearly — from Docker
+  itself at container-creation time, once `admin` is actually the profile being brought up —
+  rather than breaking every other profile's `config`/`up` in the same file.
 - **The redeploy order is inverted on purpose (#879), and the reason is a kernel boundary.** Every
   "shut down, then have something bring the replacement up" variant dies on the same thing: a
   detached process (`setsid`, double fork, `Bun.spawn({ detached: true })`) leaves its *parent*, not

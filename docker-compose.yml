@@ -41,6 +41,57 @@ services:
     restart: unless-stopped
     init: true
 
+  # Opt-in, deploy-only (needs BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE pointed at real /opt/...
+  # paths — see ops/install.sh, which generates them; not meant for local dev). A small
+  # per-instance admin web panel, a thin wrapper around ops/bot-ops.sh's five operations. Runs
+  # as its own sidecar (independent of the bot process's lifecycle) with no published host
+  # port — reachable only via the `cloudflared` sidecar below on this same compose network,
+  # itself gated by Cloudflare Access. See ops/README.md's Admin panel section for the full
+  # two-door auth model (Access + the ADMIN_TOKEN bearer check baked into the panel itself).
+  admin:
+    build:
+      context: ${ADMIN_BUILD_CONTEXT:-./ops/admin}
+    container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}-admin
+    # Deliberately NOT `env_file: ${BOT_ENV_FILE:-.env}` like the bot service — that would load
+    # every secret in the instance's .env (DISCORD_TOKEN, BLIZZARD_CLIENT_SECRET, GITHUB_TOKEN,
+    # CLOUDFLARE_TUNNEL_TOKEN) into this container's process environment wholesale, even though
+    # server.ts only ever reads ADMIN_TOKEN — directly undermining the whole point of
+    # bot-ops.sh's own whitelist, which deliberately excludes secrets. ADMIN_TOKEN is instead
+    # named explicitly below and resolved through compose's own interpolation (which needs it
+    # exported into the invoking shell first — see ops/install.sh's printed command), so only
+    # that one value ever reaches this container, not the rest of the file.
+    #
+    # BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE deliberately use a plain `:-` default here, NOT
+    # `:?required` — compose interpolates and validates every service in the file up front,
+    # regardless of which --profile is active, so a `:?` on this service would break a plain
+    # `docker compose up -d --build` for the *bot* service too (verified: it does, immediately,
+    # with no --profile admin in sight). An empty default instead surfaces as a "no such file or
+    # directory" error from bot-ops.sh's own `[ -f ... ] || die` checks (its `main()` guard) if
+    # `admin` is ever actually started without these set — Docker itself auto-creates a missing
+    # bind-mount directory rather than erroring, so the failure is bot-ops.sh's, not Docker's —
+    # but it's still a clean, immediate 502 rather than a crash, and only when this profile is
+    # the one being brought up.
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
+      - BOT_OPS_CONFIG_DIR=${BOT_OPS_CONFIG_DIR:-}
+      - BOT_OPS_COMPOSE_FILE=${BOT_OPS_COMPOSE_FILE:-}
+      - BOT_OPS_PROJECT=${BOT_OPS_PROJECT:-warbandeer-discord-debug}
+      - BOT_OPS_CONTAINER=${BOT_OPS_CONTAINER:-warbandeer-discord}
+    volumes:
+      # Root-equivalent on the host, same accepted tradeoff as the bot service's own socket
+      # mount above — it's the only way this panel can shell out to `docker compose` at all.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Host-path == container-path throughout, so the BOT_OPS_* values above resolve
+      # identically on both sides of the mount — same convention Dockge itself relies on.
+      - ${BOT_OPS_CONFIG_DIR:-/nonexistent-set-BOT_OPS_CONFIG_DIR}:${BOT_OPS_CONFIG_DIR:-/nonexistent-set-BOT_OPS_CONFIG_DIR}
+      - ${BOT_OPS_COMPOSE_FILE:-/nonexistent-set-BOT_OPS_COMPOSE_FILE}:${BOT_OPS_COMPOSE_FILE:-/nonexistent-set-BOT_OPS_COMPOSE_FILE}:ro
+      # The shared, always-current bot-ops.sh — never a copy baked into this image, so a
+      # `bin/bot-ops.sh` update (ops/install.sh re-run) takes effect without rebuilding this.
+      - /opt/rackbops-discord-bot/bin:/opt/rackbops-discord-bot/bin:ro
+    restart: unless-stopped
+    profiles:
+      - admin
+
   # Opt-in: exposes a future local API to the internet without opening inbound
   # firewall ports. Requires CLOUDFLARE_TUNNEL_TOKEN in .env (see README). Start with:
   #   docker compose --profile tunnel up -d --build

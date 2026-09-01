@@ -169,3 +169,41 @@ debug's identity. Once bootstrapped, give it an `ops.json` target once the panel
 closed; until then, manage it directly (the fetched `/opt/rackbops-discord-bot/bin/bot-ops.sh`
 over SSH, or `ops/install.sh`'s own
 printed commands).
+
+## Admin panel
+
+A small per-instance web panel (`ops/admin/`) — a thin, authenticated wrapper around this
+script's own five operations, nothing more. Built primarily to sidestep the `ops.json` gap
+above rather than fix it: reachable from anywhere, not just wherever the desktop app is
+installed, and structurally incapable of touching an instance other than its own (it only ever
+knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance).
+
+**Two doors gate it**, the same pattern already proven for Dockge on nucbox
+(`Tooling/docs/nucbox-docker-management.md` Part 3):
+
+1. **Cloudflare Access** — the network-level gate. Set up per instance: a named ingress rule on
+   nucbox's existing tunnel (e.g. `bot-debug.<zone>` → the `admin` service's internal address,
+   `http://admin:8080`, over the compose network — no host port to bind, so there's nothing to
+   loopback-restrict) plus an Access application scoped to your identity, mirroring Dockge's own
+   setup in `nucbox-docker-management.md` Part 3. This is operator work — not automated by
+   anything in this repo.
+2. **A bearer token** (`ADMIN_TOKEN` in `.env`, generated once by `ops/install.sh` at bootstrap
+   and printed to the terminal — copy it into the panel's unlock prompt on first visit, where
+   it's kept in the browser's `localStorage`), checked on every `/api/*` call. Chosen over
+   verifying Cloudflare Access's own signed JWT for being far less implementation weight; that
+   upgrade is tracked separately — [#6](https://github.com/roshne/rackbops-discord-bot/issues/6).
+
+**What it exposes — exactly `bot-ops.sh`'s five operations, nothing new:** `GET /api/status`,
+`GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`, `POST /api/env`. No rebuild/deploy
+capability lives here — that stays Discord's `/update`. The config form on the page is rendered
+from whatever `GET /api/env` returns, so it can never drift from this script's own `ALLOWED`
+whitelist above.
+
+**Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
+`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
+`bot-ops.sh` itself; `ops/install.sh`'s printed output includes the exact command). It runs as
+its own sidecar, independent of the bot process's lifecycle — if the bot crashes, the panel
+stays up to show that and let you restart it. No published host port: it's reachable only via
+the `cloudflared` sidecar on the same compose network, which is itself gated by Access — so
+until a tunnel actually routes to it, bringing the profile up just starts a service nothing
+outside that network can reach.

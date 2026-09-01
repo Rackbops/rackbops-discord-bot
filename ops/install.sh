@@ -87,11 +87,22 @@ fetch() {
   mv "$tmp" "$dest"
 }
 
+# 32 random bytes as hex via /dev/urandom + od — available on effectively any Linux host,
+# unlike openssl/uuidgen, which aren't guaranteed given this script's own stated dependencies
+# are just git/curl/docker.
+random_token() { od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; }
+
 if [ -f "$CONFIG_DIR/.env" ]; then
   echo "install: $CONFIG_DIR/.env already exists — leaving your config alone"
 else
   fetch ".env.example" 600 "$CONFIG_DIR/.env"
+  # The one secret this tooling generates itself rather than asking you to supply — it isn't
+  # tied to any external account, unlike DISCORD_TOKEN/BLIZZARD_CLIENT_SECRET above.
+  ADMIN_TOKEN="$(random_token)"
+  sed -i "s#^ADMIN_TOKEN=.*#ADMIN_TOKEN=$ADMIN_TOKEN#" "$CONFIG_DIR/.env"
   echo "install: wrote $CONFIG_DIR/.env from .env.example — fill in secrets before starting"
+  echo "install: generated ADMIN_TOKEN for the admin panel — paste this into its unlock prompt:"
+  echo "install:   $ADMIN_TOKEN"
 fi
 
 # bin/bot-ops.sh and the compose file are generated, not precious — always refresh them to
@@ -130,4 +141,19 @@ install: next steps for '$INSTANCE'
      BOT_OPS_PROJECT=$PROJECT \\
      BOT_OPS_CONTAINER=$PROJECT \\
      bash $BIN_DIR/bot-ops.sh status
+
+  4. Optional: the small web admin panel (wraps the same bot-ops.sh operations). Only bring
+     this up once Cloudflare Access is set up for this instance (see ops/README.md's Admin
+     panel section) — it has no published host port, so until a tunnel routes to it, this
+     just starts a sidecar reachable from nothing but the docker network it's on. ADMIN_TOKEN
+     is read out of .env just for this one command (not the whole file) — the admin container
+     never gets the rest of your secrets:
+
+     ADMIN_TOKEN=\$(grep '^ADMIN_TOKEN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
+     ADMIN_BUILD_CONTEXT=$REPO_URL#$BRANCH:ops/admin \\
+     BOT_OPS_CONFIG_DIR=$CONFIG_DIR \\
+     BOT_OPS_COMPOSE_FILE=$STACK_DIR/docker-compose.yml \\
+     BOT_OPS_PROJECT=$PROJECT \\
+     BOT_OPS_CONTAINER=$PROJECT \\
+     docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile admin up -d --build
 EOF

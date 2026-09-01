@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Bot Admin</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8eb;
+    --muted: #9aa3b2;
+    --accent: #4f8cff;
+    --danger: #e5484d;
+    --ok: #2fb170;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 18px; margin: 0 0 20px; }
+  h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  button {
+    font: inherit;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 7px 14px;
+    cursor: pointer;
+  }
+  button.danger { background: var(--danger); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input, textarea {
+    font: inherit;
+    background: #0d0f13;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    width: 100%;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .status-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
+  .status-grid dt { color: var(--muted); }
+  .status-grid dd { margin: 0; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.up { background: var(--ok); }
+  .dot.down { background: var(--danger); }
+  pre {
+    background: #0d0f13;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    max-height: 320px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-size: 12px;
+  }
+  .msg { font-size: 12px; margin-top: 8px; }
+  .msg.error { color: var(--danger); }
+  .msg.ok { color: var(--ok); }
+  #gate { max-width: 360px; margin: 80px auto; text-align: center; }
+</style>
+</head>
+<body>
+
+<div id="gate" hidden>
+  <h1>Bot Admin</h1>
+  <p style="color: var(--muted)">Paste the admin token to continue.</p>
+  <input id="token-input" type="password" placeholder="Admin token" autocomplete="off" />
+  <div class="row" style="margin-top: 10px; justify-content: center">
+    <button id="unlock">Unlock</button>
+  </div>
+</div>
+
+<main id="app" hidden>
+  <h1>Bot Admin</h1>
+
+  <section id="status-section">
+    <h2>Status</h2>
+    <dl class="status-grid" id="status-grid"><dt>Loading…</dt></dl>
+    <div class="row" style="margin-top: 12px">
+      <button id="refresh-status">Refresh</button>
+      <button id="restart" class="danger">Restart</button>
+      <button id="lock" style="margin-left: auto; background: #333">Lock</button>
+    </div>
+    <div id="restart-msg" class="msg"></div>
+  </section>
+
+  <section>
+    <h2>Logs</h2>
+    <div class="row">
+      <input id="logs-n" type="number" value="200" min="1" max="5000" style="width: 90px" />
+      <button id="load-logs">Load</button>
+    </div>
+    <pre id="logs-out" style="margin-top: 10px">(not loaded)</pre>
+  </section>
+
+  <section>
+    <h2>Config</h2>
+    <div id="env-fields">Loading…</div>
+    <div class="row" style="margin-top: 12px">
+      <button id="save-env">Save changes</button>
+    </div>
+    <div id="env-msg" class="msg"></div>
+  </section>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const TOKEN_KEY = "admin-token";
+  const gate = document.getElementById("gate");
+  const app = document.getElementById("app");
+
+  function getToken() { return localStorage.getItem(TOKEN_KEY); }
+  function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }
+  function clearToken() { localStorage.removeItem(TOKEN_KEY); }
+
+  // Every /api/* call goes through here. A 401 means the stored token is wrong or was rotated —
+  // drop it and show the unlock gate again rather than leaving the page in a half-broken state.
+  async function api(path, opts) {
+    const res = await fetch(path, {
+      ...opts,
+      headers: { ...(opts && opts.headers), Authorization: "Bearer " + getToken() },
+    });
+    if (res.status === 401) {
+      clearToken();
+      showGate();
+      throw new Error("unauthorized");
+    }
+    return res;
+  }
+
+  function showGate() {
+    gate.hidden = false;
+    app.hidden = true;
+  }
+
+  function showApp() {
+    gate.hidden = true;
+    app.hidden = false;
+    loadStatus();
+    loadEnv();
+  }
+
+  document.getElementById("unlock").addEventListener("click", () => {
+    const v = document.getElementById("token-input").value.trim();
+    if (!v) return;
+    setToken(v);
+    showApp();
+  });
+  document.getElementById("token-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") document.getElementById("unlock").click();
+  });
+  document.getElementById("lock").addEventListener("click", () => {
+    clearToken();
+    showGate();
+  });
+
+  async function loadStatus() {
+    const grid = document.getElementById("status-grid");
+    try {
+      const res = await api("/api/status");
+      const s = await res.json();
+      const dot = s.realmStatus === "UP" ? "up" : s.realmStatus === "DOWN" ? "down" : "";
+      grid.innerHTML =
+        "<dt>Running</dt><dd>" + (s.running ? "yes" : "no") + "</dd>" +
+        "<dt>Container</dt><dd>" + escapeHtml(s.status || "") + "</dd>" +
+        "<dt>Image</dt><dd>" + escapeHtml(s.image || "") + "</dd>" +
+        "<dt>Realm</dt><dd>" + (dot ? '<span class="dot ' + dot + '"></span>' : "") + escapeHtml(s.realmStatus || "unknown") + "</dd>";
+    } catch (e) {
+      if (e.message !== "unauthorized") grid.innerHTML = "<dt>Error</dt><dd>" + escapeHtml(e.message) + "</dd>";
+    }
+  }
+  document.getElementById("refresh-status").addEventListener("click", loadStatus);
+
+  document.getElementById("restart").addEventListener("click", async () => {
+    if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
+    const msg = document.getElementById("restart-msg");
+    msg.textContent = "Restarting…";
+    msg.className = "msg";
+    try {
+      const res = await api("/api/restart", { method: "POST" });
+      const text = await res.text();
+      msg.textContent = res.ok ? text : "Failed: " + text;
+      msg.className = "msg " + (res.ok ? "ok" : "error");
+      loadStatus();
+    } catch (e) {
+      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    }
+  });
+
+  document.getElementById("load-logs").addEventListener("click", async () => {
+    const out = document.getElementById("logs-out");
+    const n = document.getElementById("logs-n").value || "200";
+    out.textContent = "Loading…";
+    try {
+      const res = await api("/api/logs?n=" + encodeURIComponent(n));
+      out.textContent = await res.text();
+    } catch (e) {
+      if (e.message !== "unauthorized") out.textContent = "Error: " + e.message;
+    }
+  });
+
+  // Rendered from whatever GET /api/env returns, rather than a hardcoded field list — stays in
+  // sync with ops/bot-ops.sh's own ALLOWED whitelist automatically, no drift between the two.
+  async function loadEnv() {
+    const container = document.getElementById("env-fields");
+    try {
+      const res = await api("/api/env");
+      const env = await res.json();
+      container.innerHTML = "";
+      for (const key of Object.keys(env).sort()) {
+        const label = document.createElement("label");
+        label.textContent = key;
+        const input = document.createElement("input");
+        input.dataset.key = key;
+        input.value = env[key] ?? "";
+        container.appendChild(label);
+        container.appendChild(input);
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    }
+  }
+
+  document.getElementById("save-env").addEventListener("click", async () => {
+    const msg = document.getElementById("env-msg");
+    const inputs = document.querySelectorAll("#env-fields input");
+    const lines = Array.from(inputs).map((i) => i.dataset.key + "=" + i.value).join("\n");
+    msg.textContent = "Saving…";
+    msg.className = "msg";
+    try {
+      const res = await api("/api/env", { method: "POST", body: lines });
+      const result = await res.json().catch(() => null);
+      if (res.ok) {
+        const changed = result && result.changed ? result.changed.join(", ") : "";
+        msg.textContent = changed ? "Saved: " + changed : "No changes.";
+        msg.className = "msg ok";
+        loadStatus();
+      } else {
+        msg.textContent = "Failed: " + (result ? JSON.stringify(result) : await res.text());
+        msg.className = "msg error";
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    }
+  });
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  if (getToken()) showApp(); else showGate();
+})();
+</script>
+</body>
+</html>
