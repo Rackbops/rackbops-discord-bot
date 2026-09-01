@@ -45,7 +45,7 @@
   }
   button.danger { background: var(--danger); }
   button:disabled { opacity: 0.5; cursor: default; }
-  input, textarea {
+  input, textarea, select {
     font: inherit;
     background: #0d0f13;
     color: var(--text);
@@ -55,6 +55,7 @@
     width: 100%;
   }
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+  .field-hint { font-size: 11px; color: var(--muted); margin: 0 0 4px; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .status-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
   .status-grid dt { color: var(--muted); }
@@ -312,7 +313,7 @@
           const btn = document.createElement("button");
           btn.className = "danger";
           btn.textContent = "Remove";
-          btn.addEventListener("click", () => removeAdmin(email));
+          btn.addEventListener("click", (e) => withBusy(e.currentTarget, () => removeAdmin(email)));
           row.appendChild(btn);
         }
         container.appendChild(row);
@@ -373,9 +374,9 @@
     }
   }
 
-  document.getElementById("add-admin").addEventListener("click", addAdmin);
+  document.getElementById("add-admin").addEventListener("click", (e) => withBusy(e.currentTarget, addAdmin));
   document.getElementById("admin-email").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") addAdmin();
+    if (e.key === "Enter") document.getElementById("add-admin").click();
   });
 
   document.getElementById("unlock").addEventListener("click", () => {
@@ -394,6 +395,17 @@
     showGate();
   });
 
+  // Disables a button for the duration of its async action, so a double-click can't fire two
+  // restarts / two saves back to back. Re-enables in finally, even on error.
+  async function withBusy(el, fn) {
+    el.disabled = true;
+    try {
+      return await fn();
+    } finally {
+      el.disabled = false;
+    }
+  }
+
   async function loadStatus() {
     const grid = document.getElementById("status-grid");
     try {
@@ -409,35 +421,106 @@
       if (e.message !== "unauthorized") grid.innerHTML = "<dt>Error</dt><dd>" + escapeHtml(e.message) + "</dd>";
     }
   }
-  document.getElementById("refresh-status").addEventListener("click", loadStatus);
+  document.getElementById("refresh-status").addEventListener("click", (e) => withBusy(e.currentTarget, loadStatus));
 
-  document.getElementById("restart").addEventListener("click", async () => {
-    if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
-    const msg = document.getElementById("restart-msg");
-    msg.textContent = "Restarting…";
-    msg.className = "msg";
-    try {
-      const res = await api("/api/restart", { method: "POST" });
-      const text = await res.text();
-      msg.textContent = res.ok ? text : "Failed: " + text;
-      msg.className = "msg " + (res.ok ? "ok" : "error");
-      loadStatus();
-    } catch (e) {
-      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
-    }
-  });
+  document.getElementById("restart").addEventListener("click", (e) =>
+    withBusy(e.currentTarget, async () => {
+      if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
+      const msg = document.getElementById("restart-msg");
+      msg.textContent = "Restarting…";
+      msg.className = "msg";
+      try {
+        const res = await api("/api/restart", { method: "POST" });
+        const text = await res.text();
+        msg.textContent = res.ok ? text : "Failed: " + text;
+        msg.className = "msg " + (res.ok ? "ok" : "error");
+        loadStatus();
+      } catch (e2) {
+        if (e2.message !== "unauthorized") { msg.textContent = e2.message; msg.className = "msg error"; }
+      }
+    }),
+  );
 
-  document.getElementById("load-logs").addEventListener("click", async () => {
-    const out = document.getElementById("logs-out");
-    const n = document.getElementById("logs-n").value || "200";
-    out.textContent = "Loading…";
-    try {
-      const res = await api("/api/logs?n=" + encodeURIComponent(n));
-      out.textContent = await res.text();
-    } catch (e) {
-      if (e.message !== "unauthorized") out.textContent = "Error: " + e.message;
+  document.getElementById("load-logs").addEventListener("click", (e) =>
+    withBusy(e.currentTarget, async () => {
+      const out = document.getElementById("logs-out");
+      const n = document.getElementById("logs-n").value || "200";
+      out.textContent = "Loading…";
+      try {
+        const res = await api("/api/logs?n=" + encodeURIComponent(n));
+        out.textContent = await res.text();
+      } catch (e2) {
+        if (e2.message !== "unauthorized") out.textContent = "Error: " + e2.message;
+      }
+    }),
+  );
+
+  // Per-field UI hints and richer controls. Keys NOT listed here render as a plain text input, so
+  // this is purely additive — a field bot-ops.sh adds to its ALLOWED map still shows up (as text),
+  // it just won't get a chooser until it's added here too. The enum options mirror bot-ops.sh's
+  // own validation regexes (WOW_REGION `^(us|eu)$`, AUTO_UPDATE `^(true|false)$`); a blank option
+  // is always offered since an empty value clears a key back to its documented default.
+  const FIELD_META = {
+    DISCORD_SERVER_ID: { hint: "Which Discord server slash commands register to. Blank registers globally (can take ~1h to appear)." },
+    ANNOUNCE_CHANNEL_ID: { hint: "Gets DMF, weekly-reset, and server up/down announcements — and releases too, unless the field below is set." },
+    RELEASE_ANNOUNCE_CHANNEL_ID: { hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank." },
+    REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
+    ADMIN_USER_IDS: { hint: "Comma-separated Discord user IDs allowed to run /update." },
+    WOW_REGION: { control: "select", options: ["us", "eu"] },
+    AUTO_UPDATE: { control: "select", options: ["true", "false"] },
+    DMF_TIMEZONE: { control: "timezone", hint: "IANA name, e.g. America/Los_Angeles. Blank uses the region default." },
+  };
+
+  // IANA zone list for the DMF_TIMEZONE datalist — from the browser, no hardcoded list, absent on
+  // very old engines (guarded). Filtered to the single-segment shape bot-ops.sh actually accepts
+  // (^[A-Za-z_]+/[A-Za-z_]+$), so the datalist never suggests a zone (e.g. America/Argentina/Salta,
+  // Africa/Porto-Novo) the server would reject on save.
+  const TIMEZONES = (typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : []).filter(
+    (z) => /^[A-Za-z_]+\/[A-Za-z_]+$/.test(z),
+  );
+
+  // Built once, appended to <body> (not #env-fields, which loadEnv wipes) so it survives reloads.
+  if (TIMEZONES.length) {
+    const dl = document.createElement("datalist");
+    dl.id = "tz-list";
+    for (const tz of TIMEZONES) {
+      const o = document.createElement("option");
+      o.value = tz;
+      dl.appendChild(o);
     }
-  });
+    document.body.appendChild(dl);
+  }
+
+  let loadedEnv = {}; // last-loaded values, for the save-time diff/confirmation
+
+  function buildEnvControl(key, value) {
+    const meta = FIELD_META[key] || {};
+    let control;
+    if (meta.control === "select") {
+      control = document.createElement("select");
+      const options = ["", ...meta.options];
+      // Represent an out-of-enum stored value (e.g. a hand-edited .env) faithfully as its own
+      // option, rather than silently coercing the select to blank — which would misrepresent it
+      // AND record a spurious "value → blank" diff that clobbers it on the next save.
+      if (value !== "" && !options.includes(value)) options.push(value);
+      for (const opt of options) {
+        const o = document.createElement("option");
+        o.value = opt;
+        o.textContent = opt === "" ? "— default —" : opt;
+        control.appendChild(o);
+      }
+      control.value = value;
+    } else {
+      control = document.createElement("input");
+      if (meta.control === "timezone" && TIMEZONES.length) {
+        control.setAttribute("list", "tz-list");
+      }
+      control.value = value;
+    }
+    control.id = "env-" + key;
+    control.dataset.key = key;
+    return control;
+  }
 
   // Rendered from whatever GET /api/env returns, rather than a hardcoded field list — stays in
   // sync with ops/bot-ops.sh's own ALLOWED whitelist automatically, no drift between the two.
@@ -447,45 +530,75 @@
   async function loadEnv() {
     const container = document.getElementById("env-fields");
     try {
-      const res = await api("/api/env");
-      const env = await res.json();
+      const env = await (await api("/api/env")).json();
+      loadedEnv = env;
       container.innerHTML = "";
       for (const key of Object.keys(env)) {
+        const value = env[key] ?? "";
+        const control = buildEnvControl(key, value);
         const label = document.createElement("label");
         label.textContent = key;
-        const input = document.createElement("input");
-        input.dataset.key = key;
-        input.value = env[key] ?? "";
+        label.htmlFor = control.id; // clicking the label focuses the field
         container.appendChild(label);
-        container.appendChild(input);
+        const meta = FIELD_META[key];
+        if (meta && meta.hint) {
+          const hint = document.createElement("div");
+          hint.className = "field-hint";
+          hint.textContent = meta.hint;
+          container.appendChild(hint);
+        }
+        container.appendChild(control);
       }
     } catch (e) {
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
     }
   }
 
-  document.getElementById("save-env").addEventListener("click", async () => {
+  document.getElementById("save-env").addEventListener("click", (e) => withBusy(e.currentTarget, saveEnv));
+
+  async function saveEnv() {
     const msg = document.getElementById("env-msg");
-    const inputs = document.querySelectorAll("#env-fields input");
-    const lines = Array.from(inputs).map((i) => i.dataset.key + "=" + i.value).join("\n");
+    const controls = document.querySelectorAll("#env-fields [data-key]");
+    // Diff against what we loaded, so we can preview exactly what's about to change.
+    const changes = [];
+    for (const c of controls) {
+      const key = c.dataset.key;
+      const now = c.value;
+      const before = loadedEnv[key] ?? "";
+      if (now !== before) changes.push({ key, before, now });
+    }
+    if (changes.length === 0) {
+      msg.textContent = "No changes.";
+      msg.className = "msg";
+      return;
+    }
+    const preview = changes
+      .map((c) => `${c.key}: "${c.before}" → "${c.now}"`)
+      .join("\n");
+    if (!confirm("Save these config changes? The bot will restart to load them.\n\n" + preview)) return;
+
+    const lines = Array.from(controls).map((c) => c.dataset.key + "=" + c.value).join("\n");
     msg.textContent = "Saving…";
     msg.className = "msg";
     try {
       const res = await api("/api/env", { method: "POST", body: lines });
-      const result = await res.json().catch(() => null);
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
       if (res.ok) {
         const changed = result && result.changed ? result.changed.join(", ") : "";
         msg.textContent = changed ? "Saved: " + changed : "No changes.";
         msg.className = "msg ok";
+        loadEnv(); // re-baseline so a second save diffs against the new state
         loadStatus();
       } else {
-        msg.textContent = "Failed: " + (result ? JSON.stringify(result) : await res.text());
+        msg.textContent = "Failed: " + (text || "bot-ops.sh error");
         msg.className = "msg error";
       }
     } catch (e) {
       if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
     }
-  });
+  }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
