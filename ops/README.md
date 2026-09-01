@@ -187,11 +187,22 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    loopback-restrict) plus an Access application scoped to your identity, mirroring Dockge's own
    setup in `nucbox-docker-management.md` Part 3. This is operator work — not automated by
    anything in this repo.
-2. **A bearer token** (`ADMIN_TOKEN` in `.env`, generated once by `ops/install.sh` at bootstrap
-   and printed to the terminal — copy it into the panel's unlock prompt on first visit, where
-   it's kept in the browser's `localStorage`), checked on every `/api/*` call. Chosen over
-   verifying Cloudflare Access's own signed JWT for being far less implementation weight; that
-   upgrade is tracked separately — [#6](https://github.com/roshne/rackbops-discord-bot/issues/6).
+2. **Cloudflare Access's own signed JWT** — verified against Cloudflare's published JWKS
+   (`https://<team-domain>/cdn-cgi/access/certs`) on every `/api/*` call, via the
+   `Cf-Access-Jwt-Assertion` header Access attaches once a request has passed through it.
+   Configured per instance with `CLOUDFLARE_ACCESS_TEAM_DOMAIN`/`CLOUDFLARE_ACCESS_AUD` in
+   `.env` (see `.env.example` for where to find both in the Zero Trust dashboard). This is the
+   primary check once both are set — most requests behind a configured Access application never
+   need the bearer prompt at all, since Access attaches the header transparently.
+
+   **Fallback: a bearer token** (`ADMIN_TOKEN` in `.env`, generated once by `ops/install.sh` at
+   bootstrap and printed to the terminal — copy it into the panel's unlock prompt on first
+   visit, where it's kept in the browser's `localStorage`). Always required at startup
+   regardless of the Access vars above — it's the check a request falls back to whenever the
+   JWT path doesn't already succeed: `CLOUDFLARE_ACCESS_TEAM_DOMAIN`/`CLOUDFLARE_ACCESS_AUD`
+   aren't set for this instance yet, Cloudflare's JWKS endpoint is briefly unreachable, or no
+   Access header is present at all. Either check alone is sufficient (OR, not AND) — a valid
+   JWT is evaluated first and, when present and valid, the bearer token is never consulted.
 
 **What it exposes — exactly `bot-ops.sh`'s five operations, nothing new:** `GET /api/status`,
 `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`, `POST /api/env`. No rebuild/deploy

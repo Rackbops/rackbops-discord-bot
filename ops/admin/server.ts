@@ -2,9 +2,10 @@
 // subcommands (status/logs/restart/env-get/env-set). Runs as its own sidecar service (the
 // profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
 // the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
-// file's concern) and the bearer-token check below (door 2, v1 — see issue #6 for the planned
-// upgrade to verifying Access's own signed JWT instead of a standing secret).
+// file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
+// token as the fallback (OR, not AND — see isRequestAuthorized).
 import { timingSafeEqual } from "node:crypto";
+import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 
 /** Constant-time compare — a length mismatch is an immediate, safe `false` (no byte scan). */
 export function tokensMatch(provided: string, expected: string): boolean {
@@ -21,6 +22,70 @@ export function extractBearerToken(authHeader: string | null): string | undefine
 export function isAuthorized(authHeader: string | null, expectedToken: string): boolean {
   const provided = extractBearerToken(authHeader);
   return provided !== undefined && tokensMatch(provided, expectedToken);
+}
+
+export interface AccessIdentity {
+  sub: string;
+  email?: string;
+}
+
+/** Never throws — resolves `null` for any failure (expired/malformed/wrong-aud/wrong-iss/bad
+ * signature/JWKS-unreachable), so callers never need their own try/catch around it. */
+export type VerifyAccessJwt = (jwt: string) => Promise<AccessIdentity | null>;
+
+export function extractAccessJwt(req: Request): string | undefined {
+  return req.headers.get("Cf-Access-Jwt-Assertion") ?? undefined;
+}
+
+/**
+ * Trims and lowercases a raw `CLOUDFLARE_ACCESS_TEAM_DOMAIN` value, then rejects anything that
+ * isn't a bare hostname — throws on a value carrying a scheme, port, or path (e.g. pasted with an
+ * "https://" prefix still on it), which `new URL(...)` alone would silently accept as a garbage
+ * host rather than reject. Lowercasing matters because DNS hostnames are case-insensitive but
+ * jose's JWT issuer comparison is not — this is the value used for both the JWKS URL and the
+ * issuer check, so it must match a real Cloudflare-issued token's `iss` claim exactly. Exported
+ * (rather than inlined in `import.meta.main`, which the test suite never exercises) because this
+ * exact logic was the site of three real bugs across earlier review rounds — a bogus port
+ * silently accepted, an uppercase domain silently rejected, no whitespace handling — and needs
+ * its own test coverage to guard against a regression.
+ */
+export function normalizeTeamDomain(raw: string): string {
+  const teamDomain = raw.trim().toLowerCase();
+  const jwksUrl = new URL(`https://${teamDomain}/cdn-cgi/access/certs`);
+  // `.hostname` (not `.host`) so an explicit port is excluded from the parsed side and
+  // therefore still trips this comparison instead of matching itself.
+  if (jwksUrl.hostname !== teamDomain) {
+    throw new Error(`doesn't look like a bare hostname (parsed as "${jwksUrl.hostname}") — omit any scheme, port, or path`);
+  }
+  return teamDomain;
+}
+
+/**
+ * Factored apart from its `import.meta.main` wiring so tests can exercise the real jose
+ * verification call (signature/aud/iss/exp checks included) against a local, no-network JWKS —
+ * `jwks` accepts either `createRemoteJWKSet`'s or `createLocalJWKSet`'s return value, same shape.
+ */
+export function createAccessJwtVerifier(
+  jwks: JWTVerifyGetKey,
+  teamDomain: string,
+  aud: string,
+): VerifyAccessJwt {
+  return async (jwt: string): Promise<AccessIdentity | null> => {
+    try {
+      const { payload } = await jwtVerify(jwt, jwks, {
+        issuer: `https://${teamDomain}`,
+        audience: aud,
+        // Pinned explicitly rather than left to jose's default inference — guards against an
+        // algorithm-confusion attack if a future key were ever served under an unexpected alg.
+        algorithms: ["RS256"],
+      });
+      return typeof payload.sub === "string"
+        ? { sub: payload.sub, email: typeof payload.email === "string" ? payload.email : undefined }
+        : null;
+    } catch {
+      return null;
+    }
+  };
 }
 
 export type ContentType = "application/json" | "text/plain";
@@ -72,6 +137,22 @@ export interface HandlerConfig {
   indexHtml: string;
   /** Injected so request-handling logic tests without spawning a real subprocess. */
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>;
+  /** Absent (not a stub that always fails) when Access isn't configured for this instance — the
+   * Cf-Access-Jwt-Assertion header is then never evaluated at all, closing any accidental-trust
+   * gap outright rather than relying on a verifier that happens to always reject. */
+  verifyAccessJwt?: VerifyAccessJwt;
+}
+
+/** Door 2, OR not AND: a valid Access JWT authorizes on its own; the bearer token is the
+ * fallback for when JWT verification can't run (Access unconfigured for this instance, or a
+ * transient JWKS-fetch failure) — checked whenever the JWT path doesn't succeed, for any reason,
+ * with no classification of why. */
+export async function isRequestAuthorized(req: Request, config: HandlerConfig): Promise<boolean> {
+  const jwt = extractAccessJwt(req);
+  if (jwt && config.verifyAccessJwt && (await config.verifyAccessJwt(jwt))) {
+    return true;
+  }
+  return isAuthorized(req.headers.get("Authorization"), config.adminToken);
 }
 
 /** The whole request lifecycle, DI'd per CLAUDE.md's "keep I/O at the edges" convention (matches
@@ -89,7 +170,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   if (!url.pathname.startsWith("/api/")) {
     return new Response("not found", { status: 404 });
   }
-  if (!isAuthorized(req.headers.get("Authorization"), config.adminToken)) {
+  if (!(await isRequestAuthorized(req, config))) {
     return new Response("unauthorized", { status: 401 });
   }
 
@@ -135,7 +216,28 @@ if (import.meta.main) {
     return { exitCode, stdout, stderr };
   };
 
-  const config: HandlerConfig = { adminToken, indexHtml, runBotOps };
+  const rawTeamDomain = process.env.CLOUDFLARE_ACCESS_TEAM_DOMAIN;
+  const aud = process.env.CLOUDFLARE_ACCESS_AUD?.trim();
+  let verifyAccessJwt: VerifyAccessJwt | undefined;
+  if (rawTeamDomain && aud) {
+    try {
+      const teamDomain = normalizeTeamDomain(rawTeamDomain);
+      const jwksUrl = new URL(`https://${teamDomain}/cdn-cgi/access/certs`);
+      verifyAccessJwt = createAccessJwtVerifier(createRemoteJWKSet(jwksUrl), teamDomain, aud);
+      console.log(`[admin] verifying Cloudflare Access JWTs for ${teamDomain}`);
+    } catch (err) {
+      // Must degrade to bearer-only, not crash startup, same as the unset case below.
+      console.error(`[admin] couldn't set up Cloudflare Access JWT verification: ${err}`);
+    }
+  } else if (rawTeamDomain || aud) {
+    console.warn(
+      "[admin] CLOUDFLARE_ACCESS_TEAM_DOMAIN and CLOUDFLARE_ACCESS_AUD must both be set — ignoring, falling back to bearer-token-only auth",
+    );
+  } else {
+    console.log("[admin] Cloudflare Access JWT verification not configured — bearer-token-only auth");
+  }
+
+  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt };
   Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
   console.log(`[admin] listening on :${PORT}`);
 }

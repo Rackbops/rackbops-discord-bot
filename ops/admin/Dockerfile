@@ -11,6 +11,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends docker-cli docker-compose jq \
     && rm -rf /var/lib/apt/lists/*
 
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production
+
 COPY server.ts ./
 COPY public ./public
 
