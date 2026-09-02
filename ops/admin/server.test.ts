@@ -1,5 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
   adminRemovalError,
@@ -19,11 +21,13 @@ import {
   isAuthorized,
   isCrossSiteWrite,
   isEmailAllowed,
+  logDynamicAdminsStartup,
   normalizeAdminEmail,
   normalizeTeamDomain,
   parseAllowedEmails,
   parseChangedKeys,
   parseEnvValue,
+  readDynamicAdmins,
   renderIndexHtml,
   tokensMatch,
   type AdminStore,
@@ -225,6 +229,103 @@ describe("effectiveAllowlist", () => {
   });
 });
 
+// Verifier probe from issue #40, pinned as real tests: a well-formed admins.json parses; a
+// trailing comma, or "emails" as an object instead of an array, both must fail LOUDLY (throw) —
+// not be swallowed into "no dynamic admins", which is what let every one of those cases fail
+// open to any Access identity.
+describe("readDynamicAdmins", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "admins-json-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("absent file (first run) resolves an empty set, not an error", async () => {
+    const result = await readDynamicAdmins(join(dir, "admins.json"));
+    expect(result).toEqual(new Set());
+  });
+
+  test("well-formed file parses, trims, and lowercases", async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, JSON.stringify({ emails: [" Admin@X.com ", "b@x.com"] }));
+    const result = await readDynamicAdmins(file);
+    expect(result).toEqual(new Set(["admin@x.com", "b@x.com"]));
+  });
+
+  test("malformed JSON (trailing comma) throws", async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, '{"emails": ["a@x.com",]}');
+    await expect(readDynamicAdmins(file)).rejects.toThrow();
+  });
+
+  test('"emails" as an object instead of an array throws', async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, JSON.stringify({ emails: { "a@x.com": true } }));
+    await expect(readDynamicAdmins(file)).rejects.toThrow();
+  });
+
+  test("non-string entries in an otherwise-valid array are silently dropped, not a throw", async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, JSON.stringify({ emails: ["a@x.com", 42, null] }));
+    const result = await readDynamicAdmins(file);
+    expect(result).toEqual(new Set(["a@x.com"]));
+  });
+});
+
+describe("logDynamicAdminsStartup", () => {
+  function capture() {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    return { logs, errors, log: (m: string) => logs.push(m), logError: (m: string) => errors.push(m) };
+  }
+
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "admins-json-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("no config dir -> one log line, no error", async () => {
+    const { logs, errors, log, logError } = capture();
+    await logDynamicAdminsStartup(undefined, log, logError);
+    expect(logs.length).toBe(1);
+    expect(errors.length).toBe(0);
+  });
+
+  test("absent file -> logs the path and a count of 0", async () => {
+    const file = join(dir, "admins.json");
+    const { logs, errors, log, logError } = capture();
+    await logDynamicAdminsStartup(file, log, logError);
+    expect(errors.length).toBe(0);
+    expect(logs[0]).toContain(file);
+    expect(logs[0]).toContain("0");
+  });
+
+  test("populated file -> logs the path and the real count", async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, JSON.stringify({ emails: ["a@x.com", "b@x.com"] }));
+    const { logs, errors, log, logError } = capture();
+    await logDynamicAdminsStartup(file, log, logError);
+    expect(errors.length).toBe(0);
+    expect(logs[0]).toContain(file);
+    expect(logs[0]).toContain("2");
+  });
+
+  test("malformed file -> logs the error via logError, names the file, never claims success", async () => {
+    const file = join(dir, "admins.json");
+    writeFileSync(file, "{not json");
+    const { logs, errors, log, logError } = capture();
+    await logDynamicAdminsStartup(file, log, logError);
+    expect(logs.length).toBe(0);
+    expect(errors.length).toBe(1);
+    expect(errors[0]).toContain(file);
+  });
+});
+
 describe("normalizeAdminEmail", () => {
   test("trims and lowercases a valid email", () => {
     expect(normalizeAdminEmail("  Roshne@Gmail.COM ")).toBe("roshne@gmail.com");
@@ -346,6 +447,30 @@ describe("handleAdmins", () => {
       writeDynamic: async () => {
         throw new Error("no config dir");
       },
+    };
+    const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
+    expect(res.status).toBe(502);
+  });
+
+  test("a store read failure (broken admins.json) surfaces as a 502 on GET, not an unhandled throw", async () => {
+    const store: AdminStore = {
+      bootstrap: new Set(["boss@x.com"]),
+      readDynamic: async () => {
+        throw new Error("admins.json: unexpected token");
+      },
+      writeDynamic: async () => {},
+    };
+    const res = await handleAdmins(req("GET"), store, bearer);
+    expect(res.status).toBe(502);
+  });
+
+  test("a store read failure (broken admins.json) surfaces as a 502 on POST, not an unhandled throw", async () => {
+    const store: AdminStore = {
+      bootstrap: new Set(["boss@x.com"]),
+      readDynamic: async () => {
+        throw new Error("admins.json: unexpected token");
+      },
+      writeDynamic: async () => {},
     };
     const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
     expect(res.status).toBe(502);
@@ -689,6 +814,50 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
         headers: { "Cf-Access-Jwt-Assertion": jwt, Authorization: `Bearer ${TOKEN}` },
       }),
       { ...config(), adminStore: makeStore({ bootstrap: ["roshne@gmail.com"] }) },
+    );
+    expect(res.status).toBe(200);
+  });
+
+  // Issue #40's acceptance bullet: a broken admins.json used to be indistinguishable from an
+  // absent one, so with no bootstrap floor it collapsed the allow-list to "unconfigured" and let
+  // any verified identity in. These three tests pin: the fix (fails closed), the regression guard
+  // (absent file is unaffected), and that the fail-closed path doesn't over-reach into bootstrap.
+  test("a broken admins.json + empty bootstrap fails CLOSED: a verified JWT for any email is unauthorized", async () => {
+    const brokenStore: AdminStore = {
+      bootstrap: new Set(),
+      readDynamic: async () => {
+        throw new Error("admins.json: unexpected token");
+      },
+      writeDynamic: async () => {},
+    };
+    const jwt = await signToken({ email: "anyone@example.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
+      { ...config(), adminStore: brokenStore },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("an absent admins.json (first run) + empty bootstrap still behaves as before: any verified JWT authorizes", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": await signToken({ email: "anyone@example.com" }) } }),
+      { ...config(), adminStore: makeStore() }, // makeStore()'s readDynamic resolves an empty set, never throws
+    );
+    expect(res.status).toBe(200);
+  });
+
+  test("a broken admins.json doesn't lock out a bootstrap-pinned admin's JWT", async () => {
+    const brokenStore: AdminStore = {
+      bootstrap: new Set(["roshne@gmail.com"]),
+      readDynamic: async () => {
+        throw new Error("admins.json: unexpected token");
+      },
+      writeDynamic: async () => {},
+    };
+    const jwt = await signToken({ email: "roshne@gmail.com" });
+    const res = await handleRequest(
+      new Request("http://x/api/status", { headers: { "Cf-Access-Jwt-Assertion": jwt } }),
+      { ...config(), adminStore: brokenStore },
     );
     expect(res.status).toBe(200);
   });
