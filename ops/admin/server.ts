@@ -242,6 +242,10 @@ export function renderIndexHtml(template: string, instanceName: string): string 
 export interface HandlerConfig {
   adminToken: string;
   indexHtml: string;
+  /** The static WOW_REALM chooser data (ops/admin/public/realms.json), served verbatim at
+   * /realms.json for the panel to read. Absent when the file wasn't generated — the route then
+   * 404s and the panel's WOW_REALM field degrades to a plain text input. */
+  realmsJson?: string;
   /** Injected so request-handling logic tests without spawning a real subprocess. */
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>;
   /** Absent (not a stub that always fails) when Access isn't configured for this instance — the
@@ -423,6 +427,14 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     return new Response(config.indexHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
+  // The static realm list for the WOW_REALM chooser. Public at this layer, exactly like the page
+  // itself — it's non-secret data (WoW realm names) and Access already gated reaching the panel.
+  // A GET, so isCrossSiteWrite never applies. 404 when unset so the panel falls back gracefully.
+  if (req.method === "GET" && url.pathname === "/realms.json") {
+    if (!config.realmsJson) return new Response("not found", { status: 404 });
+    return new Response(config.realmsJson, { headers: { "Content-Type": "application/json; charset=utf-8" } });
+  }
+
   if (!url.pathname.startsWith("/api/")) {
     return new Response("not found", { status: 404 });
   }
@@ -498,6 +510,21 @@ if (import.meta.main) {
     instanceName,
   );
   console.log(`[admin] serving admin panel for instance "${instanceName}"`);
+
+  // Optional: the generated realm list for the WOW_REALM chooser. Absent is fine — the panel then
+  // renders WOW_REALM as a plain text input. Read once at startup; it's immutable in the image.
+  let realmsJson: string | undefined;
+  try {
+    const realmsFile = Bun.file(new URL("./public/realms.json", import.meta.url));
+    if (await realmsFile.exists()) {
+      realmsJson = await realmsFile.text();
+      console.log("[admin] WOW_REALM chooser data loaded (realms.json)");
+    } else {
+      console.log("[admin] no realms.json — WOW_REALM will be a free-text field");
+    }
+  } catch (err) {
+    console.error(`[admin] couldn't read realms.json (WOW_REALM stays free-text): ${err}`);
+  }
 
   const runBotOps = async (invocation: BotOpsInvocation): Promise<BotOpsResult> => {
     const proc = Bun.spawn(["bash", BOT_OPS_SH, ...invocation.args], {
@@ -582,7 +609,7 @@ if (import.meta.main) {
     console.log("[admin] no ADMIN_ALLOWED_EMAILS bootstrap — any Access identity authorizes until admins are added");
   }
 
-  const config: HandlerConfig = { adminToken, indexHtml, runBotOps, verifyAccessJwt, adminStore };
+  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, runBotOps, verifyAccessJwt, adminStore };
   Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
   console.log(`[admin] listening on :${PORT}`);
 }

@@ -529,6 +529,7 @@
     WOW_REGION: { control: "select", options: ["us", "eu"] },
     AUTO_UPDATE: { control: "select", options: ["true", "false"] },
     DMF_TIMEZONE: { control: "timezone", hint: "IANA name, e.g. America/Los_Angeles. Blank uses the region default." },
+    WOW_REALM: { control: "realm", hint: "Realm whose up/down status the bot tracks. Options follow the WOW_REGION set below — type the start of a name to jump to it. Blank tracks no realm." },
   };
 
   // IANA zone list for the DMF_TIMEZONE datalist — from the browser, no hardcoded list, absent on
@@ -551,6 +552,61 @@
     document.body.appendChild(dl);
   }
 
+  // WOW_REALM chooser data: a static slug/name list per region, generated ~yearly by
+  // ops/tools/gen-realms.ts and served by the panel at /realms.json. Fetched once, memoized; if
+  // it's absent or fails to load, WOW_REALM falls back to a plain text input (buildEnvControl).
+  let realmsData = null; // { us: [{slug,name}], eu: [...] } or null when unavailable
+  let realmsPromise = null;
+  function loadRealms() {
+    if (!realmsPromise) {
+      // Time-boxed like the Access-session probe: a hung /realms.json must degrade to "no chooser
+      // data" (WOW_REALM stays a text input) rather than block the whole Config render forever.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      realmsPromise = fetch("/realms.json", { signal: controller.signal })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => { realmsData = d && d.regions ? d.regions : null; })
+        .catch(() => { realmsData = null; })
+        .finally(() => clearTimeout(timeout));
+    }
+    return realmsPromise;
+  }
+
+  // Only offer realms whose slug bot-ops.sh would actually accept (^[a-z0-9-]{1,40}$) — the same
+  // "never suggest a value the server rejects" rule as the timezone datalist. This drops a handful
+  // of EU realms with accented slugs (e.g. chants-éternels) that bot-ops.sh can't store today.
+  const REALM_SLUG_RE = /^[a-z0-9-]{1,40}$/;
+
+  // Fill a WOW_REALM <select> with the realms for `region`, preserving `currentValue` — injected as
+  // its own option when it isn't in the (filtered) list, so a stored realm is never silently
+  // dropped (e.g. when the region is switched to one that doesn't contain it).
+  function populateRealmSelect(select, region, currentValue) {
+    const list = ((realmsData && realmsData[region]) || []).filter((r) => REALM_SLUG_RE.test(r.slug));
+    select.innerHTML = "";
+    const rows = [{ slug: "", name: "— default —" }, ...list];
+    if (currentValue && !list.some((r) => r.slug === currentValue)) {
+      rows.push({ slug: currentValue, name: currentValue + (region ? " (not in the " + region + " list)" : "") });
+    }
+    for (const { slug, name } of rows) {
+      const o = document.createElement("option");
+      o.value = slug;
+      o.textContent = slug === "" ? "— default —" : name;
+      select.appendChild(o);
+    }
+    select.value = currentValue;
+  }
+
+  // After the fields are built, make the WOW_REALM select track the WOW_REGION control: changing
+  // the region repopulates the realm options (carrying the current pick forward as an out-of-list
+  // option if the new region lacks it). Order-independent — WOW_REALM actually renders before
+  // WOW_REGION in bot-ops.sh's ALLOWED_ORDER, so this can't rely on DOM position.
+  function wireRealmChooser() {
+    const realmSel = document.getElementById("env-WOW_REALM");
+    const regionCtl = document.getElementById("env-WOW_REGION");
+    if (!realmSel || realmSel.tagName !== "SELECT" || !regionCtl) return;
+    regionCtl.addEventListener("change", () => populateRealmSelect(realmSel, regionCtl.value, realmSel.value));
+  }
+
   let loadedEnv = {}; // last-loaded values, for the save-time diff/confirmation
 
   function buildEnvControl(key, value) {
@@ -570,6 +626,11 @@
         control.appendChild(o);
       }
       control.value = value;
+    } else if (meta.control === "realm" && realmsData) {
+      // Region-filtered <select> (value = realm slug, label = display name). Populated from the
+      // currently-loaded WOW_REGION; wireRealmChooser keeps it in sync when the region changes.
+      control = document.createElement("select");
+      populateRealmSelect(control, loadedEnv.WOW_REGION || "", value);
     } else {
       control = document.createElement("input");
       if (meta.control === "timezone" && TIMEZONES.length) {
@@ -590,6 +651,7 @@
   async function loadEnv() {
     const container = document.getElementById("env-fields");
     try {
+      await loadRealms(); // so buildEnvControl can render WOW_REALM as a chooser when data is present
       const env = await (await api("/api/env")).json();
       loadedEnv = env;
       container.innerHTML = "";
@@ -609,6 +671,7 @@
         }
         container.appendChild(control);
       }
+      wireRealmChooser(); // region→realm reactivity, wired after every field exists
     } catch (e) {
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
     }
