@@ -819,6 +819,29 @@ describe("handleRequest", () => {
     expect(res.headers.get("Content-Type")).toContain("text/html");
   });
 
+  test("serves /realms.json unauthenticated when configured", async () => {
+    const realmsJson = '{"regions":{"us":[{"slug":"eitrigg","name":"Eitrigg"}]}}';
+    // No Authorization header — proves the route is served before the auth gate, like the page.
+    const res = await handleRequest(new Request("http://x/realms.json"), {
+      adminToken: TOKEN,
+      indexHtml: INDEX_HTML,
+      realmsJson,
+      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(realmsJson);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+  });
+
+  test("404s /realms.json when no realm data was generated", async () => {
+    const res = await handleRequest(new Request("http://x/realms.json"), {
+      adminToken: TOKEN,
+      indexHtml: INDEX_HTML,
+      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+    });
+    expect(res.status).toBe(404);
+  });
+
   test("rejects an /api/* call with no token", async () => {
     const res = await handleRequest(new Request("http://x/api/status"), {
       adminToken: TOKEN,

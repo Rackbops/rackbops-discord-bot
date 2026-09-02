@@ -232,7 +232,21 @@ rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don'
 the internal origin or same-origin browser writes would be wrongly blocked.
 No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
 page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
-`ALLOWED` whitelist above.
+`ALLOWED` whitelist above. A few fields render as constrained controls instead of free text:
+`WOW_REGION`/`AUTO_UPDATE` as selects, `DMF_TIMEZONE` as an IANA-zone datalist, and `WOW_REALM` as
+a region-filtered realm chooser (see below).
+
+**The `WOW_REALM` chooser** reads a static, bundled `public/realms.json` (served at `GET
+/realms.json` — non-secret data, public at that layer like the page itself) and filters it to the
+region `WOW_REGION` is currently set to. The panel never calls Blizzard at request time. That file
+is regenerated locally, by hand, about once a year (WoW realm lists change that rarely) with
+`bun run ops/tools/gen-realms.ts` — a script that lives outside `ops/admin/` (so it's never in the
+deployed image and adds no dependency to it), reads Blizzard client creds from
+`R:\repos\secrets\BattleNetAPI-secrets.json` (`ID`/`SECRET`), and calls the realm-index endpoint
+via the `roshne/battlenet-api-research` client. It offers only realm slugs `bot-ops.sh`'s
+`WOW_REALM` regex accepts (`^[a-z0-9-]{1,40}$`), so it never suggests a realm the server would
+reject — which currently drops a handful of EU realms with accented slugs. If `realms.json` is
+absent, `WOW_REALM` gracefully falls back to a plain text input.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
