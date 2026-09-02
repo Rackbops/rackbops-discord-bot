@@ -6,16 +6,37 @@
 <meta name="robots" content="noindex, nofollow" />
 <title>Bot Admin — __INSTANCE_NAME__</title>
 <style>
+  /* Theme-aware: light is the base palette; the dark palette overrides it under the viewer's
+     prefers-color-scheme. `color-scheme: light dark` lets native controls (scrollbars, the <select>
+     and datalist popups, autofill) follow the same preference. */
   :root {
     color-scheme: light dark;
-    --bg: #0f1115;
-    --panel: #171a21;
-    --border: #2a2f3a;
-    --text: #e6e8eb;
-    --muted: #9aa3b2;
-    --accent: #4f8cff;
-    --danger: #e5484d;
-    --ok: #2fb170;
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --border: #c3c9d4;
+    --text: #1a1d24;
+    --muted: #59616e;
+    --accent: #2563eb;
+    --danger: #cf2b31;
+    --ok: #147a4a;
+    --inset: #e6e9ee; /* recessed fields: inputs, <pre>, the instance badge, the tag box */
+    --chip: #eef1f6;  /* a tag chip's fill — lighter than the --inset box so a chip lifts off it */
+    --btn2: #4b5563;  /* neutral secondary button (Lock, Remove) — always paired with white text */
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #2a2f3a;
+      --text: #e6e8eb;
+      --muted: #9aa3b2;
+      --accent: #4f8cff;
+      --danger: #e5484d;
+      --ok: #2fb170;
+      --inset: #0d0f13;
+      --chip: #1b2130;
+      --btn2: #333;
+    }
   }
   * { box-sizing: border-box; }
   body {
@@ -47,7 +68,7 @@
   button:disabled { opacity: 0.5; cursor: default; }
   input, textarea, select {
     font: inherit;
-    background: #0d0f13;
+    background: var(--inset);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -58,8 +79,8 @@
   .field-hint { font-size: 11px; color: var(--muted); margin: 0 0 4px; }
   /* Tag/chip editor for comma-separated list fields (ADMIN_USER_IDS, WATCHED_REPOS). Looks like an
      input box with each entry as a removable chip, plus an inline field to type the next one. */
-  .tag-field { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: #0d0f13; border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
-  .tag-field .tag { display: inline-flex; align-items: center; gap: 4px; background: #1b2130; border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 12px; word-break: break-all; }
+  .tag-field { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: var(--inset); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .tag-field .tag { display: inline-flex; align-items: center; gap: 4px; background: var(--chip); border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 12px; word-break: break-all; }
   .tag-field .tag button { background: transparent; color: var(--muted); border: none; border-radius: 999px; padding: 2px 6px; font-size: 14px; line-height: 1; cursor: pointer; width: auto; }
   .tag-field .tag button:hover { color: var(--danger); }
   .tag-field .tag-add { flex: 1 1 100px; min-width: 80px; width: auto; border: none; background: transparent; padding: 2px; }
@@ -75,7 +96,7 @@
   .dot.up { background: var(--ok); }
   .dot.down { background: var(--danger); }
   pre {
-    background: #0d0f13;
+    background: var(--inset);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 10px;
@@ -101,7 +122,7 @@
     font-size: 12px;
     font-weight: 600;
     color: var(--text);
-    background: #0d0f13;
+    background: var(--inset);
     border: 1px solid var(--border);
     border-radius: 999px;
     padding: 2px 10px;
@@ -118,7 +139,7 @@
   .admin-row:last-child { border-bottom: none; }
   .admin-row .email { flex: 1; word-break: break-all; }
   .admin-row .tag { font-size: 11px; color: var(--muted); }
-  .admin-row button { background: #333; padding: 4px 10px; font-size: 12px; }
+  .admin-row button { background: var(--btn2); padding: 4px 10px; font-size: 12px; }
   .admin-row button.danger { background: var(--danger); }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
   #gate .panel-header { justify-content: center; }
@@ -151,7 +172,7 @@
     <div class="row" style="margin-top: 12px">
       <button id="refresh-status">Refresh</button>
       <button id="restart" class="danger">Restart</button>
-      <button id="lock" style="margin-left: auto; background: #333">Lock</button>
+      <button id="lock" style="margin-left: auto; background: var(--btn2)">Lock</button>
     </div>
     <div id="restart-msg" class="msg"></div>
   </section>
