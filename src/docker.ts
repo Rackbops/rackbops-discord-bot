@@ -200,3 +200,16 @@ export async function removeImage(tag: string): Promise<void> {
   const res = await api(`/images/${encodeURIComponent(tag)}`, { method: "DELETE" });
   if (!res.ok) console.warn(`[redeploy] could not remove image ${tag}: ${res.status}`);
 }
+
+/**
+ * Points `target` (e.g. `repo:latest`) at the image currently named `source` (e.g. `repo:abc1234`,
+ * or an image id) — the Engine API's own "move a tag" primitive (`POST
+ * /images/{name}/tag?repo=&tag=`), so the daemon never re-pulls or re-builds anything. `repo` and
+ * `tag` are separate query params, not a single combined `repo:tag` value — `target` is split on
+ * its last colon to produce them.
+ */
+export async function tagImage(source: string, target: string): Promise<void> {
+  const i = target.lastIndexOf(":");
+  const params = new URLSearchParams({ repo: target.slice(0, i), tag: target.slice(i + 1) });
+  await ok(`/images/${encodeURIComponent(source)}/tag?${params}`, { method: "POST" });
+}
