@@ -17,6 +17,7 @@ import {
   renameContainer,
   startContainer,
   stopContainer,
+  tagImage,
   tryInspectContainer,
   type ContainerInspect,
   type CreateContainerSpec,
@@ -59,10 +60,27 @@ export function buildRemote(repo: string, branch: string): string {
   return `https://github.com/${repo}.git#${branch}`;
 }
 
-/** The compose-built image tag, plus a per-sha tag that keeps an older build addressable. */
-export function imageTags(currentImage: string, sha: string): string[] {
+/**
+ * The only tag a fresh build gets. Never `:latest` — see `latestTag` and `takeOver`'s
+ * `tagLatest`. Before issue #39's fix this was one of two tags applied at build time (the other
+ * being `:latest` itself), and the *build* result's tag array happening to put `:latest` first is
+ * exactly what let a not-yet-verified image get used both to build and to create the replacement.
+ */
+export function shaTag(currentImage: string, sha: string): string {
   const repo = currentImage.split(":")[0] ?? currentImage;
-  return [`${repo}:latest`, `${repo}:${sha.slice(0, 7)}`];
+  return `${repo}:${sha.slice(0, 7)}`;
+}
+
+/**
+ * The floating tag every recreate path other than a fresh self-update resolves the service image
+ * by (`bot-ops.sh env-set`'s `up -d --force-recreate`, a Dockge restart, a plain `compose up
+ * -d`). Applied only once `takeOver` confirms the replacement running under it has verified
+ * itself — never at build time (issue #39) — so none of those paths can ever recreate the bot on
+ * a build that merely compiled but crashed at boot.
+ */
+export function latestTag(currentImage: string): string {
+  const repo = currentImage.split(":")[0] ?? currentImage;
+  return `${repo}:latest`;
 }
 
 /**
@@ -155,11 +173,11 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
     return { error: `could not inspect own container: ${(err as Error).message}` };
   }
 
-  const tags = imageTags(self.Config.Image, latestSha);
-  console.log(`[redeploy] building ${tags.join(", ")} from ${config.botBranch}`);
+  const tag = shaTag(self.Config.Image, latestSha);
+  console.log(`[redeploy] building ${tag} from ${config.botBranch}`);
   const built = await buildImage({
     remote: buildRemote(config.githubRepo, config.botBranch),
-    tags,
+    tags: [tag],
     buildArgs: { GIT_SHA: latestSha },
   }).catch((err) => ({ ok: false, error: (err as Error).message }));
 
@@ -174,7 +192,7 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   let replacementId: string;
   try {
     await removeContainer(name, true); // a leftover from an earlier failed attempt
-    replacementId = await createContainer(name, buildCreateSpec(self, { image: tags[0]!, handoffFrom: self.Id }));
+    replacementId = await createContainer(name, buildCreateSpec(self, { image: tag, handoffFrom: self.Id }));
     await startContainer(replacementId);
   } catch (err) {
     endHandoff();
@@ -302,16 +320,28 @@ export interface TakeOverEffects {
   write?: typeof writeMarker;
   retire?: typeof retireOriginal;
   clear?: typeof clearMarker;
+  /** Applies `:latest` onto this (now-verified) replacement's own image. Best-effort — see its
+   *  call site in {@link takeOver}. */
+  tagLatest?: () => Promise<void>;
   exit?: (code: number) => void;
+}
+
+/** The real `tagLatest` effect: reads this container's own image (always a sha tag post-#39,
+ *  never `:latest` itself) and points `:latest` at it. */
+async function tagSelfAsLatest(): Promise<void> {
+  const self = await inspectSelf();
+  await tagImage(self.Config.Image, latestTag(self.Config.Image));
 }
 
 /**
  * Complete the swap from the replacement's side, and make that completion crash-proof.
  *
  * Runs in the *replacement*: it announces `ready` (which stops the original counting toward its
- * deadline), retires the *original* — `retireOriginal` stops that other container, never this
- * one — and clears the marker. On success this returns, and `index.ts` goes on to `activate()`;
- * this process is the survivor that becomes the live bot.
+ * deadline), applies `:latest` onto its own now-verified image (issue #39 — best-effort; a tag
+ * hiccup must not turn a genuinely successful handoff into a reported failure), retires the
+ * *original* — `retireOriginal` stops that other container, never this one — and clears the
+ * marker. On success this returns, and `index.ts` goes on to `activate()`; this process is the
+ * survivor that becomes the live bot.
  *
  * The guard is for the unhappy path. Almost every throw site inside is at or before the original
  * is stopped: `write` and the pre-stop inspect precede it, and `stopContainer` throws on an HTTP
@@ -337,9 +367,22 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
   const write = effects.write ?? writeMarker;
   const retire = effects.retire ?? retireOriginal;
   const clear = effects.clear ?? clearMarker;
+  const tagLatest = effects.tagLatest ?? tagSelfAsLatest;
   const exit = effects.exit ?? ((code: number) => process.exit(code));
   try {
     await write({ status: "ready", sha: config.gitSha, at: Date.now() });
+    // Best-effort, same "never fail a good deploy over housekeeping" rule as pruneOldImages: the
+    // swap itself is real and correct regardless of whether this one tag succeeds. Applied only
+    // now, post-verification — never at build time — which is issue #39's fix: a build that
+    // merely *compiled* but crashed at boot used to leave `:latest` arming every later recreate
+    // (env-set, a Dockge restart, a plain `compose up -d`) on itself, with no way back short of a
+    // manual rebuild.
+    await tagLatest().catch((err) => {
+      console.error(
+        `[handoff] could not tag :latest onto the verified build (a later recreate may still use ` +
+          `the previous one, until the next successful update retags it): ${(err as Error).message}`,
+      );
+    });
     await retire(originalId);
     await clear();
   } catch (err) {

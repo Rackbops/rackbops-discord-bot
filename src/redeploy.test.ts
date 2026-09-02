@@ -9,10 +9,11 @@ const {
   buildCreateSpec,
   buildRemote,
   canonicalName,
-  imageTags,
+  latestTag,
   redeploy,
   replacementName,
   selectImagesToPrune,
+  shaTag,
   takeOver,
 } = await import("./redeploy");
 const { clearMarker } = await import("./handoff");
@@ -67,16 +68,25 @@ describe("buildRemote", () => {
   });
 });
 
-describe("imageTags", () => {
-  test("tags the moving name and a per-sha name off the same repo", () => {
-    expect(imageTags("warbandeer-discord-debug-bot:latest", "abcdef1234")).toEqual([
-      "warbandeer-discord-debug-bot:latest",
+describe("shaTag", () => {
+  test("the per-sha tag, off the same repo", () => {
+    expect(shaTag("warbandeer-discord-debug-bot:latest", "abcdef1234")).toBe(
       "warbandeer-discord-debug-bot:abcdef1",
-    ]);
+    );
   });
 
-  test("an untagged current image still yields both tags", () => {
-    expect(imageTags("mybot", "abcdef1234")).toEqual(["mybot:latest", "mybot:abcdef1"]);
+  test("an untagged current image still yields a tag", () => {
+    expect(shaTag("mybot", "abcdef1234")).toBe("mybot:abcdef1");
+  });
+});
+
+describe("latestTag", () => {
+  test("the floating tag, off the same repo", () => {
+    expect(latestTag("warbandeer-discord-debug-bot:abc1234")).toBe("warbandeer-discord-debug-bot:latest");
+  });
+
+  test("an untagged current image still yields a tag", () => {
+    expect(latestTag("mybot")).toBe("mybot:latest");
   });
 });
 
@@ -218,22 +228,47 @@ describe("buildCreateSpec", () => {
 describe("takeOver", () => {
   const ID = "b".repeat(64);
 
-  test("announces ready, retires the original, clears the marker — and never exits", async () => {
+  test("announces ready, tags :latest, retires the original, clears the marker — and never exits", async () => {
     const order: string[] = [];
     const exits: number[] = [];
     let retired: string | undefined;
     await takeOver(ID, {
       write: async (m) => void order.push(`write:${m.status}`),
+      tagLatest: async () => void order.push("tag"),
       retire: async (id) => void (order.push("retire"), (retired = id)),
       clear: async () => void order.push("clear"),
       exit: (code) => void exits.push(code),
     });
     // Order is load-bearing: `ready` must be written *before* the retire — that write is what
     // stops the original counting toward its deadline and removing a replacement that has in fact
-    // verified. Assert the exact sequence, so a reorder can't slip through green.
-    expect(order).toEqual(["write:ready", "retire", "clear"]);
+    // verified — and the :latest tag lands before the retire too, since it tags this (still-live)
+    // container's own image, no different in kind from the write. Assert the exact sequence, so a
+    // reorder can't slip through green.
+    expect(order).toEqual(["write:ready", "tag", "retire", "clear"]);
     expect(retired).toBe(ID);
     expect(exits).toEqual([]);
+  });
+
+  // Issue #39's other half: tagging :latest is best-effort — a tag-API hiccup must not turn a
+  // genuinely successful handoff into a reported failure. The retire and clear still have to run.
+  test("a tagLatest failure doesn't abort the takeover — retire and clear still run, no failed marker", async () => {
+    const writes: HandoffMarker[] = [];
+    const exits: number[] = [];
+    let retired: string | undefined;
+    let cleared = false;
+    await takeOver(ID, {
+      write: async (m) => void writes.push(m),
+      tagLatest: async () => {
+        throw new Error("daemon: tag conflict");
+      },
+      retire: async (id) => void (retired = id),
+      clear: async () => void (cleared = true),
+      exit: (code) => void exits.push(code),
+    });
+    expect(retired).toBe(ID);
+    expect(cleared).toBe(true);
+    expect(exits).toEqual([]);
+    expect(writes.some((m) => m.status === "failed")).toBe(false);
   });
 
   // The crux of the fix: a retire that throws must not become an unhandled rejection. The
@@ -246,6 +281,7 @@ describe("takeOver", () => {
     let cleared = false;
     await takeOver(ID, {
       write: async (m) => void writes.push(m),
+      tagLatest: async () => {},
       retire: async () => {
         throw new Error("daemon unreachable");
       },
@@ -266,6 +302,7 @@ describe("takeOver", () => {
       write: async () => {
         throw new Error("disk full");
       },
+      tagLatest: async () => {},
       retire: async () => void 0,
       exit: (code) => void exits.push(code),
     });
@@ -279,6 +316,7 @@ describe("takeOver", () => {
     const exits: number[] = [];
     await takeOver(ID, {
       write: async () => void 0,
+      tagLatest: async () => {},
       retire: async () => {
         throw null;
       },
@@ -296,7 +334,7 @@ describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
   const REPLACEMENT_ID = "c".repeat(64);
-  let calls: { path: string; method: string }[] = [];
+  let calls: { path: string; method: string; url: string }[] = [];
 
   beforeEach(async () => {
     process.env.HOSTNAME = HOSTNAME;
@@ -327,7 +365,7 @@ describe("redeploy — cleanup always runs", () => {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
-      calls.push({ path: pathname, method });
+      calls.push({ path: pathname, method, url: String(url) });
 
       if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
       if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
@@ -369,5 +407,34 @@ describe("redeploy — cleanup always runs", () => {
     expect(handoffActive()).toBe(false);
     expect(wasRemovalAttempted()).toBe(true);
     expect(result.outcome).toBe("failed");
+  });
+
+  // Issue #39, acceptance bullet 1: a build tagged only its sha (never :latest at build time —
+  // the crux of the fix), so a failed/timed-out handoff structurally cannot have touched :latest
+  // at all. redeploy() itself never calls the tag endpoint on any outcome — only takeOver, in a
+  // replacement that has actually verified, ever does (see the takeOver describe block above).
+  test("a failed handoff never touches :latest — redeploy() never applies a tag on any outcome", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    const result = await redeploy("d".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(calls.some((c) => c.path.includes("/tag"))).toBe(false);
+  });
+
+  // Issue #39, the other half of the fix: the build request itself must carry only the sha tag —
+  // this is what closes the window, since a build tagged :latest directly would arm every later
+  // recreate (env-set, a Dockge restart, a plain `compose up -d`) the instant it merely compiled.
+  test("the build request tags only the sha, never :latest", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("e".repeat(40));
+    const build = calls.find((c) => c.path === "/build");
+    expect(build).toBeDefined();
+    const params = new URL(build!.url).searchParams;
+    expect(params.getAll("t")).toEqual(["warbandeer-discord-debug-bot:eeeeeee"]);
   });
 });

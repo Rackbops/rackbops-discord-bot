@@ -3,7 +3,7 @@ import { parseBuildOutput, parseContainerId } from "./docker";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
-const { buildImage, daemonReachable, stopContainer, removeContainer } = await import("./docker");
+const { buildImage, daemonReachable, stopContainer, removeContainer, tagImage } = await import("./docker");
 
 describe("parseContainerId", () => {
   const ID = "f".repeat(64);
@@ -105,6 +105,18 @@ describe("daemon calls", () => {
     expect(decodeURIComponent(url)).toContain("t=img:latest");
     expect(decodeURIComponent(url)).toContain("t=img:abc1234");
     expect(decodeURIComponent(url)).toContain('buildargs={"GIT_SHA":"abc1234"}');
+  });
+
+  // The Engine API wants repo and tag as separate query params, not one combined "repo:tag"
+  // value — this is the split `tagImage` exists to get right.
+  test("tagImage splits the target into separate repo/tag query params", async () => {
+    stub(() => new Response("", { status: 201 }));
+    await tagImage("myrepo:abc1234", "myrepo:latest");
+    expect(calls[0]!.method).toBe("POST");
+    const url = decodeURIComponent(calls[0]!.url);
+    expect(url).toContain("/images/myrepo:abc1234/tag?");
+    expect(url).toContain("repo=myrepo");
+    expect(url).toContain("tag=latest");
   });
 
   // Both are "the state we wanted" — treating them as errors would abort a handoff over a
