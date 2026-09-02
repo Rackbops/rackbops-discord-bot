@@ -49,9 +49,9 @@
 | `src/github.ts` | GitHub API client: `fetchReleases(repo)` (drafts filtered; returns `null` on a 404 — the repo is missing or invisible to `GITHUB_TOKEN`, which GitHub reports identically — while 401/403/429/5xx still throw, and a releaseless repo is a plain `[]`) + `createReachabilityLog()` (edge-triggered per-repo tracker: `observe(repo, reachable)` → `"lost"` / `"recovered"` / `null`, in-memory so a restart re-reports once) + pure `decideReleaseAnnouncements(releases, seen)` (seed-silently on `seen===undefined`, else announce unseen oldest-first) + `createIssue` / idempotent `ensureLabel` for `/report` (both need `GITHUB_TOKEN` with issues:write) |
 | `Dockerfile` | `oven/bun:1-slim` (Debian — Intl IANA timezones), prod-only install, non-root `bun` user, `VOLUME /app/data`, `ARG/ENV GIT_SHA`, `ENTRYPOINT entrypoint.sh` |
 | `entrypoint.sh` | Root→`bun` drop when compose starts the container as root: joins the socket's group by reading its GID off the socket (`setpriv --groups`), execs the CMD; a plain exec under `USER bun` |
-| `docker-compose.yml` | Local dev: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` — `build.context`/`container_name`/`env_file` default to `.`/`warbandeer-discord`/`.env` respectively. A deployed instance overrides all three per-invocation via `BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER`/`BOT_ENV_FILE` (see the config-dir gotcha) — never persisted in `.env`. `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports. Opt-in `admin` sidecar (`profiles: [admin]`, deploy-only — see `ops/admin/`) |
-| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Takes `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` as required inputs (see the config-dir gotcha) — no fallback to its own script location. Secrets are never read/written (whitelist excludes them); env-set backs up to `<config-dir>/backups/` then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
-| `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run, `ADMIN_TOKEN` generated fresh into it), the shared `bin/bot-ops.sh`, and the Dockge-managed stack dir (compose file) — the latter two always refreshed. Prints the `up -d --build` invocation, plus the optional `--profile admin` one. See `ops/README.md` |
+| `docker-compose.yml` | Local dev: `GIT_SHA=$(git rev-parse HEAD) docker compose up -d --build` — `build.context`/`container_name`/`env_file` default to `.`/`warbandeer-discord`/`.env` respectively. A deployed instance overrides all three via `BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER`/`BOT_ENV_FILE`, either per-invocation on the command line or (issue #41) from the stack directory's own generated `.env` — never persisted in the bot's own config `.env` (see the config-dir gotcha). `GIT_SHA` build arg, named volume `state` → `/app/data`, `restart: unless-stopped`. Opt-in `cloudflared` sidecar (`profiles: [tunnel]`, needs `CLOUDFLARE_TUNNEL_TOKEN`) for exposing a future local API without inbound firewall ports. Opt-in `admin` sidecar (`profiles: [admin]`, deploy-only — see `ops/admin/`) |
+| `ops/bot-ops.sh` + `ops/README.md` | Operator admin surface originally driven by the **Ops** tab in `apps/warbandeer-desktop` / `wow-companion` (neither is part of this repo — see **Fork gotchas**): whitelisted `status`/`logs`/`restart`/`env-get`/`env-set` over docker+`.env`, invoked over SSH. Takes `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` + `BOT_OPS_PROJECT` + `BOT_OPS_CONTAINER` as required inputs (see the config-dir gotcha) — no fallback to its own script location or to any built-in name. Secrets are never read/written (whitelist excludes them); env-set backs up to `<config-dir>/backups/` then `up -d --force-recreate`. Still fully usable standalone by SSHing in and invoking it directly (see `ops/README.md`) |
+| `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run, `ADMIN_TOKEN` generated fresh into it), the shared `bin/bot-ops.sh`, the Dockge-managed stack dir's compose file, and that same stack dir's own `.env` (Compose's interpolation source, not the bot's config — see the gotcha) — the latter three always refreshed. Prints the `up -d --build` invocation, plus the optional `--profile admin` one. See `ops/README.md` |
 | `ops/admin/` (`server.ts` + `public/index.html` + `Dockerfile`) | Small per-instance admin web panel — an authenticated, thin wrapper around `ops/bot-ops.sh`'s five operations, nothing new. `server.ts`'s auth check, route→subcommand mapping, and request handler are pure/DI'd (`HandlerConfig` injects `runBotOps`, matching `updateReport.ts`'s injected-deliverer shape) so `server.test.ts` covers them without a real subprocess; only the `import.meta.main` block at the bottom does real I/O (spawns `bot-ops.sh`, binds the port). `public/index.html` is a single self-contained file, no build step — its config form renders from whatever `GET /api/env` returns rather than a hardcoded field list. See `ops/README.md`'s Admin panel section for the two-door auth model |
 
 ## Behavior
@@ -112,22 +112,32 @@
   so Dockge (nucbox's stack manager) lists and manages it — Dockge only recognises a compose
   file at a path under its own `DOCKGE_STACKS_DIR`, and doesn't care where anything that file
   references lives. `ops/bot-ops.sh` takes both as required env vars
-  (`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`) with no fallback to its own script location —
-  that assumption broke the moment the two stopped being the same directory. `ops/install.sh`
-  bootstraps a fresh instance's layout; see `ops/README.md` for the full runbook.
-- **`docker-compose.yml`'s three interpolation vars (`BOT_BUILD_CONTEXT`, `BOT_OPS_CONTAINER`,
-  `BOT_ENV_FILE`) are all supplied per-invocation, on the command line — none are ever written
-  into `.env`.** `ops/bot-ops.sh` exports `BOT_ENV_FILE` inline on every `docker compose` call
-  it makes (`cmd_restart`, `cmd_env_set`) and inherits `BOT_OPS_CONTAINER` from its own caller;
-  neither of those ever passes `--build`, so `BOT_BUILD_CONTEXT` is irrelevant to them.
-  `ops/install.sh`'s printed bootstrap command is the one place that sets `BOT_BUILD_CONTEXT`,
-  as a one-shot shell prefix on that single `up -d --build` invocation — unset (the default in
-  `build.context: ${BOT_BUILD_CONTEXT:-.}`), it's `.`, so `docker compose up -d --build` run
-  directly from this checkout for local dev is unchanged. A future manual rebuild against a
-  deployed instance needs the same var re-supplied by hand (see `ops/install.sh`'s output) —
-  there's nothing to read it back from. Self-update's own rebuilds (`src/redeploy.ts`) were
-  already remote-context-based before any of this, via the Docker Engine API directly, not
-  `docker compose` — untouched by it.
+  (`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`), along with `BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER`
+  (issue #41 — a monorepo-era default on these last two once let a var-less invocation silently
+  target a project/container no real deploy produces), with no fallback to its own script location
+  or to any built-in name. `ops/install.sh` bootstraps a fresh instance's layout; see
+  `ops/README.md` for the full runbook.
+- **`docker-compose.yml`'s interpolation vars have TWO sources, in Compose's own precedence
+  order: shell-exported values first, then a `.env` file in the stack directory** (Compose loads
+  one automatically for `${VAR}` substitution — a mechanism entirely separate from the `env_file:`
+  directive, which loads secrets *into* the container). `ops/install.sh` writes that second source
+  itself: `/opt/stacks/rackbops-discord-bot-<instance>/.env`, holding this instance's real
+  `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/`BOT_OPS_PROJECT`/`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/
+  `BOT_BUILD_CONTEXT`/`GIT_SHA` — generated and refreshed on every re-run exactly like the compose
+  file itself, never hand-edited. Its whole purpose is Dockge: Dockge's own Start/Stop/Restart
+  buttons run `docker compose` with **none** of `install.sh`'s printed shell prefix, so before this
+  file existed those buttons (and any bare `docker compose` typed by hand) fell straight through to
+  `docker-compose.yml`'s own `:-` fallbacks — `env_file` pointing at a `.env` that was never there,
+  `container_name` defaulting to the monorepo-era `warbandeer-discord` (issue #41). Shell-exported
+  values still win when present, so nothing about `ops/bot-ops.sh`'s own explicit exports
+  (`cmd_restart`, `cmd_env_set`) or `ops/install.sh`'s printed bootstrap command changes: those
+  continue to set `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/`BOT_BUILD_CONTEXT` per-invocation as before.
+  `docker-compose.yml`'s own `:-.`/`:-warbandeer-discord`/`:-.env` fallbacks are left in place on
+  purpose — a plain `docker compose up -d --build` run directly from this checkout for local dev
+  (documented in the compose file's own header) has no stack-directory `.env` to fall back to, and
+  relies on exactly those defaults. Self-update's own rebuilds (`src/redeploy.ts`) were already
+  remote-context-based before any of this, via the Docker Engine API directly, not `docker
+  compose` — untouched by it.
 - **A profile-gated service still gets fully interpolated and validated at `docker compose
   config` time, regardless of which `--profile` is active.** Profiles only filter which services
   actually get *created/started*; the whole file is parsed and every service's variables
