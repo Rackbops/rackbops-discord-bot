@@ -4,6 +4,7 @@ import {
   adminRemovalError,
   auditLogLine,
   authorizeRequest,
+  branchNamesFromApi,
   buildInvocation,
   createAccessJwtVerifier,
   describeAction,
@@ -21,6 +22,7 @@ import {
   normalizeTeamDomain,
   parseAllowedEmails,
   parseChangedKeys,
+  parseEnvValue,
   renderIndexHtml,
   tokensMatch,
   type AdminStore,
@@ -744,6 +746,30 @@ describe("renderIndexHtml", () => {
   });
 });
 
+describe("parseEnvValue", () => {
+  const env = 'GITHUB_REPO=owner/name\nGITHUB_TOKEN="ghp_secret"\nQUOTED=\'v=1\'\nEMPTY=\nSPACED= trimmed \r\nOTHER=x';
+  test("reads an unquoted value", () => expect(parseEnvValue(env, "GITHUB_REPO")).toBe("owner/name"));
+  test("strips one layer of double quotes", () => expect(parseEnvValue(env, "GITHUB_TOKEN")).toBe("ghp_secret"));
+  test("strips single quotes and keeps an inner '='", () => expect(parseEnvValue(env, "QUOTED")).toBe("v=1"));
+  test("an empty value is an empty string", () => expect(parseEnvValue(env, "EMPTY")).toBe(""));
+  test("trims surrounding whitespace and a trailing CR", () => expect(parseEnvValue(env, "SPACED")).toBe("trimmed"));
+  test("a missing key is undefined", () => expect(parseEnvValue(env, "NOPE")).toBeUndefined());
+  test("matches a whole key, not a prefix", () => expect(parseEnvValue("GITHUB_REPOSITORY=x", "GITHUB_REPO")).toBeUndefined());
+});
+
+describe("branchNamesFromApi", () => {
+  test("extracts names from the GitHub branches shape", () => {
+    expect(branchNamesFromApi([{ name: "main" }, { name: "dev" }])).toEqual(["main", "dev"]);
+  });
+  test("drops nameless / malformed entries", () => {
+    expect(branchNamesFromApi([{ name: "main" }, {}, { name: 5 }, null])).toEqual(["main"]);
+  });
+  test("a non-array body yields no branches", () => {
+    expect(branchNamesFromApi({ message: "Not Found" })).toEqual([]);
+    expect(branchNamesFromApi(null)).toEqual([]);
+  });
+});
+
 describe("buildInvocation", () => {
   const noBody = undefined;
 
@@ -840,6 +866,37 @@ describe("handleRequest", () => {
       runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
     });
     expect(res.status).toBe(404);
+  });
+
+  const branchCfg = (overrides: Partial<HandlerConfig> = {}): HandlerConfig => ({
+    adminToken: TOKEN,
+    indexHtml: INDEX_HTML,
+    runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+    ...overrides,
+  });
+  const authed = (path: string) => new Request("http://x" + path, { headers: { Authorization: `Bearer ${TOKEN}` } });
+
+  test("/api/branches returns the listed branches to an authorized caller", async () => {
+    const res = await handleRequest(authed("/api/branches"), branchCfg({ listBranches: async () => ["main", "dev"] }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ branches: ["main", "dev"] });
+  });
+
+  test("/api/branches 502s when the lookup fails (null)", async () => {
+    const res = await handleRequest(authed("/api/branches"), branchCfg({ listBranches: async () => null }));
+    expect(res.status).toBe(502);
+  });
+
+  test("/api/branches 404s when no branch lister is configured", async () => {
+    const res = await handleRequest(authed("/api/branches"), branchCfg());
+    expect(res.status).toBe(404);
+  });
+
+  test("/api/branches requires auth (no token -> 401, never calls the lister)", async () => {
+    let called = false;
+    const res = await handleRequest(new Request("http://x/api/branches"), branchCfg({ listBranches: async () => { called = true; return ["main"]; } }));
+    expect(res.status).toBe(401);
+    expect(called).toBe(false);
   });
 
   test("rejects an /api/* call with no token", async () => {
