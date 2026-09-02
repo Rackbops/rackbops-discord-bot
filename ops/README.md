@@ -266,8 +266,9 @@ falls back to a plain text input.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
-`bot-ops.sh` itself; `ops/install.sh`'s printed output includes the exact command). It runs as
-its own sidecar, independent of the bot process's lifecycle — if the bot crashes, the panel
+`bot-ops.sh` itself; `ops/install.sh`'s printed output includes the exact command, which names
+the `admin` service explicitly so it never rebuilds or recreates the running `bot` container).
+It runs as its own sidecar, independent of the bot process's lifecycle — if the bot crashes, the panel
 stays up to show that and let you restart it. No published host port: it's reachable only via
 the `cloudflared` sidecar on the same compose network, which is itself gated by Access — so
 until a tunnel actually routes to it, bringing the profile up just starts a service nothing
