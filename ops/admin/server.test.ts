@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
   adminRemovalError,
@@ -1074,5 +1075,73 @@ describe("handleRequest", () => {
     );
     expect(res.status).toBe(200);
     expect(store.dynamic.has("new@x.com")).toBe(true);
+  });
+});
+
+// WOW_REALM slug validation lives in TWO hand-duplicated places: the authority is bot-ops.sh's
+// ALLOWED[WOW_REALM] regex (bash, on the box), mirrored by REALM_SLUG_RE in the panel's index.html
+// (client JS that filters the realm chooser). This block reads both from source and pins them so
+// they can't drift, then pins the behaviour that matters — the accented EU realm slugs Blizzard's
+// connected-realm search only matches in their accented form (its ASCII-folded spelling returns zero
+// results, verified against the live API) must validate; URL/shell-metacharacter and out-of-charset
+// input must not. It runs in JS, so it mirrors bash ERE for this simple pattern rather than proving
+// the bash engine itself — the on-box env-set check does that.
+describe("WOW_REALM slug validation (bot-ops.sh ↔ panel filter stay in sync)", () => {
+  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const botOpsPattern = botOpsSrc.match(/\[WOW_REALM\]='([^']+)'/)?.[1];
+  const panelPattern = indexSrc.match(/REALM_SLUG_RE\s*=\s*\/(.+?)\/\s*;/)?.[1];
+
+  test("both source patterns are present and identical (mirror can't drift)", () => {
+    expect(botOpsPattern).toBeDefined();
+    expect(panelPattern).toBeDefined();
+    expect(panelPattern).toBe(botOpsPattern);
+  });
+
+  // The 7 EU realms Blizzard only matches by their accented slug, plus plain-ASCII controls.
+  const mustAccept = [
+    "aggra-português",
+    "chants-éternels",
+    "confrérie-du-thorium",
+    "festung-der-stürme",
+    "la-croisade-écarlate",
+    "marécage-de-zangar",
+    "pozzo-delleternità",
+    "eitrigg",
+    "hyjal",
+    "thorium-brotherhood",
+  ];
+  // Whitespace, shell/URL metacharacters, path traversal, uppercase, out-of-charset symbols, empty,
+  // and over-length must never validate — the value is interpolated into a URL and shown in Discord.
+  const mustReject = [
+    "chants eternels",
+    "a&b",
+    "a=b",
+    "a$(x)",
+    "a`x`",
+    "a;b",
+    "a|b",
+    "a/b",
+    "a?b",
+    "a#b",
+    "a%b",
+    "a@b",
+    "a<b",
+    "a>b",
+    "a'b",
+    'a"b',
+    "a\\b",
+    "../etc",
+    "Hyjal",
+    "a÷b",
+    "a×b",
+    "",
+    "x".repeat(41),
+  ];
+
+  test("accepts real accented + ASCII slugs, rejects unsafe / out-of-charset input", () => {
+    const re = new RegExp(botOpsPattern ?? "(?!)");
+    for (const slug of mustAccept) expect(re.test(slug)).toBe(true);
+    for (const bad of mustReject) expect(re.test(bad)).toBe(false);
   });
 });

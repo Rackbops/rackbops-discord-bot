@@ -245,10 +245,12 @@ is regenerated locally, by hand, about once a year (WoW realm lists change that 
 `bun run ops/tools/gen-realms.ts` — a script that lives outside `ops/admin/` (so it's never in the
 deployed image and adds no dependency to it), reads Blizzard client creds from
 `R:\repos\secrets\BattleNetAPI-secrets.json` (`ID`/`SECRET`), and calls the realm-index endpoint
-via the `roshne/battlenet-api-research` client. It offers only realm slugs `bot-ops.sh`'s
-`WOW_REALM` regex accepts (`^[a-z0-9-]{1,40}$`), so it never suggests a realm the server would
-reject — which currently drops a handful of EU realms with accented slugs. If `realms.json` is
-absent, `WOW_REALM` gracefully falls back to a plain text input.
+via the `roshne/battlenet-api-research` client, writing every slug it returns (accented EU slugs
+included). The chooser then offers only slugs `bot-ops.sh`'s `WOW_REALM` regex accepts — lowercase
+ASCII plus accented Latin letters, so EU realms like `chants-éternels` and `aggra-português` are
+offered — never suggesting a realm the server would reject. (`REALM_SLUG_RE` in `index.html` is a
+hand-duplicated mirror of that regex; `ops/admin/server.test.ts` guards the two against drift.) If
+`realms.json` is absent, `WOW_REALM` gracefully falls back to a plain text input.
 
 **The `BOT_BRANCH` chooser** lists the configured repo's live branches (branches change far too
 often for a static list) via `GET /api/branches`, which calls the GitHub API server-side.

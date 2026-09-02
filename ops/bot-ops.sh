@@ -74,7 +74,17 @@ declare -A ALLOWED=(
   [RELEASE_ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
   [REPORT_ROLE_ID]='^[0-9]{5,25}$'
   [ADMIN_USER_IDS]='^[0-9]{5,25}(,[0-9]{5,25})*$'
-  [WOW_REALM]='^[a-z0-9-]{1,40}$'
+  # Blizzard realm slugs are lowercase ASCII plus accented Latin letters (7 live EU realms use
+  # à/é/ê/ü — e.g. chants-éternels, aggra-português; the other lowercase Latin-1 letters are listed
+  # for realms Blizzard may add later). ENUMERATE them — never a range like à-ÿ: env-set can run in
+  # the admin container's C locale, where [[ =~ ]] matches byte-wise, so a multibyte range does NOT
+  # error — it silently decomposes into an over-broad byte range that wrongly admits ÷ (U+00F7) and
+  # other non-slug characters. Each enumerated char is admitted under both C (byte-wise) and UTF-8
+  # (char-wise); only the {1,40} bound differs (bytes vs chars), which is moot — real slugs run well
+  # under 40. Stays tight otherwise (the value is interpolated into a Blizzard API URL in realm.ts
+  # and shown in Discord). REALM_SLUG_RE in ops/admin/public/index.html mirrors this; server.test.ts
+  # guards them from drift.
+  [WOW_REALM]='^[a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]{1,40}$'
   [WOW_REGION]='^(us|eu)$'
   [WATCHED_REPOS]='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
   [DMF_TIMEZONE]='^[A-Za-z_]+/[A-Za-z_]+$'
