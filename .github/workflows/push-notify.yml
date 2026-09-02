@@ -1,0 +1,42 @@
+name: push-notify
+
+# Post one Discord notification per push to main (as Github-Repo-Updates), via the
+# shared reusable workflow in roshne/addon-ci. Because this repo squash-merges, a push
+# to main IS a merged PR -- so this is "tell me when a PR lands", one message per merge.
+#
+# Triggers on main ONLY: a feature-branch push posts nothing, and the branch push plus
+# its squash-merge can't double-post (the failure the native webhook had -- roshne/Tooling#111).
+#
+# addon-ci stays on roshne deliberately -- it is a PUBLIC reusable-workflow library, and
+# calling it across owners is fine (see Rackbops/Tooling#310).
+#
+# DISCORD_PUSH_WEBHOOK is passed EXPLICITLY, never via `secrets: inherit`. This is
+# load-bearing: Rackbops is a FREE org, so a PRIVATE repo cannot access org-level
+# secrets -- but `inherit` still resolves the name to that inaccessible ORG secret and
+# passes an empty string, SHADOWING the repo-level secret that would have worked. The
+# reusable workflow then skips GREEN, so nothing fails and no notification is sent.
+# Explicit passing evaluates in this repo's own context, which resolves repo-level
+# first and falls back to org-level -- correct for private and public repos alike.
+# Diagnosed 2026-09-02 on Rackbops/the-keeper#5. The reusable workflow still skips
+# green when the secret is genuinely unset, so this file is harmless in a fork.
+on:
+  push:
+    branches: [main]
+    # Pushes that are *only* bookkeeping don't earn a Discord post. GitHub skips the
+    # whole workflow (no runner, no billed minute) when EVERY path in the push matches;
+    # a push mixing one of these with real code still notifies -- the filter mutes noise,
+    # it never hides a code change.
+    # CLAUDE.md is deliberately NOT here: it steers Claude, so it's behaviour, not prose.
+    # paths-ignore can't carry an exception, so the doc files are enumerated by name
+    # rather than glob **/*.md.
+    paths-ignore:
+      - '**/README.md'          # `**/` matches a root README.md too
+      - '**/CONTRIBUTING.md'
+      - '**/CONTEXT.md'
+      - 'docs/**'               # the docs tree, incl. non-md assets
+
+jobs:
+  notify:
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@main
+    secrets:
+      DISCORD_PUSH_WEBHOOK: ${{ secrets.DISCORD_PUSH_WEBHOOK }}
