@@ -29,6 +29,7 @@ import {
   HANDOFF_FROM_ENV,
   readMarker,
   RETIREMENT_DEADLINE_MS,
+  writeMarker,
   type HandoffOutcome,
 } from "./handoff";
 import { beginHandoff, endHandoff } from "./restart";
@@ -272,6 +273,75 @@ export async function retireOriginal(originalId: string): Promise<void> {
   } catch (err) {
     // Not fatal — the bot is up and serving. It just isn't where `bot-ops.sh` looks for it.
     console.warn(`[handoff] could not take the name ${name}: ${(err as Error).message}`);
+  }
+}
+
+/** Test seams for {@link takeOver}: each defaults to the real effect, and is overridden in tests
+ *  so the failure path can be exercised without a live daemon or touching the marker file. */
+export interface TakeOverEffects {
+  write?: typeof writeMarker;
+  retire?: typeof retireOriginal;
+  clear?: typeof clearMarker;
+  exit?: (code: number) => void;
+}
+
+/**
+ * Complete the swap from the replacement's side, and make that completion crash-proof.
+ *
+ * Runs in the *replacement*: it announces `ready` (which stops the original counting toward its
+ * deadline), retires the *original* — `retireOriginal` stops that other container, never this
+ * one — and clears the marker. On success this returns, and `index.ts` goes on to `activate()`;
+ * this process is the survivor that becomes the live bot.
+ *
+ * The guard is for the unhappy path. Almost every throw site inside is at or before the original
+ * is stopped: `write` and the pre-stop inspect precede it, and `stopContainer` throws on an HTTP
+ * error before the stop has taken — so a throw normally leaves the original still alive and about
+ * to reclaim us, via `failed` if it is still polling or `stalled` once it gives up waiting for a
+ * stop that never comes. The lone exception is a transport-level drop *after* the daemon has
+ * already stopped the original but before its response returns; then both bots are momentarily
+ * down, but only momentarily — `unless-stopped` restarts this process, its next `takeOver` finds
+ * the original already stopped (a no-op stop, then it removes it and takes the name) and goes
+ * live. So the worst case is a bounded, self-recovering blip: never a permanent outage, and never
+ * two live bots.
+ *
+ * On failure, then, we do the one safe thing: write a `failed` marker — which lets an original
+ * still polling reclaim at once instead of waiting its deadline out — and exit. We must not fall
+ * through to `activate()`: two live bots on the one shared token would double every reply for the
+ * seconds until the original tore us down regardless.
+ *
+ * Left unguarded, as it was, the throw became an unhandled rejection that crashed the replacement
+ * mid-handoff — the same class of bug #33 fixed for slash-command registration, and it mirrors
+ * the verify-deadline path in `index.ts`, which gives up in exactly this shape.
+ */
+export async function takeOver(originalId: string, effects: TakeOverEffects = {}): Promise<void> {
+  const write = effects.write ?? writeMarker;
+  const retire = effects.retire ?? retireOriginal;
+  const clear = effects.clear ?? clearMarker;
+  const exit = effects.exit ?? ((code: number) => process.exit(code));
+  try {
+    await write({ status: "ready", sha: config.gitSha, at: Date.now() });
+    await retire(originalId);
+    await clear();
+  } catch (err) {
+    console.error(
+      "[handoff] takeover failed — the original was never stopped, so it stays live and reclaims" +
+        " (via its failed/stalled path); this replacement exits rather than run a second live bot" +
+        " on the shared token.",
+      err,
+    );
+    // Best-effort: if the marker mechanism itself is what broke, the original still reclaims on
+    // its own deadline — the exit is what matters, so a failed write here must not stop it.
+    await write({
+      status: "failed",
+      sha: config.gitSha,
+      // `instanceof`, not `(err as Error).message`: a bare `throw null` would otherwise raise a
+      // TypeError here — inside the catch, before `.catch` attaches — re-rejecting the very
+      // promise this guard exists to keep from rejecting. No production site throws a non-Error,
+      // but "crash-proof" has to hold unconditionally.
+      error: `takeover failed: ${err instanceof Error ? err.message : String(err)}`,
+      at: Date.now(),
+    }).catch(() => {});
+    exit(1);
   }
 }
 

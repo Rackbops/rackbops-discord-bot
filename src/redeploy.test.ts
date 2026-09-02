@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { ContainerInspect, ImageSummary } from "./docker";
+import type { HandoffMarker } from "./handoff";
 
 // redeploy.ts pulls in the `config` singleton (env resolved at import time) — see config.test.ts.
 process.env.DISCORD_TOKEN ??= "test-token";
@@ -11,6 +12,7 @@ const {
   imageTags,
   replacementName,
   selectImagesToPrune,
+  takeOver,
 } = await import("./redeploy");
 
 const SELF: ContainerInspect = {
@@ -207,5 +209,78 @@ describe("buildCreateSpec", () => {
       { image: "i", handoffFrom: "x" },
     );
     expect(ro.HostConfig.Binds).toEqual(["/etc/x:/etc/x:ro"]);
+  });
+});
+
+describe("takeOver", () => {
+  const ID = "b".repeat(64);
+
+  test("announces ready, retires the original, clears the marker — and never exits", async () => {
+    const order: string[] = [];
+    const exits: number[] = [];
+    let retired: string | undefined;
+    await takeOver(ID, {
+      write: async (m) => void order.push(`write:${m.status}`),
+      retire: async (id) => void (order.push("retire"), (retired = id)),
+      clear: async () => void order.push("clear"),
+      exit: (code) => void exits.push(code),
+    });
+    // Order is load-bearing: `ready` must be written *before* the retire — that write is what
+    // stops the original counting toward its deadline and removing a replacement that has in fact
+    // verified. Assert the exact sequence, so a reorder can't slip through green.
+    expect(order).toEqual(["write:ready", "retire", "clear"]);
+    expect(retired).toBe(ID);
+    expect(exits).toEqual([]);
+  });
+
+  // The crux of the fix: a retire that throws must not become an unhandled rejection. The
+  // original was never stopped (`stopContainer` only throws when the stop failed), so it is
+  // alive to reclaim — we tell it why with a `failed` marker and exit, rather than crashing or
+  // falling through to activate() and running a second live bot on the shared token.
+  test("a retire failure writes a failed marker and exits 1 instead of crashing", async () => {
+    const writes: HandoffMarker[] = [];
+    const exits: number[] = [];
+    let cleared = false;
+    await takeOver(ID, {
+      write: async (m) => void writes.push(m),
+      retire: async () => {
+        throw new Error("daemon unreachable");
+      },
+      clear: async () => void (cleared = true),
+      exit: (code) => void exits.push(code),
+    });
+    expect(exits).toEqual([1]);
+    expect(cleared).toBe(false); // short-circuited past the happy-path clear
+    const failed = writes.find((m) => m.status === "failed");
+    expect(failed?.error).toContain("daemon unreachable");
+  });
+
+  // Belt and suspenders: if the marker mechanism itself is what's broken, the give-up write
+  // fails too — the exit must still happen so the original reclaims on its own deadline.
+  test("still exits when even the failed-marker write throws", async () => {
+    const exits: number[] = [];
+    await takeOver(ID, {
+      write: async () => {
+        throw new Error("disk full");
+      },
+      retire: async () => void 0,
+      exit: (code) => void exits.push(code),
+    });
+    expect(exits).toEqual([1]);
+  });
+
+  // The catch builds the give-up marker's message out of `err`; a bare `throw null` must not
+  // defeat the guard by throwing a TypeError before `exit`. No production site throws a non-Error,
+  // but "crash-proof" has to mean crash-proof — so this pins the `instanceof` narrowing.
+  test("a non-Error throw still exits cleanly instead of re-rejecting", async () => {
+    const exits: number[] = [];
+    await takeOver(ID, {
+      write: async () => void 0,
+      retire: async () => {
+        throw null;
+      },
+      exit: (code) => void exits.push(code),
+    });
+    expect(exits).toEqual([1]);
   });
 });

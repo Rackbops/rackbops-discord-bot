@@ -4,8 +4,8 @@ import { commandData, handleCommand } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
-import { bootMode, clearMarker, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
-import { retireOriginal } from "./redeploy";
+import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
+import { takeOver } from "./redeploy";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const mode = bootMode(process.env);
@@ -14,8 +14,10 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   clearTimeout(verifyTimer);
   // A completed gateway login is the verification bar: process-alive proves nothing, and this
-  // is the first moment the new build has demonstrated it can actually do its job.
-  if (mode === "standby") await takeOver();
+  // is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
+  // crash-proof — a retire failure exits this process rather than falling through to `activate`,
+  // so a doomed handoff can never leave two live bots on the shared token.
+  if (mode === "standby") await takeOver(process.env[HANDOFF_FROM_ENV]!);
   await activate(c);
 });
 
@@ -70,20 +72,6 @@ async function activate(c: Client<true>): Promise<void> {
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own.
   reportUpdateOutcome(client).catch((err) => console.error("[updateReport]", err));
-}
-
-/**
- * Retire the container that started us, and take its name.
- *
- * The marker is written *first*, in the same breath: it closes the window where the original
- * could hit its own deadline and remove a replacement that had already verified. Once it reads
- * `ready` it stops counting and simply waits to be stopped.
- */
-async function takeOver(): Promise<void> {
-  const originalId = process.env[HANDOFF_FROM_ENV]!;
-  await writeMarker({ status: "ready", sha: config.gitSha, at: Date.now() });
-  await retireOriginal(originalId);
-  await clearMarker();
 }
 
 // A standby that never reaches ClientReady must say so rather than sit there: the original is
