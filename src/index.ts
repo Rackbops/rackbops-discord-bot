@@ -26,13 +26,33 @@ client.once(Events.ClientReady, async (c) => {
  */
 async function activate(c: Client<true>): Promise<void> {
   const rest = new REST().setToken(config.discordToken);
-  await rest.put(
-    config.guildId
-      ? Routes.applicationGuildCommands(c.user.id, config.guildId)
-      : Routes.applicationCommands(c.user.id),
-    { body: commandData },
-  );
-  console.log(`Registered ${commandData.length} slash commands`);
+  try {
+    await rest.put(
+      config.guildId
+        ? Routes.applicationGuildCommands(c.user.id, config.guildId)
+        : Routes.applicationCommands(c.user.id),
+      { body: commandData },
+    );
+    console.log(`Registered ${commandData.length} slash commands`);
+  } catch (err) {
+    // A command-registration failure must not take the whole bot down. This used to run unguarded
+    // in the ClientReady handler, so a throw became an unhandled rejection, the process crashed,
+    // and restart:unless-stopped relaunched it into a tight loop. The usual cause is a guild the
+    // bot was added to without the applications.commands scope — Discord rejects that with 50001
+    // Missing Access, a config/invite problem no restart can fix. Log it and keep running: the
+    // scheduler and any already-registered commands still work, and the next boot after the invite
+    // is fixed will register them.
+    console.error(
+      "[startup] slash-command registration failed" +
+        (config.guildId ? ` for guild ${config.guildId}` : " (global)") +
+        "; the bot keeps running, but its slash commands won't appear in that guild until this is" +
+        ' fixed. "Missing Access" (50001) means the bot lacks the applications.commands scope there.' +
+        " Re-invite it with that scope (that fixes both this error and command visibility)." +
+        " Clearing DISCORD_SERVER_ID switches to global registration and stops the error, but the" +
+        " bot still needs the applications.commands scope for its commands to appear in a guild.",
+      err,
+    );
+  }
 
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
