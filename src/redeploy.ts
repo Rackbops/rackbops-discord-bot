@@ -182,7 +182,19 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   }
   console.log(`[redeploy] replacement ${name} started — waiting for it to verify`);
 
-  let outcome = await awaitHandoff(replacementId);
+  let outcome: HandoffOutcome;
+  let pollError: string | undefined;
+  try {
+    outcome = await awaitHandoff(replacementId);
+  } catch (err) {
+    // A daemon blip mid-poll (a dropped socket, one 500) must not escape uncaught: left
+    // unguarded, this rejection propagated straight through `applyUpdate` -> `checkForUpdate`
+    // and skipped everything below, including `endHandoff()` — quiescing the bot forever (#37).
+    pollError = (err as Error).message;
+    console.error(`[redeploy] handoff poll failed: ${pollError} — reclaiming`);
+    outcome = "failed";
+  }
+
   if (outcome === "ready") {
     // It has verified and is retiring us; this process is about to be stopped mid-sentence.
     // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
@@ -198,11 +210,18 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   }
 
   const marker = await readMarker();
-  await removeContainer(replacementId, true);
-  await clearMarker();
-  endHandoff();
+  try {
+    await removeContainer(replacementId, true);
+  } catch (err) {
+    // Cleanup, not the verdict — a stuck removal (e.g. a 409 mid-teardown) must not skip the
+    // `endHandoff()` below either, for the same reason a poll failure above must not.
+    console.error(`[redeploy] could not remove the replacement: ${(err as Error).message}`);
+  } finally {
+    await clearMarker();
+    endHandoff();
+  }
   console.warn(`[redeploy] handoff ${outcome} — staying on the current build`);
-  return { outcome, error: marker?.error };
+  return { outcome, error: pollError ?? marker?.error };
 }
 
 /** Poll the marker and the replacement's own state until one of them decides it. */
