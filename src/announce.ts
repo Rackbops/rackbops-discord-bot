@@ -49,17 +49,50 @@ async function announce(client: Client, kind: AnnounceKind, message: string): Pr
   console.log("[announce]", message);
 }
 
+export interface TickCheck {
+  name: string;
+  run: () => Promise<void>;
+}
+
+/**
+ * Runs each check in order, isolating failures so one throwing can't starve the rest of the tick
+ * (issue #43) — the same per-item try/catch shape `checkReleases` already uses per repo, now
+ * applied across all five checks instead of just that one. Exported so the isolation itself is
+ * tested directly, without mocking discord.js's `Client` end-to-end.
+ */
+export async function runTick(checks: TickCheck[]): Promise<void> {
+  for (const { name, run } of checks) {
+    try {
+      await run();
+    } catch (err) {
+      console.error(`[tick:${name}]`, err);
+    }
+  }
+}
+
 async function onTick(client: Client): Promise<void> {
   if (restartPending()) return; // on the way out — don't start work we can't finish
   // The whole tick is one critical section: a restart requested by the update check
   // below lands only once every announcement and state write has settled.
-  await withCritical(async () => {
-    await checkDmf(client);
-    await checkWeeklyReset(client);
-    await checkRealm(client);
-    if (shouldPollReleases(new Date())) await checkReleases(client);
-    if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
-  });
+  await withCritical(() =>
+    runTick([
+      { name: "dmf", run: () => checkDmf(client) },
+      { name: "weeklyReset", run: () => checkWeeklyReset(client) },
+      { name: "realm", run: () => checkRealm(client) },
+      {
+        name: "releases",
+        run: async () => {
+          if (shouldPollReleases(new Date())) await checkReleases(client);
+        },
+      },
+      {
+        name: "autoUpdate",
+        run: async () => {
+          if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+        },
+      },
+    ]),
+  );
 }
 
 function shouldPollUpdate(): boolean {

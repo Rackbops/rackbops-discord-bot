@@ -101,7 +101,14 @@ declare -A ALLOWED=(
   [WOW_REALM]='^[a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]{1,40}$'
   [WOW_REGION]='^(us|eu)$'
   [WATCHED_REPOS]='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
-  [DMF_TIMEZONE]='^[A-Za-z_]+/[A-Za-z_]+$'
+  # Shape only, not a real-zone check (same philosophy as WOW_REALM above) — the old
+  # exactly-one-slash, letters-only pattern both accepted garbage (e.g. "Europe/Pari") and
+  # rejected real IANA zones: 3-segment names (America/Argentina/Buenos_Aires,
+  # America/Indiana/Indianapolis), hyphens (America/Port-au-Prince), a "+" (Etc/GMT+1), and
+  # no-slash names (UTC). The bot's own resolveConfig is the real gate (issue #43): it rejects
+  # anything Intl.DateTimeFormat doesn't recognize as a zone, at startup, before this shape check
+  # ever gets a chance to be the only thing standing between a typo and a silently-dead scheduler.
+  [DMF_TIMEZONE]='^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+){0,2}$'
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
