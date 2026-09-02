@@ -56,6 +56,17 @@
   }
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
   .field-hint { font-size: 11px; color: var(--muted); margin: 0 0 4px; }
+  /* Tag/chip editor for comma-separated list fields (ADMIN_USER_IDS, WATCHED_REPOS). Looks like an
+     input box with each entry as a removable chip, plus an inline field to type the next one. */
+  .tag-field { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: #0d0f13; border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
+  .tag-field .tag { display: inline-flex; align-items: center; gap: 4px; background: #1b2130; border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 12px; word-break: break-all; }
+  .tag-field .tag button { background: transparent; color: var(--muted); border: none; border-radius: 999px; padding: 2px 6px; font-size: 14px; line-height: 1; cursor: pointer; width: auto; }
+  .tag-field .tag button:hover { color: var(--danger); }
+  .tag-field .tag-add { flex: 1 1 100px; min-width: 80px; width: auto; border: none; background: transparent; padding: 2px; }
+  /* The add input is borderless/transparent, so show focus on the whole field instead of a ring
+     around just the caret (which WCAG 2.4.7 doesn't count). */
+  .tag-field:focus-within { border-color: var(--accent); }
+  .tag-field .tag-add:focus { outline: none; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .status-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
   .status-grid dt { color: var(--muted); }
@@ -525,11 +536,12 @@
     ANNOUNCE_CHANNEL_ID: { hint: "Gets DMF, weekly-reset, and server up/down announcements — and releases too, unless the field below is set." },
     RELEASE_ANNOUNCE_CHANNEL_ID: { hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank." },
     REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
-    ADMIN_USER_IDS: { hint: "Comma-separated Discord user IDs allowed to run /update." },
+    ADMIN_USER_IDS: { control: "tags", hint: "Discord user IDs allowed to run /update. Add one per chip.", placeholder: "Discord user ID" },
     WOW_REGION: { control: "select", options: ["us", "eu"] },
     AUTO_UPDATE: { control: "select", options: ["true", "false"] },
     DMF_TIMEZONE: { control: "timezone", hint: "IANA name, e.g. America/Los_Angeles. Blank uses the region default." },
     WOW_REALM: { control: "realm", hint: "Realm whose up/down status the bot tracks. Options follow the WOW_REGION set below — type the start of a name to jump to it. Blank tracks no realm." },
+    WATCHED_REPOS: { control: "tags", hint: "GitHub repos the bot watches for new releases to announce (owner/repo each). Empty falls back to just GITHUB_REPO.", placeholder: "owner/repo" },
   };
 
   // IANA zone list for the DMF_TIMEZONE datalist — from the browser, no hardcoded list, absent on
@@ -609,8 +621,81 @@
 
   let loadedEnv = {}; // last-loaded values, for the save-time diff/confirmation
 
+  // A chip editor for a comma-separated list field (ADMIN_USER_IDS, WATCHED_REPOS). The value
+  // carrier saveEnv reads is a nested hidden <input data-key> holding the canonical comma-joined
+  // list — seeded with the RAW loaded value so an untouched field records no diff, and recomputed
+  // (normalized, no spaces) only once the user actually edits. Per-token validation is left to
+  // bot-ops.sh (the enforcing backstop); this just splits on commas, trims, and de-dupes.
+  function buildTagControl(key, value, meta) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "tag-field";
+
+    const hidden = document.createElement("input");
+    hidden.type = "hidden";
+    hidden.dataset.key = key;
+    hidden.value = value;
+
+    const add = document.createElement("input");
+    add.type = "text";
+    add.className = "tag-add";
+    add.id = "env-" + key; // the field the <label> focuses (wrapper carries dataset.focusId)
+    add.placeholder = meta.placeholder || "add…";
+    add.autocomplete = "off";
+
+    // De-duped so removing a chip (filter-by-value) can't drop two identical entries; the hidden
+    // carrier still holds the raw value until an edit, so a de-duped display alone records no diff.
+    let tokens = [...new Set(value.split(",").map((t) => t.trim()).filter(Boolean))];
+    const sync = () => { hidden.value = tokens.join(","); };
+    function render() {
+      wrapper.querySelectorAll(".tag").forEach((el) => el.remove());
+      const frag = document.createDocumentFragment();
+      for (const tok of tokens) {
+        const chip = document.createElement("span");
+        chip.className = "tag";
+        const text = document.createElement("span");
+        text.textContent = tok; // list values are operator-supplied — textContent keeps them inert
+        const x = document.createElement("button");
+        x.type = "button";
+        x.textContent = "×";
+        x.title = "Remove " + tok;
+        x.setAttribute("aria-label", "Remove " + tok); // the "×" glyph would otherwise be the a11y name
+        x.addEventListener("click", () => { tokens = tokens.filter((t) => t !== tok); sync(); render(); });
+        chip.appendChild(text);
+        chip.appendChild(x);
+        frag.appendChild(chip);
+      }
+      wrapper.insertBefore(frag, add); // chips render before the typing field
+    }
+    function commit() {
+      // Split on commas too, so pasting "a,b,c" adds three chips at once.
+      const parts = add.value.split(",").map((t) => t.trim()).filter(Boolean);
+      let changed = false;
+      for (const p of parts) if (!tokens.includes(p)) { tokens.push(p); changed = true; }
+      add.value = "";
+      if (changed) { sync(); render(); }
+    }
+    add.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === ",") { e.preventDefault(); commit(); }
+      // Backspace on an empty field removes the last chip — familiar tag-input behavior.
+      else if (e.key === "Backspace" && add.value === "" && tokens.length) { tokens.pop(); sync(); render(); }
+    });
+    add.addEventListener("blur", commit); // capture typed-but-not-entered text before a Save
+
+    wrapper.appendChild(add);
+    wrapper.appendChild(hidden);
+    render();
+    // Clicking the field's empty area focuses the typing input (standard tag-input affordance),
+    // without hijacking clicks on a chip or its remove button.
+    wrapper.addEventListener("mousedown", (e) => { if (e.target === wrapper) { e.preventDefault(); add.focus(); } });
+    wrapper.dataset.focusId = add.id;
+    return wrapper;
+  }
+
   function buildEnvControl(key, value) {
     const meta = FIELD_META[key] || {};
+    // Self-contained composite (its own nested id/data-key/focusId) — return before the common
+    // id/dataset tail below, which would otherwise put a second data-key on the wrapper.
+    if (meta.control === "tags") return buildTagControl(key, value, meta);
     let control;
     if (meta.control === "select") {
       control = document.createElement("select");
@@ -660,7 +745,9 @@
         const control = buildEnvControl(key, value);
         const label = document.createElement("label");
         label.textContent = key;
-        label.htmlFor = control.id; // clicking the label focuses the field
+        // Clicking the label focuses the field; a composite control (tags) points at its nested
+        // input via dataset.focusId, since the wrapper itself isn't focusable.
+        label.htmlFor = control.dataset.focusId || control.id;
         container.appendChild(label);
         const meta = FIELD_META[key];
         if (meta && meta.hint) {
