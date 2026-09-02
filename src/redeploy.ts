@@ -186,27 +186,28 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   let pollError: string | undefined;
   try {
     outcome = await awaitHandoff(replacementId);
+    if (outcome === "ready") {
+      // It has verified and is retiring us; this process is about to be stopped mid-sentence.
+      // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
+      // between writing the marker and stopping us, that promise is never kept, and without a
+      // bound here this process would sit quiesced forever: alive, silent, and doing nothing,
+      // which is the outage #879 exists to prevent. So the wait for our own death gets a
+      // deadline too. Reaching it demotes the outcome to `stalled` and falls through to the
+      // same cleanup as any other failed swap.
+      console.log("[redeploy] replacement verified — handing over");
+      await Bun.sleep(RETIREMENT_DEADLINE_MS);
+      console.error("[redeploy] verified replacement never retired us — reclaiming");
+      outcome = "stalled";
+    }
   } catch (err) {
-    // A daemon blip mid-poll (a dropped socket, one 500) must not escape uncaught: left
-    // unguarded, this rejection propagated straight through `applyUpdate` -> `checkForUpdate`
-    // and skipped everything below, including `endHandoff()` — quiescing the bot forever (#37).
+    // A daemon blip anywhere in this stretch (a dropped socket, one 500 from the poll, or —
+    // pathologically — the retirement wait above) must not escape uncaught: left unguarded,
+    // this rejection propagated straight through `applyUpdate` -> `checkForUpdate` and skipped
+    // everything below, including `endHandoff()` — quiescing the bot forever (#37). Both the
+    // poll and the wait land here so neither can reopen that gap on its own.
     pollError = (err as Error).message;
-    console.error(`[redeploy] handoff poll failed: ${pollError} — reclaiming`);
+    console.error(`[redeploy] handoff decision failed: ${pollError} — reclaiming`);
     outcome = "failed";
-  }
-
-  if (outcome === "ready") {
-    // It has verified and is retiring us; this process is about to be stopped mid-sentence.
-    // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
-    // between writing the marker and stopping us, that promise is never kept, and without a
-    // bound here this process would sit quiesced forever: alive, silent, and doing nothing,
-    // which is the outage #879 exists to prevent. So the wait for our own death gets a
-    // deadline too. Reaching it demotes the outcome to `stalled` and falls through to the
-    // same cleanup as any other failed swap.
-    console.log("[redeploy] replacement verified — handing over");
-    await Bun.sleep(RETIREMENT_DEADLINE_MS);
-    console.error("[redeploy] verified replacement never retired us — reclaiming");
-    outcome = "stalled";
   }
 
   const marker = await readMarker();
