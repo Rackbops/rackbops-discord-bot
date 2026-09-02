@@ -108,12 +108,67 @@ export function adminRemovalError(
  * The panel-managed admin allow-list. `bootstrap` (env, permanent) plus a `dynamic` set persisted
  * out-of-band. `readDynamic` is called fresh on every auth check so an add/remove takes effect
  * immediately with no restart; the whole thing is injected (I/O at the edges) so the routing and
- * management logic test without a real filesystem.
+ * management logic test without a real filesystem. `readDynamic` may throw (see
+ * `readDynamicAdmins`) when the backing store is present but broken — callers must fail closed
+ * on that, never swallow it back into "no dynamic admins" (issue #40's fail-open bug).
  */
 export interface AdminStore {
   bootstrap: Set<string>;
   readDynamic: () => Promise<Set<string>>;
   writeDynamic: (emails: Set<string>) => Promise<void>;
+}
+
+/**
+ * Reads and parses `admins.json`. Distinguishes "absent" (`ENOENT` — the common first-run case,
+ * before any admin has ever been added from the panel) from "present but unreadable or
+ * malformed": the former resolves an empty `Set`, matching pre-existing behavior; the latter
+ * throws, so the caller can fail closed instead of silently treating a broken file as "no
+ * narrowing configured" and reopening the panel to every Access identity. Non-string entries
+ * inside an otherwise-valid array are still dropped silently (matches `branchNamesFromApi`'s
+ * permissive-filter style elsewhere in this file) — only the file-level shape is treated as
+ * broken. Exported (not left inline in the `import.meta.main` closure) so this distinction is
+ * unit-tested directly against real files, not just stubbed away.
+ */
+export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>> {
+  const file = Bun.file(adminsFile);
+  if (!(await file.exists())) return new Set();
+  const parsed: unknown = JSON.parse(await file.text()); // malformed JSON propagates as a throw
+  const emails = (parsed as { emails?: unknown })?.emails;
+  if (!Array.isArray(emails)) {
+    throw new Error(`${adminsFile}: "emails" must be an array (got ${typeof emails})`);
+  }
+  return new Set(
+    emails
+      .filter((e): e is string => typeof e === "string")
+      .map((e) => e.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Startup-time validation for the dynamic admin list — logs the file path and admin count on
+ * success, or the parse/read error via `logError` when `admins.json` exists but is broken (this
+ * exact silent failure is what issue #40 fixed: it used to be indistinguishable from "no dynamic
+ * admins"). `log`/`logError` are injected (default to `console.log`/`console.error`) so the exact
+ * message text is test-pinned rather than only ever eyeballed against a running container's logs.
+ */
+export async function logDynamicAdminsStartup(
+  adminsFile: string | undefined,
+  log: (msg: string) => void = console.log,
+  logError: (msg: string) => void = console.error,
+): Promise<void> {
+  if (!adminsFile) {
+    log("[admin] no BOT_OPS_CONFIG_DIR — dynamic admin list can't persist (ADMIN_ALLOWED_EMAILS still works)");
+    return;
+  }
+  try {
+    const dynamic = await readDynamicAdmins(adminsFile);
+    log(`[admin] ${dynamic.size} dynamic admin(s) loaded from ${adminsFile}`);
+  } catch (err) {
+    logError(
+      `[admin] ${adminsFile} exists but couldn't be read/parsed — dynamic admins fail closed (JWT auth narrows to nobody; ADMIN_TOKEN still works) until this is fixed: ${err}`,
+    );
+  }
 }
 
 /**
@@ -410,15 +465,24 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
       .readDynamic()
       .then((dynamic) => jsonResponse({ bootstrap: [...store.bootstrap].sort(), dynamic: [...dynamic].sort() }));
 
-  if (req.method === "GET") return list();
+  if (req.method === "GET") {
+    try {
+      return await list();
+    } catch (err) {
+      // A broken admins.json (unreadable/malformed) becomes a clean 502, not an unhandled throw.
+      return new Response(`couldn't read the admin list: ${err}`, { status: 502 });
+    }
+  }
 
   if (req.method === "POST" || req.method === "DELETE") {
     const parsed = (await req.json().catch(() => null)) as { email?: unknown } | null;
     const email = normalizeAdminEmail(typeof parsed?.email === "string" ? parsed.email : "");
     if (!email) return new Response("a valid email is required", { status: 400 });
 
-    const dynamic = await store.readDynamic();
     try {
+      // Reading dynamic is inside this try too — a broken admins.json throws here, not just on
+      // the write below, and must surface as the same clean 502 rather than an unhandled throw.
+      const dynamic = await store.readDynamic();
       if (req.method === "POST") {
         if (!store.bootstrap.has(email) && !dynamic.has(email)) {
           dynamic.add(email);
@@ -440,9 +504,9 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
       if (dynamic.delete(email)) await store.writeDynamic(dynamic);
       return await list();
     } catch (err) {
-      // A store write failure (e.g. no config dir to persist to) becomes a clean 502, not an
-      // unhandled throw out of the request handler.
-      return new Response(`couldn't save the admin list: ${err}`, { status: 502 });
+      // A store read failure (broken admins.json) or write failure (e.g. no config dir to
+      // persist to) becomes a clean 502, not an unhandled throw out of the request handler.
+      return new Response(`couldn't read or save the admin list: ${err}`, { status: 502 });
     }
   }
 
@@ -478,10 +542,21 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     return new Response("cross-site request blocked", { status: 403 });
   }
   // Compute the current allow-list once, here at the I/O edge (fresh store read so a just-made
-  // add/remove takes effect immediately), and pass it into the pure authorize decision.
-  const allowedEmails = config.adminStore
-    ? effectiveAllowlist(config.adminStore.bootstrap, await config.adminStore.readDynamic())
-    : undefined;
+  // add/remove takes effect immediately), and pass it into the pure authorize decision. A thrown
+  // readDynamic (admins.json present but broken) fails CLOSED to bootstrap-only: a *defined* Set
+  // (even when bootstrap is itself empty) rather than effectiveAllowlist's `undefined` "nothing
+  // configured" sentinel, so a broken dynamic file can never reopen the panel to every identity
+  // (issue #40) — while a bootstrap-pinned admin's JWT still works untouched, since the dynamic
+  // file's health was never what protected them. ADMIN_TOKEN is unaffected either way.
+  let allowedEmails: Set<string> | undefined;
+  if (config.adminStore) {
+    try {
+      allowedEmails = effectiveAllowlist(config.adminStore.bootstrap, await config.adminStore.readDynamic());
+    } catch (err) {
+      console.error(`[admin] couldn't read the dynamic admin list — failing closed to bootstrap-only: ${err}`);
+      allowedEmails = new Set(config.adminStore.bootstrap);
+    }
+  }
   const auth = await authorizeRequest(req, config, allowedEmails);
   if (!auth) {
     return new Response("unauthorized", { status: 401 });
@@ -617,22 +692,7 @@ if (import.meta.main) {
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
     bootstrap,
-    readDynamic: async () => {
-      if (!adminsFile) return new Set();
-      try {
-        const parsed: unknown = JSON.parse(await Bun.file(adminsFile).text());
-        const emails = (parsed as { emails?: unknown })?.emails;
-        return new Set(
-          (Array.isArray(emails) ? emails : [])
-            .filter((e): e is string => typeof e === "string")
-            .map((e) => e.trim().toLowerCase())
-            .filter(Boolean),
-        );
-      } catch {
-        // Absent (the common first-run case), unreadable, or malformed — treat as no dynamic admins.
-        return new Set();
-      }
-    },
+    readDynamic: () => (adminsFile ? readDynamicAdmins(adminsFile) : Promise.resolve(new Set<string>())),
     writeDynamic: async (emails) => {
       if (!adminsFile) throw new Error("BOT_OPS_CONFIG_DIR is not set — nowhere to persist admin changes");
       const tmp = `${adminsFile}.tmp`;
@@ -654,6 +714,7 @@ if (import.meta.main) {
   } else {
     console.log("[admin] no ADMIN_ALLOWED_EMAILS bootstrap — any Access identity authorizes until admins are added");
   }
+  await logDynamicAdminsStartup(adminsFile);
 
   // The BOT_BRANCH chooser's data source: the configured repo's branches from the GitHub API.
   // GITHUB_REPO/GITHUB_TOKEN are read on demand from the mounted .env (never this process's env, so

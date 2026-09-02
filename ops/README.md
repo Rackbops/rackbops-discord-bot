@@ -204,9 +204,13 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    (comma-separated, in `.env`) — the permanent *bootstrap* floor, editable only on the box — plus
    a **dynamic list managed live from the panel's Admins section**, persisted to `admins.json`
    beside `.env`. With both empty there's no narrowing (any identity Access already let through
-   authorizes); adding even one admin (env or panel) turns narrowing on. You can't lock everyone
-   out: bootstrap admins can't be removed from the panel, you can't remove yourself, and — when
-   there's no bootstrap floor at all — the panel refuses to remove the last remaining admin
+   authorizes); adding even one admin (env or panel) turns narrowing on. If `admins.json` exists
+   but can't be read or parsed (a hand-edit typo, a bad mount), the panel fails **closed**, not
+   open: narrowing stays in effect (no JWT authorizes unless a bootstrap email matches) rather
+   than silently reopening to everyone — the `ADMIN_TOKEN` bearer token remains available to fix
+   the file. You can't lock everyone out: bootstrap admins can't be removed from the panel, you
+   can't remove yourself, and — when there's no bootstrap floor at all — the panel refuses to
+   remove the last remaining admin
    (which would silently reopen it to everyone). Never applied to the bearer-token fallback, which
    stays identity-blind by design.
 
