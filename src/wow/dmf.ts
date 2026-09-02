@@ -3,11 +3,14 @@ import { config } from "../config";
 // The Darkmoon Faire opens at 00:01 realm time on the first Sunday of each
 // month and runs for one week. Realm time is modeled by config.dmfTimezone.
 export interface DmfWindow {
+  // The calendar month this window was computed for (0-indexed) -- distinct from `start`'s
+  // UTC year/month, which for an ahead-of-UTC timezone can land in the *previous* UTC month
+  // (see dmfKey's gotcha).
+  year: number;
+  monthIndex: number;
   start: Date;
   end: Date;
 }
-
-const WEEK_MS = 7 * 24 * 3600 * 1000;
 
 // Wall-clock parts of `date` as seen in timezone `tz`.
 function wallClock(date: Date, tz: string) {
@@ -35,16 +38,64 @@ function zonedToUtc(y: number, mo: number, d: number, h: number, mi: number, tz:
   return new Date(ts);
 }
 
-export function dmfWindow(year: number, monthIndex: number): DmfWindow {
+// `tz` defaults to config.dmfTimezone but is a real parameter (not just a module read) so
+// callers -- notably tests -- can exercise a region without fighting the config singleton
+// (config resolves process.env exactly once per process; see config.test.ts's gotcha).
+export function dmfWindow(
+  year: number,
+  monthIndex: number,
+  tz: string = config.dmfTimezone,
+): DmfWindow {
   let day = 1;
   while (new Date(Date.UTC(year, monthIndex, day)).getUTCDay() !== 0) day++;
-  const start = zonedToUtc(year, monthIndex, day, 0, 1, config.dmfTimezone);
-  return { start, end: new Date(start.getTime() + WEEK_MS) };
+  const start = zonedToUtc(year, monthIndex, day, 0, 1, tz);
+  // Computed independently from `start` (not `start + 7 days`) so a DST transition inside the
+  // window is reflected in realm-local terms rather than baked in as a fixed UTC offset.
+  const end = zonedToUtc(year, monthIndex, day + 7, 0, 1, tz);
+  // currentOrNextDmf calls this with monthIndex=12 for "next January" etc. -- Date.UTC normalizes
+  // that for `start`/`end`, but the raw `year`/`monthIndex` params must be normalized separately,
+  // or dmfKey produces a non-canonical key (e.g. "2033-13") that mismatches the same window's key
+  // once `now` rolls into the new year and this function is called with already-canonical inputs.
+  const canonical = new Date(Date.UTC(year, monthIndex, 1));
+  return { year: canonical.getUTCFullYear(), monthIndex: canonical.getUTCMonth(), start, end };
 }
 
-export function currentOrNextDmf(now = new Date()): { active: boolean; window: DmfWindow } {
-  const thisMonth = dmfWindow(now.getUTCFullYear(), now.getUTCMonth());
-  if (now < thisMonth.start) return { active: false, window: thisMonth };
-  if (now < thisMonth.end) return { active: true, window: thisMonth };
-  return { active: false, window: dmfWindow(now.getUTCFullYear(), now.getUTCMonth() + 1) };
+// Picks whichever of "this UTC month" or "next UTC month"'s calendar-month window actually
+// contains `now`. Checking only "this month" would miss the case where next month's window has
+// already opened before UTC midnight (ahead-of-UTC realm timezones, e.g. EU) -- see dmfKey.
+export function currentOrNextDmf(
+  now = new Date(),
+  tz: string = config.dmfTimezone,
+): { active: boolean; window: DmfWindow } {
+  const candidates = [
+    dmfWindow(now.getUTCFullYear(), now.getUTCMonth(), tz),
+    dmfWindow(now.getUTCFullYear(), now.getUTCMonth() + 1, tz),
+  ];
+  for (const window of candidates) {
+    if (now < window.end) return { active: now >= window.start, window };
+  }
+  return { active: false, window: candidates[1]! };
+}
+
+// The dedup key for a window: keyed on the calendar month it was computed for, never on
+// `start`'s UTC year/month. An ahead-of-UTC realm timezone (EU) can open a month's window
+// before UTC midnight of the *previous* month whenever that month's 1st is a Sunday -- keying
+// on `start`'s UTC parts then collides with the previous month's key and the Faire silently
+// never announces (issue #36).
+export function dmfKey(window: DmfWindow): string {
+  return `${window.year}-${window.monthIndex + 1}`;
+}
+
+// Pure decision: is there a new Darkmoon Faire to announce right now? Mirrors
+// decideRealmTransition/decideReleaseAnnouncements so announce.ts stays a thin wrapper.
+export function decideDmfAnnouncement(
+  now: Date,
+  announcedFor: string | undefined,
+  tz: string = config.dmfTimezone,
+): { key: string; window: DmfWindow } | null {
+  const { active, window } = currentOrNextDmf(now, tz);
+  if (!active) return null;
+  const key = dmfKey(window);
+  if (key === announcedFor) return null;
+  return { key, window };
 }
