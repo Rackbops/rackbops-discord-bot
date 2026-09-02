@@ -52,7 +52,12 @@ export function dmfWindow(
   // Computed independently from `start` (not `start + 7 days`) so a DST transition inside the
   // window is reflected in realm-local terms rather than baked in as a fixed UTC offset.
   const end = zonedToUtc(year, monthIndex, day + 7, 0, 1, tz);
-  return { year, monthIndex, start, end };
+  // currentOrNextDmf calls this with monthIndex=12 for "next January" etc. -- Date.UTC normalizes
+  // that for `start`/`end`, but the raw `year`/`monthIndex` params must be normalized separately,
+  // or dmfKey produces a non-canonical key (e.g. "2033-13") that mismatches the same window's key
+  // once `now` rolls into the new year and this function is called with already-canonical inputs.
+  const canonical = new Date(Date.UTC(year, monthIndex, 1));
+  return { year: canonical.getUTCFullYear(), monthIndex: canonical.getUTCMonth(), start, end };
 }
 
 // Picks whichever of "this UTC month" or "next UTC month"'s calendar-month window actually

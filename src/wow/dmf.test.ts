@@ -62,6 +62,18 @@ describe("decideDmfAnnouncement (EU)", () => {
     expect(decision?.key).not.toBe(octoberKey);
     expect(decision?.key).toBe(dmfKey(dmfWindow(2026, 10, EU)));
   });
+
+  test("regression: a January window straddling the year boundary keys the same both sides of UTC midnight", () => {
+    // Jan 1 2034 is a Sunday, so January's window bleeds into UTC December 2033
+    // (dmfWindow is asked for monthIndex=12 "next month" from December, which Date.UTC
+    // normalizes to Jan 2034 for start/end -- year/monthIndex must normalize the same way,
+    // or the same physical window keys differently once `now` crosses into the new year and
+    // currentOrNextDmf calls dmfWindow(2034, 0, ...) directly, causing a duplicate announcement).
+    const beforeMidnight = decideDmfAnnouncement(new Date("2033-12-31T23:30:00Z"), undefined, EU);
+    const afterMidnight = decideDmfAnnouncement(new Date("2034-01-01T00:30:00Z"), beforeMidnight?.key, EU);
+    expect(beforeMidnight?.key).toBe("2034-1");
+    expect(afterMidnight).toBeNull();
+  });
 });
 
 describe("dmfWindow (US)", () => {
