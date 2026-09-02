@@ -239,6 +239,36 @@ export function renderIndexHtml(template: string, instanceName: string): string 
   return template.replaceAll("__INSTANCE_NAME__", () => escaped);
 }
 
+/**
+ * Pull a single value out of a .env file's text (`KEY=value`), stripping one layer of matching
+ * surrounding quotes. Used to read GITHUB_REPO/GITHUB_TOKEN for the branch chooser directly from
+ * the mounted config dir: the token is read on demand and never enters this process's environment
+ * (so it stays out of `docker inspect`), and it's deliberately absent from bot-ops.sh's env-get
+ * whitelist, so there's no other way to reach it. Returns undefined when the key isn't present.
+ */
+export function parseEnvValue(envText: string, key: string): string | undefined {
+  for (const raw of envText.split("\n")) {
+    const line = raw.replace(/\r$/, "");
+    if (line.startsWith(key + "=")) {
+      let v = line.slice(key.length + 1).trim();
+      if (v.length >= 2 && ((v[0] === '"' && v.at(-1) === '"') || (v[0] === "'" && v.at(-1) === "'"))) {
+        v = v.slice(1, -1);
+      }
+      return v;
+    }
+  }
+  return undefined;
+}
+
+/** Branch names out of a GitHub `GET /repos/{owner}/{repo}/branches` response body; tolerant of a
+ *  non-array body or a nameless entry (both yield no name). */
+export function branchNamesFromApi(data: unknown): string[] {
+  if (!Array.isArray(data)) return [];
+  return data
+    .map((b) => (b && typeof (b as { name?: unknown }).name === "string" ? (b as { name: string }).name : ""))
+    .filter(Boolean);
+}
+
 export interface HandlerConfig {
   adminToken: string;
   indexHtml: string;
@@ -246,6 +276,10 @@ export interface HandlerConfig {
    * /realms.json for the panel to read. Absent when the file wasn't generated — the route then
    * 404s and the panel's WOW_REALM field degrades to a plain text input. */
   realmsJson?: string;
+  /** Lists the configured repo's branches (for the BOT_BRANCH chooser), or null on any failure.
+   * Injected so the route tests without a real GitHub call; absent when no config dir is set, in
+   * which case /api/branches 404s and the panel's BOT_BRANCH field degrades to a text input. */
+  listBranches?: () => Promise<string[] | null>;
   /** Injected so request-handling logic tests without spawning a real subprocess. */
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>;
   /** Absent (not a stub that always fails) when Access isn't configured for this instance — the
@@ -462,6 +496,18 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     );
   }
 
+  // The BOT_BRANCH chooser's live branch list. Server-native (never shells out), authenticated
+  // like every /api/* route, and it reaches the GitHub API + reads GITHUB_TOKEN, so it stays gated
+  // behind the auth check above. 404 (no lister configured) vs 502 (configured but the call failed)
+  // is a distinction for HTTP/logs only — the panel treats any non-200 the same and falls back to a
+  // text input.
+  if (req.method === "GET" && url.pathname === "/api/branches") {
+    if (!config.listBranches) return new Response("not found", { status: 404 });
+    const branches = await config.listBranches();
+    if (!branches) return new Response("branches unavailable", { status: 502 });
+    return jsonResponse({ branches });
+  }
+
   if (url.pathname === "/api/admins" && config.adminStore) {
     return handleAdmins(req, config.adminStore, auth);
   }
@@ -609,7 +655,49 @@ if (import.meta.main) {
     console.log("[admin] no ADMIN_ALLOWED_EMAILS bootstrap — any Access identity authorizes until admins are added");
   }
 
-  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, runBotOps, verifyAccessJwt, adminStore };
+  // The BOT_BRANCH chooser's data source: the configured repo's branches from the GitHub API.
+  // GITHUB_REPO/GITHUB_TOKEN are read on demand from the mounted .env (never this process's env, so
+  // never in `docker inspect`), which also means a GITHUB_REPO edited in .env on the box is picked
+  // up without restarting the admin service. The token is optional — a public repo lists
+  // unauthenticated, just at a lower rate limit — and the result is cached briefly so repeated panel
+  // loads don't burn the limit. Any failure resolves null, and the panel then renders BOT_BRANCH as
+  // a plain text input.
+  let branchCache: { repo: string; branches: string[]; at: number } | undefined;
+  const BRANCH_TTL_MS = 5 * 60 * 1000;
+  const listBranches: (() => Promise<string[] | null>) | undefined = configDir
+    ? async () => {
+        try {
+          const envText = await Bun.file(`${configDir}/.env`).text();
+          const repo = parseEnvValue(envText, "GITHUB_REPO");
+          if (!repo) return null;
+          if (branchCache && branchCache.repo === repo && Date.now() - branchCache.at < BRANCH_TTL_MS) {
+            return branchCache.branches;
+          }
+          const token = parseEnvValue(envText, "GITHUB_TOKEN");
+          const headers: Record<string, string> = {
+            Accept: "application/vnd.github+json",
+            "User-Agent": "rackbops-admin-panel", // GitHub 403s an API request that sends no User-Agent
+          };
+          if (token) headers.Authorization = `Bearer ${token}`;
+          // per_page=100 is GitHub's max and this doesn't paginate: a repo with >100 branches lists
+          // only the first page. The panel still shows a stored BOT_BRANCH beyond that as its own
+          // option, so nothing is lost — and a bot repo is nowhere near 100 branches regardless.
+          const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100`, {
+            headers,
+            signal: AbortSignal.timeout(8000), // don't let a stalled GitHub call hang the request
+          });
+          if (!res.ok) throw new Error(`GitHub branches API ${res.status}`);
+          const branches = branchNamesFromApi(await res.json());
+          branchCache = { repo, branches, at: Date.now() };
+          return branches;
+        } catch (err) {
+          console.error(`[admin] couldn't list branches (BOT_BRANCH stays free-text): ${err}`);
+          return null;
+        }
+      }
+    : undefined;
+
+  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, runBotOps, verifyAccessJwt, adminStore };
   Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
   console.log(`[admin] listening on :${PORT}`);
 }

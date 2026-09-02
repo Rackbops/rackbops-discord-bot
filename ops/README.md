@@ -224,8 +224,9 @@ server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restar
 `POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
 they're signed in as, plus the JWT's claims for the panel's Identity view), and
 `GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
-above). The `/api/whoami` and `/api/admins` routes never shell out to `bot-ops.sh`; `/api/admins`
-manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
+above), and `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser). The
+`/api/whoami`, `/api/admins`, and `/api/branches` routes never shell out to `bot-ops.sh`;
+`/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
 routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
 rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don't rewrite it to
@@ -233,8 +234,9 @@ the internal origin or same-origin browser writes would be wrongly blocked.
 No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
 page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
 `ALLOWED` whitelist above. A few fields render as constrained controls instead of free text:
-`WOW_REGION`/`AUTO_UPDATE` as selects, `DMF_TIMEZONE` as an IANA-zone datalist, and `WOW_REALM` as
-a region-filtered realm chooser (see below).
+`WOW_REGION`/`AUTO_UPDATE` as selects, `DMF_TIMEZONE` as an IANA-zone datalist, `WOW_REALM` as a
+region-filtered realm chooser and `BOT_BRANCH` as a live branch chooser (both below), and
+`ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors.
 
 **The `WOW_REALM` chooser** reads a static, bundled `public/realms.json` (served at `GET
 /realms.json` — non-secret data, public at that layer like the page itself) and filters it to the
@@ -247,6 +249,18 @@ via the `roshne/battlenet-api-research` client. It offers only realm slugs `bot-
 `WOW_REALM` regex accepts (`^[a-z0-9-]{1,40}$`), so it never suggests a realm the server would
 reject — which currently drops a handful of EU realms with accented slugs. If `realms.json` is
 absent, `WOW_REALM` gracefully falls back to a plain text input.
+
+**The `BOT_BRANCH` chooser** lists the configured repo's live branches (branches change far too
+often for a static list) via `GET /api/branches`, which calls the GitHub API server-side.
+`GITHUB_REPO` and `GITHUB_TOKEN` are read on demand from the mounted `.env` — never from this
+container's environment (so the token never appears in `docker inspect`), which also means a
+`GITHUB_REPO` edited in `.env` on the box is picked up without restarting the admin service. The
+token is optional: a public repo lists unauthenticated (just at a lower rate limit), and the result
+is cached ~5 minutes so repeated loads don't burn the limit. The chooser offers a blank
+"— default (main) —" option (an empty `BOT_BRANCH` is valid and defaults to `main`) and only lists
+branch names `bot-ops.sh` accepts (`^[A-Za-z0-9._/-]{1,100}$`); a stored value that isn't a current
+branch (a since-deleted branch) is still shown as its own option. If the lookup fails, `BOT_BRANCH`
+falls back to a plain text input.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
