@@ -147,21 +147,34 @@ export function buildCustomSet(equipment: EquipmentResponse): OutfitResult {
 }
 
 /**
- * Blizzard realm slug: lowercase, spaces and underscores to hyphens, apostrophes and accents
- * dropped. `Argent Dawn` → `argent-dawn`, `Aman'Thul` → `amanthul`, `Kil'jaeden` → `kiljaeden`.
- * A slug passed in already (`argent-dawn`) survives unchanged.
+ * Blizzard realm slug: lowercase, spaces and underscores to hyphens, apostrophes dropped, and
+ * accents **preserved**. `Argent Dawn` → `argent-dawn`, `Aman'Thul` → `amanthul`,
+ * `Chants Éternels` → `chants-éternels`, `Pozzo dell'Eternità` → `pozzo-delleternità`. A slug
+ * passed in already (`aggra-português`) survives unchanged.
+ *
+ * Accents are kept, not folded: verified against the live API that both the character-profile
+ * equipment endpoint and the connected-realm search match only the accented slug — `aggra-português`
+ * returns the character, the folded `aggra-portugues` 404s — so folding here broke `/transmog`
+ * outright for the 7 accented EU realms (aggra-português, chants-éternels, confrérie-du-thorium,
+ * festung-der-stürme, la-croisade-écarlate, marécage-de-zangar, pozzo-delleternità).
  */
 export function realmSlug(realm: string): string {
-  return realm
-    .trim()
-    .toLowerCase()
-    // NFD splits an accented letter into base + combining mark; the final filter then drops the
-    // mark, so `Ysondre` survives and `Éonar` becomes `eonar`. Apostrophes go before the space
-    // rule so `Kil'jaeden` doesn't become `kil-jaeden`.
-    .normalize("NFD")
-    .replace(/['’]/g, "")
-    .replace(/[\s_]+/g, "-")
-    .replace(/[^a-z0-9-]/g, "");
+  return (
+    realm
+      .trim()
+      .toLowerCase()
+      // NFC recomposes decomposed input (base letter + combining mark) into the single precomposed
+      // accented code point, so an `é` typed either way survives the filter below rather than losing
+      // its mark. Apostrophes go before the space rule so `Kil'jaeden` doesn't become `kil-jaeden`.
+      .normalize("NFC")
+      .replace(/['’]/g, "")
+      .replace(/[\s_]+/g, "-")
+      // Keep lowercase ASCII, digits, hyphen, and the lowercase Latin-1 accented letters — the same
+      // accented charset the WOW_REALM env validator accepts (ops/bot-ops.sh), so a generated slug
+      // uses only characters that gate allows. Blizzard does not fold accents in its slugs; folding
+      // here 404s every character on the accented realms.
+      .replace(/[^a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]/g, "")
+  );
 }
 
 const SLOT_LABEL: Record<string, string> = {

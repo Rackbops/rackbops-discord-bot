@@ -206,10 +206,44 @@ describe("realmSlug", () => {
   test("passes an existing slug through unchanged", () => {
     expect(realmSlug("argent-dawn")).toBe("argent-dawn");
   });
-  test("strips accents to their base letter", () => {
-    expect(realmSlug("Éonar")).toBe("eonar");
-  });
   test("trims surrounding whitespace", () => {
     expect(realmSlug("  Silvermoon  ")).toBe("silvermoon");
+  });
+
+  // Blizzard does NOT fold accents in its realm slugs — verified against the live API that both the
+  // character-profile equipment endpoint and the connected-realm search match only the accented
+  // slug (`aggra-português` returns the character; the folded `aggra-portugues` 404s). Folding here
+  // broke /transmog outright for the 7 accented EU realms, so each must slug to its accented form.
+  const ACCENTED_REALMS: [name: string, slug: string][] = [
+    ["Aggra (Português)", "aggra-português"],
+    ["Chants Éternels", "chants-éternels"],
+    ["Confrérie du Thorium", "confrérie-du-thorium"],
+    ["Festung der Stürme", "festung-der-stürme"],
+    ["La Croisade Écarlate", "la-croisade-écarlate"],
+    ["Marécage de Zangar", "marécage-de-zangar"],
+    ["Pozzo dell'Eternità", "pozzo-delleternità"],
+  ];
+  test.each(ACCENTED_REALMS)("preserves accents: %s -> %s", (name, slug) => {
+    expect(realmSlug(name)).toBe(slug);
+  });
+
+  test("passes an already-accented slug through unchanged", () => {
+    expect(realmSlug("aggra-português")).toBe("aggra-português");
+    expect(realmSlug("chants-éternels")).toBe("chants-éternels");
+  });
+
+  test("keeps a single accented letter rather than folding it", () => {
+    // The old behaviour folded `Éonar` -> `eonar`; the accent must now survive.
+    expect(realmSlug("Éonar")).toBe("éonar");
+  });
+
+  test("recomposes decomposed input so the accent still survives the filter", () => {
+    // A client may send the letter decomposed (base `E` + combining acute), which realmSlug's
+    // final filter would strip back to a fold — the `.normalize("NFC")` recomposes it first. Derive
+    // the decomposed form from the precomposed name via NFD; the guard proves it really decomposed.
+    const precomposed = "Chants Éternels";
+    const decomposed = precomposed.normalize("NFD");
+    expect(decomposed).not.toBe(precomposed); // guard: NFD actually split the accent off
+    expect(realmSlug(decomposed)).toBe("chants-éternels");
   });
 });
