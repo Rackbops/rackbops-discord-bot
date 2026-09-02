@@ -153,7 +153,8 @@ install: next steps for '$INSTANCE'
      fallback, not the only check) — leave them blank to keep ADMIN_TOKEN as the sole door-2
      check for now. ADMIN_ALLOWED_EMAILS further narrows which verified identities the JWT
      check accepts; leave it blank to allow any identity Access's own policy already lets
-     through:
+     through. The command below names the admin service explicitly, so it never rebuilds or
+     recreates the running bot container:
 
      ADMIN_TOKEN=\$(grep '^ADMIN_TOKEN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
      CLOUDFLARE_ACCESS_TEAM_DOMAIN=\$(grep '^CLOUDFLARE_ACCESS_TEAM_DOMAIN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
@@ -164,5 +165,5 @@ install: next steps for '$INSTANCE'
      BOT_OPS_COMPOSE_FILE=$STACK_DIR/docker-compose.yml \\
      BOT_OPS_PROJECT=$PROJECT \\
      BOT_OPS_CONTAINER=$PROJECT \\
-     docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile admin up -d --build
+     docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile admin up -d --build admin
 EOF
