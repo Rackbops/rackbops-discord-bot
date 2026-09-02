@@ -18,10 +18,12 @@
 #
 # Design notes:
 #   - The compose project + container come from BOT_OPS_PROJECT / BOT_OPS_CONTAINER (the caller
-#     passes them per selected bot), defaulting to the debug bot. The project MUST be passed with
-#     `-p` because it is NOT set in a non-interactive SSH shell's environment — a bare `docker
-#     compose` would default to the directory name and miss the running container. (Learned the hard
-#     way.) Both are validated to a safe charset since they're interpolated into docker commands.
+#     passes them per selected bot) — required, no fallback (issue #41: a monorepo-era default here
+#     once silently targeted a project/container no real deploy produces). The project MUST be
+#     passed with `-p` because it is NOT set in a non-interactive SSH shell's environment — a bare
+#     `docker compose` would default to the directory name and miss the running container. (Learned
+#     the hard way.) Both are validated to a safe charset since they're interpolated into docker
+#     commands.
 #   - BOT_OPS_CONFIG_DIR (holds .env + backups/) and BOT_OPS_COMPOSE_FILE (the deployed
 #     docker-compose.yml) are two independent, required inputs — no derived guessing between them.
 #     They differ under the current layout: the compose file lives under /opt/stacks/<name>/ (so
@@ -35,9 +37,21 @@
 #     comment/blank/secret lines are preserved verbatim.
 set -euo pipefail
 
-# Target bot: defaults to the debug bot; a panel passes these per selected target (debug/prod).
-PROJECT="${BOT_OPS_PROJECT:-warbandeer-discord-debug}"
-CONTAINER="${BOT_OPS_CONTAINER:-warbandeer-discord}"
+# Target bot: no fallback to the monorepo-era name — a panel (or you, by hand) must always pass
+# both per the selected target (debug/prod), the same "no repo-relative fallback" rule as
+# CONFIG_DIR/COMPOSE_FILE below. A default here once silently pointed a var-less invocation (or
+# ops/README.md's own "run directly on the box" example) at a project/container no install.sh
+# deploy actually produces (issue #41).
+PROJECT="${BOT_OPS_PROJECT:-}"
+[ -n "$PROJECT" ] || {
+  echo "bot-ops: BOT_OPS_PROJECT not set — point it at the instance's compose project (e.g. rackbops-discord-bot-debug)" >&2
+  exit 1
+}
+CONTAINER="${BOT_OPS_CONTAINER:-}"
+[ -n "$CONTAINER" ] || {
+  echo "bot-ops: BOT_OPS_CONTAINER not set — point it at the instance's container name" >&2
+  exit 1
+}
 LOGS_MAX=5000
 
 [[ "$PROJECT" =~ ^[A-Za-z0-9_.-]+$ ]] || {

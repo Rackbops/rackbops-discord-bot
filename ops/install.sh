@@ -14,14 +14,18 @@
 #   /opt/rackbops-discord-bot/<instance>/.env       from .env.example — fill in secrets by hand
 #   /opt/rackbops-discord-bot/<instance>/backups/    ops/bot-ops.sh env-set's backup target
 # Always refreshes (never touches .env — same "generated vs. precious" split as the answer-file
-# convention this follows; bin/ and the compose file are scripts/deployment descriptors, shared
-# per host, not instance config):
+# convention this follows; bin/, the compose file, and the compose-project .env below are all
+# scripts/deployment descriptors, shared per host or generated from this run's own values, not
+# instance config):
 #   /opt/rackbops-discord-bot/bin/bot-ops.sh
 #   /opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml
+#   /opt/stacks/rackbops-discord-bot-<instance>/.env      Compose's own interpolation source (see
+#                                                          below) — NOT the bot's secrets .env above
 #
-# Every fetched file is written to a temp file first, then moved into place atomically — a
-# dropped connection mid-download leaves nothing at the final path rather than a truncated file
-# that a later run's existence-check would mistake for real config.
+# Every fetched or generated file is written to a temp file first, then moved into place
+# atomically — a dropped connection (or, for the generated .env, an interrupted write) leaves
+# nothing at the final path rather than a truncated file that a later run's existence-check would
+# mistake for real config.
 #
 # Deliberately does NOT run the initial `up -d --build` itself — that needs BOT_ENV_FILE and
 # GIT_SHA resolved from values only you can supply (secrets filled in, the branch to pin) and is
@@ -119,6 +123,31 @@ echo "install: wrote $STACK_DIR/docker-compose.yml from $BRANCH (Dockge will lis
 GIT_SHA="$(git ls-remote "$REPO_URL" "refs/heads/$BRANCH" | cut -f1)" \
   || die "couldn't reach $REPO_URL (git ls-remote failed) — check network/DNS and retry"
 [ -n "$GIT_SHA" ] || die "no branch '$BRANCH' found on $REPO_URL — check the branch name"
+
+# Compose-project .env for $STACK_DIR — NOT $CONFIG_DIR/.env (the bot's own secrets file). This
+# one holds no secrets at all: it's Compose's own interpolation source (loaded automatically from
+# the project directory for every `${VAR}` in docker-compose.yml, entirely separate from the
+# env_file: directive), so Dockge's Start/Stop/Restart buttons and any bare `docker compose`
+# invocation resolve this instance's real container_name/env_file instead of the compose file's
+# monorepo-era fallbacks — closing the gap install.sh's own printed shell-prefix commands never
+# needed in the first place. Generated, not precious — always refreshed, same as bin/bot-ops.sh
+# and the compose file above, and for the same crash-safety reason: temp file first, atomic move.
+# GIT_SHA carries the sha just resolved above rather than blank, so a bot brought up through this
+# fallback alone still reports accurate self-update status; BOT_BUILD_CONTEXT points at the remote
+# branch (not `.`) so even an accidental rebuild through this fallback has a real Dockerfile to
+# build from instead of failing on the stack dir, which holds none.
+STACK_ENV_TMP="$(mktemp -p "$STACK_DIR")"
+cat > "$STACK_ENV_TMP" <<STACKENV
+BOT_ENV_FILE=$CONFIG_DIR/.env
+BOT_OPS_CONTAINER=$PROJECT
+BOT_OPS_PROJECT=$PROJECT
+BOT_OPS_CONFIG_DIR=$CONFIG_DIR
+BOT_OPS_COMPOSE_FILE=$STACK_DIR/docker-compose.yml
+BOT_BUILD_CONTEXT=$REPO_URL#$BRANCH
+GIT_SHA=$GIT_SHA
+STACKENV
+mv "$STACK_ENV_TMP" "$STACK_DIR/.env"
+echo "install: wrote $STACK_DIR/.env (Dockge's own interpolation source — see ops/README.md)"
 
 cat <<EOF
 

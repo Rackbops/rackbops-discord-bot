@@ -30,14 +30,18 @@ time, not silently written.
 | `env-get` | JSON of the **non-secret** editable env keys and their current values |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, validate, back up `.env`, apply real changes, then `up -d --force-recreate` to load them |
 
-Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`) and
+Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
 `BOT_OPS_COMPOSE_FILE` (the deployed `docker-compose.yml`, under `/opt/stacks/` for Dockge — see
-[Bootstrapping a fresh instance](#bootstrapping-a-fresh-instance-no-checkout)) are **required**,
-with no fallback to the script's own location:
+[Bootstrapping a fresh instance](#bootstrapping-a-fresh-instance-no-checkout)), `BOT_OPS_PROJECT`
+(the compose project, e.g. `rackbops-discord-bot-debug`), and `BOT_OPS_CONTAINER` (the container
+name — same value as `BOT_OPS_PROJECT` under the current layout) are all **required**, with no
+fallback to the script's own location or to any monorepo-era default:
 
 ```sh
 export BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/debug
 export BOT_OPS_COMPOSE_FILE=/opt/stacks/rackbops-discord-bot-debug/docker-compose.yml
+export BOT_OPS_PROJECT=rackbops-discord-bot-debug
+export BOT_OPS_CONTAINER=rackbops-discord-bot-debug
 bash ops/bot-ops.sh status
 echo "RELEASE_ANNOUNCE_CHANNEL_ID=1529152068055728330" | bash ops/bot-ops.sh env-set
 ```
@@ -54,14 +58,20 @@ curl -fsSL https://raw.githubusercontent.com/roshne/rackbops-discord-bot/main/op
 ```
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
-a re-run — fill in secrets there by hand). It always refreshes two things that are deployment
+a re-run — fill in secrets there by hand). It always refreshes three things that are deployment
 artifacts, not instance config — `/opt/rackbops-discord-bot/bin/bot-ops.sh` (shared across every
-instance on the host) and `/opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml`
-(Dockge lists it as a managed stack because it lives under `/opt/stacks/`, the one path Dockge
-actually scans) — both written to a temp file first and moved into place atomically, so a dropped
-connection mid-download never leaves a truncated file that a later run's existence-check could
-mistake for something real. It prints the exact `docker compose up -d --build` command to run
-once `.env` is filled in, and the `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE` exports for day-2
+instance on the host), `/opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml` (Dockge
+lists it as a managed stack because it lives under `/opt/stacks/`, the one path Dockge actually
+scans), and `/opt/stacks/rackbops-discord-bot-<instance>/.env` — a **compose-project** env file,
+distinct from the bot's own `.env` above and holding no secrets, that Compose loads automatically
+for `${VAR}` interpolation. It carries this instance's real `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/
+`BOT_OPS_PROJECT`/`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_BUILD_CONTEXT`/`GIT_SHA`, so
+Dockge's own Start/Stop/Restart buttons — which run compose with none of `install.sh`'s printed
+shell prefix — resolve this instance's actual identity instead of the compose file's own
+monorepo-era fallbacks (issue #41). All three are written to a temp file first and moved into
+place atomically, so a dropped connection (or interrupted write) never leaves a truncated file a
+later run's existence-check could mistake for something real. It prints the exact `docker compose
+up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*` exports for day-2
 `bin/bot-ops.sh` use afterward — see the script's own output, or read `ops/install.sh` directly.
 
 The compose file's `build.context` defaults to `.` (a local checkout, unchanged for anyone
