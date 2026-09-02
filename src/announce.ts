@@ -1,7 +1,7 @@
 import type { Client } from "discord.js";
 import { config } from "./config";
 import { state, saveState } from "./state";
-import { currentOrNextDmf } from "./wow/dmf";
+import { decideDmfAnnouncement } from "./wow/dmf";
 import { lastWeeklyReset } from "./wow/reset";
 import { realmStatus, realmWatchConfigured, decideRealmTransition, type RealmStatus } from "./wow/realm";
 import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog } from "./github";
@@ -84,13 +84,11 @@ function shouldPollReleases(now: Date): boolean {
 }
 
 async function checkDmf(client: Client): Promise<void> {
-  const { active, window } = currentOrNextDmf();
-  if (!active) return;
-  const key = `${window.start.getUTCFullYear()}-${window.start.getUTCMonth() + 1}`;
-  if (state.dmfAnnouncedFor === key) return;
-  const closes = Math.floor(window.end.getTime() / 1000);
+  const decision = decideDmfAnnouncement(new Date(), state.dmfAnnouncedFor);
+  if (!decision) return;
+  const closes = Math.floor(decision.window.end.getTime() / 1000);
   await announce(client, "dmf", `🎪 The **Darkmoon Faire** is open! It runs until <t:${closes}:F>.`);
-  state.dmfAnnouncedFor = key;
+  state.dmfAnnouncedFor = decision.key;
   await saveState();
 }
 
