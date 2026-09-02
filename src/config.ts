@@ -83,6 +83,17 @@ export function resolveConfig(env: Env): Config {
     );
   }
 
+  // Validated here, not left to fail wherever dmf.ts first calls Intl.DateTimeFormat with it —
+  // an invalid zone would otherwise throw on every scheduler tick (checkDmf runs first, with no
+  // per-check isolation before this fix) instead of refusing to boot at all (issue #43).
+  const dmfTimezone =
+    optional("DMF_TIMEZONE") ?? (region === "us" ? "America/Los_Angeles" : "Europe/Paris");
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: dmfTimezone });
+  } catch {
+    throw new Error(`DMF_TIMEZONE is not a valid IANA time zone, got "${dmfTimezone}"`);
+  }
+
   return {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
@@ -95,8 +106,7 @@ export function resolveConfig(env: Env): Config {
     githubRepo,
     watchedRepos: watchedRepos.length ? watchedRepos : [githubRepo],
     githubToken: optional("GITHUB_TOKEN"),
-    dmfTimezone:
-      optional("DMF_TIMEZONE") ?? (region === "us" ? "America/Los_Angeles" : "Europe/Paris"),
+    dmfTimezone,
     gitSha: optional("GIT_SHA"),
     botBranch: optional("BOT_BRANCH") ?? "main",
     autoUpdate: optional("AUTO_UPDATE") === "true",
