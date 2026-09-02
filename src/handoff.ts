@@ -142,8 +142,12 @@ export function handoffFailureMessage(outcome: "failed" | "timeout" | "stalled",
       `current build. Check the daemon socket.`
     );
   }
+  // Outcome-neutral on purpose: this bucket covers everything from "never started" to "started,
+  // then exited without signalling" to "we lost track of it mid-poll" — `${o.error}` carries the
+  // specific reason, so the headline must not claim a stage (e.g. "failed to start") the
+  // replacement may already be past.
   return (
-    `⚠️ The replacement for \`${short}\` failed to start` +
+    `⚠️ The replacement for \`${short}\` did not complete the handoff` +
     `${o.error ? `: ${o.error}` : ""}. I removed it and stayed on the current build.`
   );
 }
