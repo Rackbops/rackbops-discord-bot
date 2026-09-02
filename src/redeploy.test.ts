@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ContainerInspect, ImageSummary } from "./docker";
 import type { HandoffMarker } from "./handoff";
 
@@ -10,10 +10,13 @@ const {
   buildRemote,
   canonicalName,
   imageTags,
+  redeploy,
   replacementName,
   selectImagesToPrune,
   takeOver,
 } = await import("./redeploy");
+const { clearMarker } = await import("./handoff");
+const { handoffActive, resetForTest } = await import("./restart");
 
 const SELF: ContainerInspect = {
   Id: "a".repeat(64),
@@ -282,5 +285,89 @@ describe("takeOver", () => {
       exit: (code) => void exits.push(code),
     });
     expect(exits).toEqual([1]);
+  });
+});
+
+// #37: a daemon error anywhere from "replacement started" onward must still reach `endHandoff()`
+// — otherwise the bot stays quiesced forever (scheduler stopped, every `/update` answers "busy").
+// Drives `redeploy()` end-to-end through a stubbed `globalThis.fetch`, in the style of
+// docker.test.ts/update.test.ts, rather than mocking the docker/handoff modules directly.
+describe("redeploy — cleanup always runs", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = "self-container-id";
+  const REPLACEMENT_ID = "c".repeat(64);
+  let calls: { path: string; method: string }[] = [];
+
+  beforeEach(async () => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+    resetForTest();
+    await clearMarker();
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+    resetForTest();
+    await clearMarker();
+  });
+
+  const jsonRes = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+
+  /**
+   * Wires every daemon call redeploy() makes through "replacement started" (self-inspect, build,
+   * prune, leftover-cleanup, create, start) to a happy response, and lets each test steer only
+   * the two calls the fix touches: the handoff poll, and the final removal of the replacement.
+   */
+  function stubDaemon(o: {
+    pollReplacement: () => Response;
+    removeReplacement: () => Response;
+  }) {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+
+      if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
+      if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
+      if (pathname === "/images/json") return jsonRes([]);
+      if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
+      if (pathname === `/containers/${REPLACEMENT_ID}/start`) return new Response("", { status: 204 });
+      if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
+      if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
+      if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  const wasRemovalAttempted = () =>
+    calls.some((c) => c.method === "DELETE" && c.path === `/containers/${REPLACEMENT_ID}`);
+
+  // The crux of the fix: a rejection from `tryInspectContainer` mid-poll (a dropped socket, one
+  // 500) used to propagate straight out of `redeploy()`, skipping `endHandoff()` entirely.
+  test("a daemon error during the handoff poll still ends the handoff", async () => {
+    stubDaemon({
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    const result = await redeploy("a".repeat(40));
+    expect(handoffActive()).toBe(false);
+    expect(wasRemovalAttempted()).toBe(true);
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("500");
+  });
+
+  // Same gap, the other unguarded call: a 409 removing the replacement at the very end must not
+  // skip `endHandoff()` either.
+  test("a removeContainer conflict during cleanup still ends the handoff", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("removal in progress", { status: 409 }),
+    });
+    const result = await redeploy("b".repeat(40));
+    expect(handoffActive()).toBe(false);
+    expect(wasRemovalAttempted()).toBe(true);
+    expect(result.outcome).toBe("failed");
   });
 });
