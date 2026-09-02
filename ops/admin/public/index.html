@@ -572,10 +572,11 @@
     return realmsPromise;
   }
 
-  // Only offer realms whose slug bot-ops.sh would actually accept (^[a-z0-9-]{1,40}$) — the same
-  // "never suggest a value the server rejects" rule as the timezone datalist. This drops a handful
-  // of EU realms with accented slugs (e.g. chants-éternels) that bot-ops.sh can't store today.
-  const REALM_SLUG_RE = /^[a-z0-9-]{1,40}$/;
+  // Only offer realms whose slug bot-ops.sh would actually accept — the same "never suggest a value
+  // the server rejects" rule as the timezone datalist. This MUST stay in sync with bot-ops.sh's
+  // WOW_REALM regex: the two are a hand-duplicated mirror, and ops/admin/server.test.ts guards them
+  // against drift. The accented Latin letters cover EU realms like chants-éternels / aggra-português.
+  const REALM_SLUG_RE = /^[a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]{1,40}$/;
 
   // Fill a WOW_REALM <select> with the realms for `region`, preserving `currentValue` — injected as
   // its own option when it isn't in the (filtered) list, so a stored realm is never silently
