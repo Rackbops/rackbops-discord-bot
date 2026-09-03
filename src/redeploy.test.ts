@@ -554,6 +554,9 @@ describe("redeploy — cleanup always runs", () => {
      *  `.catch(() => [])` degradation path (best-effort, same "never fail a good deploy over
      *  housekeeping" rule as pruneOldImages). */
     imageInspectFails?: boolean;
+    /** Makes `POST /containers/{id}/start` fail after `create` already succeeded, to drive the
+     *  cleanup-on-failure path so a failed start doesn't leak the replacement container. */
+    startFails?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -569,6 +572,7 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
       if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
+        if (o.startFails) return new Response("boom", { status: 500 });
         await o.afterStart?.();
         return new Response("", { status: 204 });
       }
@@ -636,6 +640,27 @@ describe("redeploy — cleanup always runs", () => {
     expect(build).toBeDefined();
     const params = new URL(build!.url).searchParams;
     expect(params.getAll("t")).toEqual(["warbandeer-discord-debug-bot:eeeeeee"]);
+  });
+
+  // createContainer can succeed and startContainer still fail (a bind-mount error, a network
+  // alias conflict, a daemon hiccup) — without cleanup here the created-but-never-started
+  // container leaks until the NEXT redeploy attempt's own leftover-removal line. Found during
+  // review of #51 item 5: bot-ops.sh's new guard reads that lingering container as "a swap is
+  // still in progress" and refuses restart/env-set for however long until that next attempt,
+  // which the update scheduler's anti-loop suppression can push out indefinitely for the same sha.
+  test("a startContainer failure cleans up the just-created replacement instead of leaking it", async () => {
+    stubDaemon({
+      pollReplacement: () => {
+        throw new Error("must not poll — redeploy() should have returned before this");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+      startFails: true,
+    });
+    const result = await redeploy("7".repeat(40));
+    expect(result.outcome).toBeUndefined();
+    expect(result.error).toContain("could not start the replacement");
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${REPLACEMENT_ID}`)).toBe(true);
+    expect(handoffActive()).toBe(false);
   });
 
   // #51 item 2: the daemon fetches at build *start*, seconds after `latestSha` was resolved and

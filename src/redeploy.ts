@@ -228,7 +228,7 @@ export async function redeploy(
     .catch(() => []);
 
   const name = replacementName(self.Name);
-  let replacementId: string;
+  let replacementId: string | undefined;
   try {
     await removeContainer(name, true); // a leftover from an earlier failed attempt
     replacementId = await createContainer(
@@ -237,6 +237,19 @@ export async function redeploy(
     );
     await startContainer(replacementId);
   } catch (err) {
+    // createContainer can succeed and startContainer still throw (a bind-mount error, a network
+    // alias conflict, a daemon hiccup) — without cleaning up here, that leaves a replacement that
+    // exists but never started, and the ONLY other cleanup site is this same function's own
+    // leftover-removal above, which doesn't run again until the next redeploy attempt. Since
+    // #51 item 5, that lingering container also reads as "a swap is still in progress" to
+    // bot-ops.sh's guard, refusing restart/env-set for however long until that next attempt —
+    // which the update scheduler's own anti-loop suppression can push out indefinitely for the
+    // same sha. Best-effort: a cleanup failure here must not shadow the real error being reported.
+    if (replacementId) {
+      await removeContainer(replacementId, true).catch((cleanupErr) => {
+        console.error(`[redeploy] could not clean up the failed replacement: ${(cleanupErr as Error).message}`);
+      });
+    }
     endHandoff();
     return { error: `could not start the replacement: ${(err as Error).message}` };
   }
