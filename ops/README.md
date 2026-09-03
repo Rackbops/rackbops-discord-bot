@@ -222,6 +222,12 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    primary check once both are set — most requests behind a configured Access application never
    need the bearer prompt at all, since Access attaches the header transparently.
 
+   **These, and the two vars below, take effect only when the admin container starts** — they're
+   read once from the environment `--profile admin up` was run with (`ops/install.sh`'s printed
+   step 4) and frozen for the container's lifetime, never re-read from `.env`. Setting them for
+   the first time after bring-up, or changing either later, does nothing to the running panel
+   until step 4 is re-run with the new values exported.
+
    **Optional narrowing — the admin allow-list.** Restricts which *verified* identities the JWT
    check accepts, on top of whatever Cloudflare Access's own edge policy already allows through.
    Useful when an Access application's policy is shared across several tools — e.g. the same
@@ -230,7 +236,9 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    (comma-separated, in `.env`) — the permanent *bootstrap* floor, editable only on the box — plus
    a **dynamic list managed live from the panel's Admins section**, persisted to `admins.json`
    beside `.env`. With both empty there's no narrowing (any identity Access already let through
-   authorizes); adding even one admin (env or panel) turns narrowing on. If `admins.json` exists
+   authorizes); adding even one admin (env or panel) turns narrowing on. Editing
+   `ADMIN_ALLOWED_EMAILS` in `.env` after bring-up needs the same admin-container recreate as the
+   Access vars above — it isn't picked up live. If `admins.json` exists
    but can't be read or parsed (a hand-edit typo, a bad mount), the panel fails **closed**, not
    open: narrowing stays in effect (no JWT authorizes unless a bootstrap email matches) rather
    than silently reopening to everyone — the `ADMIN_TOKEN` bearer token remains available to fix
@@ -248,6 +256,11 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    aren't set for this instance yet, Cloudflare's JWKS endpoint is briefly unreachable, or no
    Access header is present at all. Either check alone is sufficient (OR, not AND) — a valid
    JWT is evaluated first and, when present and valid, the bearer token is never consulted.
+   **Rotating this value in `.env` does not revoke the old one** — same read-once-at-container-
+   start rule as the two Access vars above — the running panel keeps accepting the old token
+   until the admin container is recreated (re-run `ops/install.sh`'s step 4 with the new
+   `ADMIN_TOKEN` exported). If this token has leaked, editing `.env` alone is not enough: the
+   leaked token keeps working until that recreate happens.
 
 **What it exposes — `bot-ops.sh`'s five operations plus a few read-only or self-contained,
 server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`,
@@ -289,7 +302,12 @@ hand-duplicated mirror of that regex; `ops/admin/server.test.ts` guards the two 
 often for a static list) via `GET /api/branches`, which calls the GitHub API server-side.
 `GITHUB_REPO` and `GITHUB_TOKEN` are read on demand from the mounted `.env` — never from this
 container's environment (so the token never appears in `docker inspect`), which also means a
-`GITHUB_REPO` edited in `.env` on the box is picked up without restarting the admin service. The
+`GITHUB_REPO` edited in `.env` on the box is picked up without restarting the admin service. This
+is the opposite of `ADMIN_TOKEN`/`CLOUDFLARE_ACCESS_TEAM_DOMAIN`/`CLOUDFLARE_ACCESS_AUD`/
+`ADMIN_ALLOWED_EMAILS` above, which the container reads once from its process environment at
+`--profile admin up` time and never revisits — those need a recreate (install.sh's step 4) to
+pick up an edit; `GITHUB_REPO`/`GITHUB_TOKEN` don't, because they're read from the file itself on
+every request instead. The
 token is optional: a public repo lists unauthenticated (just at a lower rate limit), and the result
 is cached ~5 minutes so repeated loads don't burn the limit. The chooser offers a blank
 "— default (main) —" option (an empty `BOT_BRANCH` is valid and defaults to `main`) and only lists
