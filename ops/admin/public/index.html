@@ -554,7 +554,7 @@
   // is always offered since an empty value clears a key back to its documented default.
   const FIELD_META = {
     DISCORD_SERVER_ID: { hint: "Which Discord server slash commands register to. Blank registers globally (can take ~1h to appear)." },
-    ANNOUNCE_CHANNEL_ID: { hint: "Gets DMF, weekly-reset, and server up/down announcements — and releases too, unless the field below is set." },
+    ANNOUNCE_CHANNEL_ID: { hint: "Required — the bot won't start without it. Gets DMF, weekly-reset, and server up/down announcements — and releases too, unless the field below is set." },
     RELEASE_ANNOUNCE_CHANNEL_ID: { hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank." },
     REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
     ADMIN_USER_IDS: { control: "tags", hint: "Discord user IDs allowed to run /update. Add one per chip.", placeholder: "Discord user ID" },
@@ -565,6 +565,12 @@
     WATCHED_REPOS: { control: "tags", hint: "GitHub repos the bot watches for new releases to announce (owner/repo each). Empty falls back to just GITHUB_REPO.", placeholder: "owner/repo" },
     BOT_BRANCH: { control: "branch", hint: "The branch self-update (/update, AUTO_UPDATE) builds from. Lists the configured repo's live branches; blank uses the default (main)." },
   };
+
+  // Keys bot-ops.sh's env-set refuses to save blank (its own REQUIRED set) — mirrored here so the
+  // panel blocks the same blank submit client-side instead of surfacing it as a failed save after
+  // a restart-triggering recreate (issue #45). Hand-duplicated like REALM_SLUG_RE/TZ_SHAPE_RE
+  // below; server.test.ts guards the two from drift.
+  const REQUIRED_KEYS = ["ANNOUNCE_CHANNEL_ID"];
 
   // IANA zone list for the DMF_TIMEZONE datalist — from the browser, no hardcoded list, absent on
   // very old engines (guarded). Filtered to the shape bot-ops.sh's DMF_TIMEZONE regex accepts, so
@@ -834,7 +840,7 @@
         const value = env[key] ?? "";
         const control = buildEnvControl(key, value);
         const label = document.createElement("label");
-        label.textContent = key;
+        label.textContent = key + (REQUIRED_KEYS.includes(key) ? " *" : "");
         // Clicking the label focuses the field; a composite control (tags) points at its nested
         // input via dataset.focusId, since the wrapper itself isn't focusable.
         label.htmlFor = control.dataset.focusId || control.id;
@@ -887,6 +893,14 @@
     if (plan.changes.length === 0) {
       msg.textContent = "No changes.";
       msg.className = "msg";
+      return;
+    }
+    // Block a blank required field before the confirm dialog, not after a failed save (issue
+    // #45) — one bad key blocks the WHOLE save, same as bot-ops.sh itself does server-side.
+    const blanked = plan.changes.find((c) => REQUIRED_KEYS.includes(c.key) && c.now === "");
+    if (blanked) {
+      msg.textContent = blanked.key + " is required and cannot be blank.";
+      msg.className = "msg error";
       return;
     }
     const preview = plan.changes

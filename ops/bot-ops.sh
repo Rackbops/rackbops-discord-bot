@@ -88,7 +88,8 @@ ENV_FILE="$CONFIG_DIR/.env"
 
 # Non-secret keys the panel may read and write. Anything not here is rejected by env-set and
 # omitted by env-get. Each key pairs with a validation regex (empty string is always allowed —
-# it clears the key back to its documented default).
+# it clears the key back to its documented default) EXCEPT the keys named in REQUIRED below, which
+# have no default to clear back to.
 declare -A ALLOWED=(
   [DISCORD_SERVER_ID]='^[0-9]{5,25}$'
   [ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
@@ -119,6 +120,17 @@ declare -A ALLOWED=(
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
+)
+
+# Keys env-set must refuse to blank — the exception to ALLOWED's "empty string is always allowed"
+# rule above. A parallel set, not a stricter ALLOWED regex, because ALLOWED's regex is a FORMAT
+# check applied only when a value is non-blank; these keys instead have no documented default for
+# an empty value to clear back to (config.ts's resolveConfig throws `required(...)` on them at
+# startup — issue #45's ANNOUNCE_CHANNEL_ID crash-loop). Checked against every other ALLOWED key's
+# resolveConfig handling before adding one here: everything else either has a real default or is
+# genuinely optional.
+declare -A REQUIRED=(
+  [ANNOUNCE_CHANNEL_ID]=1
 )
 
 # Display order for env-get's output — a plain indexed array, not ALLOWED's own iteration order,
@@ -254,6 +266,13 @@ cmd_env_set() {
   need docker; need jq
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
+  # Every REQUIRED key must also be an ALLOWED one — same drift worry as ALLOWED_ORDER vs ALLOWED
+  # in cmd_env_get: a typo here would otherwise silently never enforce that key.
+  local rkey
+  for rkey in "${!REQUIRED[@]}"; do
+    [[ -n "${ALLOWED[$rkey]+x}" ]] || die "env-set: '$rkey' is in REQUIRED but not ALLOWED"
+  done
+
   # Counters track sizes explicitly: `${#assoc[@]}` on a still-empty associative array trips
   # "unbound variable" under `set -u`, so we never expand a possibly-empty array for its length.
   declare -A SUBMITTED=()
@@ -288,7 +307,9 @@ cmd_env_set() {
     for key in "${submitted_order[@]}"; do
       val="${SUBMITTED[$key]}"
       [ "$val" != "$(env_value "$key")" ] || continue
-      if [ -n "$val" ] && [[ ! "$val" =~ ${ALLOWED[$key]} ]]; then
+      if [ -z "$val" ]; then
+        [[ -z "${REQUIRED[$key]+x}" ]] || die "env-set: '$key' is required and cannot be blank"
+      elif [[ ! "$val" =~ ${ALLOWED[$key]} ]]; then
         die "env-set: value for '$key' is invalid"
       fi
       DIFF["$key"]="$val"
