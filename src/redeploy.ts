@@ -124,6 +124,10 @@ export function selectImagesToPrune(
  * pins *every* image default at the old image's value forever. An entry is dropped only when it
  * matches an `oldImageEnv` entry **verbatim** — matching by key alone would also drop a genuine
  * operator override that happens to share a key with an image default.
+ *
+ * The network's own `Aliases` (e.g. compose's `bot` service alias) are carried over too — without
+ * them the replacement resolves by container name only, so `http://bot:<port>` (README's
+ * documented tunnel mapping) stops resolving after the first self-update.
  */
 export function buildCreateSpec(
   self: ContainerInspect,
@@ -134,6 +138,8 @@ export function buildCreateSpec(
     (e) => !e.startsWith("GIT_SHA=") && !e.startsWith(`${HANDOFF_FROM_ENV}=`) && !oldImageEnvSet.has(e),
   );
   env.push(`${HANDOFF_FROM_ENV}=${o.handoffFrom}`);
+  const netMode = self.HostConfig.NetworkMode;
+  const aliases = netMode ? self.NetworkSettings.Networks[netMode]?.Aliases : undefined;
   return {
     Image: o.image,
     Env: env,
@@ -150,11 +156,12 @@ export function buildCreateSpec(
         (m) => `${m.Name ?? m.Source}:${m.Destination}:${m.RW ? "rw" : "ro"}`,
       ),
       RestartPolicy: { Name: self.HostConfig.RestartPolicy?.Name || "unless-stopped" },
-      NetworkMode: self.HostConfig.NetworkMode,
+      NetworkMode: netMode,
       // Compose's `init: true` lives on the container, not the image — without carrying it
       // over, the replacement runs its process as PID 1 instead of under docker-init.
       Init: self.HostConfig.Init ?? undefined,
     },
+    ...(netMode && aliases?.length ? { NetworkingConfig: { EndpointsConfig: { [netMode]: { Aliases: aliases } } } } : {}),
   };
 }
 

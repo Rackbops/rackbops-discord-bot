@@ -23,7 +23,7 @@ export interface ContainerInspect {
     Init?: boolean | null;
   };
   Mounts: { Type: string; Name?: string; Source: string; Destination: string; RW: boolean }[];
-  NetworkSettings: { Networks: Record<string, unknown> };
+  NetworkSettings: { Networks: Record<string, { Aliases?: string[] | null }> };
 }
 
 /** Body for `POST /containers/create` — only the fields this bot actually sets. */
@@ -39,6 +39,10 @@ export interface CreateContainerSpec {
     NetworkMode?: string;
     Init?: boolean;
   };
+  /** Service aliases (e.g. compose's `bot`) the network resolves the container by, beyond its
+   *  own name — dropped otherwise, since Docker never infers them from the container being
+   *  recreated. */
+  NetworkingConfig?: { EndpointsConfig: Record<string, { Aliases?: string[] }> };
 }
 
 async function api(path: string, init: RequestInit = {}): Promise<Response> {

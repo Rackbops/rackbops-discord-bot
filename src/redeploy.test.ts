@@ -41,7 +41,7 @@ const SELF: ContainerInspect = {
     { Type: "volume", Name: "wbd_state", Source: "/var/lib/docker/volumes/wbd_state/_data", Destination: "/app/data", RW: true },
     { Type: "bind", Source: "/var/run/docker.sock", Destination: "/var/run/docker.sock", RW: true },
   ],
-  NetworkSettings: { Networks: { wbd_default: {} } },
+  NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", "warbandeer-discord-debug-bot-1"] } } },
 };
 
 describe("naming", () => {
@@ -253,6 +253,29 @@ describe("buildCreateSpec", () => {
       { image: "i", handoffFrom: "x", oldImageEnv: [] },
     );
     expect(ro.HostConfig.Binds).toEqual(["/etc/x:/etc/x:ro"]);
+  });
+
+  // #51 item 6: without this the replacement resolves by container name only, so
+  // `http://bot:<port>` (README's documented tunnel mapping) stops resolving after the first
+  // self-update — inert today (no HTTP server yet), latent for the desktop-app API work.
+  test("carries the network's service aliases over", () => {
+    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toEqual([
+      "bot",
+      "warbandeer-discord-debug-bot-1",
+    ]);
+  });
+
+  test("no NetworkingConfig when the network has no aliases of its own", () => {
+    const noAliases = buildCreateSpec(
+      { ...SELF, NetworkSettings: { Networks: { wbd_default: {} } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(noAliases.NetworkingConfig).toBeUndefined();
+  });
+
+  test("no NetworkingConfig when the original has no network mode at all", () => {
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
+    expect(bare.NetworkingConfig).toBeUndefined();
   });
 });
 
