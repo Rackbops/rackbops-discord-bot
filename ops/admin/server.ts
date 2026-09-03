@@ -96,7 +96,7 @@ export function adminRemovalError(
   requesterEmail: string | undefined,
 ): string | null {
   if (bootstrap.has(email)) {
-    return "That admin is pinned via ADMIN_ALLOWED_EMAILS and can't be removed here — edit the env var on the box.";
+    return "That admin is pinned via ADMIN_ALLOWED_EMAILS and can't be removed here — edit the env var on the box and recreate the admin container (re-run install.sh's step 4) for the change to take effect.";
   }
   if (requesterEmail && email === requesterEmail) {
     return "You can't remove yourself.";
