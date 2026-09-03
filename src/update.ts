@@ -203,6 +203,19 @@ export interface RedeployDeps {
 
 const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy };
 
+// Closes the gap `handoffActive()` alone leaves open (#51 item 4): that flag doesn't read true
+// until `redeploy()` calls `beginHandoff()` as its very first line, but everything before
+// `redeploy()` — both GitHub fetches, `saveState()`, and `redeployAvailable()`'s daemon ping —
+// is async and yields the event loop while `handoffActive()` still reads false. A second call
+// landing in that stretch (two /updates in quick succession, or an admin's /update racing the
+// scheduler's auto-update tick) would otherwise sail through and reach `redeploy()` too: both
+// build the same `shaTag`, both target the same `replacementName`, and a losing call's failure
+// path calls `endHandoff()` unconditionally — un-quiescing the scheduler while the winner's
+// replacement is still coming up. Set synchronously (no `await` before it) so a second call
+// invoked before the first yields can never observe it as false, and cleared in `finally` so
+// every exit — including a thrown fetch — releases it.
+let checkInFlight = false;
+
 /**
  * Compare this build against the newest bot commit and, when stale, ask for a
  * restart so the orchestrator can bring up the new code. `force` is an admin's
@@ -219,61 +232,67 @@ export async function checkForUpdate(
   // Refused before anything else — even reading the shas. A second /update mid-swap would
   // otherwise overwrite the in-flight attempt's pendingUpdateReport, then force-remove its
   // replacement (`force: true` bypasses the anti-loop suppression, and interaction handling
-  // does not quiesce during a handoff — only the scheduler does).
-  if (handoffActive()) return { decision: "busy", latestSha: "" };
+  // does not quiesce during a handoff — only the scheduler does). `checkInFlight` covers the
+  // stretch before a handoff has even begun, which `handoffActive()` can't see.
+  if (handoffActive() || checkInFlight) return { decision: "busy", latestSha: "" };
   if (!config.gitSha) return { decision: "disabled", latestSha: "", reason: "no-sha" };
 
-  const latestSha = await fetchLatestBotSha();
-  // Only when the shas differ — the equality shortcut in `decideUpdate` covers the rest, so the
-  // ordinary "built exactly the newest bot commit" path still costs a single request.
-  const relation = sameSha(config.gitSha, latestSha)
-    ? undefined
-    : await fetchShaRelation(latestSha, config.gitSha);
-  const decision = decideUpdate({
-    runningSha: config.gitSha,
-    latestSha,
-    relation,
-    attemptedSha: state.attemptedUpdateToSha,
-    force: o.force,
-  });
-
-  if (decision === "disabled") {
-    // Reachable only via `unpublished` here — the no-sha case returned above.
-    console.warn(
-      `[update] self-update is off: ${config.gitSha.slice(0, 7)} is not on ` +
-        `${config.githubRepo}, so there is nothing to compare it against.`,
-    );
-    return { decision, latestSha, reason: "unpublished-sha" };
-  }
-
-  if (decision === "current" && state.attemptedUpdateToSha) {
-    // The update landed — clear the marker so a later one isn't wrongly suppressed.
-    state.attemptedUpdateToSha = undefined;
-    await saveState();
-  }
-
-  if (decision === "suppressed") {
-    console.warn(
-      `[update] ${latestSha.slice(0, 7)} still pending after a restart — the orchestrator ` +
-        `is not supplying new code. Rebuild the image (see README); not exiting again.`,
-    );
-  }
-
-  if (decision === "restart") {
-    state.attemptedUpdateToSha = latestSha;
-    // Written before the replacement starts and read by it after — never by both at once,
-    // which is what keeps two containers off the same state file (#879).
-    state.pendingUpdateReport = buildUpdateReport({
+  checkInFlight = true;
+  try {
+    const latestSha = await fetchLatestBotSha();
+    // Only when the shas differ — the equality shortcut in `decideUpdate` covers the rest, so the
+    // ordinary "built exactly the newest bot commit" path still costs a single request.
+    const relation = sameSha(config.gitSha, latestSha)
+      ? undefined
+      : await fetchShaRelation(latestSha, config.gitSha);
+    const decision = decideUpdate({
       runningSha: config.gitSha,
       latestSha,
-      requester: o.requester,
-      now: Date.now(),
+      relation,
+      attemptedSha: state.attemptedUpdateToSha,
+      force: o.force,
     });
-    await saveState();
-    return { decision, latestSha, redeploy: await applyUpdate(latestSha, deps) };
-  }
 
-  return { decision, latestSha };
+    if (decision === "disabled") {
+      // Reachable only via `unpublished` here — the no-sha case returned above.
+      console.warn(
+        `[update] self-update is off: ${config.gitSha.slice(0, 7)} is not on ` +
+          `${config.githubRepo}, so there is nothing to compare it against.`,
+      );
+      return { decision, latestSha, reason: "unpublished-sha" };
+    }
+
+    if (decision === "current" && state.attemptedUpdateToSha) {
+      // The update landed — clear the marker so a later one isn't wrongly suppressed.
+      state.attemptedUpdateToSha = undefined;
+      await saveState();
+    }
+
+    if (decision === "suppressed") {
+      console.warn(
+        `[update] ${latestSha.slice(0, 7)} still pending after a restart — the orchestrator ` +
+          `is not supplying new code. Rebuild the image (see README); not exiting again.`,
+      );
+    }
+
+    if (decision === "restart") {
+      state.attemptedUpdateToSha = latestSha;
+      // Written before the replacement starts and read by it after — never by both at once,
+      // which is what keeps two containers off the same state file (#879).
+      state.pendingUpdateReport = buildUpdateReport({
+        runningSha: config.gitSha,
+        latestSha,
+        requester: o.requester,
+        now: Date.now(),
+      });
+      await saveState();
+      return { decision, latestSha, redeploy: await applyUpdate(latestSha, deps) };
+    }
+
+    return { decision, latestSha };
+  } finally {
+    checkInFlight = false;
+  }
 }
 
 /**
