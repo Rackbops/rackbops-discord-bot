@@ -155,6 +155,20 @@ die() { echo "bot-ops: $*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
+# A self-update (#879) briefly runs the replacement alongside the original under
+# "<container>-next" before it takes the canonical name over. Recreating or restarting the
+# ORIGINAL while that container exists races retireOriginal's own rename/remove and can leave two
+# bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
+# operator can just retry once the swap finishes (usually well under a minute). Checked via `docker
+# ps`, not a marker file inside the bot's own data volume: the container's existence is exactly the
+# window that matters, needs no `docker exec` into a container that may itself be mid-swap, and
+# needs no extra tooling beyond the `docker` this script already requires.
+guard_no_handoff_in_progress() {
+  if docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+    die "a self-update is in progress (container '${CONTAINER}-next' exists) — try again once it completes"
+  fi
+}
+
 # One .env definition line: optional indentation, an optional `export ` prefix, the key, `=`, the
 # raw value. Shared by load_env_values (which reads .env) and cmd_env_set's rewrite (which
 # replaces lines in it), so the two can never disagree about which lines define a key.
@@ -226,6 +240,7 @@ cmd_logs() {
 
 cmd_restart() {
   need docker
+  guard_no_handoff_in_progress
   # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
   # different mechanism from the container's own runtime env, which env_file: itself supplies
   # once that interpolation resolves.
@@ -264,6 +279,7 @@ cmd_env_get() {
 
 cmd_env_set() {
   need docker; need jq
+  guard_no_handoff_in_progress
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
   # Every REQUIRED key must also be an ALLOWED one — same drift worry as ALLOWED_ORDER vs ALLOWED
