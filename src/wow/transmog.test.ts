@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { EquipmentResponse } from "./transmog";
 
 // `transmog.ts` pulls in the `config` singleton (fetchTransmog needs the region), which resolves
@@ -6,8 +6,17 @@ import type { EquipmentResponse } from "./transmog";
 // standalone, not just as part of a full-suite run that happens to prime the env first.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { buildCustomSet, realmSlug, formatTransmogReply, OUTFIT_VALUE_COUNT } =
-  await import("./transmog");
+const {
+  buildCustomSet,
+  realmSlug,
+  formatTransmogReply,
+  OUTFIT_VALUE_COUNT,
+  pickRetrySlug,
+  fetchTransmog,
+  TransmogLookupError,
+} = await import("./transmog");
+const { _resetBlizzardToken } = await import("./blizzard");
+const { _resetRealmIndex } = await import("./realm");
 
 // A slot with a transmog, shaped as the equipment endpoint returns it.
 const mog = (
@@ -245,5 +254,92 @@ describe("realmSlug", () => {
     const decomposed = precomposed.normalize("NFD");
     expect(decomposed).not.toBe(precomposed); // guard: NFD actually split the accent off
     expect(realmSlug(decomposed)).toBe("chants-éternels");
+  });
+});
+
+describe("pickRetrySlug", () => {
+  // #32: fetchTransmog recurses with the retry slug, so this must never hand back a slug equal
+  // to the one that just failed — that would recurse forever re-deriving the same dead end.
+  test("offers a different canonical slug", () => {
+    expect(pickRetrySlug("azjolnerub", "azjol-nerub")).toBe("azjolnerub");
+  });
+
+  test("refuses when the index found nothing", () => {
+    expect(pickRetrySlug(undefined, "azjol-nerub")).toBeUndefined();
+  });
+
+  test("refuses when the index only confirms the slug that already failed", () => {
+    expect(pickRetrySlug("azjol-nerub", "azjol-nerub")).toBeUndefined();
+  });
+});
+
+describe("fetchTransmog — realm-index retry (#32)", () => {
+  // End-to-end coverage of the wiring in fetchTransmog itself (the 404 -> realmExists false ->
+  // resolveCanonicalSlug -> recurse chain), not just the pure helpers it calls — that wiring has
+  // no coverage otherwise, since every piece it composes is separately unit-tested in isolation.
+  const originalFetch = globalThis.fetch;
+
+  type Route = { match: string; status?: number; body?: unknown };
+
+  function mockFetch(routes: Route[]): void {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      const route = routes.find((r) => url.includes(r.match));
+      if (!route) throw new Error(`unmocked fetch in test: ${url}`);
+      return new Response(JSON.stringify(route.body ?? {}), { status: route.status ?? 200 });
+    }) as typeof fetch;
+  }
+
+  const TOKEN_ROUTE: Route = {
+    match: "oauth.battle.net/token",
+    body: { access_token: "test-token", expires_in: 3600 },
+  };
+  const NOT_FOUND_ROUTE: Route = { match: "/data/wow/search/connected-realm", body: { results: [] } };
+
+  beforeEach(() => {
+    // Both are module-level caches (blizzardToken's OAuth token, realm.ts's realm-index cache) —
+    // reset between tests so one test's mocked response can't leak into the next.
+    _resetBlizzardToken();
+    _resetRealmIndex();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test("recovers a realm-name hyphen Blizzard drops but realmSlug's heuristic keeps", async () => {
+    mockFetch([
+      TOKEN_ROUTE,
+      { match: "/profile/wow/character/azjol-nerub/testchar/equipment", status: 404 },
+      NOT_FOUND_ROUTE,
+      { match: "/data/wow/realm/index", body: { realms: [{ name: "Azjol-Nerub", slug: "azjolnerub" }] } },
+      { match: "/profile/wow/character/azjolnerub/testchar/equipment", body: { equipped_items: [] } },
+    ]);
+
+    const result = await fetchTransmog("Testchar", "Azjol-Nerub");
+    expect(result.code.startsWith("/customset v1 ")).toBe(true);
+  });
+
+  test("still reports no realm when the index has no match for it (regression guard)", async () => {
+    mockFetch([
+      TOKEN_ROUTE,
+      { match: "/profile/wow/character/nonexistentrealm/testchar/equipment", status: 404 },
+      NOT_FOUND_ROUTE,
+      { match: "/data/wow/realm/index", body: { realms: [{ name: "Argent Dawn", slug: "argent-dawn" }] } },
+    ]);
+
+    await expect(fetchTransmog("Testchar", "NonexistentRealm")).rejects.toThrow(TransmogLookupError);
+  });
+
+  test("never touches the realm index when the heuristic slug already resolves", async () => {
+    // The common case (an already-correct slug or name) must not pay for the extra call — if it
+    // did, this test's realm-index route would be hit and the unmocked fallthrough would throw.
+    mockFetch([
+      TOKEN_ROUTE,
+      { match: "/profile/wow/character/argent-dawn/testchar/equipment", body: { equipped_items: [] } },
+    ]);
+
+    const result = await fetchTransmog("Testchar", "Argent Dawn");
+    expect(result.code.startsWith("/customset v1 ")).toBe(true);
   });
 });

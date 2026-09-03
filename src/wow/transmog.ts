@@ -1,6 +1,6 @@
 import { config } from "../config";
 import { blizzardToken } from "./blizzard";
-import { realmExists } from "./realm";
+import { realmExists, resolveCanonicalSlug } from "./realm";
 
 // Build a `/customset v1 …` outfit import string from a character's equipment, for the case the
 // in-game path (#819) structurally can't reach: someone you can't inspect — offline, another
@@ -177,6 +177,15 @@ export function realmSlug(realm: string): string {
   );
 }
 
+/**
+ * Whether a realm-index match (#32) is worth retrying the equipment fetch with: only if it found
+ * something, and only if it's actually different from the slug that already failed — otherwise
+ * `fetchTransmog` would recurse forever re-deriving the same failing slug from the same input.
+ */
+export function pickRetrySlug(canonical: string | undefined, failedSlug: string): string | undefined {
+  return canonical && canonical !== failedSlug ? canonical : undefined;
+}
+
 const SLOT_LABEL: Record<string, string> = {
   HEAD: "Head",
   SHOULDER: "Shoulder",
@@ -271,6 +280,12 @@ export async function fetchTransmog(character: string, realm: string): Promise<O
     // and let the reader work it out. One of them is separable: ask about the realm directly.
     // Only on this path, so a successful lookup never pays for the extra call.
     if (!(await realmExists(slug))) {
+      // realmSlug's heuristic can't distinguish a literal hyphen in the realm's NAME (which
+      // Blizzard's canonical slug drops, e.g. Azjol-Nerub -> azjolnerub) from a hyphen that's a
+      // word-separator in an already-typed slug (which Blizzard keeps, e.g. argent-dawn). Rather
+      // than guess, check the realm index for the name actually typed (#32) before giving up.
+      const retrySlug = pickRetrySlug(await resolveCanonicalSlug(realm, config.region), slug);
+      if (retrySlug) return fetchTransmog(character, retrySlug);
       throw new TransmogLookupError(
         `No realm **${slug}** in ${config.region.toUpperCase()}. ` +
           `Check the realm name — it's the realm the character is *on*, spelled as in game ` +
