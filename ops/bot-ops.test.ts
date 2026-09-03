@@ -52,11 +52,12 @@ function setup(
   envText: string,
   opts: {
     nextRunning?: boolean;
-    /** Whether the simulated `<container>-next` still has a live handoff.json — i.e. is
-     *  genuinely mid-swap (true, the default whenever nextRunning is set) vs. a swap that
-     *  finished but got stuck under the "-next" name (false — issue #51 item 5's guard must NOT
-     *  refuse forever in that case). Ignored unless nextRunning is set. */
-    nextHandoffMarker?: boolean;
+    /** Whether the simulated canonical-named container is still RUNNING — i.e. the swap is
+     *  genuinely unresolved (true, the default whenever nextRunning is set) vs. already past
+     *  retireOriginal's stop (false — a swap that finished but got stuck renaming "-next" to the
+     *  canonical name; issue #51 item 5's guard must NOT refuse forever in that case). Ignored
+     *  unless nextRunning is set. */
+    originalStillRunning?: boolean;
   } = {},
 ): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
@@ -64,12 +65,13 @@ function setup(
   const bin = join(root, "bin");
   mkdirSync(cfg);
   mkdirSync(bin);
-  const markerState = opts.nextHandoffMarker ?? true ? "present" : "absent";
-  // `ps` and `exec` only answer specially when opts.nextRunning simulates a `<container>-next`
-  // (issue #51 item 5's guard) — every other invocation (build, create, up -d
-  // --force-recreate, ...) never matches `$1`, so it stays silent for them, same as before this
-  // option existed. The `exec` branch stands in for the real container's filesystem: rather than
-  // actually running the inner `test -f`, it just reports the configured marker state directly.
+  const originalRunning = opts.originalStillRunning ?? true;
+  // `ps` only answers specially when opts.nextRunning simulates a `<container>-next` (issue #51
+  // item 5's guard) — every other invocation (build, create, up -d --force-recreate, ...) never
+  // matches `$1`, so it stays silent for them, same as before this option existed. The guard makes
+  // two `ps` calls with different filters: one for "-next" (always answered when nextRunning is
+  // set), one for the bare canonical name with no "-a" (answered only per originalStillRunning,
+  // matching real `docker ps`'s "running containers only" default).
   writeFileSync(
     join(bin, "docker"),
     [
@@ -77,10 +79,10 @@ function setup(
       `printf '%s\\n' "docker $*" >> "$(dirname "$0")/docker.log"`,
       opts.nextRunning
         ? [
-            `if [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container-next"* ]]; then`,
+            `if [[ "$1" == "ps" ]] && [[ "$*" == *"-next"* ]]; then`,
             `  printf '%s\\n' "probe-container-next"`,
-            `elif [[ "$1" == "exec" ]] && [[ "$2" == "probe-container-next" ]]; then`,
-            `  printf '%s\\n' "${markerState}"`,
+            `elif [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container"* ]]; then`,
+            originalRunning ? `  printf '%s\\n' "probe-container"` : `  :`,
             `fi`,
           ].join("\n")
         : "",
@@ -451,13 +453,14 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
 
 // Issue #51 item 5: a self-update briefly runs the replacement alongside the original under
 // "<container>-next" before it takes the canonical name over. restart/env-set recreating or
-// restarting the ORIGINAL in that window races retireOriginal's own rename/remove and can leave
-// two bots on the shared token — both commands must refuse outright rather than risk it. But the
-// container's mere existence must NOT be the whole signal (see the next describe block) — the
-// live handoff.json marker is what actually distinguishes "still swapping" from "stuck".
+// restarting the ORIGINAL in that window races retireOriginal's own stop/remove/rename and can
+// leave two bots on the shared token — both commands must refuse outright rather than risk it.
+// The container's mere existence must NOT be the whole signal (see the next describe block) —
+// whether the CANONICAL name is still a running container is what actually distinguishes "still
+// unresolved" from "stuck on a cosmetic rename failure, already safe."
 describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is mid-flight (issue #51)", () => {
-  test("restart refuses when a <container>-next container has a live handoff marker", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: true });
+  test("restart refuses when a <container>-next container exists and the original is still running", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalStillRunning: true });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
@@ -466,8 +469,8 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
     expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
   });
 
-  test("env-set refuses when a <container>-next container has a live handoff marker — .env untouched, no backup", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: true });
+  test("env-set refuses when a <container>-next container exists and the original is still running — .env untouched, no backup", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalStillRunning: true });
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
@@ -490,18 +493,19 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
 // per its own comment, since the bot is up and serving regardless. That can leave a fully healthy
 // replacement permanently running under "<container>-next" with no self-heal. A guard keyed on
 // the container's mere existence would then refuse restart/env-set FOREVER — worse than the race
-// it exists to prevent. handoff.json (cleared once retireOriginal returns, cosmetic failure or
-// not) is what tells the two states apart.
+// it exists to prevent. Once retireOriginal gets past stopping the original — its own documented
+// "point of no return" — the original is no longer RUNNING, which is what tells this state apart
+// from a swap that's still genuinely in progress.
 describe.skipIf(!runnable)("bot-ops.sh doesn't lock out restart/env-set forever on a stuck-but-healthy swap (issue #51)", () => {
-  test("restart proceeds when <container>-next exists but its handoff marker is already cleared", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: false });
+  test("restart proceeds when <container>-next exists but the original has already been stopped", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalStillRunning: false });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).toBe(0);
     expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("restart"))).toBe(true);
   });
 
-  test("env-set proceeds when <container>-next exists but its handoff marker is already cleared", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: false });
+  test("env-set proceeds when <container>-next exists but the original has already been stopped", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalStillRunning: false });
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
