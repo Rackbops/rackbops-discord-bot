@@ -414,9 +414,10 @@ export function describeAction(invocation: BotOpsInvocation, stdout: string): st
   return action;
 }
 
-/** The audit line for a *successful mutating* action (restart/env-set), or `null` for a read or a
- * failure (reads aren't logged — they're low-value and re-fetched on demand; failures are logged
- * separately on the error path). Pure and exported so which actions get attributed is test-pinned. */
+/** The audit line for a *successful mutating* action (restart/env-set), for a *failed* env-set
+ * that still changed something, or `null` for a read or a no-op failure (reads aren't logged —
+ * they're low-value and re-fetched on demand). Pure and exported so which actions get attributed
+ * is test-pinned. */
 export function auditLogLine(
   invocation: BotOpsInvocation,
   result: BotOpsResult,
@@ -424,8 +425,35 @@ export function auditLogLine(
 ): string | null {
   const action = invocation.args[0];
   if (action !== "restart" && action !== "env-set") return null;
-  if (result.exitCode !== 0) return null;
-  return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
+  if (result.exitCode === 0) {
+    return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
+  }
+  // A failed recreate after .env was already rewritten is still a real mutation worth attributing
+  // (issue #47) — env-set's own JSON says what changed even though the exit code is non-zero.
+  // Anything else non-zero (a bad value die()'d before touching .env, any restart failure) has
+  // nothing to attribute; the error path's console.error covers it instead.
+  if (action === "env-set") {
+    const changed = parseChangedKeys(result.stdout);
+    if (changed.length > 0) {
+      return `[admin] env-set (changed: ${changed.join(", ")}) — recreate FAILED by ${describeActor(auth)}`;
+    }
+  }
+  return null;
+}
+
+/** True when `text` parses as JSON — used on the failure path to prefer a subcommand's own JSON
+ * stdout over stderr: env-set still emits its result (ok/changed/backup/log) there even when the
+ * recreate step itself fails, and that's the only place the backup path and compose error survive
+ * once .env has already been rewritten (issue #47). An early die() leaves stdout empty, so this
+ * still falls through to the stderr fallback exactly as before. */
+export function parsesAsJson(text: string): boolean {
+  if (!text.trim()) return false;
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -596,6 +624,15 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     console.error(
       `[admin] ${invocation.args[0]} failed (exit ${result.exitCode}) — requested by ${describeActor(auth)}: ${result.stderr.trim()}`,
     );
+    // An env-set whose recreate step failed still mutated .env — attribute it (issue #47).
+    const audit = auditLogLine(invocation, result, auth);
+    if (audit) console.log(audit);
+    // Prefer stdout when it parses as JSON: that's env-set's own result (backup path, compose
+    // error) surviving a failed recreate. stderr stays the fallback for an early die() that never
+    // wrote any stdout at all.
+    if (parsesAsJson(result.stdout)) {
+      return new Response(result.stdout, { status: 502, headers: { "Content-Type": invocation.contentType } });
+    }
     return new Response(result.stderr.trim() || "bot-ops.sh failed", { status: 502 });
   }
   // Attribute successful mutations (restart/env-set) — the audit trail today's who-changed-what
