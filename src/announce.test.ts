@@ -154,6 +154,94 @@ describe("guardedTick", () => {
       warnSpy.mockRestore();
     }
   });
+
+  // Review finding: the reset is what makes a merely-slow tick (one skip, then a clean run)
+  // distinct from a genuinely stuck one (repeated skips) — without it, a single skip any time
+  // after an earlier 2-in-a-row streak would immediately warn again.
+  test("a successful run resets the skip streak — a later solo skip is silent again", async () => {
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let resolveFirst!: () => void;
+      const firstBody = new Promise<void>((resolve) => {
+        resolveFirst = resolve;
+      });
+      const first = guardedTick(() => firstBody);
+      await guardedTick(async () => {}); // 1st skip
+      await guardedTick(async () => {}); // 2nd skip — warns
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      resolveFirst();
+      await first;
+
+      await guardedTick(async () => {}); // a clean, successful run in between
+      warnSpy.mockClear();
+
+      let resolveSecond!: () => void;
+      const secondBody = new Promise<void>((resolve) => {
+        resolveSecond = resolve;
+      });
+      const second = guardedTick(() => secondBody);
+      await guardedTick(async () => {}); // a fresh solo skip, not a continuation of the earlier streak
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      resolveSecond();
+      await second;
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // A network call with no timeout of its own (every fetch a tick can reach) could hang forever;
+  // without a bound here that would leave tickInFlight stuck true permanently, silently freezing
+  // every future tick — not just the one stuck check. `watchdogMs` is the injected test seam so
+  // this doesn't actually wait out the real 5-minute bound.
+  test("a run() that never settles has its guard released by the watchdog", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const stuck = new Promise<void>(() => {}); // never resolves
+      void guardedTick(() => stuck, 20);
+      await Bun.sleep(40); // let the short watchdog fire
+
+      let laterRan = false;
+      await guardedTick(async () => void (laterRan = true));
+      expect(laterRan).toBe(true); // a later tick can proceed once the watchdog releases the guard
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // The generation guard's whole reason to exist: a tick the watchdog already released can still
+  // resolve LATER, once some newer tick is legitimately in flight — its own (very late) finally
+  // must not clobber that newer tick's guard out from under it.
+  test("a stuck tick resolving after its watchdog fired doesn't clobber a newer tick's guard", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let resolveStuck!: () => void;
+      const stuck = new Promise<void>((resolve) => {
+        resolveStuck = resolve;
+      });
+      void guardedTick(() => stuck, 20); // generation 1 — will be watchdog-released
+      await Bun.sleep(40); // let generation 1's watchdog fire
+
+      let resolveSecond!: () => void;
+      const secondBody = new Promise<void>((resolve) => {
+        resolveSecond = resolve;
+      });
+      const second = guardedTick(() => secondBody); // generation 2, genuinely in flight — not awaited yet
+
+      resolveStuck(); // generation 1's run() finally settles, long after its own watchdog fired
+      await Bun.sleep(0); // let generation 1's finally run
+
+      let duringSecond = false;
+      await guardedTick(async () => void (duringSecond = true));
+      expect(duringSecond).toBe(false); // generation 2 must still be seen as in flight
+
+      resolveSecond();
+      await second;
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
 });
 
 // #52 item 2: checkRepoReleases used to save `nextSeen` once after posting the whole batch, so a

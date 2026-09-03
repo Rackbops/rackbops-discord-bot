@@ -72,6 +72,20 @@ export async function runTick(checks: TickCheck[]): Promise<void> {
 
 let tickInFlight = false;
 let consecutiveSkips = 0;
+// Distinguishes which "generation" of tick currently owns tickInFlight, so a watchdog or
+// finally belonging to an old, still-hung tick can never stomp on a later, legitimately
+// in-flight one — see the watchdog comment below.
+let tickGeneration = 0;
+
+// None of the checks a tick can reach (Blizzard/GitHub calls in wow/realm.ts, wow/blizzard.ts,
+// github.ts, update.ts) carry a timeout of their own — a genuinely hung socket (connected, but
+// the far end never responds and never closes) leaves `run()` below never settling. Without this
+// bound, that would leave tickInFlight stuck true forever, silently freezing EVERY future tick —
+// not just the one stuck check, all five, since they all now go through this one guard. Generous
+// on purpose: a real tick should finish in well under a minute, even a slow one. Adding a timeout
+// to each individual fetch (closing the hang itself, not just its blast radius here) is tracked
+// as a separate follow-up rather than folded into this fix.
+const TICK_WATCHDOG_MS = 5 * 60 * 1000;
 
 /**
  * Prevents a tick from starting while the previous one is still running (issue #52 item 1):
@@ -81,11 +95,16 @@ let consecutiveSkips = 0;
  * before the first tick has written it — producing a duplicate announcement.
  *
  * Skips outright rather than queuing, so a merely-slow tick never piles up work — the next tick
- * to actually run re-reads whatever state the (by-then-finished) previous one left behind. Logs
- * only once skipping becomes REPEATED (2+ in a row), not on every skip: an occasional single
- * skip under an ordinarily-slow tick is expected and not itself a problem to flag.
+ * to actually run re-reads whatever state the (by-then-finished) previous one left behind. Warns
+ * on every skip once skipping becomes REPEATED (2+ in a row), not the first one: an occasional
+ * single skip under an ordinarily-slow tick is expected and not itself worth flagging.
  */
-export async function guardedTick(run: () => Promise<void>): Promise<void> {
+export async function guardedTick(
+  run: () => Promise<void>,
+  // Test seam: real callers always take the default. Overridable so a test can exercise the
+  // watchdog firing without actually waiting out the real 5-minute bound.
+  watchdogMs = TICK_WATCHDOG_MS,
+): Promise<void> {
   if (tickInFlight) {
     consecutiveSkips++;
     if (consecutiveSkips >= 2) {
@@ -94,11 +113,30 @@ export async function guardedTick(run: () => Promise<void>): Promise<void> {
     return;
   }
   tickInFlight = true;
+  const myGeneration = ++tickGeneration;
+  const watchdog = setTimeout(() => {
+    // Only fires if `run()` is STILL pending this far in — release the guard so future ticks
+    // aren't blocked forever; the stuck call itself is left running in the background (nothing
+    // can safely cancel it without a signal threaded all the way down, which is the follow-up).
+    console.error(
+      `[tick] a tick has been running for over ${Math.round(watchdogMs / 1000)}s — releasing the guard so ` +
+        `future ticks aren't blocked forever`,
+    );
+    tickInFlight = false;
+  }, watchdogMs);
   try {
     await run();
   } finally {
-    tickInFlight = false;
-    consecutiveSkips = 0;
+    clearTimeout(watchdog);
+    // Guards against the watchdog (or this finally itself, on a very late resolution) touching
+    // state that a LATER generation's tick already owns — e.g. the watchdog fired, generation
+    // N+1 started and is legitimately in flight, and only THEN does generation N's original
+    // `run()` finally settle; without this check its finally would wrongly clear generation
+    // N+1's in-progress guard.
+    if (tickGeneration === myGeneration) {
+      tickInFlight = false;
+      consecutiveSkips = 0;
+    }
   }
 }
 
@@ -106,6 +144,7 @@ export async function guardedTick(run: () => Promise<void>): Promise<void> {
 export function resetTickGuardForTest(): void {
   tickInFlight = false;
   consecutiveSkips = 0;
+  tickGeneration = 0;
 }
 
 async function onTick(client: Client): Promise<void> {
