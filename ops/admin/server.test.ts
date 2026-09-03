@@ -1314,3 +1314,188 @@ describe("WOW_REALM slug validation (bot-ops.sh ↔ panel filter stay in sync)",
     for (const bad of mustReject) expect(re.test(bad)).toBe(false);
   });
 });
+
+// The panel's save path, pinned against the page's OWN source: the pure planEnvSave and saveEnv
+// itself are lifted from index.html (between their ENV_SAVE_PLAN / ENV_SAVE markers) and evaluated
+// here, so what issue #44 hinged on — the POST body carries ONLY the keys whose value changed, never
+// an untouched field echoed back — is asserted on the real functions, not a re-implementation. The
+// consumer boundary is what a green planEnvSave alone can't prove (a saveEnv that planned against
+// `{}` instead of the loaded env, or posted every control, would leave the bug in place), so saveEnv
+// is run against a stubbed page and the body it actually hands to api() is what's asserted.
+describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const planSrc = indexSrc.match(/\/\/ ENV_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE_PLAN:end/)?.[1];
+  const saveSrc = indexSrc.match(/\/\/ ENV_SAVE:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE:end/)?.[1];
+  type Plan = { changes: { key: string; before: string; now: string }[]; body: string };
+  // "use strict" up front, matching the page's own IIFE (index.html:226): without it, a `Function`
+  // body silently creates a global on an assignment to an un-injected or misspelled identifier
+  // instead of throwing — the real (strict-mode) page would ReferenceError there instead.
+  const planEnvSave = (loaded: Record<string, string>, current: Record<string, string>): Plan =>
+    (new Function(`"use strict";\n${planSrc ?? ""}\nreturn planEnvSave;`)() as (
+      l: typeof loaded,
+      c: typeof current,
+    ) => Plan)(loaded, current);
+
+  /** Runs the page's real saveEnv with `controls` as the rendered fields and `loaded` as what
+   *  GET /api/env returned, recording what it confirms and POSTs. Every page global saveEnv touches
+   *  is injected: document (only #env-msg and the field controls are looked up), confirm, api,
+   *  loadEnv/loadStatus (the post-save re-baseline), and loadedEnv. */
+  interface FakePage {
+    posts: { path: string; opts: { method?: string; body?: string } }[];
+    confirms: string[];
+    msg: { textContent: string; className: string };
+    reloads: number;
+  }
+  async function runSaveEnv(
+    loaded: Record<string, string>,
+    controls: Record<string, string>,
+    opts: { confirm?: boolean; response?: { ok: boolean; text: string } } = {},
+  ): Promise<FakePage> {
+    const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, reloads: 0 };
+    const document = {
+      getElementById: (id: string) => (id === "env-msg" ? page.msg : null),
+      querySelectorAll: (selector: string) =>
+        selector === "#env-fields [data-key]" ? Object.entries(controls).map(([key, value]) => ({ dataset: { key }, value })) : [],
+    };
+    const confirm = (text: string): boolean => {
+      page.confirms.push(text);
+      return opts.confirm ?? true;
+    };
+    const api = async (path: string, o: { method?: string; body?: string }) => {
+      page.posts.push({ path, opts: o });
+      const r = opts.response ?? { ok: true, text: '{"ok":true,"changed":["ANNOUNCE_CHANNEL_ID"]}' };
+      return { ok: r.ok, text: async () => r.text };
+    };
+    const saveEnv = new Function(
+      "document",
+      "confirm",
+      "api",
+      "loadEnv",
+      "loadStatus",
+      "loadedEnv",
+      `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
+    )(document, confirm, api, () => page.reloads++, () => {}, loaded) as () => Promise<void>;
+    await saveEnv();
+    return page;
+  }
+
+  test("both marked functions are present in the served page", () => {
+    expect(planSrc).toContain("function planEnvSave(");
+    expect(saveSrc).toContain("async function saveEnv(");
+  });
+
+  test("saveEnv POSTs only the changed fields, diffed against the LOADED env, and previews the same", async () => {
+    // The issue's exact setup: two stored values the whitelist would reject, both untouched.
+    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "111", ADMIN_USER_IDS: "123456, 234567", WOW_REALM: "stormrage" };
+    const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "222" });
+    expect(page.posts).toEqual([{ path: "/api/env", opts: { method: "POST", body: "ANNOUNCE_CHANNEL_ID=222" } }]);
+    expect(page.confirms).toHaveLength(1);
+    expect(page.confirms[0]).toContain('ANNOUNCE_CHANNEL_ID: "111" → "222"');
+    expect(page.confirms[0]).not.toContain("ADMIN_USER_IDS");
+    expect(page.msg).toEqual({ textContent: "Saved: ANNOUNCE_CHANNEL_ID", className: "msg ok" });
+    expect(page.reloads).toBe(1); // re-baselined, so a second save diffs against the new state
+  });
+
+  test("saveEnv with nothing changed posts nothing and says so", async () => {
+    const same = { ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" };
+    const page = await runSaveEnv(same, { ...same });
+    expect(page.posts).toEqual([]);
+    expect(page.confirms).toEqual([]);
+    expect(page.msg.textContent).toBe("No changes.");
+  });
+
+  test("a declined confirm posts nothing", async () => {
+    const page = await runSaveEnv({ WOW_REGION: "us" }, { WOW_REGION: "eu" }, { confirm: false });
+    expect(page.confirms).toHaveLength(1);
+    expect(page.posts).toEqual([]);
+    expect(page.reloads).toBe(0);
+  });
+
+  test("a rejected save surfaces bot-ops.sh's own message and does not re-baseline", async () => {
+    const page = await runSaveEnv(
+      { WOW_REGION: "us" },
+      { WOW_REGION: "eu" },
+      { response: { ok: false, text: "bot-ops: env-set: value for 'WOW_REGION' is invalid" } },
+    );
+    expect(page.msg).toEqual({ textContent: "Failed: bot-ops: env-set: value for 'WOW_REGION' is invalid", className: "msg error" });
+    expect(page.reloads).toBe(0);
+  });
+
+  test("the body carries only the keys whose value differs, in field order (not alphabetical)", () => {
+    // WOW_REGION before ANNOUNCE_CHANNEL_ID: bot-ops.sh's own ALLOWED_ORDER puts WOW_REALM/WOW_REGION
+    // ahead of ANNOUNCE_CHANNEL_ID's later cousins, so a real field order is never alphabetical — an
+    // Object.keys(...).sort() mutant must fail this, not just happen to match by coincidence.
+    const loaded = { WOW_REGION: "us", WOW_REALM: "stormrage", ANNOUNCE_CHANNEL_ID: "111", DISCORD_SERVER_ID: "" };
+    const current = { WOW_REGION: "eu", WOW_REALM: "stormrage", ANNOUNCE_CHANNEL_ID: "222", DISCORD_SERVER_ID: "" };
+    const plan = planEnvSave(loaded, current);
+    expect(plan.body).toBe("WOW_REGION=eu\nANNOUNCE_CHANNEL_ID=222");
+    expect(plan.changes).toEqual([
+      { key: "WOW_REGION", before: "us", now: "eu" },
+      { key: "ANNOUNCE_CHANNEL_ID", before: "111", now: "222" },
+    ]);
+  });
+
+  test("an untouched field whose stored value the whitelist would reject is never sent", () => {
+    // The issue's failure: this value round-trips unchanged, so it must not reach env-set at all.
+    const loaded = { ADMIN_USER_IDS: "123456, 234567", ANNOUNCE_CHANNEL_ID: "111" };
+    const plan = planEnvSave(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "222" });
+    expect(plan.body).toBe("ANNOUNCE_CHANNEL_ID=222");
+    expect(plan.body).not.toContain("ADMIN_USER_IDS");
+  });
+
+  test("a field absent from the loaded env diffs against the empty string", () => {
+    expect(planEnvSave({}, { WOW_REGION: "" }).changes).toEqual([]);
+    expect(planEnvSave({}, { WOW_REGION: "eu" }).changes).toEqual([{ key: "WOW_REGION", before: "", now: "eu" }]);
+  });
+
+  test("clearing a value is a change (an empty value clears the key back to its default)", () => {
+    expect(planEnvSave({ BOT_BRANCH: "dev" }, { BOT_BRANCH: "" }).body).toBe("BOT_BRANCH=");
+  });
+
+  test("no differences -> empty preview list and empty body", () => {
+    const same = { A: "1", B: "" };
+    expect(planEnvSave(same, { ...same })).toEqual({ changes: [], body: "" });
+  });
+
+  test("the confirm preview and the body name exactly the same keys", () => {
+    const plan = planEnvSave({ A: "1", B: "2", C: "3" }, { A: "1", B: "x", C: "y" });
+    expect(plan.body.split("\n").map((l) => l.split("=")[0])).toEqual(plan.changes.map((c) => c.key));
+  });
+});
+
+// DMF_TIMEZONE's shape check is hand-duplicated like WOW_REALM's above: ALLOWED[DMF_TIMEZONE] in
+// bot-ops.sh and TZ_SHAPE_RE in the panel (which filters the datalist so it never offers a zone the
+// server rejects). #69 widened the server side to 3-segment / hyphen / "+" / no-slash zones and the
+// panel's filter was left on the old exactly-one-slash shape, silently under-offering — pinned here
+// so the two can't drift again. filterTimezones (not just TZ_SHAPE_RE) is lifted and called so a
+// filter that stopped applying the regex — or stopped filtering at all — would fail this even
+// though the regex string itself still matched bot-ops.sh's.
+describe("DMF_TIMEZONE shape (bot-ops.sh ↔ panel datalist filter stay in sync)", () => {
+  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const botOpsPattern = botOpsSrc.match(/\[DMF_TIMEZONE\]='([^']+)'/)?.[1];
+  const filterSrc = indexSrc.match(/\/\/ TZ_FILTER:begin\n([\s\S]*?)\n\s*\/\/ TZ_FILTER:end/)?.[1];
+  const panelPattern = filterSrc?.match(/TZ_SHAPE_RE\s*=\s*new RegExp\("([^"]+)"\)/)?.[1];
+  const filterTimezones = (zones: string[]): string[] =>
+    (new Function(`"use strict";\n${filterSrc ?? ""}\nreturn filterTimezones;`)() as (z: string[]) => string[])(zones);
+
+  test("both source patterns are present and identical (mirror can't drift)", () => {
+    expect(botOpsPattern).toBeDefined();
+    expect(panelPattern).toBeDefined();
+    expect(panelPattern).toBe(botOpsPattern);
+  });
+
+  test("every IANA zone this runtime knows survives filterTimezones, so the datalist offers all of them", () => {
+    const zones: string[] = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [];
+    expect(zones.length).toBeGreaterThan(300); // a runtime with no zone list would make this vacuous
+    expect(filterTimezones(zones)).toEqual(zones); // nothing real gets dropped
+    const withJunk = [...zones, "Europe/Paris/x/y", "Europe Paris", "a;b", "a$(x)", ""];
+    expect(filterTimezones(withJunk)).toEqual(zones); // and the junk actually gets filtered OUT
+    expect(filterTimezones(["America/Indiana/Indianapolis", "America/Port-au-Prince", "Etc/GMT+1", "UTC"])).toEqual([
+      "America/Indiana/Indianapolis",
+      "America/Port-au-Prince",
+      "Etc/GMT+1",
+      "UTC",
+    ]);
+  });
+});

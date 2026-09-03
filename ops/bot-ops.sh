@@ -12,9 +12,11 @@
 #   status        Print JSON: container running?, status line, image, realm status.
 #   logs [N]      Print the last N (default 200, max 5000) container log lines, raw.
 #   restart       Restart the bot process in place (docker compose restart). No env reload.
-#   env-get       Print JSON of the NON-SECRET whitelisted env keys and their current values.
-#   env-set       Read KEY=VALUE lines from stdin, validate against the whitelist, back up
-#                 .env, apply only real changes, then `up -d --force-recreate` to load them.
+#   env-get       Print JSON of the NON-SECRET whitelisted env keys and their EFFECTIVE values —
+#                 .env read the way compose's env_file loader reads it (see load_env_values).
+#   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
+#                 remaining one against the effective value, validate the FORMAT of only the ones
+#                 that change, back up .env, apply those changes, then `up -d --force-recreate`.
 #
 # Design notes:
 #   - The compose project + container come from BOT_OPS_PROJECT / BOT_OPS_CONTAINER (the caller
@@ -34,7 +36,12 @@
 #     from ALLOWED. env-get never reads them out; env-set never writes them. Edit those by hand
 #     with nano on the box.
 #   - env-set rebuilds .env line-by-line (no sed) so a value can never inject into the file, and
-#     comment/blank/secret lines are preserved verbatim.
+#     comment/blank/secret lines are preserved verbatim. An indented or `export`ed line for a key
+#     being changed is rewritten in place as plain `KEY=`.
+#   - env-set diffs BEFORE it validates a value's FORMAT, and validates only what changes (issue
+#     #44) — whitelist MEMBERSHIP is still checked for every submitted key regardless. Format-
+#     validating every submitted line first meant one stored value the bot accepts but a regex
+#     here rejects failed every save that echoed it back, naming a key the operator never touched.
 set -euo pipefail
 
 # Target bot: no fallback to the monorepo-era name — a panel (or you, by hand) must always pass
@@ -136,13 +143,51 @@ die() { echo "bot-ops: $*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
-# Current value of a key from .env (empty if unset/absent). Strips the leading `KEY=`.
-env_value() {
-  local key="$1"
+# One .env definition line: optional indentation, an optional `export ` prefix, the key, `=`, the
+# raw value. Shared by load_env_values (which reads .env) and cmd_env_set's rewrite (which
+# replaces lines in it), so the two can never disagree about which lines define a key.
+readonly ENV_LINE_RE='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+
+# The effective value of every key in .env, read ONCE per invocation into ENV_VALUES the way
+# compose's `env_file:` loader reads the same file — checked against `docker compose config`
+# (Compose 2.40) on the box, issue #44 — so env-get shows, and env-set diffs against, what the
+# bot is actually running with:
+#   - the LAST occurrence of a key wins (the old `grep -m1` took the first);
+#   - an `export KEY=...` line defines KEY, indented or not (both used to be invisible);
+#   - surrounding whitespace is trimmed — which also drops a CRLF-saved file's trailing "\r",
+#     previously leaked into every value;
+#   - then ONE layer of matching "..." or '...' is stripped. An unterminated quote is left as-is:
+#     compose refuses to load such a file at all ("unterminated quoted value"), so raw is the
+#     honest reading, and saving that key rewrites it unquoted — which repairs the file.
+# Deliberately NOT modelled, though compose does these too: an inline ` # comment`, `${VAR}`
+# interpolation, whitespace around the `=`, a `KEY: value` colon separator, and backslash escapes
+# inside double quotes. Nothing env-set writes can produce them (no ALLOWED regex admits `#`, `$`,
+# `:`, `\`, or whitespace); a hand-edit that does shows raw in the panel and normalises on the
+# next save of that key, as before.
+# A bash `read` loop rather than grep on purpose: Git Bash's grep drops "\r" silently, which
+# would let the CR handling pass its test on a Windows dev box even with the trim deleted.
+declare -A ENV_VALUES=()
+load_env_values() {
+  ENV_VALUES=()
   [ -f "$ENV_FILE" ] || return 0
-  local line
-  line="$(grep -m1 -E "^${key}=" "$ENV_FILE" || true)"
-  printf '%s' "${line#*=}"
+  local line val
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ $ENV_LINE_RE ]] || continue
+    val="${BASH_REMATCH[3]}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    if (( ${#val} >= 2 )); then
+      case "$val" in
+        \"*\" | \'*\') val="${val:1:${#val}-2}" ;;
+      esac
+    fi
+    ENV_VALUES["${BASH_REMATCH[2]}"]="$val"
+  done < "$ENV_FILE"
+}
+
+# Effective value of a key (empty if unset/absent) — from ENV_VALUES, so load_env_values first.
+env_value() {
+  printf '%s' "${ENV_VALUES[$1]-}"
 }
 
 cmd_status() {
@@ -194,6 +239,7 @@ cmd_env_get() {
   done
   (( ${#seen[@]} == ${#ALLOWED[@]} )) \
     || die "env-get: ALLOWED_ORDER (${#seen[@]} unique) and ALLOWED (${#ALLOWED[@]}) have drifted"
+  load_env_values
   local args=()
   for key in "${ALLOWED_ORDER[@]}"; do
     args+=(--arg "$key" "$(env_value "$key")")
@@ -210,30 +256,43 @@ cmd_env_set() {
 
   # Counters track sizes explicitly: `${#assoc[@]}` on a still-empty associative array trips
   # "unbound variable" under `set -u`, so we never expand a possibly-empty array for its length.
-  declare -A CHANGES=()
-  local line key val n_changes=0
+  declare -A SUBMITTED=()
+  local -a submitted_order=()
+  local line key val n_submitted=0
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" == *=* ]] || die "env-set: malformed input line (need KEY=VALUE)"
     key="${line%%=*}"
     val="${line#*=}"
+    # A key that isn't even key-shaped (`=value`, `a b=1`) is malformed input — checked before the
+    # ALLOWED lookup, which would otherwise die on an empty subscript with a raw bash error.
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "env-set: malformed input line (need KEY=VALUE)"
+    # Whitelist membership is checked up front whether or not the value changes — that's a
+    # question of authority (may the panel touch this key at all?), not of format.
     [[ -n "${ALLOWED[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
-    if [ -n "$val" ] && [[ ! "$val" =~ ${ALLOWED[$key]} ]]; then
-      die "env-set: value for '$key' is invalid"
-    fi
-    CHANGES["$key"]="$val"
-    n_changes=$((n_changes + 1))
+    [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
+    SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
+    n_submitted=$((n_submitted + 1))
   done
 
-  # Reduce to real changes (new value differs from current) — a no-op must not restart the bot.
+  # Reduce to real changes (new value differs from the EFFECTIVE current value — see
+  # load_env_values) and validate only those, in submission order. The order matters (issue
+  # #44): validating every submitted line first meant a stored value the bot accepts but a regex
+  # here rejects — a hand-quoted realm, a CRLF-saved file, `1, 2` in ADMIN_USER_IDS — failed every
+  # save that echoed it back, naming a key the operator never touched. A value that isn't
+  # changing was never this script's to judge. A no-op must not restart the bot.
+  load_env_values
   declare -A DIFF=()
   local n_diff=0
-  if [ "$n_changes" -gt 0 ]; then
-    for key in "${!CHANGES[@]}"; do
-      if [ "${CHANGES[$key]}" != "$(env_value "$key")" ]; then
-        DIFF["$key"]="${CHANGES[$key]}"
-        n_diff=$((n_diff + 1))
+  if [ "$n_submitted" -gt 0 ]; then
+    for key in "${submitted_order[@]}"; do
+      val="${SUBMITTED[$key]}"
+      [ "$val" != "$(env_value "$key")" ] || continue
+      if [ -n "$val" ] && [[ ! "$val" =~ ${ALLOWED[$key]} ]]; then
+        die "env-set: value for '$key' is invalid"
       fi
+      DIFF["$key"]="$val"
+      n_diff=$((n_diff + 1))
     done
   fi
   if [ "$n_diff" -eq 0 ]; then
@@ -270,14 +329,15 @@ cmd_env_set() {
   chown "$target_owner" "$backup" \
     || echo "bot-ops: warning: couldn't set backup ownership to $target_owner" >&2
 
-  # Rewrite .env: replace matching KEY= lines in place, preserve everything else verbatim,
-  # append any changed key that wasn't already present.
+  # Rewrite .env: replace matching KEY= lines in place (an indented or `export KEY=` line too — it
+  # comes back as plain `KEY=`, which compose reads identically), preserve everything else
+  # verbatim, append any changed key that wasn't already present.
   declare -A APPLIED
   local tmp k
   tmp="$(mktemp)"
   while IFS= read -r line || [ -n "$line" ]; do
-    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
-      k="${BASH_REMATCH[1]}"
+    if [[ "$line" =~ $ENV_LINE_RE ]]; then
+      k="${BASH_REMATCH[2]}"
       if [[ -n "${DIFF[$k]+x}" ]]; then
         printf '%s=%s\n' "$k" "${DIFF[$k]}" >> "$tmp"
         APPLIED["$k"]=1
