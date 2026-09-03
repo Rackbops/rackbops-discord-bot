@@ -13,6 +13,7 @@ const {
   redeploy,
   replacementName,
   resolveBootMode,
+  retireOriginal,
   selectImagesToPrune,
   shaTag,
   takeOver,
@@ -324,6 +325,95 @@ describe("takeOver", () => {
       exit: (code) => void exits.push(code),
     });
     expect(exits).toEqual([1]);
+  });
+});
+
+// A retire against the same original can happen twice: if a prior removeContainer below failed,
+// the original is left a stopped-but-not-removed corpse that a later standby boot retries
+// takeOver -> retireOriginal against. The stop has to tell a first attempt (original still
+// running — a failure must propagate, since the original is alive to reclaim) from a retry
+// (already stopped — a failure is just a daemon hiccup re-confirming what's already true, and
+// must degrade like every other post-stop step instead of crashing the sole live bot).
+describe("retireOriginal", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = "self-container-id";
+  const ORIGINAL_ID = "d".repeat(64);
+  let calls: { path: string; method: string }[] = [];
+
+  const runningOriginal: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: true, Status: "running", ExitCode: 0 },
+  };
+  const stoppedCorpse: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: false, Status: "exited", ExitCode: 0 },
+  };
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+  });
+
+  function stubDaemon(o: { inspectOriginal: () => Response; stopOriginal: () => Response }) {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) return o.inspectOriginal();
+      if (pathname === `/containers/${ORIGINAL_ID}/stop`) return o.stopOriginal();
+      if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return new Response("", { status: 204 });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname.endsWith("/rename")) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  test("a first attempt against a running original propagates a genuine stop failure", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(runningOriginal), { status: 200 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await expect(retireOriginal(ORIGINAL_ID)).rejects.toThrow(/500/);
+  });
+
+  test("a retry against an already-stopped corpse tolerates a genuine stop failure and still removes it", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(stoppedCorpse), { status: 200 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  // The expected 304 (already stopped) is tolerated by stopContainer itself either way — pinning
+  // this keeps the new branch from changing the ordinary retry's behavior.
+  test("a retry that gets the expected 304 behaves the same as before this fix", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(stoppedCorpse), { status: 200 }),
+      stopOriginal: () => new Response("", { status: 304 }),
+    });
+    await retireOriginal(ORIGINAL_ID);
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  // An original that's already fully gone (removed, not just stopped) is a third, pre-existing
+  // case: stopContainer's own 404 tolerance means it never reaches the new branch at all.
+  test("an original that no longer exists at all still returns cleanly", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response("not found", { status: 404 }),
+      stopOriginal: () => new Response("not found", { status: 404 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
   });
 });
 

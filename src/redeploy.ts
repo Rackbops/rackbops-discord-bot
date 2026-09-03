@@ -285,10 +285,30 @@ async function pruneOldImages(currentImage: string): Promise<void> {
  * Removal, not just a stop — under `restart: unless-stopped` an exited container is brought
  * back on its old image, which is the original #868 failure and would now leave two bots
  * running. An explicit `docker stop` is exempt from that policy, and the `rm` makes it moot.
+ *
+ * This can also run a second time against the same original: if a prior call's `removeContainer`
+ * failed below, the original is left a stopped-but-not-removed corpse that a standby boot mode
+ * still keyed on (env-based `bootMode`, or #46's daemon-confirmed `resolveBootMode` — either way,
+ * the original still *exists*) will retry `takeOver` -> `retireOriginal` against. The stop below
+ * has to tell those two calls apart: on a first attempt the original is genuinely still alive, so
+ * a stop failure must propagate (it stays alive to reclaim); on a retry it is already stopped, so
+ * a stop failure is just a daemon hiccup re-confirming what is already true, and must degrade like
+ * every other post-stop step below rather than crash the sole live bot.
  */
 export async function retireOriginal(originalId: string): Promise<void> {
   const original = await tryInspectContainer(originalId);
-  await stopContainer(originalId);
+  // A container that already exists but isn't running can only be a corpse from a prior,
+  // incomplete retirement — the original is guaranteed still running the first time this is ever
+  // called for a given handoff. That's the signal: past this point on a retry, there is no live
+  // original left to reclaim, so degrade instead of throwing, same as the removal below.
+  const retryingAStoppedCorpse = original !== undefined && !original.State.Running;
+  if (retryingAStoppedCorpse) {
+    await stopContainer(originalId).catch((err) => {
+      console.warn(`[handoff] retry: stop of the already-stopped original failed: ${(err as Error).message}`);
+    });
+  } else {
+    await stopContainer(originalId);
+  }
   // The stop is the point of no return: past it the original is dead and cannot reclaim, so
   // every later step must degrade rather than throw — a throw here rejects the replacement's
   // ClientReady, and with the only other bot already stopped that is a total outage. Before
