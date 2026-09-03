@@ -110,7 +110,7 @@
   input[type="checkbox"] { width: auto; margin: 0; vertical-align: middle; }
   .inline-check { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
   #logs-filter { flex: 1 1 160px; width: auto; min-width: 140px; }
-  .msg { font-size: 12px; margin-top: 8px; }
+  .msg { font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
   .msg.error { color: var(--danger); }
   .msg.ok { color: var(--ok); }
   .panel-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 20px; }
@@ -922,8 +922,15 @@
         loadEnv(); // re-baseline so a second save diffs against the new state
         loadStatus();
       } else {
-        msg.textContent = "Failed: " + (text || "bot-ops.sh error");
+        let failText = text || "bot-ops.sh error";
+        if (result && (result.log || result.backup)) {
+          // The recreate itself failed after .env was already rewritten — show the compose error
+          // and backup path instead of the raw JSON blob (issue #47).
+          failText = [result.log, result.backup ? "Backup: " + result.backup : ""].filter(Boolean).join("\n");
+        }
+        msg.textContent = "Failed: " + failText;
         msg.className = "msg error";
+        loadEnv(); // .env may already have been rewritten even though the recreate failed — re-baseline
       }
     } catch (e) {
       if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }

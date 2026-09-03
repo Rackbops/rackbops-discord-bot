@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -737,7 +737,7 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     );
   });
 
-  test("auditLogLine returns null for reads and for failures (logged elsewhere)", () => {
+  test("auditLogLine returns null for reads and for no-op failures (logged elsewhere)", () => {
     const status: BotOpsInvocation = { args: ["status"], contentType: "application/json" };
     const logs: BotOpsInvocation = { args: ["logs"], contentType: "text/plain" };
     const envGet: BotOpsInvocation = { args: ["env-get"], contentType: "application/json" };
@@ -745,8 +745,23 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     expect(auditLogLine(status, ok("{}"), auth)).toBeNull();
     expect(auditLogLine(logs, ok(""), auth)).toBeNull();
     expect(auditLogLine(envGet, ok("{}"), auth)).toBeNull();
-    // a mutation that FAILED (non-zero exit) isn't logged here — the error path logs it instead
+    // restart has no "changed" concept, so a failed restart has nothing to attribute
     expect(auditLogLine(okRestart, { exitCode: 1, stdout: "", stderr: "boom" }, auth)).toBeNull();
+    // an env-set that die()'d before touching .env (empty/non-JSON stdout) mutated nothing either
+    expect(auditLogLine(okEnvSet, { exitCode: 1, stdout: "", stderr: "bot-ops: value is invalid" }, auth)).toBeNull();
+    expect(auditLogLine(okEnvSet, { exitCode: 1, stdout: '{"changed":[]}', stderr: "" }, auth)).toBeNull();
+  });
+
+  test("auditLogLine attributes a failed env-set recreate when .env was already rewritten (issue #47)", () => {
+    const auth: Authorization = { via: "bearer" };
+    const result: BotOpsResult = {
+      exitCode: 1,
+      stdout: '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
+      stderr: "",
+    };
+    expect(auditLogLine(okEnvSet, result, auth)).toBe(
+      "[admin] env-set (changed: WOW_REALM) — recreate FAILED by the ADMIN_TOKEN bearer token",
+    );
   });
 });
 
@@ -1117,6 +1132,37 @@ describe("handleRequest", () => {
     expect(await res.text()).toBe("bot-ops: value for 'BOT_BRANCH' is invalid");
   });
 
+  test("a failed env-set recreate returns its JSON stdout (backup/log), logs an audit line, not the empty stderr (issue #47)", async () => {
+    const stdout = '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+    // Spied rather than left to the pure auditLogLine unit test alone — that only proves the
+    // function's own logic, not that handleRequest's failure branch actually calls and logs it
+    // (a prior review round mutation-tested this exact wiring by deleting it: the suite stayed
+    // green with only the unit test in place).
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await handleRequest(
+        new Request("http://x/api/env", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: "WOW_REALM=stormrage",
+        }),
+        {
+          adminToken: TOKEN,
+          indexHtml: INDEX_HTML,
+          runBotOps: fakeRunBotOps({ exitCode: 1, stdout, stderr: "" }),
+        },
+      );
+      expect(res.status).toBe(502);
+      expect(await res.text()).toBe(stdout);
+      expect(res.headers.get("Content-Type")).toBe("application/json");
+      expect(logSpy).toHaveBeenCalledWith(
+        "[admin] env-set (changed: WOW_REALM) — recreate FAILED by the ADMIN_TOKEN bearer token",
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   test("an unrecognised authenticated route is a 404, not silently 200", async () => {
     const res = await handleRequest(
       new Request("http://x/api/nonexistent", { headers: { Authorization: `Bearer ${TOKEN}` } }),
@@ -1417,14 +1463,33 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     expect(page.reloads).toBe(0);
   });
 
-  test("a rejected save surfaces bot-ops.sh's own message and does not re-baseline", async () => {
+  test("a rejected save surfaces bot-ops.sh's own message and re-baselines (issue #47)", async () => {
     const page = await runSaveEnv(
       { WOW_REGION: "us" },
       { WOW_REGION: "eu" },
       { response: { ok: false, text: "bot-ops: env-set: value for 'WOW_REGION' is invalid" } },
     );
     expect(page.msg).toEqual({ textContent: "Failed: bot-ops: env-set: value for 'WOW_REGION' is invalid", className: "msg error" });
-    expect(page.reloads).toBe(0);
+    // .env may already have been rewritten even though this particular response is plain text
+    // (a die() before any rewrite, in this case) — saveEnv can't tell the difference from the
+    // response shape alone, so it re-baselines unconditionally on any failure.
+    expect(page.reloads).toBe(1);
+  });
+
+  test("a failed recreate shows the compose error and backup path, not the raw JSON, and re-baselines (issue #47)", async () => {
+    const page = await runSaveEnv(
+      { WOW_REALM: "stormrage" },
+      { WOW_REALM: "orgrimmar" },
+      {
+        response: {
+          ok: false,
+          text: '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
+        },
+      },
+    );
+    expect(page.msg.className).toBe("msg error");
+    expect(page.msg.textContent).toBe("Failed: compose: image not found\nBackup: /opt/x/.env.bak.1");
+    expect(page.reloads).toBe(1);
   });
 
   test("the body carries only the keys whose value differs, in field order (not alphabetical)", () => {
