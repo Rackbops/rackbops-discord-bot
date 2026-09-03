@@ -195,6 +195,13 @@ export async function listImages(): Promise<ImageSummary[]> {
   return (await (await ok("/images/json")).json()) as ImageSummary[];
 }
 
+/** Just enough of `GET /images/{id}/json` to read an image's own baked-in `ENV`. */
+export async function inspectImage(id: string): Promise<{ Config: { Env: string[] } }> {
+  return (await (await ok(`/images/${encodeURIComponent(id)}/json`)).json()) as {
+    Config: { Env: string[] };
+  };
+}
+
 /** Best-effort: an image still referenced by a container refuses to delete, which is correct. */
 export async function removeImage(tag: string): Promise<void> {
   const res = await api(`/images/${encodeURIComponent(tag)}`, { method: "DELETE" });

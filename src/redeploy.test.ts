@@ -150,7 +150,7 @@ describe("selectImagesToPrune", () => {
 });
 
 describe("buildCreateSpec", () => {
-  const spec = buildCreateSpec(SELF, { image: "img:abc1234", handoffFrom: SELF.Id });
+  const spec = buildCreateSpec(SELF, { image: "img:abc1234", handoffFrom: SELF.Id, oldImageEnv: [] });
 
   // The crux of "zero config": everything the replacement needs is discovered from the
   // original's own inspect, so there is nothing for an operator to set up first.
@@ -175,9 +175,38 @@ describe("buildCreateSpec", () => {
   test("never stacks a second HANDOFF_FROM when one is already set", () => {
     const chained = buildCreateSpec(
       { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, "HANDOFF_FROM=older"] } },
-      { image: "img:abc1234", handoffFrom: "newer" },
+      { image: "img:abc1234", handoffFrom: "newer", oldImageEnv: [] },
     );
     expect(chained.Env.filter((e) => e.startsWith("HANDOFF_FROM="))).toEqual(["HANDOFF_FROM=newer"]);
+  });
+
+  // #51 item 7: Config.Env is the image's baked ENV merged with the container's own, so copying
+  // it verbatim pins EVERY image default (not just GIT_SHA) at the old image's value forever.
+  // Dropping only entries that match an old-image entry VERBATIM is what lets the new image
+  // supply its own defaults while a genuine operator override (env_file-sourced, same key,
+  // different value) still survives the swap.
+  test("drops an entry that matches the old image's own baked env verbatim", () => {
+    const withBaked = buildCreateSpec(
+      { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, "BUN_INSTALL_BIN=/usr/local/bin"] } },
+      { image: "img:abc1234", handoffFrom: SELF.Id, oldImageEnv: ["PATH=/usr/bin", "BUN_INSTALL_BIN=/usr/local/bin"] },
+    );
+    expect(withBaked.Env.some((e) => e.startsWith("PATH="))).toBe(false);
+    expect(withBaked.Env.some((e) => e.startsWith("BUN_INSTALL_BIN="))).toBe(false);
+  });
+
+  test("keeps an operator override even when it shares a key with an image default", () => {
+    // AUTO_UPDATE=true is the container's own value; the (hypothetical) image bakes a DIFFERENT
+    // default. A key-only match would wrongly drop this and silently revert the operator's choice.
+    const overridden = buildCreateSpec(SELF, {
+      image: "img:abc1234",
+      handoffFrom: SELF.Id,
+      oldImageEnv: ["AUTO_UPDATE=false"],
+    });
+    expect(overridden.Env).toContain("AUTO_UPDATE=true");
+  });
+
+  test("an empty oldImageEnv carries every container-set var over, same as before this fix", () => {
+    expect(spec.Env).toContain("PATH=/usr/bin");
   });
 
   test("re-binds the state volume, so the replacement reads the report left for it", () => {
@@ -198,7 +227,7 @@ describe("buildCreateSpec", () => {
   });
 
   test("defaults the restart policy when the original somehow has none", () => {
-    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x" });
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
     expect(bare.HostConfig.RestartPolicy).toEqual({ Name: "unless-stopped" });
   });
 
@@ -206,7 +235,7 @@ describe("buildCreateSpec", () => {
   // `init: true` is container config, not image config, and wasn't carried over.
   test("keeps init, so the replacement still runs under docker-init", () => {
     expect(spec.HostConfig.Init).toBe(true);
-    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x" });
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
     expect(bare.HostConfig.Init).toBeUndefined();
   });
 
@@ -221,7 +250,7 @@ describe("buildCreateSpec", () => {
   test("a read-only mount stays read-only", () => {
     const ro = buildCreateSpec(
       { ...SELF, Mounts: [{ Type: "bind", Source: "/etc/x", Destination: "/etc/x", RW: false }] },
-      { image: "i", handoffFrom: "x" },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
     );
     expect(ro.HostConfig.Binds).toEqual(["/etc/x:/etc/x:ro"]);
   });
@@ -477,6 +506,7 @@ describe("redeploy — cleanup always runs", () => {
       if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
       if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
       if (pathname === "/images/json") return jsonRes([]);
+      if (pathname.startsWith("/images/") && pathname.endsWith("/json")) return jsonRes({ Config: { Env: [] } });
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
       if (pathname === `/containers/${REPLACEMENT_ID}/start`) return new Response("", { status: 204 });
       if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
@@ -561,6 +591,20 @@ describe("redeploy — cleanup always runs", () => {
     const remote = new URL(build!.url).searchParams.get("remote");
     expect(remote).toContain(`#${sha}`);
     expect(remote).not.toContain("#main");
+  });
+
+  // #51 item 7: the old image's own baked env has to be read so buildCreateSpec can tell an
+  // image default apart from a genuine operator override — wiring pinned so it can't go silently
+  // dead (the drop-logic itself is unit-tested directly on buildCreateSpec, below).
+  test("inspects the old image's own env before creating the replacement", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("1".repeat(40));
+    expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/images/") && c.path.endsWith("/json"))).toBe(
+      true,
+    );
   });
 });
 

@@ -10,6 +10,7 @@ import {
   buildImage,
   createContainer,
   daemonReachable,
+  inspectImage,
   inspectSelf,
   listImages,
   removeContainer,
@@ -116,13 +117,21 @@ export function selectImagesToPrune(
  * ENV with the container's own, so copying it verbatim would pin the *old* build's sha onto the
  * new container and override the new image's — leaving a correctly-updated bot convinced it was
  * still the old build, and reporting the update as a no-op.
+ *
+ * `oldImageEnv` generalizes that same fix to every other image-baked var (`PATH`,
+ * `BUN_INSTALL_BIN`, the base image's cache path, anything future `ENV`-added the way `GIT_SHA`
+ * was): `Config.Env` merges the image's own ENV with the container's, so copying it verbatim
+ * pins *every* image default at the old image's value forever. An entry is dropped only when it
+ * matches an `oldImageEnv` entry **verbatim** — matching by key alone would also drop a genuine
+ * operator override that happens to share a key with an image default.
  */
 export function buildCreateSpec(
   self: ContainerInspect,
-  o: { image: string; handoffFrom: string },
+  o: { image: string; handoffFrom: string; oldImageEnv: string[] },
 ): CreateContainerSpec {
+  const oldImageEnvSet = new Set(o.oldImageEnv);
   const env = self.Config.Env.filter(
-    (e) => !e.startsWith("GIT_SHA=") && !e.startsWith(`${HANDOFF_FROM_ENV}=`),
+    (e) => !e.startsWith("GIT_SHA=") && !e.startsWith(`${HANDOFF_FROM_ENV}=`) && !oldImageEnvSet.has(e),
   );
   env.push(`${HANDOFF_FROM_ENV}=${o.handoffFrom}`);
   return {
@@ -193,11 +202,21 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   }
   await pruneOldImages(self.Config.Image);
 
+  // Best-effort: this is what lets a var baked into the OLD image (not just GIT_SHA) fall back
+  // to the new image's own default instead of staying pinned forever. A failed inspect degrades
+  // to the old behavior (carry everything over) rather than failing a redeploy over housekeeping.
+  const oldImageEnv = await inspectImage(self.Image)
+    .then((img) => img.Config.Env)
+    .catch(() => []);
+
   const name = replacementName(self.Name);
   let replacementId: string;
   try {
     await removeContainer(name, true); // a leftover from an earlier failed attempt
-    replacementId = await createContainer(name, buildCreateSpec(self, { image: tag, handoffFrom: self.Id }));
+    replacementId = await createContainer(
+      name,
+      buildCreateSpec(self, { image: tag, handoffFrom: self.Id, oldImageEnv }),
+    );
     await startContainer(replacementId);
   } catch (err) {
     endHandoff();
