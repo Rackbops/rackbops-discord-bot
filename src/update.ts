@@ -194,6 +194,15 @@ export interface UpdateCheck {
   redeploy?: RedeployResult;
 }
 
+/** The two docker-daemon-touching calls `applyUpdate` makes, injectable so `checkForUpdate`'s
+ *  orchestration is testable without a real daemon (mirrors updateReport.ts's `Deliverers`). */
+export interface RedeployDeps {
+  redeployAvailable: typeof redeployAvailable;
+  redeploy: typeof redeploy;
+}
+
+const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy };
+
 /**
  * Compare this build against the newest bot commit and, when stale, ask for a
  * restart so the orchestrator can bring up the new code. `force` is an admin's
@@ -205,6 +214,7 @@ export interface UpdateCheck {
  */
 export async function checkForUpdate(
   o: { force?: boolean; requester?: UpdateRequester } = {},
+  deps: RedeployDeps = liveRedeployDeps,
 ): Promise<UpdateCheck> {
   // Refused before anything else — even reading the shas. A second /update mid-swap would
   // otherwise overwrite the in-flight attempt's pendingUpdateReport, then force-remove its
@@ -260,7 +270,7 @@ export async function checkForUpdate(
       now: Date.now(),
     });
     await saveState();
-    return { decision, latestSha, redeploy: await applyUpdate(latestSha) };
+    return { decision, latestSha, redeploy: await applyUpdate(latestSha, deps) };
   }
 
   return { decision, latestSha };
@@ -274,23 +284,26 @@ export async function checkForUpdate(
  * original behaviour — exit and let whatever supervises the container supply a new image. That
  * fallback is why an existing deployment on an older compose file keeps working unchanged.
  */
-async function applyUpdate(latestSha: string): Promise<RedeployResult | undefined> {
+async function applyUpdate(
+  latestSha: string,
+  deps: RedeployDeps,
+): Promise<RedeployResult | undefined> {
   const shortRun = config.gitSha!.slice(0, 7);
   const shortNew = latestSha.slice(0, 7);
 
-  if (!(await redeployAvailable())) {
+  if (!(await deps.redeployAvailable())) {
     console.log("[update] no docker socket — falling back to exit-and-be-respawned");
     requestRestart(`update ${shortRun} -> ${shortNew}`);
     return undefined;
   }
 
   // `redeploy` resolving at all means the swap failed — success kills this process mid-await.
-  const result = await redeploy(latestSha);
+  const result = await deps.redeploy(latestSha);
 
-  // We're still the live bot, so the update is un-owed: drop the markers, or the next boot
-  // would deliver a follow-up for a restart that never occurred and the anti-loop guard would
-  // suppress a later, genuine attempt.
-  state.attemptedUpdateToSha = undefined;
+  // We're still the live bot, so no restart occurred: the follow-up report is un-owed and would
+  // otherwise describe a restart that never happened. `attemptedUpdateToSha` stays set, though —
+  // it's what makes decideUpdate suppress the NEXT scheduler tick for this same failing sha (#50)
+  // instead of rebuilding it every 15 minutes; an admin's /update (force: true) still bypasses it.
   state.pendingUpdateReport = undefined;
   await saveState();
   console.warn(`[update] redeploy to ${shortNew} failed: ${result.error ?? result.outcome}`);

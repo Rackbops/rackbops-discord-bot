@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 // `update.ts` pulls in the `config` singleton, which resolves process.env at import
 // time — satisfy the required vars before importing so this file runs standalone.
@@ -7,6 +7,8 @@ process.env.ANNOUNCE_CHANNEL_ID ??= "100";
 const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelation } =
   await import("./update");
 const { beginHandoff, endHandoff } = await import("./restart");
+const { config } = await import("./config");
+const { state, saveState } = await import("./state");
 
 const OLD = "a".repeat(40);
 const NEW = "b".repeat(40);
@@ -208,6 +210,85 @@ describe("checkForUpdate during a handoff", () => {
     }) as unknown as typeof fetch;
     beginHandoff("test swap in flight");
     expect((await checkForUpdate({ force: true })).decision).toBe("busy");
+  });
+});
+
+describe("checkForUpdate — anti-loop suppression after a failed in-process redeploy (#50)", () => {
+  const realFetch = globalThis.fetch;
+  const realGitSha = config.gitSha;
+
+  beforeEach(() => {
+    config.gitSha = OLD;
+    state.attemptedUpdateToSha = undefined;
+    state.pendingUpdateReport = undefined;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    config.gitSha = realGitSha;
+    state.attemptedUpdateToSha = undefined;
+    state.pendingUpdateReport = undefined;
+    // checkForUpdate/applyUpdate call the REAL saveState() against the real (gitignored)
+    // data/state.json — the in-memory reset above is invisible on disk unless it's flushed too,
+    // or the test's last real write (a fake 40-char sha) is what a subsequent `bun run start`
+    // would find there.
+    await saveState();
+  });
+
+  function stubGitHub(): void {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/commits?")) {
+        return new Response(JSON.stringify([{ sha: NEW }]), { status: 200 });
+      }
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ status: "behind" }), { status: 200 });
+      }
+      throw new Error(`unmocked fetch in test: ${url}`);
+    }) as typeof fetch;
+  }
+
+  // The crux of #50: applyUpdate used to clear attemptedUpdateToSha unconditionally after a
+  // redeploy() failure (redeploy() resolving at all means it failed — success kills the process
+  // mid-await), so decideUpdate could never reach `suppressed` for this path and the scheduler
+  // rebuilt the same broken sha every tick, forever.
+  test("a failed redeploy suppresses the next unforced check for the same sha", async () => {
+    stubGitHub();
+    const failing = {
+      redeployAvailable: async () => true,
+      redeploy: async () => ({ outcome: "failed" as const, error: "boom" }),
+    };
+
+    const first = await checkForUpdate({}, failing);
+    expect(first.decision).toBe("restart");
+    expect(state.attemptedUpdateToSha).toBe(NEW); // not cleared by the failed attempt
+
+    let redeployCalled = false;
+    const tracked = {
+      redeployAvailable: async () => true,
+      redeploy: async () => {
+        redeployCalled = true;
+        return { outcome: "failed" as const };
+      },
+    };
+    const second = await checkForUpdate({}, tracked);
+    expect(second.decision).toBe("suppressed");
+    expect(redeployCalled).toBe(false);
+  });
+
+  test("force still retries a sha that already failed", async () => {
+    stubGitHub();
+    state.attemptedUpdateToSha = NEW; // as if a prior attempt already failed
+    let redeployCalled = false;
+    const deps = {
+      redeployAvailable: async () => true,
+      redeploy: async () => {
+        redeployCalled = true;
+        return { outcome: "failed" as const };
+      },
+    };
+    expect((await checkForUpdate({ force: true }, deps)).decision).toBe("restart");
+    expect(redeployCalled).toBe(true);
   });
 });
 
