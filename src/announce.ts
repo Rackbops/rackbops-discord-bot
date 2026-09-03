@@ -4,7 +4,7 @@ import { state, saveState } from "./state";
 import { decideDmfAnnouncement } from "./wow/dmf";
 import { lastWeeklyReset } from "./wow/reset";
 import { realmStatus, realmWatchConfigured, decideRealmTransition, type RealmStatus } from "./wow/realm";
-import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog } from "./github";
+import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
 import { checkForUpdate } from "./update";
 import { restartPending, withCritical } from "./restart";
 
@@ -70,28 +70,68 @@ export async function runTick(checks: TickCheck[]): Promise<void> {
   }
 }
 
+let tickInFlight = false;
+let consecutiveSkips = 0;
+
+/**
+ * Prevents a tick from starting while the previous one is still running (issue #52 item 1):
+ * without this, a stalled send (discord.js retries 3x with a 15s timeout each and waits out a
+ * 429's `retry_after`, so a single `announce()` can exceed the 60s tick interval) lets a second
+ * tick pass the same dedup-key check (`weeklyAnnouncedFor`, `dmfAnnouncedFor`, `realmStatus`)
+ * before the first tick has written it — producing a duplicate announcement.
+ *
+ * Skips outright rather than queuing, so a merely-slow tick never piles up work — the next tick
+ * to actually run re-reads whatever state the (by-then-finished) previous one left behind. Logs
+ * only once skipping becomes REPEATED (2+ in a row), not on every skip: an occasional single
+ * skip under an ordinarily-slow tick is expected and not itself a problem to flag.
+ */
+export async function guardedTick(run: () => Promise<void>): Promise<void> {
+  if (tickInFlight) {
+    consecutiveSkips++;
+    if (consecutiveSkips >= 2) {
+      console.warn(`[tick] skipped ${consecutiveSkips} ticks in a row — the previous one is still running`);
+    }
+    return;
+  }
+  tickInFlight = true;
+  try {
+    await run();
+  } finally {
+    tickInFlight = false;
+    consecutiveSkips = 0;
+  }
+}
+
+/** Reset module state between tests. */
+export function resetTickGuardForTest(): void {
+  tickInFlight = false;
+  consecutiveSkips = 0;
+}
+
 async function onTick(client: Client): Promise<void> {
   if (restartPending()) return; // on the way out — don't start work we can't finish
-  // The whole tick is one critical section: a restart requested by the update check
-  // below lands only once every announcement and state write has settled.
-  await withCritical(() =>
-    runTick([
-      { name: "dmf", run: () => checkDmf(client) },
-      { name: "weeklyReset", run: () => checkWeeklyReset(client) },
-      { name: "realm", run: () => checkRealm(client) },
-      {
-        name: "releases",
-        run: async () => {
-          if (shouldPollReleases(new Date())) await checkReleases(client);
+  await guardedTick(() =>
+    // The whole tick is one critical section: a restart requested by the update check
+    // below lands only once every announcement and state write has settled.
+    withCritical(() =>
+      runTick([
+        { name: "dmf", run: () => checkDmf(client) },
+        { name: "weeklyReset", run: () => checkWeeklyReset(client) },
+        { name: "realm", run: () => checkRealm(client) },
+        {
+          name: "releases",
+          run: async () => {
+            if (shouldPollReleases(new Date())) await checkReleases(client);
+          },
         },
-      },
-      {
-        name: "autoUpdate",
-        run: async () => {
-          if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+        {
+          name: "autoUpdate",
+          run: async () => {
+            if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+          },
         },
-      },
-    ]),
+      ]),
+    ),
   );
 }
 
@@ -196,10 +236,41 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
   if (releaseReachability.observe(repo, true) === "recovered") {
     console.log(`[release] ${repo} is reachable again`);
   }
-  const { toAnnounce, nextSeen } = decideReleaseAnnouncements(releases, state.seenReleaseIds[repo]);
-  for (const release of toAnnounce) {
-    await announce(client, "release", `📦 New release: **${release.name}**\n${release.url}`);
+  await commitReleaseAnnouncements(releases, state.seenReleaseIds[repo], {
+    announce: (release) => announce(client, "release", `📦 New release: **${release.name}**\n${release.url}`),
+    persist: async (seen) => {
+      state.seenReleaseIds[repo] = seen;
+      await saveState();
+    },
+  });
+}
+
+/**
+ * The core of a per-repo release check, decoupled from discord.js and the module's own
+ * `announce`/`saveState` — the same "extract the isolable logic, inject the side effects"
+ * shape `runTick` already uses, so the incremental-persistence fix (issue #52 item 2) can be
+ * driven directly without mocking `Client`.
+ *
+ * Commits each id right after its announce succeeds, rather than saving `nextSeen` once after
+ * the whole batch — a throw partway through a multi-release burst must not discard the ids of
+ * releases already posted, or the next poll re-announces them.
+ */
+export async function commitReleaseAnnouncements(
+  releases: Release[],
+  seen: number[] | undefined,
+  deps: { announce: (release: Release) => Promise<void>; persist: (seen: number[]) => Promise<void> },
+): Promise<void> {
+  const { toAnnounce, nextSeen } = decideReleaseAnnouncements(releases, seen);
+  if (toAnnounce.length === 0) {
+    // Nothing to post — still commit nextSeen: covers the first-poll seed (seen was undefined,
+    // so nextSeen is the full current list) and the ordinary no-new-releases case.
+    await deps.persist(nextSeen);
+    return;
   }
-  state.seenReleaseIds[repo] = nextSeen;
-  await saveState();
+  const committed = [...(seen ?? [])];
+  for (const release of toAnnounce) {
+    await deps.announce(release);
+    committed.push(release.id);
+    await deps.persist(committed);
+  }
 }
