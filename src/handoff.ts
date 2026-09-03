@@ -135,11 +135,13 @@ export function handoffFailureMessage(outcome: "failed" | "timeout" | "stalled",
   }
   if (outcome === "stalled") {
     // Distinct from `failed` on purpose: the replacement *worked* and then couldn't retire me,
-    // which points at the daemon socket rather than at the new build.
+    // which points at the daemon socket rather than at the new build. `o.error` is rarely set
+    // here — a genuine stall is a hung daemon call that never resolved either way — but when it
+    // is (a slow-but-eventual failure the redeploy loop still caught), it's worth showing.
     return (
       `⚠️ The replacement for \`${short}\` verified but never retired me within ` +
       `${Math.round(RETIREMENT_DEADLINE_MS / 60_000)}m — I removed it and stayed on the ` +
-      `current build. Check the daemon socket.`
+      `current build. Check the daemon socket.${o.error ? ` (${o.error})` : ""}`
     );
   }
   // Outcome-neutral on purpose: this bucket covers everything from "never started" to "started,

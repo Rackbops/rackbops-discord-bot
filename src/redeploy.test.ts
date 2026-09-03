@@ -18,7 +18,7 @@ const {
   shaTag,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker, HANDOFF_FROM_ENV } = await import("./handoff");
+const { clearMarker, writeMarker, HANDOFF_FROM_ENV } = await import("./handoff");
 const { handoffActive, resetForTest } = await import("./restart");
 
 const SELF: ContainerInspect = {
@@ -520,6 +520,11 @@ describe("redeploy — cleanup always runs", () => {
   function stubDaemon(o: {
     pollReplacement: () => Response;
     removeReplacement: () => Response;
+    /** Runs (awaited) when the replacement is started — before `awaitHandoff` ever polls, so a
+     *  marker written here is guaranteed on disk for the very first poll to see. Used by the
+     *  item-3 retirement-wait tests to reach a `ready` outcome deterministically, with no reliance
+     *  on POLL_MS timing. */
+    afterStart?: () => Promise<void>;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -531,7 +536,10 @@ describe("redeploy — cleanup always runs", () => {
       if (pathname === "/images/json") return jsonRes([]);
       if (pathname.startsWith("/images/") && pathname.endsWith("/json")) return jsonRes({ Config: { Env: [] } });
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
-      if (pathname === `/containers/${REPLACEMENT_ID}/start`) return new Response("", { status: 204 });
+      if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
+        await o.afterStart?.();
+        return new Response("", { status: 204 });
+      }
       if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
       if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
       if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
@@ -628,6 +636,40 @@ describe("redeploy — cleanup always runs", () => {
     expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/images/") && c.path.endsWith("/json"))).toBe(
       true,
     );
+  });
+
+  // #51 item 3: a blind Bun.sleep(RETIREMENT_DEADLINE_MS) here used to sit on a `failed` marker
+  // for up to 3 minutes before ever reading it. Polling instead catches it within one `pollMs` —
+  // pinned with a deadline generously larger than when the marker actually flips, so a slow CI
+  // disk can't turn this into a flake.
+  test("a marker that flips to failed during the retirement wait reclaims quickly, with the reason", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 404 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "2222222", at: Date.now() }),
+    });
+    const resultPromise = redeploy("2".repeat(40), { deadlineMs: 300, pollMs: 20 });
+    void Bun.sleep(60).then(() =>
+      writeMarker({ status: "failed", sha: "2222222", error: "retire boom", at: Date.now() }),
+    );
+    const result = await resultPromise;
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBe("retire boom");
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The other half: the deadline genuinely elapsing (nothing ever flips the marker) is still a
+  // `stalled` outcome, not `failed` — distinct because it points at the daemon socket, not the
+  // build itself (see handoff.ts's handoffFailureMessage).
+  test("a marker that stays ready for the whole deadline is stalled, not failed", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 404 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
+    });
+    const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled");
+    expect(handoffActive()).toBe(false);
   });
 });
 

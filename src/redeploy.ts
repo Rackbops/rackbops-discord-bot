@@ -179,7 +179,12 @@ export interface RedeployResult {
  * therefore not a return: it starts the retirement wait, and outliving that wait is itself a
  * failure (`stalled`), because the one thing `ready` promised was a stop that never came.
  */
-export async function redeploy(latestSha: string): Promise<RedeployResult> {
+export async function redeploy(
+  latestSha: string,
+  // Test seam: real callers always take the defaults. Overridable so a test can exercise the
+  // retirement wait (item 3) without actually waiting out the real 3-minute deadline.
+  retirementOpts: { deadlineMs?: number; pollMs?: number } = {},
+): Promise<RedeployResult> {
   beginHandoff(`redeploy -> ${latestSha.slice(0, 7)}`);
   await clearMarker();
 
@@ -243,10 +248,18 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
       // which is the outage #879 exists to prevent. So the wait for our own death gets a
       // deadline too. Reaching it demotes the outcome to `stalled` and falls through to the
       // same cleanup as any other failed swap.
+      //
+      // The wait polls the marker rather than sleeping blind for the whole deadline: `takeOver`
+      // writes `failed` (with a reason) the moment its own retire attempt throws, and a blind
+      // sleep would sit on that answer for up to `RETIREMENT_DEADLINE_MS` before ever reading it.
       console.log("[redeploy] replacement verified — handing over");
-      await Bun.sleep(RETIREMENT_DEADLINE_MS);
-      console.error("[redeploy] verified replacement never retired us — reclaiming");
-      outcome = "stalled";
+      if (await awaitRetirementFailure(retirementOpts.deadlineMs, retirementOpts.pollMs)) {
+        console.error("[redeploy] replacement signalled failed after verifying — reclaiming");
+        outcome = "failed";
+      } else {
+        console.error("[redeploy] verified replacement never retired us — reclaiming");
+        outcome = "stalled";
+      }
     }
   } catch (err) {
     // A daemon blip anywhere in this stretch (a dropped socket, one 500 from the poll, or —
@@ -294,6 +307,25 @@ async function awaitHandoff(replacementId: string): Promise<HandoffOutcome> {
     if (outcome !== "waiting") return outcome;
     await Bun.sleep(POLL_MS);
   }
+}
+
+/**
+ * Poll the marker during the post-`ready` retirement wait, so a `failed` written after the
+ * replacement already signalled `ready` is caught within one `pollMs`, not left sitting until
+ * `deadlineMs` (`RETIREMENT_DEADLINE_MS`, 3 minutes) elapses blind. Returns `true` the moment the
+ * marker flips to `failed`; `false` once the whole deadline passes while it's still `ready`
+ * (a genuine stall — the daemon socket itself is presumed stuck, per `handoffFailureMessage`).
+ */
+async function awaitRetirementFailure(
+  deadlineMs = RETIREMENT_DEADLINE_MS,
+  pollMs = POLL_MS,
+): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < deadlineMs) {
+    await Bun.sleep(pollMs);
+    if ((await readMarker())?.status === "failed") return true;
+  }
+  return false;
 }
 
 async function pruneOldImages(currentImage: string): Promise<void> {
