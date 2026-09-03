@@ -231,28 +231,18 @@
     retire it — two live bots answering the same Discord token. Existence doesn't have that
     window: a container's object persists across a reboot regardless of whether it's currently
     running.
-  - **A stopped-but-not-removed original stays `standby` — accepted, not fixed here.**
-    `retireOriginal` removes the original only best-effort; on a failed removal the corpse also
-    still holds the canonical name, so the replacement's own rename right after fails alongside it
-    (name conflict, caught non-fatally) — the replacement is left visibly un-renamed, a state
-    `retireOriginal`'s own comments already document as non-fatal-but-not-where-`bot-ops.sh`-looks.
-    `resolveBootMode` re-arming standby on that container's later restarts is a narrower version of
-    the pre-#46 bug (needs an independent `removeContainer` failure to trigger at all, versus every
-    restart unconditionally before), and it's retried, not stuck: the next `takeOver` re-runs the
-    same `retireOriginal`, whose removal may well succeed this time. That retry's own
-    `stopContainer` call is unwrapped, though (it already tolerates the corpse's expected 304/404
-    — see `docker.ts` — so this needs a genuine daemon error, not just "already stopped"), and on
-    a real failure there propagates uncaught into `takeOver`'s catch, which `exit(1)`s. For a
-    *first* retirement that's the documented-correct move (the original is still alive to
-    reclaim); for a corpse retry there's no live original left to reclaim — this process **is**
-    the only live bot, so that exit is a genuine, if `unless-stopped`-recoverable, self-inflicted
-    restart. Narrow (needs the corpse *and* an independent daemon hiccup landing on that one call)
-    and bounded, not fixed here — wrapping `stopContainer` blindly would silently break the
-    genuine-handoff case the comment above it protects (a real stop failure must still propagate
-    so the original can reclaim); doing this properly needs `retireOriginal` to tell a first
-    attempt from a retry, which is more than this fix's scope. Closing the corpse case fully would
-    also need a signal existence can't provide with the fields this codebase's `ContainerInspect`
-    models — not worth trading the reboot-race safety above to chase either way.
+  - **A stopped-but-not-removed original stays `standby`.** `retireOriginal` removes the original
+    only best-effort; on a failed removal the corpse also still holds the canonical name, so the
+    replacement's own rename right after fails alongside it (name conflict, caught non-fatally) —
+    the replacement is left visibly un-renamed, a state `retireOriginal`'s own comments already
+    document as non-fatal-but-not-where-`bot-ops.sh`-looks. `resolveBootMode` re-arming standby on
+    that container's later restarts is a narrower version of the pre-#46 bug (needs an independent
+    `removeContainer` failure to trigger at all, versus every restart unconditionally before), and
+    it's retried, not stuck: the next `takeOver` re-runs the same `retireOriginal`, whose removal
+    may well succeed this time. That retry's own `stopContainer` call is handled, not left to
+    propagate — see the `retireOriginal` gotcha below for how it tells a genuine first attempt
+    (original still alive, so a stop failure must reach the original to reclaim) from a call
+    against an original with nothing left to reclaim it.
   - **An unconfirmed daemon error — including a timeout — stays `standby`, never downgrades.** A
     genuine handoff boot needs a live daemon connection for the rest of the protocol regardless, so
     treating "can't tell" as "gone" risks two live bots on the shared token, same reasoning as the
