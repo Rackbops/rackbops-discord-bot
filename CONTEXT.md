@@ -268,19 +268,26 @@
   `stalled` — reclaim, remove the replacement, report "check the daemon socket"), and past the
   `stopContainer` point of no return `retireOriginal` degrades instead of throwing, because the
   original is dead by then and a rejecting `ClientReady` would strand *both* containers.
-- **`retireOriginal` can run twice against the same original — a first attempt and a retry need
-  opposite `stopContainer` failure handling.** If a prior call's `removeContainer` failed, the
-  original is left a stopped-but-not-removed corpse that still *exists* — and a later standby boot
-  (raw env `bootMode`, or #46's daemon-confirmed `resolveBootMode`, whichever is current) retries
-  `takeOver` -> `retireOriginal` against that same id. `stopContainer` already tolerates the
-  corpse's expected 304/404, so the only way this second call fails is a genuine daemon error —
-  and on a first attempt that must still propagate (the original is genuinely alive, watching, and
-  reclaims at its deadline), but on a retry there is no live original left to reclaim, so
-  propagating would just crash the sole live bot via `takeOver`'s catch -> `exit(1)`, an
-  `unless-stopped`-recoverable but wholly self-inflicted restart. `retireOriginal` tells the two
-  apart by inspecting the original *before* stopping it: still running means a first attempt
-  (strict — let a stop failure propagate); already not-running (only reachable as a corpse from an
-  earlier incomplete cycle) means a retry (degrade a stop failure the same as every later step).
+- **`retireOriginal` can run against an original with nothing left alive to reclaim it — only a
+  genuinely *live* original gets the strict `stopContainer` failure handling.** Two separate paths
+  land here with the original already gone in some sense: (1) if a prior call's `removeContainer`
+  failed, the original is left a stopped-but-not-removed corpse that still *exists*, and a later
+  standby boot (raw env `bootMode`, or #46's daemon-confirmed `resolveBootMode`, whichever is
+  current) retries `takeOver` -> `retireOriginal` against that same id; (2) `HANDOFF_FROM` never
+  clears from a swapped-in container's own env (it's baked in at creation, and container env is
+  immutable), so any boot path that still honors it against an id since fully removed — not just a
+  corpse, gone entirely — lands here too. `stopContainer` already tolerates the expected 304
+  (already stopped) / 404 (already gone), so the only way either call fails is a genuine daemon
+  error — and on a genuine first attempt that must still propagate (the original is alive,
+  watching, and reclaims at its deadline), but in both of the above there is no live original left
+  to reclaim, so propagating would just crash the sole live bot via `takeOver`'s catch ->
+  `exit(1)`, an `unless-stopped`-recoverable but wholly self-inflicted restart. `retireOriginal`
+  tells them apart by inspecting the original *before* stopping it: running means a genuine first
+  attempt (strict — let a stop failure propagate); anything else — not running, or gone entirely
+  (`tryInspectContainer` returns `undefined`) — means nothing is left to reclaim (degrade a stop
+  failure the same as every later step). An earlier version of this fix only covered the
+  not-running case and missed `undefined`, which is in practice the *more* commonly reached of the
+  two — caught in review before merging.
 - **A second `/update` mid-swap answers `busy`** — the guard sits at the top of
   `checkForUpdate`, before any state write or network call, because interaction handling does
   not quiesce during a handoff (only the scheduler does) and `/update`'s `force: true` bypasses

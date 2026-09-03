@@ -328,12 +328,15 @@ describe("takeOver", () => {
   });
 });
 
-// A retire against the same original can happen twice: if a prior removeContainer below failed,
-// the original is left a stopped-but-not-removed corpse that a later standby boot retries
-// takeOver -> retireOriginal against. The stop has to tell a first attempt (original still
-// running — a failure must propagate, since the original is alive to reclaim) from a retry
-// (already stopped — a failure is just a daemon hiccup re-confirming what's already true, and
-// must degrade like every other post-stop step instead of crashing the sole live bot).
+// A retire against the same original can run more than once with nothing left alive to reclaim if
+// it fails: a prior removeContainer failure below leaves a stopped-but-not-removed corpse a later
+// standby boot retries takeOver -> retireOriginal against, and separately HANDOFF_FROM never
+// clears from a swapped-in container's own env, so a boot path that still honors it against an id
+// since fully removed lands here too. The stop has to tell a genuine first attempt (original still
+// running — a failure must propagate, since the original is alive to reclaim) from both of those
+// (already stopped, or already gone entirely — a failure is just a daemon hiccup re-confirming
+// what's already true, and must degrade like every other post-stop step instead of crashing the
+// sole live bot).
 describe("retireOriginal", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
@@ -406,9 +409,22 @@ describe("retireOriginal", () => {
     expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
   });
 
-  // An original that's already fully gone (removed, not just stopped) is a third, pre-existing
-  // case: stopContainer's own 404 tolerance means it never reaches the new branch at all.
-  test("an original that no longer exists at all still returns cleanly", async () => {
+  // An original that's already fully gone (removed, not just stopped) is a third "nothing left to
+  // reclaim" case — reached routinely, since HANDOFF_FROM never clears from a swapped-in
+  // container's own env, so any boot path that still honors it against a since-fully-removed id
+  // lands here too. stopContainer's own 404 tolerance covers the expected repeat-404, but this
+  // pins the case a naive "not-running" check would miss: a genuine daemon error on that same
+  // call must be tolerated exactly like the stopped-corpse retry above, not left to propagate.
+  test("an original that no longer exists at all tolerates a genuine stop failure too", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response("not found", { status: 404 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  test("an original that no longer exists at all still returns cleanly on the expected 404", async () => {
     stubDaemon({
       inspectOriginal: () => new Response("not found", { status: 404 }),
       stopOriginal: () => new Response("not found", { status: 404 }),
