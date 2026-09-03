@@ -21,8 +21,10 @@ const {
 const { clearMarker, writeMarker, HANDOFF_FROM_ENV } = await import("./handoff");
 const { handoffActive, resetForTest } = await import("./restart");
 
+const SELF_ID = "a".repeat(64);
+const SELF_SHORT_ID = SELF_ID.slice(0, 12);
 const SELF: ContainerInspect = {
-  Id: "a".repeat(64),
+  Id: SELF_ID,
   Name: "/warbandeer-discord",
   Image: "sha256:deadbeef",
   State: { Running: true, Status: "running", ExitCode: 0 },
@@ -41,7 +43,10 @@ const SELF: ContainerInspect = {
     { Type: "volume", Name: "wbd_state", Source: "/var/lib/docker/volumes/wbd_state/_data", Destination: "/app/data", RW: true },
     { Type: "bind", Source: "/var/run/docker.sock", Destination: "/var/run/docker.sock", RW: true },
   ],
-  NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", "warbandeer-discord-debug-bot-1"] } } },
+  // Docker auto-adds a connected container's own short id here alongside any deliberately
+  // configured alias — "bot" is the real, meant-to-be-shared compose service alias; the short id
+  // is this SPECIFIC container's own identity and must not be carried onto a different one.
+  NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", SELF_SHORT_ID] } } },
 };
 
 describe("naming", () => {
@@ -258,11 +263,16 @@ describe("buildCreateSpec", () => {
   // #51 item 6: without this the replacement resolves by container name only, so
   // `http://bot:<port>` (README's documented tunnel mapping) stops resolving after the first
   // self-update — inert today (no HTTP server yet), latent for the desktop-app API work.
-  test("carries the network's service aliases over", () => {
-    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toEqual([
-      "bot",
-      "warbandeer-discord-debug-bot-1",
-    ]);
+  test("carries the network's deliberately-configured service alias over", () => {
+    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toContain("bot");
+  });
+
+  // Docker auto-adds a connected container's own short id to the same Aliases array. Carrying
+  // that over would tag the REPLACEMENT with the ORIGINAL's specific identity — meaningless (and
+  // wrong) on a different container, unlike "bot", which is meant to be shared across whichever
+  // container currently holds the service.
+  test("drops the original's own auto-added short container id from the carried-over aliases", () => {
+    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).not.toContain(SELF_SHORT_ID);
   });
 
   test("no NetworkingConfig when the network has no aliases of its own", () => {
@@ -271,6 +281,17 @@ describe("buildCreateSpec", () => {
       { image: "i", handoffFrom: "x", oldImageEnv: [] },
     );
     expect(noAliases.NetworkingConfig).toBeUndefined();
+  });
+
+  // If the only alias Docker ever recorded is the original's own short id (no deliberate alias
+  // configured at all), filtering it out must not leave behind an empty-but-present
+  // NetworkingConfig — that's functionally the same as having none.
+  test("no NetworkingConfig when the only alias present is the original's own short id", () => {
+    const onlyShortId = buildCreateSpec(
+      { ...SELF, NetworkSettings: { Networks: { wbd_default: { Aliases: [SELF_SHORT_ID] } } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(onlyShortId.NetworkingConfig).toBeUndefined();
   });
 
   test("no NetworkingConfig when the original has no network mode at all", () => {
@@ -493,7 +514,7 @@ describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
   const REPLACEMENT_ID = "c".repeat(64);
-  let calls: { path: string; method: string; url: string }[] = [];
+  let calls: { path: string; method: string; url: string; body?: string }[] = [];
 
   beforeEach(async () => {
     process.env.HOSTNAME = HOSTNAME;
@@ -525,16 +546,22 @@ describe("redeploy — cleanup always runs", () => {
      *  item-3 retirement-wait tests to reach a `ready` outcome deterministically, with no reliance
      *  on POLL_MS timing. */
     afterStart?: () => Promise<void>;
+    /** The old image's own baked env, returned by the `GET /images/<id>/json` inspect — lets a
+     *  test drive item 7's actual drop logic through the real redeploy() flow. Defaults to empty
+     *  (carries everything, i.e. no drop), matching every test that isn't specifically about it. */
+    oldImageEnv?: string[];
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
-      calls.push({ path: pathname, method, url: String(url) });
+      calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
       if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
       if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
       if (pathname === "/images/json") return jsonRes([]);
-      if (pathname.startsWith("/images/") && pathname.endsWith("/json")) return jsonRes({ Config: { Env: [] } });
+      if (pathname.startsWith("/images/") && pathname.endsWith("/json")) {
+        return jsonRes({ Config: { Env: o.oldImageEnv ?? [] } });
+      }
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
       if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
         await o.afterStart?.();
@@ -636,6 +663,42 @@ describe("redeploy — cleanup always runs", () => {
     expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/images/") && c.path.endsWith("/json"))).toBe(
       true,
     );
+  });
+
+  // The wiring test above only confirms the GET happened — not that its result actually reaches
+  // the create call. A fetch that silently discarded the inspected env (e.g. always resolving to
+  // []) would still pass it; this drives the real POST /containers/create body and would catch
+  // exactly that.
+  test("the old image's env fetched via inspectImage actually reaches the create request body", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+      oldImageEnv: ["PATH=/usr/bin"], // matches SELF.Config.Env's own PATH entry verbatim
+    });
+    await redeploy("4".repeat(40));
+    const create = calls.find((c) => c.path === "/containers/create");
+    expect(create?.body).toBeDefined();
+    const body = JSON.parse(create!.body!) as { Env: string[] };
+    expect(body.Env).not.toContain("PATH=/usr/bin");
+    expect(body.Env).toContain("DISCORD_TOKEN=secret"); // an operator-set var, untouched
+  });
+
+  // Same class of gap for item 6: confirms the network aliases computed in buildCreateSpec
+  // actually land in the real create request body, not just that the isolated unit tests exercise
+  // the function in the abstract.
+  test("the network's service alias actually reaches the create request body", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("5".repeat(40));
+    const create = calls.find((c) => c.path === "/containers/create");
+    const body = JSON.parse(create!.body!) as {
+      NetworkingConfig?: { EndpointsConfig: Record<string, { Aliases?: string[] }> };
+    };
+    const aliases = body.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases;
+    expect(aliases).toContain("bot");
+    expect(aliases).not.toContain(SELF_SHORT_ID);
   });
 
   // #51 item 3: a blind Bun.sleep(RETIREMENT_DEADLINE_MS) here used to sit on a `failed` marker

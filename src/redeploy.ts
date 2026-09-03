@@ -127,7 +127,10 @@ export function selectImagesToPrune(
  *
  * The network's own `Aliases` (e.g. compose's `bot` service alias) are carried over too — without
  * them the replacement resolves by container name only, so `http://bot:<port>` (README's
- * documented tunnel mapping) stops resolving after the first self-update.
+ * documented tunnel mapping) stops resolving after the first self-update. Docker auto-adds a
+ * container's own short id to this same array on top of any deliberately-configured alias, so
+ * that one entry is dropped — it names the OLD container specifically and means nothing on the
+ * new one, unlike a real service alias which is meant to be shared.
  */
 export function buildCreateSpec(
   self: ContainerInspect,
@@ -139,7 +142,10 @@ export function buildCreateSpec(
   );
   env.push(`${HANDOFF_FROM_ENV}=${o.handoffFrom}`);
   const netMode = self.HostConfig.NetworkMode;
-  const aliases = netMode ? self.NetworkSettings.Networks[netMode]?.Aliases : undefined;
+  const selfShortId = self.Id.slice(0, 12);
+  const aliases = netMode
+    ? self.NetworkSettings.Networks[netMode]?.Aliases?.filter((a) => a !== selfShortId)
+    : undefined;
   return {
     Image: o.image,
     Env: env,
