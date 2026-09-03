@@ -27,8 +27,8 @@ time, not silently written.
 | `status` | JSON: container running?, status line, image, last-observed realm status |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload |
-| `env-get` | JSON of the **non-secret** editable env keys and their current values |
-| `env-set` | Read `KEY=VALUE` lines from **stdin**, validate, back up `.env`, apply real changes, then `up -d --force-recreate` to load them |
+| `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes) |
+| `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 
 Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
 `BOT_OPS_COMPOSE_FILE` (the deployed `docker-compose.yml`, under `/opt/stacks/` for Dockge — see
@@ -90,7 +90,8 @@ re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved v
 `ADMIN_USER_IDS`, `WOW_REALM`, `WOW_REGION`, `WATCHED_REPOS`, `DMF_TIMEZONE`, `AUTO_UPDATE`,
 `BOT_BRANCH`, `COMMAND_PREFIX` — listed in `ALLOWED_ORDER`, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
-against a format regex; an empty value clears the key back to its documented default.
+against a format regex when it *changes* (see the safety notes below); an empty value clears the
+key back to its documented default.
 
 **Secrets are intentionally absent** — `DISCORD_TOKEN`, `BLIZZARD_CLIENT_ID`,
 `BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`. `env-get` never reads them
@@ -99,10 +100,11 @@ out and `env-set` refuses to write them. Edit those by hand with `nano` on the b
 ## Safety notes
 
 - **Compose project + container come from `BOT_OPS_PROJECT` / `BOT_OPS_CONTAINER`** (a panel passes
-  them per selected bot), defaulting to the debug bot's `warbandeer-discord-debug` /
-  `warbandeer-discord`. The project must be passed with `-p` because it is *not* set in a
-  non-interactive SSH shell's environment (a bare `docker compose` would default to the directory
-  name and miss the running container); both are validated to a safe charset before use.
+  them per selected bot) — required, with no default (issue #41: a monorepo-era fallback once
+  silently targeted a project/container no real deploy produces). The project must be passed with
+  `-p` because it is *not* set in a non-interactive SSH shell's environment (a bare `docker compose`
+  would default to the directory name and miss the running container); both are validated to a
+  safe charset before use.
 - **`BOT_OPS_CONFIG_DIR` / `BOT_OPS_COMPOSE_FILE` are required, with no fallback.** The script no
   longer derives anything from its own location — those two independent paths (config dir vs.
   the Dockge-managed compose file, see [Bootstrapping](#bootstrapping-a-fresh-instance-no-checkout))
@@ -111,6 +113,20 @@ out and `env-set` refuses to write them. Edit those by hand with `nano` on the b
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
   `<config-dir>/backups/.env.bak.<stamp>` is written before any change; a no-op (new value equals
   current) does nothing and does **not** restart the bot.
+- **`env-set` diffs before it validates, and only what changes is validated** (issue #44). A
+  stored value the bot accepts but a whitelist regex rejects — a hand-quoted realm, a CRLF-saved
+  file, `1, 2` in `ADMIN_USER_IDS` — used to fail every save that echoed it back, naming a key the
+  operator never touched. Both `env-get` and that diff read `.env` the way compose's `env_file:`
+  loader does (checked against `docker compose config`): the **last** occurrence of a key wins,
+  `export KEY=` counts, an indented line counts, surrounding whitespace and a trailing CR are
+  dropped, and one layer of matching quotes is stripped — so the panel shows, and diffs against,
+  the value the bot is actually running with. Not modelled (compose does these too, but nothing
+  `env-set` writes can produce them): inline ` # comments`, `${VAR}` interpolation, spaces around
+  the `=`, a `KEY: value` colon separator, backslash escapes inside double quotes. A key repeated
+  on `env-set`'s stdin takes its last value, like `.env` itself. Unchanged lines are still
+  preserved verbatim (a file whose last line lacks a newline gains one); only an indented or
+  `export`ed line for a key being changed comes back as plain `KEY=`. `ops/bot-ops.test.ts` pins
+  all of this against the real script.
 - Applying an env change **recreates the container** (brief restart) because env vars are frozen
   at container start; a plain `restart` would not reload them.
 - That recreate deliberately does **not** pass `--build`, so it reuses whatever image is currently
@@ -247,7 +263,10 @@ rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don'
 the internal origin or same-origin browser writes would be wrongly blocked.
 No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
 page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
-`ALLOWED` whitelist above. A few fields render as constrained controls instead of free text:
+`ALLOWED` whitelist above. Save posts only the fields that changed — the same list the confirm
+dialog previews — never the untouched ones echoed back (issue #44): a stored value the whitelist
+would reject can't block an unrelated save, and a tab loaded before another operator's save can't
+silently revert their unrelated edit. A few fields render as constrained controls instead of free text:
 `WOW_REGION`/`AUTO_UPDATE` as selects, `DMF_TIMEZONE` as an IANA-zone datalist, `WOW_REALM` as a
 region-filtered realm chooser and `BOT_BRANCH` as a live branch chooser (both below), and
 `ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors.

@@ -567,11 +567,24 @@
   };
 
   // IANA zone list for the DMF_TIMEZONE datalist — from the browser, no hardcoded list, absent on
-  // very old engines (guarded). Filtered to the single-segment shape bot-ops.sh actually accepts
-  // (^[A-Za-z_]+/[A-Za-z_]+$), so the datalist never suggests a zone (e.g. America/Argentina/Salta,
-  // Africa/Porto-Novo) the server would reject on save.
-  const TIMEZONES = (typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : []).filter(
-    (z) => /^[A-Za-z_]+\/[A-Za-z_]+$/.test(z),
+  // very old engines (guarded). Filtered to the shape bot-ops.sh's DMF_TIMEZONE regex accepts, so
+  // the datalist never suggests a zone the server would reject on save. TZ_SHAPE_RE is a
+  // hand-duplicated mirror of that regex, built from the identical string (a RegExp literal would
+  // need the "/" escaped) so ops/admin/server.test.ts can pin the two against drift — #69 widened
+  // the server side to 3-segment / hyphen / "+" / no-slash zones and this filter was left on the
+  // old exactly-one-slash shape, silently under-offering (e.g. America/Indiana/Indianapolis).
+  // filterTimezones is its own function, not inlined into this IIFE-scope const, so
+  // server.test.ts can lift and call the ACTUAL filtering (not just the regex string) between the
+  // TZ_FILTER markers below — a filter that stopped applying TZ_SHAPE_RE would otherwise still
+  // pass the "the two patterns match" test while silently reverting to unfiltered or nothing.
+  // TZ_FILTER:begin
+  const TZ_SHAPE_RE = new RegExp("^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+){0,2}$");
+  function filterTimezones(zones) {
+    return zones.filter((z) => TZ_SHAPE_RE.test(z));
+  }
+  // TZ_FILTER:end
+  const TIMEZONES = filterTimezones(
+    typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [],
   );
 
   // Built once, appended to <body> (not #env-fields, which loadEnv wipes) so it survives reloads.
@@ -843,32 +856,48 @@
 
   document.getElementById("save-env").addEventListener("click", (e) => withBusy(e.currentTarget, saveEnv));
 
-  async function saveEnv() {
-    const msg = document.getElementById("env-msg");
-    const controls = document.querySelectorAll("#env-fields [data-key]");
-    // Diff against what we loaded, so we can preview exactly what's about to change.
+  // The save-time diff — pure, and lifted out of saveEnv so ops/admin/server.test.ts can pin it
+  // against this very source (the test lifts this function and saveEnv, between their
+  // ENV_SAVE_PLAN / ENV_SAVE markers, evaluates them, and runs saveEnv against a stubbed page, so
+  // the POST body is asserted end-to-end). `loaded` is what GET /api/env returned; `current` is {KEY: control value}
+  // for every rendered field, in field order. The POST body carries ONLY the keys whose value
+  // differs — never an untouched field echoed back (issue #44): posting every field meant a stored
+  // value the bot accepts but bot-ops.sh's regex rejects (a hand-quoted realm, a CRLF-saved .env)
+  // failed every save from this panel, naming a field the operator never touched — and a tab
+  // loaded before another operator's save silently reverted their change on its own next save.
+  // The confirm preview and the body come from the same list, so what's shown is what's sent.
+  // ENV_SAVE_PLAN:begin
+  function planEnvSave(loaded, current) {
     const changes = [];
-    for (const c of controls) {
-      const key = c.dataset.key;
-      const now = c.value;
-      const before = loadedEnv[key] ?? "";
+    for (const key of Object.keys(current)) {
+      const before = loaded[key] ?? "";
+      const now = current[key];
       if (now !== before) changes.push({ key, before, now });
     }
-    if (changes.length === 0) {
+    return { changes, body: changes.map((c) => c.key + "=" + c.now).join("\n") };
+  }
+  // ENV_SAVE_PLAN:end
+
+  // ENV_SAVE:begin
+  async function saveEnv() {
+    const msg = document.getElementById("env-msg");
+    const current = {};
+    for (const c of document.querySelectorAll("#env-fields [data-key]")) current[c.dataset.key] = c.value;
+    const plan = planEnvSave(loadedEnv, current);
+    if (plan.changes.length === 0) {
       msg.textContent = "No changes.";
       msg.className = "msg";
       return;
     }
-    const preview = changes
+    const preview = plan.changes
       .map((c) => `${c.key}: "${c.before}" → "${c.now}"`)
       .join("\n");
     if (!confirm("Save these config changes? The bot will restart to load them.\n\n" + preview)) return;
 
-    const lines = Array.from(controls).map((c) => c.dataset.key + "=" + c.value).join("\n");
     msg.textContent = "Saving…";
     msg.className = "msg";
     try {
-      const res = await api("/api/env", { method: "POST", body: lines });
+      const res = await api("/api/env", { method: "POST", body: plan.body });
       const text = await res.text();
       let result = null;
       try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
@@ -886,6 +915,7 @@
       if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
     }
   }
+  // ENV_SAVE:end
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
