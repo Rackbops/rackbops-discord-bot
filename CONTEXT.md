@@ -283,6 +283,12 @@
   not quiesce during a handoff (only the scheduler does) and `/update`'s `force: true` bypasses
   the anti-loop suppression: unguarded, it would overwrite the in-flight attempt's
   `pendingUpdateReport` and then force-remove its replacement.
+- **The guard is two flags, not one (#51 item 4).** `handoffActive()` alone doesn't read true
+  until `redeploy()`'s own `beginHandoff()` — its first line — so a second call landing in the
+  stretch before that (both GitHub fetches, `saveState()`, `redeployAvailable()`'s daemon ping,
+  all async) used to pass straight through. `checkInFlight`, a module-level flag in `update.ts`
+  claimed synchronously before the first `await` and released in `finally`, closes that window:
+  two calls fired back-to-back (no `await` between them) can never both observe it as false.
 - **`/report`** (`src/report.ts`) is disabled unless BOTH `REPORT_ROLE_ID` and `GITHUB_TOKEN`
   are set (it replies "not configured" otherwise). `project` is a fixed choices list, so an
   unknown project can't reach the handler; the modal `customId` (`report:<project>`) carries the

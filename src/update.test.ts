@@ -292,6 +292,78 @@ describe("checkForUpdate — anti-loop suppression after a failed in-process red
   });
 });
 
+describe("checkForUpdate — concurrent calls before any handoff begins (#51 item 4)", () => {
+  const realFetch = globalThis.fetch;
+  const realGitSha = config.gitSha;
+
+  beforeEach(() => {
+    config.gitSha = OLD;
+    state.attemptedUpdateToSha = undefined;
+    state.pendingUpdateReport = undefined;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    config.gitSha = realGitSha;
+    state.attemptedUpdateToSha = undefined;
+    state.pendingUpdateReport = undefined;
+    await saveState();
+  });
+
+  function stubGitHub(): void {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/commits?")) {
+        return new Response(JSON.stringify([{ sha: NEW }]), { status: 200 });
+      }
+      if (url.includes("/compare/")) {
+        return new Response(JSON.stringify({ status: "behind" }), { status: 200 });
+      }
+      throw new Error(`unmocked fetch in test: ${url}`);
+    }) as typeof fetch;
+  }
+
+  // `handoffActive()` alone doesn't read true until `redeploy()`'s own `beginHandoff()` — its
+  // first line — so a second call fired while the first is still mid-flight (two GitHub fetches,
+  // a state save, `redeployAvailable()`) used to sail straight past the guard and reach
+  // `redeploy()` too, racing two builds/containers targeting the same tag and container name.
+  // Fired back-to-back with neither awaited first — mirrors two /update presses landing before
+  // either has finished its own async work — this only exercises the guard if it is claimed
+  // synchronously, before the first `await`.
+  test("a second concurrent call refuses busy instead of racing the first into redeploy", async () => {
+    stubGitHub();
+    let redeployCalls = 0;
+    const deps = {
+      redeployAvailable: async () => true,
+      redeploy: async () => {
+        redeployCalls += 1;
+        return { outcome: "failed" as const };
+      },
+    };
+
+    const first = checkForUpdate({ force: true }, deps);
+    const second = checkForUpdate({ force: true }, deps);
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(firstResult.decision).toBe("restart");
+    expect(secondResult.decision).toBe("busy");
+    expect(redeployCalls).toBe(1);
+  });
+
+  // The flag must release on every exit, not just the "restart" path — otherwise one busy/current/
+  // suppressed call would wedge every later one behind a guard nothing will ever clear.
+  test("the guard releases after a non-restart decision, so the next call isn't wedged busy", async () => {
+    config.gitSha = NEW; // current — decideUpdate short-circuits before the guard matters
+    stubGitHub();
+
+    const first = await checkForUpdate();
+    expect(first.decision).toBe("current");
+
+    const second = await checkForUpdate();
+    expect(second.decision).toBe("current");
+  });
+});
+
 describe("buildUpdateReport", () => {
   const NOW = 1_700_000_000_000;
 
