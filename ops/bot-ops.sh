@@ -374,8 +374,14 @@ cmd_env_set() {
   # State the mode instead of inheriting whatever mktemp happened to create. `mv` carries the temp
   # file's mode onto .env, so today .env ends up 0600 purely as a side effect of mktemp's default —
   # correct by accident, and silently narrowing for anyone who set .env to 0640 on purpose. Saying
-  # 0600 outright makes the intent the contract.
-  chmod 600 "$ENV_FILE"
+  # 0600 outright makes the intent the contract. `|| warn`-guarded like the chown calls around it:
+  # .env has already been rewritten by this point, so under `set -e` an unguarded failure here (a
+  # read-only remount, an immutable attr, an ACL/quota edge case) would exit before the jq -n below
+  # ever runs, losing the JSON result for a mutation that already happened (same class as issue #47)
+  # — and mktemp's own 0600 default (the comment above) means the file is already correctly narrow
+  # even when this explicit chmod can't confirm it.
+  chmod 600 "$ENV_FILE" \
+    || echo "bot-ops: warning: couldn't set .env permissions to 600" >&2
   chown "$target_owner" "$ENV_FILE" \
     || echo "bot-ops: warning: couldn't restore .env ownership to $target_owner" >&2
 
