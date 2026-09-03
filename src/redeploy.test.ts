@@ -550,6 +550,10 @@ describe("redeploy — cleanup always runs", () => {
      *  test drive item 7's actual drop logic through the real redeploy() flow. Defaults to empty
      *  (carries everything, i.e. no drop), matching every test that isn't specifically about it. */
     oldImageEnv?: string[];
+    /** Makes the `GET /images/<id>/json` inspect itself fail, to drive `redeploy()`'s
+     *  `.catch(() => [])` degradation path (best-effort, same "never fail a good deploy over
+     *  housekeeping" rule as pruneOldImages). */
+    imageInspectFails?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -560,6 +564,7 @@ describe("redeploy — cleanup always runs", () => {
       if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
       if (pathname === "/images/json") return jsonRes([]);
       if (pathname.startsWith("/images/") && pathname.endsWith("/json")) {
+        if (o.imageInspectFails) return new Response("boom", { status: 500 });
         return jsonRes({ Config: { Env: o.oldImageEnv ?? [] } });
       }
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
@@ -663,6 +668,22 @@ describe("redeploy — cleanup always runs", () => {
     expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/images/") && c.path.endsWith("/json"))).toBe(
       true,
     );
+  });
+
+  // A failed image inspect must degrade to "carry everything over" (today's pre-item-7 behavior),
+  // not crash the whole redeploy — the same "never fail a good deploy over housekeeping" rule as
+  // pruneOldImages.
+  test("a failed old-image inspect doesn't abort the redeploy — degrades to carrying every env var over", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+      imageInspectFails: true,
+    });
+    const result = await redeploy("6".repeat(40));
+    expect(result.outcome).toBe("failed"); // the ordinary poll outcome — the image-inspect failure must not surface as this
+    const create = calls.find((c) => c.path === "/containers/create");
+    const body = JSON.parse(create!.body!) as { Env: string[] };
+    expect(body.Env).toContain("PATH=/usr/bin"); // nothing dropped — the fallback carried it over
   });
 
   // The wiring test above only confirms the GET happened — not that its result actually reaches
