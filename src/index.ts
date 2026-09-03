@@ -1,5 +1,6 @@
-import { Client, Events, GatewayIntentBits, REST, Routes } from "discord.js";
+import { Client, Events, REST, Routes } from "discord.js";
 import { config } from "./config";
+import { createClient } from "./client";
 import { commandData, handleCommand } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler } from "./announce";
@@ -7,7 +8,7 @@ import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = createClient();
 // A daemon call only happens here when the env actually says standby (#46) — an ordinary boot
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);

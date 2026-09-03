@@ -114,14 +114,21 @@ export async function deliverUpdateReport(
   return "none";
 }
 
-function liveDeliverers(client: Client): Deliverers {
+export function liveDeliverers(client: Client): Deliverers {
   return {
     // The follow-up webhook route is authenticated by the interaction token itself, so this
     // posts unauthenticated. discord.js's WebhookClient can't set the ephemeral flag.
+    //
+    // This bypasses `Client` entirely (a raw REST call, not `client.channels`/`client.users`), so
+    // it never sees the Client-level `allowedMentions: { parse: [] }` default (#48) — set it here
+    // too. `content` is always bot-generated (updateOutcomeMessage's sha-based text) so nothing
+    // here can currently be pinged, but this is the one send path outside the Client's reach, and
+    // the whole point of the client-wide default was that no call site should have to remember to
+    // opt in to *safety*.
     async viaToken(report, content) {
       await new REST().post(
         Routes.webhook(report.applicationId!, report.interactionToken!) as `/${string}`,
-        { body: { content, flags: EPHEMERAL }, auth: false },
+        { body: { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } }, auth: false },
       );
     },
     async viaDm(report, content) {
@@ -131,7 +138,13 @@ function liveDeliverers(client: Client): Deliverers {
     async viaChannel(report, content) {
       const channel = await client.channels.fetch(report.channelId!);
       if (!channel?.isSendable()) throw new Error(`Channel ${report.channelId} is not sendable`);
-      await channel.send(`<@${report.userId}> ${content}`);
+      // The client default is allowedMentions: { parse: [] } (#48), so the ping here needs an
+      // explicit opt-in — report.userId is trusted (it's who requested the /update, not
+      // arbitrary text), unlike the content this is prefixed onto.
+      await channel.send({
+        content: `<@${report.userId}> ${content}`,
+        allowedMentions: { users: [report.userId] },
+      });
     },
   };
 }

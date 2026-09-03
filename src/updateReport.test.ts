@@ -10,6 +10,7 @@ const {
   tokenUsable,
   reportTooOld,
   deliverUpdateReport,
+  liveDeliverers,
 } = await import("./updateReport");
 type PendingUpdateReport = import("./state").PendingUpdateReport;
 type Deliverers = import("./updateReport").Deliverers;
@@ -175,5 +176,33 @@ describe("deliverUpdateReport", () => {
     const r = report({ channelId: undefined });
     expect(await deliverUpdateReport(r, "hi", deliverers, NOW)).toBe("none");
     expect(calls).toEqual(["viaToken", "viaDm"]);
+  });
+});
+
+describe("liveDeliverers.viaChannel", () => {
+  // The client-wide default is allowedMentions: { parse: [] } (#48) — the requester ping this
+  // route prefixes onto `content` needs an explicit opt-in, or it silently stops pinging at all.
+  // Content itself must stay unparsed even though it's concatenated right next to a real mention,
+  // so anything an attacker smuggled into it (another <@id>, a role mention) can't ride along.
+  test("opts the requester's own ping in, without opening content back up to arbitrary mentions", async () => {
+    const sendCalls: unknown[] = [];
+    const fakeChannel = {
+      isSendable: () => true,
+      send: async (payload: unknown) => {
+        sendCalls.push(payload);
+      },
+    };
+    const fakeClient = {
+      channels: { fetch: async () => fakeChannel },
+    } as unknown as import("discord.js").Client;
+
+    await liveDeliverers(fakeClient).viaChannel(report(), "<@1337> gotcha @everyone");
+
+    expect(sendCalls).toEqual([
+      {
+        content: "<@42> <@1337> gotcha @everyone",
+        allowedMentions: { users: ["42"] },
+      },
+    ]);
   });
 });
