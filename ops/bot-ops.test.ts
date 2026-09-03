@@ -345,6 +345,26 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(readFileSync(join(fx.cfg, "backups", backups[0]!), "utf8")).toBe(stored);
     expect(dockerCalls(fx)).toEqual([expect.stringContaining("-p probe-project up -d --force-recreate")]);
   });
+
+  test("a chmod failure after .env is rewritten still prints the JSON result and recreates (issue #47's failure class)", async () => {
+    // A failing `chmod` shim ahead of the real one on PATH stands in for the exotic real-world
+    // cases where chmod itself can fail (read-only remount, immutable attr, ACL/quota) — unlike
+    // chown, which fails routinely for a non-root deploy-user run. Without the `|| warn` guard,
+    // `set -e` would exit right here, before the closing `jq -n` ever runs, discarding the JSON
+    // result for a .env rewrite that already happened.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    writeFileSync(
+      join(fx.bin, "chmod"),
+      ["#!/usr/bin/env bash", "echo 'chmod: fake failure' >&2", "exit 1", ""].join("\n"),
+      { mode: 0o755 },
+    );
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
+    expect(run.stderr).toContain("bot-ops: warning: couldn't set .env permissions to 600");
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("up -d --force-recreate")]);
+  });
 });
 
 describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (issue #45)", () => {
