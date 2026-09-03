@@ -48,15 +48,57 @@ interface Fixture {
 }
 const fixtures: Fixture[] = [];
 
-function setup(envText: string): Fixture {
+function setup(
+  envText: string,
+  opts: {
+    nextRunning?: boolean;
+    /** The simulated canonical-named container's real docker state:
+     *  - "running": the swap is genuinely unresolved (the default whenever nextRunning is set) —
+     *    matches a bare `docker ps` (no `-a`) AND `docker ps -a`, same as a real running container.
+     *  - "stopped": past retireOriginal's stop but its remove failed (round-1's actual bug —
+     *    a stopped-but-not-removed corpse) — matches ONLY `docker ps -a`, not a bare `docker ps`,
+     *    same as a real stopped-but-present container. The guard must NOT refuse in this state
+     *    (issue #51 item 5), which is exactly what would break if a future edit accidentally added
+     *    `-a` to the guard's running-check — this state is what catches that regression.
+     *  - "gone": fully removed. Matches neither.
+     *  Ignored unless nextRunning is set. */
+    originalState?: "running" | "stopped" | "gone";
+  } = {},
+): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
   const cfg = join(root, "cfg");
   const bin = join(root, "bin");
   mkdirSync(cfg);
   mkdirSync(bin);
+  const originalState = opts.originalState ?? "running";
+  // `ps` only answers specially when opts.nextRunning simulates a `<container>-next` (issue #51
+  // item 5's guard) — every other invocation (build, create, up -d --force-recreate, ...) never
+  // matches `$1`, so it stays silent for them, same as before this option existed. The guard makes
+  // two `ps` calls with different filters: one for "-next" (always answered when nextRunning is
+  // set, with `-a` so it sees even a not-yet-started replacement), one for the bare canonical name.
+  // That second query's `-a` (or lack of it) has to be respected for real, not just its filter
+  // text — that's the exact flag the guard's whole self-heal/no-lockout design rests on, so the
+  // shim tracks it explicitly rather than answering the same way regardless.
+  const hasDashA = `[[ " $* " == *" -a "* ]]`;
+  const answersCanonicalQuery =
+    originalState === "running" ? "true" : originalState === "stopped" ? hasDashA : "false";
   writeFileSync(
     join(bin, "docker"),
-    ["#!/usr/bin/env bash", `printf '%s\\n' "docker $*" >> "$(dirname "$0")/docker.log"`, "exit 0", ""].join("\n"),
+    [
+      "#!/usr/bin/env bash",
+      `printf '%s\\n' "docker $*" >> "$(dirname "$0")/docker.log"`,
+      opts.nextRunning
+        ? [
+            `if [[ "$1" == "ps" ]] && [[ "$*" == *"-next"* ]]; then`,
+            `  printf '%s\\n' "probe-container-next"`,
+            `elif [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container"* ]]; then`,
+            `  if ${answersCanonicalQuery}; then printf '%s\\n' "probe-container"; fi`,
+            `fi`,
+          ].join("\n")
+        : "",
+      "exit 0",
+      "",
+    ].join("\n"),
     { mode: 0o755 },
   );
   const compose = join(root, "compose.yml");
@@ -197,7 +239,11 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
     expect(envText(fx)).toBe('ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=22222\n');
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("up -d --force-recreate")]);
+    // The #51-item-5 guard's `docker ps` check runs first, then the real recreate.
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("up -d --force-recreate"),
+    ]);
   });
 
   test("the issue's literal case — a 3-segment DMF_TIMEZONE stored — keeps working (regex widened by #69)", async () => {
@@ -215,7 +261,9 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(run.stderr).toContain("env-set: value for 'ANNOUNCE_CHANNEL_ID' is invalid");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
     expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
-    expect(dockerCalls(fx)).toEqual([]);
+    // Only the #51-item-5 guard's own `docker ps` check ran — the invalid value never reached
+    // the recreate step.
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("validation runs only over CHANGED keys, and names the first invalid one in submission order", async () => {
@@ -254,7 +302,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=11111\nDISCORD_TOKEN=secret\n");
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain("'DISCORD_TOKEN' is not an editable key");
-    expect(dockerCalls(fx)).toEqual([]);
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("a malformed line is refused as such — including an empty or non-key-shaped key", async () => {
@@ -274,7 +322,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(run.exitCode).toBe(0);
     expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
     expect(envText(fx)).toBe(stored); // byte-identical: no rewrite, quotes and CR left alone
-    expect(dockerCalls(fx)).toEqual([]);
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("a duplicated key is diffed against its LAST (effective) value, and every copy is rewritten", async () => {
@@ -291,7 +339,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const run = await botOps(fx, ["env-set"], "WOW_REGION=us\nBOT_BRANCH=main\n");
     expect(run.exitCode).toBe(0);
     expect(envText(fx)).toBe("WOW_REGION=us\nBOT_BRANCH=main\nANNOUNCE_CHANNEL_ID=11111\n");
-    expect(dockerCalls(fx)).toHaveLength(1);
+    expect(dockerCalls(fx)).toHaveLength(2); // the #51-item-5 guard's `ps` check, then the recreate
   });
 
   test("a .env whose LAST line has no trailing newline is still read by load_env_values", async () => {
@@ -343,7 +391,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const backups = readdirSync(join(fx.cfg, "backups"));
     expect(backups).toHaveLength(1);
     expect(readFileSync(join(fx.cfg, "backups", backups[0]!), "utf8")).toBe(stored);
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("-p probe-project up -d --force-recreate")]);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("-p probe-project up -d --force-recreate"),
+    ]);
   });
 
   test("a chmod failure after .env is rewritten still prints the JSON result and recreates (issue #47's failure class)", async () => {
@@ -363,7 +414,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
     expect(run.stderr).toContain("bot-ops: warning: couldn't set .env permissions to 600");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("up -d --force-recreate")]);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("up -d --force-recreate"),
+    ]);
   });
 });
 
@@ -375,7 +429,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     expect(run.stderr).toContain("env-set: 'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
     expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
-    expect(dockerCalls(fx)).toEqual([]);
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("blanking a required key alongside a valid, unrelated change rejects the WHOLE submission", async () => {
@@ -384,7 +438,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n"); // WOW_REGION change never applied either
-    expect(dockerCalls(fx)).toEqual([]);
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("a non-required key still clears to blank normally — REQUIRED doesn't block unrelated keys", async () => {
@@ -404,5 +458,80 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["WOW_REGION"] });
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n");
+  });
+});
+
+// Issue #51 item 5: a self-update briefly runs the replacement alongside the original under
+// "<container>-next" before it takes the canonical name over. restart/env-set recreating or
+// restarting the ORIGINAL in that window races retireOriginal's own stop/remove/rename and can
+// leave two bots on the shared token — both commands must refuse outright rather than risk it.
+// The container's mere existence must NOT be the whole signal (see the next describe block) —
+// whether the CANONICAL name is still a running container is what actually distinguishes "still
+// unresolved" from "stuck on a cosmetic rename failure, already safe."
+describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is mid-flight (issue #51)", () => {
+  test("restart refuses when a <container>-next container exists and the original is still running", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalState: "running" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("a self-update is in progress");
+    expect(run.stderr).toContain("probe-container-next");
+    // The guard fires before the real restart — never told compose to touch anything.
+    expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
+  });
+
+  test("env-set refuses when a <container>-next container exists and the original is still running — .env untouched, no backup", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalState: "running" });
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("a self-update is in progress");
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+    expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
+  });
+
+  test("restart and env-set both proceed normally when nothing is mid-swap", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n"); // nextRunning defaults to false
+    const restart = await botOps(fx, ["restart"]);
+    expect(restart.exitCode).toBe(0);
+    const envSet = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(envSet.exitCode).toBe(0);
+    expect(envSet.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
+  });
+});
+
+// retireOriginal tolerates its own post-stop remove/rename failing and never retries — cosmetic,
+// per its own comment, since the bot is up and serving regardless. That can leave a fully healthy
+// replacement permanently running under "<container>-next" with no self-heal. A guard keyed on
+// the container's mere existence would then refuse restart/env-set FOREVER — worse than the race
+// it exists to prevent. Once retireOriginal gets past stopping the original — its own documented
+// "point of no return" — the original is no longer RUNNING, which is what tells this state apart
+// from a swap that's still genuinely in progress.
+describe.skipIf(!runnable)("bot-ops.sh doesn't lock out restart/env-set forever on a stuck-but-healthy swap (issue #51)", () => {
+  // "stopped" is round 1's actual bug: the original's own removeContainer failed, leaving a
+  // stopped-but-not-removed corpse still present under the canonical name. It matters that this
+  // is modeled as PRESENT-but-stopped rather than fully gone: it's the one state that would also
+  // (wrongly) match a `docker ps -a` query, so it's what actually catches a future edit that
+  // accidentally adds `-a` back onto the guard's running-check and reintroduces the lockout.
+  test("restart proceeds when <container>-next exists but the original is a stopped, unremoved corpse", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalState: "stopped" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
+    expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("restart"))).toBe(true);
+  });
+
+  test("env-set proceeds when <container>-next exists but the original is a stopped, unremoved corpse", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalState: "stopped" });
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
+  });
+
+  // The other half of retireOriginal's tolerant path: the original's remove actually succeeded
+  // (fully gone), only the rename failed. Same expected outcome as the stopped-corpse case.
+  test("restart proceeds when <container>-next exists but the original has been fully removed", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, originalState: "gone" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
   });
 });

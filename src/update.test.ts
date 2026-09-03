@@ -162,8 +162,28 @@ describe("fetchShaRelation", () => {
   }
 
   test("404 means the running sha isn't on the remote", async () => {
+    stub(() => new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }));
+    expect(await fetchShaRelation(NEW, OLD)).toBe("unpublished");
+  });
+
+  test("a 404 with no body at all still falls back to unpublished", async () => {
     stub(() => new Response("", { status: 404 }));
     expect(await fetchShaRelation(NEW, OLD)).toBe("unpublished");
+  });
+
+  // A history rewrite of BOT_BRANCH can leave a deployed sha still on the remote but sharing no
+  // ancestry with the newest commit — GitHub answers that with a 404 too, but it means `diverged`
+  // (a rebuild would work), not `unpublished` (nothing to compare against at all).
+  test("a 404 with 'no common ancestor' means diverged, not unpublished", async () => {
+    stub(() =>
+      new Response(JSON.stringify({ message: "No common ancestor between abc123 and def456" }), { status: 404 }),
+    );
+    expect(await fetchShaRelation(NEW, OLD)).toBe("diverged");
+  });
+
+  test("the no-common-ancestor check is case-insensitive", async () => {
+    stub(() => new Response(JSON.stringify({ message: "NO COMMON ANCESTOR" }), { status: 404 }));
+    expect(await fetchShaRelation(NEW, OLD)).toBe("diverged");
   });
 
   test("a server error is unknown, not a throw", async () => {

@@ -122,6 +122,18 @@ describe("handoffFailureMessage", () => {
     expect(msg).toContain("socket");
   });
 
+  // #51 item 3: a stall can still carry a reason (e.g. the redeploy loop caught a `failed`
+  // marker written just past the deadline) — it used to be discarded outright.
+  test("a stall carries the reason when there is one", () => {
+    expect(handoffFailureMessage("stalled", { targetSha: sha, error: "daemon unreachable" })).toContain(
+      "daemon unreachable",
+    );
+  });
+
+  test("a stall without a reason still reads as a sentence", () => {
+    expect(handoffFailureMessage("stalled", { targetSha: sha })).not.toContain("undefined");
+  });
+
   // The headline of #879: whatever went wrong, the original is still serving.
   test("every failure says the current build is still running", () => {
     for (const outcome of ["failed", "timeout", "stalled"] as const) {

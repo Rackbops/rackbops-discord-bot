@@ -155,7 +155,15 @@ export async function fetchShaRelation(
         `${encodeURIComponent(latestSha)}...${encodeURIComponent(runningSha)}`,
       { headers: apiHeaders() },
     );
-    if (res.status === 404) return "unpublished";
+    if (res.status === 404) {
+      // GitHub answers 404 for two different questions: the running sha genuinely isn't on the
+      // remote (`unpublished`), or it IS on the remote but shares no history with the newest bot
+      // commit — "No common ancestor" (probed: repos/git/git/compare/master...todo) — which is a
+      // `diverged` deploy off a rewritten branch, not one the operator forgot to push.
+      const body = (await res.json().catch(() => undefined)) as { message?: string } | undefined;
+      if (body?.message?.toLowerCase().includes("no common ancestor")) return "diverged";
+      return "unpublished";
+    }
     if (!res.ok) {
       console.warn(`[update] compare failed: ${res.status} — treating a sha mismatch as stale`);
       return "unknown";

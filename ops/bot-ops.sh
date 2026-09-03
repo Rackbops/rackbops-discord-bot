@@ -155,6 +155,60 @@ die() { echo "bot-ops: $*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
+# A self-update (#879) briefly runs the replacement alongside the original under
+# "<container>-next" before it takes the canonical name over. Recreating or restarting the
+# ORIGINAL while that container exists races retireOriginal's own stop/remove/rename and can leave
+# two bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
+# operator can just retry once the swap finishes (usually well under a minute).
+#
+# The "-next" container's mere EXISTENCE is not enough on its own to decide THAT, in either
+# direction:
+#   - Too EARLY a signal misses the pre-verification window (up to VERIFY_DEADLINE_MS, ~90s) where
+#     "-next" already exists but hasn't written anything yet — an env-set force-recreate landing
+#     there would recreate the untouched original under a brand-new container id, orphaning the
+#     replacement's own HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats
+#     it as "already gone" (its documented tolerant path), and skips the rename WITHOUT throwing —
+#     so the replacement still goes live. Two live bots, and the recreated one is still on the OLD
+#     image (:latest isn't retagged until takeOver verifies).
+#   - Too LATE a signal (checked only via a marker file, tried and reverted once already) means the
+#     container's existence outlives the marker: retireOriginal tolerates its own post-stop
+#     remove/rename failing (a stopped original corpse still holding the canonical name, or the
+#     resulting name conflict) and never retries — "cosmetic," per its own comment, since the bot
+#     is up and serving either way. Guarding on a marker that's already been cleared by then would
+#     wrongly allow past that safe point, but guarding on one that hasn't been WRITTEN yet wrongly
+#     refuses nothing during the dangerous window above — no single read of that file can tell the
+#     two apart, since both look identical (absent) from outside.
+#
+# What actually distinguishes "still unresolved" from "resolved, rename just didn't stick" is
+# whether the ORIGINAL itself is still running. It stays running for the entire pre-verification
+# wait and the entire verified-but-not-yet-retired wait (nothing has touched it yet in either), and
+# retireOriginal's own comment calls its stop "the point of no return" — every step after that
+# (remove, rename) is best-effort and non-fatal on failure. So: refuse only while "-next" exists
+# AND the canonical name still resolves to a RUNNING container. A narrow gap remains between that
+# stop and the remainder of the cleanup finishing (typically milliseconds — two more daemon calls)
+# where this allows through; unlike the window above, both containers agree on the SAME already-
+# verified image there (tagLatest runs before the stop), so the worst case is a brief, self-
+# resolving overlap rather than a stale-code split-brain — the same class of accepted residual risk
+# as issue #51's own item 1.
+#
+# Known, DECLINED-for-now residual risk (found in review, tracked on #85 rather than fixed here):
+# retireOriginal's own stopContainer call is unguarded on a genuine first attempt (redeploy.ts)
+# — if the daemon actually stops the original but the HTTP response is lost in transit (the exact
+# scenario takeOver's own comment already names), that throw crashes the REPLACEMENT process
+# rather than completing the swap. `docker ps` (no -a) then correctly reports the original as not
+# running — this guard reads that as safe — while the crashed replacement is mid-reboot (a real
+# Bun process + gateway reconnect, low seconds, not "two more daemon calls") retrying the whole
+# handoff. An env-set landing in THAT window can still produce a genuine two-live-bots outcome.
+# This is the same restart-policy/crash-proofing family of race as #85's `unless-stopped`
+# resurrection issue, not a gap specific to this guard's own signal — fixing it here without also
+# fixing #85 would be treating one symptom of a shared root cause.
+guard_no_handoff_in_progress() {
+  docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+  if docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+    die "a self-update is in progress (container '${CONTAINER}-next' exists and '${CONTAINER}' is still running) — try again once it completes"
+  fi
+}
+
 # One .env definition line: optional indentation, an optional `export ` prefix, the key, `=`, the
 # raw value. Shared by load_env_values (which reads .env) and cmd_env_set's rewrite (which
 # replaces lines in it), so the two can never disagree about which lines define a key.
@@ -226,6 +280,7 @@ cmd_logs() {
 
 cmd_restart() {
   need docker
+  guard_no_handoff_in_progress
   # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
   # different mechanism from the container's own runtime env, which env_file: itself supplies
   # once that interpolation resolves.
@@ -264,6 +319,7 @@ cmd_env_get() {
 
 cmd_env_set() {
   need docker; need jq
+  guard_no_handoff_in_progress
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
   # Every REQUIRED key must also be an ALLOWED one — same drift worry as ALLOWED_ORDER vs ALLOWED

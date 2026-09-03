@@ -18,11 +18,13 @@ const {
   shaTag,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker, HANDOFF_FROM_ENV } = await import("./handoff");
+const { clearMarker, writeMarker, HANDOFF_FROM_ENV } = await import("./handoff");
 const { handoffActive, resetForTest } = await import("./restart");
 
+const SELF_ID = "a".repeat(64);
+const SELF_SHORT_ID = SELF_ID.slice(0, 12);
 const SELF: ContainerInspect = {
-  Id: "a".repeat(64),
+  Id: SELF_ID,
   Name: "/warbandeer-discord",
   Image: "sha256:deadbeef",
   State: { Running: true, Status: "running", ExitCode: 0 },
@@ -41,7 +43,10 @@ const SELF: ContainerInspect = {
     { Type: "volume", Name: "wbd_state", Source: "/var/lib/docker/volumes/wbd_state/_data", Destination: "/app/data", RW: true },
     { Type: "bind", Source: "/var/run/docker.sock", Destination: "/var/run/docker.sock", RW: true },
   ],
-  NetworkSettings: { Networks: { wbd_default: {} } },
+  // Docker auto-adds a connected container's own short id here alongside any deliberately
+  // configured alias — "bot" is the real, meant-to-be-shared compose service alias; the short id
+  // is this SPECIFIC container's own identity and must not be carried onto a different one.
+  NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", SELF_SHORT_ID] } } },
 };
 
 describe("naming", () => {
@@ -150,7 +155,7 @@ describe("selectImagesToPrune", () => {
 });
 
 describe("buildCreateSpec", () => {
-  const spec = buildCreateSpec(SELF, { image: "img:abc1234", handoffFrom: SELF.Id });
+  const spec = buildCreateSpec(SELF, { image: "img:abc1234", handoffFrom: SELF.Id, oldImageEnv: [] });
 
   // The crux of "zero config": everything the replacement needs is discovered from the
   // original's own inspect, so there is nothing for an operator to set up first.
@@ -175,9 +180,38 @@ describe("buildCreateSpec", () => {
   test("never stacks a second HANDOFF_FROM when one is already set", () => {
     const chained = buildCreateSpec(
       { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, "HANDOFF_FROM=older"] } },
-      { image: "img:abc1234", handoffFrom: "newer" },
+      { image: "img:abc1234", handoffFrom: "newer", oldImageEnv: [] },
     );
     expect(chained.Env.filter((e) => e.startsWith("HANDOFF_FROM="))).toEqual(["HANDOFF_FROM=newer"]);
+  });
+
+  // #51 item 7: Config.Env is the image's baked ENV merged with the container's own, so copying
+  // it verbatim pins EVERY image default (not just GIT_SHA) at the old image's value forever.
+  // Dropping only entries that match an old-image entry VERBATIM is what lets the new image
+  // supply its own defaults while a genuine operator override (env_file-sourced, same key,
+  // different value) still survives the swap.
+  test("drops an entry that matches the old image's own baked env verbatim", () => {
+    const withBaked = buildCreateSpec(
+      { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, "BUN_INSTALL_BIN=/usr/local/bin"] } },
+      { image: "img:abc1234", handoffFrom: SELF.Id, oldImageEnv: ["PATH=/usr/bin", "BUN_INSTALL_BIN=/usr/local/bin"] },
+    );
+    expect(withBaked.Env.some((e) => e.startsWith("PATH="))).toBe(false);
+    expect(withBaked.Env.some((e) => e.startsWith("BUN_INSTALL_BIN="))).toBe(false);
+  });
+
+  test("keeps an operator override even when it shares a key with an image default", () => {
+    // AUTO_UPDATE=true is the container's own value; the (hypothetical) image bakes a DIFFERENT
+    // default. A key-only match would wrongly drop this and silently revert the operator's choice.
+    const overridden = buildCreateSpec(SELF, {
+      image: "img:abc1234",
+      handoffFrom: SELF.Id,
+      oldImageEnv: ["AUTO_UPDATE=false"],
+    });
+    expect(overridden.Env).toContain("AUTO_UPDATE=true");
+  });
+
+  test("an empty oldImageEnv carries every container-set var over, same as before this fix", () => {
+    expect(spec.Env).toContain("PATH=/usr/bin");
   });
 
   test("re-binds the state volume, so the replacement reads the report left for it", () => {
@@ -198,7 +232,7 @@ describe("buildCreateSpec", () => {
   });
 
   test("defaults the restart policy when the original somehow has none", () => {
-    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x" });
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
     expect(bare.HostConfig.RestartPolicy).toEqual({ Name: "unless-stopped" });
   });
 
@@ -206,7 +240,7 @@ describe("buildCreateSpec", () => {
   // `init: true` is container config, not image config, and wasn't carried over.
   test("keeps init, so the replacement still runs under docker-init", () => {
     expect(spec.HostConfig.Init).toBe(true);
-    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x" });
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
     expect(bare.HostConfig.Init).toBeUndefined();
   });
 
@@ -221,9 +255,48 @@ describe("buildCreateSpec", () => {
   test("a read-only mount stays read-only", () => {
     const ro = buildCreateSpec(
       { ...SELF, Mounts: [{ Type: "bind", Source: "/etc/x", Destination: "/etc/x", RW: false }] },
-      { image: "i", handoffFrom: "x" },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
     );
     expect(ro.HostConfig.Binds).toEqual(["/etc/x:/etc/x:ro"]);
+  });
+
+  // #51 item 6: without this the replacement resolves by container name only, so
+  // `http://bot:<port>` (README's documented tunnel mapping) stops resolving after the first
+  // self-update — inert today (no HTTP server yet), latent for the desktop-app API work.
+  test("carries the network's deliberately-configured service alias over", () => {
+    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toContain("bot");
+  });
+
+  // Docker auto-adds a connected container's own short id to the same Aliases array. Carrying
+  // that over would tag the REPLACEMENT with the ORIGINAL's specific identity — meaningless (and
+  // wrong) on a different container, unlike "bot", which is meant to be shared across whichever
+  // container currently holds the service.
+  test("drops the original's own auto-added short container id from the carried-over aliases", () => {
+    expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).not.toContain(SELF_SHORT_ID);
+  });
+
+  test("no NetworkingConfig when the network has no aliases of its own", () => {
+    const noAliases = buildCreateSpec(
+      { ...SELF, NetworkSettings: { Networks: { wbd_default: {} } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(noAliases.NetworkingConfig).toBeUndefined();
+  });
+
+  // If the only alias Docker ever recorded is the original's own short id (no deliberate alias
+  // configured at all), filtering it out must not leave behind an empty-but-present
+  // NetworkingConfig — that's functionally the same as having none.
+  test("no NetworkingConfig when the only alias present is the original's own short id", () => {
+    const onlyShortId = buildCreateSpec(
+      { ...SELF, NetworkSettings: { Networks: { wbd_default: { Aliases: [SELF_SHORT_ID] } } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(onlyShortId.NetworkingConfig).toBeUndefined();
+  });
+
+  test("no NetworkingConfig when the original has no network mode at all", () => {
+    const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
+    expect(bare.NetworkingConfig).toBeUndefined();
   });
 });
 
@@ -441,7 +514,7 @@ describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
   const REPLACEMENT_ID = "c".repeat(64);
-  let calls: { path: string; method: string; url: string }[] = [];
+  let calls: { path: string; method: string; url: string; body?: string }[] = [];
 
   beforeEach(async () => {
     process.env.HOSTNAME = HOSTNAME;
@@ -468,17 +541,41 @@ describe("redeploy — cleanup always runs", () => {
   function stubDaemon(o: {
     pollReplacement: () => Response;
     removeReplacement: () => Response;
+    /** Runs (awaited) when the replacement is started — before `awaitHandoff` ever polls, so a
+     *  marker written here is guaranteed on disk for the very first poll to see. Used by the
+     *  item-3 retirement-wait tests to reach a `ready` outcome deterministically, with no reliance
+     *  on POLL_MS timing. */
+    afterStart?: () => Promise<void>;
+    /** The old image's own baked env, returned by the `GET /images/<id>/json` inspect — lets a
+     *  test drive item 7's actual drop logic through the real redeploy() flow. Defaults to empty
+     *  (carries everything, i.e. no drop), matching every test that isn't specifically about it. */
+    oldImageEnv?: string[];
+    /** Makes the `GET /images/<id>/json` inspect itself fail, to drive `redeploy()`'s
+     *  `.catch(() => [])` degradation path (best-effort, same "never fail a good deploy over
+     *  housekeeping" rule as pruneOldImages). */
+    imageInspectFails?: boolean;
+    /** Makes `POST /containers/{id}/start` fail after `create` already succeeded, to drive the
+     *  cleanup-on-failure path so a failed start doesn't leak the replacement container. */
+    startFails?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
-      calls.push({ path: pathname, method, url: String(url) });
+      calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
       if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
       if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
       if (pathname === "/images/json") return jsonRes([]);
+      if (pathname.startsWith("/images/") && pathname.endsWith("/json")) {
+        if (o.imageInspectFails) return new Response("boom", { status: 500 });
+        return jsonRes({ Config: { Env: o.oldImageEnv ?? [] } });
+      }
       if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
-      if (pathname === `/containers/${REPLACEMENT_ID}/start`) return new Response("", { status: 204 });
+      if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
+        if (o.startFails) return new Response("boom", { status: 500 });
+        await o.afterStart?.();
+        return new Response("", { status: 204 });
+      }
       if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
       if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
       if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
@@ -543,6 +640,145 @@ describe("redeploy — cleanup always runs", () => {
     expect(build).toBeDefined();
     const params = new URL(build!.url).searchParams;
     expect(params.getAll("t")).toEqual(["warbandeer-discord-debug-bot:eeeeeee"]);
+  });
+
+  // createContainer can succeed and startContainer still fail (a bind-mount error, a network
+  // alias conflict, a daemon hiccup) — without cleanup here the created-but-never-started
+  // container leaks until the NEXT redeploy attempt's own leftover-removal line. Found during
+  // review of #51 item 5: bot-ops.sh's new guard reads that lingering container as "a swap is
+  // still in progress" and refuses restart/env-set for however long until that next attempt,
+  // which the update scheduler's anti-loop suppression can push out indefinitely for the same sha.
+  test("a startContainer failure cleans up the just-created replacement instead of leaking it", async () => {
+    stubDaemon({
+      pollReplacement: () => {
+        throw new Error("must not poll — redeploy() should have returned before this");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+      startFails: true,
+    });
+    const result = await redeploy("7".repeat(40));
+    expect(result.outcome).toBeUndefined();
+    expect(result.error).toContain("could not start the replacement");
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${REPLACEMENT_ID}`)).toBe(true);
+    expect(handoffActive()).toBe(false);
+  });
+
+  // #51 item 2: the daemon fetches at build *start*, seconds after `latestSha` was resolved and
+  // compared — a push landing in that window must not silently ship newer code stamped with the
+  // older, already-compared sha. Building from the exact sha (not config.botBranch's live tip)
+  // closes it: GitHub serves a fetch by full sha, so the daemon checks out exactly that commit.
+  test("builds from the exact compared sha, not the branch's current tip", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    const sha = "f".repeat(40);
+    await redeploy(sha);
+    const build = calls.find((c) => c.path === "/build");
+    expect(build).toBeDefined();
+    const remote = new URL(build!.url).searchParams.get("remote");
+    expect(remote).toContain(`#${sha}`);
+    expect(remote).not.toContain("#main");
+  });
+
+  // #51 item 7: the old image's own baked env has to be read so buildCreateSpec can tell an
+  // image default apart from a genuine operator override — wiring pinned so it can't go silently
+  // dead (the drop-logic itself is unit-tested directly on buildCreateSpec, below).
+  test("inspects the old image's own env before creating the replacement", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("1".repeat(40));
+    expect(calls.some((c) => c.method === "GET" && c.path.startsWith("/images/") && c.path.endsWith("/json"))).toBe(
+      true,
+    );
+  });
+
+  // A failed image inspect must degrade to "carry everything over" (today's pre-item-7 behavior),
+  // not crash the whole redeploy — the same "never fail a good deploy over housekeeping" rule as
+  // pruneOldImages.
+  test("a failed old-image inspect doesn't abort the redeploy — degrades to carrying every env var over", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+      imageInspectFails: true,
+    });
+    const result = await redeploy("6".repeat(40));
+    expect(result.outcome).toBe("failed"); // the ordinary poll outcome — the image-inspect failure must not surface as this
+    const create = calls.find((c) => c.path === "/containers/create");
+    const body = JSON.parse(create!.body!) as { Env: string[] };
+    expect(body.Env).toContain("PATH=/usr/bin"); // nothing dropped — the fallback carried it over
+  });
+
+  // The wiring test above only confirms the GET happened — not that its result actually reaches
+  // the create call. A fetch that silently discarded the inspected env (e.g. always resolving to
+  // []) would still pass it; this drives the real POST /containers/create body and would catch
+  // exactly that.
+  test("the old image's env fetched via inspectImage actually reaches the create request body", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+      oldImageEnv: ["PATH=/usr/bin"], // matches SELF.Config.Env's own PATH entry verbatim
+    });
+    await redeploy("4".repeat(40));
+    const create = calls.find((c) => c.path === "/containers/create");
+    expect(create?.body).toBeDefined();
+    const body = JSON.parse(create!.body!) as { Env: string[] };
+    expect(body.Env).not.toContain("PATH=/usr/bin");
+    expect(body.Env).toContain("DISCORD_TOKEN=secret"); // an operator-set var, untouched
+  });
+
+  // Same class of gap for item 6: confirms the network aliases computed in buildCreateSpec
+  // actually land in the real create request body, not just that the isolated unit tests exercise
+  // the function in the abstract.
+  test("the network's service alias actually reaches the create request body", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("5".repeat(40));
+    const create = calls.find((c) => c.path === "/containers/create");
+    const body = JSON.parse(create!.body!) as {
+      NetworkingConfig?: { EndpointsConfig: Record<string, { Aliases?: string[] }> };
+    };
+    const aliases = body.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases;
+    expect(aliases).toContain("bot");
+    expect(aliases).not.toContain(SELF_SHORT_ID);
+  });
+
+  // #51 item 3: a blind Bun.sleep(RETIREMENT_DEADLINE_MS) here used to sit on a `failed` marker
+  // for up to 3 minutes before ever reading it. Polling instead catches it within one `pollMs` —
+  // pinned with a deadline generously larger than when the marker actually flips, so a slow CI
+  // disk can't turn this into a flake.
+  test("a marker that flips to failed during the retirement wait reclaims quickly, with the reason", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 404 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "2222222", at: Date.now() }),
+    });
+    const resultPromise = redeploy("2".repeat(40), { deadlineMs: 300, pollMs: 20 });
+    void Bun.sleep(60).then(() =>
+      writeMarker({ status: "failed", sha: "2222222", error: "retire boom", at: Date.now() }),
+    );
+    const result = await resultPromise;
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBe("retire boom");
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The other half: the deadline genuinely elapsing (nothing ever flips the marker) is still a
+  // `stalled` outcome, not `failed` — distinct because it points at the daemon socket, not the
+  // build itself (see handoff.ts's handoffFailureMessage).
+  test("a marker that stays ready for the whole deadline is stalled, not failed", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 404 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
+    });
+    const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled");
+    expect(handoffActive()).toBe(false);
   });
 });
 
