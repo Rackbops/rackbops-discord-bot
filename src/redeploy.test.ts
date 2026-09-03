@@ -544,6 +544,24 @@ describe("redeploy — cleanup always runs", () => {
     const params = new URL(build!.url).searchParams;
     expect(params.getAll("t")).toEqual(["warbandeer-discord-debug-bot:eeeeeee"]);
   });
+
+  // #51 item 2: the daemon fetches at build *start*, seconds after `latestSha` was resolved and
+  // compared — a push landing in that window must not silently ship newer code stamped with the
+  // older, already-compared sha. Building from the exact sha (not config.botBranch's live tip)
+  // closes it: GitHub serves a fetch by full sha, so the daemon checks out exactly that commit.
+  test("builds from the exact compared sha, not the branch's current tip", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    const sha = "f".repeat(40);
+    await redeploy(sha);
+    const build = calls.find((c) => c.path === "/build");
+    expect(build).toBeDefined();
+    const remote = new URL(build!.url).searchParams.get("remote");
+    expect(remote).toContain(`#${sha}`);
+    expect(remote).not.toContain("#main");
+  });
 });
 
 // Issue #46: HANDOFF_FROM is baked into the replacement's env at creation time and never

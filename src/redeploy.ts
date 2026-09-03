@@ -56,9 +56,10 @@ export function replacementName(inspectedName: string): string {
   return `${canonicalName(inspectedName)}-next`;
 }
 
-/** A git URL the daemon can fetch a build context from: the whole repo at the target branch. */
-export function buildRemote(repo: string, branch: string): string {
-  return `https://github.com/${repo}.git#${branch}`;
+/** A git URL the daemon can fetch a build context from: the whole repo at the target ref
+ *  (a branch name or a full sha both work — GitHub serves a fetch by either). */
+export function buildRemote(repo: string, ref: string): string {
+  return `https://github.com/${repo}.git#${ref}`;
 }
 
 /**
@@ -175,9 +176,12 @@ export async function redeploy(latestSha: string): Promise<RedeployResult> {
   }
 
   const tag = shaTag(self.Config.Image, latestSha);
-  console.log(`[redeploy] building ${tag} from ${config.botBranch}`);
+  console.log(`[redeploy] building ${tag} from ${latestSha.slice(0, 7)}`);
+  // Built from the exact compared sha, not `config.botBranch`'s current tip: the daemon fetches
+  // at build *start*, seconds after `latestSha` was resolved, and a push landing in that window
+  // would otherwise build newer code while still stamping it GIT_SHA=<the older, compared sha>.
   const built = await buildImage({
-    remote: buildRemote(config.githubRepo, config.botBranch),
+    remote: buildRemote(config.githubRepo, latestSha),
     tags: [tag],
     buildArgs: { GIT_SHA: latestSha },
   }).catch((err) => ({ ok: false, error: (err as Error).message }));
