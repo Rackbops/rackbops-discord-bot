@@ -48,23 +48,41 @@ interface Fixture {
 }
 const fixtures: Fixture[] = [];
 
-function setup(envText: string, opts: { nextRunning?: boolean } = {}): Fixture {
+function setup(
+  envText: string,
+  opts: {
+    nextRunning?: boolean;
+    /** Whether the simulated `<container>-next` still has a live handoff.json — i.e. is
+     *  genuinely mid-swap (true, the default whenever nextRunning is set) vs. a swap that
+     *  finished but got stuck under the "-next" name (false — issue #51 item 5's guard must NOT
+     *  refuse forever in that case). Ignored unless nextRunning is set. */
+    nextHandoffMarker?: boolean;
+  } = {},
+): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
   const cfg = join(root, "cfg");
   const bin = join(root, "bin");
   mkdirSync(cfg);
   mkdirSync(bin);
-  // The `ps` line only fires when opts.nextRunning simulates a mid-swap `<container>-next`
+  const markerState = opts.nextHandoffMarker ?? true ? "present" : "absent";
+  // `ps` and `exec` only answer specially when opts.nextRunning simulates a `<container>-next`
   // (issue #51 item 5's guard) — every other invocation (build, create, up -d
-  // --force-recreate, ...) never has that substring in its args, so it stays silent for them,
-  // same as before this option existed.
+  // --force-recreate, ...) never matches `$1`, so it stays silent for them, same as before this
+  // option existed. The `exec` branch stands in for the real container's filesystem: rather than
+  // actually running the inner `test -f`, it just reports the configured marker state directly.
   writeFileSync(
     join(bin, "docker"),
     [
       "#!/usr/bin/env bash",
       `printf '%s\\n' "docker $*" >> "$(dirname "$0")/docker.log"`,
       opts.nextRunning
-        ? `[[ "$*" == *"probe-container-next"* ]] && printf '%s\\n' "probe-container-next"`
+        ? [
+            `if [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container-next"* ]]; then`,
+            `  printf '%s\\n' "probe-container-next"`,
+            `elif [[ "$1" == "exec" ]] && [[ "$2" == "probe-container-next" ]]; then`,
+            `  printf '%s\\n' "${markerState}"`,
+            `fi`,
+          ].join("\n")
         : "",
       "exit 0",
       "",
@@ -434,10 +452,12 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
 // Issue #51 item 5: a self-update briefly runs the replacement alongside the original under
 // "<container>-next" before it takes the canonical name over. restart/env-set recreating or
 // restarting the ORIGINAL in that window races retireOriginal's own rename/remove and can leave
-// two bots on the shared token — both commands must refuse outright rather than risk it.
+// two bots on the shared token — both commands must refuse outright rather than risk it. But the
+// container's mere existence must NOT be the whole signal (see the next describe block) — the
+// live handoff.json marker is what actually distinguishes "still swapping" from "stuck".
 describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is mid-flight (issue #51)", () => {
-  test("restart refuses when a <container>-next container exists", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true });
+  test("restart refuses when a <container>-next container has a live handoff marker", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: true });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
@@ -446,8 +466,8 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
     expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
   });
 
-  test("env-set refuses when a <container>-next container exists — .env untouched, no backup", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true });
+  test("env-set refuses when a <container>-next container has a live handoff marker — .env untouched, no backup", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: true });
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
@@ -463,5 +483,28 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
     const envSet = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(envSet.exitCode).toBe(0);
     expect(envSet.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
+  });
+});
+
+// retireOriginal tolerates its own post-stop remove/rename failing and never retries — cosmetic,
+// per its own comment, since the bot is up and serving regardless. That can leave a fully healthy
+// replacement permanently running under "<container>-next" with no self-heal. A guard keyed on
+// the container's mere existence would then refuse restart/env-set FOREVER — worse than the race
+// it exists to prevent. handoff.json (cleared once retireOriginal returns, cosmetic failure or
+// not) is what tells the two states apart.
+describe.skipIf(!runnable)("bot-ops.sh doesn't lock out restart/env-set forever on a stuck-but-healthy swap (issue #51)", () => {
+  test("restart proceeds when <container>-next exists but its handoff marker is already cleared", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: false });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
+    expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("restart"))).toBe(true);
+  });
+
+  test("env-set proceeds when <container>-next exists but its handoff marker is already cleared", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextRunning: true, nextHandoffMarker: false });
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
   });
 });

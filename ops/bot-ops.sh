@@ -159,14 +159,25 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 # "<container>-next" before it takes the canonical name over. Recreating or restarting the
 # ORIGINAL while that container exists races retireOriginal's own rename/remove and can leave two
 # bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
-# operator can just retry once the swap finishes (usually well under a minute). Checked via `docker
-# ps`, not a marker file inside the bot's own data volume: the container's existence is exactly the
-# window that matters, needs no `docker exec` into a container that may itself be mid-swap, and
-# needs no extra tooling beyond the `docker` this script already requires.
+# operator can just retry once the swap finishes (usually well under a minute).
+#
+# The container's mere EXISTENCE is not enough on its own, though: retireOriginal tolerates its
+# own post-stop remove/rename failing (a stopped original corpse still holding the canonical
+# name, or the resulting name conflict) and never retries — "cosmetic," per its own comment, since
+# the bot is up and serving either way. Guarding on existence alone would refuse restart/env-set
+# FOREVER once that happens, with no self-heal, since nothing else ever revisits the rename. The
+# marker the swap itself writes and clears (handoff.json, in the SAME data volume both containers
+# mount) is the real signal: it stays present for the whole stop/remove/rename sequence and is
+# cleared once retireOriginal returns, cosmetic rename failure or not — so refuse only while it's
+# confirmed still there. Any inconclusive read (the container isn't answering `exec` yet, a daemon
+# blip) defaults to refusing too, same "don't risk it" call as the rest of this guard.
 guard_no_handoff_in_progress() {
-  if docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    die "a self-update is in progress (container '${CONTAINER}-next' exists) — try again once it completes"
+  docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+  if docker exec "${CONTAINER}-next" sh -c \
+       'test -f /app/data/handoff.json && echo present || echo absent' 2>/dev/null | grep -q '^absent$'; then
+    return 0
   fi
+  die "a self-update is in progress (container '${CONTAINER}-next' exists) — try again once it completes"
 }
 
 # One .env definition line: optional indentation, an optional `export ` prefix, the key, `=`, the
