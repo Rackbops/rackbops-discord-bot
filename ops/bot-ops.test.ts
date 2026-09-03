@@ -346,3 +346,43 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(dockerCalls(fx)).toEqual([expect.stringContaining("-p probe-project up -d --force-recreate")]);
   });
 });
+
+describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (issue #45)", () => {
+  test("the issue's literal case: blanking ANNOUNCE_CHANNEL_ID exits non-zero, names the key, .env untouched", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=\n");
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("env-set: 'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+    expect(dockerCalls(fx)).toEqual([]);
+  });
+
+  test("blanking a required key alongside a valid, unrelated change rejects the WHOLE submission", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n");
+    const run = await botOps(fx, ["env-set"], "WOW_REGION=eu\nANNOUNCE_CHANNEL_ID=\n");
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n"); // WOW_REGION change never applied either
+    expect(dockerCalls(fx)).toEqual([]);
+  });
+
+  test("a non-required key still clears to blank normally — REQUIRED doesn't block unrelated keys", async () => {
+    const fx = setup("BOT_BRANCH=dev\nANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "BOT_BRANCH=\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: ["BOT_BRANCH"] });
+    expect(envText(fx)).toBe("BOT_BRANCH=\nANNOUNCE_CHANNEL_ID=11111\n");
+  });
+
+  test("submitting the already-stored value (still blank) is a no-op, not a fresh rejection", async () => {
+    // Mirrors the existing "submitting the stored value spelled differently is a no-op" test:
+    // a value that isn't CHANGING was never this script's to judge, even a required one that's
+    // already broken from before this fix existed.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=us\n");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: ["WOW_REGION"] });
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n");
+  });
+});

@@ -1326,6 +1326,11 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const planSrc = indexSrc.match(/\/\/ ENV_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE_PLAN:end/)?.[1];
   const saveSrc = indexSrc.match(/\/\/ ENV_SAVE:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE:end/)?.[1];
+  // REQUIRED_KEYS lives outside the ENV_SAVE markers (the real page's saveEnv reaches it via
+  // closure, in the single IIFE scope it shares with FIELD_META) — so the isolated eval below must
+  // have it injected explicitly, extracted from source like planSrc/saveSrc are.
+  const requiredKeysSrc = indexSrc.match(/REQUIRED_KEYS\s*=\s*(\[[^\]]*\])/)?.[1];
+  const REQUIRED_KEYS = JSON.parse(requiredKeysSrc ?? "[]") as string[];
   type Plan = { changes: { key: string; before: string; now: string }[]; body: string };
   // "use strict" up front, matching the page's own IIFE (index.html:226): without it, a `Function`
   // body silently creates a global on an assignment to an un-injected or misspelled identifier
@@ -1373,8 +1378,9 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
       "loadEnv",
       "loadStatus",
       "loadedEnv",
+      "REQUIRED_KEYS",
       `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
-    )(document, confirm, api, () => page.reloads++, () => {}, loaded) as () => Promise<void>;
+    )(document, confirm, api, () => page.reloads++, () => {}, loaded, REQUIRED_KEYS) as () => Promise<void>;
     await saveEnv();
     return page;
   }
@@ -1461,6 +1467,23 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     const plan = planEnvSave({ A: "1", B: "2", C: "3" }, { A: "1", B: "x", C: "y" });
     expect(plan.body.split("\n").map((l) => l.split("=")[0])).toEqual(plan.changes.map((c) => c.key));
   });
+
+  // Blanking a REQUIRED key (issue #45): the panel must refuse to submit before the confirm
+  // dialog, not after a failed save — bot-ops.sh's env-set would reject it anyway, but only once
+  // the container has already been recreated with the bad value.
+  test("blanking a required field is refused before the confirm dialog — nothing is posted", async () => {
+    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" }, { ANNOUNCE_CHANNEL_ID: "", WOW_REGION: "us" });
+    expect(page.confirms).toEqual([]);
+    expect(page.posts).toEqual([]);
+    expect(page.msg).toEqual({ textContent: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.", className: "msg error" });
+    expect(page.reloads).toBe(0);
+  });
+
+  test("blanking a required field alongside an unrelated valid change blocks the WHOLE save", async () => {
+    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" }, { ANNOUNCE_CHANNEL_ID: "", WOW_REGION: "eu" });
+    expect(page.posts).toEqual([]); // the WOW_REGION change is not posted either
+    expect(page.msg.className).toBe("msg error");
+  });
 });
 
 // DMF_TIMEZONE's shape check is hand-duplicated like WOW_REALM's above: ALLOWED[DMF_TIMEZONE] in
@@ -1497,5 +1520,26 @@ describe("DMF_TIMEZONE shape (bot-ops.sh ↔ panel datalist filter stay in sync)
       "Etc/GMT+1",
       "UTC",
     ]);
+  });
+});
+
+// Which keys may never be blanked is hand-duplicated like WOW_REALM/DMF_TIMEZONE above: the
+// authority is bot-ops.sh's REQUIRED set (env-set refuses an empty value for them, since they have
+// no documented default — issue #45), mirrored by REQUIRED_KEYS in the panel so a blank submit is
+// refused client-side instead of surfacing only after a failed, restart-triggering save.
+describe("REQUIRED keys (bot-ops.sh ↔ panel REQUIRED_KEYS stay in sync)", () => {
+  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const requiredBlock = botOpsSrc.match(/declare -A REQUIRED=\(([\s\S]*?)\)/)?.[1] ?? "";
+  const botOpsRequired = [...requiredBlock.matchAll(/\[(\w+)\]=1/g)].map((m) => m[1]!).sort();
+  const panelRequired = (JSON.parse(indexSrc.match(/REQUIRED_KEYS\s*=\s*(\[[^\]]*\])/)?.[1] ?? "[]") as string[]).sort();
+
+  test("both source lists are present and identical (mirror can't drift)", () => {
+    expect(botOpsRequired.length).toBeGreaterThan(0);
+    expect(panelRequired).toEqual(botOpsRequired);
+  });
+
+  test("every REQUIRED key is itself a whitelisted ALLOWED key", () => {
+    for (const key of botOpsRequired) expect(botOpsSrc).toMatch(new RegExp(`\\[${key}\\]='`));
   });
 });
