@@ -24,6 +24,7 @@ import {
   type ImageSummary,
 } from "./docker";
 import {
+  bootMode,
   clearMarker,
   decideHandoffOutcome,
   HANDOFF_DEADLINE_MS,
@@ -411,4 +412,72 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
 /** Whether a self-contained redeploy is possible at all: the daemon socket has to be mounted. */
 export async function redeployAvailable(): Promise<boolean> {
   return daemonReachable();
+}
+
+/** How long `resolveBootMode` waits on the one daemon call it makes before `client.login()` is
+ *  even attempted. `docker.ts` carries no timeout of its own on any call, and this is the first
+ *  place a hung (not merely erroring) daemon socket could block *boot itself* rather than
+ *  something already gated behind a successful gateway login — bounded here so that case falls
+ *  through to the same "can't confirm" handling as any other inspect failure, instead of hanging
+ *  forever. Comfortably under `VERIFY_DEADLINE_MS` (90s), so it can't meaningfully eat into that
+ *  budget on a boot that turns out to be a genuine handoff. */
+const RESOLVE_BOOT_MODE_TIMEOUT_MS = 10_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+/**
+ * The boot decision `index.ts` actually acts on (#46). `bootMode(env)` alone only reports what
+ * the env *says* — and `HANDOFF_FROM` is baked into the replacement's env at creation time and
+ * never cleared, since container env is immutable. So it still reads "standby" on every later
+ * in-place restart of the very container that already completed the handoff: `bot-ops.sh
+ * restart`, the ops panel's Restart, a reboot, a daemon restart, or a crash loop under
+ * `unless-stopped` — all of them, forever, against an original that's long gone.
+ *
+ * This confirms the instruction against the daemon before honoring it: standby only counts while
+ * the named original still *exists*. Deliberately existence, not the original's live running
+ * state — a container that merely hasn't been (re)started yet still exists, so keying on
+ * existence keeps this immune to Docker's restart-ordering: a host reboot mid-handoff restarts
+ * both containers, in no guaranteed order, and a running-state check caught the original between
+ * "exists" and "running again" would wrongly read "gone," letting the replacement go live before
+ * retiring it — two live bots on the same token. A stopped-but-not-removed original (`retireOriginal`
+ * removes only best-effort) is a narrower, already-known-and-accepted degradation: on a failed
+ * removal the corpse also keeps the canonical name, so the replacement's own rename fails right
+ * alongside it (name conflict) and it's left visibly un-renamed — an operator-visible state
+ * already documented as non-fatal in `retireOriginal`, not something this check needs to paper
+ * over by risking the split-brain above.
+ *
+ * An inspect that can't confirm either way — a daemon blip or timeout, not a definite 404 — stays
+ * "standby" rather than downgrading: a genuine handoff boot needs a live daemon connection for the
+ * rest of the protocol regardless, and treating "can't tell" as "gone" risks two live bots
+ * answering the same token concurrently, which is strictly worse than leaning on the existing
+ * crash-proof paths (`verifyTimer`, `RETIREMENT_DEADLINE_MS`) to resolve it. Only a confirmed-gone
+ * original ever downgrades to `normal`.
+ */
+export async function resolveBootMode(
+  env: Record<string, string | undefined>,
+  inspect: typeof tryInspectContainer = tryInspectContainer,
+  timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS,
+): Promise<"standby" | "normal"> {
+  const raw = bootMode(env);
+  if (raw !== "standby") return raw;
+  try {
+    const original = await withTimeout(inspect(env[HANDOFF_FROM_ENV]!), timeoutMs);
+    return original ? "standby" : "normal";
+  } catch {
+    return "standby";
+  }
 }

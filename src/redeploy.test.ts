@@ -12,11 +12,12 @@ const {
   latestTag,
   redeploy,
   replacementName,
+  resolveBootMode,
   selectImagesToPrune,
   shaTag,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker } = await import("./handoff");
+const { clearMarker, HANDOFF_FROM_ENV } = await import("./handoff");
 const { handoffActive, resetForTest } = await import("./restart");
 
 const SELF: ContainerInspect = {
@@ -436,5 +437,78 @@ describe("redeploy — cleanup always runs", () => {
     expect(build).toBeDefined();
     const params = new URL(build!.url).searchParams;
     expect(params.getAll("t")).toEqual(["warbandeer-discord-debug-bot:eeeeeee"]);
+  });
+});
+
+// Issue #46: HANDOFF_FROM is baked into the replacement's env at creation time and never
+// cleared, so `bootMode(env)` alone re-reads "standby" on every later in-place restart of the
+// very container that already completed the handoff. `resolveBootMode` is the fix — it confirms
+// the instruction against the daemon before honoring it.
+describe("resolveBootMode", () => {
+  const countingInspect = (result: ContainerInspect | undefined | (() => never)) => {
+    let calls = 0;
+    const inspect = async (_id: string) => {
+      calls++;
+      if (typeof result === "function") return result();
+      return result;
+    };
+    return { inspect, callCount: () => calls };
+  };
+
+  test("no HANDOFF_FROM at all is a normal boot, and never touches the daemon", async () => {
+    const { inspect, callCount } = countingInspect(SELF);
+    expect(await resolveBootMode({}, inspect)).toBe("normal");
+    expect(callCount()).toBe(0);
+  });
+
+  // Mirrors bootMode's own empty-string case: an unset compose var interpolates to "", and that
+  // must not arm standby or reach for the daemon either.
+  test("an empty HANDOFF_FROM is a normal boot, and never touches the daemon", async () => {
+    const { inspect, callCount } = countingInspect(SELF);
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: "" }, inspect)).toBe("normal");
+    expect(callCount()).toBe(0);
+  });
+
+  test("a HANDOFF_FROM whose original is still running is a genuine handoff — standby", async () => {
+    const { inspect } = countingInspect({ ...SELF, State: { Running: true, Status: "running", ExitCode: 0 } });
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect)).toBe("standby");
+  });
+
+  // The issue's own acceptance bullet: an id that 404s (long gone, fully removed) is a normal
+  // boot, not standby.
+  test("a HANDOFF_FROM whose original no longer exists is a normal boot", async () => {
+    const { inspect } = countingInspect(undefined);
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect)).toBe("normal");
+  });
+
+  // Deliberately existence, not the original's live running state: a container that merely
+  // hasn't been (re)started yet post-reboot still exists (200, State.Running: false), and a
+  // check keyed on "running" would misread that window as "gone," letting a genuinely mid-flight
+  // replacement go live without ever retiring the original — two live bots on the shared token.
+  // A stopped-but-still-present original (e.g. a failed removal in `retireOriginal`) must stay
+  // standby, the same as a running one.
+  test("a HANDOFF_FROM whose original exists but isn't running yet stays standby, not normal", async () => {
+    const { inspect } = countingInspect({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 0 } });
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect)).toBe("standby");
+  });
+
+  // A daemon blip can't confirm the original is gone, and a genuine handoff boot needs a live
+  // daemon connection for the rest of the protocol regardless — so an unconfirmed error must
+  // stay standby rather than risk two live bots on the shared token.
+  test("a daemon error while checking is not proof the original is gone — stays standby", async () => {
+    const { inspect } = countingInspect(() => {
+      throw new Error("boom");
+    });
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect)).toBe("standby");
+  });
+
+  // The other new failure mode this fix could introduce: the daemon call now happens before
+  // `client.login()` is even attempted, and `docker.ts` carries no timeout of its own. A hung
+  // (not merely erroring) socket must not block boot forever — it has to fall through to the
+  // same "can't confirm" handling as any other inspect failure, bounded well under the real
+  // default so this test stays fast.
+  test("a daemon call that never resolves times out and stays standby, not hung forever", async () => {
+    const inspect = () => new Promise<ContainerInspect | undefined>(() => {}); // never settles
+    expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect, 20)).toBe("standby");
   });
 });

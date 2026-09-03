@@ -4,11 +4,13 @@ import { commandData, handleCommand } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
-import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
-import { takeOver } from "./redeploy";
+import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
+import { resolveBootMode, takeOver } from "./redeploy";
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const mode = bootMode(process.env);
+// A daemon call only happens here when the env actually says standby (#46) — an ordinary boot
+// resolves this without ever touching the docker socket, same as before.
+const mode = await resolveBootMode(process.env);
 
 client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
