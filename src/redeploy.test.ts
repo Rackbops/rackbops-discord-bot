@@ -13,6 +13,7 @@ const {
   redeploy,
   replacementName,
   resolveBootMode,
+  retireOriginal,
   selectImagesToPrune,
   shaTag,
   takeOver,
@@ -324,6 +325,111 @@ describe("takeOver", () => {
       exit: (code) => void exits.push(code),
     });
     expect(exits).toEqual([1]);
+  });
+});
+
+// A retire against the same original can run more than once with nothing left alive to reclaim if
+// it fails: a prior removeContainer failure below leaves a stopped-but-not-removed corpse a later
+// standby boot retries takeOver -> retireOriginal against, and separately HANDOFF_FROM never
+// clears from a swapped-in container's own env, so a boot path that still honors it against an id
+// since fully removed lands here too. The stop has to tell a genuine first attempt (original still
+// running — a failure must propagate, since the original is alive to reclaim) from both of those
+// (already stopped, or already gone entirely — a failure is just a daemon hiccup re-confirming
+// what's already true, and must degrade like every other post-stop step instead of crashing the
+// sole live bot).
+describe("retireOriginal", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = "self-container-id";
+  const ORIGINAL_ID = "d".repeat(64);
+  let calls: { path: string; method: string }[] = [];
+
+  const runningOriginal: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: true, Status: "running", ExitCode: 0 },
+  };
+  const stoppedCorpse: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: false, Status: "exited", ExitCode: 0 },
+  };
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+  });
+
+  function stubDaemon(o: { inspectOriginal: () => Response; stopOriginal: () => Response }) {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) return o.inspectOriginal();
+      if (pathname === `/containers/${ORIGINAL_ID}/stop`) return o.stopOriginal();
+      if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return new Response("", { status: 204 });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname.endsWith("/rename")) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  test("a first attempt against a running original propagates a genuine stop failure", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(runningOriginal), { status: 200 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await expect(retireOriginal(ORIGINAL_ID)).rejects.toThrow(/500/);
+  });
+
+  test("a retry against an already-stopped corpse tolerates a genuine stop failure and still removes it", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(stoppedCorpse), { status: 200 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  // The expected 304 (already stopped) is tolerated by stopContainer itself either way — pinning
+  // this keeps the new branch from changing the ordinary retry's behavior.
+  test("a retry that gets the expected 304 behaves the same as before this fix", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(stoppedCorpse), { status: 200 }),
+      stopOriginal: () => new Response("", { status: 304 }),
+    });
+    await retireOriginal(ORIGINAL_ID);
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  // An original that's already fully gone (removed, not just stopped) is a third "nothing left to
+  // reclaim" case — reached routinely, since HANDOFF_FROM never clears from a swapped-in
+  // container's own env, so any boot path that still honors it against a since-fully-removed id
+  // lands here too. stopContainer's own 404 tolerance covers the expected repeat-404, but this
+  // pins the case a naive "not-running" check would miss: a genuine daemon error on that same
+  // call must be tolerated exactly like the stopped-corpse retry above, not left to propagate.
+  test("an original that no longer exists at all tolerates a genuine stop failure too", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response("not found", { status: 404 }),
+      stopOriginal: () => new Response("daemon blip", { status: 500 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  test("an original that no longer exists at all still returns cleanly on the expected 404", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response("not found", { status: 404 }),
+      stopOriginal: () => new Response("not found", { status: 404 }),
+    });
+    await retireOriginal(ORIGINAL_ID); // must not throw
   });
 });
 
