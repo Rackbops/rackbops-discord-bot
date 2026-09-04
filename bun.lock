@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "warbandeer-discord",
+      "name": "rackbops-discord-bot",
       "dependencies": {
         "discord.js": "^14.27.0",
       },

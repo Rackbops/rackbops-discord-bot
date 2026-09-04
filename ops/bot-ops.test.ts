@@ -121,21 +121,32 @@ interface Run {
   json: Record<string, unknown> | null;
 }
 
-async function botOps(fx: Fixture, args: string[], stdin?: string): Promise<Run> {
+async function botOps(
+  fx: Fixture,
+  args: string[],
+  stdin?: string,
+  // Overrides applied on top of the default identity below — `undefined` unsets a key entirely
+  // rather than passing the literal string "undefined", so a test can exercise bot-ops.sh's own
+  // required-var checks (issue #41) instead of always running with a valid identity.
+  identityOverrides: Record<string, string | undefined> = {},
+): Promise<Run> {
   // Windows spells the variable `Path`; setting a second `PATH` beside it would be ambiguous.
   const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    [pathKey]: fx.bin + delimiter + (process.env[pathKey] ?? ""),
+    BOT_OPS_PROJECT: "probe-project",
+    BOT_OPS_CONTAINER: "probe-container",
+    BOT_OPS_CONFIG_DIR: bashPath(fx.cfg),
+    BOT_OPS_COMPOSE_FILE: bashPath(fx.compose),
+    ...identityOverrides,
+  };
+  for (const key of Object.keys(env)) if (env[key] === undefined) delete env[key];
   const proc = Bun.spawn([BASH!, bashPath(BOT_OPS_SH), ...args], {
     stdin: stdin !== undefined ? Buffer.from(stdin) : undefined,
     stdout: "pipe",
     stderr: "pipe",
-    env: {
-      ...process.env,
-      [pathKey]: fx.bin + delimiter + (process.env[pathKey] ?? ""),
-      BOT_OPS_PROJECT: "probe-project",
-      BOT_OPS_CONTAINER: "probe-container",
-      BOT_OPS_CONFIG_DIR: bashPath(fx.cfg),
-      BOT_OPS_COMPOSE_FILE: bashPath(fx.compose),
-    },
+    env: env as Record<string, string>,
   });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -170,6 +181,53 @@ async function fullBody(fx: Fixture, overrides: Record<string, string>): Promise
     .map(([k, v]) => `${k}=${v}`)
     .join("\n");
 }
+
+// issue #41: BOT_OPS_PROJECT/BOT_OPS_CONTAINER have no fallback — a caller that forgets either
+// must get a named, immediate die, never a silent guess. This is the precondition every other
+// subcommand depends on, so it's checked before any of them (using "status" here is arbitrary).
+describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINER, no fallback (issue #41)", () => {
+  test("BOT_OPS_PROJECT unset dies naming it, before touching docker", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"], undefined, { BOT_OPS_PROJECT: undefined });
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("BOT_OPS_PROJECT not set");
+    expect(dockerCalls(fx)).toHaveLength(0);
+  });
+
+  test("BOT_OPS_CONTAINER unset (PROJECT valid) dies naming it", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"], undefined, { BOT_OPS_CONTAINER: undefined });
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("BOT_OPS_CONTAINER not set");
+    expect(dockerCalls(fx)).toHaveLength(0);
+  });
+
+  test("both unset dies naming BOT_OPS_PROJECT specifically (checked first)", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"], undefined, {
+      BOT_OPS_PROJECT: undefined,
+      BOT_OPS_CONTAINER: undefined,
+    });
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("BOT_OPS_PROJECT not set");
+  });
+
+  test("a BOT_OPS_PROJECT outside the safe charset dies as invalid, not interpolated", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"], undefined, { BOT_OPS_PROJECT: "bad project" });
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("invalid BOT_OPS_PROJECT");
+    expect(dockerCalls(fx)).toHaveLength(0);
+  });
+
+  test("a BOT_OPS_CONTAINER outside the safe charset dies as invalid, not interpolated", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"], undefined, { BOT_OPS_CONTAINER: "bad;container" });
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("invalid BOT_OPS_CONTAINER");
+    expect(dockerCalls(fx)).toHaveLength(0);
+  });
+});
 
 describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_file loader does (issue #44)", () => {
   test("the LAST occurrence of a duplicated key wins, not the first", async () => {
