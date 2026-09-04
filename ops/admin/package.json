@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "scripts": {
+    "check": "bunx tsc --noEmit"
+  },
   "dependencies": {
     "jose": "^5.9.6"
   },
