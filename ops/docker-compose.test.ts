@@ -14,13 +14,12 @@ import { fileURLToPath } from "node:url";
 
 const COMPOSE_SRC = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
 
-// A deliberately narrow view of `config --format json`'s output — only the fields these tests
-// actually read. `env_file` is typed `unknown`: Compose normalizes a short-form string into some
-// canonical shape (a bare string on some versions, a `[{path,required}]` list on others), and the
-// assertions below deliberately stringify rather than assert an exact shape, so there's no real
-// type to give it.
+// A deliberately narrow view of `config --format json`'s output — only `container_name` is typed;
+// everything else on a service is left as `unknown` and read via a whole-object JSON.stringify
+// (see the env_file assertion below) rather than a specific key, since Compose's own normalization
+// of `env_file:` isn't stable/documented enough to assert an exact shape against.
 interface ComposeConfig {
-  services: Record<string, { container_name?: string; env_file?: unknown }>;
+  services: Record<string, { container_name?: string } & Record<string, unknown>>;
 }
 
 // The exact keys ops/install.sh writes into a stack directory's own .env (its compose-project
@@ -94,19 +93,23 @@ async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: s
 // directory in the fixture, so `admin`'s own `build.context` (`${ADMIN_BUILD_CONTEXT:-./ops/admin}`)
 // points at a path that doesn't exist here — matching a REAL bootstrapped stack directory exactly:
 // ops/install.sh only ever writes docker-compose.yml + .env into $STACK_DIR, never a copy of
-// ops/admin/. If `docker compose config` with no `--profile admin` turned out to validate an
-// inactive profile's build context against the filesystem, that would already be a live problem in
-// production today (nucbox brings the bot up via a plain `up -d --build` with no ops/admin/ on disk
-// beside it, and separately profile-scopes the admin build only when it wants that service — see
-// the admin-panel-deploy runbook) — so no placeholder Dockerfile is added here to paper over the
-// question. Left for a real `docker compose` (CI, not this dev box) to answer for real.
+// ops/admin/. Confirmed in CI (this repo's ubuntu-latest runner, real `docker compose`): `config`
+// with no `--profile admin` renders cleanly regardless — an inactive profile's build context is not
+// filesystem-validated, only its `${VAR}` interpolation is (consistent with `admin`'s own
+// `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE` needing the `:-` — not `:?` — default documented in
+// CONTEXT.md, which is about interpolation validation, not build-context resolution).
 describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instance, not monorepo-era (issue #41)", () => {
   test("a bootstrapped instance's stack .env overrides every monorepo-era fallback", async () => {
     const dir = makeStack(null);
     // env_file:'s short form defaults to required: true — the target must actually exist on disk
-    // or `config` itself refuses to resolve it, same as a real deploy's BOT_ENV_FILE.
+    // or `config` itself refuses to resolve it, same as a real deploy's BOT_ENV_FILE. A marker
+    // line (rather than an empty file) lets the assertion below prove the RIGHT file was loaded —
+    // Compose's `config` folds a resolved env_file's contents into the service's own environment
+    // rather than echoing the source path back out (confirmed empirically: asserting on a path
+    // substring under an `env_file` key failed in CI with "Received value must be ... a string" —
+    // that key is undefined in the rendered JSON once Compose has already resolved it).
     const botEnvFile = join(dir, "bot-secrets.env");
-    writeFileSync(botEnvFile, "");
+    writeFileSync(botEnvFile, "PROBE_ENV_MARKER=rackbops-instance-secrets\n");
     const stackEnv = [
       `BOT_ENV_FILE=${botEnvFile}`,
       "BOT_OPS_CONTAINER=probe-instance",
@@ -123,7 +126,9 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     expect(exitCode).toBe(0);
     expect(json!.services.bot.container_name).toBe("probe-instance");
     expect(json!.services.bot.container_name).not.toBe("warbandeer-discord");
-    expect(JSON.stringify(json!.services.bot.env_file)).toContain(botEnvFile);
+    // Whole-object stringify rather than a specific key — robust to wherever Compose's resolved
+    // JSON actually places a loaded env_file's contents (see the comment above).
+    expect(JSON.stringify(json!.services.bot)).toContain("rackbops-instance-secrets");
   });
 
   test("a bare stack dir with a plain local .env (no BOT_OPS_* keys) keeps the local-dev default", async () => {
