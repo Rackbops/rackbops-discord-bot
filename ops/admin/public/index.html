@@ -258,6 +258,26 @@
     return res;
   }
 
+  // TIMEOUT_SIGNAL:begin
+  // A short-lived AbortController tied to a timeout, shared by every /api/* call this page makes
+  // that shouldn't hang forever. Before issue #53, only the Access-session probe, the realm-chooser
+  // fetch, and the branch-chooser fetch had this; the restart and env-save POSTs had NO timeout at
+  // all and could hang indefinitely behind a wedged bot-ops.sh subprocess on the server. `cancel()`
+  // MUST be called once the real request settles (a `finally`), or the timer outlives the request
+  // for nothing.
+  function timeoutSignal(ms) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    return { signal: controller.signal, cancel: () => clearTimeout(timer) };
+  }
+  // TIMEOUT_SIGNAL:end
+
+  // Restart and env-save can legitimately take a while server-side (a slow image pull/recreate) —
+  // this sits between the server's 90s bot-ops.sh subprocess timeout and its 120s Bun.serve
+  // idleTimeout, so a real server-side 504 has room to arrive before the client gives up on its
+  // own (issue #53 item 1/2).
+  const MUTATION_TIMEOUT_MS = 110000;
+
   function showGate() {
     gate.hidden = false;
     app.hidden = true;
@@ -463,23 +483,27 @@
   }
   document.getElementById("refresh-status").addEventListener("click", (e) => withBusy(e.currentTarget, loadStatus));
 
-  document.getElementById("restart").addEventListener("click", (e) =>
-    withBusy(e.currentTarget, async () => {
-      if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
-      const msg = document.getElementById("restart-msg");
-      msg.textContent = "Restarting…";
-      msg.className = "msg";
-      try {
-        const res = await api("/api/restart", { method: "POST" });
-        const text = await res.text();
-        msg.textContent = res.ok ? text : "Failed: " + text;
-        msg.className = "msg " + (res.ok ? "ok" : "error");
-        loadStatus();
-      } catch (e2) {
-        if (e2.message !== "unauthorized") { msg.textContent = e2.message; msg.className = "msg error"; }
-      }
-    }),
-  );
+  // RESTART:begin
+  async function doRestart() {
+    if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
+    const msg = document.getElementById("restart-msg");
+    msg.textContent = "Restarting…";
+    msg.className = "msg";
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/restart", { method: "POST", signal });
+      const text = await res.text();
+      msg.textContent = res.ok ? text : "Failed: " + text;
+      msg.className = "msg " + (res.ok ? "ok" : "error");
+      loadStatus();
+    } catch (e2) {
+      if (e2.message !== "unauthorized") { msg.textContent = e2.message; msg.className = "msg error"; }
+    } finally {
+      cancel();
+    }
+  }
+  // RESTART:end
+  document.getElementById("restart").addEventListener("click", (e) => withBusy(e.currentTarget, doRestart));
 
   // The full text of the last successful log load, kept so the filter re-derives from the whole
   // batch (clearing the filter restores every line) rather than from whatever is currently on
@@ -911,8 +935,9 @@
 
     msg.textContent = "Saving…";
     msg.className = "msg";
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     try {
-      const res = await api("/api/env", { method: "POST", body: plan.body });
+      const res = await api("/api/env", { method: "POST", body: plan.body, signal });
       const text = await res.text();
       let result = null;
       try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
@@ -935,6 +960,8 @@
       }
     } catch (e) {
       if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    } finally {
+      cancel();
     }
   }
   // ENV_SAVE:end
@@ -943,28 +970,35 @@
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   }
 
+  // HAS_ACCESS_SESSION:begin
   // No stored bearer token yet — before asking for one, check whether Cloudflare Access already
   // authenticated this browser. A valid Cf-Access-Jwt-Assertion needs no client-side involvement
   // at all (the edge attaches it transparently); this fetch carries no Authorization header of
-  // its own, only the Access session cookie via credentials: "include". Checks the response is
-  // genuinely our own JSON status shape, not just a 2xx — an Access redirect to a same-origin
-  // page (unlikely for this deployment, but not guaranteed by anything in this file) could
-  // otherwise resolve res.ok true without real auth. A hung request degrades to "not
-  // authenticated" after a few seconds rather than leaving the page blank forever.
+  // its own, only the Access session cookie via credentials: "include". /api/whoami (not
+  // /api/status, before issue #53) — server-native, never shells out to bot-ops.sh, unlike status,
+  // which this probe doesn't need. Checks the response is genuinely our own JSON whoami shape, not
+  // just a 2xx — an Access redirect to a same-origin page (unlikely for this deployment, but not
+  // guaranteed by anything in this file) could otherwise resolve res.ok true without real auth. A
+  // hung request degrades to "not authenticated" after a few seconds rather than leaving the page
+  // blank forever.
   async function hasAccessSession() {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    const { signal, cancel } = timeoutSignal(5000);
     try {
-      const res = await fetch("/api/status", { credentials: "include", signal: controller.signal });
+      const res = await fetch("/api/whoami", { credentials: "include", signal });
       if (!res.ok) return false;
       const data = await res.json();
-      return typeof data.running === "boolean";
+      // This probe never sends an Authorization header, so a genuine whoami response here can
+      // only ever come back via:"jwt" (an ambient Cloudflare Access session) — via:"bearer" is not
+      // reachable from this call site at all (authorizeRequest only returns it when a bearer token
+      // was actually sent), so it's not checked for here.
+      return data.via === "jwt";
     } catch {
       return false;
     } finally {
-      clearTimeout(timeout);
+      cancel();
     }
   }
+  // HAS_ACCESS_SESSION:end
 
   (async () => {
     if (sessionStorage.getItem(LOCKED_KEY)) { showGate(); return; }

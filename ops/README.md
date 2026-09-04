@@ -274,6 +274,10 @@ routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
 rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don't rewrite it to
 the internal origin or same-origin browser writes would be wrongly blocked.
+A `restart`/`env-set` invocation that runs past 90s (a wedged `dockerd`, a slow image pull) is
+killed and answered with a `504`, distinct from the `502` a normal `bot-ops.sh` failure gets;
+`Bun.serve`'s own idle timeout is raised to 120s so a legitimately slow-but-under-90s request is
+never cut off by the HTTP layer first.
 No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
 page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
 `ALLOWED` whitelist above. Save posts only the fields that changed — the same list the confirm

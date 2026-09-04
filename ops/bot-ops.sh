@@ -273,7 +273,11 @@ cmd_status() {
 cmd_logs() {
   need docker
   local n="${1:-200}"
-  [[ "$n" =~ ^[0-9]+$ ]] || die "logs: N must be a number"
+  # Bounded to 5 digits (max 99999, well over LOGS_MAX) BEFORE the arithmetic comparison below: an
+  # unbounded all-digits string like 2^64 wraps in bash's 64-bit `(( ))` context (evaluates as
+  # `0 > LOGS_MAX` = false), so the value would sail through uncapped to `docker logs --tail`,
+  # which dockerd then treats as "all lines" (issue #53 item 4).
+  [[ "$n" =~ ^[0-9]{1,5}$ ]] || die "logs: N must be a number"
   (( n > LOGS_MAX )) && n="$LOGS_MAX"
   docker logs "$CONTAINER" --tail "$n" 2>&1
 }
