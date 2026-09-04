@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install ops/admin dependencies
+        run: bun install --frozen-lockfile
+        working-directory: ops/admin
+
+      - name: Typecheck (root)
+        run: bun run check
+
+      - name: Typecheck (ops/admin)
+        run: bun run check
+        working-directory: ops/admin
+
+      # A single unscoped `bun test` from the repo root already covers both
+      # projects' suites (Bun resolves each test file's imports relative to
+      # its own location) -- confirmed empirically: 491 tests across 18
+      # files, root + ops/admin/server.test.ts together, ~19s locally.
+      - name: Test
+        run: bun test
