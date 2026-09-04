@@ -162,9 +162,19 @@ describe.skipIf(!runnable)("cloudflared's TUNNEL_TOKEN resolves via Compose inte
   // (see that test's own comment), so `docker compose config` refuses to resolve ANY service in
   // the file, cloudflared included, unless *some* .env exists on disk relative to the stack dir —
   // empty is fine, since these tests don't want BOT_OPS_*/secrets in it anyway.
+  //
+  // COMPOSE_PROFILES=tunnel (equivalent to --profile tunnel) on every call here: a profile-gated
+  // service is fully INTERPOLATED regardless of active profile (CONTEXT.md's own documented
+  // finding, which the #41 tests above rely on for `admin`), but `config`'s rendered *output*
+  // still omits a service whose profile isn't active — confirmed the hard way, in CI, once this
+  // test actually ran against a real `docker compose` for the first time. Without it,
+  // `json.services.cloudflared` is `undefined`, not merely token-less.
   test("a shell-exported CLOUDFLARE_TUNNEL_TOKEN reaches cloudflared's TUNNEL_TOKEN", async () => {
     const dir = makeStack("");
-    const { exitCode, json } = await composeConfig(dir, { CLOUDFLARE_TUNNEL_TOKEN: "probe-tunnel-token" });
+    const { exitCode, json } = await composeConfig(dir, {
+      CLOUDFLARE_TUNNEL_TOKEN: "probe-tunnel-token",
+      COMPOSE_PROFILES: "tunnel",
+    });
     expect(exitCode).toBe(0);
     expect(JSON.stringify(json!.services.cloudflared)).toContain("probe-tunnel-token");
   });
@@ -177,7 +187,7 @@ describe.skipIf(!runnable)("cloudflared's TUNNEL_TOKEN resolves via Compose inte
     // invocation against this file (Dockge's Start/Stop/Restart included) — assert on that
     // directly rather than just the exit code.
     const dir = makeStack("");
-    const { exitCode, stderr, json } = await composeConfig(dir);
+    const { exitCode, stderr, json } = await composeConfig(dir, { COMPOSE_PROFILES: "tunnel" });
     expect(exitCode).toBe(0);
     expect(stderr).not.toContain("CLOUDFLARE_TUNNEL_TOKEN");
     expect(JSON.stringify(json!.services.cloudflared)).not.toContain("probe-tunnel-token");
