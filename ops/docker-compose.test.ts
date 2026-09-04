@@ -124,8 +124,8 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
 
     const { exitCode, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
-    expect(json!.services.bot.container_name).toBe("probe-instance");
-    expect(json!.services.bot.container_name).not.toBe("warbandeer-discord");
+    expect(json!.services.bot!.container_name).toBe("probe-instance");
+    expect(json!.services.bot!.container_name).not.toBe("warbandeer-discord");
     // Whole-object stringify rather than a specific key — robust to wherever Compose's resolved
     // JSON actually places a loaded env_file's contents (see the comment above).
     expect(JSON.stringify(json!.services.bot)).toContain("rackbops-instance-secrets");
@@ -139,6 +139,6 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
     const { exitCode, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
-    expect(json!.services.bot.container_name).toBe("warbandeer-discord");
+    expect(json!.services.bot!.container_name).toBe("warbandeer-discord");
   });
 });

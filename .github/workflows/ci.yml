@@ -27,6 +27,9 @@ jobs:
       - name: Typecheck (root)
         run: bun run check
 
+      - name: Typecheck (ops)
+        run: bunx tsc --noEmit -p ops/tsconfig.json
+
       - name: Typecheck (ops/admin)
         run: bun run check
         working-directory: ops/admin
