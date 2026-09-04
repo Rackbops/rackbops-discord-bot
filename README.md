@@ -18,6 +18,7 @@ Discord bot for the guild channel: WoW timers and announcements.
 - **Self-update** — `/update` (admins only) builds the latest code and moves the bot onto it, with nothing outside Discord involved. It verifies the new build before retiring the old one, so a bad build leaves the bot running, and messages you with the build it actually landed on. See [Self-update](#self-update).
 - **Transmog import strings** — `/transmog <character> <realm>` returns a `/customset v1 …` string for what a character is wearing, pasteable into `/collected outfit import`. For the characters you *can't* inspect in-game: offline, another realm, or a name someone pasted in chat. Needs the same Blizzard API credentials as realm status. Two caveats it states in every reply: weapon illusions aren't in the profile data, and profile data is a snapshot from the character's **last logout** — so someone online right now reports what they wore last session.
 - **Issue reports** — `/report` lets members with a configured role file a GitHub issue (Title + Description via a popup form) straight into the mapped project's repo (`wow`, `abm`), labeled `automated` and noting who filed it. The confirmation posts **in the channel the report was filed from**, carrying the title, the description and the issue link, so the channel can see what's been raised.
+- **Character linking** — `/link` mints a one-time code you enter in the Warbandeer desktop app to connect its character data (gear, currencies, and more) to your Discord account; `/unlink` disconnects it. Off by default — see [Character linking](#character-linking).
 
 All times are posted as Discord timestamps, so everyone sees them in their own timezone.
 
@@ -108,12 +109,57 @@ Behavior:
 - If the bot exits to update and comes back on the same build, it says so once in the log and **stops trying** — a misconfigured deploy produces a warning, not a restart loop. `/update` overrides that suppression.
 - Without `GIT_SHA` — or with one the remote has never seen — self-update reports itself disabled rather than guessing, and says which of the two it is.
 
+## Character linking
+
+`/link` mints a short (10-minute), single-use code. Entered into the Warbandeer desktop app, it
+authorizes that install to push character data (gear, currencies, playtime, reputations —
+whatever the desktop app's SavedVariables reader sends) and associates it with your Discord
+account. `/unlink [account_label]` disconnects one — the `account_label` option only matters if
+you've linked more than one WoW account; with exactly one linked, `/unlink` needs no argument.
+
+This needs an inbound HTTP endpoint, so it's **off by default**: set `WARBANDEER_INGEST_PORT` in
+`.env` to enable it (any free port — it's never published to the host, only reachable through the
+Cloudflare Tunnel below). Unset, `/link` replies that linking isn't configured rather than
+minting a code that could never be redeemed.
+
+Unlike the admin panel's tunnel use, this endpoint has **no Cloudflare Access login wall** —
+arbitrary guild members have no Access identity to check against, which is the whole reason
+`/link`'s code + Device Token model exists as its own auth layer. Once enabled and mapped to a
+public hostname, `POST /link` is reachable by anyone who can guess or intercept an 8-character
+code within its 10-minute window; a per-IP rate limit is the only other barrier. See
+[`docs/adr/0001`](docs/adr/0001-http-ingest-behind-cloudflare-tunnel.md)'s Consequences section.
+
+### Wire contract (for a desktop-app implementer)
+
+- `POST /link` `{ "code": string, "accountLabel": string }` → `200 { "token": string }` (the
+  Device Token — shown once, store it; the bot only ever keeps a hash) or `400` with a plain-text
+  reason (`"unknown code"`, `"code expired"`, a validation message, or the 20-linked-accounts-per-
+  user cap). The submitted `code` is trimmed and uppercased before matching, so stray whitespace
+  or lowercase is fine. `accountLabel` is trimmed, capped at 64 characters, and rejected if it
+  contains control characters (including newlines) or is empty after trimming — re-linking an
+  already-present label rotates its Device Token rather than erroring or duplicating it. Also
+  `413` over the 512 KB body cap and `429` over the per-IP rate limit.
+- `POST /characters`, header `Authorization: Bearer <token>`, body the character payload (an
+  object with a `characters` array — up to 60 entries — each entry whatever fields the desktop
+  app's SavedVariables reader has — realm/guid/class/level/spec/professions/gear ilvl/currency/
+  playtime/reputations — plus an optional `warband: { bankGold: number }`) → `204` on success,
+  `401` unauthenticated, `400` on a validation failure (a named field: a string over 256
+  characters, more than 60 character entries, nesting past 6 levels, an array past 200 entries, or
+  an object past 100 keys), `413` over the 512 KB body cap, `429` over the rate limit. Every push
+  **replaces** that Account Label's previously stored data wholesale — never merged. `/unlink`
+  deletes the stored data for that Account Label too, not just the Device Token — a push racing
+  its own `/unlink` may still land before the token is revoked.
+
+Design rationale (transport, the two-stage auth model, storage, and the hardening this endpoint
+enforces) is written up in [`docs/adr/`](docs/adr/) — 0001 through 0003.
+
 ## Cloudflare Tunnel
 
-An opt-in sidecar for exposing a future local API (e.g. for the desktop app) to the internet without opening any inbound firewall ports. It's currently just plumbing — the bot has no HTTP server yet — but sets up the tunnel ahead of that work.
+An opt-in sidecar exposing the bot's local API (currently: the character-linking endpoint above)
+to the internet without opening any inbound firewall ports.
 
 1. In the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/), go to **Networks → Tunnels**, create a tunnel, choose the **Docker** connector, and copy the token it gives you.
-2. Set `CLOUDFLARE_TUNNEL_TOKEN` in `.env`.
+2. Set `CLOUDFLARE_TUNNEL_TOKEN` and `WARBANDEER_INGEST_PORT` in `.env`.
 3. Start it alongside the bot:
 
    ```
@@ -122,7 +168,8 @@ An opt-in sidecar for exposing a future local API (e.g. for the desktop app) to 
 
    Without `--profile tunnel`, the sidecar doesn't start — a normal `docker compose up` is unaffected and doesn't need the token.
 
-Once the bot exposes a local port, map a public hostname to it (`http://bot:<port>`) in the tunnel's **Public Hostname** settings in the dashboard.
+Map a public hostname to `http://bot:<WARBANDEER_INGEST_PORT>` in the tunnel's **Public Hostname**
+settings in the dashboard.
 
 ## Behavior notes
 
@@ -139,7 +186,7 @@ Once the bot exposes a local port, map a public hostname to it (`http://bot:<por
 |---|---|
 | `src/index.ts` | Client login, command registration, interaction routing (commands + `/report` modals) |
 | `src/config.ts` | Env config (`.env`); `/report` project→repo map |
-| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report` handlers |
+| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report`, `/link`, `/unlink` handlers |
 | `src/wow/transmog.ts` | `/transmog` — equipment → `/customset` import string, realm slugs, reply text |
 | `src/wow/blizzard.ts` | Shared Blizzard client-credentials token |
 | `src/report.ts` | `/report` — role gate, modal form, files a GitHub issue, announces it in the channel |
@@ -155,3 +202,8 @@ Once the bot exposes a local port, map a public hostname to it (`http://bot:<por
 | `src/wow/reset.ts` | Daily/weekly reset math per region |
 | `src/wow/realm.ts` | Blizzard OAuth + connected-realm status |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
+| `src/warbandeer/link-command.ts` | `/link`, `/unlink` — mint/redeem-flow reply text, account removal |
+| `src/warbandeer/server.ts` | The ingest HTTP server: `POST /link`, `POST /characters`, rate limiting |
+| `src/warbandeer/links.ts` | Link Code + Device Token model (`data/links.json`) |
+| `src/warbandeer/characters.ts` | Character Snapshot validation + storage (`data/characters/`) |
+| `src/warbandeer/storage.ts` | Shared atomic JSON read/write, used by `links.ts`/`characters.ts` |
