@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
 
 // `commands.ts` pulls in the `config` singleton, which resolves process.env at import
 // time — satisfy the required vars before importing so this file runs standalone.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { isAdmin, bareName, updateReply } = await import("./commands");
+const { isAdmin, bareName, updateReply, commandData } = await import("./commands");
 
 describe("isAdmin", () => {
   test("accepts a user on the allowlist", () => {
@@ -105,5 +106,17 @@ describe("updateReply", () => {
 
   test("a stalled swap gets the stall wording, not the generic failure", () => {
     expect(updateReply("restart", SHA, { redeploy: { outcome: "stalled" } })).toContain("verified");
+  });
+});
+
+describe("commandData", () => {
+  // Round-3 finding: /unlink's account_label option used to hardcode max_length: 64 with a
+  // comment claiming it matched characters.ts's MAX_ACCOUNT_LABEL_LENGTH — nothing actually tied
+  // them together, so the two could drift silently. Now sourced from the same constant; this
+  // pins that the built command JSON reflects it, not just the source line.
+  test("/unlink's account_label max length matches MAX_ACCOUNT_LABEL_LENGTH", () => {
+    const unlink = commandData.find((c) => c.name === "unlink");
+    const accountLabel = unlink?.options?.find((o) => o.name === "account_label");
+    expect(accountLabel).toMatchObject({ max_length: MAX_ACCOUNT_LABEL_LENGTH });
   });
 });

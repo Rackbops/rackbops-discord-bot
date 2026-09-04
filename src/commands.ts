@@ -21,6 +21,7 @@ import { withCritical } from "./restart";
 import { handoffFailureMessage } from "./handoff";
 import type { RedeployResult } from "./redeploy";
 import { handleLinkCommand, handleUnlinkCommand } from "./warbandeer/link-command";
+import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
 
 const ts = (d: Date, style: "F" | "R" = "F") => `<t:${Math.floor(d.getTime() / 1000)}:${style}>`;
 const when = (d: Date) => `${ts(d)} (${ts(d, "R")})`;
@@ -86,9 +87,10 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
         .setName("account_label")
         .setDescription("Which linked account (only needed if you have more than one)")
         .setRequired(false)
-        // Matches characters.ts's MAX_ACCOUNT_LABEL_LENGTH — without this, Discord's own 6000-char
-        // default lets a value through that unlinkReply() can't fit into a 2000-char reply.
-        .setMaxLength(64),
+        // Sourced from characters.ts's own constant, not a repeated literal — without this,
+        // Discord's own 6000-char default lets a value through that unlinkReply() can't fit into
+        // a 2000-char reply.
+        .setMaxLength(MAX_ACCOUNT_LABEL_LENGTH),
     ),
 ].map((c) => c.toJSON());
 

@@ -96,6 +96,20 @@ describe("validateCharacterPayload", () => {
     const result = validateCharacterPayload({ characters: [{ currency: bomb }] }, "Main");
     expect(result).toMatchObject({ ok: false });
   });
+
+  test("rejects an oversized object key WITHOUT echoing it into the error message", () => {
+    // Round-3 finding: the key-length check used to interpolate the raw key into its error —
+    // unlike the sibling string-VALUE check just above, which never echoes the value — so a
+    // pathological key blew the error (and everything that logs or returns it) up to the key's
+    // own size instead of staying a short, fixed message.
+    const hugeKey = "k".repeat(MAX_STRING_FIELD_LENGTH + 1);
+    const result = validateCharacterPayload({ characters: [{ [hugeKey]: 1 }] }, "Main");
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.error.length).toBeLessThan(100);
+      expect(result.error).not.toContain(hugeKey);
+    }
+  });
 });
 
 describe("validateAccountLabel", () => {

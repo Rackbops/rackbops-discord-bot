@@ -34,6 +34,7 @@ other user's data or the announcement dedup history that unrelated features depe
 
 This splits `CONTEXT.md`'s single Linked Account concept — identity, Device Token hash, latest
 Character Snapshot, and its timestamp — across two physical files. That's a storage detail, not
-a change to the domain entity: `links.json` holds the identity/token/label half, the per-user
-character file holds the snapshot half plus its own `updatedAt`, and the two are always read
-together to answer "what does this Discord User have linked."
+a change to the domain entity: `links.json` holds the identity/token/label half (plus its own
+`updatedAt`, bumped on every successful push — `LinkedAccount`'s field, not the snapshot's), the
+per-user character file holds the snapshot half plus its own `receivedAt`, and the two are always
+read together to answer "what does this Discord User have linked."

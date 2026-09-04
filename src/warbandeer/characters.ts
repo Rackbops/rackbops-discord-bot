@@ -85,7 +85,13 @@ function checkBoundedShape(value: unknown, path: string, depth: number): string 
     const keys = Object.keys(obj);
     if (keys.length > MAX_OBJECT_KEYS) return `${path}: object exceeds ${MAX_OBJECT_KEYS} keys`;
     for (const key of keys) {
-      if (key.length > MAX_STRING_FIELD_LENGTH) return `${path}.${key}: key name too long`;
+      // Never echoes the raw key, same reason the string-value check three lines up never echoes
+      // the value — this error reaches both a log line and a raw HTTP reply, so an oversized key
+      // must not become an oversized message in turn.
+      // Never echoes the raw key, same reason the string-value check three lines up never echoes
+      // the value — this error reaches both a log line and a raw HTTP reply, so an oversized key
+      // must not become an oversized message in turn.
+      if (key.length > MAX_STRING_FIELD_LENGTH) return `${path}: an object key exceeds ${MAX_STRING_FIELD_LENGTH} characters`;
       const err = checkBoundedShape(obj[key], `${path}.${key}`, depth + 1);
       if (err) return err;
     }

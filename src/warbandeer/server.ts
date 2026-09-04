@@ -311,9 +311,12 @@ export function startWarbandeerServer(
     // two were the same threshold, Bun's own limit would win the race and reset the connection
     // (ECONNRESET) instead of letting readBodyWithCap's streamed check produce a clean 413.
     // Verified live: with both set to the same value, an over-cap request never got a 413 at
-    // all. This exists purely to bound Bun's own buffering if the app-level check were ever
-    // bypassed — the real, precise, test-covered enforcement is deps.maxBodyBytes.
-    maxRequestBodySize: DEFAULT_MAX_BODY_BYTES * 4,
+    // all. Derived from deps.maxBodyBytes (NOT the DEFAULT_MAX_BODY_BYTES constant below) so a
+    // caller that overrides maxBodyBytes — a test, or a future env-driven cap — can't reintroduce
+    // exactly this gap by way of the two values silently drifting apart; this exists purely to
+    // bound Bun's own buffering if the app-level check were ever bypassed — the real, precise,
+    // test-covered enforcement is deps.maxBodyBytes itself.
+    maxRequestBodySize: deps.maxBodyBytes * 4,
     idleTimeout: 30,
     fetch: (req, srv) => {
       const clientIp = req.headers.get("CF-Connecting-IP") ?? srv.requestIP(req)?.address ?? "unknown";

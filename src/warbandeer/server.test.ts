@@ -581,9 +581,47 @@ describe("startWarbandeerServer — real listener", () => {
       const res = await fetch(`http://localhost:${port}/characters`, {
         method: "POST",
         headers: { Authorization: "Bearer t" },
-        body: "x".repeat(5000), // over deps.maxBodyBytes, well under maxRequestBodySize
+        // Over deps.maxBodyBytes (1024), well under maxRequestBodySize (deps.maxBodyBytes * 4 =
+        // 4096) — deliberately NOT a huge fixed size like 5000: this test's whole point is the
+        // gap between the two caps, so the body must actually respect deps.maxBodyBytes's own
+        // scale, not just be "small" in absolute terms.
+        body: "x".repeat(2048),
       });
       expect(res.status).toBe(413);
+    } finally {
+      stop();
+    }
+  });
+
+  test("maxRequestBodySize is derived from deps.maxBodyBytes, not a fixed constant", async () => {
+    // Round-3 finding: this used to be a hardcoded DEFAULT_MAX_BODY_BYTES * 4 regardless of what
+    // deps.maxBodyBytes actually was — correct only because the one production caller
+    // (createProductionDeps) happens to use matching values. A caller with a LARGER
+    // maxBodyBytes would have had its own cap undercut by the stale hardcoded backstop,
+    // reproducing the exact ECONNRESET Round 2 already fixed once, one level removed. Proof: a
+    // body well over the OLD hardcoded backstop (DEFAULT_MAX_BODY_BYTES * 4 = 2 MiB) but still
+    // under THIS deps object's own (larger) maxBodyBytes must be accepted over real HTTP, not
+    // reset — deps.storeCharacters is stubbed to accept anything, so a clean 204 here is only
+    // possible if the connection survived the transport layer at all.
+    const bigCap = 3 * 1024 * 1024; // 3 MiB — bigger than DEFAULT_MAX_BODY_BYTES * 4 (2 MiB)
+    const deps: WarbandeerDeps = {
+      maxBodyBytes: bigCap,
+      rateLimiter: createRateLimiter({ windowMs: 60_000, max: 1000 }),
+      authFailureLimiter: createRateLimiter({ windowMs: 60_000, max: 1000 }),
+      redeemCode: async () => ({ ok: true, token: "t" }),
+      authenticate: () => ({ discordUserId: "1", accountLabel: "Main" }),
+      storeCharacters: async () => ({ ok: true }),
+    };
+    const { stop, port } = startWarbandeerServer(0, deps);
+    try {
+      const targetBytes = 2.5 * 1024 * 1024; // between the old 2 MiB backstop and bigCap (3 MiB)
+      const body = JSON.stringify({ pad: "x".repeat(targetBytes - 10) });
+      const res = await fetch(`http://localhost:${port}/characters`, {
+        method: "POST",
+        headers: { Authorization: "Bearer t", "Content-Type": "application/json" },
+        body,
+      });
+      expect(res.status).toBe(204);
     } finally {
       stop();
     }
