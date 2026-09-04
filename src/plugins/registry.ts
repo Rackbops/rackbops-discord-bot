@@ -74,6 +74,13 @@ export function selectPlugins(
   return selected;
 }
 
+/** One `"<name>: <reason>"` line per skipped plugin, for the caller to log — kept out of this
+ * otherwise I/O-free module's own responsibility so the reasons stay unit-testable without a
+ * console spy. */
+export function describeSkips(selected: readonly SelectedPlugin[]): string[] {
+  return selected.filter((sp): sp is SelectedPlugin & { skipped: string } => sp.skipped !== undefined).map((sp) => `${sp.name}: ${sp.skipped}`);
+}
+
 /** Deduped union of `core` and every non-skipped plugin's declared intents, in first-seen order. */
 export function collectIntents(core: readonly number[], selected: readonly SelectedPlugin[]): number[] {
   const seen = new Set<number>(core);

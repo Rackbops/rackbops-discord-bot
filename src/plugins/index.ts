@@ -50,10 +50,14 @@ function isValidPluginIndex(value: unknown): value is PluginIndex {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
   if (v.schemaVersion !== 1 || !Array.isArray(v.plugins)) return false;
+  // Duplicate names collapse silently in registry.ts's Map-keyed lookup (last one wins), so
+  // rejecting them here — same bucket as every other malformed-manifest case — is cheaper than
+  // guarding it at every later consumer.
+  const seenNames = new Set<string>();
   return v.plugins.every((p) => {
     if (typeof p !== "object" || p === null) return false;
     const e = p as Record<string, unknown>;
-    return (
+    const shapeOk =
       typeof e.name === "string" &&
       /^[a-z][a-z0-9-]*$/.test(e.name) &&
       typeof e.package === "string" &&
@@ -62,8 +66,16 @@ function isValidPluginIndex(value: unknown): value is PluginIndex {
       typeof e.hostApiVersion === "number" &&
       Array.isArray(e.commands) &&
       Array.isArray(e.env) &&
-      Array.isArray(e.releases)
-    );
+      Array.isArray(e.releases) &&
+      // discord.js's IntentsBitField throws on a non-number flag (BitFieldInvalid) — validated
+      // here so a malformed entry is skipped as "bad manifest," never reaches createClient()
+      // uncaught. A bad entry that slipped past this would also get cached, crash-looping every
+      // restart until the cache is cleared — this check is what keeps that unreachable.
+      (e.intents === undefined || (Array.isArray(e.intents) && e.intents.every((i) => typeof i === "number")));
+    if (!shapeOk) return false;
+    if (seenNames.has(e.name as string)) return false;
+    seenNames.add(e.name as string);
+    return true;
   });
 }
 
@@ -110,9 +122,13 @@ export async function loadPluginIndex(
     }
   };
 
+  // config.ts accepts a bare absolute path (POSIX — this bot only ever runs in the Linux
+  // container) as shorthand, but fetch() can't resolve a schemeless string as a URL at all.
+  const fetchUrl = url.startsWith("/") ? `file://${url}` : url;
+
   let res: Response;
   try {
-    res = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs) });
+    res = await fetchFn(fetchUrl, { signal: AbortSignal.timeout(timeoutMs) });
   } catch (err) {
     return useCache(String(err));
   }

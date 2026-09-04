@@ -135,6 +135,65 @@ describe("loadPluginIndex", () => {
     }
   });
 
+  test("an entry with a non-number intents value is treated as invalid shape", async () => {
+    seedCache(VALID_INDEX);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const bad = { ...VALID_INDEX, plugins: [{ ...VALID_INDEX.plugins[0]!, intents: ["not-a-flag"] }] };
+      const fetch = async () => jsonResponse(bad);
+      const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch });
+      // Falling back to the cache (not "fresh") is what keeps a malformed intents array from ever
+      // reaching collectIntents()/createClient() — discord.js throws on a non-number flag.
+      expect(result.source).toBe("cache");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("an entry with a numeric intents array is accepted", async () => {
+    const fetch = async () => jsonResponse({ ...VALID_INDEX, plugins: [{ ...VALID_INDEX.plugins[0]!, intents: [1, 512] }] });
+    const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch });
+    expect(result.source).toBe("fresh");
+    expect(result.index.plugins[0]!.intents).toEqual([1, 512]);
+  });
+
+  test("two entries sharing a name are treated as invalid shape, not silently collapsed", async () => {
+    seedCache(VALID_INDEX);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const dup = {
+        ...VALID_INDEX,
+        plugins: [VALID_INDEX.plugins[0]!, { ...VALID_INDEX.plugins[0]!, hostApiVersion: 2 }],
+      };
+      const fetch = async () => jsonResponse(dup);
+      const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch });
+      expect(result.source).toBe("cache");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("a bare absolute path is fetched as a file:// URL, since fetch() can't resolve a schemeless string", async () => {
+    let receivedUrl = "";
+    const fetch = async (url: string) => {
+      receivedUrl = url;
+      return jsonResponse(VALID_INDEX);
+    };
+    const result = await loadPluginIndex("/data/plugins.json", dir, { fetch });
+    expect(receivedUrl).toBe("file:///data/plugins.json");
+    expect(result.source).toBe("fresh");
+  });
+
+  test("an http(s) URL is passed through unchanged", async () => {
+    let receivedUrl = "";
+    const fetch = async (url: string) => {
+      receivedUrl = url;
+      return jsonResponse(VALID_INDEX);
+    };
+    await loadPluginIndex("https://example/plugins.json", dir, { fetch });
+    expect(receivedUrl).toBe("https://example/plugins.json");
+  });
+
   test("a cache-write failure does not discard a good fresh fetch", async () => {
     const fetch = async () => jsonResponse(VALID_INDEX);
     const writeFile = async () => {

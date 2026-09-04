@@ -10,7 +10,7 @@ import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
 import { startWarbandeerServer, warbandeerConnectorConfigured } from "./warbandeer/server";
 import { loadPluginIndex } from "./plugins";
-import { selectPlugins, collectIntents } from "./plugins/registry";
+import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
 
 // Same path src/state.ts computes (both files sit directly in src/); #99 centralises this.
@@ -25,9 +25,10 @@ const selectedPlugins = selectPlugins(
   HOST_API_VERSION,
   CORE_COMMAND_NAMES,
 );
-const skippedPluginCount = selectedPlugins.filter((p) => p.skipped).length;
+const skipReasons = describeSkips(selectedPlugins);
+for (const line of skipReasons) console.warn(`[plugins] ${line}`);
 console.log(
-  `[plugins] index: ${pluginIndexResult.source}, ${selectedPlugins.length - skippedPluginCount} selected, ${skippedPluginCount} skipped`,
+  `[plugins] index: ${pluginIndexResult.source}, ${selectedPlugins.length - skipReasons.length} selected, ${skipReasons.length} skipped`,
 );
 
 const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));

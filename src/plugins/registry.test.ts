@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { selectPlugins, collectIntents } from "./registry";
+import { selectPlugins, collectIntents, describeSkips } from "./registry";
 import type { PluginIndex, PluginIndexEntry } from "./contract";
 
 function entry(overrides: Partial<PluginIndexEntry> & { name: string }): PluginIndexEntry {
@@ -73,6 +73,24 @@ describe("selectPlugins", () => {
     const idx = index([entry({ name: "warbandeer" })]);
     const result = selectPlugins(idx, [{ name: "warbandeer", version: "1.2.3" }], 1, CORE_COMMANDS);
     expect(result[0]!.pinnedVersion).toBe("1.2.3");
+  });
+});
+
+describe("describeSkips", () => {
+  test("renders only skipped plugins, as \"name: reason\"", () => {
+    const selected = [
+      { name: "ok", entry: entry({ name: "ok" }) },
+      { name: "bad", skipped: "not in the plugin index" },
+      { name: "old", entry: entry({ name: "old", hostApiVersion: 2 }), skipped: "needs host API v2, this bot is v1" },
+    ];
+    expect(describeSkips(selected)).toEqual([
+      "bad: not in the plugin index",
+      "old: needs host API v2, this bot is v1",
+    ]);
+  });
+
+  test("no skipped plugins yields an empty array", () => {
+    expect(describeSkips([{ name: "ok", entry: entry({ name: "ok" }) }])).toEqual([]);
   });
 });
 

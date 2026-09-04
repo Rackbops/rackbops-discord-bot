@@ -14,15 +14,18 @@ describe("index.ts wiring", () => {
     expect(source).not.toMatch(/new Client\(/);
   });
 
-  test("loads the Plugin Index and selects plugins before the Client is constructed", () => {
+  test("loads the Plugin Index, selects plugins, and logs skip reasons before the Client is constructed", () => {
     const loadCall = source.indexOf("loadPluginIndex(");
     const selectCall = source.indexOf("selectPlugins(");
+    const describeCall = source.indexOf("describeSkips(");
     const createCall = source.indexOf("createClient(collectIntents(");
     expect(loadCall).toBeGreaterThan(-1);
     expect(selectCall).toBeGreaterThan(-1);
+    expect(describeCall).toBeGreaterThan(-1);
     expect(createCall).toBeGreaterThan(-1);
     expect(loadCall).toBeLessThan(createCall);
     expect(selectCall).toBeLessThan(createCall);
+    expect(describeCall).toBeLessThan(createCall);
   });
 
   test("no plugin code is imported — only the manifest reader and pure selection", () => {
