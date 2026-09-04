@@ -97,12 +97,14 @@ services:
     profiles:
       - admin
 
-  # Opt-in: exposes a future local API to the internet without opening inbound
-  # firewall ports. Requires CLOUDFLARE_TUNNEL_TOKEN in .env (see README). Start with:
+  # Opt-in: exposes the bot's local API (the Warbandeer character-linking endpoint,
+  # WARBANDEER_INGEST_PORT — see README's "Character linking" section) to the internet
+  # without opening inbound firewall ports. Requires CLOUDFLARE_TUNNEL_TOKEN in .env. Start
+  # with:
   #   docker compose --profile tunnel up -d --build
   cloudflared:
     image: cloudflare/cloudflared:latest
-    container_name: warbandeer-discord-tunnel
+    container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}-tunnel
     command: tunnel --no-autoupdate run
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
