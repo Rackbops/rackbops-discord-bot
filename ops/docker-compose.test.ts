@@ -14,6 +14,15 @@ import { fileURLToPath } from "node:url";
 
 const COMPOSE_SRC = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
 
+// A deliberately narrow view of `config --format json`'s output — only the fields these tests
+// actually read. `env_file` is typed `unknown`: Compose normalizes a short-form string into some
+// canonical shape (a bare string on some versions, a `[{path,required}]` list on others), and the
+// assertions below deliberately stringify rather than assert an exact shape, so there's no real
+// type to give it.
+interface ComposeConfig {
+  services: Record<string, { container_name?: string; env_file?: unknown }>;
+}
+
 // The exact keys ops/install.sh writes into a stack directory's own .env (its compose-project
 // interpolation source, distinct from env_file: — see install.sh's STACKENV heredoc). Stripped
 // from the child's environment before every invocation below so an ambient value in the host or
@@ -59,7 +68,7 @@ function makeStack(env: string | null): string {
   return dir;
 }
 
-async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: string; json: any }> {
+async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: string; json: ComposeConfig | null }> {
   const proc = Bun.spawn(["docker", "compose", "-f", "docker-compose.yml", "config", "--format", "json"], {
     cwd: dir,
     stdout: "pipe",
@@ -71,7 +80,7 @@ async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: s
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  let json: any = null;
+  let json: ComposeConfig | null = null;
   try {
     json = JSON.parse(stdout);
   } catch {
@@ -80,6 +89,17 @@ async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: s
   return { exitCode, stderr, json };
 }
 
+// Scope note: these tests only exercise the `bot` service — the one Dockge's plain Start/Restart/
+// Stop always touches, profile or no profile. They deliberately do NOT create an `ops/admin/`
+// directory in the fixture, so `admin`'s own `build.context` (`${ADMIN_BUILD_CONTEXT:-./ops/admin}`)
+// points at a path that doesn't exist here — matching a REAL bootstrapped stack directory exactly:
+// ops/install.sh only ever writes docker-compose.yml + .env into $STACK_DIR, never a copy of
+// ops/admin/. If `docker compose config` with no `--profile admin` turned out to validate an
+// inactive profile's build context against the filesystem, that would already be a live problem in
+// production today (nucbox brings the bot up via a plain `up -d --build` with no ops/admin/ on disk
+// beside it, and separately profile-scopes the admin build only when it wants that service — see
+// the admin-panel-deploy runbook) — so no placeholder Dockerfile is added here to paper over the
+// question. Left for a real `docker compose` (CI, not this dev box) to answer for real.
 describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instance, not monorepo-era (issue #41)", () => {
   test("a bootstrapped instance's stack .env overrides every monorepo-era fallback", async () => {
     const dir = makeStack(null);
@@ -101,9 +121,9 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
 
     const { exitCode, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
-    expect(json.services.bot.container_name).toBe("probe-instance");
-    expect(json.services.bot.container_name).not.toBe("warbandeer-discord");
-    expect(JSON.stringify(json.services.bot.env_file)).toContain(botEnvFile);
+    expect(json!.services.bot.container_name).toBe("probe-instance");
+    expect(json!.services.bot.container_name).not.toBe("warbandeer-discord");
+    expect(JSON.stringify(json!.services.bot.env_file)).toContain(botEnvFile);
   });
 
   test("a bare stack dir with a plain local .env (no BOT_OPS_* keys) keeps the local-dev default", async () => {
@@ -114,6 +134,6 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
     const { exitCode, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
-    expect(json.services.bot.container_name).toBe("warbandeer-discord");
+    expect(json!.services.bot.container_name).toBe("warbandeer-discord");
   });
 });
