@@ -18,7 +18,7 @@ export interface Release {
 export async function fetchReleases(repo: string): Promise<Release[] | null> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "warbandeer-discord",
+    "User-Agent": "rackbops-discord-bot",
   };
   if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
   const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=15`, { headers });
@@ -96,7 +96,7 @@ function writeHeaders(): Record<string, string> {
   if (!config.githubToken) throw new Error("GITHUB_TOKEN is not set — cannot write to GitHub");
   return {
     Accept: "application/vnd.github+json",
-    "User-Agent": "warbandeer-discord",
+    "User-Agent": "rackbops-discord-bot",
     "Content-Type": "application/json",
     Authorization: `Bearer ${config.githubToken}`,
   };

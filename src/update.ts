@@ -109,7 +109,7 @@ export function buildUpdateReport(o: {
 function apiHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
-    "User-Agent": "warbandeer-discord",
+    "User-Agent": "rackbops-discord-bot",
   };
   if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
   return headers;
