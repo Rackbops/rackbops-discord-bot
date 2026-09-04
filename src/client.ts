@@ -10,6 +10,10 @@ export const CLIENT_OPTIONS: ClientOptions = {
   allowedMentions: { parse: [] },
 };
 
-export function createClient(): Client {
-  return new Client(CLIENT_OPTIONS);
+// What the Client gets when nothing else says otherwise — before plugins existed, this was the
+// only intent set there ever was. src/index.ts now passes collectIntents(CORE_INTENTS, selected).
+export const CORE_INTENTS: number[] = [GatewayIntentBits.Guilds];
+
+export function createClient(intents: number[] = CORE_INTENTS): Client {
+  return new Client({ ...CLIENT_OPTIONS, intents });
 }

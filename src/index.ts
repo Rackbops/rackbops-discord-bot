@@ -1,15 +1,37 @@
+import { join } from "node:path";
 import { Client, Events, REST, Routes } from "discord.js";
 import { config } from "./config";
-import { createClient } from "./client";
-import { commandData, handleCommand } from "./commands";
+import { createClient, CORE_INTENTS } from "./client";
+import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
 import { startWarbandeerServer, warbandeerConnectorConfigured } from "./warbandeer/server";
+import { loadPluginIndex } from "./plugins";
+import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
+import { HOST_API_VERSION } from "./plugins/contract";
 
-const client = createClient();
+// Same path src/state.ts computes (both files sit directly in src/); #99 centralises this.
+const DATA_DIR = join(import.meta.dir, "..", "data");
+
+// The boot-time half of plugin support: read the manifest and pick intents before the Client
+// exists (intents are frozen at construction) — no plugin code runs until #99's activate().
+const pluginIndexResult = await loadPluginIndex(config.pluginIndexUrl, DATA_DIR);
+const selectedPlugins = selectPlugins(
+  pluginIndexResult.index,
+  config.plugins,
+  HOST_API_VERSION,
+  CORE_COMMAND_NAMES,
+);
+const skipReasons = describeSkips(selectedPlugins);
+for (const line of skipReasons) console.warn(`[plugins] ${line}`);
+console.log(
+  `[plugins] index: ${pluginIndexResult.source}, ${selectedPlugins.length - skipReasons.length} selected, ${skipReasons.length} skipped`,
+);
+
+const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
 // A daemon call only happens here when the env actually says standby (#46) — an ordinary boot
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);

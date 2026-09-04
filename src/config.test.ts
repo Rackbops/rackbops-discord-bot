@@ -213,3 +213,67 @@ describe("resolveConfig — self-update", () => {
     expect(resolveConfig({ ...base, ADMIN_USER_IDS: " , " }).adminUserIds).toEqual([]);
   });
 });
+
+describe("resolveConfig — plugins", () => {
+  test("PLUGINS unset yields no plugins", () => {
+    expect(resolveConfig(base).plugins).toEqual([]);
+  });
+
+  test("parses bare names and name@version tokens", () => {
+    expect(resolveConfig({ ...base, PLUGINS: "warbandeer,foo@1.2.3" }).plugins).toEqual([
+      { name: "warbandeer" },
+      { name: "foo", version: "1.2.3" },
+    ]);
+  });
+
+  test("tolerates whitespace around tokens", () => {
+    expect(resolveConfig({ ...base, PLUGINS: " warbandeer , foo@1.2.3 " }).plugins).toEqual([
+      { name: "warbandeer" },
+      { name: "foo", version: "1.2.3" },
+    ]);
+  });
+
+  test("rejects a malformed name", () => {
+    expect(() => resolveConfig({ ...base, PLUGINS: "Bad_Name" })).toThrow(/PLUGINS must be a comma-separated/);
+  });
+
+  test("rejects a malformed version", () => {
+    expect(() => resolveConfig({ ...base, PLUGINS: "foo@not-semver" })).toThrow(/PLUGINS must be a comma-separated/);
+  });
+
+  test("accepts a semver prerelease version", () => {
+    expect(resolveConfig({ ...base, PLUGINS: "foo@1.2.3-beta.1" }).plugins).toEqual([
+      { name: "foo", version: "1.2.3-beta.1" },
+    ]);
+  });
+
+  test("rejects a duplicate name, naming it", () => {
+    expect(() => resolveConfig({ ...base, PLUGINS: "foo,foo@1.0.0" })).toThrow(/"foo" more than once/);
+  });
+
+  test("PLUGIN_INDEX_URL defaults to the Rackbops/bot-plugins manifest", () => {
+    expect(resolveConfig(base).pluginIndexUrl).toBe(
+      "https://raw.githubusercontent.com/Rackbops/bot-plugins/main/plugins.json",
+    );
+  });
+
+  test("PLUGIN_INDEX_URL accepts https, http, file:// and an absolute path", () => {
+    expect(resolveConfig({ ...base, PLUGIN_INDEX_URL: "https://example/x.json" }).pluginIndexUrl).toBe(
+      "https://example/x.json",
+    );
+    expect(resolveConfig({ ...base, PLUGIN_INDEX_URL: "http://localhost:8080/x.json" }).pluginIndexUrl).toBe(
+      "http://localhost:8080/x.json",
+    );
+    expect(resolveConfig({ ...base, PLUGIN_INDEX_URL: "file:///tmp/x.json" }).pluginIndexUrl).toBe(
+      "file:///tmp/x.json",
+    );
+    expect(resolveConfig({ ...base, PLUGIN_INDEX_URL: "/data/x.json" }).pluginIndexUrl).toBe("/data/x.json");
+  });
+
+  test("rejects a PLUGIN_INDEX_URL that isn't http(s), file:// or absolute", () => {
+    expect(() => resolveConfig({ ...base, PLUGIN_INDEX_URL: "ftp://example/x.json" })).toThrow(
+      /PLUGIN_INDEX_URL must be/,
+    );
+    expect(() => resolveConfig({ ...base, PLUGIN_INDEX_URL: "relative/x.json" })).toThrow(/PLUGIN_INDEX_URL must be/);
+  });
+});
