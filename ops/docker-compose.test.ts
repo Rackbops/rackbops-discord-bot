@@ -157,8 +157,13 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
 // export — the same mechanism admin's own secrets already use, and what install.sh's printed
 // tunnel-profile instructions do by hand.
 describe.skipIf(!runnable)("cloudflared's TUNNEL_TOKEN resolves via Compose interpolation, not env_file (issue #54)", () => {
+  // makeStack("") — not null — for the same reason the #41 test above uses a real file: the
+  // `bot` service's `env_file: ${BOT_ENV_FILE:-.env}` short form defaults to `required: true`
+  // (see that test's own comment), so `docker compose config` refuses to resolve ANY service in
+  // the file, cloudflared included, unless *some* .env exists on disk relative to the stack dir —
+  // empty is fine, since these tests don't want BOT_OPS_*/secrets in it anyway.
   test("a shell-exported CLOUDFLARE_TUNNEL_TOKEN reaches cloudflared's TUNNEL_TOKEN", async () => {
-    const dir = makeStack(null);
+    const dir = makeStack("");
     const { exitCode, json } = await composeConfig(dir, { CLOUDFLARE_TUNNEL_TOKEN: "probe-tunnel-token" });
     expect(exitCode).toBe(0);
     expect(JSON.stringify(json!.services.cloudflared)).toContain("probe-tunnel-token");
@@ -171,7 +176,7 @@ describe.skipIf(!runnable)("cloudflared's TUNNEL_TOKEN resolves via Compose inte
     // Compose's own "variable is not set" warning on stderr for every var-less `docker compose`
     // invocation against this file (Dockge's Start/Stop/Restart included) — assert on that
     // directly rather than just the exit code.
-    const dir = makeStack(null);
+    const dir = makeStack("");
     const { exitCode, stderr, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
     expect(stderr).not.toContain("CLOUDFLARE_TUNNEL_TOKEN");
