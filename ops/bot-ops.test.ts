@@ -535,3 +535,34 @@ describe.skipIf(!runnable)("bot-ops.sh doesn't lock out restart/env-set forever 
     expect(run.exitCode).toBe(0);
   });
 });
+
+describe.skipIf(!runnable)("bot-ops.sh logs bounds N before the arithmetic clamp (issue #53 item 4)", () => {
+  test("a 2^64 N is refused, not silently wrapped past LOGS_MAX by bash's 64-bit arithmetic", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["logs", "18446744073709551616"]); // 2^64: wraps to 0 in `(( ))`
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("logs: N must be a number");
+    expect(dockerCalls(fx)).toHaveLength(0); // never reaches `docker logs` at all
+  });
+
+  test("a 6-digit N is refused too, even though it would never overflow", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["logs", "123456"]);
+    expect(run.exitCode).not.toBe(0);
+    expect(dockerCalls(fx)).toHaveLength(0);
+  });
+
+  test("an in-bounds N over LOGS_MAX still clamps to 5000, unaffected by the tighter regex", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["logs", "99999"]);
+    expect(run.exitCode).toBe(0);
+    expect(dockerCalls(fx)).toEqual(["docker logs probe-container --tail 5000"]);
+  });
+
+  test("the default (no N given) still works", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["logs"]);
+    expect(run.exitCode).toBe(0);
+    expect(dockerCalls(fx)).toEqual(["docker logs probe-container --tail 200"]);
+  });
+});

@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
+  adminAuditLine,
   adminRemovalError,
   auditLogLine,
   authorizeRequest,
   branchNamesFromApi,
   buildInvocation,
   createAccessJwtVerifier,
+  createRunBotOps,
   describeAction,
   describeActor,
   effectiveAllowlist,
@@ -18,6 +20,7 @@ import {
   extractBearerToken,
   handleAdmins,
   handleRequest,
+  IDLE_TIMEOUT_SECONDS,
   isAuthorized,
   isCrossSiteWrite,
   isEmailAllowed,
@@ -29,6 +32,7 @@ import {
   parseEnvValue,
   readDynamicAdmins,
   renderIndexHtml,
+  SUBPROCESS_TIMEOUT_MS,
   tokensMatch,
   type AdminStore,
   type Authorization,
@@ -475,6 +479,40 @@ describe("handleAdmins", () => {
     const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
     expect(res.status).toBe(502);
   });
+
+  // Spied rather than left to the pure adminAuditLine unit test alone — that only proves the
+  // function's own formatting, not that handleAdmins actually calls and logs it (issue #53 item 3;
+  // mirrors the identical rationale at the auditLogLine spy test below auditLogLine's own unit test —
+  // a prior review round mutation-tested that exact wiring by deleting it and the suite stayed green
+  // with only the pure-function test in place).
+  test("POST logs an audit line for a real add, not for the already-an-admin no-op (issue #53 item 3)", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const store = makeStore({ bootstrap: ["boss@x.com"] });
+      await handleAdmins(req("POST", { email: "new@x.com" }), store, admin);
+      expect(logSpy).toHaveBeenCalledWith("[admin] admins: added new@x.com by me@x.com");
+      logSpy.mockClear();
+
+      await handleAdmins(req("POST", { email: "boss@x.com" }), store, admin); // already a bootstrap admin
+      expect(logSpy).not.toHaveBeenCalled();
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("DELETE logs an audit line for a real removal, not for a refused one (issue #53 item 3)", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const store = makeStore({ bootstrap: ["boss@x.com"], dynamic: ["gone@x.com"] });
+      await handleAdmins(req("DELETE", { email: "boss@x.com" }), store, admin); // refused: bootstrap-pinned
+      expect(logSpy).not.toHaveBeenCalled();
+
+      await handleAdmins(req("DELETE", { email: "gone@x.com" }), store, admin);
+      expect(logSpy).toHaveBeenCalledWith("[admin] admins: removed gone@x.com by me@x.com");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
 });
 
 describe("isCrossSiteWrite", () => {
@@ -714,6 +752,17 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     expect(describeActor({ via: "bearer" })).toBe("the ADMIN_TOKEN bearer token");
   });
 
+  test("describeActor names a service token's common_name when there's no email claim (issue #53 item 5)", () => {
+    expect(describeActor({ via: "jwt", claims: { common_name: "warbandeer-ci" } })).toBe(
+      'an Access session (service token "warbandeer-ci")',
+    );
+    // Regression: a real Access JWT with neither email nor common_name falls back exactly as before.
+    expect(describeActor({ via: "jwt", claims: { sub: "abc" } })).toBe("an Access session (no email claim)");
+    expect(describeActor({ via: "jwt", claims: { common_name: 123 as unknown as string } })).toBe(
+      "an Access session (no email claim)",
+    );
+  });
+
   test("parseChangedKeys pulls string keys from env-set JSON, tolerating anything else", () => {
     expect(parseChangedKeys('{"changed":["BOT_BRANCH","WOW_REALM"]}')).toEqual(["BOT_BRANCH", "WOW_REALM"]);
     expect(parseChangedKeys('{"changed":[]}')).toEqual([]);
@@ -761,6 +810,34 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     };
     expect(auditLogLine(okEnvSet, result, auth)).toBe(
       "[admin] env-set (changed: WOW_REALM) — recreate FAILED by the ADMIN_TOKEN bearer token",
+    );
+  });
+
+  // A timed-out env-set is the case issue #47's fix didn't cover: bot-ops.sh's cmd_env_set rewrites
+  // .env BEFORE the killable recreate step, so a kill mid-recreate means stdout is empty — the
+  // env-set-with-changed-keys branch above finds nothing and would otherwise return null, losing
+  // the audit trail for a mutation that already happened (issue #53 item 1/2 follow-up, found in
+  // review). Covers both restart and env-set — a timed-out restart has no ".env already mutated"
+  // nuance, but the attempt itself is still worth a line for an operator investigating afterward.
+  test("auditLogLine logs the bare fact of a timeout, even with empty stdout (issue #53 item 1/2)", () => {
+    const auth: Authorization = { via: "jwt", email: "roshne@gmail.com" };
+    const timedOutResult: BotOpsResult = { exitCode: 1, stdout: "", stderr: "", timedOut: true };
+    expect(auditLogLine(okEnvSet, timedOutResult, auth)).toBe(
+      "[admin] env-set timed out (killed after running past its limit) — attempted by roshne@gmail.com",
+    );
+    expect(auditLogLine(okRestart, timedOutResult, auth)).toBe(
+      "[admin] restart timed out (killed after running past its limit) — attempted by roshne@gmail.com",
+    );
+  });
+});
+
+describe("adminAuditLine (issue #53 item 3)", () => {
+  test("names the action, email, and actor", () => {
+    expect(adminAuditLine("added", "new@x.com", { via: "jwt", email: "boss@x.com" })).toBe(
+      "[admin] admins: added new@x.com by boss@x.com",
+    );
+    expect(adminAuditLine("removed", "gone@x.com", { via: "bearer" })).toBe(
+      "[admin] admins: removed gone@x.com by the ADMIN_TOKEN bearer token",
     );
   });
 });
@@ -1011,6 +1088,116 @@ describe("buildInvocation", () => {
   });
 });
 
+// Real-bash tests, mirroring bot-ops.test.ts's own convention for exercising a real subprocess
+// rather than a stub: this is the one place the Bun.spawn timeout/killSignal wiring itself is
+// proven to work, not just asserted by reading the code. No filesystem access happens (just
+// `sleep`), so — unlike bot-ops.test.ts's Windows-specific bash resolution, which exists to avoid a
+// WSL bash.exe seeing a different filesystem — a plain `Bun.which("bash")` is enough here; skips
+// LOUDLY rather than passing vacuously when bash isn't on PATH.
+const BASH = Bun.which("bash");
+if (!BASH) {
+  console.warn("[server.test] SKIPPING createRunBotOps real-subprocess tests: no bash on PATH");
+}
+describe.skipIf(!BASH)("createRunBotOps (issue #53 item 1/2: subprocess timeout)", () => {
+  const scripts: string[] = [];
+  function slowScript(body: string): string {
+    const path = join(tmpdir(), `bot-ops-createRunBotOps-${Date.now()}-${Math.random().toString(36).slice(2)}.sh`);
+    writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`, { mode: 0o755 });
+    scripts.push(path);
+    return path;
+  }
+  afterEach(() => {
+    for (const path of scripts.splice(0)) rmSync(path, { force: true });
+  });
+
+  test("a process that outlives its timeout is killed and reported as timed out", async () => {
+    const script = slowScript("sleep 5\necho should-not-print");
+    const runBotOps = createRunBotOps(script, { timeoutMs: 100, killSignal: "SIGKILL" });
+    const result = await runBotOps({ args: [], contentType: "text/plain" });
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stdout).not.toContain("should-not-print");
+  }, 10000);
+
+  test("a process finishing within its timeout is not marked as timed out, exit code/stdout intact", async () => {
+    const script = slowScript("echo hi\nexit 3");
+    const runBotOps = createRunBotOps(script, { timeoutMs: 5000 });
+    const result = await runBotOps({ args: [], contentType: "text/plain" });
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(3);
+    expect(result.stdout.trim()).toBe("hi");
+  });
+
+  test("args and stdin are still passed through exactly as before", async () => {
+    const script = slowScript('cat\necho "args: $*"');
+    const runBotOps = createRunBotOps(script, { timeoutMs: 5000 });
+    const result = await runBotOps({ args: ["env-set"], stdin: "KEY=value", contentType: "application/json" });
+    expect(result.timedOut).toBe(false);
+    expect(result.stdout).toContain("KEY=value");
+    expect(result.stdout).toContain("args: env-set");
+  });
+
+  // A process whose exit code merely LOOKS like a signal kill (the conventional 128+signum
+  // convention, e.g. 143 for SIGTERM) — but was never actually signaled at all — must not be
+  // confused for one either. This guards the general shape of the fix: `timedOut` is written ONLY
+  // by our own timer callback (a single assignment site in createRunBotOps — see its doc comment),
+  // never inferred from `exitCode` or any other after-the-fact process state.
+  //
+  // A stronger regression test would kill the real subprocess with a genuine external signal
+  // (unrelated to our own timer) and assert `timedOut` stays false — this is exactly the bug found
+  // in review (an earlier version inferred `timedOut` from `proc.signalCode !== null`, which is
+  // true for ANY signal-terminated exit, verified by probe against a real `proc.kill("SIGTERM")`
+  // sent from outside the timeout timer). That's deliberately NOT automated here: simulating an
+  // externally-caused signal kill portably across this repo's two real test environments (Windows
+  // dev via Git Bash, Linux CI) isn't practical — probed directly during this review: Git Bash's
+  // `kill -TERM $$` (self-signal) does not produce a real OS-level signal-terminated exit on
+  // Windows (Bun reports `signalCode: null`, `exitCode: 0`), and `pkill`/`pgrep` aren't on PATH
+  // there either. The fix's correctness rests on the single-assignment-site construction instead.
+  test("an exit code that merely resembles a signal-kill convention (143) is not confused for one", async () => {
+    const script = slowScript("exit 143"); // 128+SIGTERM, but never actually signaled
+    const runBotOps = createRunBotOps(script, { timeoutMs: 5000 });
+    const result = await runBotOps({ args: [], contentType: "text/plain" });
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(143);
+  });
+
+  // Real bug found in round-2 review, reproduced and verified fixed against a real Linux kernel
+  // (this repo's Windows dev box can't verify the fix itself — see the platform gate below — so
+  // this was independently confirmed via WSL2 during review): bot-ops.sh's mutating subcommands run
+  // `docker compose ...` through a command substitution — a genuine CHILD of the spawned bash, not a
+  // tail-call `exec`. Killing only `proc` (bash) left that child running and still holding the SAME
+  // stdout/stderr pipe FDs this function reads until EOF, so the timeout bounded nothing: measured
+  // ~8000ms (the child's real duration) instead of the configured ~300ms, even though `timedOut` was
+  // (correctly, by itself) still reported true. The fix spawns detached and kills the whole process
+  // GROUP via `process.kill(-proc.pid, ...)` on a real kill. Windows has no such group-kill semantics
+  // (falls back to killing just the direct child there — the admin panel only ever runs in a Linux
+  // container in production, so that's an accepted, disclosed local-dev-only gap), which is exactly
+  // why this specific test — the one that actually proves the group-kill closes the bug — only runs
+  // on a real POSIX kernel; on Windows it would just re-measure that known, accepted gap.
+  test.skipIf(process.platform === "win32")(
+    "a grandchild spawned via command substitution (shaped like bot-ops.sh's real docker compose call) is killed too — the timeout actually bounds wall-clock time, not just `timedOut`",
+    async () => {
+      const script = slowScript('recreate_log="$(sleep 8; echo done)"\necho "$recreate_log"');
+      const runBotOps = createRunBotOps(script, { timeoutMs: 300, killSignal: "SIGKILL" });
+      const start = Date.now();
+      const result = await runBotOps({ args: [], contentType: "text/plain" });
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(2000); // the bug this guards: this used to take the real ~8000ms
+      expect(result.timedOut).toBe(true);
+      expect(result.stdout).toBe(""); // the grandchild's "done" must never have been captured
+    },
+    10000,
+  );
+});
+
+describe("SUBPROCESS_TIMEOUT_MS / IDLE_TIMEOUT_SECONDS (issue #53 item 1/2)", () => {
+  test("the values match the design, and idleTimeout leaves real margin over the subprocess timeout", () => {
+    expect(SUBPROCESS_TIMEOUT_MS).toBe(90_000);
+    expect(IDLE_TIMEOUT_SECONDS).toBe(120);
+    expect(IDLE_TIMEOUT_SECONDS * 1000).toBeGreaterThan(SUBPROCESS_TIMEOUT_MS);
+  });
+});
+
 describe("handleRequest", () => {
   const TOKEN = "test-token";
   const INDEX_HTML = "<html>admin panel</html>";
@@ -1130,6 +1317,45 @@ describe("handleRequest", () => {
     );
     expect(res.status).toBe(502);
     expect(await res.text()).toBe("bot-ops: value for 'BOT_BRANCH' is invalid");
+  });
+
+  test("a timed-out bot-ops.sh invocation returns a distinct 504, not the generic 502 (issue #53 item 1/2)", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/restart", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } }),
+      {
+        adminToken: TOKEN,
+        indexHtml: INDEX_HTML,
+        runBotOps: fakeRunBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true }),
+      },
+    );
+    expect(res.status).toBe(504);
+  });
+
+  // Spied rather than left to the pure auditLogLine unit test alone — mirrors the identical
+  // rationale on the issue #47 test below: a prior review round mutation-tested this exact class of
+  // wiring by deleting it and the suite stayed green with only the pure-function test in place.
+  test("a timed-out env-set still logs an audit line despite empty stdout (issue #53 item 1/2, found in review)", async () => {
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const res = await handleRequest(
+        new Request("http://x/api/env", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${TOKEN}` },
+          body: "BOT_BRANCH=main",
+        }),
+        {
+          adminToken: TOKEN,
+          indexHtml: INDEX_HTML,
+          runBotOps: fakeRunBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true }),
+        },
+      );
+      expect(res.status).toBe(504);
+      expect(logSpy).toHaveBeenCalledWith(
+        "[admin] env-set timed out (killed after running past its limit) — attempted by the ADMIN_TOKEN bearer token",
+      );
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   test("a failed env-set recreate returns its JSON stdout (backup/log), logs an audit line, not the empty stderr (issue #47)", async () => {
@@ -1392,7 +1618,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
    *  is injected: document (only #env-msg and the field controls are looked up), confirm, api,
    *  loadEnv/loadStatus (the post-save re-baseline), and loadedEnv. */
   interface FakePage {
-    posts: { path: string; opts: { method?: string; body?: string } }[];
+    posts: { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } }[];
     confirms: string[];
     msg: { textContent: string; className: string };
     reloads: number;
@@ -1412,11 +1638,15 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
       page.confirms.push(text);
       return opts.confirm ?? true;
     };
-    const api = async (path: string, o: { method?: string; body?: string }) => {
+    const api = async (path: string, o: { method?: string; body?: string; signal?: AbortSignal }) => {
       page.posts.push({ path, opts: o });
       const r = opts.response ?? { ok: true, text: '{"ok":true,"changed":["ANNOUNCE_CHANNEL_ID"]}' };
       return { ok: r.ok, text: async () => r.text };
     };
+    // A no-op fake (no real delay) — saveEnv's real timeoutSignal wiring is already covered for
+    // real by the dedicated TIMEOUT_SIGNAL unit tests; this harness only needs to prove saveEnv
+    // calls it and forwards the resulting signal into api() (issue #53 item 2).
+    const timeoutSignal = (_ms: number) => ({ signal: new AbortController().signal, cancel: () => {} });
     const saveEnv = new Function(
       "document",
       "confirm",
@@ -1425,8 +1655,10 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
       "loadStatus",
       "loadedEnv",
       "REQUIRED_KEYS",
+      "MUTATION_TIMEOUT_MS",
+      "timeoutSignal",
       `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
-    )(document, confirm, api, () => page.reloads++, () => {}, loaded, REQUIRED_KEYS) as () => Promise<void>;
+    )(document, confirm, api, () => page.reloads++, () => {}, loaded, REQUIRED_KEYS, 110000, timeoutSignal) as () => Promise<void>;
     await saveEnv();
     return page;
   }
@@ -1440,7 +1672,13 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     // The issue's exact setup: two stored values the whitelist would reject, both untouched.
     const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "111", ADMIN_USER_IDS: "123456, 234567", WOW_REALM: "stormrage" };
     const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "222" });
-    expect(page.posts).toEqual([{ path: "/api/env", opts: { method: "POST", body: "ANNOUNCE_CHANNEL_ID=222" } }]);
+    expect(page.posts).toHaveLength(1);
+    const [post] = page.posts;
+    expect(post?.path).toBe("/api/env");
+    expect(post?.opts.method).toBe("POST");
+    expect(post?.opts.body).toBe("ANNOUNCE_CHANNEL_ID=222");
+    // issue #53 item 2: the POST now carries a real AbortSignal, not none at all.
+    expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
     expect(page.confirms).toHaveLength(1);
     expect(page.confirms[0]).toContain('ANNOUNCE_CHANNEL_ID: "111" → "222"');
     expect(page.confirms[0]).not.toContain("ADMIN_USER_IDS");
@@ -1548,6 +1786,165 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" }, { ANNOUNCE_CHANNEL_ID: "", WOW_REGION: "eu" });
     expect(page.posts).toEqual([]); // the WOW_REGION change is not posted either
     expect(page.msg.className).toBe("msg error");
+  });
+});
+
+describe("admin panel timeoutSignal (issue #53 item 1/2)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const timeoutSignalSrc = indexSrc.match(/\/\/ TIMEOUT_SIGNAL:begin\n([\s\S]*?)\n\s*\/\/ TIMEOUT_SIGNAL:end/)?.[1];
+  const makeTimeoutSignal = () =>
+    (new Function(`"use strict";\n${timeoutSignalSrc ?? ""}\nreturn timeoutSignal;`)() as (
+      ms: number,
+    ) => { signal: AbortSignal; cancel: () => void });
+
+  test("is present in the served page", () => {
+    expect(timeoutSignalSrc).toContain("function timeoutSignal(");
+  });
+
+  test("the signal aborts once ms elapses", async () => {
+    const timeoutSignal = makeTimeoutSignal();
+    const { signal } = timeoutSignal(10);
+    expect(signal.aborted).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(signal.aborted).toBe(true);
+  });
+
+  test("cancel() before the timeout elapses prevents the abort", async () => {
+    const timeoutSignal = makeTimeoutSignal();
+    const { signal, cancel } = timeoutSignal(10);
+    cancel();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(signal.aborted).toBe(false);
+  });
+});
+
+describe("admin panel doRestart (issue #53 item 2)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const timeoutSignalSrc = indexSrc.match(/\/\/ TIMEOUT_SIGNAL:begin\n([\s\S]*?)\n\s*\/\/ TIMEOUT_SIGNAL:end/)?.[1];
+  const restartSrc = indexSrc.match(/\/\/ RESTART:begin\n([\s\S]*?)\n\s*\/\/ RESTART:end/)?.[1];
+
+  interface FakePage {
+    posts: { path: string; opts: { method?: string; signal?: AbortSignal } }[];
+    confirms: string[];
+    msg: { textContent: string; className: string };
+    statusLoads: number;
+  }
+  async function runDoRestart(opts: { confirm?: boolean; response?: { ok: boolean; text: string } } = {}): Promise<FakePage> {
+    const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, statusLoads: 0 };
+    const document = { getElementById: (id: string) => (id === "restart-msg" ? page.msg : null) };
+    const confirm = (text: string): boolean => {
+      page.confirms.push(text);
+      return opts.confirm ?? true;
+    };
+    const api = async (path: string, o: { method?: string; signal?: AbortSignal }) => {
+      page.posts.push({ path, opts: o });
+      const r = opts.response ?? { ok: true, text: "restarted" };
+      return { ok: r.ok, text: async () => r.text };
+    };
+    const doRestart = new Function(
+      "document",
+      "confirm",
+      "api",
+      "loadStatus",
+      "MUTATION_TIMEOUT_MS",
+      `"use strict";\n${timeoutSignalSrc ?? ""}\n${restartSrc ?? ""}\nreturn doRestart;`,
+    )(document, confirm, api, () => page.statusLoads++, 110000) as () => Promise<void>;
+    await doRestart();
+    return page;
+  }
+
+  test("is present in the served page", () => {
+    expect(restartSrc).toContain("async function doRestart(");
+  });
+
+  test("a declined confirm never calls api()", async () => {
+    const page = await runDoRestart({ confirm: false });
+    expect(page.confirms).toHaveLength(1);
+    expect(page.posts).toEqual([]);
+  });
+
+  test("a confirmed restart POSTs with a real AbortSignal, and re-loads status on success", async () => {
+    const page = await runDoRestart();
+    expect(page.posts).toHaveLength(1);
+    const [post] = page.posts;
+    expect(post?.path).toBe("/api/restart");
+    expect(post?.opts.method).toBe("POST");
+    // issue #53 item 2: the POST now carries a real AbortSignal, not none at all.
+    expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
+    expect(post?.opts.signal?.aborted).toBe(false); // never actually timed out in this test
+    expect(page.msg).toEqual({ textContent: "restarted", className: "msg ok" });
+    expect(page.statusLoads).toBe(1);
+  });
+
+  test("a failed restart surfaces the response text as an error", async () => {
+    const page = await runDoRestart({ response: { ok: false, text: "compose error" } });
+    expect(page.msg).toEqual({ textContent: "Failed: compose error", className: "msg error" });
+  });
+});
+
+describe("admin panel hasAccessSession (issue #53 item 6: probes via /api/whoami, not /api/status)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const timeoutSignalSrc = indexSrc.match(/\/\/ TIMEOUT_SIGNAL:begin\n([\s\S]*?)\n\s*\/\/ TIMEOUT_SIGNAL:end/)?.[1];
+  const hasAccessSessionSrc = indexSrc.match(/\/\/ HAS_ACCESS_SESSION:begin\n([\s\S]*?)\n\s*\/\/ HAS_ACCESS_SESSION:end/)?.[1];
+
+  function run(fetchImpl: (path: string, opts: unknown) => Promise<{ ok: boolean; json: () => Promise<unknown> }>): {
+    calls: { path: string; opts: unknown }[];
+    hasAccessSession: () => Promise<boolean>;
+  } {
+    const calls: { path: string; opts: unknown }[] = [];
+    const fetch = (path: string, opts: unknown) => {
+      calls.push({ path, opts });
+      return fetchImpl(path, opts);
+    };
+    const hasAccessSession = new Function(
+      "fetch",
+      `"use strict";\n${timeoutSignalSrc ?? ""}\n${hasAccessSessionSrc ?? ""}\nreturn hasAccessSession;`,
+    )(fetch) as () => Promise<boolean>;
+    return { calls, hasAccessSession };
+  }
+
+  test("is present in the served page", () => {
+    expect(hasAccessSessionSrc).toContain("async function hasAccessSession(");
+  });
+
+  test("probes /api/whoami, not /api/status, with credentials included and a real signal", async () => {
+    const { calls, hasAccessSession } = run(async () => ({ ok: true, json: async () => ({ via: "jwt", email: null, claims: null }) }));
+    await hasAccessSession();
+    expect(calls).toHaveLength(1);
+    const [call] = calls;
+    expect(call?.path).toBe("/api/whoami");
+    const opts = call?.opts as { credentials?: string; signal?: AbortSignal };
+    expect(opts.credentials).toBe("include");
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("true for a via:jwt whoami response — the only shape this unauthenticated probe can ever get back", async () => {
+    const { hasAccessSession } = run(async () => ({ ok: true, json: async () => ({ via: "jwt" }) }));
+    expect(await hasAccessSession()).toBe(true);
+  });
+
+  // via:"bearer" is not reachable from this call site (no Authorization header is ever sent), so
+  // it's deliberately not treated as a pass here either — see the source comment.
+  test("false for a via:bearer whoami response, even though the panel itself does authorize that way", async () => {
+    const { hasAccessSession } = run(async () => ({ ok: true, json: async () => ({ via: "bearer" }) }));
+    expect(await hasAccessSession()).toBe(false);
+  });
+
+  test("false for a non-2xx", async () => {
+    const { hasAccessSession } = run(async () => ({ ok: false, json: async () => ({ via: "jwt" }) }));
+    expect(await hasAccessSession()).toBe(false);
+  });
+
+  test("false for a 200 that isn't genuinely our whoami shape", async () => {
+    const { hasAccessSession } = run(async () => ({ ok: true, json: async () => ({}) }));
+    expect(await hasAccessSession()).toBe(false);
+  });
+
+  test("false (not a throw) when fetch itself rejects", async () => {
+    const { hasAccessSession } = run(async () => {
+      throw new Error("network error");
+    });
+    expect(await hasAccessSession()).toBe(false);
   });
 });
 

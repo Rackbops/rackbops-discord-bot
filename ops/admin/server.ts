@@ -238,6 +238,10 @@ export interface BotOpsResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /** True when the process was killed for running past its own timeout, not for its own nonzero
+   * exit — lets handleRequest report a distinct 504 instead of a generic 502 (issue #53 item 1/2).
+   * Optional so every existing fixture literal across the test suite stays valid unchanged. */
+  timedOut?: boolean;
 }
 
 /**
@@ -268,6 +272,107 @@ export function buildInvocation(
     return { args: ["env-set"], stdin: body ?? "", contentType: "application/json" };
   }
   return undefined;
+}
+
+/**
+ * The two coordinated timeouts behind issue #53 item 1/2 — 120s comfortably outlasts 90s, giving a
+ * real subprocess timeout's 504 room to reach the client before Bun's own socket idleTimeout would
+ * cut the connection first. Exported as named constants (not inlined at their two call sites inside
+ * `import.meta.main`) so the actual values, and the margin between them, are test-pinned rather than
+ * only asserted by reading the code and its comments.
+ *
+ * Disclosed gap: `import.meta.main`'s own wiring of these into `Bun.spawn`/`Bun.serve` is NOT
+ * exercised by this test suite — nothing below `if (import.meta.main)` runs on import (see this
+ * file's own top comment), and a real end-to-end check of `idleTimeout` needs a live server and a
+ * request held open past it. `createRunBotOps` itself IS covered by a real subprocess test; only the
+ * two literal call sites that wire these constants into it and into `Bun.serve` are not.
+ */
+export const SUBPROCESS_TIMEOUT_MS = 90_000;
+export const IDLE_TIMEOUT_SECONDS = 120;
+
+/**
+ * Builds the real `runBotOps` implementation: spawns `bash <botOpsSh> <args>`, piping stdin/stdout/
+ * stderr, with a hard wall-clock timeout so a wedged subprocess (a hung dockerd, a slow image pull)
+ * can never hang a request forever (issue #53 item 2) — `Bun.serve`'s own `idleTimeout` is the other
+ * half of that fix, at the HTTP layer. `killSignal` defaults to SIGKILL: bot-ops.sh and the docker
+ * CLI it shells out to have no cleanup worth a SIGTERM grace period.
+ *
+ * Deliberately does NOT use `Bun.spawn`'s own `timeout`/`killSignal` options: those surface no
+ * dedicated "timed out" flag on the async `Subprocess` (only `spawnSync`'s result has one), and the
+ * obvious proxy — a non-null `signalCode` once `exited` resolves — is wrong, verified by probe: a
+ * process killed by an UNRELATED external signal (a redeploy handoff sending SIGTERM to this
+ * container's children, an OOM kill) also leaves a non-null `signalCode`, indistinguishable from our
+ * own timeout kill, which would mislabel it a "timeout" to the client and audit log when it wasn't
+ * one. Racing `exited` against our own timer instead means `timedOut` is set ONLY when this function
+ * itself decided to kill the process — never inferred from after-the-fact process state.
+ *
+ * `detached: true` (POSIX `setsid()` per Bun's own docs) makes the spawned `bash` the leader of its
+ * OWN process group, so the timeout kill below can target `-proc.pid` (the whole group) rather than
+ * just `proc.pid` (bash alone) — this is not cosmetic: bot-ops.sh's mutating subcommands run
+ * `docker compose ...` via command substitution, a real CHILD of bash, not a tail-call `exec`. Killing
+ * only bash leaves that child running and still holding the SAME stdout/stderr pipe FDs this function
+ * reads until EOF, so the `Promise.all` below would keep waiting for however long the orphaned
+ * `docker compose` call actually takes — not `opts.timeoutMs` — defeating the whole point of this
+ * function. Verified by review with a real subprocess (a plain `sleep 8` shaped exactly like
+ * `cmd_restart`'s `docker compose ... restart 2>&1`, `timeoutMs: 300`): killing just `proc` took the
+ * full ~8s to resolve despite `timedOut` correctly flipping true; killing the process group (verified
+ * separately against a real Linux kernel, since Windows has no such group-kill semantics — see the
+ * platform check below) resolves in well under a second. `process.kill` (not `proc.kill`) is what
+ * supports a negative-pid group target; Windows has no equivalent, so there this falls back to
+ * killing just the direct child — an accepted local-dev-only gap, since this admin panel only ever
+ * runs in a Linux container in production.
+ *
+ * Another disclosed, accepted gap from the same `detached` choice: in production (a container,
+ * `exec`-form CMD, no `init: true`, so Bun IS PID 1) this is a non-issue — Linux tears down the
+ * whole PID namespace, detached grandchildren included, the instant PID 1 exits, regardless of
+ * process-group membership. It only matters for the bare, non-compose `bun run server.ts` dev mode
+ * this file's `instanceName` fallback above already acknowledges as real: there, a detached child
+ * now survives a Ctrl+C to the dev terminal (SIGINT no longer reaches a process outside the
+ * terminal's own foreground process group), where it used to die along with the server. A wedged
+ * local `docker compose` from an interrupted request can outlive the dev server until its own
+ * subcommand finishes or 90s pass. Not fixed here: forwarding the server's own termination signals
+ * into every in-flight process group is real scope beyond what this timeout fix needs.
+ *
+ * Factored out of `import.meta.main` (not left inline, as it used to be) so the timeout itself is
+ * covered by a real, fast subprocess test rather than only asserted by reading the code.
+ */
+export function createRunBotOps(
+  botOpsSh: string,
+  opts: { timeoutMs: number; killSignal?: NodeJS.Signals },
+): (invocation: BotOpsInvocation) => Promise<BotOpsResult> {
+  return async (invocation) => {
+    const proc = Bun.spawn(["bash", botOpsSh, ...invocation.args], {
+      stdin: invocation.stdin !== undefined ? Buffer.from(invocation.stdin) : undefined,
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      const signal = opts.killSignal ?? "SIGKILL";
+      if (process.platform === "win32") {
+        proc.kill(signal);
+        return;
+      }
+      try {
+        process.kill(-proc.pid, signal); // negative pid: the whole process group, not just bash
+      } catch (err) {
+        // The dominant real case is a benign ESRCH (the group already fully exited on its own,
+        // right around the timeout boundary) — but an unexpected failure here silently falls back
+        // to killing just the direct child, which is exactly the round-2 bug this function fixes.
+        // Logged so a recurrence is visible rather than silently re-eating an orphaned grandchild.
+        console.error(`[admin] group kill failed (${err}) — falling back to the direct child only`);
+        proc.kill(signal);
+      }
+    }, opts.timeoutMs);
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]).finally(() => clearTimeout(timer));
+    return { exitCode, stdout, stderr, timedOut };
+  };
 }
 
 /** HTML-escapes a string for insertion into an HTML text/attribute context. */
@@ -384,11 +489,19 @@ export async function authorizeRequest(
 }
 
 /** A one-line audit description of who performed an action. The email when the JWT carried one;
- * otherwise a description of the path, since the bearer token and an email-less JWT genuinely
- * have no identity to name. */
+ * on an email-less JWT, a Cloudflare Access service-token's `common_name` claim (its Client ID) —
+ * the one identity such a token does carry (issue #53 item 5) — when present; otherwise a
+ * description of the path, since the bearer token and a claims-less JWT genuinely have no identity
+ * to name. */
 export function describeActor(auth: Authorization): string {
   if (auth.email) return auth.email;
-  return auth.via === "jwt" ? "an Access session (no email claim)" : "the ADMIN_TOKEN bearer token";
+  if (auth.via === "jwt") {
+    const commonName = auth.claims?.common_name;
+    return typeof commonName === "string" && commonName
+      ? `an Access session (service token "${commonName}")`
+      : "an Access session (no email claim)";
+  }
+  return "the ADMIN_TOKEN bearer token";
 }
 
 /** Best-effort: pulls the `changed` key list out of env-set's JSON stdout, so the audit line can
@@ -428,6 +541,18 @@ export function auditLogLine(
   if (result.exitCode === 0) {
     return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
   }
+  // A killed-for-timing-out env-set is the same "already mutated, don't lose the audit trail"
+  // concern issue #47 fixed for a failed recreate — but worse: bot-ops.sh's cmd_env_set rewrites
+  // .env FIRST and only emits its {changed,...} JSON after the (killable) `docker compose up -d
+  // --force-recreate` call returns, so a kill mid-recreate means stdout is empty and there is no
+  // changed-keys list to report — parseChangedKeys below would find nothing. Logging the bare fact
+  // of the timeout is strictly better than the silence that would otherwise follow a real mutation
+  // (issue #53 item 1/2 follow-up). Restart has no equivalent "already mutated before the slow
+  // part" step, but a timed-out restart attempt is still worth a line: the container may now be in
+  // a half-restarted state, and an operator investigating wants to know it was tried.
+  if (result.timedOut) {
+    return `[admin] ${action} timed out (killed after running past its limit) — attempted by ${describeActor(auth)}`;
+  }
   // A failed recreate after .env was already rewritten is still a real mutation worth attributing
   // (issue #47) — env-set's own JSON says what changed even though the exit code is non-zero.
   // Anything else non-zero (a bad value die()'d before touching .env, any restart failure) has
@@ -439,6 +564,13 @@ export function auditLogLine(
     }
   }
   return null;
+}
+
+/** The audit line for an admin-list mutation (add/remove) — the one mutation that grants panel
+ * access to a new identity previously left no audit trail at all (issue #53 item 3). Pure and
+ * exported, mirroring auditLogLine's shape, so the exact message is test-pinned. */
+export function adminAuditLine(action: "added" | "removed", email: string, auth: Authorization): string {
+  return `[admin] admins: ${action} ${email} by ${describeActor(auth)}`;
 }
 
 /** True when `text` parses as JSON — used on the failure path to prefer a subcommand's own JSON
@@ -515,6 +647,7 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
         if (!store.bootstrap.has(email) && !dynamic.has(email)) {
           dynamic.add(email);
           await store.writeDynamic(dynamic);
+          console.log(adminAuditLine("added", email, auth)); // issue #53 item 3
         }
         return await list();
       }
@@ -529,7 +662,10 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
           { status: 400 },
         );
       }
-      if (dynamic.delete(email)) await store.writeDynamic(dynamic);
+      if (dynamic.delete(email)) {
+        await store.writeDynamic(dynamic);
+        console.log(adminAuditLine("removed", email, auth)); // issue #53 item 3
+      }
       return await list();
     } catch (err) {
       // A store read failure (broken admins.json) or write failure (e.g. no config dir to
@@ -627,6 +763,11 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     // An env-set whose recreate step failed still mutated .env — attribute it (issue #47).
     const audit = auditLogLine(invocation, result, auth);
     if (audit) console.log(audit);
+    // A distinct 504 for "we killed it ourselves after it ran too long" — not lumped in with a
+    // generic 502, which is bot-ops.sh's own failure, a different condition (issue #53 item 1/2).
+    if (result.timedOut) {
+      return new Response("bot-ops.sh timed out", { status: 504 });
+    }
     // Prefer stdout when it parses as JSON: that's env-set's own result (backup path, compose
     // error) surviving a failed recreate. stderr stays the fallback for an early die() that never
     // wrote any stdout at all.
@@ -684,19 +825,7 @@ if (import.meta.main) {
     console.error(`[admin] couldn't read realms.json (WOW_REALM stays free-text): ${err}`);
   }
 
-  const runBotOps = async (invocation: BotOpsInvocation): Promise<BotOpsResult> => {
-    const proc = Bun.spawn(["bash", BOT_OPS_SH, ...invocation.args], {
-      stdin: invocation.stdin !== undefined ? Buffer.from(invocation.stdin) : undefined,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([
-      new Response(proc.stdout).text(),
-      new Response(proc.stderr).text(),
-      proc.exited,
-    ]);
-    return { exitCode, stdout, stderr };
-  };
+  const runBotOps = createRunBotOps(BOT_OPS_SH, { timeoutMs: SUBPROCESS_TIMEOUT_MS });
 
   const rawTeamDomain = process.env.CLOUDFLARE_ACCESS_TEAM_DOMAIN;
   const aud = process.env.CLOUDFLARE_ACCESS_AUD?.trim();
@@ -796,6 +925,9 @@ if (import.meta.main) {
     : undefined;
 
   const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, runBotOps, verifyAccessJwt, adminStore };
-  Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config) });
+  // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
+  // restart/env-set request out from under the client while bot-ops.sh is still legitimately
+  // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.
+  Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config), idleTimeout: IDLE_TIMEOUT_SECONDS });
   console.log(`[admin] listening on :${PORT}`);
 }
