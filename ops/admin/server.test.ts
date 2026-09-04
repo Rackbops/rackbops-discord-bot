@@ -1,10 +1,4 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-
-// #82 acceptance testing: deliberately failing test, reverted once the Test step is confirmed
-// to fail and report non-zero.
-test("THROWAWAY: deliberately fails to verify CI's Test step catches it", () => {
-  expect(true).toBe(false);
-});
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
