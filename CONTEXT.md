@@ -197,6 +197,27 @@ _Avoid_: character data (doesn't say "whole thing, replaced wholesale, not merge
   empty string, so a misconfigured `--profile admin` run still fails clearly — from Docker
   itself at container-creation time, once `admin` is actually the profile being brought up —
   rather than breaking every other profile's `config`/`up` in the same file.
+- **`ops/install.sh` resolves a `DEPLOY_UID`/`DEPLOY_GID` once, up front, rather than trusting
+  `id -u`/`id -g` at each chown site.** `curl | bash -s -- prod` (the normal flow) runs entirely
+  as the invoking non-root user — `sudo` is only invoked *internally*, by `bootstrap_dir`, for the
+  one-time `/opt` escalation. But `curl | sudo bash -s -- prod` (piping the whole interpreter
+  through `sudo`) makes `id -u` report 0 for the *entire* script, not just that one escalation, so
+  every file it creates — not only what `bootstrap_dir` chowns — would otherwise end up
+  root-owned. `SUDO_UID`/`SUDO_GID` (set by `sudo` itself, never the operator) name who actually
+  invoked it; with no `sudo` in the picture at all there's no real user to hand ownership to, so
+  install.sh refuses outright rather than deploying an instance only root can maintain (issue
+  #54). Every chown site (`bootstrap_dir`, `fetch()`, the `STACK_ENV_TMP` write, `backups/`) uses
+  the resolved `$DEPLOY_UID:$DEPLOY_GID` unconditionally — in the normal non-root path this just
+  equals the current user's own ids, and chowning a file to its own owner is always a safe no-op.
+- **`cloudflared`'s `TUNNEL_TOKEN` is sourced the same way `admin`'s secrets are — named-var
+  Compose interpolation, exported by hand out of `$CONFIG_DIR/.env` — not `env_file:`.**
+  `env_file: ${BOT_ENV_FILE:-.env}` would load *every* secret in the instance's `.env`
+  (`DISCORD_TOKEN`, `BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`) into the `cloudflared` container's
+  process environment wholesale, and would still need an entrypoint rewrite to rename
+  `CLOUDFLARE_TUNNEL_TOKEN` to the `TUNNEL_TOKEN` name the `cloudflared` binary itself expects —
+  the same anti-pattern the `admin` service's own comment already rejects for itself.
+  `ops/install.sh`'s printed next-steps read the value out of `.env` with the same
+  `grep '^KEY=' ... | cut -d= -f2-` one-liner already used for `ADMIN_TOKEN` (issue #54).
 - **The redeploy order is inverted on purpose (#879), and the reason is a kernel boundary.** Every
   "shut down, then have something bring the replacement up" variant dies on the same thing: a
   detached process (`setsid`, double fork, `Bun.spawn({ detached: true })`) leaves its *parent*, not

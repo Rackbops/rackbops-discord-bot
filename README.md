@@ -162,8 +162,22 @@ to the internet without opening any inbound firewall ports.
 2. Set `CLOUDFLARE_TUNNEL_TOKEN` and `WARBANDEER_INGEST_PORT` in `.env`.
 3. Start it alongside the bot:
 
+   **Local dev** (a checkout's own `.env` beside `docker-compose.yml` is Compose's interpolation
+   source, so the token above resolves automatically):
+
    ```
    GIT_SHA=$(git rev-parse HEAD) docker compose --profile tunnel up -d --build
+   ```
+
+   **A deployed instance** (`ops/install.sh` never puts secrets in the stack directory's own
+   `.env`, so `CLOUDFLARE_TUNNEL_TOKEN` needs exporting explicitly out of the instance's real
+   `.env` — the exact command, with this instance's real paths already filled in, is also
+   printed by `ops/install.sh` itself at the end of a fresh bootstrap):
+
+   ```
+   CLOUDFLARE_TUNNEL_TOKEN=$(grep '^CLOUDFLARE_TUNNEL_TOKEN=' /opt/rackbops-discord-bot/<instance>/.env | cut -d= -f2-) \
+     docker compose -f /opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml \
+       -p rackbops-discord-bot-<instance> --profile tunnel up -d --build cloudflared
    ```
 
    Without `--profile tunnel`, the sidecar doesn't start — a normal `docker compose up` is unaffected and doesn't need the token.

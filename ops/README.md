@@ -324,7 +324,9 @@ falls back to a plain text input.
 `bot-ops.sh` itself; `ops/install.sh`'s printed output includes the exact command, which names
 the `admin` service explicitly so it never rebuilds or recreates the running `bot` container).
 It runs as its own sidecar, independent of the bot process's lifecycle — if the bot crashes, the panel
-stays up to show that and let you restart it. No published host port: it's reachable only via
-the `cloudflared` sidecar on the same compose network, which is itself gated by Access — so
-until a tunnel actually routes to it, bringing the profile up just starts a service nothing
-outside that network can reach.
+stays up to show that and let you restart it. No published host port: it's reached over the
+network via nucbox's own pre-existing, host-level Cloudflare tunnel (an ingress rule pointed at
+this service — see "Two doors" above), **not** via this compose file's own opt-in `cloudflared`
+sidecar (that one is a separate tunnel dedicated to `WARBANDEER_INGEST_PORT` — see the Cloudflare
+Tunnel section in the root README) — so until nucbox's tunnel has an ingress rule for it, bringing
+the profile up just starts a service nothing outside the compose network can reach.
