@@ -12,13 +12,46 @@
 > release pipeline); self-update was repointed at this fork accordingly — see the **Fork
 > gotchas** entry below for what's still open.
 
+## Language
+
+**Link Code**:
+A short-lived (~10 min), single-use code minted by `/link` and entered into the Warbandeer
+desktop app to authorize a Device Token. Not itself a credential for pushing character data —
+only for redeeming one, once.
+_Avoid_: linking code, auth code, pairing code
+
+**Device Token**:
+The long-lived bearer credential the desktop app receives by redeeming a Link Code, sent on
+every later character push. The bot persists only a hash of it, never the plaintext. Distinct
+from a Link Code: long-lived and repeatable vs. short-lived and single-use.
+_Avoid_: API key, access token
+
+**Account Label**:
+An operator-chosen name identifying one WoW account (not a Discord account, not a Battle.net
+account) within a Linked Account — e.g. `"Main"` or `"Alts"`. One Discord User can hold several,
+one per WoW account or per desktop install that has linked.
+_Avoid_: account (bare — always ambiguous between a Discord account and a WoW account)
+
+**Linked Account**:
+The persisted association between a Discord User and one Account Label: its Device Token hash,
+the Character Snapshot it last pushed, and when. Created by redeeming a Link Code; removed by
+`/unlink`. A Discord User's links are a list of these, not a single record.
+_Avoid_: link, character link (the *act* of creating one is "linking"; the noun is a Linked
+Account)
+
+**Character Snapshot**:
+The full character-data payload one push replaces its Linked Account's prior snapshot with —
+never a diff or an append. Shaped after the desktop app's own `CharDb` (warband gold, and
+per-character level/spec/professions/gear ilvl/currencies/playtime/reputations).
+_Avoid_: character data (doesn't say "whole thing, replaced wholesale, not merged")
+
 ## File Map
 
 | File | Responsibility |
 |---|---|
 | `src/index.ts` | Client login (Guilds intent only), then `activate()` — slash-command registration (guild if `DISCORD_SERVER_ID`, else global), the interaction routes (chat commands → `handleCommand`, `/report` modal submits → `handleReportModal`), the scheduler, and `reportUpdateOutcome()` fired un-awaited (an owed `/update` follow-up must not delay startup). Under `resolveBootMode() === "standby"` (#879, confirmed against the daemon since #46) it logs in and attaches **none** of that until `takeOver()` has retired the original — both instances hold the same token and Discord delivers events to both sessions, so a standby with handlers would double every reply. A standby that never reaches `ClientReady` inside `VERIFY_DEADLINE_MS` writes a `failed` marker and exits 1, so the original gets a reason rather than a timeout |
 | `src/config.ts` | Env config from `.env` — pure `resolveConfig(env)` (exported for tests) + the `config` singleton resolved from `process.env`; throws at import time on missing required vars, an invalid `COMMAND_PREFIX`, or a `DMF_TIMEZONE` `Intl.DateTimeFormat` doesn't recognize as a real IANA zone (issue #43 — otherwise `dmf.ts` throws on it at the first scheduler tick instead of the bot refusing to boot). Also the `/report` project→repo map (`REPORT_PROJECTS` + `repoForProject`) + `reportRoleId`, the release-watch list (`watchedRepos` from `WATCHED_REPOS`, comma-separated `owner/repo`, defaulting to `[githubRepo]` — distinct from `githubRepo`, which anchors self-update), and the self-update config (`gitSha`, `botBranch`, `autoUpdate`, `adminUserIds`) |
-| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/update`, `/report` command builders + dispatch; `cmd(name)` builds every command under `config.commandPrefix`, `bareName()` strips it back off on dispatch; `isAdmin()` allowlist gate for `/update`; `updateReply(decision, latestSha, { runningSha, reason, redeploy })` (exported for tests) renders the `/update` acknowledgement — a `redeploy` result present at all means the swap **failed**, since a successful one never returns to reply (the replacement retires this process and delivers the ✅ itself) — the running sha is a **parameter, not a `config` read**, because config resolves env at import time and is one singleton for the whole bun test process, so a formatter reading it is only testable by winning a race with whichever test file imports config first; dispatch passes the interaction's user/channel/application/token to `checkForUpdate` as the follow-up requester; Discord `<t:…>` timestamp helpers |
+| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/update`, `/report`, `/link`, `/unlink` command builders + dispatch (the latter two delegate to `src/warbandeer/link-command.ts`, issue #3); `cmd(name)` builds every command under `config.commandPrefix`, `bareName()` strips it back off on dispatch; `isAdmin()` allowlist gate for `/update`; `updateReply(decision, latestSha, { runningSha, reason, redeploy })` (exported for tests) renders the `/update` acknowledgement — a `redeploy` result present at all means the swap **failed**, since a successful one never returns to reply (the replacement retires this process and delivers the ✅ itself) — the running sha is a **parameter, not a `config` read**, because config resolves env at import time and is one singleton for the whole bun test process, so a formatter reading it is only testable by winning a race with whichever test file imports config first; dispatch passes the interaction's user/channel/application/token to `checkForUpdate` as the follow-up requester; Discord `<t:…>` timestamp helpers |
 | `src/report.ts` | `/report` flow: role gate (reads roles from the interaction — no Members intent), Title/Description modal, then `createIssue` in the mapped repo labeled `automated`; `reportBody` footer names the reporter (plain username, no mention); pure `reportAnnouncement()` renders the channel-visible confirmation (reporter, `repo#N` + url, title, description clamped to Discord's 2000-char cap with a truncation note) |
 | `src/announce.ts` | 60 s tick scheduler: DMF-open (`checkDmf` is a thin wrapper around `decideDmfAnnouncement`, mirroring `checkRealm`/`checkReleases`'s delegation to a pure decide function) + weekly-reset announcements, continuous realm up/down watch (`checkRealm`, polls every `REALM_POLL_GAP_MS` = 2 min whenever `realmWatchConfigured()`), release polling (`checkReleases` loops `config.watchedRepos`, isolating each repo's failure via a per-repo try/catch so one bad repo can't starve the others; a repo `fetchReleases` reports unreachable is skipped without touching its seen-id list — so it seeds silently if it returns — and warns only on the edge, via the module-level `releaseReachability` log); routes per `AnnounceKind` via `channelFor()` — releases → `RELEASE_ANNOUNCE_CHANNEL_ID` (falls back to `ANNOUNCE_CHANNEL_ID`), everything else → `ANNOUNCE_CHANNEL_ID`. `runTick(checks)` (issue #43, exported) generalizes `checkReleases`'s own per-repo isolation to the whole tick — `onTick` runs all five checks (dmf/weeklyReset/realm/releases/autoUpdate) through it, so one throwing (a bad `DMF_TIMEZONE` used to be the reachable case, before `config.ts` started validating it) can no longer starve the rest of that tick |
 | `src/config.test.ts` | bun tests for `resolveConfig` (release-channel fallback, required-var, region, `COMMAND_PREFIX`, `DMF_TIMEZONE`'s per-region default/real-zone-accept/non-zone-reject, `REPORT_ROLE_ID`, `WATCHED_REPOS` parse/default, self-update vars) + report helpers (`repoForProject`, `reportBody`, `reportAnnouncement` — content, no-truncation-when-it-fits, the 2000-char clamp, and the boundary either side of it) |
@@ -55,6 +88,12 @@
 | `ops/bot-ops.test.ts` | bun tests that spawn the real `ops/bot-ops.sh` (bash + jq from the host, a fake `docker` shim first on PATH that only logs its argv) against a throwaway config dir: `env-get`'s compose-style read of `.env` (last duplicate wins, `export`, CRLF, quotes, trimming) and `env-set`'s diff-then-validate order (issue #44) — an unchanged out-of-regex value never blocks, a changed invalid one still fails naming the key, differently-spelled-but-equal values are a no-op with no recreate, an `export`ed key is rewritten in place, a real change backs up + rewrites + recreates once. Skips loudly when bash/jq are absent. Discovered by the root `bun test` like `ops/admin/server.test.ts` |
 | `ops/install.sh` | Curl-able bootstrap for a fresh instance (`debug`/`prod`) with no checkout on the host — creates the config dir (`.env` from `.env.example`, never overwritten on re-run, `ADMIN_TOKEN` generated fresh into it), the shared `bin/bot-ops.sh`, the Dockge-managed stack dir's compose file, and that same stack dir's own `.env` (Compose's interpolation source, not the bot's config — see the gotcha) — the latter three always refreshed. Prints the `up -d --build` invocation, plus the optional `--profile admin` one. See `ops/README.md` |
 | `ops/admin/` (`server.ts` + `public/index.html` + `Dockerfile`) | Small per-instance admin web panel — an authenticated, thin wrapper around `ops/bot-ops.sh`'s five operations, nothing new. `server.ts`'s auth check, route→subcommand mapping, and request handler are pure/DI'd (`HandlerConfig` injects `runBotOps`, matching `updateReport.ts`'s injected-deliverer shape) so `server.test.ts` covers them without a real subprocess; only the `import.meta.main` block at the bottom does real I/O (spawns `bot-ops.sh`, binds the port). `public/index.html` is a single self-contained file, no build step — its config form renders from whatever `GET /api/env` returns rather than a hardcoded field list, and Save posts only the changed keys (pure `planEnvSave`, which `server.test.ts` lifts from the page source and pins — issue #44). See `ops/README.md`'s Admin panel section for the two-door auth model |
+| `src/warbandeer/` | The Warbandeer desktop-app connector (issue #3) — see `docs/adr/0001`–`0003` for why each piece is shaped the way it is. A top-level module, sibling to `src/wow/` rather than inside it, per `PURPOSE.md`'s plugin direction |
+| `src/warbandeer/links.ts` | Link Code + Device Token domain logic and its own storage (`data/links.json`, gitignored). Pure functions (`mintLinkCode`, `redeemLinkCode`, `upsertLinkedAccount`, `removeLinkedAccount`, `touchLinkedAccount`, `findAccountByToken`) operate on a `LinksState` value; `links`/`saveLinks()` is the live singleton, mutated in place by callers exactly like `state.ts`'s `state` (read a pure function's result, reassign the singleton's fields, `await saveLinks()`). `hashToken`/`verifyToken` use `node:crypto`'s `timingSafeEqual` — reimplemented here rather than imported from `ops/admin/server.ts`'s `tokensMatch`, since `ops/admin/` is a separate Bun sub-project. Minting a code invalidates any prior unredeemed code for the same Discord User; redeeming burns the code on any match attempt, including a failed one against an expired code |
+| `src/warbandeer/characters.ts` | Character Snapshot validation (`validateCharacterPayload` — payload-shape caps: string length, array length, object key count, nesting depth; no library, hand-rolled) and storage: one file per Discord User (`data/characters/<id>.json`, gitignored), a push replacing its Account Label's prior snapshot wholesale. `accountLabel` is always the authenticated token's own, passed in as a parameter — never trusted from the request body. Path-parameterized primitives (`loadCharacterSnapshotsFrom`/`saveCharacterSnapshotTo`) mirror `state.ts`'s split, so tests use a temp dir |
+| `src/warbandeer/server.ts` | The ingest `Bun.serve` HTTP server — `POST /link` (redeem a Link Code for a Device Token), `POST /characters` (bearer-authenticated push). `handleRequest(req, clientIp, deps)` is pure/DI'd exactly like `ops/admin/server.ts`'s handler; `startWarbandeerServer(port, deps?)` is the only thing touching `Bun.serve` (called from `index.ts`'s `activate()`, inside a try/catch, only when `warbandeerConnectorConfigured()`; a bind failure is logged and the bot keeps running — `warbandeerServerRunning()` then reports the true runtime state, distinct from "configured"), returns the real bound port so `deps` can be omitted (production) or supplied (tests, port `0` for an OS-assigned free one). Payload size is capped before parsing: `Content-Length` checked first, then the body is streamed via `req.body.getReader()` and the read aborted the moment the running total crosses the cap — `Bun.serve`'s own `maxRequestBodySize` is set well ABOVE this app-level cap (4x), never equal to it, since Bun enforces its own limit at the transport layer before `fetch` even runs and an equal value means Bun's reset (`ECONNRESET`) wins the race instead of this module's clean `413`. Two separate `RateLimiter`s: `rateLimiter` (tight — per-IP for `/link`, per-token for `POST /characters` post-auth) and `authFailureLimiter` (a ~10x looser per-IP bucket checked on `/characters` *before* authentication, so a flood of garbage bearer tokens is bounded without several legitimate users behind one shared address colliding — it's charged on every request that reaches it, success or failure, so it mitigates rather than eliminates that collision risk). `createProductionDeps(overrides?)` binds to the real `links` singleton and `characters.ts`'s `CHARACTERS_DIR` by default; `overrides` (`linksState`/`persistLinks`/`charactersBaseDir`) exists so `server.test.ts` can exercise the real auth+persistence wiring against throwaway state instead |
+| `src/warbandeer/link-command.ts` | `/link` (mints a code, ephemeral reply) and `/unlink` (optional `account_label`; zero/one/many-accounts branches). Self-service — no admin/role gate, since a user only ever acts on their own `interaction.user.id`. Pure, exported `linkReply()`/`unlinkReply()` are unit-tested directly, mirroring `updateReply()`'s/`report.ts`'s pure-formatter style |
+| `src/warbandeer/storage.ts` | Shared atomic-JSON-file primitives — `writeJsonAtomic`/`readJsonOrFresh` (the same temp-file-then-rename + corrupt-file-moved-aside pattern `state.ts` established) plus two ways to serialize concurrent access: `createJsonWriter` (one file, whole-value writes — `links.ts` uses this) and `createKeyedJsonMutator` (many files, each identified by path, and — unlike `createJsonWriter` — serializes the READ that precedes the write too, not just the write itself; `characters.ts` uses this, since a naive read-modify-write let two concurrent pushes for the same Discord User silently lose one's data). `writeJsonAtomic` alone is NOT safe for two callers racing the same path (fixed `.tmp` name) — every real caller reaches it only through one of these two wrappers |
 
 ## Behavior
 
@@ -80,6 +119,11 @@
   the build it actually came back on — `updated` / `noop` / `unexpected` named explicitly, since
   the no-op is otherwise indistinguishable from success. Only a `/update`-initiated restart leaves
   a report, so `AUTO_UPDATE` exits and host reboots stay silent.
+- **Character linking** (`src/warbandeer/`, issue #3) is off by default — `/link` mints a code
+  only when `WARBANDEER_INGEST_PORT` is set; otherwise it replies that linking isn't configured.
+  When on: `/link` → the desktop app redeems the code for a Device Token → every later character
+  push replaces that Account Label's prior Character Snapshot wholesale (never merged). See
+  `docs/adr/0001`–`0003` for why it's shaped this way.
 
 ## Gotchas
 
@@ -102,10 +146,10 @@
     below), which neither app's `ops.json` has a field for yet. Tracked as
     [roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197) (the design
     doc's Q4: `opsCmd`/`configDir` fields).
-  - No CI: `.github/workflows/discord-bot-test.yml` lived at the monorepo root, so the
-    path-scoped extraction didn't carry it over. `bun run check` + `bun test` (referenced
-    elsewhere in this doc as CI-enforced) need to be run by hand until a workflow is added
-    here.
+  - ~~No CI~~ — **resolved**: `.github/workflows/ci.yml` now runs `bun run check` + `bun test`
+    on every pull request (`on: pull_request` — not a direct push to `main`), a fork-native
+    workflow rather than a carry-over of the original monorepo's path-scoped
+    `discord-bot-test.yml`.
 - **Config dir and compose file are two independent, required locations — never derived from
   each other or from a checkout.** `/opt/rackbops-discord-bot/<instance>/` holds `.env` +
   `backups/` (operator-precious, never auto-migrated — see `ops/README.md`); `.env` is never
@@ -377,17 +421,26 @@
   survive the exit (a Discord reply, a state write) has to run inside `withCritical()`. The
   `/update` handler wraps its `checkForUpdate` for exactly this reason; without it the process
   dies before `editReply` lands.
-- Run `bun run check` (tsc) and `bun test` after changes. In the original monorepo CI ran
-  both on every PR/push touching this app (`.github/workflows/discord-bot-test.yml`,
-  path-scoped) — that workflow lived at the monorepo root, so it wasn't carried over by the
-  fork's extraction (see **Fork gotchas**); this repo has no CI yet, so run both by hand.
-  No lint beyond tsc.
-- **`cloudflared` currently has nothing to route to** — the bot exposes no HTTP port yet
-  (that's the desktop-app API work, tracked separately). It's pure plumbing for now: an
-  opt-in sidecar (`--profile tunnel`) that joins the bot's Compose network, so a future
-  local server is reachable at `http://bot:<port>` once one exists and a public hostname
-  is mapped to it in the Cloudflare dashboard. The bot process itself never reads
+- Run `bun run check` (tsc) and `bun test` after changes. `.github/workflows/ci.yml` now runs
+  both on every pull request (`on: pull_request` only — a direct push to `main` runs no CI)
+  (`bun install --frozen-lockfile`, `bun run check` for both projects, one
+  root `bun test`) — the fork's own CI, not carried over from the original monorepo's
+  path-scoped `discord-bot-test.yml` (see **Fork gotchas**). No lint beyond tsc.
+- **`cloudflared` now has something to route to**: `src/warbandeer/server.ts`'s ingest
+  endpoint, once `WARBANDEER_INGEST_PORT` is set (issue #3). The sidecar itself is still
+  opt-in (`--profile tunnel`) and unchanged in shape — it joins the bot's Compose network, so
+  the server is reachable at `http://bot:<WARBANDEER_INGEST_PORT>` once a public hostname is
+  mapped to it in the Cloudflare dashboard. The bot process itself never reads
   `CLOUDFLARE_TUNNEL_TOKEN` — only the sidecar container does.
+- **Every `*.test.ts` under `src/warbandeer/` that reaches `server.ts` (directly or via
+  `link-command.ts`) hits the same `config` singleton gotcha as `update.ts`/`commands.ts`**
+  (see the general note below) — `server.test.ts` and `link-command.test.ts` both prime
+  `DISCORD_TOKEN`/`ANNOUNCE_CHANNEL_ID` and use a dynamic `await import()` for exactly this
+  reason. `links.ts`/`characters.ts`/`storage.ts` have no `config` dependency and don't need it.
+- **A `POST /characters` push's `accountLabel` always comes from the authenticated Device
+  Token's own Linked Account, never from the request body.** `validateCharacterPayload` takes
+  it as a parameter rather than reading `raw.accountLabel` — a client authenticated as one
+  account can't claim to be pushing data for a different one.
 - Every `*.test.ts` that reaches the `config` singleton (directly or transitively — `update.ts`
   and `commands.ts` both do) must prime `DISCORD_TOKEN`/`ANNOUNCE_CHANNEL_ID` and use a dynamic
   `await import()`, or it throws when run **standalone**. A full-suite `bun test` can mask this:

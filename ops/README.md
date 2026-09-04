@@ -88,7 +88,7 @@ re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved v
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
 `ADMIN_USER_IDS`, `WOW_REALM`, `WOW_REGION`, `WATCHED_REPOS`, `DMF_TIMEZONE`, `AUTO_UPDATE`,
-`BOT_BRANCH`, `COMMAND_PREFIX` — listed in `ALLOWED_ORDER`, the order the admin panel displays
+`BOT_BRANCH`, `COMMAND_PREFIX`, `WARBANDEER_INGEST_PORT` — listed in `ALLOWED_ORDER`, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
 key back to its documented default.

@@ -234,7 +234,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const stored = 'ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=11111\n';
     const fx = setup(stored);
     const body = await fullBody(fx, { ANNOUNCE_CHANNEL_ID: "22222" });
-    expect(body.split("\n")).toHaveLength(12); // every whitelisted key echoed, like the old panel
+    expect(body.split("\n")).toHaveLength(13); // every whitelisted key echoed, like the old panel
     const run = await botOps(fx, ["env-set"], body);
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });

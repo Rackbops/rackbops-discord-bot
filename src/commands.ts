@@ -20,6 +20,8 @@ import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./upda
 import { withCritical } from "./restart";
 import { handoffFailureMessage } from "./handoff";
 import type { RedeployResult } from "./redeploy";
+import { handleLinkCommand, handleUnlinkCommand } from "./warbandeer/link-command";
+import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
 
 const ts = (d: Date, style: "F" | "R" = "F") => `<t:${Math.floor(d.getTime() / 1000)}:${style}>`;
 const when = (d: Date) => `${ts(d)} (${ts(d, "R")})`;
@@ -77,6 +79,19 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .setDescription("Restart the bot to pick up the latest build (admins only)")
     // Hides it from non-admins in the UI. Defence in depth — the ID allowlist is the gate.
     .setDefaultMemberPermissions(0),
+  cmd("link").setDescription("Link the Warbandeer desktop app to your Discord account"),
+  cmd("unlink")
+    .setDescription("Unlink a Warbandeer desktop account from your Discord account")
+    .addStringOption((o) =>
+      o
+        .setName("account_label")
+        .setDescription("Which linked account (only needed if you have more than one)")
+        .setRequired(false)
+        // Sourced from characters.ts's own constant, not a repeated literal — without this,
+        // Discord's own 6000-char default lets a value through that unlinkReply() can't fit into
+        // a 2000-char reply.
+        .setMaxLength(MAX_ACCOUNT_LABEL_LENGTH),
+    ),
 ].map((c) => c.toJSON());
 
 export async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -180,6 +195,14 @@ export async function handleCommand(interaction: ChatInputCommandInteraction): P
     }
     case "report": {
       await handleReportCommand(interaction);
+      return;
+    }
+    case "link": {
+      await handleLinkCommand(interaction);
+      return;
+    }
+    case "unlink": {
+      await handleUnlinkCommand(interaction);
       return;
     }
   }

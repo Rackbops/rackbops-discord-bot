@@ -24,6 +24,9 @@ export interface Config {
   adminUserIds: string[];
   reportRoleId?: string;
   commandPrefix: string;
+  /** Port the Warbandeer connector's ingest server binds inside the container. Unset = the
+   * connector doesn't start at all (`/link` reports itself disabled) — see docs/adr/0001. */
+  warbandeerIngestPort?: number;
 }
 
 /** `/report` project token → GitHub `owner/repo`. The slash-command choices are built from
@@ -94,6 +97,16 @@ export function resolveConfig(env: Env): Config {
     throw new Error(`DMF_TIMEZONE is not a valid IANA time zone, got "${dmfTimezone}"`);
   }
 
+  const warbandeerIngestPortRaw = optional("WARBANDEER_INGEST_PORT");
+  let warbandeerIngestPort: number | undefined;
+  if (warbandeerIngestPortRaw !== undefined) {
+    const n = Number(warbandeerIngestPortRaw);
+    if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+      throw new Error(`WARBANDEER_INGEST_PORT must be a valid port number, got "${warbandeerIngestPortRaw}"`);
+    }
+    warbandeerIngestPort = n;
+  }
+
   return {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
@@ -113,6 +126,7 @@ export function resolveConfig(env: Env): Config {
     adminUserIds: list("ADMIN_USER_IDS"),
     reportRoleId: optional("REPORT_ROLE_ID"),
     commandPrefix,
+    warbandeerIngestPort,
   };
 }
 

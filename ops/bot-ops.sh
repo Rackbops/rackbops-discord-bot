@@ -120,6 +120,11 @@ declare -A ALLOWED=(
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
+  # The real 1-65535 range, not just "1-5 digits": env-set's --force-recreate runs BEFORE the
+  # container boots far enough to hit config.ts's own rejection, so a looser shape check here
+  # (0, 00000, 99999) would recreate the bot straight into a crash loop under
+  # restart:unless-stopped rather than refusing the save up front.
+  [WARBANDEER_INGEST_PORT]='^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$'
 )
 
 # Keys env-set must refuse to blank — the exception to ALLOWED's "empty string is always allowed"
@@ -149,6 +154,7 @@ ALLOWED_ORDER=(
   AUTO_UPDATE
   BOT_BRANCH
   COMMAND_PREFIX
+  WARBANDEER_INGEST_PORT
 )
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
