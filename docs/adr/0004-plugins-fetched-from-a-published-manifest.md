@@ -10,8 +10,10 @@ it: `src/warbandeer/links.ts:215` is an unconditional top-level `await` reached 
 `data/links.json` at every boot; and a self-update replacement snapshots `links` at module load —
 before `takeOver()` — while the original keeps serving `/link`, `/unlink` and the ingest endpoint
 (`beginHandoff()`, `src/restart.ts:63-66`, only quiesces the scheduler via `restartPending()`,
-`src/announce.ts:151`) for up to `VERIFY_DEADLINE_MS` (`src/handoff.ts`), so the replacement's
-first whole-file `saveLinks()` overwrites whatever the original wrote in that window.
+`src/announce.ts:151`, and refuses a second `/update` via `handoffActive()`) for the length of the
+handoff — bounded by `VERIFY_DEADLINE_MS` (`src/handoff.ts:22`) plus boot-mode resolution and the
+retire step — so the replacement's first whole-file `saveLinks()` overwrites whatever the original
+wrote in that window.
 
 Two more constraints shape the answer. Gateway intents are frozen when the client is constructed
 (`node_modules/discord.js/src/client/Client.js:544`: `new IntentsBitField(options.intents).freeze()`),
@@ -19,9 +21,9 @@ and `src/index.ts:12` constructs it before login — so whatever a plugin needs 
 come from plugin code. And the bot repo must stay forkable without plugin baggage: a plugin's code,
 tests, changelog and release cadence belong to the plugin, not to this repo.
 
-Research: `docs/research/2026-09-04-plugin-architecture.md` (its §2 extension-point inventory and
-§6 shipped-identifier constraints are the reference; its in-repo-registry recommendation is what this
-ADR supersedes). Design epic: #95.
+Research: `docs/research/2026-09-04-plugin-architecture.md` (its §2 extension-point inventory, §4
+isolation/versioning/DI findings, §5 discord-ai shape notes and §6 shipped-identifier constraints are
+the reference; its in-repo-registry recommendation is what this ADR supersedes). Design epic: #95.
 
 **Decision:** plugins are **single-file bundles published to npm from a separate repo**
 (`Rackbops/bot-plugins`, packages `@rackbops/plugin-<name>`), described by a **Plugin Index** that
@@ -74,12 +76,15 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    chooses now, a scheduled time, remind me later, or skip this version — from Discord or the admin
    panel. There is no auto-update flag. `PLUGINS=name@version` is a hard pin. Compatibility is
    `hostApiVersion === HOST_API_VERSION`, integer equality.
-6. **Storage.** `HostApi.storage` hands over `src/storage.ts`'s primitives and `HostApi.dataDir` is
-   the same `data/` directory, so `data/links.json` and `data/characters/` keep their paths — the
+6. **Storage.** `HostApi.storage` hands over the storage primitives (today
+   `src/warbandeer/storage.ts`, promoted to `src/storage.ts` when the connector moves out) and
+   `HostApi.dataDir` is the same `data/` directory, so `data/links.json` and `data/characters/` keep their paths — the
    desktop-app contract and the operator's data do not move.
 7. **No `Client` in the Host API.** The host owns every gateway listener, which is what keeps the
    standby invariant (`CONTEXT.md`: "The standby attaches nothing") enforceable, and a fake host is all
-   a plugin's tests need. An HTTP plugin keeps its own `Bun.serve` on its own port env; a host-owned
+   a plugin's tests need. It is a declared-dependency boundary, not a sandbox: a command handler's
+   `interaction.client` still reaches the live `Client` (a handler only ever runs after the host
+   attached the listener inside `activate()`). An HTTP plugin keeps its own `Bun.serve` on its own port env; a host-owned
    router and a stop/dispose hook are additive later.
 8. **Commands register on every boot** from core + loaded plugins; a removed plugin's commands
    vanish through the existing bulk `rest.put` overwrite (`src/index.ts:34-41`).
@@ -108,7 +113,7 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
 ## Consequences
 
 The trust statement above is the security boundary — worth stating plainly, since "installed from
-a manifest" can read as "sandboxed". A plugin's TypeScript is checked in the plugins repo, not by
+the Plugin Index" can read as "sandboxed". A plugin's TypeScript is checked in the plugins repo, not by
 this repo's `bun run check`; native dependencies are not supported (bundles); a boot with no network
 runs whatever is cached. A disabled plugin's code never runs, and nothing plugin-side runs on a
 standby. The image build needs no change and no credentials (`README.md:82` — the daemon fetches

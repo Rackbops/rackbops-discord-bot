@@ -221,3 +221,4 @@ settings in the dashboard.
 | `src/warbandeer/links.ts` | Link Code + Device Token model (`data/links.json`) |
 | `src/warbandeer/characters.ts` | Character Snapshot validation + storage (`data/characters/`) |
 | `src/warbandeer/storage.ts` | Shared atomic JSON read/write, used by `links.ts`/`characters.ts` |
+| `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |

@@ -50,7 +50,8 @@ A self-contained feature unit the bot installs from the Plugin Index by name: a 
 exporting `createPlugin(host)`, contributing slash commands (built on a host-named builder so they
 land under `COMMAND_PREFIX`), optional scheduler ticks, and an `activate()` that runs once, after
 `takeOver()`. It never reaches `config`, the `Client` or `data/` directly — everything comes through
-the Host API. First one: the Warbandeer connector. See `docs/adr/0004`.
+the Host API. The first one will be the Warbandeer connector — still baked in today (#100 moves it
+out). See `docs/adr/0004`.
 _Avoid_: module, extension, integration, feature flag, connector (the connector is *a* plugin —
 "connector" names the desktop-app feature, not the packaging)
 
@@ -63,8 +64,9 @@ _Avoid_: manifest (bare — ambiguous with a package manifest), registry, catalo
 
 **Host API**:
 The object handed to a plugin's `createPlugin`: `name`, its declared `env` slice, `dataDir`, a
-prefixed `log`, `storage`, `announce`. The only door from a plugin into the bot; versioned by the
-integer `HOST_API_VERSION`.
+prefixed `log`, `storage`, `announce`. The only door the host *offers* a plugin — a
+declared-dependency boundary, not a sandbox (a command handler's `interaction.client` still reaches
+the live `Client`); versioned by the integer `HOST_API_VERSION`.
 _Avoid_: context, container, services, host (bare)
 
 **Plugin State**:
@@ -123,8 +125,8 @@ _Avoid_: plugin list, cache
 | `src/warbandeer/server.ts` | The ingest `Bun.serve` HTTP server — `POST /link` (redeem a Link Code for a Device Token), `POST /characters` (bearer-authenticated push). `handleRequest(req, clientIp, deps)` is pure/DI'd exactly like `ops/admin/server.ts`'s handler; `startWarbandeerServer(port, deps?)` is the only thing touching `Bun.serve` (called from `index.ts`'s `activate()`, inside a try/catch, only when `warbandeerConnectorConfigured()`; a bind failure is logged and the bot keeps running — `warbandeerServerRunning()` then reports the true runtime state, distinct from "configured"), returns the real bound port so `deps` can be omitted (production) or supplied (tests, port `0` for an OS-assigned free one). Payload size is capped before parsing: `Content-Length` checked first, then the body is streamed via `req.body.getReader()` and the read aborted the moment the running total crosses the cap — `Bun.serve`'s own `maxRequestBodySize` is set well ABOVE this app-level cap (4x), never equal to it, since Bun enforces its own limit at the transport layer before `fetch` even runs and an equal value means Bun's reset (`ECONNRESET`) wins the race instead of this module's clean `413`. Two separate `RateLimiter`s: `rateLimiter` (tight — per-IP for `/link`, per-token for `POST /characters` post-auth) and `authFailureLimiter` (a ~10x looser per-IP bucket checked on `/characters` *before* authentication, so a flood of garbage bearer tokens is bounded without several legitimate users behind one shared address colliding — it's charged on every request that reaches it, success or failure, so it mitigates rather than eliminates that collision risk). `createProductionDeps(overrides?)` binds to the real `links` singleton and `characters.ts`'s `CHARACTERS_DIR` by default; `overrides` (`linksState`/`persistLinks`/`charactersBaseDir`) exists so `server.test.ts` can exercise the real auth+persistence wiring against throwaway state instead |
 | `src/warbandeer/link-command.ts` | `/link` (mints a code, ephemeral reply) and `/unlink` (optional `account_label`; zero/one/many-accounts branches). Self-service — no admin/role gate, since a user only ever acts on their own `interaction.user.id`. Pure, exported `linkReply()`/`unlinkReply()` are unit-tested directly, mirroring `updateReply()`'s/`report.ts`'s pure-formatter style |
 | `src/warbandeer/storage.ts` | Shared atomic-JSON-file primitives — `writeJsonAtomic`/`readJsonOrFresh` (the same temp-file-then-rename + corrupt-file-moved-aside pattern `state.ts` established) plus two ways to serialize concurrent access: `createJsonWriter` (one file, whole-value writes — `links.ts` uses this) and `createKeyedJsonMutator` (many files, each identified by path, and — unlike `createJsonWriter` — serializes the READ that precedes the write too, not just the write itself; `characters.ts` uses this, since a naive read-modify-write let two concurrent pushes for the same Discord User silently lose one's data). `writeJsonAtomic` alone is NOT safe for two callers racing the same path (fixed `.tmp` name) — every real caller reaches it only through one of these two wrappers |
-| `src/plugins/contract.ts` | Types only — the host<->plugin contract (`HostApi`, `Plugin`, `PluginModule`, `PluginCommand`, `TickCheck`), the Plugin Index / Plugin State / request shapes, and `HOST_API_VERSION`. No runtime imports, so it can be read before the `Client` exists and vendored verbatim by the plugins repo. See `docs/adr/0004` |
-| `src/plugins/contract.test.ts` | bun tests pinning `contract.ts`'s invariant at the source level (like `index.test.ts`): every import is `import type`, no `require`, and `HOST_API_VERSION` (= 1) is the module's only runtime export |
+| `src/plugins/contract.ts` | Types plus one integer constant (`HOST_API_VERSION`) — the host<->plugin contract (`HostApi`, `Plugin`, `PluginModule`, `PluginCommand`, `TickCheck`) and the Plugin Index / Plugin State / request shapes. No runtime code at all (pinned by `contract.test.ts`), so it can be read before the `Client` exists and vendored verbatim by the plugins repo. See `docs/adr/0004` |
+| `src/plugins/contract.test.ts` | bun tests pinning `contract.ts`'s invariant three ways: stripped of types by `Bun.Transpiler`, the module is exactly `export const HOST_API_VERSION = 1;` (so no value import, re-export, dynamic import or stray statement survives); every `import` in the comment-stripped source is `import type` (and no `require`/`export … from`); and `HOST_API_VERSION` (= 1) is the only runtime export |
 
 ## Behavior
 

@@ -155,7 +155,8 @@ export interface HostStorage {
 /**
  * Everything a plugin may touch. Deliberately no discord.js `Client`: the host owns every gateway
  * listener (nothing plugin-side may attach before `takeOver()` completes during a self-update
- * handoff), and a fake host is all a plugin's tests need.
+ * handoff), and a fake host is all a plugin's tests need. A declared-dependency boundary, not a
+ * sandbox: a command handler's `interaction.client` still reaches the live `Client`.
  */
 export interface HostApi {
   readonly name: string;

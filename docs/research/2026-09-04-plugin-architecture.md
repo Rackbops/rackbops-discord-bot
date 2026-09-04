@@ -11,11 +11,12 @@ tree), Bun's own docs (`bun.com/docs`), discord.js's typings/source in `node_mod
 does not repeat it. Ends with a recommended *direction* and the open decisions; does not decide the
 final design.
 
-> **Status (2026-09-04):** the "in-repo static lazy registry" direction recommended in §1/§3/§4 and the
-> Recommendation section was **not adopted** — superseded by
-> `docs/adr/0004-plugins-fetched-from-a-published-manifest.md` (plugins are published bundles fetched
-> from a manifest; epic #95). §2 (extension-point inventory), §5 (discord-ai as a reference shape) and
-> §6 (migration constraints, shipped identifiers) remain the reference.
+> **Status (2026-09-04):** the in-repo static lazy registry this document recommends (§1a, the
+> env-presence-only switch in §3, the carve-out steps in §6b, and the Recommendation) was **not
+> adopted** — superseded by `docs/adr/0004-plugins-fetched-from-a-published-manifest.md` (plugins are
+> published bundles fetched from a Plugin Index; epic #95). What the ADR kept: §1d's reference shapes,
+> §2 (extension-point inventory), §4 (in-process isolation, an integer host API version, a DI'd host
+> object), §5 (discord-ai as a reference shape) and §6's shipped-identifier constraints.
 
 ## Repo facts confirmed as part of this research (in addition to the ones already given)
 
