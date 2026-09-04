@@ -27,6 +27,17 @@ export interface Config {
   /** Port the Warbandeer connector's ingest server binds inside the container. Unset = the
    * connector doesn't start at all (`/link` reports itself disabled) — see docs/adr/0001. */
   warbandeerIngestPort?: number;
+  /** Parsed `PLUGINS=` tokens — which plugins to install. Installing ≠ configured; a plugin's
+   * own env keys are separate. See docs/adr/0004. */
+  plugins: PluginSelector[];
+  /** Where to fetch the Plugin Index (plugins.json) from — http(s), file://, or an absolute path. */
+  pluginIndexUrl: string;
+}
+
+/** One `PLUGINS=` token: a bare name, or `name@version` to pin a version. */
+export interface PluginSelector {
+  name: string;
+  version?: string;
 }
 
 /** `/report` project token → GitHub `owner/repo`. The slash-command choices are built from
@@ -107,6 +118,35 @@ export function resolveConfig(env: Env): Config {
     warbandeerIngestPort = n;
   }
 
+  // name, or name@version to pin a version; duplicate names rejected separately from list()'s
+  // own token-level dedup, which wouldn't catch "foo,foo@1.0.0" (different tokens, same name).
+  const pluginTokens = list("PLUGINS");
+  const plugins: PluginSelector[] = [];
+  const seenPluginNames = new Set<string>();
+  for (const token of pluginTokens) {
+    const at = token.indexOf("@");
+    const name = at === -1 ? token : token.slice(0, at);
+    const version = at === -1 ? undefined : token.slice(at + 1);
+    if (!/^[a-z][a-z0-9-]*$/.test(name) || (version !== undefined && !/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(version))) {
+      throw new Error(
+        `PLUGINS must be a comma-separated list of plugin names (optionally name@version), got "${token}"`,
+      );
+    }
+    if (seenPluginNames.has(name)) {
+      throw new Error(`PLUGINS lists "${name}" more than once`);
+    }
+    seenPluginNames.add(name);
+    plugins.push(version === undefined ? { name } : { name, version });
+  }
+
+  const pluginIndexUrl =
+    optional("PLUGIN_INDEX_URL") ?? "https://raw.githubusercontent.com/Rackbops/bot-plugins/main/plugins.json";
+  if (!/^https?:\/\//.test(pluginIndexUrl) && !/^file:\/\//.test(pluginIndexUrl) && !pluginIndexUrl.startsWith("/")) {
+    throw new Error(
+      `PLUGIN_INDEX_URL must be an http(s) URL, a file:// URL or an absolute path, got "${pluginIndexUrl}"`,
+    );
+  }
+
   return {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
@@ -127,6 +167,8 @@ export function resolveConfig(env: Env): Config {
     reportRoleId: optional("REPORT_ROLE_ID"),
     commandPrefix,
     warbandeerIngestPort,
+    plugins,
+    pluginIndexUrl,
   };
 }
 

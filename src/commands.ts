@@ -94,6 +94,9 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     ),
 ].map((c) => c.toJSON());
 
+// What selectPlugins() checks a plugin's declared command names against before any plugin loads.
+export const CORE_COMMAND_NAMES: string[] = commandData.map((c) => bareName(c.name));
+
 export async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   switch (bareName(interaction.commandName)) {
     case "dmf": {
