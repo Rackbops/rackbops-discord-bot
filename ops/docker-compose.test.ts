@@ -67,12 +67,18 @@ function makeStack(env: string | null): string {
   return dir;
 }
 
-async function composeConfig(dir: string): Promise<{ exitCode: number; stderr: string; json: ComposeConfig | null }> {
+async function composeConfig(
+  dir: string,
+  extraEnv: Record<string, string> = {},
+): Promise<{ exitCode: number; stderr: string; json: ComposeConfig | null }> {
   const proc = Bun.spawn(["docker", "compose", "-f", "docker-compose.yml", "config", "--format", "json"], {
     cwd: dir,
     stdout: "pipe",
     stderr: "pipe",
-    env: cleanEnv(), // no BOT_OPS_*/BOT_ENV_FILE exported — mirrors Dockge's own invocation exactly
+    // No BOT_OPS_*/BOT_ENV_FILE exported by default — mirrors Dockge's own invocation exactly.
+    // extraEnv layers on top for tests that need to simulate a specific shell export (e.g. the
+    // CLOUDFLARE_TUNNEL_TOKEN a real operator would export by hand — see issue #54's tests below).
+    env: { ...cleanEnv(), ...extraEnv },
   });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -140,5 +146,50 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     const { exitCode, json } = await composeConfig(dir);
     expect(exitCode).toBe(0);
     expect(json!.services.bot!.container_name).toBe("warbandeer-discord");
+  });
+});
+
+// cloudflared's TUNNEL_TOKEN is Compose *interpolation* (${CLOUDFLARE_TUNNEL_TOKEN} in the
+// environment: block), resolved only from a shell-exported var or the stack directory's own
+// .env — never from BOT_ENV_FILE/$CONFIG_DIR/.env, which is a completely separate env_file:
+// runtime-injection mechanism (see the .env-precedence bullet in CONTEXT.md). install.sh's
+// generated stack .env deliberately carries no secrets, so the only realistic path is a shell
+// export — the same mechanism admin's own secrets already use, and what install.sh's printed
+// tunnel-profile instructions do by hand.
+describe.skipIf(!runnable)("cloudflared's TUNNEL_TOKEN resolves via Compose interpolation, not env_file (issue #54)", () => {
+  // makeStack("") — not null — for the same reason the #41 test above uses a real file: the
+  // `bot` service's `env_file: ${BOT_ENV_FILE:-.env}` short form defaults to `required: true`
+  // (see that test's own comment), so `docker compose config` refuses to resolve ANY service in
+  // the file, cloudflared included, unless *some* .env exists on disk relative to the stack dir —
+  // empty is fine, since these tests don't want BOT_OPS_*/secrets in it anyway.
+  //
+  // COMPOSE_PROFILES=tunnel (equivalent to --profile tunnel) on every call here: a profile-gated
+  // service is fully INTERPOLATED regardless of active profile (CONTEXT.md's own documented
+  // finding, which the #41 tests above rely on for `admin`), but `config`'s rendered *output*
+  // still omits a service whose profile isn't active — confirmed the hard way, in CI, once this
+  // test actually ran against a real `docker compose` for the first time. Without it,
+  // `json.services.cloudflared` is `undefined`, not merely token-less.
+  test("a shell-exported CLOUDFLARE_TUNNEL_TOKEN reaches cloudflared's TUNNEL_TOKEN", async () => {
+    const dir = makeStack("");
+    const { exitCode, json } = await composeConfig(dir, {
+      CLOUDFLARE_TUNNEL_TOKEN: "probe-tunnel-token",
+      COMPOSE_PROFILES: "tunnel",
+    });
+    expect(exitCode).toBe(0);
+    expect(JSON.stringify(json!.services.cloudflared)).toContain("probe-tunnel-token");
+  });
+
+  test("with no token anywhere, the :- default resolves it to empty with no undefined-variable warning", async () => {
+    // Compose already tolerates a bare ${VAR} with no default (empty value, exit 0) — only `:?`
+    // actually fails, so exitCode alone can't distinguish this from the pre-fix bare
+    // ${CLOUDFLARE_TUNNEL_TOKEN}. The `:-` default's real, checkable effect is suppressing
+    // Compose's own "variable is not set" warning on stderr for every var-less `docker compose`
+    // invocation against this file (Dockge's Start/Stop/Restart included) — assert on that
+    // directly rather than just the exit code.
+    const dir = makeStack("");
+    const { exitCode, stderr, json } = await composeConfig(dir, { COMPOSE_PROFILES: "tunnel" });
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("CLOUDFLARE_TUNNEL_TOKEN");
+    expect(JSON.stringify(json!.services.cloudflared)).not.toContain("probe-tunnel-token");
   });
 });

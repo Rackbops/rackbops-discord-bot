@@ -45,10 +45,12 @@ services:
   # paths — see ops/install.sh, which generates them; not meant for local dev). A small
   # per-instance admin web panel, a thin wrapper around ops/bot-ops.sh's five operations. Runs
   # as its own sidecar (independent of the bot process's lifecycle) with no published host
-  # port — reachable only via the `cloudflared` sidecar below on this same compose network,
-  # itself gated by Cloudflare Access. See ops/README.md's Admin panel section for the full
-  # two-door auth model (Access + door 2 — a verified Access JWT primarily, the ADMIN_TOKEN
-  # bearer check as a fallback — both baked into the panel itself).
+  # port — reached over the network via nucbox's own pre-existing, host-level Cloudflare tunnel
+  # (an ingress rule pointed at this service, external to this compose file), gated by Cloudflare
+  # Access — NOT via the `cloudflared` sidecar below, which is a separate, opt-in tunnel
+  # dedicated to WARBANDEER_INGEST_PORT (see its own comment). See ops/README.md's Admin panel
+  # section for the full two-door auth model (Access + door 2 — a verified Access JWT primarily,
+  # the ADMIN_TOKEN bearer check as a fallback — both baked into the panel itself).
   admin:
     build:
       context: ${ADMIN_BUILD_CONTEXT:-./ops/admin}
@@ -99,15 +101,21 @@ services:
 
   # Opt-in: exposes the bot's local API (the Warbandeer character-linking endpoint,
   # WARBANDEER_INGEST_PORT — see README's "Character linking" section) to the internet
-  # without opening inbound firewall ports. Requires CLOUDFLARE_TUNNEL_TOKEN in .env. Start
-  # with:
+  # without opening inbound firewall ports. TUNNEL_TOKEN below is Compose interpolation, not
+  # env_file: — same mechanism as the admin service's secrets above — so CLOUDFLARE_TUNNEL_TOKEN
+  # must be exported into the invoking shell (out of $CONFIG_DIR/.env; see ops/install.sh's
+  # printed instructions), not just set "in .env" generically. Start with:
   #   docker compose --profile tunnel up -d --build
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}-tunnel
     command: tunnel --no-autoupdate run
     environment:
-      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN}
+      # :- default: a profile-gated service is still fully interpolated regardless of which
+      # --profile is active (see the admin service's own comment above), so an unset token must
+      # resolve to empty rather than trip Compose's undefined-variable warning on every
+      # unrelated `docker compose` invocation.
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
     restart: unless-stopped
     depends_on:
       - bot

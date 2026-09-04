@@ -624,3 +624,40 @@ describe.skipIf(!runnable)("bot-ops.sh logs bounds N before the arithmetic clamp
     expect(dockerCalls(fx)).toEqual(["docker logs probe-container --tail 200"]);
   });
 });
+
+describe.skipIf(!runnable)("bot-ops.sh env-set's temp file is atomic and self-cleaning (issue #54)", () => {
+  test("the temp file is created in CONFIG_DIR, not $TMPDIR — so a cross-filesystem mv can't happen", async () => {
+    // mktemp -p "$CONFIG_DIR" ignores TMPDIR entirely (an explicit -p wins). A bare `mktemp`
+    // would instead fall back to this bogus TMPDIR and die before ever reaching ENV_FILE — this
+    // is a real regression test for the EXDEV risk the issue describes (env-set usually runs
+    // from the admin container, where the default temp dir is a different filesystem from
+    // CONFIG_DIR's own bind mount): it fails against the pre-fix `tmp="$(mktemp)"` and passes
+    // once the temp file is pinned to CONFIG_DIR.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const bogusTmp = join(fx.root, "nonexistent-tmpdir");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n", {
+      TMPDIR: bogusTmp,
+      TMP: bogusTmp,
+      TEMP: bogusTmp,
+    });
+    expect(run.exitCode).toBe(0);
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
+  });
+
+  test("a failed rewrite leaves no leftover temp file in CONFIG_DIR (EXIT trap)", async () => {
+    // Mirrors the existing fake-chmod-failure test's shim-injection style. mv is only ever
+    // called at this one spot in the whole script, so faking it on PATH targets exactly this
+    // failure without touching anything else env-set does.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    writeFileSync(
+      join(fx.bin, "mv"),
+      ["#!/usr/bin/env bash", "echo 'mv: fake failure' >&2", "exit 1", ""].join("\n"),
+      { mode: 0o755 },
+    );
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).not.toBe(0);
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n"); // mv never landed — original untouched
+    const leftovers = readdirSync(fx.cfg).filter((f) => f !== ".env" && f !== "backups");
+    expect(leftovers).toHaveLength(0);
+  });
+});

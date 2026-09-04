@@ -421,7 +421,17 @@ cmd_env_set() {
   # verbatim, append any changed key that wasn't already present.
   declare -A APPLIED
   local tmp k
-  tmp="$(mktemp)"
+  # -p "$CONFIG_DIR" keeps the temp file on the SAME filesystem as $ENV_FILE — env-set usually
+  # runs from the admin container, where the default temp dir is the container's own overlay fs
+  # while $CONFIG_DIR is a bind mount, so a bare `mktemp` here would make the mv below cross a
+  # filesystem boundary and silently degrade to copy-then-unlink, losing the atomicity this is
+  # for (same reasoning as ops/install.sh's own fetch() helper). The trap is double-quoted so
+  # $tmp's value is baked in immediately, not deferred: $tmp is `local` to this function, so a
+  # deferred (single-quoted) expansion would read as unset once the EXIT trap actually fires
+  # (after main()'s whole call chain has unwound) and die on `set -u`, corrupting the exit code
+  # of an otherwise-successful run.
+  tmp="$(mktemp -p "$CONFIG_DIR")"
+  trap "rm -f \"$tmp\"" EXIT
   while IFS= read -r line || [ -n "$line" ]; do
     if [[ "$line" =~ $ENV_LINE_RE ]]; then
       k="${BASH_REMATCH[2]}"
