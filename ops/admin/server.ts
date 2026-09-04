@@ -5,6 +5,7 @@
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
 // token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
+import { thisModuleDoesNotExist } from "./nonexistent-module";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 
 /** Constant-time compare — a length mismatch is an immediate, safe `false` (no byte scan). */
