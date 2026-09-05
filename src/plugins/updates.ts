@@ -126,14 +126,15 @@ function releasesBetween(entry: PluginIndexEntry, from: string, to: string): Plu
     .sort((a, b) => compareSemver(b.version, a.version));
 }
 
-/** Render release-notes blocks, clamped to Discord's cap with a `… full notes: <url>` tail (the
- *  `reportAnnouncement` clamp shape). */
-function renderNotes(releases: PluginRelease[]): string {
+/** Render release-notes blocks, clamped to `maxLen` with a `… full notes: <url>` tail (the
+ *  `reportAnnouncement` clamp shape). `maxLen` is a budget the caller sets so the WHOLE message it
+ *  wraps these notes in stays within Discord's cap — not just the notes sub-part. */
+function renderNotes(releases: PluginRelease[], maxLen = MESSAGE_LIMIT): string {
   if (releases.length === 0) return "(no release notes published)";
   const body = releases.map((r) => `**${r.version}** (${r.publishedAt.slice(0, 10)})\n${r.notes}`).join("\n\n");
-  if (body.length <= MESSAGE_LIMIT) return body;
+  if (body.length <= maxLen) return body;
   const tail = `\n… full notes: ${releases[0]?.url ?? ""}`;
-  return body.slice(0, Math.max(0, MESSAGE_LIMIT - tail.length)) + tail;
+  return body.slice(0, Math.max(0, maxLen - tail.length)) + tail;
 }
 
 /** The `(from, to]` release notes for a plugin, rendered + clamped. Exported for `/plugins list`. */
@@ -144,11 +145,15 @@ export function releaseNotesBetween(entry: PluginIndexEntry, from: string, to: s
 /** The DM/channel notification text. Compatible: the four operator options. Incompatible: says the
  *  bot must update first, and offers no install path. */
 export function notificationMessage(u: PluginUpdateDecision, botHostApi: number): string {
-  const head = `📦 **${u.name}** ${u.to} is available (installed ${u.from}).\n${renderNotes(u.releases)}\n`;
+  const head = `📦 **${u.name}** ${u.to} is available (installed ${u.from}).\n`;
   const last = u.compatible
     ? `Update with \`/plugins update ${u.name}\` (now, or \`at:\` a time), \`/plugins remind ${u.name}\`, \`/plugins skip ${u.name}\`, or use the admin panel.`
     : `This version needs a newer bot (host API v${u.neededHostApi}, this bot is v${botHostApi}) — update the bot first.`;
-  return head + last;
+  // Budget the notes so head + notes + "\n" + last stays within Discord's 2000-char cap — clamping
+  // only the notes (as before) let the assembled message overflow and Discord rejected the send,
+  // silently losing the notice after retries. Same whole-message budgeting as report.ts.
+  const notes = renderNotes(u.releases, MESSAGE_LIMIT - head.length - last.length - 1);
+  return `${head}${notes}\n${last}`;
 }
 
 /** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
@@ -156,7 +161,7 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number)
 export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date): string {
   if (state.plugins.length === 0) return "No plugins installed.";
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
-  return state.plugins
+  const out = state.plugins
     .map((p) => {
       let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
       const entry = entryByName.get(p.name);
@@ -170,6 +175,11 @@ export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _n
       return line;
     })
     .join("\n");
+  // Clamp the whole reply — many plugins each with a note can exceed Discord's cap and editReply
+  // would reject it, leaving the deferred reply hanging.
+  if (out.length <= MESSAGE_LIMIT) return out;
+  const trunc = "\n… (list truncated)";
+  return out.slice(0, Math.max(0, MESSAGE_LIMIT - trunc.length)) + trunc;
 }
 
 export interface PluginNotifyDeliverers {

@@ -219,17 +219,23 @@ export async function handleCommand(
       if (sub === "list") {
         // Deferred: re-fetching the Plugin Index (for "available" + notes) can outrun the 3s window.
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const [{ index }, state] = await Promise.all([
-          loadPluginIndex(config.pluginIndexUrl, DATA_DIR),
-          // Read state.json directly (not via host.ts's readPluginState) to avoid a commands↔host
-          // import cycle — the path mirrors host.ts's statePath.
-          readJsonOrFresh<PluginStateFile>(
-            `${DATA_DIR}/plugins/state.json`,
-            () => ({ hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] }),
-            "plugins",
-          ),
-        ]);
-        await interaction.editReply(renderPluginsList(state, index, new Date()));
+        try {
+          const [{ index }, state] = await Promise.all([
+            loadPluginIndex(config.pluginIndexUrl, DATA_DIR),
+            // Read state.json directly (not via host.ts's readPluginState) to avoid a commands↔host
+            // import cycle — the path mirrors host.ts's statePath.
+            readJsonOrFresh<PluginStateFile>(
+              `${DATA_DIR}/plugins/state.json`,
+              () => ({ hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] }),
+              "plugins",
+            ),
+          ]);
+          await interaction.editReply(renderPluginsList(state, index, new Date()));
+        } catch (err) {
+          // Match the transmog/update deferred convention: a failure edits the deferred reply with an
+          // error rather than leaving the admin's "thinking…" hanging.
+          await interaction.editReply(`⚠️ Couldn't list plugins: ${(err as Error).message}`);
+        }
         return;
       }
       // #104 adds update|remind|skip|cancel here.

@@ -141,6 +141,15 @@ describe("notificationMessage", () => {
     expect(msg).toContain("This version needs a newer bot (host API v2, this bot is v1) — update the bot first.");
     expect(msg).not.toContain("/plugins update");
   });
+  test("the WHOLE message stays within Discord's 2000-char cap, footer intact, on a long changelog", () => {
+    const msg = notificationMessage(
+      { ...base, to: "2.0.0", compatible: true, action: "notify", releases: [rel("2.0.0", { notes: "x".repeat(3000) })] },
+      1,
+    );
+    expect(msg.length).toBeLessThanOrEqual(2000);
+    expect(msg).toContain("📦 **warbandeer** 2.0.0 is available"); // head survives
+    expect(msg).toContain("`/plugins update warbandeer`"); // footer survives the clamp
+  });
 });
 
 describe("renderPluginsList", () => {
@@ -163,6 +172,13 @@ describe("renderPluginsList", () => {
   });
   test("empty state → a plain line", () => {
     expect(renderPluginsList(state([]), index([]), NOW)).toBe("No plugins installed.");
+  });
+  test("clamps a long list to Discord's cap", () => {
+    const plugins = Array.from({ length: 12 }, (_, i) => stateEntry(`p${i}`, "1.0.0"));
+    const entries = Array.from({ length: 12 }, (_, i) => entry(`p${i}`, "2.0.0", { releases: [rel("2.0.0", { notes: "y".repeat(400) })] }));
+    const out = renderPluginsList(state(plugins), index(entries), NOW);
+    expect(out.length).toBeLessThanOrEqual(2000);
+    expect(out).toContain("… (list truncated)");
   });
 });
 
