@@ -102,7 +102,10 @@ lives now that the connector is the `warbandeer` plugin (issue #100): set `PLUGI
 the key becomes editable once the bot has cached the index. A plugin's `secret` keys are never
 listed or written, exactly like the core secrets below. If the bot isn't running (no cached index),
 `env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** — never
-an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged).
+an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
+`env-set` refuses a plugin key in that same state, since it can't read the manifest to validate one;
+edit a plugin's keys while the bot is up. A valid-JSON-but-wrong-shape cached index is treated the
+same way (degraded, never a crash).
 
 **Secrets are intentionally absent** — `DISCORD_TOKEN`, `BLIZZARD_CLIENT_ID`,
 `BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`. `env-get` never reads them

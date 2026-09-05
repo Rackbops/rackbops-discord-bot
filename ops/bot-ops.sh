@@ -316,12 +316,25 @@ load_plugin_keys() {
   # escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash reader
   # would then see it doubled; raw lines pass the regex through verbatim (a `format` never spans
   # lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
-  rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
+  #
+  # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
+  # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
+  # manifest it accepts and caches can still be wrong-shaped here). Guard both shapes inside the
+  # program — a non-object plugin or env entry, or one missing a string key/format, is skipped so the
+  # well-formed keys still list — and treat a program error (`.index` being a non-object, which
+  # `.index.plugins` can't index) as "index unavailable" via `2>/dev/null` + the `if !`, rather than
+  # letting pipefail + set -e abort the whole env-get/env-set. Same posture cmd_status takes for
+  # state.json; without it a valid-JSON-but-wrong-shape cached index crashes ops (a D3 violation).
+  if ! rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
     (.index.plugins // [])
-    | map(select(.name as $n | $names | index($n)))
+    | map(select((type == "object") and (.name as $n | $names | index($n))))
     | .[].env[]?
+    | select((type == "object") and (.key | type == "string") and (.format | type == "string"))
     | (.key, .format, (.required // false | tostring), (.secret // false | tostring))
-  ')"
+  ' 2>/dev/null)"; then
+    PLUGIN_KEYS_STATUS="index unavailable"
+    return 0
+  fi
   while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret; do
     # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
     # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a

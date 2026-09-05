@@ -872,3 +872,45 @@ describe.skipIf(!runnable)("bot-ops.sh status includes the plugin state (#101)",
     expect(run.json?.plugins).toEqual([]);
   });
 });
+
+describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-wrong-shape index (#101, D3)", () => {
+  // The bot's own isValidPluginIndex only checks `Array.isArray(env)`, so a manifest it accepts and
+  // caches can still be wrong-shaped here — and `jq -e .` only proves valid JSON. Without the shape
+  // guards in load_plugin_keys these crashed env-get AND env-set (exit 5), breaking the whole panel
+  // even for a static-key save. A plugin issue must never crash ops (D3).
+  test("a plugin whose env has a NON-OBJECT element: env-get exit 0, no jq error, that entry skipped, siblings still list", async () => {
+    const index = wrapIndex([pluginEntry("warbandeer", ["OOPS", 123, envKey("WARBANDEER_INGEST_PORT", "^[0-9]+$")])]);
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).not.toContain("jq: error");
+    expect(run.json).toHaveProperty("WARBANDEER_INGEST_PORT"); // the well-formed sibling still lists
+  });
+
+  test("a non-object env element doesn't break a static-key env-set (was exit 5 before the shape guard)", async () => {
+    const index = wrapIndex([pluginEntry("warbandeer", ["OOPS"])]);
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
+  });
+
+  test("a non-object `.index` → index unavailable note, static keys only, exit 0 — not a crash", async () => {
+    // wrapIndex always makes `.index` an object, so hand-build the wrong shape.
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: JSON.stringify({ writtenAt: "x", index: "broken" }) });
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).toContain("plugins: index unavailable");
+    expect(run.stderr).not.toContain("jq: error");
+    expect(Object.keys(run.json as object)).toHaveLength(14); // the static keys only
+  });
+
+  test("a required plugin key cannot be blanked — same rule as a required static key", async () => {
+    const index = wrapIndex([pluginEntry("warbandeer", [envKey("WARBANDEER_INGEST_PORT", "^[0-9]+$", { required: true })])]);
+    const fx = setup("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=\n");
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("env-set: 'WARBANDEER_INGEST_PORT' is required and cannot be blank");
+    expect(envText(fx)).toBe("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n");
+  });
+});
