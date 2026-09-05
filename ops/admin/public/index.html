@@ -141,6 +141,17 @@
   .admin-row .tag { font-size: 11px; color: var(--muted); }
   .admin-row button { background: var(--btn2); padding: 4px 10px; font-size: 12px; }
   .admin-row button.danger { background: var(--danger); }
+  .plugin-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .plugin-row:last-child { border-bottom: none; }
+  .plugin-row input[type="checkbox"] { width: auto; margin-top: 3px; flex: none; }
+  .plugin-info { flex: 1; min-width: 0; }
+  .plugin-name { font-weight: 600; word-break: break-all; }
+  .plugin-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .plugin-meta { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .plugin-badge { display: inline-block; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border); }
+  .plugin-badge.update { color: var(--accent); border-color: var(--accent); }
+  .plugin-badge.active { color: var(--ok); border-color: var(--ok); }
+  .plugin-badge.warn { color: var(--danger); border-color: var(--danger); }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
   #gate .panel-header { justify-content: center; }
 </style>
@@ -196,6 +207,21 @@
       <button id="save-env">Save changes</button>
     </div>
     <div id="env-msg" class="msg"></div>
+  </section>
+
+  <section id="plugins-section">
+    <h2>Plugins</h2>
+    <p style="color: var(--muted); margin: 0 0 10px">
+      Choose which plugins this instance runs. Ticking or unticking a plugin sets the
+      <code>PLUGINS</code> list and recreates the bot to apply it. This never installs code from the
+      browser — only plugins offered by the Plugin Index can be enabled. A disabled plugin's stored
+      data is left untouched.
+    </p>
+    <div id="plugins-list">Loading…</div>
+    <div class="row" style="margin-top: 12px">
+      <button id="save-plugins">Save changes</button>
+    </div>
+    <div id="plugins-msg" class="msg"></div>
   </section>
 
   <section id="admins-section">
@@ -289,6 +315,7 @@
     loadWhoami();
     loadStatus();
     loadEnv();
+    loadPlugins();
     loadAdmins();
   }
 
@@ -433,6 +460,216 @@
       if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
     }
   }
+
+  // ---- Modify Plugins (#102) ------------------------------------------------------------------
+  // The last /api/plugins response, kept so savePlugins can diff against the raw PLUGINS value and
+  // reuse the manifest order without a second fetch.
+  let pluginsData = null;
+
+  async function loadPlugins() {
+    const container = document.getElementById("plugins-list");
+    document.getElementById("plugins-msg").textContent = "";
+    try {
+      const data = await (await api("/api/plugins")).json();
+      pluginsData = data;
+      // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy —
+      // disable Save so a change can't be planned against a false-empty selection and wipe it.
+      const saveBtn = document.getElementById("save-plugins");
+      if (saveBtn) saveBtn.disabled = !!data.stateError;
+      container.innerHTML = "";
+      if (data.stateError) {
+        const notice = document.createElement("div");
+        notice.className = "field-hint";
+        notice.style.color = "var(--danger)";
+        notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
+        container.appendChild(notice);
+      }
+      if (data.indexError) {
+        const notice = document.createElement("div");
+        notice.className = "field-hint";
+        notice.textContent = "Plugin Index unavailable (" + data.indexError + ") — showing installed plugins only.";
+        container.appendChild(notice);
+      }
+      if (!data.plugins || data.plugins.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "field-hint";
+        empty.textContent = "No plugins available or installed.";
+        container.appendChild(empty);
+        return;
+      }
+      const indexAvailable = !data.indexError;
+      for (const p of data.plugins) container.appendChild(buildPluginRow(p, indexAvailable));
+      const note = document.createElement("div");
+      note.className = "field-hint";
+      note.style.marginTop = "8px";
+      note.textContent = "Changes apply when the bot restarts (saving recreates it).";
+      container.appendChild(note);
+    } catch (e) {
+      if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    }
+  }
+
+  function makeBadge(text, kind) {
+    const b = document.createElement("span");
+    b.className = "plugin-badge" + (kind ? " " + kind : "");
+    b.textContent = text;
+    return b;
+  }
+
+  // PLUGIN_BADGES:begin
+  // Pure badge DECISIONS ({text, kind}), split from DOM rendering so ops/admin/server.test.ts can
+  // lift and pin them — the index-outage suppression and the newer-release check live here.
+  function pluginStateBadge(p, indexAvailable) {
+    // Only claim "not in index" when the index actually loaded — during an outage EVERY row is
+    // inIndex:false, so labelling them all "not in index" would contradict the outage notice.
+    if (indexAvailable && !p.inIndex) return { text: "not in index", kind: "warn" };
+    if (p.error) return { text: "failed: " + p.error, kind: "warn" };
+    if (p.enabled && p.missingEnv && p.missingEnv.length) return { text: "needs config: " + p.missingEnv.join(", "), kind: "warn" };
+    if (p.active) return { text: "active", kind: "active" };
+    if (p.enabled) return { text: "enabled, not active", kind: null };
+    return { text: "disabled", kind: null };
+  }
+  // "update to X" only when a NEWER release exists — guard on latest !== installed too, since a
+  // dev/pruned installedVersion that isn't in the release list makes releasesNewerThan return all.
+  function pluginUpdateBadge(p) {
+    if (p.installedVersion && p.latestVersion && p.latestVersion !== p.installedVersion && p.releases && p.releases.length) {
+      return { text: "update to " + p.latestVersion, kind: "update" };
+    }
+    return null;
+  }
+  // PLUGIN_BADGES:end
+
+  // One card per plugin. All server-sourced text goes through textContent / createElement — never
+  // innerHTML — so a plugin name or description can't inject markup.
+  function buildPluginRow(p, indexAvailable) {
+    const row = document.createElement("div");
+    row.className = "plugin-row";
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.checked = !!p.enabled;
+    check.dataset.plugin = p.name;
+    check.id = "plugin-" + p.name;
+    // Only index-listed plugins can be enabled; one the index doesn't offer and that isn't already
+    // on stays unticked and locked. An already-enabled one the index dropped stays editable so it
+    // can still be removed.
+    if (!p.inIndex && !p.enabled) check.disabled = true;
+    row.appendChild(check);
+
+    const info = document.createElement("div");
+    info.className = "plugin-info";
+
+    const name = document.createElement("label");
+    name.className = "plugin-name";
+    name.htmlFor = check.id;
+    name.textContent = p.name;
+    info.appendChild(name);
+
+    if (p.description) {
+      const desc = document.createElement("div");
+      desc.className = "plugin-desc";
+      desc.textContent = p.description;
+      info.appendChild(desc);
+    }
+
+    const meta = document.createElement("div");
+    meta.className = "plugin-meta";
+    const version = document.createElement("span");
+    version.textContent = p.installedVersion
+      ? "installed " + p.installedVersion
+      : p.enabled ? "enabled, not yet installed" : "not installed";
+    meta.appendChild(version);
+    const upd = pluginUpdateBadge(p);
+    if (upd) meta.appendChild(makeBadge(upd.text, upd.kind));
+    const state = pluginStateBadge(p, indexAvailable);
+    if (state) meta.appendChild(makeBadge(state.text, state.kind));
+    info.appendChild(meta);
+
+    row.appendChild(info);
+    return row;
+  }
+
+  // PLUGINS_SAVE_PLAN:begin
+  // Pure: from the currently-ticked plugin names, the raw current PLUGINS value, and the manifest's
+  // name order, produce the new PLUGINS string. A still-ticked plugin keeps any `name@version` pin
+  // it already had; names are ordered by the manifest (any ticked name the manifest doesn't list is
+  // appended in its own order). `changed` compares against the NORMALIZED current value (trimmed,
+  // empties dropped) so a pure-formatting difference doesn't trigger a spurious restart. Lifted by
+  // ops/admin/server.test.ts and pinned against this very source.
+  function planPluginsSave(checkedNames, currentValue, manifestOrder) {
+    const checked = new Set(checkedNames);
+    const currentTokens = String(currentValue || "").split(",").map((t) => t.trim()).filter(Boolean);
+    const pinByName = new Map();
+    for (const tok of currentTokens) {
+      const name = tok.split("@")[0];
+      if (name) pinByName.set(name, tok);
+    }
+    const ordered = [];
+    const seen = new Set();
+    for (const name of manifestOrder) {
+      if (checked.has(name) && !seen.has(name)) { ordered.push(name); seen.add(name); }
+    }
+    for (const name of checkedNames) {
+      if (!seen.has(name)) { ordered.push(name); seen.add(name); }
+    }
+    const value = ordered.map((name) => pinByName.get(name) || name).join(",");
+    return { value, changed: value !== currentTokens.join(",") };
+  }
+  // PLUGINS_SAVE_PLAN:end
+
+  // PLUGINS_SAVE:begin
+  async function savePlugins() {
+    const msg = document.getElementById("plugins-msg");
+    // Never plan a save against an untrusted baseline: a failed state read (empty pluginsValue) could
+    // otherwise diff a ticked subset against "" and wipe the real selection. The button is disabled
+    // in this case too; this is the belt-and-braces guard.
+    if (!pluginsData || pluginsData.stateError) return;
+    const checkedNames = [...document.querySelectorAll("#plugins-list input[type=checkbox]")]
+      .filter((c) => c.checked)
+      .map((c) => c.dataset.plugin);
+    const manifestOrder = (pluginsData.plugins || []).map((p) => p.name);
+    const plan = planPluginsSave(checkedNames, pluginsData.pluginsValue || "", manifestOrder);
+    if (!plan.changed) {
+      msg.textContent = "No changes.";
+      msg.className = "msg";
+      return;
+    }
+    if (!confirm('Set PLUGINS to "' + plan.value + '"? The bot will restart to load the change.')) return;
+    msg.textContent = "Saving…";
+    msg.className = "msg";
+    // Reuse the config Save path — a POST /api/env carrying ONLY PLUGINS — so the Origin guard, the
+    // auth check, and bot-ops.sh's own validation/recreate all apply unchanged; no new mutating route.
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/env", { method: "POST", body: "PLUGINS=" + plan.value, signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
+      if (res.ok) {
+        msg.textContent = "Saved. PLUGINS = " + plan.value;
+        msg.className = "msg ok";
+        loadPlugins();
+        loadEnv(); // re-baseline the Config form's PLUGINS field from the persisted value
+        loadStatus();
+      } else {
+        let failText = text || "bot-ops.sh error";
+        if (result && (result.log || result.backup)) {
+          failText = [result.log, result.backup ? "Backup: " + result.backup : ""].filter(Boolean).join("\n");
+        }
+        msg.textContent = "Failed: " + failText;
+        msg.className = "msg error";
+        loadPlugins();
+        loadEnv();
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+    } finally {
+      cancel();
+    }
+  }
+  // PLUGINS_SAVE:end
+
+  document.getElementById("save-plugins").addEventListener("click", (e) => withBusy(e.currentTarget, savePlugins));
 
   document.getElementById("add-admin").addEventListener("click", (e) => withBusy(e.currentTarget, addAdmin));
   document.getElementById("admin-email").addEventListener("keydown", (e) => {
