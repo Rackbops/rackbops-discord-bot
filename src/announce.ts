@@ -8,6 +8,11 @@ import { realmStatus, realmWatchConfigured, decideRealmTransition, type RealmSta
 import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
 import { checkForUpdate } from "./update";
 import { restartPending, withCritical } from "./restart";
+import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator } from "./storage";
+import { loadPluginIndex } from "./plugins";
+import { readPluginState, mutatePluginState } from "./plugins/host";
+import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
+import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 
 const TICK_MS = 60 * 1000;
 const RESET_ANNOUNCE_WINDOW_MS = 10 * 60 * 1000;
@@ -28,6 +33,19 @@ const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
 let lastReleasePollAt = 0;
 let lastUpdatePollAt = 0;
 let lastRealmPollAt = 0;
+let lastPluginPollAt = 0;
+
+// The plugin-update check must not run until the boot writePluginState (index.ts, after the
+// scheduler starts) has landed — otherwise its keyed-mutator persist would race that one-time
+// whole-file write. index.ts flips this on right after that write.
+let pluginStateReady = false;
+
+/** Called by index.ts once the boot state.json write has completed — see the race note above. */
+export function markPluginStateReady(): void {
+  pluginStateReady = true;
+}
+
+const pluginStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 
 export function startScheduler(client: Client, extraChecks: TickCheck[] = []): void {
   const tick = () => onTick(client, extraChecks).catch((err) => console.error("[tick]", err));
@@ -168,6 +186,17 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
         if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
       },
     },
+    {
+      // Notify admins of a newer plugin version, with what changed — never installs/restarts (#103).
+      // Gated on pluginStateReady so it can't race the boot state.json write (see the flag above).
+      name: "pluginUpdates",
+      run: async () => {
+        if (pluginStateReady && shouldPollPluginUpdates()) {
+          lastPluginPollAt = Date.now(); // stamp at poll start, like checkReleases/checkAutoUpdate
+          await checkPluginUpdates(livePluginUpdateDeps(client));
+        }
+      },
+    },
     ...extra,
   ];
 }
@@ -188,6 +217,35 @@ function shouldPollUpdate(): boolean {
 async function checkAutoUpdate(): Promise<void> {
   lastUpdatePollAt = Date.now();
   await checkForUpdate();
+}
+
+// Flat 15-min cadence with a startup catch-up (like shouldPollReleases), so a version published
+// while the bot was offline is announced on the first eligible tick after boot.
+function shouldPollPluginUpdates(): boolean {
+  if (lastPluginPollAt === 0) return true; // startup catch-up
+  return Date.now() - lastPluginPollAt >= UPDATE_POLL_GAP_MS;
+}
+
+/** Live deps for `checkPluginUpdates`, built from config + the shared storage + the Client's DM and
+ *  announce paths. `loadIndex` re-fetches (and re-caches) the manifest; `mutateState` is host.ts's
+ *  single race-safe state.json mutator; the fallback reuses `announceTo`. */
+function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
+  return {
+    loadIndex: async () => (await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)).index,
+    readState: () => readPluginState(DATA_DIR, pluginStorage),
+    mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
+    deliverers: {
+      dmUser: async (userId, content) => {
+        const user = await client.users.fetch(userId);
+        await user.send(content);
+      },
+      postAnnounce: (content) => announceTo(client, config.announceChannelId, content),
+    },
+    adminUserIds: config.adminUserIds,
+    hostApiVersion: HOST_API_VERSION,
+    now: () => new Date(),
+    log: console,
+  };
 }
 
 function shouldPollReleases(now: Date): boolean {

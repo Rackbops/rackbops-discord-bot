@@ -20,7 +20,10 @@ import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./upda
 import { withCritical } from "./restart";
 import { handoffFailureMessage } from "./handoff";
 import type { RedeployResult } from "./redeploy";
-import type { PluginCommand } from "./plugins/contract";
+import { DATA_DIR, readJsonOrFresh } from "./storage";
+import { loadPluginIndex } from "./plugins";
+import { renderPluginsList } from "./plugins/updates";
+import { HOST_API_VERSION, type PluginCommand, type PluginStateFile } from "./plugins/contract";
 
 const ts = (d: Date, style: "F" | "R" = "F") => `<t:${Math.floor(d.getTime() / 1000)}:${style}>`;
 const when = (d: Date) => `${ts(d)} (${ts(d, "R")})`;
@@ -85,6 +88,11 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
     .setDescription("Restart the bot to pick up the latest build (admins only)")
     // Hides it from non-admins in the UI. Defence in depth — the ID allowlist is the gate.
     .setDefaultMemberPermissions(0),
+  cmd("plugins")
+    .setDescription("Installed plugins and available updates (admins only)")
+    .setDefaultMemberPermissions(0)
+    // Built with a subcommand from the start so #104 adds update|remind|skip|cancel as siblings.
+    .addSubcommand((s) => s.setName("list").setDescription("List installed plugins and any available updates")),
 ].map((c) => c.toJSON());
 
 // What selectPlugins() checks a plugin's declared command names against before any plugin loads.
@@ -195,6 +203,37 @@ export async function handleCommand(
     }
     case "report": {
       await handleReportCommand(interaction);
+      return;
+    }
+    case "plugins": {
+      if (!isAdmin(interaction.user.id, config.adminUserIds)) {
+        await interaction.reply({
+          content: config.adminUserIds.length
+            ? "⛔ You're not allowed to run this."
+            : "⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+      const sub = interaction.options.getSubcommand();
+      if (sub === "list") {
+        // Deferred: re-fetching the Plugin Index (for "available" + notes) can outrun the 3s window.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const [{ index }, state] = await Promise.all([
+          loadPluginIndex(config.pluginIndexUrl, DATA_DIR),
+          // Read state.json directly (not via host.ts's readPluginState) to avoid a commands↔host
+          // import cycle — the path mirrors host.ts's statePath.
+          readJsonOrFresh<PluginStateFile>(
+            `${DATA_DIR}/plugins/state.json`,
+            () => ({ hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] }),
+            "plugins",
+          ),
+        ]);
+        await interaction.editReply(renderPluginsList(state, index, new Date()));
+        return;
+      }
+      // #104 adds update|remind|skip|cancel here.
+      await interaction.reply({ content: `Unknown /plugins subcommand: ${sub}`, flags: MessageFlags.Ephemeral });
       return;
     }
     default: {

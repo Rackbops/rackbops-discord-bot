@@ -11,19 +11,28 @@ const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements,
   await import("./announce");
 
 describe("tickChecks", () => {
-  test("is the five core checks in order, then the extras", () => {
+  test("is the six core checks in order, then the extras", () => {
     const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
     const checks = tickChecks({} as unknown as Client, extra);
-    expect(checks.map((c) => c.name)).toEqual(["dmf", "weeklyReset", "realm", "releases", "autoUpdate", "myplugin:poll"]);
+    expect(checks.map((c) => c.name)).toEqual([
+      "dmf",
+      "weeklyReset",
+      "realm",
+      "releases",
+      "autoUpdate",
+      "pluginUpdates",
+      "myplugin:poll",
+    ]);
   });
 
-  test("with no extras, exactly the five core checks", () => {
+  test("with no extras, exactly the six core checks", () => {
     expect(tickChecks({} as unknown as Client, []).map((c) => c.name)).toEqual([
       "dmf",
       "weeklyReset",
       "realm",
       "releases",
       "autoUpdate",
+      "pluginUpdates",
     ]);
   });
 });
