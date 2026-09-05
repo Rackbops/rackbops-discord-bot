@@ -613,6 +613,52 @@ cmd_env_set() {
   return "$rc"
 }
 
+# #105: queue a plugin-update request the bot's mailbox will consume. Reads the request JSON on stdin
+# (the admin panel's POST /api/plugins/request, which fills `requestedBy` from the verified Access
+# identity), validates action/plugin/version/at/days, and writes it into the bot's
+# data/plugins/requests/ so the bot — the sole writer of state.json — applies it on its next tick.
+# This is the FIRST docker-exec WRITE and the FIRST `-u bun` in this script: every other exec is a
+# read-only root `cat`, but the write MUST be `-u bun` (the container runs as root for the socket, so
+# a root-created requests/ dir would be un-writable by the bun bot — it could then neither delete a
+# consumed file nor create rejected/). The filename is script-controlled (epoch-ms + validated action
+# + a nonce, so two same-ms same-action requests don't collide); the untrusted JSON is only ever the
+# `cat >` body (a redirect, not eval), never the command or the path.
+cmd_plugin_request() {
+  need docker; need jq
+  local payload action plugin version at days
+  payload="$(cat)"
+  printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || die "plugin-request: payload is not valid JSON"
+  action="$(printf '%s' "$payload" | jq -r '.action // ""')"
+  plugin="$(printf '%s' "$payload" | jq -r '.plugin // ""')"
+  version="$(printf '%s' "$payload" | jq -r '.version // ""')"
+  at="$(printf '%s' "$payload" | jq -r '.at // ""')"
+  days="$(printf '%s' "$payload" | jq -r 'if .days == null then "" else (.days|tostring) end')"
+
+  case "$action" in
+    update-now|schedule|remind|skip|cancel) ;;
+    *) die "plugin-request: bad action '$action'" ;;
+  esac
+  [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin '$plugin'"
+  # Anchored semver, no slashes — the path-traversal gate (the bot re-validates, but reject early too).
+  local ver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+  local iso_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]+)?([+-][0-9]{2}:?[0-9]{2}|Z)$'
+  if [ "$action" != "cancel" ]; then
+    [[ "$version" =~ $ver_re ]] || die "plugin-request: bad version '$version'"
+  fi
+  [ "$action" != "schedule" ] || [[ "$at" =~ $iso_re ]] || die "plugin-request: bad at '$at'"
+  if [ "$action" = "remind" ] && [ -n "$days" ]; then
+    # 1-999, matching the bot's own validator — a 0-day snooze is meaningless (the bot rejects it too).
+    { [[ "$days" =~ ^[0-9]{1,3}$ ]] && [ "$days" -ge 1 ]; } || die "plugin-request: bad days '$days'"
+  fi
+
+  local file
+  file="$(date +%s%3N)-${action}-${RANDOM}.json"
+  # -i to pipe the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
+  printf '%s' "$payload" \
+    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p /app/data/plugins/requests && cat > /app/data/plugins/requests/${file}"
+  jq -n --arg queued "$file" '{ok: true, queued: $queued}'
+}
+
 main() {
   [ -f "$ENV_FILE" ] || die ".env not found at $ENV_FILE (is BOT_OPS_CONFIG_DIR correct?)"
   [ -f "$COMPOSE_FILE" ] || die "compose file not found at $COMPOSE_FILE (is BOT_OPS_COMPOSE_FILE correct?)"
@@ -624,7 +670,8 @@ main() {
     restart) cmd_restart ;;
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}" ;;
+    plugin-request) cmd_plugin_request ;;
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request}" ;;
   esac
 }
 

@@ -103,6 +103,9 @@ function setup(
     opts.pluginState !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/state.json"* ]]; then cat ${JSON.stringify(bashPath(pluginStateFile))}; fi`
       : "",
+    // #105 plugin-request write: capture the piped payload so a test can assert the round-trip (the
+    // real docker would run the container's `cat > …/requests/<file>`; the fake records stdin here).
+    `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests/"* ]]; then cat > "$(dirname "$0")/request-stdin.json"; fi`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -943,5 +946,64 @@ describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-w
     expect(env).not.toHaveProperty("5"); // non-string key not listed
     expect(env).not.toHaveProperty("BAD_FMT"); // non-string format not listed
     expect(env).toHaveProperty("WARBANDEER_INGEST_PORT");
+  });
+});
+
+describe.skipIf(!runnable)("plugin-request (#105)", () => {
+  const ENV = "PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n";
+  const req = (o: object) => JSON.stringify(o);
+
+  test("a valid request queues a file: exec -i -u bun to the requests path, {queued} output", async () => {
+    const fx = setup(ENV, {});
+    const run = await botOps(fx, ["plugin-request"], req({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    // The filename carries the epoch-ms + action + a nonce (so same-ms same-action can't collide).
+    expect(run.json?.queued).toMatch(/^\d{10,}-update-now-\d+\.json$/);
+    const exec = dockerCalls(fx).find((c) => c.startsWith("docker exec"));
+    expect(exec).toBeDefined();
+    expect(exec).toContain("-u bun"); // load-bearing: the bot (bun) must own requests/ to consume it
+    expect(exec).toContain("exec -i"); // stdin piped
+    expect(exec).toContain("probe-container");
+    expect(exec).toContain("/app/data/plugins/requests/");
+    // The untrusted payload round-trips to the container's stdin, verbatim.
+    expect(readFileSync(join(fx.bin, "request-stdin.json"), "utf8")).toContain('"action":"update-now"');
+  });
+
+  test("cancel needs no version; schedule accepts an ISO-with-offset `at`", async () => {
+    const fx = setup(ENV, {});
+    expect((await botOps(fx, ["plugin-request"], req({ action: "cancel", plugin: "warbandeer", requestedBy: "t" }))).exitCode).toBe(0);
+    expect((await botOps(fx, ["plugin-request"], req({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" }))).exitCode).toBe(0);
+  });
+
+  test("rejects a bad action / plugin / version / at before touching docker", async () => {
+    const fx = setup(ENV, {});
+    const cases: [object, string][] = [
+      [{ action: "rm-rf", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, "bad action"],
+      [{ action: "skip", plugin: "Warbandeer", version: "1.1.0", requestedBy: "t" }, "bad plugin"],
+      [{ action: "update-now", plugin: "warbandeer", version: "1.0.0/../x", requestedBy: "t" }, "bad version"],
+      [{ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "tomorrow", requestedBy: "t" }, "bad at"],
+    ];
+    for (const [payload, msg] of cases) {
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, msg).not.toBe(0);
+      expect(run.stderr, msg).toContain(`plugin-request: ${msg}`);
+    }
+    // None of the invalid requests reached a docker exec-write.
+    expect(dockerCalls(fx).some((c) => c.includes("/app/data/plugins/requests/"))).toBe(false);
+  });
+
+  test("non-JSON stdin is rejected", async () => {
+    const fx = setup(ENV, {});
+    const run = await botOps(fx, ["plugin-request"], "{ not json");
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("not valid JSON");
+  });
+
+  test("remind days is 1-999 (aligned with the bot): 0 is rejected, 7 accepted", async () => {
+    const fx = setup(ENV, {});
+    const zero = await botOps(fx, ["plugin-request"], req({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 0, requestedBy: "t" }));
+    expect(zero.exitCode).not.toBe(0);
+    expect(zero.stderr).toContain("bad days");
+    expect((await botOps(fx, ["plugin-request"], req({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7, requestedBy: "t" }))).exitCode).toBe(0);
   });
 });
