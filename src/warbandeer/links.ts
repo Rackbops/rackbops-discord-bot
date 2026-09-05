@@ -1,6 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
-import { createJsonWriter, readJsonOrFresh } from "./storage";
+import { createJsonWriter, readJsonOrFresh } from "../storage";
 
 /** A Link Code redeemable once, within its TTL, for a Device Token. */
 export interface PendingLinkCode {

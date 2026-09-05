@@ -1,11 +1,63 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import type { Client } from "discord.js";
 import type { Release } from "./github";
+import type { TickCheck } from "./plugins/contract";
 
 // announce.ts imports the `config` singleton (resolved from process.env at import time), so
 // prime the required vars before pulling the module in — see config.test.ts.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements } = await import("./announce");
+const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements, tickChecks, announceTo } =
+  await import("./announce");
+
+describe("tickChecks", () => {
+  test("is the five core checks in order, then the extras", () => {
+    const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
+    const checks = tickChecks({} as unknown as Client, extra);
+    expect(checks.map((c) => c.name)).toEqual(["dmf", "weeklyReset", "realm", "releases", "autoUpdate", "myplugin:poll"]);
+  });
+
+  test("with no extras, exactly the five core checks", () => {
+    expect(tickChecks({} as unknown as Client, []).map((c) => c.name)).toEqual([
+      "dmf",
+      "weeklyReset",
+      "realm",
+      "releases",
+      "autoUpdate",
+    ]);
+  });
+});
+
+describe("announceTo", () => {
+  test("fetches the channel, checks it's sendable, sends, and logs the unchanged [announce] line", async () => {
+    let sent: string | undefined;
+    let fetched: string | undefined;
+    const client = {
+      channels: {
+        fetch: async (id: string) => {
+          fetched = id;
+          return { isSendable: () => true, send: async (m: string) => void (sent = m) };
+        },
+      },
+    } as unknown as Client;
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await announceTo(client, "chan-1", "hello world");
+      expect(fetched).toBe("chan-1");
+      expect(sent).toBe("hello world");
+      expect(logSpy).toHaveBeenCalledWith("[announce]", "hello world");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("throws when the channel isn't sendable", async () => {
+    const client = {
+      channels: { fetch: async () => ({ isSendable: () => false }) },
+    } as unknown as Client;
+    await expect(announceTo(client, "chan-1", "x")).rejects.toThrow(/not sendable/);
+  });
+});
 
 // Scoped to runTick's isolation guarantee (issue #43) — not a wider push at #57's broader
 // "no announce/dmf tests" gap. checkDmf/checkWeeklyReset/etc. call real discord.js/Blizzard/

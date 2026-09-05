@@ -1,5 +1,6 @@
 import type { Client } from "discord.js";
 import { config } from "./config";
+import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
 import { decideDmfAnnouncement } from "./wow/dmf";
 import { lastWeeklyReset } from "./wow/reset";
@@ -28,8 +29,8 @@ let lastReleasePollAt = 0;
 let lastUpdatePollAt = 0;
 let lastRealmPollAt = 0;
 
-export function startScheduler(client: Client): void {
-  const tick = () => onTick(client).catch((err) => console.error("[tick]", err));
+export function startScheduler(client: Client, extraChecks: TickCheck[] = []): void {
+  const tick = () => onTick(client, extraChecks).catch((err) => console.error("[tick]", err));
   tick();
   setInterval(tick, TICK_MS);
 }
@@ -41,17 +42,18 @@ function channelFor(kind: AnnounceKind): string {
   return kind === "release" ? config.releaseAnnounceChannelId : config.announceChannelId;
 }
 
-async function announce(client: Client, kind: AnnounceKind, message: string): Promise<void> {
-  const channelId = channelFor(kind);
+/** Posts `message` to a specific channel, through the bot's own send path. Split out from
+ * `announce` so a plugin's `HostApi.announce` (which posts to `ANNOUNCE_CHANNEL_ID`) reuses exactly
+ * this path — the `[announce]` log line stays byte-identical. */
+export async function announceTo(client: Client, channelId: string, message: string): Promise<void> {
   const channel = await client.channels.fetch(channelId);
   if (!channel?.isSendable()) throw new Error(`Announce channel ${channelId} is not sendable`);
   await channel.send(message);
   console.log("[announce]", message);
 }
 
-export interface TickCheck {
-  name: string;
-  run: () => Promise<void>;
+async function announce(client: Client, kind: AnnounceKind, message: string): Promise<void> {
+  return announceTo(client, channelFor(kind), message);
 }
 
 /**
@@ -147,30 +149,35 @@ export function resetTickGuardForTest(): void {
   tickGeneration = 0;
 }
 
-async function onTick(client: Client): Promise<void> {
+/** The five core scheduler checks in order, followed by any plugin ticks. Pure so the composition
+ * (five core names, then the extras) is tested directly. */
+export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
+  return [
+    { name: "dmf", run: () => checkDmf(client) },
+    { name: "weeklyReset", run: () => checkWeeklyReset(client) },
+    { name: "realm", run: () => checkRealm(client) },
+    {
+      name: "releases",
+      run: async () => {
+        if (shouldPollReleases(new Date())) await checkReleases(client);
+      },
+    },
+    {
+      name: "autoUpdate",
+      run: async () => {
+        if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+      },
+    },
+    ...extra,
+  ];
+}
+
+async function onTick(client: Client, extraChecks: TickCheck[]): Promise<void> {
   if (restartPending()) return; // on the way out — don't start work we can't finish
   await guardedTick(() =>
     // The whole tick is one critical section: a restart requested by the update check
     // below lands only once every announcement and state write has settled.
-    withCritical(() =>
-      runTick([
-        { name: "dmf", run: () => checkDmf(client) },
-        { name: "weeklyReset", run: () => checkWeeklyReset(client) },
-        { name: "realm", run: () => checkRealm(client) },
-        {
-          name: "releases",
-          run: async () => {
-            if (shouldPollReleases(new Date())) await checkReleases(client);
-          },
-        },
-        {
-          name: "autoUpdate",
-          run: async () => {
-            if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
-          },
-        },
-      ]),
-    ),
+    withCritical(() => runTick(tickChecks(client, extraChecks))),
   );
 }
 

@@ -1,0 +1,89 @@
+[
+  {
+    "options": [],
+    "name": "dmf",
+    "description": "Darkmoon Faire schedule",
+    "type": 1
+  },
+  {
+    "options": [],
+    "name": "reset",
+    "description": "Next daily and weekly reset times",
+    "type": 1
+  },
+  {
+    "options": [],
+    "name": "status",
+    "description": "Realm status",
+    "type": 1
+  },
+  {
+    "options": [
+      {
+        "type": 3,
+        "choices": [
+          {
+            "name": "wow",
+            "value": "wow"
+          },
+          {
+            "name": "abm",
+            "value": "abm"
+          }
+        ],
+        "name": "project",
+        "description": "Which project the report is about",
+        "required": true
+      }
+    ],
+    "name": "report",
+    "description": "File a GitHub issue for a project",
+    "type": 1
+  },
+  {
+    "options": [
+      {
+        "type": 3,
+        "name": "character",
+        "description": "Character name",
+        "required": true
+      },
+      {
+        "type": 3,
+        "name": "realm",
+        "description": "Realm, e.g. \"Argent Dawn\"",
+        "required": true
+      }
+    ],
+    "name": "transmog",
+    "description": "Get a /customset import string for a character's transmog",
+    "type": 1
+  },
+  {
+    "options": [],
+    "name": "update",
+    "description": "Restart the bot to pick up the latest build (admins only)",
+    "default_member_permissions": "0",
+    "type": 1
+  },
+  {
+    "options": [],
+    "name": "link",
+    "description": "Link the Warbandeer desktop app to your Discord account",
+    "type": 1
+  },
+  {
+    "options": [
+      {
+        "type": 3,
+        "name": "account_label",
+        "description": "Which linked account (only needed if you have more than one)",
+        "required": false,
+        "max_length": 64
+      }
+    ],
+    "name": "unlink",
+    "description": "Unlink a Warbandeer desktop account from your Discord account",
+    "type": 1
+  }
+]

@@ -1,11 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
+import type { ChatInputCommandInteraction } from "discord.js";
+import type { PluginCommand } from "./plugins/contract";
 
 // `commands.ts` pulls in the `config` singleton, which resolves process.env at import
 // time — satisfy the required vars before importing so this file runs standalone.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { isAdmin, bareName, updateReply, commandData } = await import("./commands");
+const { isAdmin, bareName, updateReply, commandData, handleCommand } = await import("./commands");
+const { buildCommandBody } = await import("./plugins/host");
+const { config } = await import("./config");
+const coreBodyFixture = await Bun.file(new URL("./plugins/fixtures/command-body.main.json", import.meta.url)).json();
 
 describe("isAdmin", () => {
   test("accepts a user on the allowlist", () => {
@@ -118,5 +123,34 @@ describe("commandData", () => {
     const unlink = commandData.find((c) => c.name === "unlink");
     const accountLabel = unlink?.options?.find((o) => o.name === "account_label");
     expect(accountLabel).toMatchObject({ max_length: MAX_ACCOUNT_LABEL_LENGTH });
+  });
+});
+
+describe("handleCommand — plugin dispatch (default case)", () => {
+  test("dispatches a non-core command to the looked-up plugin handler", async () => {
+    let handledName: string | undefined;
+    const pluginCommand = { name: "hello", handle: async (i: ChatInputCommandInteraction) => { handledName = i.commandName; } } as unknown as PluginCommand;
+    await handleCommand({ commandName: "hello" } as unknown as ChatInputCommandInteraction, (bare) => (bare === "hello" ? pluginCommand : undefined));
+    expect(handledName).toBe("hello");
+  });
+
+  test("warns and resolves when neither a core case nor a plugin matches", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await handleCommand({ commandName: "nope" } as unknown as ChatInputCommandInteraction, () => undefined);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("no handler for /nope");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("buildCommandBody — core-only identity", () => {
+  // The framework must not change the core registration body. With no plugins, the built body must
+  // equal the committed core command JSON captured from main (fixtures/command-body.main.json).
+  test("with no plugins, the registration body equals the committed core command JSON", () => {
+    const body = buildCommandBody(config.commandPrefix, commandData, new Map(), { info() {}, warn() {}, error() {} });
+    expect(body).toEqual(coreBodyFixture);
   });
 });
