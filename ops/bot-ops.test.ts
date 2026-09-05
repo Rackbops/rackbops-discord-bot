@@ -63,6 +63,12 @@ function setup(
      *  - "gone": fully removed. Matches neither.
      *  Ignored unless nextRunning is set. */
     originalState?: "running" | "stopped" | "gone";
+    /** Fixture JSON the fake `docker exec … cat` returns for the bot's cached Plugin Index
+     *  (`/app/data/plugins/index.json` — the CachedPluginIndex wrapper `{writtenAt, index}`) and
+     *  Plugin State (`/app/data/plugins/state.json`). Absent → the shim prints nothing for that
+     *  path, i.e. the file isn't there in the container (index unavailable / no state). */
+    pluginIndex?: string;
+    pluginState?: string;
   } = {},
 ): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
@@ -82,6 +88,24 @@ function setup(
   const hasDashA = `[[ " $* " == *" -a "* ]]`;
   const answersCanonicalQuery =
     originalState === "running" ? "true" : originalState === "stopped" ? hasDashA : "false";
+  // The plugin fixtures the shim serves for `docker exec <container> cat <path>` — the same
+  // docker-exec read bot-ops.sh uses for the cached index and plugin state. Written to host files
+  // the shim `cat`s (bash-visible paths); absent options leave that `if` out, so the read comes
+  // back empty (file not present in the container).
+  const pluginIndexFile = join(root, "plugin-index.json");
+  const pluginStateFile = join(root, "plugin-state.json");
+  if (opts.pluginIndex !== undefined) writeFileSync(pluginIndexFile, opts.pluginIndex);
+  if (opts.pluginState !== undefined) writeFileSync(pluginStateFile, opts.pluginState);
+  const execHandler = [
+    opts.pluginIndex !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/index.json"* ]]; then cat ${JSON.stringify(bashPath(pluginIndexFile))}; fi`
+      : "",
+    opts.pluginState !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/state.json"* ]]; then cat ${JSON.stringify(bashPath(pluginStateFile))}; fi`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
   writeFileSync(
     join(bin, "docker"),
     [
@@ -96,6 +120,7 @@ function setup(
             `fi`,
           ].join("\n")
         : "",
+      execHandler,
       "exit 0",
       "",
     ].join("\n"),
@@ -292,7 +317,9 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const stored = 'ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=11111\n';
     const fx = setup(stored);
     const body = await fullBody(fx, { ANNOUNCE_CHANNEL_ID: "22222" });
-    expect(body.split("\n")).toHaveLength(13); // every whitelisted key echoed, like the old panel
+    // 14 static whitelisted keys now (#101 dropped WARBANDEER_INGEST_PORT, added PLUGINS +
+    // PLUGIN_INDEX_URL); no PLUGINS set here, so no plugin keys are merged in.
+    expect(body.split("\n")).toHaveLength(14); // every whitelisted key echoed, like the old panel
     const run = await botOps(fx, ["env-set"], body);
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
@@ -659,5 +686,189 @@ describe.skipIf(!runnable)("bot-ops.sh env-set's temp file is atomic and self-cl
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n"); // mv never landed — original untouched
     const leftovers = readdirSync(fx.cfg).filter((f) => f !== ".env" && f !== "backups");
     expect(leftovers).toHaveLength(0);
+  });
+});
+
+// Issue #101: bot-ops.sh learns about plugins — the PLUGINS / PLUGIN_INDEX_URL static rows, the
+// manifest-declared env keys of the installed plugins (merged into env-get / env-set from the
+// container's cached index, never hand-mirrored), and status.plugins.
+
+/** The real WARBANDEER_INGEST_PORT format (the 1-65535 shape #100 moved off the static whitelist). */
+const PORT_RE = "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$";
+
+/** One PluginEnvKey (contract.ts) — `key`/`format`/`description` plus optional `required`/`secret`. */
+function envKey(key: string, format: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { key, format, description: `${key} desc`, ...extra };
+}
+/** One PluginIndexEntry with just the fields load_plugin_keys reads (name + env). */
+function pluginEntry(name: string, env: unknown[]): Record<string, unknown> {
+  return {
+    name,
+    package: `@rackbops/plugin-${name}`,
+    version: "1.0.0",
+    description: `${name} plugin`,
+    hostApiVersion: 1,
+    commands: [],
+    env,
+    releases: [],
+  };
+}
+/** The on-disk cached index is the CachedPluginIndex WRAPPER `{writtenAt, index}` — the manifest is
+ *  at `.index.plugins`, which is what bot-ops.sh's `.index.plugins` jq path depends on. */
+function wrapIndex(plugins: unknown[]): string {
+  return JSON.stringify({
+    writtenAt: "2026-09-05T00:00:00.000Z",
+    index: { schemaVersion: 1, generatedAt: "2026-09-05T00:00:00.000Z", plugins },
+  });
+}
+
+describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#101)", () => {
+  test("PLUGINS accepts bare names and name@version, comma-separated; rejects bad shapes", async () => {
+    const fx = setup("PLUGINS=warbandeer\n");
+    for (const good of ["warbandeer,foo", "warbandeer@1.2.3", "a-b,c@0.0.0-rc.1"]) {
+      const run = await botOps(fx, ["env-set"], `PLUGINS=${good}\n`);
+      expect(run.exitCode).toBe(0);
+      expect(run.json).toMatchObject({ changed: ["PLUGINS"] });
+    }
+    for (const bad of ["Warbandeer", "foo bar", "a,,b", "1foo", "foo@"]) {
+      const run = await botOps(fx, ["env-set"], `PLUGINS=${bad}\n`);
+      expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain("value for 'PLUGINS' is invalid");
+    }
+  });
+
+  test("PLUGIN_INDEX_URL accepts http(s)/file/absolute path; rejects other shapes", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    for (const good of ["https://example.com/plugins.json", "http://x/y", "file:///opt/p.json", "/opt/plugins.json"]) {
+      expect((await botOps(fx, ["env-set"], `PLUGIN_INDEX_URL=${good}\n`)).exitCode).toBe(0);
+    }
+    for (const bad of ["ftp://x/y", "example.com/p.json", "relative/path.json", "http:// space"]) {
+      const run = await botOps(fx, ["env-set"], `PLUGIN_INDEX_URL=${bad}\n`);
+      expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain("value for 'PLUGIN_INDEX_URL' is invalid");
+    }
+  });
+
+  test("WARBANDEER_INGEST_PORT is no longer a static key — refused when no plugin declares it", async () => {
+    // #100 removed the baked-in connector; with no plugins installed the key is unknown to the
+    // whitelist. (It comes back via the manifest once warbandeer is installed — see below.)
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=8080\n");
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("'WARBANDEER_INGEST_PORT' is not an editable key");
+    expect(await envGet(fx)).not.toHaveProperty("WARBANDEER_INGEST_PORT");
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-get lists installed plugins' non-secret keys (#101)", () => {
+  test("only the enabled plugin's non-secret keys appear, after the static ones, in manifest order", async () => {
+    const index = wrapIndex([
+      pluginEntry("a", [envKey("A_ONE", "^[a-z]+$"), envKey("A_SECRET", "^.+$", { secret: true }), envKey("A_TWO", "^[0-9]+$")]),
+      pluginEntry("b", [envKey("B_ONE", "^.+$")]),
+    ]);
+    const fx = setup("PLUGINS=a\nANNOUNCE_CHANNEL_ID=11111\nA_ONE=xyz\n", { pluginIndex: index });
+    const env = await envGet(fx);
+    expect(env.A_ONE).toBe("xyz"); // listed, with its effective value from .env
+    expect(env.A_TWO).toBe(""); // listed even when unset in .env
+    expect(env).not.toHaveProperty("A_SECRET"); // a secret key is never listed
+    expect(env).not.toHaveProperty("B_ONE"); // plugin b isn't in PLUGINS
+    const keys = Object.keys(env);
+    expect(keys).toContain("PLUGINS");
+    expect(keys.slice(-2)).toEqual(["A_ONE", "A_TWO"]); // plugin keys after the static ones, manifest order
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-set validates an installed plugin's key from the manifest (#101)", () => {
+  const index = wrapIndex([
+    pluginEntry("warbandeer", [envKey("WARBANDEER_INGEST_PORT", PORT_RE), envKey("WARBANDEER_SECRET", "^.+$", { secret: true })]),
+  ]);
+
+  test("a stored out-of-regex plugin value never blocks an unrelated change (diff-then-validate)", async () => {
+    // WARBANDEER_INGEST_PORT=abc is invalid but UNCHANGED — a value that isn't changing was never
+    // this script's to judge, exactly as for a static key (issue #44). Validating before diffing
+    // would make this fail.
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\nWARBANDEER_INGEST_PORT=abc\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=abc\nANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
+    expect(envText(fx)).toBe("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=22222\nWARBANDEER_INGEST_PORT=abc\n");
+  });
+
+  test("a CHANGED plugin value is validated against the manifest format and named when invalid", async () => {
+    const fx = setup("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=99999\n"); // > 65535
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("env-set: value for 'WARBANDEER_INGEST_PORT' is invalid");
+    expect(envText(fx)).toBe("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n"); // untouched
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("a valid plugin-key change backs up, rewrites, and recreates once — reading the index between the guard and the recreate", async () => {
+    const fx = setup("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=9090\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["WARBANDEER_INGEST_PORT"], recreated: true });
+    expect(envText(fx)).toBe("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=9090\n");
+    expect(readdirSync(join(fx.cfg, "backups"))).toHaveLength(1);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"),
+      expect.stringContaining("up -d --force-recreate"),
+    ]);
+  });
+
+  test("a secret plugin key is refused as not editable, and never listed by env-get", async () => {
+    const fx = setup("PLUGINS=warbandeer\n", { pluginIndex: index });
+    const set = await botOps(fx, ["env-set"], "WARBANDEER_SECRET=hunter2\n");
+    expect(set.exitCode).toBe(1);
+    expect(set.stderr).toContain("'WARBANDEER_SECRET' is not an editable key");
+    const env = await envGet(fx);
+    expect(env).not.toHaveProperty("WARBANDEER_SECRET");
+    expect(env).toHaveProperty("WARBANDEER_INGEST_PORT"); // the non-secret sibling IS listed
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-get is graceful when the Plugin Index can't be read (#101)", () => {
+  test("PLUGINS set but no cached index → static keys only, a note on stderr, exit 0", async () => {
+    // No pluginIndex fixture, so the shim prints nothing for the exec cat — the file isn't there.
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0); // never an error (D3)
+    expect(run.stderr).toContain("plugins: index unavailable");
+    const env = run.json as Record<string, string>;
+    expect(env).toHaveProperty("PLUGINS", "warbandeer");
+    expect(env).not.toHaveProperty("WARBANDEER_INGEST_PORT"); // couldn't read the manifest
+    expect(Object.keys(env)).toHaveLength(14); // the 14 static keys, nothing merged
+  });
+
+  test("no PLUGINS set → no docker read at all, no note", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).not.toContain("index unavailable");
+    expect(dockerCalls(fx)).toHaveLength(0); // load_plugin_keys short-circuits before docker
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh status includes the plugin state (#101)", () => {
+  test("status.plugins carries the state file's .plugins array", async () => {
+    const state = JSON.stringify({
+      hostApiVersion: 1,
+      writtenAt: "2026-09-05T00:00:00.000Z",
+      plugins: [{ name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }],
+    });
+    const fx = setup("PLUGINS=warbandeer\n", { pluginState: state });
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.plugins).toEqual([
+      { name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true },
+    ]);
+  });
+
+  test("status.plugins is [] when the plugin state file is absent", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n"); // no pluginState fixture
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.plugins).toEqual([]);
   });
 });
