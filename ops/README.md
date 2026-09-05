@@ -53,7 +53,7 @@ nothing but `git`, `docker`, and `curl` — no clone of this repo, no Bun toolch
 directly from the public repo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/roshne/rackbops-discord-bot/main/ops/install.sh \
+curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh \
   | bash -s -- debug
 ```
 
@@ -76,7 +76,7 @@ up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*`
 
 The compose file's `build.context` defaults to `.` (a local checkout, unchanged for anyone
 running `docker compose up -d --build` from a clone) — the bootstrap command instead supplies
-`BOT_BUILD_CONTEXT=https://github.com/roshne/rackbops-discord-bot.git#<branch>` as a one-shot
+`BOT_BUILD_CONTEXT=https://github.com/Rackbops/rackbops-discord-bot.git#<branch>` as a one-shot
 shell variable on that single invocation, so the Docker daemon fetches and builds the source
 itself. It is **not** written into `.env` — nothing rebuilds via `docker compose --build` after
 that initial bring-up (self-update's own rebuilds go through the Docker Engine API directly, in
@@ -199,7 +199,7 @@ Prod is just another `ops/install.sh`-bootstrapped instance (see
 `bot-ops.sh` itself is prod-specific.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/roshne/rackbops-discord-bot/main/ops/install.sh \
+curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh \
   | bash -s -- prod
 ```
 

@@ -3,7 +3,7 @@ services:
     build:
       # Defaults to the local checkout, unchanged for `docker compose up -d --build` here.
       # A deployed instance instead supplies BOT_BUILD_CONTEXT as a shell var on the build
-      # invocation itself (e.g. https://github.com/roshne/rackbops-discord-bot.git#main) so the
+      # invocation itself (e.g. https://github.com/Rackbops/rackbops-discord-bot.git#main) so the
       # daemon fetches and builds the source itself — no checkout needed on that host at all.
       # NOT persisted in .env: nothing rebuilds via `docker compose --build` after the initial
       # bring-up (self-update's own rebuilds go through the Docker Engine API directly, in

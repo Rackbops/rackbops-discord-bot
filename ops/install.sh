@@ -3,7 +3,7 @@
 # install.sh — bootstrap a fresh rackbops-discord-bot instance with no checkout on the host:
 # just git, docker, and curl. Curl-able:
 #
-#   curl -fsSL https://raw.githubusercontent.com/roshne/rackbops-discord-bot/main/ops/install.sh \
+#   curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh \
 #     | bash -s -- debug
 #
 # Run as a normal user, not root — sudo is invoked internally, just once, to bootstrap /opt.
@@ -43,8 +43,8 @@
 # the file is fully fetched, runs the whole thing — never a partial prefix.
 set -euo pipefail
 
-REPO_URL="https://github.com/roshne/rackbops-discord-bot.git"
-RAW_BASE="https://raw.githubusercontent.com/roshne/rackbops-discord-bot"
+REPO_URL="https://github.com/Rackbops/rackbops-discord-bot.git"
+RAW_BASE="https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot"
 
 die() { echo "install: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found — install it first"; }
@@ -193,7 +193,7 @@ STACKENV
 
 install: next steps for '$INSTANCE'
   1. Edit $CONFIG_DIR/.env — set DISCORD_TOKEN, ANNOUNCE_CHANNEL_ID, and anything else you need.
-     Make sure BOT_BRANCH=$BRANCH and GITHUB_REPO=roshne/rackbops-discord-bot are set there too,
+     Make sure BOT_BRANCH=$BRANCH and GITHUB_REPO=Rackbops/rackbops-discord-bot are set there too,
      so self-update (/update, AUTO_UPDATE) targets the same branch this bootstrap just built.
   2. Bring it up (safe to re-run):
 
