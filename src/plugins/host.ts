@@ -3,7 +3,7 @@
 // so host.test.ts drives it with fake bundles and a temp dir, no discord.js Client and no network.
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
 import { SlashCommandBuilder, type RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
-import { commandNamer } from "../commands";
+import { commandNamer } from "../commandNaming";
 import { createKeyedJsonMutator } from "../storage";
 import type {
   HostApi,
@@ -221,6 +221,8 @@ export function buildPluginStateFile(opts: {
   selected: readonly SelectedPlugin[];
   installed: readonly InstalledPlugin[];
   installSkips: Record<string, string>;
+  /** #104: a `/plugins update` target that failed and was reverted to the previous version. */
+  fallbacks: Record<string, { attempted: string; reason: string }>;
   loaded: readonly LoadedPlugin[];
   loadErrors: Record<string, string>;
   processEnv: Record<string, string | undefined>;
@@ -239,8 +241,12 @@ export function buildPluginStateFile(opts: {
     const availableVersion =
       sp.entry && installedVersion && sp.entry.version !== installedVersion ? sp.entry.version : undefined;
     const missingEnv = sp.entry ? missingRequiredEnv(sp.entry, opts.processEnv) : [];
-    // First failure along the chain: selection skip -> install skip -> load error -> activate error.
-    const error = sp.skipped ?? opts.installSkips[sp.name] ?? opts.loadErrors[sp.name] ?? loaded?.error;
+    // First failure along the chain: selection skip -> install skip -> #104 update-fallback (installed
+    // on the previous version, target failed) -> load error -> activate error. `targetVersion` is NOT
+    // carried forward: it lived for exactly this boot — success promoted it into installedVersion (via
+    // `installed.version` below), failure reverted to the previous, either way it is now consumed.
+    const error =
+      sp.skipped ?? opts.installSkips[sp.name] ?? opts.fallbacks[sp.name]?.reason ?? opts.loadErrors[sp.name] ?? loaded?.error;
     const entry: PluginStateEntry = {
       name: sp.name,
       enabled: true,
@@ -276,6 +282,7 @@ export async function writePluginState(opts: {
   selected: readonly SelectedPlugin[];
   installed: readonly InstalledPlugin[];
   installSkips: Record<string, string>;
+  fallbacks: Record<string, { attempted: string; reason: string }>;
   loaded: readonly LoadedPlugin[];
   loadErrors: Record<string, string>;
   processEnv: Record<string, string | undefined>;
@@ -286,6 +293,7 @@ export async function writePluginState(opts: {
     selected: opts.selected,
     installed: opts.installed,
     installSkips: opts.installSkips,
+    fallbacks: opts.fallbacks,
     loaded: opts.loaded,
     loadErrors: opts.loadErrors,
     processEnv: opts.processEnv,

@@ -163,7 +163,44 @@ describe("handleCommand — /plugins", () => {
     } as unknown as ChatInputCommandInteraction;
     await handleCommand(interaction);
     expect(replied?.content).toContain("set `ADMIN_USER_IDS`");
-    expect(deferred).toBe(false); // gated before any I/O
+    expect(deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
+  });
+
+  // #104 update-now restart ordering. The handler does real network/state I/O (loadPluginIndex,
+  // mutatePluginState), so — like index.test.ts's boot-order guard — this pins the critical ordering
+  // by source-scan: the pin write + reply must sit INSIDE withCritical and BEFORE requestRestart, so
+  // the exit (deferred to the critical section's end) can't beat the state write or the reply.
+  test("update-now writes the pin inside withCritical, before requestRestart (source guard)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    const block = src.slice(src.indexOf("if (result.restart)"));
+    const wc = block.indexOf("withCritical(");
+    // Require the `await` on the pin write — without it the deferred exit could beat the state write.
+    const mutate = block.indexOf("await mutatePluginState(DATA_DIR, result.mutate)");
+    const reply = block.indexOf("await interaction.editReply(result.reply)");
+    const restart = block.indexOf("requestRestart(");
+    for (const [label, pos] of Object.entries({ wc, mutate, reply, restart })) {
+      expect(pos, `${label} present`).toBeGreaterThan(-1);
+    }
+    expect(wc).toBeLessThan(mutate); // wrapped in the critical section
+    expect(mutate).toBeLessThan(reply); // pin written (awaited) before the reply
+    expect(reply).toBeLessThan(restart); // …and the restart is requested last
+  });
+
+  // The write subcommands must refuse until the boot state.json write has landed (isPluginStateReady),
+  // so a command in the startup window can't race that write. Behaviorally awkward to exercise (the
+  // config.adminUserIds singleton is empty in-process), so source-scan it like the ordering guard: the
+  // readiness check must sit before the deferReply/mutate of the write path.
+  test("write subcommands are gated behind isPluginStateReady, before the mutate (source guard)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    const listBranch = src.indexOf('if (sub === "list")');
+    const gate = src.indexOf("if (!isPluginStateReady())", listBranch);
+    const defer = src.indexOf("await interaction.deferReply", gate);
+    const mutate = src.indexOf("mutatePluginState(DATA_DIR, result.mutate)", gate);
+    expect(gate).toBeGreaterThan(listBranch); // the gate is on the write path, after the list branch
+    expect(gate).toBeLessThan(defer); // …and refuses before deferring / doing I/O
+    expect(gate).toBeLessThan(mutate);
   });
 });
 

@@ -21,11 +21,13 @@ import {
   buildCommandBody,
   createHostApi,
   loadPlugins,
+  mutatePluginState,
   pluginCommandMap,
   pluginTicks,
   readPluginState,
   writePluginState,
 } from "./plugins/host";
+import { reportPluginUpdateOutcome } from "./plugins/updates";
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -72,14 +74,18 @@ async function activate(c: Client<true>): Promise<void> {
   // outer try degrades ANY unexpected failure to core-only registration — a plugin never crashes boot.
   const storage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
   let previousState: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
-  let installResult: InstallResult = { installed: [], skips: {} };
+  let installResult: InstallResult = { installed: [], skips: {}, fallbacks: {} };
   let loadResult: LoadResult = { loaded: [], errors: {} };
   let commandMap: PluginCommandMap = new Map();
   let commandBody = commandData;
   try {
     previousState = await readPluginState(DATA_DIR, storage);
-    const installedVersions = Object.fromEntries(previousState.plugins.map((p) => [p.name, p.installedVersion]));
-    installResult = await installPlugins(selectedPlugins, DATA_DIR, installedVersions, {
+    // Per-plugin pins: the last-good installedVersion plus #104's transient targetVersion (an explicit
+    // /plugins update the next boot should try, falling back to installedVersion if it can't install).
+    const pins = Object.fromEntries(
+      previousState.plugins.map((p) => [p.name, { installedVersion: p.installedVersion, targetVersion: p.targetVersion }]),
+    );
+    installResult = await installPlugins(selectedPlugins, DATA_DIR, pins, {
       fetch,
       extract: tarExtract,
       now: Date.now,
@@ -158,6 +164,7 @@ async function activate(c: Client<true>): Promise<void> {
       selected: selectedPlugins,
       installed: installResult.installed,
       installSkips: installResult.skips,
+      fallbacks: installResult.fallbacks,
       loaded: loadResult.loaded,
       loadErrors: loadResult.errors,
       processEnv: process.env,
@@ -177,6 +184,23 @@ async function activate(c: Client<true>): Promise<void> {
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own.
   reportUpdateOutcome(client).catch((err) => console.error("[updateReport]", err));
+
+  // #104: and the owed /plugins-update follow-up. Not awaited for the same reason; clears its marker
+  // through the shared mutator (the pluginUpdates tick is live now that markPluginStateReady fired).
+  reportPluginUpdateOutcome({
+    readState: () => readPluginState(DATA_DIR, storage),
+    mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
+    dmUser: async (userId, content) => {
+      const user = await client.users.fetch(userId);
+      await user.send(content);
+    },
+    postChannel: async (channelId, userId, content) => {
+      const channel = await client.channels.fetch(channelId);
+      if (!channel?.isSendable()) throw new Error(`Channel ${channelId} is not sendable`);
+      await channel.send({ content: `<@${userId}> ${content}`, allowedMentions: { users: [userId] } });
+    },
+    log: console,
+  }).catch((err) => console.error("[plugins] report-back", err));
 }
 
 // A standby that never reaches ClientReady must say so rather than sit there: the original is

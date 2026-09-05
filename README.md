@@ -116,7 +116,10 @@ The bot loads plugins named in `PLUGINS=` from a published manifest and **never 
 - Every 15 minutes (and once at startup) the bot checks the Plugin Index for a newer version of each installed plugin. When it finds one, it **DMs the admins (`ADMIN_USER_IDS`) once**, with the release notes for everything between your installed version and the new one, and the choices: `/plugins update <name>` (now, or `at:` a time), `/plugins remind <name>`, `/plugins skip <name>` — or the admin panel. If DMs are closed it falls back to the announce channel once. Nothing installs, restarts, or moves a version from this notice.
 - A newer version that needs a newer bot is still announced — worded "needs a newer bot" — but isn't offered for install until you update the bot.
 - `/plugins list` (admins only, private reply) shows each installed plugin, any newer version, and whether it's skipped or snoozed.
-- Acting on an update — installing now, scheduling it, snoozing, or skipping — is `/plugins update|remind|skip|cancel` (and the panel's buttons). *(The action side lands in a follow-up; this release is the notifications and `/plugins list`.)*
+- **Acting on an update** (admins, private reply — nothing changes until you choose):
+  - `/plugins update <name>` installs it **now**: the bot restarts into it and, once it's back, DMs you `✅ <name> is now <version>`. If that version can't be installed, the bot comes back on your **previous** version and tells you so — it never strands the plugin.
+  - `/plugins update <name> at:<time>` **schedules** it. `at:` is either `HH:MM` (24-hour, **UTC** — the next time that clock hits it) or a full ISO-8601 datetime **with an offset** (e.g. `2026-09-06T18:30-07:00`); the reply echoes it back in your local time to confirm. At that time the bot DMs a heads-up, restarts into the version, and reports back.
+  - `/plugins remind <name> [days]` snoozes the reminder (default 7 days); `/plugins skip <name>` silences this version until a newer one appears; `/plugins cancel <name>` drops a schedule.
 
 ## Character linking
 
@@ -211,7 +214,7 @@ settings in the dashboard.
 |---|---|
 | `src/index.ts` | Client login, command registration, interaction routing (commands + `/report` modals) |
 | `src/config.ts` | Env config (`.env`); `/report` project→repo map |
-| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report` handlers (`/link`/`/unlink` come from the `warbandeer` plugin) |
+| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report`, `/plugins list\|update\|remind\|skip\|cancel` handlers (`/link`/`/unlink` come from the `warbandeer` plugin) |
 | `src/wow/transmog.ts` | `/transmog` — equipment → `/customset` import string, realm slugs, reply text |
 | `src/wow/blizzard.ts` | Shared Blizzard client-credentials token |
 | `src/report.ts` | `/report` — role gate, modal form, files a GitHub issue, announces it in the channel |

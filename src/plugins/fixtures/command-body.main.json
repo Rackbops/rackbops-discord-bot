@@ -73,6 +73,72 @@
         "name": "list",
         "description": "List installed plugins and any available updates",
         "options": []
+      },
+      {
+        "type": 1,
+        "name": "update",
+        "description": "Update a plugin now, or schedule it for a time",
+        "options": [
+          {
+            "type": 3,
+            "name": "name",
+            "description": "Plugin name",
+            "required": true
+          },
+          {
+            "type": 3,
+            "name": "at",
+            "description": "When: HH:MM (24h, UTC) or ISO-8601 with offset. Omit = now",
+            "required": false
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "name": "remind",
+        "description": "Snooze the update reminder for a plugin",
+        "options": [
+          {
+            "type": 3,
+            "name": "name",
+            "description": "Plugin name",
+            "required": true
+          },
+          {
+            "max_value": 365,
+            "min_value": 1,
+            "type": 4,
+            "name": "days",
+            "description": "Days to snooze (default 7)",
+            "required": false
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "name": "skip",
+        "description": "Skip this version — no reminders until a newer one appears",
+        "options": [
+          {
+            "type": 3,
+            "name": "name",
+            "description": "Plugin name",
+            "required": true
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "name": "cancel",
+        "description": "Cancel a plugin's scheduled update",
+        "options": [
+          {
+            "type": 3,
+            "name": "name",
+            "description": "Plugin name",
+            "required": true
+          }
+        ]
       }
     ],
     "name": "plugins",
