@@ -24,9 +24,6 @@ export interface Config {
   adminUserIds: string[];
   reportRoleId?: string;
   commandPrefix: string;
-  /** Port the Warbandeer connector's ingest server binds inside the container. Unset = the
-   * connector doesn't start at all (`/link` reports itself disabled) — see docs/adr/0001. */
-  warbandeerIngestPort?: number;
   /** Parsed `PLUGINS=` tokens — which plugins to install. Installing ≠ configured; a plugin's
    * own env keys are separate. See docs/adr/0004. */
   plugins: PluginSelector[];
@@ -108,16 +105,6 @@ export function resolveConfig(env: Env): Config {
     throw new Error(`DMF_TIMEZONE is not a valid IANA time zone, got "${dmfTimezone}"`);
   }
 
-  const warbandeerIngestPortRaw = optional("WARBANDEER_INGEST_PORT");
-  let warbandeerIngestPort: number | undefined;
-  if (warbandeerIngestPortRaw !== undefined) {
-    const n = Number(warbandeerIngestPortRaw);
-    if (!Number.isInteger(n) || n <= 0 || n > 65535) {
-      throw new Error(`WARBANDEER_INGEST_PORT must be a valid port number, got "${warbandeerIngestPortRaw}"`);
-    }
-    warbandeerIngestPort = n;
-  }
-
   // name, or name@version to pin a version; duplicate names rejected separately from list()'s
   // own token-level dedup, which wouldn't catch "foo,foo@1.0.0" (different tokens, same name).
   const pluginTokens = list("PLUGINS");
@@ -166,7 +153,6 @@ export function resolveConfig(env: Env): Config {
     adminUserIds: list("ADMIN_USER_IDS"),
     reportRoleId: optional("REPORT_ROLE_ID"),
     commandPrefix,
-    warbandeerIngestPort,
     plugins,
     pluginIndexUrl,
   };

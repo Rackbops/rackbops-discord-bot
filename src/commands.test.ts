@@ -1,5 +1,4 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
 import type { ChatInputCommandInteraction } from "discord.js";
 import type { PluginCommand } from "./plugins/contract";
 
@@ -115,14 +114,11 @@ describe("updateReply", () => {
 });
 
 describe("commandData", () => {
-  // Round-3 finding: /unlink's account_label option used to hardcode max_length: 64 with a
-  // comment claiming it matched characters.ts's MAX_ACCOUNT_LABEL_LENGTH — nothing actually tied
-  // them together, so the two could drift silently. Now sourced from the same constant; this
-  // pins that the built command JSON reflects it, not just the source line.
-  test("/unlink's account_label max length matches MAX_ACCOUNT_LABEL_LENGTH", () => {
-    const unlink = commandData.find((c) => c.name === "unlink");
-    const accountLabel = unlink?.options?.find((o) => o.name === "account_label");
-    expect(accountLabel).toMatchObject({ max_length: MAX_ACCOUNT_LABEL_LENGTH });
+  // #100 removed the baked-in connector: /link and /unlink are now the warbandeer plugin's, not
+  // core. Pin that they are gone from the core registration (the plugin adds them back when loaded).
+  test("no longer contains the connector's /link or /unlink", () => {
+    expect(commandData.map((c) => c.name)).not.toContain("link");
+    expect(commandData.map((c) => c.name)).not.toContain("unlink");
   });
 });
 
@@ -147,10 +143,12 @@ describe("handleCommand — plugin dispatch (default case)", () => {
 });
 
 describe("buildCommandBody — core-only identity", () => {
-  // The framework must not change the core registration body. With no plugins, the built body must
-  // equal the committed core command JSON captured from main (fixtures/command-body.main.json).
-  test("with no plugins, the registration body equals the committed core command JSON", () => {
+  // The framework must not change the core registration body, AND #100's connector removal is pinned
+  // here: with no plugins the built body must equal the captured core JSON MINUS the two connector
+  // commands (fixtures/command-body.main.json was captured pre-#100 with /link + /unlink present).
+  test("with no plugins, the body equals the fixture minus the removed connector commands", () => {
     const body = buildCommandBody(config.commandPrefix, commandData, new Map(), { info() {}, warn() {}, error() {} });
-    expect(body).toEqual(coreBodyFixture);
+    const expected = coreBodyFixture.filter((c: { name: string }) => c.name !== "link" && c.name !== "unlink");
+    expect(body).toEqual(expected);
   });
 });

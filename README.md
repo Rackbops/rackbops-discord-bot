@@ -117,10 +117,12 @@ whatever the desktop app's SavedVariables reader sends) and associates it with y
 account. `/unlink [account_label]` disconnects one — the `account_label` option only matters if
 you've linked more than one WoW account; with exactly one linked, `/unlink` needs no argument.
 
-This needs an inbound HTTP endpoint, so it's **off by default**: set `WARBANDEER_INGEST_PORT` in
-`.env` to enable it (any free port — it's never published to the host, only reachable through the
-Cloudflare Tunnel below). Unset, `/link` replies that linking isn't configured rather than
-minting a code that could never be redeemed.
+Character linking ships as a **plugin** (`@rackbops/plugin-warbandeer`), not baked into the bot:
+install it with `PLUGINS=warbandeer` in `.env`. It also needs an inbound HTTP endpoint, so it's
+**off unless** `WARBANDEER_INGEST_PORT` is also set (any free port — never published to the host,
+only reachable through the Cloudflare Tunnel below). With the plugin installed but the port unset,
+`/link` replies that linking isn't configured rather than minting a code that could never be
+redeemed; without `PLUGINS=warbandeer`, `/link` and `/unlink` aren't registered at all.
 
 Unlike the admin panel's tunnel use, this endpoint has **no Cloudflare Access login wall** —
 arbitrary guild members have no Access identity to check against, which is the whole reason
@@ -159,7 +161,7 @@ An opt-in sidecar exposing the bot's local API (currently: the character-linking
 to the internet without opening any inbound firewall ports.
 
 1. In the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/), go to **Networks → Tunnels**, create a tunnel, choose the **Docker** connector, and copy the token it gives you.
-2. Set `CLOUDFLARE_TUNNEL_TOKEN` and `WARBANDEER_INGEST_PORT` in `.env`.
+2. Set `CLOUDFLARE_TUNNEL_TOKEN`, `PLUGINS=warbandeer`, and `WARBANDEER_INGEST_PORT` in `.env`.
 3. Start it alongside the bot:
 
    **Local dev** (a checkout's own `.env` beside `docker-compose.yml` is Compose's interpolation
@@ -200,7 +202,7 @@ settings in the dashboard.
 |---|---|
 | `src/index.ts` | Client login, command registration, interaction routing (commands + `/report` modals) |
 | `src/config.ts` | Env config (`.env`); `/report` project→repo map |
-| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report`, `/link`, `/unlink` handlers |
+| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report` handlers (`/link`/`/unlink` come from the `warbandeer` plugin) |
 | `src/wow/transmog.ts` | `/transmog` — equipment → `/customset` import string, realm slugs, reply text |
 | `src/wow/blizzard.ts` | Shared Blizzard client-credentials token |
 | `src/report.ts` | `/report` — role gate, modal form, files a GitHub issue, announces it in the channel |
@@ -216,9 +218,5 @@ settings in the dashboard.
 | `src/wow/reset.ts` | Daily/weekly reset math per region |
 | `src/wow/realm.ts` | Blizzard OAuth + connected-realm status |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
-| `src/warbandeer/link-command.ts` | `/link`, `/unlink` — mint/redeem-flow reply text, account removal |
-| `src/warbandeer/server.ts` | The ingest HTTP server: `POST /link`, `POST /characters`, rate limiting |
-| `src/warbandeer/links.ts` | Link Code + Device Token model (`data/links.json`) |
-| `src/warbandeer/characters.ts` | Character Snapshot validation + storage (`data/characters/`) |
-| `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), used by `warbandeer/{links,characters}.ts` and handed to plugins as `HostApi.storage`/`dataDir` |
+| `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), handed to plugins as `HostApi.storage`/`dataDir` |
 | `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |
