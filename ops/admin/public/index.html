@@ -152,6 +152,23 @@
   .plugin-badge.update { color: var(--accent); border-color: var(--accent); }
   .plugin-badge.active { color: var(--ok); border-color: var(--ok); }
   .plugin-badge.warn { color: var(--danger); border-color: var(--danger); }
+  .plugin-update { margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--inset); }
+  .plugin-changes { margin: 0 0 8px; }
+  .plugin-changes summary { cursor: pointer; font-size: 12px; color: var(--accent); }
+  .plugin-changes .rel { margin-top: 6px; }
+  .plugin-changes .rel-ver { font-weight: 600; font-size: 12px; }
+  .plugin-changes .rel-meta { font-size: 11px; color: var(--muted); }
+  .plugin-changes .rel-notes { font-size: 12px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+  .plugin-incompat { font-size: 11px; color: var(--danger); margin-bottom: 6px; }
+  .plugin-sched-note { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .plugin-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .plugin-actions button { padding: 4px 10px; font-size: 12px; }
+  .plugin-actions button.secondary { background: var(--btn2); }
+  .plugin-actions .sched { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .plugin-actions input[type="datetime-local"] { width: auto; padding: 3px 6px; font-size: 12px; }
+  .plugin-actions-msg { font-size: 11px; margin-top: 6px; white-space: pre-wrap; }
+  .plugin-actions-msg.ok { color: var(--ok); }
+  .plugin-actions-msg.error { color: var(--danger); }
   #gate { max-width: 360px; margin: 80px auto; text-align: center; }
   #gate .panel-header { justify-content: center; }
 </style>
@@ -539,6 +556,36 @@
   }
   // PLUGIN_BADGES:end
 
+  // PLUGIN_REQUEST_HELPERS:begin
+  // Pure helpers for the #105 update-action buttons, lifted + pinned by ops/admin/server.test.ts.
+  // A <datetime-local> value has no timezone; new Date(v) reads it as the admin's LOCAL time, and
+  // toISOString() emits the same instant as a UTC `…Z` string — which satisfies the bot's
+  // ISO_OFFSET_RE (Z is an accepted offset) and Date.parse. null on a blank/invalid pick.
+  function scheduleAtToIso(localValue) {
+    if (!localValue) return null;
+    const d = new Date(localValue);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  // The <datetime-local> value string for a Date, in the admin's local time (no offset, seconds
+  // dropped) — used to pre-fill the Schedule picker with a sensible default.
+  function toDatetimeLocalValue(d) {
+    const pad = (n) => String(n).padStart(2, "0");
+    return (
+      d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+      "T" + pad(d.getHours()) + ":" + pad(d.getMinutes())
+    );
+  }
+  // The request body for one action. `requestedBy` is DELIBERATELY absent — the server fills it from
+  // the verified Access identity; a client-supplied one is ignored. `version` is omitted for cancel.
+  function pluginRequestPayload(action, plugin, version, extra) {
+    const body = { action, plugin };
+    if (action !== "cancel") body.version = version;
+    if (action === "schedule" && extra && extra.at) body.at = extra.at;
+    if (action === "remind" && extra && extra.days != null) body.days = extra.days;
+    return body;
+  }
+  // PLUGIN_REQUEST_HELPERS:end
+
   // One card per plugin. All server-sourced text goes through textContent / createElement — never
   // innerHTML — so a plugin name or description can't inject markup.
   function buildPluginRow(p, indexAvailable) {
@@ -585,8 +632,176 @@
     if (state) meta.appendChild(makeBadge(state.text, state.kind));
     info.appendChild(meta);
 
+    const updateBlock = buildPluginUpdateBlock(p);
+    if (updateBlock) info.appendChild(updateBlock);
+
     row.appendChild(info);
     return row;
+  }
+
+  // A human-readable local timestamp for an ISO string (browser-only rendering — the pure ISO
+  // conversion that a test pins is scheduleAtToIso, above). Falls back to the raw string if unparseable.
+  function formatLocal(iso) {
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? String(iso) : d.toLocaleString();
+  }
+
+  // The #105 update-action area for one plugin: the "What changed" release notes, a compatibility
+  // note, the current schedule/skip/remind state, and the five action buttons. Returns null when
+  // there's neither an available update nor a pending schedule to cancel (nothing to act on). All
+  // server-sourced text via textContent/createElement — no innerHTML, no markdown dependency.
+  function buildPluginUpdateBlock(p) {
+    const hasUpdate = !!pluginUpdateBadge(p);
+    if (!hasUpdate && !p.scheduled) return null;
+
+    const wrap = document.createElement("div");
+    wrap.className = "plugin-update";
+
+    // "What changed": each release newer than installed (the server already trimmed p.releases to
+    // that latest-first prefix), version + published date + notes.
+    if (hasUpdate && p.releases && p.releases.length) {
+      const details = document.createElement("details");
+      details.className = "plugin-changes";
+      const summary = document.createElement("summary");
+      summary.textContent = "What changed (" + p.releases.length + " release" + (p.releases.length === 1 ? "" : "s") + ")";
+      details.appendChild(summary);
+      for (const rel of p.releases) {
+        const relDiv = document.createElement("div");
+        relDiv.className = "rel";
+        const ver = document.createElement("div");
+        ver.className = "rel-ver";
+        ver.textContent = rel.version;
+        relDiv.appendChild(ver);
+        if (rel.publishedAt) {
+          const m = document.createElement("div");
+          m.className = "rel-meta";
+          m.textContent = formatLocal(rel.publishedAt);
+          relDiv.appendChild(m);
+        }
+        if (rel.notes) {
+          const n = document.createElement("div");
+          n.className = "rel-notes";
+          n.textContent = rel.notes;
+          relDiv.appendChild(n);
+        }
+        details.appendChild(relDiv);
+      }
+      wrap.appendChild(details);
+    }
+
+    // Compatibility: the index's latest needs a newer host API than this bot — Update now / Schedule
+    // would be rejected by the bot, so suppress them (below) and say why here.
+    if (hasUpdate && p.compatible === false) {
+      const note = document.createElement("div");
+      note.className = "plugin-incompat";
+      note.textContent =
+        "This update needs a newer bot" +
+        (typeof p.neededHostApi === "number" ? " (host API v" + p.neededHostApi + ")" : "") +
+        " — update the bot itself before installing it.";
+      wrap.appendChild(note);
+    }
+
+    // Current update-lifecycle state, so the admin knows what's already queued (and that Cancel applies).
+    const stateBits = [];
+    if (p.scheduled) stateBits.push("Scheduled " + p.scheduled.version + " for " + formatLocal(p.scheduled.at));
+    if (p.remindAt) stateBits.push("Reminder set for " + formatLocal(p.remindAt));
+    if (p.skippedVersion) stateBits.push("Skipped " + p.skippedVersion);
+    if (stateBits.length) {
+      const sn = document.createElement("div");
+      sn.className = "plugin-sched-note";
+      sn.textContent = stateBits.join(" · ");
+      wrap.appendChild(sn);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "plugin-actions";
+    const msg = document.createElement("div");
+    msg.className = "plugin-actions-msg";
+
+    // Wires a button: validate/build the payload, optionally confirm, then POST. A null payload means
+    // validation already set an error message, so nothing is sent.
+    const wire = (btn, buildPayload, confirmText) =>
+      btn.addEventListener("click", (e) =>
+        withBusy(e.currentTarget, async () => {
+          const payload = buildPayload();
+          if (!payload) return;
+          if (confirmText && !confirm(confirmText)) return;
+          await sendPluginRequest(payload, msg);
+        }),
+      );
+
+    const canInstall = hasUpdate && p.compatible !== false;
+
+    if (canInstall) {
+      const now = document.createElement("button");
+      now.type = "button";
+      now.textContent = "Update now";
+      wire(
+        now,
+        () => pluginRequestPayload("update-now", p.name, p.latestVersion),
+        'Update "' + p.name + '" to ' + p.latestVersion + " now? The bot will restart to install it.",
+      );
+      actions.appendChild(now);
+
+      const sched = document.createElement("span");
+      sched.className = "sched";
+      const when = document.createElement("input");
+      when.type = "datetime-local";
+      when.value = toDatetimeLocalValue(new Date(Date.now() + 60 * 60 * 1000)); // default: an hour out
+      const schedBtn = document.createElement("button");
+      schedBtn.type = "button";
+      schedBtn.className = "secondary";
+      schedBtn.textContent = "Schedule";
+      wire(
+        schedBtn,
+        () => {
+          const at = scheduleAtToIso(when.value);
+          if (!at) {
+            msg.textContent = "Pick a valid date and time to schedule the update.";
+            msg.className = "plugin-actions-msg error";
+            return null;
+          }
+          return pluginRequestPayload("schedule", p.name, p.latestVersion, { at });
+        },
+        null,
+      );
+      sched.appendChild(when);
+      sched.appendChild(schedBtn);
+      actions.appendChild(sched);
+    }
+
+    if (hasUpdate) {
+      const remind = document.createElement("button");
+      remind.type = "button";
+      remind.className = "secondary";
+      remind.textContent = "Remind me in 7 days";
+      wire(remind, () => pluginRequestPayload("remind", p.name, p.latestVersion, { days: 7 }), null);
+      actions.appendChild(remind);
+
+      const skip = document.createElement("button");
+      skip.type = "button";
+      skip.className = "secondary";
+      skip.textContent = "Skip this version";
+      wire(
+        skip,
+        () => pluginRequestPayload("skip", p.name, p.latestVersion),
+        'Skip ' + p.latestVersion + ' for "' + p.name + '"? You won\'t be reminded about this version again.',
+      );
+      actions.appendChild(skip);
+    }
+
+    if (p.scheduled) {
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "danger";
+      cancel.textContent = "Cancel scheduled update";
+      wire(cancel, () => pluginRequestPayload("cancel", p.name), 'Cancel the scheduled update for "' + p.name + '"?');
+      actions.appendChild(cancel);
+    }
+
+    wrap.appendChild(actions);
+    wrap.appendChild(msg);
+    return wrap;
   }
 
   // PLUGINS_SAVE_PLAN:begin
@@ -668,6 +883,43 @@
     }
   }
   // PLUGINS_SAVE:end
+
+  // PLUGIN_REQUEST_SEND:begin
+  // Consumer boundary for the #105 action buttons: POST /api/plugins/request with the pure payload,
+  // then re-load so the new schedule/skip/remind state shows. Mirrors savePlugins' timeout + error
+  // handling. Lifted + tested (ops/admin/server.test.ts) so "POSTs to /api/plugins/request, never
+  // sets requestedBy client-side, re-loads on success" is pinned at the boundary, not just the payload.
+  async function sendPluginRequest(payload, msg) {
+    msg.textContent = "Queuing…";
+    msg.className = "plugin-actions-msg";
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/plugins/request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal,
+      });
+      const text = await res.text();
+      if (res.ok) {
+        msg.textContent = "Queued — the bot applies this on its next check (within a minute).";
+        msg.className = "plugin-actions-msg ok";
+        loadPlugins();
+        loadStatus();
+      } else {
+        msg.textContent = "Failed: " + (text || "HTTP " + res.status);
+        msg.className = "plugin-actions-msg error";
+      }
+    } catch (e) {
+      if (e.message !== "unauthorized") {
+        msg.textContent = e.message;
+        msg.className = "plugin-actions-msg error";
+      }
+    } finally {
+      cancel();
+    }
+  }
+  // PLUGIN_REQUEST_SEND:end
 
   document.getElementById("save-plugins").addEventListener("click", (e) => withBusy(e.currentTarget, savePlugins));
 
