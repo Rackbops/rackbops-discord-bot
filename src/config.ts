@@ -127,7 +127,7 @@ export function resolveConfig(env: Env): Config {
   }
 
   const pluginIndexUrl =
-    optional("PLUGIN_INDEX_URL") ?? "https://raw.githubusercontent.com/Rackbops/bot-plugins/main/plugins.json";
+    optional("PLUGIN_INDEX_URL") ?? "https://raw.githubusercontent.com/Rackbops/rackbops-bot-plugins/main/plugins.json";
   if (!/^https?:\/\//.test(pluginIndexUrl) && !/^file:\/\//.test(pluginIndexUrl) && !pluginIndexUrl.startsWith("/")) {
     throw new Error(
       `PLUGIN_INDEX_URL must be an http(s) URL, a file:// URL or an absolute path, got "${pluginIndexUrl}"`,
