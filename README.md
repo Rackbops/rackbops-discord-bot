@@ -220,5 +220,5 @@ settings in the dashboard.
 | `src/warbandeer/server.ts` | The ingest HTTP server: `POST /link`, `POST /characters`, rate limiting |
 | `src/warbandeer/links.ts` | Link Code + Device Token model (`data/links.json`) |
 | `src/warbandeer/characters.ts` | Character Snapshot validation + storage (`data/characters/`) |
-| `src/warbandeer/storage.ts` | Shared atomic JSON read/write, used by `links.ts`/`characters.ts` |
+| `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), used by `warbandeer/{links,characters}.ts` and handed to plugins as `HostApi.storage`/`dataDir` |
 | `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |

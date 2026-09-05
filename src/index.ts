@@ -1,10 +1,11 @@
-import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Client, Events, REST, Routes } from "discord.js";
 import { config } from "./config";
+import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "./storage";
 import { createClient, CORE_INTENTS } from "./client";
 import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler } from "./announce";
+import { startScheduler, announceTo } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
@@ -12,9 +13,20 @@ import { startWarbandeerServer, warbandeerConnectorConfigured } from "./warbande
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
-
-// Same path src/state.ts computes (both files sit directly in src/); #99 centralises this.
-const DATA_DIR = join(import.meta.dir, "..", "data");
+import type { HostApi, HostStorage, PluginIndexEntry, PluginModule, PluginStateFile } from "./plugins/contract";
+import { installPlugins, tarExtract } from "./plugins/install";
+import type { InstallResult } from "./plugins/install";
+import type { LoadResult, PluginCommandMap } from "./plugins/host";
+import {
+  activatePlugins,
+  buildCommandBody,
+  createHostApi,
+  loadPlugins,
+  pluginCommandMap,
+  pluginTicks,
+  readPluginState,
+  writePluginState,
+} from "./plugins/host";
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -54,14 +66,55 @@ client.once(Events.ClientReady, async (c) => {
  */
 async function activate(c: Client<true>): Promise<void> {
   const rest = new REST().setToken(config.discordToken);
+
+  // Plugin setup — install and load BEFORE command registration (the builders come from the bundles)
+  // and inside activate() (after takeOver()) so nothing plugin-side runs during the handoff overlap.
+  // Fully isolated: per-plugin failures are already contained inside install/load/build, and this
+  // outer try degrades ANY unexpected failure to core-only registration — a plugin never crashes boot.
+  const storage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
+  let previousState: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
+  let installResult: InstallResult = { installed: [], skips: {} };
+  let loadResult: LoadResult = { loaded: [], errors: {} };
+  let commandMap: PluginCommandMap = new Map();
+  let commandBody = commandData;
+  try {
+    previousState = await readPluginState(DATA_DIR, storage);
+    const installedVersions = Object.fromEntries(previousState.plugins.map((p) => [p.name, p.installedVersion]));
+    installResult = await installPlugins(selectedPlugins, DATA_DIR, installedVersions, {
+      fetch,
+      extract: tarExtract,
+      now: Date.now,
+      log: console,
+    });
+    const makeHost = (entry: PluginIndexEntry): HostApi =>
+      createHostApi({
+        entry,
+        processEnv: process.env,
+        dataDir: DATA_DIR,
+        baseLog: console,
+        storage,
+        announce: (message) => announceTo(client, config.announceChannelId, message),
+      });
+    loadResult = await loadPlugins(
+      installResult.installed,
+      makeHost,
+      async (bundlePath) => (await import(pathToFileURL(bundlePath).href)) as PluginModule,
+      console,
+    );
+    commandMap = pluginCommandMap(loadResult.loaded, CORE_COMMAND_NAMES, console);
+    commandBody = buildCommandBody(config.commandPrefix, commandData, commandMap, console);
+  } catch (err) {
+    console.error("[plugins] plugin setup failed — the bot starts core-only", err);
+  }
+
   try {
     await rest.put(
       config.guildId
         ? Routes.applicationGuildCommands(c.user.id, config.guildId)
         : Routes.applicationCommands(c.user.id),
-      { body: commandData },
+      { body: commandBody },
     );
-    console.log(`Registered ${commandData.length} slash commands`);
+    console.log(`Registered ${commandBody.length} slash commands`);
   } catch (err) {
     // A command-registration failure must not take the whole bot down. This used to run unguarded
     // in the ClientReady handler, so a throw became an unhandled rejection, the process crashed,
@@ -85,7 +138,7 @@ async function activate(c: Client<true>): Promise<void> {
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
       if (interaction.isChatInputCommand()) {
-        await handleCommand(interaction);
+        await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
         await handleReportModal(interaction);
       }
@@ -94,7 +147,7 @@ async function activate(c: Client<true>): Promise<void> {
     }
   });
 
-  startScheduler(client);
+  startScheduler(client, pluginTicks(loadResult.loaded, console));
   // Absent WARBANDEER_INGEST_PORT means the connector never starts at all — fail closed
   // (docs/adr/0001) rather than binding a port nobody asked for. Guarded the same way command
   // registration is above: Bun.serve throwing (a privileged port under the non-root `bun` user,
@@ -112,6 +165,29 @@ async function activate(c: Client<true>): Promise<void> {
       );
     }
   }
+
+  // Activate plugins AFTER the scheduler is up (pluginTicks are running-gated, so a tick that fires
+  // before this resolves is skipped) — a throwing activate() is isolated, never crashing the bot.
+  await activatePlugins(loadResult.loaded, console);
+  try {
+    await writePluginState({
+      dataDir: DATA_DIR,
+      storage,
+      selected: selectedPlugins,
+      installed: installResult.installed,
+      installSkips: installResult.skips,
+      loaded: loadResult.loaded,
+      loadErrors: loadResult.errors,
+      processEnv: process.env,
+      previous: previousState,
+      now: () => new Date(),
+    });
+  } catch (err) {
+    // A data/plugins/state.json write failure (a full/read-only volume) is bookkeeping for ops
+    // tooling — it must not crash a bot that is otherwise up and serving.
+    console.error("[plugins] writing data/plugins/state.json failed", err);
+  }
+
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own.
   reportUpdateOutcome(client).catch((err) => console.error("[updateReport]", err));

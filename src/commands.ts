@@ -22,6 +22,7 @@ import { handoffFailureMessage } from "./handoff";
 import type { RedeployResult } from "./redeploy";
 import { handleLinkCommand, handleUnlinkCommand } from "./warbandeer/link-command";
 import { MAX_ACCOUNT_LABEL_LENGTH } from "./warbandeer/characters";
+import type { PluginCommand } from "./plugins/contract";
 
 const ts = (d: Date, style: "F" | "R" = "F") => `<t:${Math.floor(d.getTime() / 1000)}:${style}>`;
 const when = (d: Date) => `${ts(d)} (${ts(d, "R")})`;
@@ -39,9 +40,16 @@ export function isAdmin(userId: string, adminUserIds: string[]): boolean {
 // bot can coexist in the same server. Empty by default → plain `dmf`/`reset`/`status`.
 const prefix = config.commandPrefix;
 
+/** Returns a builder-namer bound to `prefix`: `commandNamer("r_")("dmf")` → a `SlashCommandBuilder`
+ *  already named `r_dmf`. Exported so the plugin loader (`src/plugins/host.ts`) names plugin commands
+ *  through the same namer, keeping them inside the `COMMAND_PREFIX` namespace. */
+export function commandNamer(prefix: string): (name: string) => SlashCommandBuilder {
+  return (name: string) => new SlashCommandBuilder().setName(`${prefix}${name}`);
+}
+
 /** Start a command under the configured prefix. Build every command with this — a hand-written
  *  `new SlashCommandBuilder().setName("foo")` registers outside the namespace. */
-const cmd = (name: string) => new SlashCommandBuilder().setName(`${prefix}${name}`);
+const cmd = commandNamer(prefix);
 
 /**
  * The command name with COMMAND_PREFIX stripped, so dispatch reads the same whether or not a
@@ -97,8 +105,12 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
 // What selectPlugins() checks a plugin's declared command names against before any plugin loads.
 export const CORE_COMMAND_NAMES: string[] = commandData.map((c) => bareName(c.name));
 
-export async function handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-  switch (bareName(interaction.commandName)) {
+export async function handleCommand(
+  interaction: ChatInputCommandInteraction,
+  lookup: (bare: string) => PluginCommand | undefined = () => undefined,
+): Promise<void> {
+  const bare = bareName(interaction.commandName);
+  switch (bare) {
     case "dmf": {
       const { active, window } = currentOrNextDmf();
       await interaction.reply(
@@ -206,6 +218,14 @@ export async function handleCommand(interaction: ChatInputCommandInteraction): P
     }
     case "unlink": {
       await handleUnlinkCommand(interaction);
+      return;
+    }
+    default: {
+      // A loaded plugin's command (or nothing). The lookup is keyed by bare name; a name that
+      // matches no core case and no plugin just warns rather than silently dropping.
+      const pluginCommand = lookup(bare);
+      if (pluginCommand) await pluginCommand.handle(interaction);
+      else console.warn(`[interaction] no handler for /${interaction.commandName}`);
       return;
     }
   }

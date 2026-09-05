@@ -1,5 +1,14 @@
 import { mkdirSync, renameSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+
+/**
+ * The one `data/` directory (`/app/data` in the image), computed once here now that storage is a
+ * top-level `src/` module. The same value `src/state.ts` and `src/handoff.ts` compute for their own
+ * files, and `src/index.ts` imports from here; `HostApi.dataDir` handed to plugins is this too.
+ * Never recompute a data path from `import.meta.dir` under `src/plugins/` — that module is two hops
+ * from `data/`, not one.
+ */
+export const DATA_DIR = join(import.meta.dir, "..", "data");
 
 /**
  * Atomically writes `data` as JSON to `path`: a temp file in the same directory, then a rename —

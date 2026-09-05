@@ -2,7 +2,15 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, readJsonOrFresh, writeJsonAtomic } from "./storage";
+import { createJsonWriter, DATA_DIR, readJsonOrFresh, writeJsonAtomic } from "./storage";
+
+describe("DATA_DIR", () => {
+  test("resolves to the repo's data/ directory (one hop up from src/)", () => {
+    // storage.test.ts sits in src/ alongside storage.ts, so import.meta.dir is the same src/;
+    // the mutation this guards is a wrong hop count (e.g. an extra "..").
+    expect(DATA_DIR).toBe(join(import.meta.dir, "..", "data"));
+  });
+});
 
 // Mirrors state.test.ts's own coverage of the same two failure modes (a corrupt file, two
 // overlapping writers), applied here since links.ts/characters.ts both delegate to this module.

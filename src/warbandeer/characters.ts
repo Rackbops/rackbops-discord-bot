@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { createKeyedJsonMutator, readJsonOrFresh } from "./storage";
+import { createKeyedJsonMutator, readJsonOrFresh } from "../storage";
 
 /**
  * A character field the desktop app's broker sends. Kept loosely typed (`unknown`, validated for
