@@ -120,11 +120,16 @@ declare -A ALLOWED=(
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
-  # The real 1-65535 range, not just "1-5 digits": env-set's --force-recreate runs BEFORE the
-  # container boots far enough to hit config.ts's own rejection, so a looser shape check here
-  # (0, 00000, 99999) would recreate the bot straight into a crash loop under
-  # restart:unless-stopped rather than refusing the save up front.
-  [WARBANDEER_INGEST_PORT]='^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$'
+  # `PLUGINS=` selects which plugins to install (operator-controlled, panel-edited): a bare `name`
+  # or `name@version` to pin, comma-separated; empty = no plugins. The manifest-declared env keys of
+  # the plugins named here are merged into this whitelist at runtime by load_plugin_keys, so a
+  # plugin's own key (e.g. WARBANDEER_INGEST_PORT, a static row here until #100 removed the baked-in
+  # connector) is validated with the FORMAT the Plugin Index carries rather than hand-mirrored per
+  # plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
+  [PLUGINS]='^[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?(,[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?)*$'
+  # Where the bot fetches the Plugin Index from: an http(s) URL, a file:// URL, or a bare absolute
+  # path (config.ts accepts all three; empty clears back to the published default).
+  [PLUGIN_INDEX_URL]='^(https?://[^[:space:]]+|file://[^[:space:]]+|/[^[:space:]]+)$'
 )
 
 # Keys env-set must refuse to blank — the exception to ALLOWED's "empty string is always allowed"
@@ -154,7 +159,8 @@ ALLOWED_ORDER=(
   AUTO_UPDATE
   BOT_BRANCH
   COMMAND_PREFIX
-  WARBANDEER_INGEST_PORT
+  PLUGINS
+  PLUGIN_INDEX_URL
 )
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
@@ -262,18 +268,109 @@ env_value() {
   printf '%s' "${ENV_VALUES[$1]-}"
 }
 
+# Container paths to the bot's plugin bookkeeping, read the same docker-exec way cmd_status reads
+# the bot's own state.json. The cached Plugin Index is the WRAPPER src/plugins/index.ts writes —
+# `{ writtenAt, index: { …, plugins: [...] } }` — so the manifest lives at `.index.plugins`, NOT a
+# bare top-level `.plugins`. The state file (PluginStateFile) is a DIFFERENT shape whose plugin
+# array IS top-level `.plugins`; it is also a different file from the bot's `/app/data/state.json`.
+readonly PLUGIN_INDEX_PATH='/app/data/plugins/index.json'
+readonly PLUGIN_STATE_PATH='/app/data/plugins/state.json'
+
+# The env keys the INSTALLED plugins declare — merged into env-get's listing and env-set's
+# whitelist so the panel manages a plugin's own keys (e.g. WARBANDEER_INGEST_PORT) without this
+# script hand-mirroring each plugin. `secret` keys are dropped entirely — never listed, never
+# editable, exactly like the core secrets. Manifest order is preserved (PLUGIN_KEY_ORDER);
+# PLUGIN_FORMAT / PLUGIN_REQUIRED carry each key's validation.
+PLUGIN_KEY_ORDER=()
+declare -A PLUGIN_FORMAT=()
+declare -A PLUGIN_REQUIRED=()
+# "none" (no plugins enabled — no docker read attempted), "ok", or "index unavailable" (the bot
+# isn't running or hasn't cached the index yet — env-get then shows static keys only, never errors).
+PLUGIN_KEYS_STATUS="none"
+
+# Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED from the container's cached index,
+# restricted to the plugins named in this instance's own PLUGINS value. Requires load_env_values to
+# have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
+# would lose the globals it sets to a subshell — so it reads docker's output into a variable and
+# parses it via a here-string. No plugins enabled → returns immediately WITHOUT touching docker, so
+# an instance with no plugins pays nothing (and every pre-#101 test, none of which set PLUGINS, sees
+# no new docker call). A missing/unreadable/invalid index is "unavailable", never an error (D3).
+load_plugin_keys() {
+  PLUGIN_KEY_ORDER=()
+  PLUGIN_FORMAT=()
+  PLUGIN_REQUIRED=()
+  PLUGIN_KEYS_STATUS="none"
+  local plugins_val names_json raw rows key format required secret
+  plugins_val="$(env_value PLUGINS)"
+  [ -n "$plugins_val" ] || return 0
+  PLUGIN_KEYS_STATUS="ok"
+  # PLUGINS is `name(@version)?(,…)*`; the index is keyed by bare name, so drop any @version pin.
+  names_json="$(printf '%s' "$plugins_val" \
+                | jq -R 'split(",") | map(split("@")[0] | select(length > 0))')"
+  raw="$(docker exec "$CONTAINER" cat "$PLUGIN_INDEX_PATH" 2>/dev/null || true)"
+  if [ -z "$raw" ] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    PLUGIN_KEYS_STATUS="index unavailable"
+    return 0
+  fi
+  # Each env key as four RAW lines (key, format, required, secret), NOT @tsv: jq's TSV encoder
+  # escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash reader
+  # would then see it doubled; raw lines pass the regex through verbatim (a `format` never spans
+  # lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
+  #
+  # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
+  # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
+  # manifest it accepts and caches can still be wrong-shaped here). Guard both shapes inside the
+  # program — a non-object plugin or env entry, or one missing a string key/format, is skipped so the
+  # well-formed keys still list — and treat a program error (`.index` being a non-object, which
+  # `.index.plugins` can't index) as "index unavailable" via `2>/dev/null` + the `if !`, rather than
+  # letting pipefail + set -e abort the whole env-get/env-set. Same posture cmd_status takes for
+  # state.json; without it a valid-JSON-but-wrong-shape cached index crashes ops (a D3 violation).
+  if ! rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
+    (.index.plugins // [])
+    | map(select((type == "object") and (.name as $n | $names | index($n))))
+    | .[].env[]?
+    | select((type == "object") and (.key | type == "string") and (.format | type == "string"))
+    | (.key, .format, (.required // false | tostring), (.secret // false | tostring))
+  ' 2>/dev/null)"; then
+    PLUGIN_KEYS_STATUS="index unavailable"
+    return 0
+  fi
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret; do
+    # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
+    # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a
+    # CRLF-saved .env — else the key names and the `secret`/`required` flags are all "…\r".
+    key="${key%$'\r'}"
+    format="${format%$'\r'}"
+    required="${required%$'\r'}"
+    secret="${secret%$'\r'}"
+    [ -n "$key" ] || continue
+    [ "$secret" = "true" ] && continue                # secret keys: never listed or edited
+    [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue   # a key declared twice: first wins
+    PLUGIN_KEY_ORDER+=("$key")
+    PLUGIN_FORMAT["$key"]="$format"
+    PLUGIN_REQUIRED["$key"]="$required"
+  done <<< "$rows"
+}
+
 cmd_status() {
   need docker; need jq
-  local running status image realm
+  local running status image realm plugins
   running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
   status="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.Status}}' 2>/dev/null || true)"
   image="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
   # Best-effort: the persisted last-observed realm status (may be absent on a fresh install).
   realm="$(docker exec "$CONTAINER" cat /app/data/state.json 2>/dev/null \
             | jq -r '.realmStatus // ""' 2>/dev/null || true)"
+  # Best-effort: the plugins the bot recorded after activation (PluginStateFile.plugins — a
+  # different file from state.json above). Normalised to a JSON array so --argjson never chokes:
+  # an absent/unreadable file, or a `.plugins` that isn't an array, becomes [].
+  plugins="$(docker exec "$CONTAINER" cat "$PLUGIN_STATE_PATH" 2>/dev/null \
+              | jq -c 'if (.plugins | type) == "array" then .plugins else [] end' 2>/dev/null || true)"
+  [ -n "$plugins" ] || plugins='[]'
   jq -n --argjson running "${running:-false}" \
         --arg status "$status" --arg image "$image" --arg realm "$realm" \
-        '{running: $running, status: $status, image: $image, realmStatus: $realm}'
+        --argjson plugins "$plugins" \
+        '{running: $running, status: $status, image: $image, realmStatus: $realm, plugins: $plugins}'
 }
 
 cmd_logs() {
@@ -321,9 +418,26 @@ cmd_env_get() {
   for key in "${ALLOWED_ORDER[@]}"; do
     args+=(--arg "$key" "$(env_value "$key")")
   done
-  # Build a {KEY: value, ...} object over exactly the allowlisted keys, in ALLOWED_ORDER's order —
-  # jq preserves --arg insertion order in $ARGS.named, and the admin panel's front-end renders
-  # this object's keys in the order it receives them rather than re-sorting.
+  # After the static keys, append each INSTALLED plugin's non-secret env keys in manifest order, so
+  # the panel's config form renders them (e.g. WARBANDEER_INGEST_PORT once the warbandeer plugin is
+  # installed) — read from the container's cached index by load_plugin_keys, never hand-mirrored.
+  load_plugin_keys
+  if [ "${#PLUGIN_KEY_ORDER[@]}" -gt 0 ]; then
+    for key in "${PLUGIN_KEY_ORDER[@]}"; do
+      [[ -n "${ALLOWED[$key]+x}" ]] && continue   # a plugin key colliding with a static one: static wins, never double-listed
+      args+=(--arg "$key" "$(env_value "$key")")
+    done
+  fi
+  # A note, deliberately NOT a JSON field: env-get's stdout must stay a flat {KEY: value} map the
+  # panel round-trips back through env-set (a lowercase `plugins` meta key would be echoed and then
+  # rejected as un-editable). #102's panel learns index availability from its own fetch of the index;
+  # here we just say on stderr why a configured plugin's keys aren't being shown.
+  if [ "$PLUGIN_KEYS_STATUS" = "index unavailable" ]; then
+    echo "bot-ops: plugins: index unavailable — showing static keys only (the bot isn't running or hasn't cached the Plugin Index yet)" >&2
+  fi
+  # Build a {KEY: value, ...} object over the static keys then the installed plugins' keys, in that
+  # order — jq preserves --arg insertion order in $ARGS.named, and the admin panel's front-end
+  # renders this object's keys in the order it receives them rather than re-sorting.
   jq -n "${args[@]}" '$ARGS.named'
 }
 
@@ -339,6 +453,15 @@ cmd_env_set() {
     [[ -n "${ALLOWED[$rkey]+x}" ]] || die "env-set: '$rkey' is in REQUIRED but not ALLOWED"
   done
 
+  # Merge in each INSTALLED plugin's declared env keys (from the container's cached index) so the
+  # whitelist below accepts them alongside the static ALLOWED set — read once, up front. Needs the
+  # effective PLUGINS value, so load .env first. No plugins → no docker read (load_plugin_keys
+  # short-circuits), a no-op on an instance with no plugins. The manifest reflects the CURRENTLY
+  # installed plugins: a plugin's own key becomes editable only once that plugin is in PLUGINS and
+  # the bot has cached the index, not in the same save that first adds the plugin.
+  load_env_values
+  load_plugin_keys
+
   # Counters track sizes explicitly: `${#assoc[@]}` on a still-empty associative array trips
   # "unbound variable" under `set -u`, so we never expand a possibly-empty array for its length.
   declare -A SUBMITTED=()
@@ -353,8 +476,11 @@ cmd_env_set() {
     # ALLOWED lookup, which would otherwise die on an empty subscript with a raw bash error.
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "env-set: malformed input line (need KEY=VALUE)"
     # Whitelist membership is checked up front whether or not the value changes — that's a
-    # question of authority (may the panel touch this key at all?), not of format.
-    [[ -n "${ALLOWED[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
+    # question of authority (may the panel touch this key at all?), not of format. A key is
+    # editable if it is a static ALLOWED key OR an installed plugin's own non-secret key; a
+    # plugin's `secret` key was dropped from PLUGIN_FORMAT, so it is refused here exactly like a
+    # core secret.
+    [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
     [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
     SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
     n_submitted=$((n_submitted + 1))
@@ -368,14 +494,23 @@ cmd_env_set() {
   # changing was never this script's to judge. A no-op must not restart the bot.
   load_env_values
   declare -A DIFF=()
-  local n_diff=0
+  local n_diff=0 fmt is_required
   if [ "$n_submitted" -gt 0 ]; then
     for key in "${submitted_order[@]}"; do
       val="${SUBMITTED[$key]}"
       [ "$val" != "$(env_value "$key")" ] || continue
+      # Format + required-ness come from the static ALLOWED set, or from the installed plugin's
+      # manifest entry for a plugin-owned key (a static key wins if somehow both name it).
+      if [[ -n "${ALLOWED[$key]+x}" ]]; then
+        fmt="${ALLOWED[$key]}"
+        is_required="${REQUIRED[$key]+x}"
+      else
+        fmt="${PLUGIN_FORMAT[$key]}"
+        if [ "${PLUGIN_REQUIRED[$key]:-false}" = "true" ]; then is_required="x"; else is_required=""; fi
+      fi
       if [ -z "$val" ]; then
-        [[ -z "${REQUIRED[$key]+x}" ]] || die "env-set: '$key' is required and cannot be blank"
-      elif [[ ! "$val" =~ ${ALLOWED[$key]} ]]; then
+        [ -z "$is_required" ] || die "env-set: '$key' is required and cannot be blank"
+      elif [[ ! "$val" =~ $fmt ]]; then
         die "env-set: value for '$key' is invalid"
       fi
       DIFF["$key"]="$val"

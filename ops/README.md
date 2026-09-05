@@ -24,10 +24,10 @@ time, not silently written.
 
 | Command | Does |
 |---|---|
-| `status` | JSON: container running?, status line, image, last-observed realm status |
+| `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload |
-| `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes) |
+| `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 
 Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
@@ -88,10 +88,24 @@ re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved v
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
 `ADMIN_USER_IDS`, `WOW_REALM`, `WOW_REGION`, `WATCHED_REPOS`, `DMF_TIMEZONE`, `AUTO_UPDATE`,
-`BOT_BRANCH`, `COMMAND_PREFIX`, `WARBANDEER_INGEST_PORT` — listed in `ALLOWED_ORDER`, the order the admin panel displays
+`BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_ORDER`, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
 key back to its documented default.
+
+**Plugin-declared keys** — on top of the static list above, every **installed** plugin (named in
+`PLUGINS=`) contributes its own env keys: `env-get` lists them (non-secret only, after the static
+keys, in manifest order) and `env-set` accepts them, validating each with the format, honouring the
+`required` flag, and refusing the `secret` keys the Plugin Index carries — read from the bot's
+cached `data/plugins/index.json`, never hand-mirrored here. This is where `WARBANDEER_INGEST_PORT`
+lives now that the connector is the `warbandeer` plugin (issue #100): set `PLUGINS=warbandeer` and
+the key becomes editable once the bot has cached the index. A plugin's `secret` keys are never
+listed or written, exactly like the core secrets below. If the bot isn't running (no cached index),
+`env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** — never
+an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
+`env-set` refuses a plugin key in that same state, since it can't read the manifest to validate one;
+edit a plugin's keys while the bot is up. A valid-JSON-but-wrong-shape cached index is treated the
+same way (degraded, never a crash).
 
 **Secrets are intentionally absent** — `DISCORD_TOKEN`, `BLIZZARD_CLIENT_ID`,
 `BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`. `env-get` never reads them
