@@ -74,8 +74,14 @@ describe("resolveConfig", () => {
     expect(resolveConfig({ ...base, DISCORD_SERVER_ID: "999" }).guildId).toBe("999");
   });
 
+  test("githubRepo defaults to Rackbops/rackbops-discord-bot (the org repo, not roshne/… — #115)", () => {
+    // The repo moved to the Rackbops org; the old roshne/… default worked only via GitHub's
+    // owner-transfer redirect. Pin the exact default so a regression fails here, not at runtime.
+    expect(resolveConfig(base).githubRepo).toBe("Rackbops/rackbops-discord-bot");
+  });
+
   test("watchedRepos defaults to just the configured GITHUB_REPO", () => {
-    expect(resolveConfig(base).watchedRepos).toEqual(["roshne/rackbops-discord-bot"]);
+    expect(resolveConfig(base).watchedRepos).toEqual(["Rackbops/rackbops-discord-bot"]);
     expect(resolveConfig({ ...base, GITHUB_REPO: "acme/thing" }).watchedRepos).toEqual([
       "acme/thing",
     ]);
@@ -92,10 +98,10 @@ describe("resolveConfig", () => {
 
   test("an empty WATCHED_REPOS falls back to GITHUB_REPO", () => {
     expect(resolveConfig({ ...base, WATCHED_REPOS: "" }).watchedRepos).toEqual([
-      "roshne/rackbops-discord-bot",
+      "Rackbops/rackbops-discord-bot",
     ]);
     expect(resolveConfig({ ...base, WATCHED_REPOS: " , " }).watchedRepos).toEqual([
-      "roshne/rackbops-discord-bot",
+      "Rackbops/rackbops-discord-bot",
     ]);
   });
 });

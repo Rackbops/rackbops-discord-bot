@@ -65,13 +65,13 @@ describe("naming", () => {
 
 describe("buildRemote", () => {
   test("points the daemon at the whole repo on the target branch", () => {
-    expect(buildRemote("roshne/rackbops-discord-bot", "main")).toBe(
-      "https://github.com/roshne/rackbops-discord-bot.git#main",
+    expect(buildRemote("Rackbops/rackbops-discord-bot", "main")).toBe(
+      "https://github.com/Rackbops/rackbops-discord-bot.git#main",
     );
   });
 
   test("carries a branch with slashes through intact", () => {
-    expect(buildRemote("roshne/rackbops-discord-bot", "feat/x")).toContain("#feat/x");
+    expect(buildRemote("Rackbops/rackbops-discord-bot", "feat/x")).toContain("#feat/x");
   });
 });
 

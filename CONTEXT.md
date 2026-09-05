@@ -192,13 +192,13 @@ _Avoid_: plugin list, cache
   `import.meta.resolve("discord.js")` from inside the container.)
 - **Fork gotchas.** This repo was extracted, with history, from `nazumods/wow`'s
   `apps/warbandeer-discord` — see the top-of-file note for full credit to Nazuraki.
-  `GITHUB_REPO` now defaults to this fork (`roshne/rackbops-discord-bot`), and self-update no
+  `GITHUB_REPO` now defaults to this fork (`Rackbops/rackbops-discord-bot`), and self-update no
   longer path-filters (`BOT_PATH` is gone from `src/update.ts` / `src/redeploy.ts` — the whole
   repo is the bot now, so `fetchLatestBotSha` compares against the newest commit on the branch,
   full stop, and `buildRemote` builds from the repo root with no subdirectory). Remaining open
   work from the fork extraction:
   - ~~Self-update's rebuild needs `GITHUB_REPO` to be publicly clonable~~ — **resolved**: this
-    repo is public (`roshne/rackbops-discord-bot`), so the daemon's remote git build context
+    repo is public (`Rackbops/rackbops-discord-bot`), so the daemon's remote git build context
     (no credential support) already works, for both self-update and the no-clone deploy model
     below.
   - `ops/bot-ops.sh`'s consumers — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops**
