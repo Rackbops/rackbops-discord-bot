@@ -37,11 +37,12 @@ function makeFetch(opts: { bytes: Uint8Array; integrity: string; calls: string[]
   };
 }
 
-/** A fake extract standing in for `tar`: drops a plugin.js into the version dir. The real tarExtract
- * is exercised by the Linux-only test at the bottom (Windows `tar` mangles C: drive-letter paths). */
+/** A fake extract standing in for `tar`: writes dist/plugin.js into the version dir, mirroring what
+ * `tar --strip-components=1` produces from `package/dist/plugin.js`. The real tarExtract is exercised
+ * by the Linux-only test at the bottom (Windows `tar` mangles C: drive-letter paths). */
 const fakeExtract: InstallDeps["extract"] = async (_tarPath, destDir) => {
-  mkdirSync(destDir, { recursive: true });
-  writeFileSync(join(destDir, "plugin.js"), "extracted");
+  mkdirSync(join(destDir, "dist"), { recursive: true });
+  writeFileSync(join(destDir, "dist", "plugin.js"), "extracted");
 };
 
 function withDataDir<T>(fn: (dataDir: string) => Promise<T>): Promise<T> {
@@ -62,7 +63,7 @@ describe("installPlugins", () => {
         log: noopLog,
       });
       expect(result.skips).toEqual({});
-      const bundlePath = join(dataDir, "plugins", "demo", "1.0.0", "plugin.js");
+      const bundlePath = join(dataDir, "plugins", "demo", "1.0.0", "dist", "plugin.js");
       expect(result.installed[0]?.bundlePath).toBe(bundlePath);
       expect(existsSync(bundlePath)).toBe(true);
       // metadata URL carries the encoded package + version
@@ -82,17 +83,17 @@ describe("installPlugins", () => {
       });
       expect(result.installed).toHaveLength(0);
       expect(result.skips.demo).toContain("integrity mismatch for @rackbops/plugin-demo@1.0.0");
-      expect(existsSync(join(dataDir, "plugins", "demo", "1.0.0", "plugin.js"))).toBe(false);
+      expect(existsSync(join(dataDir, "plugins", "demo", "1.0.0", "dist", "plugin.js"))).toBe(false);
     });
   });
 
   test("a cached version is reused with no fetch", async () => {
     await withDataDir(async (dataDir) => {
-      const bundlePath = join(dataDir, "plugins", "demo", "1.0.0", "plugin.js");
-      mkdirSync(join(dataDir, "plugins", "demo", "1.0.0"), { recursive: true });
+      const bundlePath = join(dataDir, "plugins", "demo", "1.0.0", "dist", "plugin.js");
+      mkdirSync(join(dataDir, "plugins", "demo", "1.0.0", "dist"), { recursive: true });
       writeFileSync(bundlePath, "cached");
       const calls: string[] = [];
-      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, { demo: "1.0.0" }, {
         fetch: makeFetch({ bytes: new Uint8Array(), integrity: "x", calls }),
         extract: fakeExtract,
         now: () => 1,
@@ -100,6 +101,24 @@ describe("installPlugins", () => {
       });
       expect(result.installed[0]?.bundlePath).toBe(bundlePath);
       expect(calls).toEqual([]); // no network
+    });
+  });
+
+  test("with no pin and no state, the newest cached version is reused rather than upgrading to the index", async () => {
+    await withDataDir(async (dataDir) => {
+      // 1.0.0 is cached on disk; the index now offers 2.0.0. With no pin and empty state, the bot
+      // must NOT silently upgrade — it reuses the cached 1.0.0 and makes no network call.
+      mkdirSync(join(dataDir, "plugins", "demo", "1.0.0", "dist"), { recursive: true });
+      writeFileSync(join(dataDir, "plugins", "demo", "1.0.0", "dist", "plugin.js"), "cached");
+      const calls: string[] = [];
+      const result = await installPlugins([{ name: "demo", entry: entry({ version: "2.0.0" }) }], dataDir, {}, {
+        fetch: makeFetch({ bytes: new Uint8Array(), integrity: "x", calls }),
+        extract: fakeExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.installed[0]?.version).toBe("1.0.0");
+      expect(calls).toEqual([]); // no upgrade fetch
     });
   });
 
@@ -186,7 +205,8 @@ describe("installPlugins", () => {
       expect(packed.exitCode).toBe(0);
       const dest = join(dataDir, "out");
       await tarExtract(tgz, dest);
-      expect(readFileSync(join(dest, "plugin.js"), "utf8")).toContain("createPlugin");
+      // --strip-components=1 drops `package/`, leaving dist/plugin.js + package.json
+      expect(readFileSync(join(dest, "dist", "plugin.js"), "utf8")).toContain("createPlugin");
       expect(existsSync(join(dest, "package.json"))).toBe(true);
     });
   });

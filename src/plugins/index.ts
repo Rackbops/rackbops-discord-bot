@@ -1,7 +1,8 @@
 // Boot-time Plugin Index fetch, with a cache — no plugin code loads here. Deliberately dependency-
 // free of src/warbandeer/ and src/config.ts (src/plugins/* stays that way; see CONTEXT.md) — the
-// atomic-write pattern below is copied from src/warbandeer/storage.ts rather than imported, since
-// that module is warbandeer-scoped until #99 moves it.
+// atomic-write pattern below is a small copy of src/storage.ts's rather than an import. #99 moved
+// storage up to src/storage.ts, so this could now import from ../storage; left duplicated on purpose
+// to keep this module dependency-light and the #99 diff small.
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PluginIndex } from "./contract";

@@ -136,7 +136,15 @@ export function buildCommandBody(
   const cmd = commandNamer(prefix);
   const body: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [...coreCommandJson];
   for (const [bare, { entry, command }] of map) {
-    const built = command.build(cmd(bare)).toJSON();
+    let built: RESTPostAPIChatInputApplicationCommandsJSONBody;
+    try {
+      // Plugin code: `build()` and discord.js's `toJSON()` (which validates) can both throw. Isolate
+      // it — a bad builder drops just its command, never crashing the whole registration/boot.
+      built = command.build(cmd(bare)).toJSON();
+    } catch (err) {
+      log.error(`[plugins] ${entry.name}: command "${bare}" failed to build — dropping it`, err);
+      continue;
+    }
     if (built.name !== `${prefix}${bare}`) {
       log.warn(`[plugins] ${entry.name}: command "${bare}" built the wrong name "${built.name}" — dropping it`);
       continue;

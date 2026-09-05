@@ -3,7 +3,7 @@
 // Pure over injected I/O (fetch/extract/now/log) so it unit-tests with a fake fetch + fixture
 // tarball and never hits the network or the real data dir. No plugin CODE runs here — that is
 // loadPlugins/activatePlugins in host.ts, inside the bot's activate() after takeOver().
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
@@ -63,6 +63,34 @@ async function fetchJson(fetchImpl: InstallDeps["fetch"], url: string): Promise<
   return res.json();
 }
 
+/** Descending compare of dotted numeric versions — enough to pick the newest cached version dir. */
+function compareVersionsDesc(a: string, b: string): number {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pb[i] || 0) - (pa[i] || 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/** The newest already-installed version of `name` on disk (a version dir with a built bundle), or
+ * undefined. Used only when neither an operator pin nor a `state.json` record is available — so a
+ * lost/corrupt state.json reuses what's cached rather than silently upgrading to the index's newer
+ * version (the "no silent upgrades" rule; a real version move is #104's explicit action). */
+function newestCachedVersion(dataDir: string, name: string): string | undefined {
+  const pluginDir = join(dataDir, "plugins", name);
+  let versions: string[];
+  try {
+    versions = readdirSync(pluginDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name !== "tmp" && existsSync(join(pluginDir, e.name, "dist", "plugin.js")))
+      .map((e) => e.name);
+  } catch {
+    return undefined;
+  }
+  return versions.sort(compareVersionsDesc)[0];
+}
+
 /** SRI compare: `dist.integrity` is `sha512-<base64>`; hash the tarball bytes and compare base64. */
 function integrityMatches(bytes: Uint8Array, integrity: string): boolean {
   const [algo, expected] = integrity.split("-", 2);
@@ -91,9 +119,11 @@ export async function installPlugins(
   for (const sp of selected) {
     if (sp.skipped || !sp.entry) continue;
     const entry = sp.entry;
-    const version = sp.pinnedVersion ?? installedVersions[sp.name] ?? entry.version;
+    const version = sp.pinnedVersion ?? installedVersions[sp.name] ?? newestCachedVersion(dataDir, sp.name) ?? entry.version;
     const versionDir = join(dataDir, "plugins", sp.name, version);
-    const bundlePath = join(versionDir, "plugin.js");
+    // `tar --strip-components=1` drops only the tarball's leading `package/`, so `package/dist/plugin.js`
+    // extracts to `<versionDir>/dist/plugin.js` (not `<versionDir>/plugin.js`).
+    const bundlePath = join(versionDir, "dist", "plugin.js");
 
     if (existsSync(bundlePath)) {
       installed.push({ entry, version, bundlePath });
@@ -124,8 +154,8 @@ export async function installPlugins(
       const tmpDir = join(dataDir, "plugins", "tmp");
       mkdirSync(tmpDir, { recursive: true });
       const tarPath = join(tmpDir, `${sp.name}-${version}-${deps.now()}.tgz`);
-      await Bun.write(tarPath, bytes);
       try {
+        await Bun.write(tarPath, bytes);
         await deps.extract(tarPath, versionDir);
       } finally {
         rmSync(tarPath, { force: true });

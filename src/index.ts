@@ -13,8 +13,10 @@ import { startWarbandeerServer, warbandeerConnectorConfigured } from "./warbande
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
-import type { HostApi, HostStorage, PluginIndexEntry, PluginModule } from "./plugins/contract";
+import type { HostApi, HostStorage, PluginIndexEntry, PluginModule, PluginStateFile } from "./plugins/contract";
 import { installPlugins, tarExtract } from "./plugins/install";
+import type { InstallResult } from "./plugins/install";
+import type { LoadResult, PluginCommandMap } from "./plugins/host";
 import {
   activatePlugins,
   buildCommandBody,
@@ -65,34 +67,45 @@ client.once(Events.ClientReady, async (c) => {
 async function activate(c: Client<true>): Promise<void> {
   const rest = new REST().setToken(config.discordToken);
 
-  // Plugins: install and load BEFORE command registration (the builders come from the bundles) and
-  // inside activate() (after takeOver()) so nothing plugin-side runs during the handoff overlap.
+  // Plugin setup — install and load BEFORE command registration (the builders come from the bundles)
+  // and inside activate() (after takeOver()) so nothing plugin-side runs during the handoff overlap.
+  // Fully isolated: per-plugin failures are already contained inside install/load/build, and this
+  // outer try degrades ANY unexpected failure to core-only registration — a plugin never crashes boot.
   const storage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
-  const previousState = await readPluginState(DATA_DIR, storage);
-  const installedVersions = Object.fromEntries(previousState.plugins.map((p) => [p.name, p.installedVersion]));
-  const installResult = await installPlugins(selectedPlugins, DATA_DIR, installedVersions, {
-    fetch,
-    extract: tarExtract,
-    now: Date.now,
-    log: console,
-  });
-  const makeHost = (entry: PluginIndexEntry): HostApi =>
-    createHostApi({
-      entry,
-      processEnv: process.env,
-      dataDir: DATA_DIR,
-      baseLog: console,
-      storage,
-      announce: (message) => announceTo(client, config.announceChannelId, message),
+  let previousState: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
+  let installResult: InstallResult = { installed: [], skips: {} };
+  let loadResult: LoadResult = { loaded: [], errors: {} };
+  let commandMap: PluginCommandMap = new Map();
+  let commandBody = commandData;
+  try {
+    previousState = await readPluginState(DATA_DIR, storage);
+    const installedVersions = Object.fromEntries(previousState.plugins.map((p) => [p.name, p.installedVersion]));
+    installResult = await installPlugins(selectedPlugins, DATA_DIR, installedVersions, {
+      fetch,
+      extract: tarExtract,
+      now: Date.now,
+      log: console,
     });
-  const loadResult = await loadPlugins(
-    installResult.installed,
-    makeHost,
-    async (bundlePath) => (await import(pathToFileURL(bundlePath).href)) as PluginModule,
-    console,
-  );
-  const commandMap = pluginCommandMap(loadResult.loaded, CORE_COMMAND_NAMES, console);
-  const commandBody = buildCommandBody(config.commandPrefix, commandData, commandMap, console);
+    const makeHost = (entry: PluginIndexEntry): HostApi =>
+      createHostApi({
+        entry,
+        processEnv: process.env,
+        dataDir: DATA_DIR,
+        baseLog: console,
+        storage,
+        announce: (message) => announceTo(client, config.announceChannelId, message),
+      });
+    loadResult = await loadPlugins(
+      installResult.installed,
+      makeHost,
+      async (bundlePath) => (await import(pathToFileURL(bundlePath).href)) as PluginModule,
+      console,
+    );
+    commandMap = pluginCommandMap(loadResult.loaded, CORE_COMMAND_NAMES, console);
+    commandBody = buildCommandBody(config.commandPrefix, commandData, commandMap, console);
+  } catch (err) {
+    console.error("[plugins] plugin setup failed — the bot starts core-only", err);
+  }
 
   try {
     await rest.put(
@@ -156,18 +169,24 @@ async function activate(c: Client<true>): Promise<void> {
   // Activate plugins AFTER the scheduler is up (pluginTicks are running-gated, so a tick that fires
   // before this resolves is skipped) — a throwing activate() is isolated, never crashing the bot.
   await activatePlugins(loadResult.loaded, console);
-  await writePluginState({
-    dataDir: DATA_DIR,
-    storage,
-    selected: selectedPlugins,
-    installed: installResult.installed,
-    installSkips: installResult.skips,
-    loaded: loadResult.loaded,
-    loadErrors: loadResult.errors,
-    processEnv: process.env,
-    previous: previousState,
-    now: () => new Date(),
-  });
+  try {
+    await writePluginState({
+      dataDir: DATA_DIR,
+      storage,
+      selected: selectedPlugins,
+      installed: installResult.installed,
+      installSkips: installResult.skips,
+      loaded: loadResult.loaded,
+      loadErrors: loadResult.errors,
+      processEnv: process.env,
+      previous: previousState,
+      now: () => new Date(),
+    });
+  } catch (err) {
+    // A data/plugins/state.json write failure (a full/read-only volume) is bookkeeping for ops
+    // tooling — it must not crash a bot that is otherwise up and serving.
+    console.error("[plugins] writing data/plugins/state.json failed", err);
+  }
 
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own.

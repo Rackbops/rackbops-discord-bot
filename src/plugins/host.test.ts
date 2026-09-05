@@ -139,6 +139,27 @@ describe("buildCommandBody", () => {
     expect(body.map((c) => c.name)).toEqual(["dmf"]); // evil dropped
     expect(calls.some((l) => l.level === "warn" && l.message.includes("wrong name"))).toBe(true);
   });
+
+  test("a command whose build()/toJSON() throws is dropped, not propagated (the bot must not crash)", () => {
+    const { log, calls } = makeLog();
+    const boom = cmd("boom", () => {
+      throw new Error("build blew up");
+    });
+    // a valid discord.js builder with no description throws in toJSON() — the other realistic throw
+    const noDesc = cmd("nodesc", (b) => b); // never calls setDescription
+    const good = cmd("good");
+    const map = pluginCommandMap(
+      [loaded(entry({ name: "a" }), { commands: [boom] }), loaded(entry({ name: "b" }), { commands: [noDesc] }), loaded(entry({ name: "c" }), { commands: [good] })],
+      [],
+      log,
+    );
+    let body: ReturnType<typeof buildCommandBody> = [];
+    expect(() => {
+      body = buildCommandBody("", coreJson, map, log);
+    }).not.toThrow();
+    expect(body.map((c) => c.name)).toEqual(["dmf", "good"]); // boom + nodesc dropped, core + good kept
+    expect(calls.filter((l) => l.level === "error")).toHaveLength(2);
+  });
 });
 
 describe("pluginTicks", () => {
