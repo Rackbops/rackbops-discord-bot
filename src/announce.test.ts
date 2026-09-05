@@ -11,29 +11,22 @@ const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements,
   await import("./announce");
 
 describe("tickChecks", () => {
-  test("is the six core checks in order, then the extras", () => {
+  // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates), then extras.
+  const CORE = ["dmf", "weeklyReset", "realm", "releases", "autoUpdate", "pluginRequests", "pluginUpdates"];
+
+  test("is the core checks in order, then the extras", () => {
     const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
     const checks = tickChecks({} as unknown as Client, extra);
-    expect(checks.map((c) => c.name)).toEqual([
-      "dmf",
-      "weeklyReset",
-      "realm",
-      "releases",
-      "autoUpdate",
-      "pluginUpdates",
-      "myplugin:poll",
-    ]);
+    expect(checks.map((c) => c.name)).toEqual([...CORE, "myplugin:poll"]);
   });
 
-  test("with no extras, exactly the six core checks", () => {
-    expect(tickChecks({} as unknown as Client, []).map((c) => c.name)).toEqual([
-      "dmf",
-      "weeklyReset",
-      "realm",
-      "releases",
-      "autoUpdate",
-      "pluginUpdates",
-    ]);
+  test("with no extras, exactly the core checks", () => {
+    expect(tickChecks({} as unknown as Client, []).map((c) => c.name)).toEqual(CORE);
+  });
+
+  test("pluginRequests drains the mailbox before pluginUpdates notifies/schedules", () => {
+    const names = tickChecks({} as unknown as Client, []).map((c) => c.name);
+    expect(names.indexOf("pluginRequests")).toBeLessThan(names.indexOf("pluginUpdates"));
   });
 });
 

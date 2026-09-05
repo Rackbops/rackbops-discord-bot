@@ -29,6 +29,7 @@ time, not silently written.
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
+| `plugin-request` | Read one plugin-update **request JSON** from stdin (`{action, plugin, version?, at?, days?, requestedBy}` — `action` ∈ `update-now`/`schedule`/`remind`/`skip`/`cancel`), validate it, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
 
 Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
 `BOT_OPS_COMPOSE_FILE` (the deployed `docker-compose.yml`, under `/opt/stacks/` for Dockge — see
@@ -45,6 +46,23 @@ export BOT_OPS_CONTAINER=rackbops-discord-bot-debug
 bash ops/bot-ops.sh status
 echo "RELEASE_ANNOUNCE_CHANNEL_ID=1529152068055728330" | bash ops/bot-ops.sh env-set
 ```
+
+## Plugin request mailbox
+
+The admin panel (and Discord's `/plugins`) can act on a plugin update — install now, schedule it,
+remind, skip, cancel. The panel is a **separate service that can't write the bot's `state.json`** (the
+bot is the sole writer). So a panel action becomes a **request file** the bot consumes: `plugin-request`
+validates the JSON and writes it into `data/plugins/requests/` via `docker exec -u bun` (the bot runs
+as `bun`, so `-u bun` makes the file bot-owned — a root-created file would be un-deletable by the bot).
+
+The bot **drains** the mailbox at the start of its update tick (every ~60s) and once at boot, applying
+each request through the same state builders `/plugins` uses, then deleting the file. A malformed or
+invalid file (unknown action, bad `plugin`/`version`, a `version` with a slash, a not-installed
+plugin) is moved to `requests/rejected/` with a log line — never applied, never crashing the drain.
+The mailbox can only ever run the five actions on an **already-installed** plugin; it can't enable a
+new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
+(`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
+update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
 
 ## Bootstrapping a fresh instance (no checkout)
 

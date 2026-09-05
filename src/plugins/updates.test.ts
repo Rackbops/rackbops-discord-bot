@@ -15,6 +15,12 @@ import {
   resetPluginUpdateStateForTest,
   parseScheduleTime,
   planPluginAction,
+  pinUpdateNow,
+  scheduleUpdate,
+  remindLater,
+  skipVersion,
+  cancelPending,
+  isDiscordUserId,
   decidePluginReportOutcome,
   reportPluginUpdateOutcome,
   type PluginActionContext,
@@ -213,7 +219,7 @@ describe("deliverPluginNotification", () => {
   };
   const log = () => {
     const warns: string[] = [];
-    return { log: { warn: (m: string) => void warns.push(m), error: () => {} }, warns };
+    return { log: { info: () => {}, warn: (m: string) => void warns.push(m), error: () => {} }, warns };
   };
 
   test("DMs each admin; no channel post when every DM succeeds", async () => {
@@ -248,7 +254,7 @@ describe("deliverPluginNotification", () => {
       dmUser: async () => { throw new Error("x"); },
       postAnnounce: async () => { throw new Error("y"); },
     };
-    expect(await deliverPluginNotification("msg", ["1"], deliverers, { warn() {}, error() {} })).toBe(false);
+    expect(await deliverPluginNotification("msg", ["1"], deliverers, { info() {}, warn() {}, error() {} })).toBe(false);
   });
 });
 
@@ -291,7 +297,7 @@ describe("checkPluginUpdates", () => {
       adminUserIds: opts.adminUserIds ?? ["admin1"],
       hostApiVersion: 1,
       now: () => NOW,
-      log: { warn() {}, error() {} },
+      log: { info() {}, warn() {}, error() {} },
       restartPending: () => opts.restartPending ?? false,
       requestRestart: (reason) => { restarts.push(reason); },
     };
@@ -355,7 +361,10 @@ describe("checkPluginUpdates", () => {
     expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
   });
 
-  const scheduled = (version: string, at: string, by = "admin1") => ({ scheduled: { version, at, requestedBy: by } });
+  // A Discord snowflake requestedBy (so the heads-up DM fires — a panel identity would be skipped by
+  // isDiscordUserId; that path is covered by its own test below).
+  const SNOWFLAKE = "200863115821318144";
+  const scheduled = (version: string, at: string, by = SNOWFLAKE) => ({ scheduled: { version, at, requestedBy: by } });
 
   test("a due schedule: heads-up DM, sets targetVersion + pendingReport, clears scheduled, restarts once", async () => {
     const h = harness({
@@ -363,11 +372,22 @@ describe("checkPluginUpdates", () => {
       state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
     });
     await checkPluginUpdates(h.deps);
-    expect(h.dms).toEqual(["admin1"]); // the heads-up (the notify itself is suppressed while scheduled)
+    expect(h.dms).toEqual([SNOWFLAKE]); // the heads-up (the notify itself is suppressed while scheduled)
     expect(h.restarts).toHaveLength(1);
     expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
     expect(h.state.plugins[0]?.scheduled).toBeUndefined();
-    expect(h.state.pendingReport).toMatchObject({ plugin: "a", toVersion: "1.1.0", userId: "admin1" });
+    expect(h.state.pendingReport).toMatchObject({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE });
+  });
+
+  test("a due schedule requested from the PANEL (non-snowflake requestedBy) still fires but skips the DM", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z", "email:me@x.com"))]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.dms).toEqual([]); // isDiscordUserId guard — no futile users.fetch(email)
+    expect(h.restarts).toHaveLength(1); // the update still proceeds
+    expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
   });
 
   test("a schedule not yet due is left untouched", async () => {
@@ -548,6 +568,36 @@ describe("decidePluginReportOutcome (#104)", () => {
   });
 });
 
+describe("version-parameterized builders (#105 — shared by planPluginAction + the request mailbox)", () => {
+  const seed = () => state([stateEntry("a", "1.0.0")]);
+  // The load-bearing property: each builder pins the version it's GIVEN (a request's explicit pin),
+  // not the index's — a mutation that ignored the arg and read the index would break the mailbox.
+  test("skipVersion / scheduleUpdate / remindLater pin the given values", () => {
+    expect(skipVersion("a", "9.9.9")(seed()).plugins[0]?.skippedVersion).toBe("9.9.9");
+    expect(scheduleUpdate("a", "9.9.9", "2026-01-01T00:00:00Z", "u")(seed()).plugins[0]?.scheduled).toEqual({
+      version: "9.9.9",
+      at: "2026-01-01T00:00:00Z",
+      requestedBy: "u",
+    });
+    expect(remindLater("a", "2026-02-02T00:00:00Z")(seed()).plugins[0]?.remindAt).toBe("2026-02-02T00:00:00Z");
+  });
+  test("pinUpdateNow sets targetVersion + pendingReport; cancelPending clears scheduled + targetVersion", () => {
+    const report = { plugin: "a", toVersion: "9.9.9", userId: "u", requestedAt: 0 };
+    const after = pinUpdateNow("a", "9.9.9", report)(seed());
+    expect(after.plugins[0]?.targetVersion).toBe("9.9.9");
+    expect(after.pendingReport).toEqual(report);
+    const seeded = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "x", requestedBy: "u" }, targetVersion: "1.1.0" })]);
+    const cleared = cancelPending("a")(seeded).plugins[0];
+    expect(cleared?.scheduled).toBeUndefined();
+    expect(cleared?.targetVersion).toBeUndefined();
+  });
+  test("isDiscordUserId: a snowflake vs a panel identity", () => {
+    expect(isDiscordUserId("200863115821318144")).toBe(true);
+    expect(isDiscordUserId("email:me@x.com")).toBe(false);
+    expect(isDiscordUserId("token")).toBe(false);
+  });
+});
+
 describe("reportPluginUpdateOutcome (#104)", () => {
   function reportHarness(opts: { state: PluginStateFile; dm?: () => Promise<void> }) {
     let current = opts.state;
@@ -559,7 +609,7 @@ describe("reportPluginUpdateOutcome (#104)", () => {
       mutateState: async (mutate) => { current = mutate(current); },
       dmUser: async (_id, content) => { if (opts.dm) await opts.dm(); dms.push(content); },
       postChannel: async (_c, _u, content) => { channels.push(content); },
-      log: { warn() {}, error: (m) => errors.push(m) },
+      log: { info() {}, warn() {}, error: (m) => errors.push(m) },
     };
     return { deps, dms, channels, errors, get state() { return current; } };
   }
@@ -571,19 +621,27 @@ describe("reportPluginUpdateOutcome (#104)", () => {
     await reportPluginUpdateOutcome(h.deps);
     expect(h.dms).toHaveLength(0);
   });
+  const SNOWFLAKE = "200863115821318144";
   test("clears pendingReport BEFORE delivering, then DMs the requester", async () => {
-    const h = reportHarness({ state: withReport({ plugin: "a", toVersion: "1.1.0", userId: "u", requestedAt: 0 }) });
+    const h = reportHarness({ state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, requestedAt: 0 }) });
     await reportPluginUpdateOutcome(h.deps);
     expect(h.state.pendingReport).toBeUndefined();
     expect(h.dms[0]).toContain("is now 1.1.0");
   });
   test("a failed DM still leaves pendingReport cleared (never re-fires) and falls back to the channel", async () => {
     const h = reportHarness({
-      state: withReport({ plugin: "a", toVersion: "1.1.0", userId: "u", channelId: "chan1", requestedAt: 0 }),
+      state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, channelId: "chan1", requestedAt: 0 }),
       dm: async () => { throw new Error("closed DMs"); },
     });
     await reportPluginUpdateOutcome(h.deps);
     expect(h.state.pendingReport).toBeUndefined(); // cleared before delivery — no boot-loop re-fire
     expect(h.channels[0]).toContain("is now 1.1.0");
+  });
+  test("a PANEL-origin request (non-snowflake requestedBy) clears the report + logs, never DMs", async () => {
+    const h = reportHarness({ state: withReport({ plugin: "a", toVersion: "1.1.0", userId: "email:me@x.com", requestedAt: 0 }) });
+    await reportPluginUpdateOutcome(h.deps);
+    expect(h.state.pendingReport).toBeUndefined(); // still cleared — never re-fires
+    expect(h.dms).toHaveLength(0); // no futile users.fetch(email)
+    expect(h.channels).toHaveLength(0);
   });
 });

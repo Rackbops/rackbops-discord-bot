@@ -204,6 +204,14 @@ function discordTs(ms: number, style: "F" | "R" = "F"): string {
   return `<t:${Math.floor(ms / 1000)}:${style}>`;
 }
 
+/** A Discord user snowflake — 17-20 digits. #105's panel requests record `requestedBy` as a panel
+ *  identity (`email:<addr>` / `token`), which is NOT DM-able; the heads-up + report-back DM sites use
+ *  this to skip a futile `users.fetch(<email>)` and log the outcome instead (the panel actor sees the
+ *  result on the panel's own refresh). */
+export function isDiscordUserId(s: string): boolean {
+  return /^\d{17,20}$/.test(s);
+}
+
 const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 /**
@@ -286,39 +294,79 @@ function updateEntry(
   return { ...s, plugins: s.plugins.map((p) => (p.name === name ? f(p) : p)) };
 }
 
+// ---- Version-parameterized state-mutation builders -------------------------------------------------
+// The pure `(PluginStateFile) => PluginStateFile` builders behind each action. Extracted so BOTH the
+// index-derived path (`planPluginAction`, called with `version = the index's latest`) and the
+// explicit-pin path (the request mailbox #105, called with `version = the request's pinned version`)
+// share one implementation — a request must be able to pin a version even if the index has since
+// moved. Each is a plain function of the values it needs, no `ctx`/index.
+
+/** Set the transient `targetVersion` (the next boot installs it) + the boot report-back. */
+export function pinUpdateNow(
+  name: string,
+  version: string,
+  report: NonNullable<PluginStateFile["pendingReport"]>,
+): (s: PluginStateFile) => PluginStateFile {
+  return (s) => ({ ...updateEntry(s, name, (e) => ({ ...e, targetVersion: version })), pendingReport: report });
+}
+
+/** Queue a scheduled update — the tick fires it at `at` (ISO-8601). */
+export function scheduleUpdate(
+  name: string,
+  version: string,
+  at: string,
+  requestedBy: string,
+): (s: PluginStateFile) => PluginStateFile {
+  return (s) => updateEntry(s, name, (e) => ({ ...e, scheduled: { version, at, requestedBy } }));
+}
+
+/** Snooze the update reminder until `at` (ISO-8601). */
+export function remindLater(name: string, at: string): (s: PluginStateFile) => PluginStateFile {
+  return (s) => updateEntry(s, name, (e) => ({ ...e, remindAt: at }));
+}
+
+/** Skip `version` — no more notices until a newer version appears. */
+export function skipVersion(name: string, version: string): (s: PluginStateFile) => PluginStateFile {
+  return (s) => updateEntry(s, name, (e) => ({ ...e, skippedVersion: version }));
+}
+
+/** Drop any pending update — clears BOTH `scheduled` and `targetVersion` (the latter is set the
+ *  instant a schedule fires, so a cancel that loses the fire-instant race would otherwise leave the
+ *  pin queued), and this plugin's `pendingReport` (so a spurious latched restart doesn't report an
+ *  update that won't happen). Next boot, with no `targetVersion`, the plugin stays on its installed
+ *  version. */
+export function cancelPending(name: string): (s: PluginStateFile) => PluginStateFile {
+  return (s) => {
+    const cleared = updateEntry(s, name, (e) => {
+      const next = { ...e };
+      delete next.scheduled;
+      delete next.targetVersion;
+      return next;
+    });
+    if (cleared.pendingReport?.plugin === name) {
+      const next = { ...cleared };
+      delete next.pendingReport;
+      return next;
+    }
+    return cleared;
+  };
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /**
- * Plan one `/plugins` action: a refusal (identity `mutate`, explaining why) or a success (the
- * `mutate` to persist + the reply, and for `update` now the `restart` marker). NEVER performs I/O.
- * `update`/`remind`/`skip` require a strictly-newer version; `update` also requires compatibility;
- * `cancel` always works (drops a schedule, or says there was none).
+ * Plan one `/plugins` action: a refusal (no `mutate`, explaining why) or a success (the `mutate` to
+ * persist + the reply, and for `update` now the `restart` marker). NEVER performs I/O. `update`/
+ * `remind`/`skip` require a strictly-newer version; `update` also requires compatibility; `cancel`
+ * always works. The target version is the INDEX's latest (`ctx.latestVersion`); the request mailbox
+ * (#105) instead calls the builders above directly with the request's explicit pinned version.
  */
 export function planPluginAction(action: PluginAction, ctx: PluginActionContext): PluginActionResult {
   const { name } = ctx;
 
   if (action.kind === "cancel") {
     if (!ctx.hasPending) return { reply: `**${name}** has no scheduled update.` };
-    // Clear BOTH the schedule AND any `targetVersion` — the latter is set the instant a schedule
-    // fires, so a cancel that loses the fire-instant race would otherwise leave the pin queued and
-    // report a false "Cancelled" while the update still applied. Also drop this plugin's pendingReport
-    // so a spurious restart (if requestRestart already latched) doesn't report an update that won't
-    // happen. On the next boot, with no targetVersion, the plugin stays on its installed version.
-    return {
-      reply: `Cancelled the pending update for **${name}**.`,
-      mutate: (s) => {
-        const withoutPending = updateEntry(s, name, (e) => {
-          const next = { ...e };
-          delete next.scheduled;
-          delete next.targetVersion;
-          return next;
-        });
-        if (withoutPending.pendingReport?.plugin === name) {
-          const next = { ...withoutPending };
-          delete next.pendingReport;
-          return next;
-        }
-        return withoutPending;
-      },
-    };
+    return { reply: `Cancelled the pending update for **${name}**.`, mutate: cancelPending(name) };
   }
 
   // update / remind / skip all need a newer version to act on.
@@ -331,15 +379,15 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
   if (action.kind === "skip") {
     return {
       reply: `Skipping **${name}** ${to} — I won't mention it again until a newer version appears.`,
-      mutate: (s) => updateEntry(s, name, (e) => ({ ...e, skippedVersion: to })),
+      mutate: skipVersion(name, to),
     };
   }
 
   if (action.kind === "remind") {
-    const at = ctx.now.getTime() + action.days * 24 * 60 * 60 * 1000;
+    const at = ctx.now.getTime() + action.days * DAY_MS;
     return {
       reply: `Okay — I'll remind you about **${name}** ${to} ${discordTs(at)} (${discordTs(at, "R")}).`,
-      mutate: (s) => updateEntry(s, name, (e) => ({ ...e, remindAt: new Date(at).toISOString() })),
+      mutate: remindLater(name, new Date(at).toISOString()),
     };
   }
 
@@ -350,10 +398,9 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
     };
   }
   if (action.at) {
-    const iso = action.at.toISOString();
     return {
       reply: `Scheduled **${name}** ${to} for ${discordTs(action.at.getTime())} (${discordTs(action.at.getTime(), "R")}).`,
-      mutate: (s) => updateEntry(s, name, (e) => ({ ...e, scheduled: { version: to, at: iso, requestedBy: ctx.requestedBy } })),
+      mutate: scheduleUpdate(name, to, action.at.toISOString(), ctx.requestedBy),
     };
   }
   // update now: set the transient targetVersion + the boot report-back, then the handler restarts.
@@ -367,7 +414,7 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
   return {
     reply: `Updating **${name}** ${from} → ${to} now — restarting, back in a moment.`,
     restart: { from, to },
-    mutate: (s) => ({ ...updateEntry(s, name, (e) => ({ ...e, targetVersion: to })), pendingReport: report }),
+    mutate: pinUpdateNow(name, to, report),
   };
 }
 
@@ -402,6 +449,7 @@ export interface PluginNotifyDeliverers {
 }
 
 export interface PluginUpdateLog {
+  info(message: string): void;
   warn(message: string): void;
   error(message: string, err?: unknown): void;
 }
@@ -564,13 +612,17 @@ async function runDueSchedules(deps: PluginUpdateDeps): Promise<void> {
     });
     if (!acted) continue; // cancelled out from under us — leave it, try the next plugin
 
-    try {
-      await deps.deliverers.dmUser(
-        sched.requestedBy,
-        `Updating **${p.name}** ${from ?? "?"} → ${to} now, as scheduled — restarting, back in a moment.`,
-      );
-    } catch {
-      /* a closed DM must not abort the update — the boot report is authoritative */
+    // A panel-origin schedule's requestedBy is an identity string, not a DM-able snowflake — skip the
+    // futile fetch (the panel actor sees the result on refresh); a Discord requester gets the heads-up.
+    if (isDiscordUserId(sched.requestedBy)) {
+      try {
+        await deps.deliverers.dmUser(
+          sched.requestedBy,
+          `Updating **${p.name}** ${from ?? "?"} → ${to} now, as scheduled — restarting, back in a moment.`,
+        );
+      } catch {
+        /* a closed DM must not abort the update — the boot report is authoritative */
+      }
     }
     deps.requestRestart(`plugin update (scheduled): ${p.name} ${from ?? "?"} → ${to}`);
     return; // one restart per tick
@@ -604,6 +656,12 @@ export async function reportPluginUpdateOutcome(deps: PluginReportDeps): Promise
   });
   const entry = state.plugins.find((p) => p.name === report.plugin);
   const { message } = decidePluginReportOutcome(report, entry);
+  // A panel-origin request's requestedBy is a panel identity, not a DM-able snowflake — there's no
+  // Discord user to tell; log the outcome (the panel actor reads it back from /api/plugins).
+  if (!isDiscordUserId(report.userId)) {
+    deps.log.info(`[plugins] update report-back (panel request by ${report.userId}): ${message}`);
+    return;
+  }
   try {
     await deps.dmUser(report.userId, message);
   } catch {

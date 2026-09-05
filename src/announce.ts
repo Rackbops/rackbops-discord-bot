@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { mkdir, readdir, readFile, rename, unlink } from "node:fs/promises";
 import type { Client } from "discord.js";
 import { config } from "./config";
 import type { TickCheck } from "./plugins/contract";
@@ -12,6 +14,7 @@ import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKey
 import { loadPluginIndex } from "./plugins";
 import { readPluginState, mutatePluginState } from "./plugins/host";
 import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
+import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 
 const TICK_MS = 60 * 1000;
@@ -175,8 +178,8 @@ export function resetTickGuardForTest(): void {
   tickGeneration = 0;
 }
 
-/** The five core scheduler checks in order, followed by any plugin ticks. Pure so the composition
- * (five core names, then the extras) is tested directly. */
+/** The core scheduler checks in order, followed by any plugin ticks. Pure so the composition (the
+ * core names in order, then the extras) is tested directly. */
 export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
   return [
     { name: "dmf", run: () => checkDmf(client) },
@@ -192,6 +195,16 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       name: "autoUpdate",
       run: async () => {
         if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+      },
+    },
+    {
+      // Drain the plugin request MAILBOX (#105) — panel-dropped update/schedule/remind/skip/cancel
+      // requests — every tick, and BEFORE the pluginUpdates pass so a just-queued request is applied
+      // this tick (the panel promises "≤1 min"). Gated on pluginStateReady like pluginUpdates; the
+      // consumer is single-flight vs the boot drain.
+      name: "pluginRequests",
+      run: async () => {
+        if (pluginStateReady) await consumePluginRequests(livePluginRequestDeps());
       },
     },
     {
@@ -261,6 +274,27 @@ function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
     // earlier restart (autoUpdate) already won this tick.
     restartPending,
     requestRestart,
+  };
+}
+
+/** Live deps for the #105 request-mailbox consumer (real fs + the shared index/state/mutator). No
+ *  Discord client — a panel request has no DM target; the report-back logs the outcome. Reused by the
+ *  boot drain in index.ts. */
+export function livePluginRequestDeps(): PluginRequestDeps {
+  return {
+    requestsDir: join(DATA_DIR, "plugins", "requests"),
+    readDir: (dir) => readdir(dir),
+    readFile: (path) => readFile(path, "utf8"),
+    unlink: (path) => unlink(path),
+    rename: (from, to) => rename(from, to),
+    mkdir: (dir) => mkdir(dir, { recursive: true }).then(() => undefined),
+    loadIndex: async () => (await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)).index,
+    readState: () => readPluginState(DATA_DIR, pluginStorage),
+    mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
+    requestRestart,
+    hostApiVersion: HOST_API_VERSION,
+    now: () => new Date(),
+    log: console,
   };
 }
 
