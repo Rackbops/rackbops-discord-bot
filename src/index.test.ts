@@ -45,11 +45,18 @@ describe("index.ts wiring", () => {
     const startSched = source.indexOf("startScheduler(client", activateFn);
     const activatePlugins = source.indexOf("await activatePlugins(", activateFn);
     const report = source.indexOf("reportUpdateOutcome(", activateFn);
-    for (const pos of [install, load, restPut, startSched, activatePlugins, report]) expect(pos).toBeGreaterThan(-1);
+    // #104: the plugin update-report call. "reportUpdateOutcome(" is NOT a substring of
+    // "reportPluginUpdateOutcome(" (…report P lugin…, not …report U pdate…), so the scan above finds
+    // the /update report, and this finds the plugin one.
+    const markReady = source.indexOf("markPluginStateReady(", activateFn);
+    const pluginReport = source.indexOf("reportPluginUpdateOutcome(", activateFn);
+    for (const pos of [install, load, restPut, startSched, activatePlugins, report, markReady, pluginReport])
+      expect(pos).toBeGreaterThan(-1);
     expect(install).toBeLessThan(restPut); // builders come from the bundles
     expect(load).toBeLessThan(restPut);
     expect(startSched).toBeLessThan(activatePlugins); // ticks are running-gated before activate resolves
     expect(activatePlugins).toBeLessThan(report);
+    expect(markReady).toBeLessThan(pluginReport); // report-back clears its marker via the now-live mutator
   });
 
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {

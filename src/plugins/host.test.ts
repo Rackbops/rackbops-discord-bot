@@ -7,7 +7,8 @@ import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndexEntry, Plu
 import type { InstalledPlugin } from "./install";
 import type { LoadedPlugin } from "./host";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
-// host.ts imports ../commands, which resolves the config singleton from process.env at import time.
+// Prime the env some transitive imports read at load time (harmless if unused after the #104 cycle
+// break moved commandNamer to ../commandNaming, so host.ts no longer imports ../commands/config).
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
 const {
@@ -233,6 +234,7 @@ describe("buildPluginStateFile", () => {
       selected: [{ name: "p", entry: e }],
       installed: [{ entry: e, version: "1.0.0", bundlePath: "/a" }],
       installSkips: {},
+      fallbacks: {},
       loaded: [loaded(e, { commands: [] }, true)],
       loadErrors: {},
       processEnv: {},
@@ -253,6 +255,7 @@ describe("buildPluginStateFile", () => {
       selected: [{ name: "p", entry: e, skipped: "needs host API v2" }],
       installed: [],
       installSkips: {},
+      fallbacks: {},
       loaded: [],
       loadErrors: {},
       processEnv: {},
@@ -260,6 +263,49 @@ describe("buildPluginStateFile", () => {
       now: new Date("2026-09-04T00:00:00.000Z"),
     });
     expect(state.plugins[0]).toMatchObject({ configured: false, missingEnv: ["P_REQ"], active: false, error: "needs host API v2" });
+  });
+
+  // #104: targetVersion is a one-boot transient — consumed here, never carried forward.
+  const withTarget: PluginStateFile = {
+    hostApiVersion: 1,
+    writtenAt: "",
+    plugins: [{ name: "p", enabled: true, installedVersion: "1.0.0", targetVersion: "1.1.0", configured: true, missingEnv: [], active: false }],
+  };
+
+  test("consumes targetVersion on a successful update: installedVersion becomes the target, targetVersion dropped", () => {
+    const e = entry({ name: "p", version: "1.1.0" });
+    const state = buildPluginStateFile({
+      selected: [{ name: "p", entry: e }],
+      installed: [{ entry: e, version: "1.1.0", bundlePath: "/a" }],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [loaded(e, { commands: [] }, true)],
+      loadErrors: {},
+      processEnv: {},
+      previous: withTarget,
+      now: new Date("2026-09-05T00:00:00.000Z"),
+    });
+    expect(state.plugins[0]?.installedVersion).toBe("1.1.0");
+    expect(state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(state.plugins[0]?.error).toBeUndefined();
+  });
+
+  test("on an update fallback: installedVersion stays the previous, error names the failure, targetVersion dropped", () => {
+    const e = entry({ name: "p", version: "1.1.0" });
+    const state = buildPluginStateFile({
+      selected: [{ name: "p", entry: e }],
+      installed: [{ entry: e, version: "1.0.0", bundlePath: "/a" }], // fell back to the previous bundle
+      installSkips: {},
+      fallbacks: { p: { attempted: "1.1.0", reason: "integrity mismatch for @rackbops/plugin-p@1.1.0" } },
+      loaded: [loaded(e, { commands: [] }, true)],
+      loadErrors: {},
+      processEnv: {},
+      previous: withTarget,
+      now: new Date("2026-09-05T00:00:00.000Z"),
+    });
+    expect(state.plugins[0]?.installedVersion).toBe("1.0.0"); // reverted to the last-good
+    expect(state.plugins[0]?.targetVersion).toBeUndefined(); // consumed either way — no retry loop
+    expect(state.plugins[0]?.error).toContain("integrity mismatch");
   });
 });
 
@@ -282,6 +328,7 @@ describe("readPluginState / writePluginState round-trip", () => {
         selected: [{ name: "p", entry: e }],
         installed: [{ entry: e, version: "1.0.0", bundlePath: "/a" }],
         installSkips: {},
+        fallbacks: {},
         loaded: [loaded(e, { commands: [] }, true)],
         loadErrors: {},
         processEnv: {},

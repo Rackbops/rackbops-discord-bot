@@ -93,7 +93,7 @@ describe("installPlugins", () => {
       mkdirSync(join(dataDir, "plugins", "demo", "1.0.0", "dist"), { recursive: true });
       writeFileSync(bundlePath, "cached");
       const calls: string[] = [];
-      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, { demo: "1.0.0" }, {
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, { demo: { installedVersion: "1.0.0" } }, {
         fetch: makeFetch({ bytes: new Uint8Array(), integrity: "x", calls }),
         extract: fakeExtract,
         now: () => 1,
@@ -141,7 +141,7 @@ describe("installPlugins", () => {
     await withDataDir(async (dataDir) => {
       const bytes = new TextEncoder().encode("x");
       const calls: string[] = [];
-      await installPlugins([{ name: "demo", entry: entry({ version: "2.0.0" }) }], dataDir, { demo: "1.0.0" }, {
+      await installPlugins([{ name: "demo", entry: entry({ version: "2.0.0" }) }], dataDir, { demo: { installedVersion: "1.0.0" } }, {
         fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
         extract: fakeExtract,
         now: () => 1,
@@ -189,6 +189,65 @@ describe("installPlugins", () => {
       );
       expect(result.installed).toEqual([]);
       expect(calls).toEqual([]);
+    });
+  });
+
+  // #104: a failed targetVersion install falls back to the recorded last-good version.
+  const seedCached = (dataDir: string, version: string) => {
+    mkdirSync(join(dataDir, "plugins", "demo", version, "dist"), { recursive: true });
+    writeFileSync(join(dataDir, "plugins", "demo", version, "dist", "plugin.js"), `cached ${version}`);
+  };
+
+  test("a broken target reverts to the recorded previous version (cached), recording the failure", async () => {
+    await withDataDir(async (dataDir) => {
+      seedCached(dataDir, "1.0.0"); // the last-good bundle is on disk
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      // integrity that won't match the tarball bytes → the 1.1.0 target install fails.
+      const result = await installPlugins(
+        [{ name: "demo", entry: entry({ version: "1.1.0" }) }],
+        dataDir,
+        { demo: { installedVersion: "1.0.0", targetVersion: "1.1.0" } },
+        { fetch: makeFetch({ bytes, integrity: "sha512-bogus", calls }), extract: fakeExtract, now: () => 1, log: noopLog },
+      );
+      expect(result.installed.map((i) => i.version)).toEqual(["1.0.0"]); // came back on the previous
+      expect(result.fallbacks.demo).toMatchObject({ attempted: "1.1.0" });
+      expect(result.fallbacks.demo?.reason).toContain("integrity mismatch");
+      expect(result.skips).toEqual({});
+    });
+  });
+
+  test("the fallback is the RECORDED previous version, never a newer cached one (no silent upgrade)", async () => {
+    await withDataDir(async (dataDir) => {
+      seedCached(dataDir, "1.0.0"); // hand-lowered pin
+      seedCached(dataDir, "2.0.0"); // an older-run's cache, NEWER than the pin
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const result = await installPlugins(
+        [{ name: "demo", entry: entry({ version: "2.0.1" }) }],
+        dataDir,
+        { demo: { installedVersion: "1.0.0", targetVersion: "2.0.1" } },
+        { fetch: makeFetch({ bytes, integrity: "sha512-bogus", calls }), extract: fakeExtract, now: () => 1, log: noopLog },
+      );
+      // MUST be 1.0.0 (the recorded pin), NOT 2.0.0 (newestCached) — else it silently upgrades.
+      expect(result.installed.map((i) => i.version)).toEqual(["1.0.0"]);
+      expect(result.fallbacks.demo?.attempted).toBe("2.0.1");
+    });
+  });
+
+  test("a broken target with no cached previous is a plain skip (no fallback invented)", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const result = await installPlugins(
+        [{ name: "demo", entry: entry({ version: "1.1.0" }) }],
+        dataDir,
+        { demo: { targetVersion: "1.1.0" } }, // no installedVersion recorded
+        { fetch: makeFetch({ bytes, integrity: "sha512-bogus", calls }), extract: fakeExtract, now: () => 1, log: noopLog },
+      );
+      expect(result.installed).toEqual([]);
+      expect(result.skips.demo).toContain("integrity mismatch");
+      expect(result.fallbacks).toEqual({});
     });
   });
 

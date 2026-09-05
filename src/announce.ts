@@ -7,7 +7,7 @@ import { lastWeeklyReset } from "./wow/reset";
 import { realmStatus, realmWatchConfigured, decideRealmTransition, type RealmStatus } from "./wow/realm";
 import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
 import { checkForUpdate } from "./update";
-import { restartPending, withCritical } from "./restart";
+import { restartPending, requestRestart, withCritical } from "./restart";
 import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator } from "./storage";
 import { loadPluginIndex } from "./plugins";
 import { readPluginState, mutatePluginState } from "./plugins/host";
@@ -43,6 +43,14 @@ let pluginStateReady = false;
 /** Called by index.ts once the boot state.json write has completed — see the race note above. */
 export function markPluginStateReady(): void {
   pluginStateReady = true;
+}
+
+/** True once the boot state.json write has landed. `/plugins` WRITE subcommands (#104) check this
+ *  before mutating state.json, so a command firing in the startup window (the gateway connects, and
+ *  the interaction listener is live, before that one-time whole-file write) can't race it — the same
+ *  race the update tick is gated against. */
+export function isPluginStateReady(): boolean {
+  return pluginStateReady;
 }
 
 const pluginStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
@@ -187,7 +195,9 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       },
     },
     {
-      // Notify admins of a newer plugin version, with what changed — never installs/restarts (#103).
+      // Notify admins of a newer plugin version, with what changed (#103) — and run a DUE scheduled
+      // update, which moves the pin and restarts the bot (#104), the one place this tick acts on an
+      // update, and only because an admin scheduled it.
       // Gated on pluginStateReady so it can't race the boot state.json write (see the flag above).
       name: "pluginUpdates",
       run: async () => {
@@ -204,8 +214,9 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
 async function onTick(client: Client, extraChecks: TickCheck[]): Promise<void> {
   if (restartPending()) return; // on the way out — don't start work we can't finish
   await guardedTick(() =>
-    // The whole tick is one critical section: a restart requested by the update check
-    // below lands only once every announcement and state write has settled.
+    // The whole tick is one critical section: a restart requested during it — by the self-update
+    // check or by a due plugin-update schedule (#104) — lands only once every announcement and state
+    // write has settled.
     withCritical(() => runTick(tickChecks(client, extraChecks))),
   );
 }
@@ -245,6 +256,11 @@ function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
     hostApiVersion: HOST_API_VERSION,
     now: () => new Date(),
     log: console,
+    // #104: a due scheduled update restarts the bot. requestRestart inside the tick's withCritical
+    // defers the exit until the DM + state write settle; restartPending lets it stand down if an
+    // earlier restart (autoUpdate) already won this tick.
+    restartPending,
+    requestRestart,
   };
 }
 

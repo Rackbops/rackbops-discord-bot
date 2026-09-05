@@ -39,6 +39,17 @@ export interface InstallResult {
   installed: InstalledPlugin[];
   /** name -> reason, for the plugins that couldn't be installed (download/integrity/extract). */
   skips: Record<string, string>;
+  /** #104: name -> {the target that failed, why}, when a `/plugins update` target-version install
+   *  failed but the recorded previous version was used instead. The plugin IS installed (on its
+   *  previous version); this drives the boot report-back's "could not update … still on …" message. */
+  fallbacks: Record<string, { attempted: string; reason: string }>;
+}
+
+/** The pins a plugin resolves its install version against — the last-good `installedVersion` and,
+ *  after a `/plugins update`, the transient `targetVersion` the next boot should try first (#104). */
+export interface PluginPins {
+  installedVersion?: string;
+  targetVersion?: string;
 }
 
 /** The production `extract`: `tar` flattening the npm tarball's `package/` prefix. `tar` is present
@@ -99,77 +110,106 @@ function integrityMatches(bytes: Uint8Array, integrity: string): boolean {
   return actual === expected;
 }
 
+/** Install ONE specific version: reuse a cached `<name>/<version>/dist/plugin.js` with no fetch, else
+ *  download the tarball, verify its `dist.integrity`, and extract. Never throws — returns a reason. */
+async function tryInstallVersion(
+  entry: PluginIndexEntry,
+  name: string,
+  version: string,
+  dataDir: string,
+  deps: InstallDeps,
+): Promise<{ ok: true; plugin: InstalledPlugin } | { ok: false; reason: string }> {
+  const versionDir = join(dataDir, "plugins", name, version);
+  // `tar --strip-components=1` drops only the tarball's leading `package/`, so `package/dist/plugin.js`
+  // extracts to `<versionDir>/dist/plugin.js` (not `<versionDir>/plugin.js`).
+  const bundlePath = join(versionDir, "dist", "plugin.js");
+  if (existsSync(bundlePath)) return { ok: true, plugin: { entry, version, bundlePath } };
+  try {
+    const meta = (await fetchJson(
+      deps.fetch,
+      `${REGISTRY_BASE}/${encodeURIComponent(entry.package)}/${version}`,
+    )) as RegistryVersion;
+    const tarball = meta.dist?.tarball;
+    const integrity = meta.dist?.integrity;
+    if (typeof tarball !== "string" || typeof integrity !== "string") {
+      return { ok: false, reason: `registry entry for ${entry.package}@${version} has no dist.tarball/integrity` };
+    }
+    const tarRes = await deps.fetch(tarball, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    if (!tarRes.ok) return { ok: false, reason: `${tarball}: ${tarRes.status} ${tarRes.statusText}` };
+    const bytes = new Uint8Array(await tarRes.arrayBuffer());
+    if (!integrityMatches(bytes, integrity)) {
+      return { ok: false, reason: `integrity mismatch for ${entry.package}@${version}` };
+    }
+    const tmpDir = join(dataDir, "plugins", "tmp");
+    mkdirSync(tmpDir, { recursive: true });
+    const tarPath = join(tmpDir, `${name}-${version}-${deps.now()}.tgz`);
+    try {
+      await Bun.write(tarPath, bytes);
+      await deps.extract(tarPath, versionDir);
+    } finally {
+      rmSync(tarPath, { force: true });
+    }
+    if (!existsSync(bundlePath)) return { ok: false, reason: `extract produced no plugin.js for ${entry.package}@${version}` };
+    deps.log.info(`[plugins] ${name}@${version} downloaded, integrity ok`);
+    return { ok: true, plugin: { entry, version, bundlePath } };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /**
  * Installs each selected, non-skipped plugin. Version resolution: an operator pin
- * (`PLUGINS=name@version`) wins, then the version recorded in the previous `state.json`
- * (`installedVersions[name]`), then the index's current version — the bot NEVER moves an installed
- * plugin to a newer version on its own (that is #104's explicit action). A cached
- * `data/plugins/<name>/<version>/plugin.js` is reused with no fetch. Any per-plugin failure
- * (download, integrity mismatch, extract) is recorded in `skips` and affects only that plugin.
+ * (`PLUGINS=name@version`) wins, then #104's transient `targetVersion` (an explicit `/plugins update`),
+ * then the last-good `installedVersion` from the previous `state.json`, then the newest cached version,
+ * then the index's current version — the bot NEVER moves an installed plugin to a newer version on its
+ * own. A cached `data/plugins/<name>/<version>/dist/plugin.js` is reused with no fetch.
+ *
+ * #104 failure fallback: when a `/plugins update` **target** install fails, fall back to the recorded
+ * last-good `installedVersion` (deterministically — NOT `newestCachedVersion`, which could out-rank a
+ * hand-lowered pin), so the bot comes back running on the previous version; the failure is recorded in
+ * `fallbacks`. Any per-plugin failure with no usable fallback is recorded in `skips`.
  */
 export async function installPlugins(
   selected: readonly SelectedPlugin[],
   dataDir: string,
-  installedVersions: Record<string, string | undefined>,
+  pins: Record<string, PluginPins>,
   deps: InstallDeps,
 ): Promise<InstallResult> {
   const installed: InstalledPlugin[] = [];
   const skips: Record<string, string> = {};
+  const fallbacks: Record<string, { attempted: string; reason: string }> = {};
 
   for (const sp of selected) {
     if (sp.skipped || !sp.entry) continue;
     const entry = sp.entry;
-    const version = sp.pinnedVersion ?? installedVersions[sp.name] ?? newestCachedVersion(dataDir, sp.name) ?? entry.version;
-    const versionDir = join(dataDir, "plugins", sp.name, version);
-    // `tar --strip-components=1` drops only the tarball's leading `package/`, so `package/dist/plugin.js`
-    // extracts to `<versionDir>/dist/plugin.js` (not `<versionDir>/plugin.js`).
-    const bundlePath = join(versionDir, "dist", "plugin.js");
+    const pin = pins[sp.name];
+    const primary =
+      sp.pinnedVersion ?? pin?.targetVersion ?? pin?.installedVersion ?? newestCachedVersion(dataDir, sp.name) ?? entry.version;
 
-    if (existsSync(bundlePath)) {
-      installed.push({ entry, version, bundlePath });
+    const attempt = await tryInstallVersion(entry, sp.name, primary, dataDir, deps);
+    if (attempt.ok) {
+      installed.push(attempt.plugin);
       continue;
     }
 
-    try {
-      const meta = (await fetchJson(
-        deps.fetch,
-        `${REGISTRY_BASE}/${encodeURIComponent(entry.package)}/${version}`,
-      )) as RegistryVersion;
-      const tarball = meta.dist?.tarball;
-      const integrity = meta.dist?.integrity;
-      if (typeof tarball !== "string" || typeof integrity !== "string") {
-        throw new Error(`registry entry for ${entry.package}@${version} has no dist.tarball/integrity`);
-      }
-
-      const tarRes = await deps.fetch(tarball, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-      if (!tarRes.ok) throw new Error(`${tarball}: ${tarRes.status} ${tarRes.statusText}`);
-      const bytes = new Uint8Array(await tarRes.arrayBuffer());
-
-      if (!integrityMatches(bytes, integrity)) {
-        skips[sp.name] = `integrity mismatch for ${entry.package}@${version}`;
-        deps.log.error(`[plugins] ${sp.name}: ${skips[sp.name]}`);
+    // A failed TARGET-version update (an explicit /plugins update, not an operator @pin) falls back to
+    // the recorded last-good version — deterministic, never a cached version that could out-rank the
+    // pin. The previous bundle is normally still cached (existsSync reuse in tryInstallVersion).
+    const lastGood = pin?.installedVersion;
+    const wasTarget = !sp.pinnedVersion && pin?.targetVersion !== undefined && primary === pin.targetVersion;
+    if (wasTarget && lastGood && lastGood !== primary) {
+      const fb = await tryInstallVersion(entry, sp.name, lastGood, dataDir, deps);
+      if (fb.ok) {
+        installed.push(fb.plugin);
+        fallbacks[sp.name] = { attempted: primary, reason: attempt.reason };
+        deps.log.warn(`[plugins] ${sp.name}: install of ${primary} failed (${attempt.reason}); staying on ${lastGood}`);
         continue;
       }
-
-      const tmpDir = join(dataDir, "plugins", "tmp");
-      mkdirSync(tmpDir, { recursive: true });
-      const tarPath = join(tmpDir, `${sp.name}-${version}-${deps.now()}.tgz`);
-      try {
-        await Bun.write(tarPath, bytes);
-        await deps.extract(tarPath, versionDir);
-      } finally {
-        rmSync(tarPath, { force: true });
-      }
-      if (!existsSync(bundlePath)) {
-        throw new Error(`extract produced no plugin.js for ${entry.package}@${version}`);
-      }
-      deps.log.info(`[plugins] ${sp.name}@${version} downloaded, integrity ok`);
-      installed.push({ entry, version, bundlePath });
-    } catch (err) {
-      skips[sp.name] = err instanceof Error ? err.message : String(err);
-      deps.log.error(`[plugins] ${sp.name}: install failed — ${skips[sp.name]}`);
     }
+
+    skips[sp.name] = attempt.reason;
+    deps.log.error(`[plugins] ${sp.name}: install failed — ${attempt.reason}`);
   }
 
-  return { installed, skips };
+  return { installed, skips, fallbacks };
 }
