@@ -26,7 +26,7 @@ isolation/versioning/DI findings, §5 discord-ai shape notes and §6 shipped-ide
 the reference; its in-repo-registry recommendation is what this ADR supersedes). Design epic: #95.
 
 **Decision:** plugins are **single-file bundles published to npm from a separate repo**
-(`Rackbops/bot-plugins`, packages `@rackbops/plugin-<name>`), described by a **Plugin Index** that
+(`Rackbops/rackbops-bot-plugins`, packages `@rackbops/plugin-<name>`), described by a **Plugin Index** that
 repo's CI generates — `plugins.json`, fetched from `PLUGIN_INDEX_URL` and cached at
 `data/plugins/index.json`. The bot installs the plugins named in `PLUGINS=` at boot (resolve
 `package@version` on the registry, download the tarball, verify the registry's `dist.integrity`,

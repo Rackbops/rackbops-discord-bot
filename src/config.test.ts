@@ -251,9 +251,12 @@ describe("resolveConfig — plugins", () => {
     expect(() => resolveConfig({ ...base, PLUGINS: "foo,foo@1.0.0" })).toThrow(/"foo" more than once/);
   });
 
-  test("PLUGIN_INDEX_URL defaults to the Rackbops/bot-plugins manifest", () => {
+  test("PLUGIN_INDEX_URL defaults to the Rackbops/rackbops-bot-plugins manifest (the real repo, not bot-plugins — #113)", () => {
+    // The repo is rackbops-bot-plugins (Tooling#370); the bare `bot-plugins` URL 404s, which came
+    // up core-only on the first real deploy (#106). Pin the exact URL so a regression to the wrong
+    // repo name fails here rather than only at deploy.
     expect(resolveConfig(base).pluginIndexUrl).toBe(
-      "https://raw.githubusercontent.com/Rackbops/bot-plugins/main/plugins.json",
+      "https://raw.githubusercontent.com/Rackbops/rackbops-bot-plugins/main/plugins.json",
     );
   });
 
