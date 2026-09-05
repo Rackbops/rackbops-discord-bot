@@ -120,6 +120,7 @@ The bot loads plugins named in `PLUGINS=` from a published manifest and **never 
   - `/plugins update <name>` installs it **now**: the bot restarts into it and, once it's back, DMs you `✅ <name> is now <version>`. If that version can't be installed, the bot comes back on your **previous** version and tells you so — it never strands the plugin.
   - `/plugins update <name> at:<time>` **schedules** it. `at:` is either `HH:MM` (24-hour, **UTC** — the next time that clock hits it) or a full ISO-8601 datetime **with an offset** (e.g. `2026-09-06T18:30-07:00`); the reply echoes it back in your local time to confirm. At that time the bot DMs a heads-up, restarts into the version, and reports back.
   - `/plugins remind <name> [days]` snoozes the reminder (default 7 days); `/plugins skip <name>` silences this version until a newer one appears; `/plugins cancel <name>` drops a schedule.
+- **From the admin panel instead of Discord.** The panel's Modify Plugins section shows the same "What changed" notes and the same choices as buttons — **Update now**, **Schedule** (a date/time picker), **Remind me in 7 days**, **Skip this version**, and **Cancel scheduled update** — for whoever is signed in through Cloudflare Access. A click is queued and applied on the bot's next check (within a minute), identical to the `/plugins` command; the panel records *who* asked (their Access email) and shows the outcome on refresh rather than DMing.
 
 ## Character linking
 

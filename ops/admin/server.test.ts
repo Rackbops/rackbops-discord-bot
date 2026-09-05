@@ -22,6 +22,7 @@ import {
   extractBearerToken,
   handleAdmins,
   handleRequest,
+  HOST_API_VERSION,
   IDLE_TIMEOUT_SECONDS,
   isAuthorized,
   isCrossSiteWrite,
@@ -34,6 +35,7 @@ import {
   parseChangedKeys,
   parseEnvValue,
   parsePluginIndex,
+  parsePluginRequestInput,
   readDynamicAdmins,
   renderIndexHtml,
   SUBPROCESS_TIMEOUT_MS,
@@ -2157,6 +2159,19 @@ describe("DEFAULT_PLUGIN_INDEX_URL mirrors src/config.ts (#102, can't drift like
   });
 });
 
+// The panel's HOST_API_VERSION is a hand copy of contract.ts's, used only to decide which updates to
+// flag as "needs a newer bot" — the bot itself is the real compatibility enforcer. Pin the two
+// together mechanically (the same drift class as the index-URL mirror): if the bot bumps its host
+// API, this fails here rather than the panel silently mislabelling a compatible update.
+describe("HOST_API_VERSION mirrors src/plugins/contract.ts (#105, can't drift)", () => {
+  test("matches the bot's HOST_API_VERSION", () => {
+    const contractSrc = readFileSync(new URL("../../src/plugins/contract.ts", import.meta.url), "utf8");
+    const botVersion = contractSrc.match(/export const HOST_API_VERSION = (\d+)/)?.[1];
+    expect(botVersion).toBeTruthy();
+    expect(HOST_API_VERSION).toBe(Number(botVersion));
+  });
+});
+
 describe("createPluginIndexLister (#102)", () => {
   const validText = JSON.stringify({ schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0" }] });
   const otherText = JSON.stringify({ schemaVersion: 1, plugins: [{ name: "raidhelper", version: "2.0.0" }] });
@@ -2321,6 +2336,242 @@ describe("mergePluginsView (#102)", () => {
     expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
     expect(view.plugins[0]!.inIndex).toBe(false);
     expect(view.pluginsValue).toBe("warbandeer");
+  });
+});
+
+// #105 adds the update-lifecycle passthrough (scheduled/skippedVersion/remindAt — the Cancel-button
+// and marker inputs) and the compat flag the card uses to suppress Update now. The #102 merge tests
+// above deliberately don't set hostApiVersion, so these use entries that do.
+describe("mergePluginsView surfaces #105 schedule state + compat", () => {
+  const withApi = (hostApiVersion: number): PluginIndex => ({
+    schemaVersion: 1,
+    plugins: [
+      {
+        name: "warbandeer",
+        version: "1.1.0",
+        description: "d",
+        hostApiVersion,
+        releases: [{ version: "1.1.0", publishedAt: "2026-02-01", url: "u", notes: "n" }],
+      },
+    ],
+  });
+
+  test("carries scheduled / skippedVersion / remindAt through from the bot's status", () => {
+    const status: PluginStatusEntry[] = [
+      {
+        name: "warbandeer",
+        enabled: true,
+        installedVersion: "1.0.0",
+        active: true,
+        scheduled: { version: "1.1.0", at: "2026-09-06T18:30:00.000Z", requestedBy: "email:me@x.com" },
+        skippedVersion: "1.0.5",
+        remindAt: "2026-09-10T00:00:00.000Z",
+      },
+    ];
+    const wb = mergePluginsView(withApi(1), status, "warbandeer").plugins.find((p) => p.name === "warbandeer")!;
+    // A dropped `scheduled` passthrough (the mutation) means the panel never offers Cancel.
+    expect(wb.scheduled).toEqual({ version: "1.1.0", at: "2026-09-06T18:30:00.000Z", requestedBy: "email:me@x.com" });
+    expect(wb.skippedVersion).toBe("1.0.5");
+    expect(wb.remindAt).toBe("2026-09-10T00:00:00.000Z");
+  });
+
+  test("status omitting the fields leaves them undefined (never a spurious Cancel/marker)", () => {
+    const wb = mergePluginsView(withApi(1), [{ name: "warbandeer", installedVersion: "1.0.0" }], "warbandeer").plugins[0]!;
+    expect(wb.scheduled).toBeUndefined();
+    expect(wb.skippedVersion).toBeUndefined();
+    expect(wb.remindAt).toBeUndefined();
+  });
+
+  test("compatible is true (no neededHostApi) when the entry's hostApiVersion equals the bot's", () => {
+    const wb = mergePluginsView(withApi(HOST_API_VERSION), [], "warbandeer").plugins[0]!;
+    expect(wb.compatible).toBe(true);
+    expect(wb.neededHostApi).toBeUndefined();
+  });
+
+  test("compatible is false — with neededHostApi — when the entry needs a newer host API (bot would reject Update now)", () => {
+    const wb = mergePluginsView(withApi(HOST_API_VERSION + 1), [], "warbandeer").plugins[0]!;
+    // A `!==`→`===`-flipped compat mutant marks this compatible and lets the card offer an Update now
+    // the bot will reject. (This case alone can't kill a `<=`/`<` mutant — the older-API case below does.)
+    expect(wb.compatible).toBe(false);
+    expect(wb.neededHostApi).toBe(HOST_API_VERSION + 1);
+  });
+
+  test("compatible is false for an OLDER-host-API entry too (the bot rejects `!==`, so === is the mirror, not <=)", () => {
+    // The bot's validate rejects an update to the index's current version whenever
+    // entry.hostApiVersion !== HOST_API_VERSION — BOTH newer and older. This is the one input that
+    // distinguishes the correct `===` from a `<=`/`<` mutant (which would call an older-API build
+    // compatible and offer an Update now the bot then quarantines). Realistic once HOST_API_VERSION
+    // bumps and an un-updated plugin still declares the prior version.
+    const wb = mergePluginsView(withApi(HOST_API_VERSION - 1), [], "warbandeer").plugins[0]!;
+    expect(wb.compatible).toBe(false);
+    expect(wb.neededHostApi).toBe(HOST_API_VERSION - 1);
+  });
+
+  test("a plugin not in the index is compatible (nothing to install → the flag is moot, never blocks)", () => {
+    const legacy = mergePluginsView(withApi(1), [{ name: "legacy", installedVersion: "0.9.0" }], "").plugins.find(
+      (p) => p.name === "legacy",
+    )!;
+    expect(legacy.compatible).toBe(true);
+    expect(legacy.neededHostApi).toBeUndefined();
+  });
+});
+
+// The panel-side request schema — the FIRST of three validation layers (panel → bot-ops.sh → the bot's
+// requests.ts validate). It mirrors requests.ts's regexes so a hostile/malformed body is 400'd before
+// it reaches bot-ops.sh at all; the anchored version regex (no `/`) is the traversal gate.
+describe("parsePluginRequestInput (#105 request trust boundary)", () => {
+  test("accepts each well-formed action and never carries requestedBy (the server sets it)", () => {
+    expect(parsePluginRequestInput({ action: "update-now", plugin: "warbandeer", version: "1.1.0" })).toEqual({
+      ok: true,
+      request: { action: "update-now", plugin: "warbandeer", version: "1.1.0" },
+    });
+    expect(parsePluginRequestInput({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30:00.000Z" }).ok).toBe(true);
+    expect(parsePluginRequestInput({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7 }).ok).toBe(true);
+    expect(parsePluginRequestInput({ action: "skip", plugin: "warbandeer", version: "1.1.0" }).ok).toBe(true);
+    expect(parsePluginRequestInput({ action: "cancel", plugin: "warbandeer" })).toEqual({
+      ok: true,
+      request: { action: "cancel", plugin: "warbandeer" },
+    });
+  });
+
+  test("a client-supplied requestedBy is dropped, not passed through (never trusted from the body)", () => {
+    const r = parsePluginRequestInput({ action: "skip", plugin: "warbandeer", version: "1.1.0", requestedBy: "email:admin@evil" });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.request).not.toHaveProperty("requestedBy");
+  });
+
+  test("rejects a non-object, an unknown action, and a bad plugin name", () => {
+    expect(parsePluginRequestInput(null).ok).toBe(false);
+    expect(parsePluginRequestInput("nope").ok).toBe(false);
+    expect(parsePluginRequestInput({ action: "delete-everything", plugin: "warbandeer", version: "1.1.0" }).ok).toBe(false);
+    expect(parsePluginRequestInput({ action: "skip", plugin: "Warbandeer", version: "1.1.0" }).ok).toBe(false); // uppercase
+  });
+
+  test("rejects a version with a slash or path traversal (the security gate)", () => {
+    for (const version of ["1.0.0/../../etc", "../../evil", "1.0.0/x", "latest"]) {
+      expect(parsePluginRequestInput({ action: "update-now", plugin: "warbandeer", version }).ok).toBe(false);
+    }
+  });
+
+  test("cancel needs no version; every other action requires a valid one", () => {
+    expect(parsePluginRequestInput({ action: "cancel", plugin: "warbandeer" }).ok).toBe(true);
+    expect(parsePluginRequestInput({ action: "skip", plugin: "warbandeer" }).ok).toBe(false); // missing version
+  });
+
+  test("rejects a bad schedule time and out-of-range days", () => {
+    expect(parsePluginRequestInput({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "tomorrow" }).ok).toBe(false);
+    expect(parsePluginRequestInput({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30" }).ok).toBe(false); // no offset
+    expect(parsePluginRequestInput({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 0 }).ok).toBe(false);
+    expect(parsePluginRequestInput({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 1000 }).ok).toBe(false);
+  });
+});
+
+// The #105 producer route: a panel action button → a request file the bot consumes. Server-native
+// (like /api/admins) specifically so `requestedBy` is set from the verified identity, never the body.
+describe("POST /api/plugins/request (#105 panel producer)", () => {
+  const TOKEN = "test-token";
+  const INDEX_HTML = "<html></html>";
+  const okStdout = '{"ok":true,"queued":"1757000000000-skip-42.json"}';
+
+  // Captures the invocation so a test can assert args + stdin (the requestedBy injection).
+  function capturingBotOps(result: BotOpsResult = { exitCode: 0, stdout: okStdout, stderr: "" }) {
+    const calls: BotOpsInvocation[] = [];
+    return { calls, run: async (inv: BotOpsInvocation): Promise<BotOpsResult> => (calls.push(inv), result) };
+  }
+  const cfg = (run: HandlerConfig["runBotOps"]): HandlerConfig => ({ adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: run });
+  const post = (body: unknown, headers: Record<string, string> = {}) =>
+    new Request("http://panel.example/api/plugins/request", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+
+  test("queues a valid request: runs `plugin-request` with the JSON on stdin, returns bot-ops' output", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post({ action: "skip", plugin: "warbandeer", version: "1.1.0" }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe(okStdout);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(bot.calls).toHaveLength(1);
+    expect(bot.calls[0]!.args).toEqual(["plugin-request"]);
+    expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ action: "skip", plugin: "warbandeer", version: "1.1.0", requestedBy: "token" });
+  });
+
+  test("requestedBy is set from the verified Access email, NEVER the client body", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(
+      new Request("http://panel.example/api/plugins/request", {
+        method: "POST",
+        headers: { "Cf-Access-Jwt-Assertion": "jwt", "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "email:attacker@evil" }),
+      }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: bot.run, verifyAccessJwt: async () => ({ sub: "real@example.com", email: "real@example.com" }) },
+    );
+    expect(res.status).toBe(200);
+    const sent = JSON.parse(bot.calls[0]!.stdin!);
+    // The identity wins — a mutant that reads requestedBy from the body would send "email:attacker@evil".
+    expect(sent.requestedBy).toBe("email:real@example.com");
+  });
+
+  test("the bearer path records requestedBy: token (no email identity)", async () => {
+    const bot = capturingBotOps();
+    await handleRequest(post({ action: "cancel", plugin: "warbandeer" }), cfg(bot.run));
+    expect(JSON.parse(bot.calls[0]!.stdin!).requestedBy).toBe("token");
+  });
+
+  test("no token -> 401 and bot-ops is never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(
+      new Request("http://panel.example/api/plugins/request", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cancel", plugin: "warbandeer" }),
+      }),
+      cfg(bot.run),
+    );
+    expect(res.status).toBe(401);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("a cross-site Origin -> 403 before auth, bot-ops never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post({ action: "cancel", plugin: "warbandeer" }, { Origin: "http://evil.com" }), cfg(bot.run));
+    expect(res.status).toBe(403);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("a schema-invalid body -> 400, bot-ops never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post({ action: "delete-everything", plugin: "warbandeer", version: "1.1.0" }), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("a version with a slash -> 400 (the traversal gate), bot-ops never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post({ action: "update-now", plugin: "warbandeer", version: "1.0.0/../etc" }), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("invalid JSON -> 400, bot-ops never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post("{ not json", {}), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("a bot-ops failure surfaces its stderr with a 502", async () => {
+    const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "bot-ops: plugin-request: invalid action" });
+    const res = await handleRequest(post({ action: "skip", plugin: "warbandeer", version: "1.1.0" }), cfg(bot.run));
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe("bot-ops: plugin-request: invalid action");
+  });
+
+  test("a timed-out bot-ops returns a distinct 504", async () => {
+    const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
+    const res = await handleRequest(post({ action: "skip", plugin: "warbandeer", version: "1.1.0" }), cfg(bot.run));
+    expect(res.status).toBe(504);
   });
 });
 
@@ -2531,5 +2782,127 @@ describe("admin panel plugin badge decisions (#102, lifted from index.html)", ()
       expect(fns.pluginUpdateBadge({ latestVersion: "2.0.0", releases: [{ version: "2.0.0" }] })).toBeNull();
       expect(fns.pluginUpdateBadge({ installedVersion: "1.0.0", latestVersion: "1.1.0", releases: [] })).toBeNull();
     });
+  });
+});
+
+// The #105 action-button helpers, lifted from index.html and pinned here: the datetime-local→ISO
+// conversion (must satisfy the bot's ISO_OFFSET_RE) and the payload builder (must never carry
+// requestedBy — the server owns that). The DOM render (buildPluginUpdateBlock) stays browser-only,
+// exactly like buildPluginRow; its pure inputs (pluginUpdateBadge, compatible, scheduled) are the
+// tested seams.
+describe("admin panel plugin request helpers (#105, lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const helpersSrc = indexSrc.match(/\/\/ PLUGIN_REQUEST_HELPERS:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_REQUEST_HELPERS:end/)?.[1];
+  const fns = new Function(
+    `"use strict";\n${helpersSrc ?? ""}\nreturn { scheduleAtToIso, toDatetimeLocalValue, pluginRequestPayload };`,
+  )() as {
+    scheduleAtToIso: (v: string) => string | null;
+    toDatetimeLocalValue: (d: Date) => string;
+    pluginRequestPayload: (action: string, plugin: string, version?: string, extra?: { at?: string; days?: number }) => Record<string, unknown>;
+  };
+
+  test("the marked helpers are present in the served page", () => {
+    expect(helpersSrc).toContain("function scheduleAtToIso(");
+    expect(helpersSrc).toContain("function pluginRequestPayload(");
+  });
+
+  describe("scheduleAtToIso", () => {
+    test("a datetime-local value becomes an offset-bearing ISO the bot's regex accepts, same instant", () => {
+      const iso = fns.scheduleAtToIso("2026-09-06T18:30");
+      expect(iso).not.toBeNull();
+      // The bot's ISO_OFFSET_RE (requests.ts) — Z counts as an offset, so toISOString()'s output passes.
+      expect(iso!).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?([+-]\d{2}:?\d{2}|Z)$/);
+      expect(new Date(iso!).getTime()).toBe(new Date("2026-09-06T18:30").getTime());
+    });
+    test("null on a blank or unparseable value (the Schedule button then refuses to send)", () => {
+      expect(fns.scheduleAtToIso("")).toBeNull();
+      expect(fns.scheduleAtToIso("not a date")).toBeNull();
+    });
+  });
+
+  test("toDatetimeLocalValue's output round-trips back to the same instant through scheduleAtToIso", () => {
+    const d = new Date("2026-09-06T18:30");
+    const localValue = fns.toDatetimeLocalValue(d);
+    expect(localValue).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+    expect(new Date(fns.scheduleAtToIso(localValue)!).getTime()).toBe(d.getTime());
+  });
+
+  describe("pluginRequestPayload", () => {
+    test("builds each action's body and NEVER includes requestedBy (the server injects it)", () => {
+      expect(fns.pluginRequestPayload("update-now", "warbandeer", "1.1.0")).toEqual({ action: "update-now", plugin: "warbandeer", version: "1.1.0" });
+      expect(fns.pluginRequestPayload("schedule", "warbandeer", "1.1.0", { at: "2026-09-06T18:30:00.000Z" })).toEqual({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30:00.000Z" });
+      expect(fns.pluginRequestPayload("remind", "warbandeer", "1.1.0", { days: 7 })).toEqual({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7 });
+      expect(fns.pluginRequestPayload("cancel", "warbandeer")).toEqual({ action: "cancel", plugin: "warbandeer" });
+    });
+    test("omits version for cancel even when one is passed", () => {
+      expect(fns.pluginRequestPayload("cancel", "warbandeer", "1.1.0")).not.toHaveProperty("version");
+    });
+  });
+});
+
+// The send consumer, pinned against the page's OWN source — mirrors the savePlugins lift. Proves the
+// boundary (POSTs to /api/plugins/request, re-loads on success, never adds requestedBy), not just the
+// pure payload — the "break lives between changed and unchanged code" lesson.
+describe("admin panel sendPluginRequest (#105, lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const sendSrc = indexSrc.match(/\/\/ PLUGIN_REQUEST_SEND:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_REQUEST_SEND:end/)?.[1];
+
+  test("the marked consumer is present in the served page", () => {
+    expect(sendSrc).toContain("async function sendPluginRequest(");
+  });
+
+  interface Sent {
+    path: string;
+    opts: { method?: string; body?: string; headers?: Record<string, string>; signal?: AbortSignal };
+  }
+  async function runSend(
+    payload: Record<string, unknown>,
+    response: { ok: boolean; text: string } = { ok: true, text: '{"ok":true,"queued":"x.json"}' },
+  ) {
+    const posts: Sent[] = [];
+    const reloads = { plugins: 0, status: 0 };
+    const msg = { textContent: "", className: "" };
+    const api = async (path: string, opts: Sent["opts"]) => {
+      posts.push({ path, opts });
+      return { ok: response.ok, status: response.ok ? 200 : 502, text: async () => response.text };
+    };
+    const timeoutSignal = (_ms: number) => ({ signal: new AbortController().signal, cancel: () => {} });
+    const sendPluginRequest = new Function(
+      "api",
+      "timeoutSignal",
+      "MUTATION_TIMEOUT_MS",
+      "loadPlugins",
+      "loadStatus",
+      `${sendSrc ?? ""}\nreturn sendPluginRequest;`,
+    )(api, timeoutSignal, 110000, () => reloads.plugins++, () => reloads.status++) as (
+      p: unknown,
+      m: unknown,
+    ) => Promise<void>;
+    await sendPluginRequest(payload, msg);
+    return { posts, reloads, msg };
+  }
+
+  test("POSTs the payload to /api/plugins/request as JSON with a signal, then re-loads on success", async () => {
+    const { posts, reloads, msg } = await runSend({ action: "skip", plugin: "warbandeer", version: "1.1.0" });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.path).toBe("/api/plugins/request");
+    expect(posts[0]!.opts.method).toBe("POST");
+    expect(posts[0]!.opts.headers).toMatchObject({ "Content-Type": "application/json" });
+    expect(JSON.parse(posts[0]!.opts.body!)).toEqual({ action: "skip", plugin: "warbandeer", version: "1.1.0" });
+    expect(posts[0]!.opts.signal).toBeInstanceOf(AbortSignal);
+    expect(msg.className).toBe("plugin-actions-msg ok");
+    expect(reloads).toEqual({ plugins: 1, status: 1 });
+  });
+
+  test("never adds requestedBy to the posted body (the server injects it from identity)", async () => {
+    const { posts } = await runSend({ action: "skip", plugin: "warbandeer", version: "1.1.0" });
+    expect(posts[0]!.opts.body).not.toContain("requestedBy");
+  });
+
+  test("a failed request shows the server's message and does NOT re-load", async () => {
+    const { reloads, msg } = await runSend({ action: "cancel", plugin: "warbandeer" }, { ok: false, text: "bad action" });
+    expect(msg.className).toBe("plugin-actions-msg error");
+    expect(msg.textContent).toContain("bad action");
+    expect(reloads).toEqual({ plugins: 0, status: 0 });
   });
 });

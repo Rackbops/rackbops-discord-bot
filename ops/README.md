@@ -301,10 +301,12 @@ they're signed in as, plus the JWT's claims for the panel's Identity view), and
 `GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
 above), `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser), and
 `GET /api/plugins` (the Modify Plugins view — the Plugin Index merged with this instance's installed
-state and current `PLUGINS`; see below). The
+state and current `PLUGINS`; see below), and (**#105**) `POST /api/plugins/request` (an update-action
+button → a request file the bot consumes). The
 `/api/whoami`, `/api/admins`, and `/api/branches` routes never shell out to `bot-ops.sh`;
-`/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, but
-saving a plugin change goes through the ordinary `POST /api/env` (only `PLUGINS`), not a new route.
+`/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and
+`/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does), while
+saving a plugin's *enabled* state still goes through the ordinary `POST /api/env` (only `PLUGINS`).
 `/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
 routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
@@ -377,6 +379,24 @@ remove one) rather than failing — the `/api/plugins` route degrades to a `200`
 never a hard error. If the bot's own state can't be read (`status`/`env-get` failed — e.g. a docker
 hiccup), the route sets a `stateError` instead and the panel **disables Save**, since an empty
 selection read back under failure would otherwise let a save wipe the real `PLUGINS`.
+
+**Driving an available update (#105).** A card whose plugin has a newer release than the one
+installed grows an update-action area: a **What changed** block (the release notes for each version
+newer than installed, from the index), **Update now** and **Schedule** (a date/time picker) *when the
+update is host-API-compatible with this bot*, and **Remind me in 7 days** and **Skip this version**
+*always* (you can still silence or snooze a version you can't yet install); a **Cancel scheduled
+update** button appears once one is scheduled. Each button `POST`s a
+small request to `POST /api/plugins/request` — `{action, plugin, version?, at?, days?}` — which
+Origin-guards and schema-validates it (the same anchored `plugin`/`version` rules `bot-ops.sh` and
+the bot enforce, so a bad or hostile body is a `400` here), then sets `requestedBy` from the
+**Cloudflare Access identity that made the request, never anything in the body** (`email:<addr>`, or
+`token` on the bearer path), and shells `bot-ops.sh plugin-request` to drop the file in the mailbox.
+The bot applies it on its next tick (within a minute) exactly as it does a `/plugins` command — an
+**Update now** or a due **Schedule** restarts the bot to install; the identity is recorded in
+`state.json` and shown in `/plugins list`, but because it isn't a Discord user id the bot **logs** the
+outcome rather than trying to DM it. An update whose latest version needs a newer bot than this one
+shows a "needs a newer bot" note and offers no install button (the bot would reject it anyway). See
+"Plugin request mailbox" above for the file format and the `rejected/` quarantine.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as

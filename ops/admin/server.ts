@@ -247,7 +247,10 @@ export interface BotOpsResult {
 /**
  * Pure: maps a request's method/path/query/body onto a bot-ops.sh invocation, or `undefined`
  * for a route this panel doesn't recognise. No new bot-ops.sh capability is introduced here —
- * every branch maps 1:1 onto one of its five existing subcommands.
+ * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`env-get`/
+ * `env-set`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
+ * server-native route (`POST /api/plugins/request`) so `requestedBy` can be set from the verified
+ * identity, so it never reaches buildInvocation.
  */
 export function buildInvocation(
   method: string,
@@ -442,6 +445,11 @@ export function branchNamesFromApi(data: unknown): string[] {
  *  keep it in sync with src/config.ts. */
 export const DEFAULT_PLUGIN_INDEX_URL = "https://raw.githubusercontent.com/Rackbops/rackbops-bot-plugins/main/plugins.json";
 
+/** The bot's host-API version — a mirror of src/plugins/contract.ts's `HOST_API_VERSION`, used to
+ *  flag an update whose version needs a newer bot (#105 compat warning). Drift here is cosmetic
+ *  (the bot itself enforces compatibility); a test pins it against contract.ts. */
+export const HOST_API_VERSION = 1;
+
 export interface PluginRelease {
   version: string;
   publishedAt: string;
@@ -455,6 +463,7 @@ export interface PluginIndexEntry {
   description?: string;
   commands?: string[];
   releases?: PluginRelease[];
+  hostApiVersion?: number;
 }
 export interface PluginIndex {
   schemaVersion: number;
@@ -470,6 +479,11 @@ export interface PluginStatusEntry {
   missingEnv?: string[];
   active?: boolean;
   error?: string;
+  /** #105 update-lifecycle state, mirrored from PluginStateEntry — the panel reads these to know
+   *  which action buttons to offer (Cancel only when `scheduled`; the Skip/Remind markers). */
+  skippedVersion?: string;
+  remindAt?: string;
+  scheduled?: { version: string; at: string; requestedBy: string };
 }
 /** One row of the Modify Plugins view. */
 export interface PluginView {
@@ -484,6 +498,21 @@ export interface PluginView {
   error?: string;
   inIndex: boolean;
   releases: PluginRelease[];
+  /** #105 update-lifecycle state, carried through from the bot's status so the card can offer the
+   *  right actions and markers (Cancel only when `scheduled`, "(skipped)"/"(reminder set)"). */
+  skippedVersion?: string;
+  remindAt?: string;
+  scheduled?: { version: string; at: string; requestedBy: string };
+  /** Whether the panel should offer to install the index's latest version. An index entry is
+   *  compatible only when its declared `hostApiVersion` EQUALS the bot's (`HOST_API_VERSION`) — the
+   *  same equality the bot's `validate` enforces, so a newer- OR older-API entry is incompatible and
+   *  the card shows a "needs a newer bot" note + suppresses Update now. A plugin not in the index (no
+   *  entry) is compatible — there's nothing to install, so the flag is moot. An entry that omits
+   *  `hostApiVersion` (the contract requires it, so only a malformed index) counts as incompatible,
+   *  again mirroring the bot's reject. */
+  compatible: boolean;
+  /** The host API the index entry declares, surfaced only when it exceeds the bot's (the note text). */
+  neededHostApi?: number;
 }
 export interface PluginsView {
   plugins: PluginView[];
@@ -566,6 +595,12 @@ export function mergePluginsView(
   const plugins: PluginView[] = names.map((name) => {
     const entry = entryByName.get(name);
     const st = statusByName.get(name);
+    // Compat mirrors the bot's `validate` (requests.ts:154): an update to the index's CURRENT version
+    // is installable only when the entry's declared hostApiVersion EQUALS the bot's — the panel's
+    // Update now pins `latestVersion` (= entry.version), which is exactly the case the bot's compat
+    // check guards, so `===` suppresses Update now precisely when the bot would reject it. A plugin
+    // not in the index (no entry) has nothing to update to → moot → compatible.
+    const compatible = entry === undefined || entry.hostApiVersion === HOST_API_VERSION;
     return {
       name,
       description: entry?.description ?? "",
@@ -578,11 +613,80 @@ export function mergePluginsView(
       error: st?.error,
       inIndex: entry !== undefined,
       releases: releasesNewerThan(entry?.releases ?? [], st?.installedVersion),
+      skippedVersion: st?.skippedVersion,
+      remindAt: st?.remindAt,
+      scheduled: st?.scheduled,
+      compatible,
+      ...(!compatible && typeof entry?.hostApiVersion === "number" ? { neededHostApi: entry.hostApiVersion } : {}),
     };
   });
   return index === null
     ? { plugins, pluginsValue, indexError: "the Plugin Index couldn't be fetched" }
     : { plugins, pluginsValue };
+}
+
+/** The five request actions the panel can POST — a subset of the bot's PluginRequest union
+ *  (contract.ts:132). `requestedBy` is deliberately NOT part of this: the server fills it from the
+ *  verified Access identity, never the client body (a spoofed one would misattribute the audit trail
+ *  and mis-target the bot's heads-up DM). */
+export type PluginRequestAction = "update-now" | "schedule" | "remind" | "skip" | "cancel";
+export interface PluginRequestInput {
+  action: PluginRequestAction;
+  plugin: string;
+  version?: string;
+  at?: string;
+  days?: number;
+}
+
+// Mirror the bot's requests.ts regexes exactly — the anchored VERSION_RE (no `/`) is the traversal
+// gate, since a version flows into a filesystem join + a URL segment in the bot's install path.
+const REQUEST_PLUGIN_NAME_RE = /^[a-z][a-z0-9-]*$/;
+const REQUEST_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const REQUEST_ISO_OFFSET_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?([+-]\d{2}:?\d{2}|Z)$/;
+
+/** Server-side schema validation for POST /api/plugins/request — the panel's trust boundary, mirroring
+ *  the bot's `validate` (requests.ts) so a malformed/hostile body is 400'd before it reaches
+ *  bot-ops.sh (which re-validates, and the bot re-validates a third time on consume: defense in
+ *  depth). Shape + formats only — installed/compat is the bot's state to own, re-checked there. */
+export function parsePluginRequestInput(
+  raw: unknown,
+): { ok: true; request: PluginRequestInput } | { ok: false; reason: string } {
+  if (typeof raw !== "object" || raw === null) return { ok: false, reason: "body is not a JSON object" };
+  const r = raw as Record<string, unknown>;
+  const action = r.action;
+  if (
+    action !== "update-now" &&
+    action !== "schedule" &&
+    action !== "remind" &&
+    action !== "skip" &&
+    action !== "cancel"
+  ) {
+    return { ok: false, reason: "unknown action" };
+  }
+  if (typeof r.plugin !== "string" || !REQUEST_PLUGIN_NAME_RE.test(r.plugin)) {
+    return { ok: false, reason: "bad plugin name" };
+  }
+  const request: PluginRequestInput = { action, plugin: r.plugin };
+  // `version` — required for every action but cancel; the traversal-safe gate.
+  if (action !== "cancel") {
+    if (typeof r.version !== "string" || !REQUEST_VERSION_RE.test(r.version)) {
+      return { ok: false, reason: "bad version" };
+    }
+    request.version = r.version;
+  }
+  if (action === "schedule") {
+    if (typeof r.at !== "string" || !REQUEST_ISO_OFFSET_RE.test(r.at) || Number.isNaN(Date.parse(r.at))) {
+      return { ok: false, reason: "bad schedule time" };
+    }
+    request.at = r.at;
+  }
+  if (action === "remind" && r.days !== undefined) {
+    if (typeof r.days !== "number" || !Number.isInteger(r.days) || r.days < 1 || r.days > 999) {
+      return { ok: false, reason: "bad days" };
+    }
+    request.days = r.days;
+  }
+  return { ok: true, request };
 }
 
 /** I/O seams for the Plugin Index lister — injected so the read-on-demand + cache logic is testable
@@ -982,6 +1086,43 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
       view.stateError = "the bot's current state couldn't be read";
     }
     return jsonResponse(view);
+  }
+
+  // A Modify Plugins action button (Update now / Schedule / Remind / Skip / Cancel) → one request file
+  // the bot consumes on its next tick. Server-native (like /api/admins, NOT a buildInvocation branch)
+  // specifically because `requestedBy` MUST be set from the verified identity here, never the client
+  // body — a spoofed one would misattribute the audit trail and mis-target the bot's heads-up DM. A
+  // POST, so the isCrossSiteWrite gate above already blocked a forged cross-site call; the schema is
+  // re-validated server-side, and bot-ops.sh + the bot each re-validate on top (defense in depth).
+  if (req.method === "POST" && url.pathname === "/api/plugins/request") {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await req.text());
+    } catch {
+      return new Response("invalid JSON", { status: 400 });
+    }
+    const parsed = parsePluginRequestInput(raw);
+    if (!parsed.ok) return new Response(parsed.reason, { status: 400 });
+    // requestedBy is server-set from the Access identity — the email when known, else a token marker.
+    // The bot's isDiscordUserId guard (#104) makes a non-snowflake requestedBy skip the DM and log
+    // the outcome instead, so a panel actor never triggers a bogus users.fetch("email:…").
+    const requestedBy = auth.email ? `email:${auth.email}` : "token";
+    const payload = JSON.stringify({ ...parsed.request, requestedBy });
+    const result = await config.runBotOps({ args: ["plugin-request"], stdin: payload, contentType: "application/json" });
+    if (result.exitCode !== 0) {
+      console.error(
+        `[admin] plugin-request failed (exit ${result.exitCode}) — requested by ${describeActor(auth)}: ${result.stderr.trim()}`,
+      );
+      if (result.timedOut) return new Response("bot-ops.sh timed out", { status: 504 });
+      return new Response(result.stderr.trim() || "plugin-request failed", { status: 502 });
+    }
+    console.log(
+      `[admin] plugin-request queued (${parsed.request.action} ${parsed.request.plugin}) — requested by ${describeActor(auth)}`,
+    );
+    if (parsesAsJson(result.stdout)) {
+      return new Response(result.stdout, { headers: { "Content-Type": "application/json" } });
+    }
+    return jsonResponse({ ok: true });
   }
 
   if (url.pathname === "/api/admins" && config.adminStore) {
