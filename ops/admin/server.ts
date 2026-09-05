@@ -429,6 +429,202 @@ export function branchNamesFromApi(data: unknown): string[] {
     .filter(Boolean);
 }
 
+// ---- Modify Plugins (#102) -------------------------------------------------------------------
+// Minimal local mirrors of the JSON shapes this view consumes. ops/admin deliberately imports
+// nothing from src/ (src/plugins/contract.ts type-imports discord.js, which this package's isolated
+// typecheck can't resolve), so — like every other bot-ops.sh JSON the panel handles — these are
+// duck-typed. Field names track src/plugins/contract.ts (PluginIndexEntry / PluginRelease /
+// PluginStateEntry); keep them in sync there.
+
+/** The bot's compiled default Plugin Index URL — a mirror of src/config.ts's `pluginIndexUrl`
+ *  default, used when `.env` leaves `PLUGIN_INDEX_URL` unset (the common case). Drift here is
+ *  cosmetic (this only affects which index the PANEL lists; the bot uses its own compiled default);
+ *  keep it in sync with src/config.ts. */
+export const DEFAULT_PLUGIN_INDEX_URL = "https://raw.githubusercontent.com/Rackbops/rackbops-bot-plugins/main/plugins.json";
+
+export interface PluginRelease {
+  version: string;
+  publishedAt: string;
+  url: string;
+  notes: string;
+}
+export interface PluginIndexEntry {
+  name: string;
+  package?: string;
+  version: string;
+  description?: string;
+  commands?: string[];
+  releases?: PluginRelease[];
+}
+export interface PluginIndex {
+  schemaVersion: number;
+  plugins: PluginIndexEntry[];
+}
+/** One plugin as the bot recorded it in state.json — the `status.plugins` array from bot-ops.sh. */
+export interface PluginStatusEntry {
+  name: string;
+  enabled?: boolean;
+  installedVersion?: string;
+  availableVersion?: string;
+  configured?: boolean;
+  missingEnv?: string[];
+  active?: boolean;
+  error?: string;
+}
+/** One row of the Modify Plugins view. */
+export interface PluginView {
+  name: string;
+  description: string;
+  latestVersion?: string;
+  installedVersion?: string;
+  enabled: boolean;
+  configured: boolean;
+  missingEnv: string[];
+  active: boolean;
+  error?: string;
+  inIndex: boolean;
+  releases: PluginRelease[];
+}
+export interface PluginsView {
+  plugins: PluginView[];
+  /** The instance's raw `PLUGINS=` value, verbatim — the panel's Save diffs against it and reuses
+   *  any `name@version` pin it holds, so the merge stays the sole reader of the env value. */
+  pluginsValue: string;
+  /** Set when the Plugin Index couldn't be loaded — the view then shows installed plugins only. */
+  indexError?: string;
+  /** Set (by the route, not the merge) when the bot's own state read failed — `status`/`env-get`
+   *  returned non-zero, so `pluginsValue` can't be trusted as a Save baseline (an empty one would
+   *  look like "nothing enabled" and let a Save wipe the real selection). The panel disables Save
+   *  while this is set. */
+  stateError?: string;
+}
+
+/** Parse + shape-validate a fetched Plugin Index (the raw published manifest — top-level `.plugins`,
+ *  NOT the bot's cached `{writtenAt, index}` wrapper). null on bad JSON/shape. Mirrors
+ *  src/plugins/index.ts's isValidPluginIndex at panel scope. */
+export function parsePluginIndex(text: string): PluginIndex | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof data !== "object" || data === null) return null;
+  const d = data as { schemaVersion?: unknown; plugins?: unknown };
+  if (d.schemaVersion !== 1 || !Array.isArray(d.plugins)) return null;
+  const ok = d.plugins.every(
+    (p) =>
+      p !== null &&
+      typeof p === "object" &&
+      typeof (p as { name?: unknown }).name === "string" &&
+      typeof (p as { version?: unknown }).version === "string",
+  );
+  return ok ? (data as PluginIndex) : null;
+}
+
+/** The set of enabled plugin NAMES from a `PLUGINS=` value (dropping any `@version` pin). */
+function enabledPluginNames(pluginsValue: string): Set<string> {
+  return new Set(
+    pluginsValue
+      .split(",")
+      .map((t) => t.trim().split("@")[0] ?? "")
+      .filter(Boolean),
+  );
+}
+
+/** Releases newer than `installedVersion`: the latest-first prefix before the installed entry (the
+ *  manifest is latest-first — no semver dep needed in ops/admin; #105 renders them). No
+ *  `installedVersion`, or it isn't in the list, → all releases. */
+function releasesNewerThan(releases: PluginRelease[], installedVersion: string | undefined): PluginRelease[] {
+  if (!installedVersion) return releases;
+  const i = releases.findIndex((r) => r.version === installedVersion);
+  return i === -1 ? releases : releases.slice(0, i);
+}
+
+/** Pure merge of the Plugin Index, the bot's installed state (`status.plugins`), and the current
+ *  `PLUGINS` value into one per-plugin view. `index === null` → `indexError` + state-only entries,
+ *  so the panel still renders what's installed. */
+export function mergePluginsView(
+  index: PluginIndex | null,
+  statusPlugins: PluginStatusEntry[],
+  pluginsValue: string,
+): PluginsView {
+  const enabled = enabledPluginNames(pluginsValue);
+  const statusByName = new Map(statusPlugins.map((s) => [s.name, s]));
+  const entryByName = new Map((index?.plugins ?? []).map((e) => [e.name, e]));
+  // Union index ∪ status ∪ enabled (index first for ordering), so a not-yet-booted or
+  // unknown-to-index plugin still shows up with the right checkbox state. De-duplicated: a malformed
+  // manifest (or status list) with a repeated `name` must not produce two identical rows and two
+  // colliding `plugin-<name>` element ids.
+  const names = [
+    ...new Set([
+      ...(index?.plugins ?? []).map((e) => e.name),
+      ...statusPlugins.map((s) => s.name).filter((n) => !entryByName.has(n)),
+      ...[...enabled].filter((n) => !entryByName.has(n) && !statusByName.has(n)),
+    ]),
+  ];
+  const plugins: PluginView[] = names.map((name) => {
+    const entry = entryByName.get(name);
+    const st = statusByName.get(name);
+    return {
+      name,
+      description: entry?.description ?? "",
+      latestVersion: entry?.version,
+      installedVersion: st?.installedVersion,
+      enabled: enabled.has(name),
+      configured: st?.configured ?? false,
+      missingEnv: st?.missingEnv ?? [],
+      active: st?.active ?? false,
+      error: st?.error,
+      inIndex: entry !== undefined,
+      releases: releasesNewerThan(entry?.releases ?? [], st?.installedVersion),
+    };
+  });
+  return index === null
+    ? { plugins, pluginsValue, indexError: "the Plugin Index couldn't be fetched" }
+    : { plugins, pluginsValue };
+}
+
+/** I/O seams for the Plugin Index lister — injected so the read-on-demand + cache logic is testable
+ *  without a real filesystem or network. */
+export interface PluginIndexListerDeps {
+  /** Reads the mounted .env's text — called on every request so an edited PLUGIN_INDEX_URL is seen
+   *  without recreating the admin service (the same on-demand posture as the branches lister). */
+  readEnvText: () => Promise<string>;
+  /** Fetches the raw index text for the resolved URL (the http-fetch / file-read seam — timeouts and
+   *  scheme dispatch live in the real implementation, not here). */
+  fetchIndexText: (url: string) => Promise<string>;
+  /** The default URL when .env leaves PLUGIN_INDEX_URL unset (mirrors src/config.ts's default). */
+  defaultUrl: string;
+  now?: () => number;
+  ttlMs?: number;
+}
+
+/** Builds the /api/plugins index lister: on each call it reads PLUGIN_INDEX_URL from .env (falling
+ *  back to the default), and serves the last-good parse from an in-memory cache keyed on that URL for
+ *  `ttlMs` — so a changed URL is refetched immediately while an unchanged one is served from cache.
+ *  Any failure (env read, fetch, or a bad-shape index) resolves null, so the route reports an
+ *  indexError and the panel shows installed plugins only rather than erroring. */
+export function createPluginIndexLister(deps: PluginIndexListerDeps): () => Promise<PluginIndex | null> {
+  const now = deps.now ?? Date.now;
+  const ttlMs = deps.ttlMs ?? 5 * 60 * 1000;
+  let cache: { url: string; index: PluginIndex; at: number } | undefined;
+  return async () => {
+    try {
+      const envText = await deps.readEnvText();
+      const url = parseEnvValue(envText, "PLUGIN_INDEX_URL") || deps.defaultUrl;
+      if (cache && cache.url === url && now() - cache.at < ttlMs) return cache.index;
+      const index = parsePluginIndex(await deps.fetchIndexText(url));
+      if (!index) throw new Error("Plugin Index has an unexpected shape");
+      cache = { url, index, at: now() };
+      return index;
+    } catch (err) {
+      console.error(`[admin] couldn't load the Plugin Index (Modify Plugins shows installed only): ${err}`);
+      return null;
+    }
+  };
+}
+
 export interface HandlerConfig {
   adminToken: string;
   indexHtml: string;
@@ -440,6 +636,10 @@ export interface HandlerConfig {
    * Injected so the route tests without a real GitHub call; absent when no config dir is set, in
    * which case /api/branches 404s and the panel's BOT_BRANCH field degrades to a text input. */
   listBranches?: () => Promise<string[] | null>;
+  /** Loads + parses the Plugin Index (for the Modify Plugins view), or null on any failure. Injected
+   * so /api/plugins tests without a real fetch; absent when no config dir is set, in which case the
+   * route returns an indexError and the view shows installed plugins only. */
+  listPluginIndex?: () => Promise<PluginIndex | null>;
   /** Injected so request-handling logic tests without spawning a real subprocess. */
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>;
   /** Absent (not a stub that always fails) when Access isn't configured for this instance — the
@@ -590,6 +790,18 @@ export function parsesAsJson(text: string): boolean {
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+/** Best-effort read of one top-level field from a bot-ops.sh JSON stdout — undefined on any parse
+ * failure or a non-object, so a degraded/empty subprocess result yields an empty view rather than
+ * throwing (the same convenience-not-correctness posture as parseChangedKeys). */
+function safeJsonField(text: string, field: string): unknown {
+  try {
+    const obj: unknown = JSON.parse(text);
+    return typeof obj === "object" && obj !== null ? (obj as Record<string, unknown>)[field] : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -745,6 +957,31 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     const branches = await config.listBranches();
     if (!branches) return new Response("branches unavailable", { status: 502 });
     return jsonResponse({ branches });
+  }
+
+  // The Modify Plugins view: the Plugin Index (what's available) merged with the bot's installed
+  // state (status.plugins) and the current PLUGINS selection (env-get). Server-native, authenticated
+  // like every /api/* route; a GET, so isCrossSiteWrite never applies. Always 200 — an unreachable
+  // index degrades to an indexError plus the installed plugins, so the panel still renders what's
+  // installed. (Saving happens through the existing POST /api/env, not here.)
+  if (req.method === "GET" && url.pathname === "/api/plugins") {
+    const [statusRes, envRes] = await Promise.all([
+      config.runBotOps({ args: ["status"], contentType: "application/json" }),
+      config.runBotOps({ args: ["env-get"], contentType: "application/json" }),
+    ]);
+    const rawPlugins = safeJsonField(statusRes.stdout, "plugins");
+    const statusPlugins = Array.isArray(rawPlugins) ? (rawPlugins as PluginStatusEntry[]) : [];
+    const rawPluginsValue = safeJsonField(envRes.stdout, "PLUGINS");
+    const pluginsValue = typeof rawPluginsValue === "string" ? rawPluginsValue : "";
+    const index = config.listPluginIndex ? await config.listPluginIndex() : null;
+    const view = mergePluginsView(index, statusPlugins, pluginsValue);
+    // A failed state read leaves pluginsValue empty, which would look like "no plugins enabled" and
+    // let a Save wipe the real selection — surface it (distinct from indexError) so the panel can
+    // disable Save until the bot is readable again, rather than acting on a false-empty baseline.
+    if (statusRes.exitCode !== 0 || envRes.exitCode !== 0) {
+      view.stateError = "the bot's current state couldn't be read";
+    }
+    return jsonResponse(view);
   }
 
   if (url.pathname === "/api/admins" && config.adminStore) {
@@ -924,7 +1161,31 @@ if (import.meta.main) {
       }
     : undefined;
 
-  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, runBotOps, verifyAccessJwt, adminStore };
+  // The Modify Plugins view's "what's available" source: the raw Plugin Index (top-level `.plugins`,
+  // NOT the bot's cached wrapper). PLUGIN_INDEX_URL is read on demand from the mounted .env (empty →
+  // the bot's compiled default, mirrored here); an http(s) URL is fetched with a 5 s timeout, a
+  // file:///bare path is read best-effort (the admin container may not mount it). The cache + on-demand
+  // read live in createPluginIndexLister (tested); only the fetch/read I/O is wired here.
+  const listPluginIndex: (() => Promise<PluginIndex | null>) | undefined = configDir
+    ? createPluginIndexLister({
+        readEnvText: () => Bun.file(`${configDir}/.env`).text(),
+        fetchIndexText: async (url) => {
+          if (/^https?:\/\//i.test(url)) {
+            const res = await fetch(url, {
+              headers: { "User-Agent": "rackbops-admin-panel" },
+              signal: AbortSignal.timeout(5000), // don't let a stalled fetch hang the request
+            });
+            if (!res.ok) throw new Error(`Plugin Index fetch ${res.status}`);
+            return await res.text();
+          }
+          const path = url.startsWith("file://") ? url.slice("file://".length) : url;
+          return await Bun.file(path).text();
+        },
+        defaultUrl: DEFAULT_PLUGIN_INDEX_URL,
+      })
+    : undefined;
+
+  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, listPluginIndex, runBotOps, verifyAccessJwt, adminStore };
   // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
   // restart/env-set request out from under the client while bot-ops.sh is still legitimately
   // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.

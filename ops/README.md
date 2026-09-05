@@ -281,8 +281,12 @@ server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restar
 `POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
 they're signed in as, plus the JWT's claims for the panel's Identity view), and
 `GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
-above), and `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser). The
+above), `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser), and
+`GET /api/plugins` (the Modify Plugins view — the Plugin Index merged with this instance's installed
+state and current `PLUGINS`; see below). The
 `/api/whoami`, `/api/admins`, and `/api/branches` routes never shell out to `bot-ops.sh`;
+`/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, but
+saving a plugin change goes through the ordinary `POST /api/env` (only `PLUGINS`), not a new route.
 `/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
 routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
@@ -332,6 +336,29 @@ is cached ~5 minutes so repeated loads don't burn the limit. The chooser offers 
 branch names `bot-ops.sh` accepts (`^[A-Za-z0-9._/-]{1,100}$`); a stored value that isn't a current
 branch (a since-deleted branch) is still shown as its own option. If the lookup fails, `BOT_BRANCH`
 falls back to a plain text input.
+
+**The Modify Plugins section** lists every plugin the Plugin Index offers alongside what this
+instance has installed, and lets you add or remove one by ticking its checkbox and pressing Save.
+`GET /api/plugins` builds the view server-side: it merges the raw Plugin Index (fetched from
+`PLUGIN_INDEX_URL` — read on demand from the mounted `.env` like `GITHUB_REPO`, defaulting to the
+bot's own index when unset — so an edit is picked up without recreating the admin service, cached
+~5 min) with the bot's installed state (`bot-ops.sh status`'s `plugins`) and the current `PLUGINS`
+value (`env-get`). Each row shows the installed version, an "update to X" badge when the index
+carries a newer release, and a state tag (active / needs config / failed / not in index). **This
+never installs code from the browser** — ticking a plugin only adds its name to `PLUGINS`; the code
+is fetched and installed by the bot on its next boot exactly as it is for a hand-edited `PLUGINS`.
+You can never newly-*enable* a plugin the index doesn't list (its checkbox is disabled), but an
+already-enabled plugin the index has since dropped stays editable so you can still remove it. Save is
+the ordinary config Save under the hood: it computes the new `PLUGINS` string — preserving any
+`name@version` pin a still-ticked plugin already had, ordered by the manifest — and `POST`s **only**
+`PLUGINS` through `/api/env`, so the same Origin guard, auth, `bot-ops.sh` validation, and recreate
+apply as any other config change. The recreate it triggers is the restart that loads the change; a
+removed plugin's stored data files are left untouched. If the Plugin Index can't be fetched, the
+section shows an "index unavailable" notice and still lists the installed plugins (so you can still
+remove one) rather than failing — the `/api/plugins` route degrades to a `200` with an `indexError`,
+never a hard error. If the bot's own state can't be read (`status`/`env-get` failed — e.g. a docker
+hiccup), the route sets a `stateError` instead and the panel **disables Save**, since an empty
+selection read back under failure would otherwise let a save wipe the real `PLUGINS`.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as

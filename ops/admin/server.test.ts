@@ -11,7 +11,9 @@ import {
   branchNamesFromApi,
   buildInvocation,
   createAccessJwtVerifier,
+  createPluginIndexLister,
   createRunBotOps,
+  DEFAULT_PLUGIN_INDEX_URL,
   describeAction,
   describeActor,
   effectiveAllowlist,
@@ -25,11 +27,13 @@ import {
   isCrossSiteWrite,
   isEmailAllowed,
   logDynamicAdminsStartup,
+  mergePluginsView,
   normalizeAdminEmail,
   normalizeTeamDomain,
   parseAllowedEmails,
   parseChangedKeys,
   parseEnvValue,
+  parsePluginIndex,
   readDynamicAdmins,
   renderIndexHtml,
   SUBPROCESS_TIMEOUT_MS,
@@ -39,6 +43,9 @@ import {
   type BotOpsInvocation,
   type BotOpsResult,
   type HandlerConfig,
+  type PluginIndex,
+  type PluginsView,
+  type PluginStatusEntry,
 } from "./server";
 
 /** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set. */
@@ -1271,6 +1278,118 @@ describe("handleRequest", () => {
     expect(called).toBe(false);
   });
 
+  // /api/plugins gathers PLUGINS + installed state via bot-ops.sh (env-get + status) and the index
+  // via the injected lister, then returns mergePluginsView. runBotOps is called twice with different
+  // args, so the fake dispatches on the subcommand.
+  const pluginsBotOps = (statusStdout: string, envStdout: string) => async (inv: BotOpsInvocation): Promise<BotOpsResult> => {
+    if (inv.args[0] === "status") return { exitCode: 0, stdout: statusStdout, stderr: "" };
+    if (inv.args[0] === "env-get") return { exitCode: 0, stdout: envStdout, stderr: "" };
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+  const sampleIndex: PluginIndex = {
+    schemaVersion: 1,
+    plugins: [
+      { name: "warbandeer", version: "1.0.0", description: "Warband tools", releases: [{ version: "1.0.0", publishedAt: "2026-01-01", url: "u", notes: "n" }] },
+      { name: "raidhelper", version: "2.0.0", description: "Raid helper" },
+    ],
+  };
+
+  test("/api/plugins merges the index, installed state, and PLUGINS into the view", async () => {
+    const status = JSON.stringify({ plugins: [{ name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }] });
+    const res = await handleRequest(
+      authed("/api/plugins"),
+      branchCfg({ runBotOps: pluginsBotOps(status, JSON.stringify({ PLUGINS: "warbandeer" })), listPluginIndex: async () => sampleIndex }),
+    );
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.indexError).toBeUndefined();
+    expect(view.pluginsValue).toBe("warbandeer");
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer", "raidhelper"]);
+    const wb = view.plugins.find((p) => p.name === "warbandeer");
+    expect(wb).toMatchObject({ enabled: true, installedVersion: "1.0.0", active: true, inIndex: true, latestVersion: "1.0.0" });
+    const rh = view.plugins.find((p) => p.name === "raidhelper")!;
+    expect(rh).toMatchObject({ enabled: false, active: false, inIndex: true, latestVersion: "2.0.0" });
+    expect(rh.installedVersion).toBeUndefined();
+  });
+
+  test("/api/plugins degrades to a 200 with indexError (not a 502) when the index can't be loaded", async () => {
+    const status = JSON.stringify({ plugins: [{ name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }] });
+    const res = await handleRequest(
+      authed("/api/plugins"),
+      branchCfg({ runBotOps: pluginsBotOps(status, JSON.stringify({ PLUGINS: "warbandeer" })), listPluginIndex: async () => null }),
+    );
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.indexError).toBeTruthy();
+    // Still lists the installed plugin (state-only) so the panel renders what's installed.
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
+    expect(view.plugins[0]).toMatchObject({ enabled: true, inIndex: false, installedVersion: "1.0.0" });
+  });
+
+  test("/api/plugins with no index lister configured returns 200 + indexError, state only", async () => {
+    const status = JSON.stringify({ plugins: [{ name: "warbandeer", installedVersion: "1.0.0", active: true }] });
+    const res = await handleRequest(authed("/api/plugins"), branchCfg({ runBotOps: pluginsBotOps(status, JSON.stringify({ PLUGINS: "warbandeer" })) }));
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.indexError).toBeTruthy();
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
+  });
+
+  test("/api/plugins tolerates a malformed status/env payload (non-array plugins, non-string PLUGINS)", async () => {
+    const res = await handleRequest(
+      authed("/api/plugins"),
+      branchCfg({ runBotOps: pluginsBotOps(JSON.stringify({ plugins: "oops" }), JSON.stringify({ PLUGINS: 5 })), listPluginIndex: async () => sampleIndex }),
+    );
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.pluginsValue).toBe(""); // a non-string PLUGINS coerces to empty, no crash
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer", "raidhelper"]); // index-only, none enabled
+    expect(view.plugins.every((p) => !p.enabled)).toBe(true);
+  });
+
+  test("/api/plugins surfaces a stateError (not a silent empty view) when env-get fails", async () => {
+    // A failed env-get returns empty stdout; without the exit-code check the route would report a
+    // false-empty PLUGINS baseline and the panel would let a Save wipe the real selection.
+    const failingBotOps = async (inv: BotOpsInvocation): Promise<BotOpsResult> =>
+      inv.args[0] === "env-get"
+        ? { exitCode: 1, stdout: "", stderr: "bot-ops: cannot read .env" }
+        : { exitCode: 0, stdout: JSON.stringify({ plugins: [{ name: "warbandeer", installedVersion: "1.0.0", active: true }] }), stderr: "" };
+    const res = await handleRequest(authed("/api/plugins"), branchCfg({ runBotOps: failingBotOps, listPluginIndex: async () => sampleIndex }));
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.stateError).toBeTruthy();
+  });
+
+  test("/api/plugins surfaces a stateError when status fails too", async () => {
+    const failingStatus = async (inv: BotOpsInvocation): Promise<BotOpsResult> =>
+      inv.args[0] === "status"
+        ? { exitCode: 1, stdout: "", stderr: "docker unreachable" }
+        : { exitCode: 0, stdout: JSON.stringify({ PLUGINS: "warbandeer" }), stderr: "" };
+    const res = await handleRequest(authed("/api/plugins"), branchCfg({ runBotOps: failingStatus, listPluginIndex: async () => sampleIndex }));
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as PluginsView).stateError).toBeTruthy();
+  });
+
+  test("/api/plugins leaves stateError unset when both reads succeed", async () => {
+    const res = await handleRequest(
+      authed("/api/plugins"),
+      branchCfg({ runBotOps: pluginsBotOps(JSON.stringify({ plugins: [] }), JSON.stringify({ PLUGINS: "" })), listPluginIndex: async () => sampleIndex }),
+    );
+    expect(((await res.json()) as PluginsView).stateError).toBeUndefined();
+  });
+
+  test("/api/plugins requires auth (no token -> 401, never shells out or fetches the index)", async () => {
+    let botOpsCalled = false;
+    let indexCalled = false;
+    const res = await handleRequest(new Request("http://x/api/plugins"), branchCfg({
+      runBotOps: async () => { botOpsCalled = true; return { exitCode: 0, stdout: "{}", stderr: "" }; },
+      listPluginIndex: async () => { indexCalled = true; return sampleIndex; },
+    }));
+    expect(res.status).toBe(401);
+    expect(botOpsCalled).toBe(false);
+    expect(indexCalled).toBe(false);
+  });
+
   test("rejects an /api/* call with no token", async () => {
     const res = await handleRequest(new Request("http://x/api/status"), {
       adminToken: TOKEN,
@@ -2003,5 +2122,414 @@ describe("REQUIRED keys (bot-ops.sh ↔ panel REQUIRED_KEYS stay in sync)", () =
 
   test("every REQUIRED key is itself a whitelisted ALLOWED key", () => {
     for (const key of botOpsRequired) expect(botOpsSrc).toMatch(new RegExp(`\\[${key}\\]='`));
+  });
+});
+
+describe("parsePluginIndex (#102)", () => {
+  test("parses a valid raw index (top-level .plugins)", () => {
+    const idx = parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0" }] }));
+    expect(idx?.plugins[0]?.name).toBe("a");
+  });
+  test("null on bad JSON", () => {
+    expect(parsePluginIndex("not json")).toBeNull();
+  });
+  test("null on a wrong schemaVersion", () => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 2, plugins: [] }))).toBeNull();
+  });
+  test("null when plugins isn't an array", () => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: {} }))).toBeNull();
+  });
+  test("null when an entry is missing name or version", () => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a" }] }))).toBeNull();
+  });
+});
+
+// The panel duck-types its way around importing src/ (config.ts type-imports discord.js), so its
+// default index URL is a hand copy of config.ts's `pluginIndexUrl` default. This pins the two
+// together mechanically — the same "stale hardcoded default behind a redirect" class as #113/#115,
+// caught here instead of on a user's box: if config.ts's default changes, this test fails.
+describe("DEFAULT_PLUGIN_INDEX_URL mirrors src/config.ts (#102, can't drift like #113/#115)", () => {
+  test("matches the bot's compiled pluginIndexUrl default", () => {
+    const configSrc = readFileSync(new URL("../../src/config.ts", import.meta.url), "utf8");
+    const botDefault = configSrc.match(/optional\("PLUGIN_INDEX_URL"\)\s*\?\?\s*"([^"]+)"/)?.[1];
+    expect(botDefault).toBeTruthy();
+    expect(DEFAULT_PLUGIN_INDEX_URL).toBe(botDefault!);
+  });
+});
+
+describe("createPluginIndexLister (#102)", () => {
+  const validText = JSON.stringify({ schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0" }] });
+  const otherText = JSON.stringify({ schemaVersion: 1, plugins: [{ name: "raidhelper", version: "2.0.0" }] });
+
+  test("reads PLUGIN_INDEX_URL from .env on demand, fetches, and parses", async () => {
+    const fetched: string[] = [];
+    const lister = createPluginIndexLister({
+      readEnvText: async () => "PLUGIN_INDEX_URL=https://a/index.json\n",
+      fetchIndexText: async (url) => { fetched.push(url); return validText; },
+      defaultUrl: "https://default/index.json",
+    });
+    const idx = await lister();
+    expect(idx?.plugins[0]?.name).toBe("warbandeer");
+    expect(fetched).toEqual(["https://a/index.json"]);
+  });
+
+  test("falls back to the default URL when .env leaves PLUGIN_INDEX_URL unset", async () => {
+    const fetched: string[] = [];
+    const lister = createPluginIndexLister({
+      readEnvText: async () => "OTHER=1\n",
+      fetchIndexText: async (url) => { fetched.push(url); return validText; },
+      defaultUrl: "https://default/index.json",
+    });
+    await lister();
+    expect(fetched).toEqual(["https://default/index.json"]);
+  });
+
+  test("serves the cache within the TTL (no second fetch), then refetches after it expires", async () => {
+    let clock = 1000;
+    const fetched: string[] = [];
+    const lister = createPluginIndexLister({
+      readEnvText: async () => "PLUGIN_INDEX_URL=https://a/index.json\n",
+      fetchIndexText: async (url) => { fetched.push(url); return validText; },
+      defaultUrl: "https://default/index.json",
+      now: () => clock,
+      ttlMs: 1000,
+    });
+    await lister();
+    clock = 1500; // within TTL
+    await lister();
+    expect(fetched).toHaveLength(1); // cache hit, no refetch
+    clock = 2600; // past TTL
+    await lister();
+    expect(fetched).toHaveLength(2); // refetched
+  });
+
+  test("a changed PLUGIN_INDEX_URL is picked up immediately (cache is keyed on the URL, not just time)", async () => {
+    let envUrl = "https://a/index.json";
+    const fetched: string[] = [];
+    const lister = createPluginIndexLister({
+      readEnvText: async () => `PLUGIN_INDEX_URL=${envUrl}\n`,
+      fetchIndexText: async (url) => { fetched.push(url); return url.includes("/a/") ? validText : otherText; },
+      defaultUrl: "https://default/index.json",
+      now: () => 1000, // time frozen: only a URL change can bust the cache
+      ttlMs: 60000,
+    });
+    expect((await lister())?.plugins[0]?.name).toBe("warbandeer");
+    envUrl = "https://b/index.json"; // operator edited .env
+    const second = await lister();
+    expect(second?.plugins[0]?.name).toBe("raidhelper");
+    expect(fetched).toEqual(["https://a/index.json", "https://b/index.json"]);
+  });
+
+  test("a fetch failure resolves null (route then reports indexError)", async () => {
+    const lister = createPluginIndexLister({
+      readEnvText: async () => "PLUGIN_INDEX_URL=https://a/index.json\n",
+      fetchIndexText: async () => { throw new Error("timed out"); },
+      defaultUrl: "https://default/index.json",
+    });
+    expect(await lister()).toBeNull();
+  });
+
+  test("a bad-shape index resolves null (never a partial/garbage index)", async () => {
+    const lister = createPluginIndexLister({
+      readEnvText: async () => "PLUGIN_INDEX_URL=https://a/index.json\n",
+      fetchIndexText: async () => JSON.stringify({ schemaVersion: 2, plugins: [] }),
+      defaultUrl: "https://default/index.json",
+    });
+    expect(await lister()).toBeNull();
+  });
+});
+
+describe("mergePluginsView (#102)", () => {
+  const index: PluginIndex = {
+    schemaVersion: 1,
+    plugins: [
+      {
+        name: "warbandeer",
+        version: "1.1.0",
+        description: "d",
+        releases: [
+          { version: "1.1.0", publishedAt: "2026-02-01", url: "u", notes: "n2" },
+          { version: "1.0.0", publishedAt: "2026-01-01", url: "u", notes: "n1" },
+        ],
+      },
+      { name: "raidhelper", version: "2.0.0", description: "r" },
+    ],
+  };
+  const status: PluginStatusEntry[] = [
+    { name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true },
+  ];
+
+  test("merges index + status + PLUGINS; enabled comes from PLUGINS, pin ignored for matching", () => {
+    const view = mergePluginsView(index, status, "warbandeer@1.0.0");
+    expect(view.pluginsValue).toBe("warbandeer@1.0.0");
+    expect(view.indexError).toBeUndefined();
+    const wb = view.plugins.find((p) => p.name === "warbandeer")!;
+    expect(wb).toMatchObject({ enabled: true, installedVersion: "1.0.0", latestVersion: "1.1.0", active: true, inIndex: true, configured: true });
+    const rh = view.plugins.find((p) => p.name === "raidhelper")!;
+    expect(rh).toMatchObject({ enabled: false, inIndex: true, latestVersion: "2.0.0" });
+    expect(rh.installedVersion).toBeUndefined();
+  });
+
+  test("passes through configured / missingEnv / error from status (the state-badge inputs)", () => {
+    const st: PluginStatusEntry[] = [
+      { name: "warbandeer", enabled: true, installedVersion: "1.0.0", configured: false, missingEnv: ["WB_TOKEN", "WB_CHANNEL"], active: false, error: "boot failed: bad token" },
+    ];
+    const wb = mergePluginsView(index, st, "warbandeer").plugins.find((p) => p.name === "warbandeer")!;
+    expect(wb.configured).toBe(false);
+    expect(wb.missingEnv).toEqual(["WB_TOKEN", "WB_CHANNEL"]);
+    expect(wb.error).toBe("boot failed: bad token");
+    // and the defaults when status omits them (raidhelper has no status entry)
+    const rh = mergePluginsView(index, st, "warbandeer").plugins.find((p) => p.name === "raidhelper")!;
+    expect(rh.configured).toBe(false);
+    expect(rh.missingEnv).toEqual([]);
+    expect(rh.error).toBeUndefined();
+  });
+
+  test("de-duplicates a repeated name (malformed manifest) into a single row", () => {
+    const dupIndex: PluginIndex = {
+      schemaVersion: 1,
+      plugins: [
+        { name: "warbandeer", version: "1.0.0" },
+        { name: "warbandeer", version: "9.9.9" },
+      ],
+    };
+    const names = mergePluginsView(dupIndex, [], "").plugins.map((p) => p.name);
+    expect(names).toEqual(["warbandeer"]);
+  });
+
+  test("releases are only those newer than the installed version (latest-first prefix)", () => {
+    const wb = mergePluginsView(index, status, "warbandeer").plugins.find((p) => p.name === "warbandeer")!;
+    expect(wb.releases.map((r) => r.version)).toEqual(["1.1.0"]);
+  });
+
+  test("an installed plugin absent from the index is still listed, inIndex:false", () => {
+    const view = mergePluginsView(index, [{ name: "legacy", installedVersion: "0.9.0", active: false }], "");
+    const legacy = view.plugins.find((p) => p.name === "legacy")!;
+    expect(legacy.inIndex).toBe(false);
+    expect(legacy.installedVersion).toBe("0.9.0");
+    expect(legacy.enabled).toBe(false);
+  });
+
+  test("a PLUGINS-only plugin (unknown to index and status) still appears, enabled", () => {
+    const ghost = mergePluginsView(index, [], "warbandeer,ghost").plugins.find((p) => p.name === "ghost")!;
+    expect(ghost).toMatchObject({ enabled: true, inIndex: false });
+  });
+
+  test("index === null yields indexError plus state-only entries", () => {
+    const view = mergePluginsView(null, status, "warbandeer");
+    expect(view.indexError).toBeTruthy();
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
+    expect(view.plugins[0]!.inIndex).toBe(false);
+    expect(view.pluginsValue).toBe("warbandeer");
+  });
+});
+
+// The plugin Save path, pinned against the page's OWN source — mirrors the saveEnv lift above. The
+// pure planPluginsSave and savePlugins are lifted from index.html (between their PLUGINS_SAVE_PLAN /
+// PLUGINS_SAVE markers) and evaluated here, so the consumer boundary (savePlugins POSTs PLUGINS=<value>
+// and ONLY that) is proven on the real function, not a re-implementation.
+describe("admin panel plugin Save (#102)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const planSrc = indexSrc.match(/\/\/ PLUGINS_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ PLUGINS_SAVE_PLAN:end/)?.[1];
+  const saveSrc = indexSrc.match(/\/\/ PLUGINS_SAVE:begin\n([\s\S]*?)\n\s*\/\/ PLUGINS_SAVE:end/)?.[1];
+
+  type Plan = { value: string; changed: boolean };
+  const planPluginsSave = (checked: string[], current: string, order: string[]): Plan =>
+    (new Function(`"use strict";\n${planSrc ?? ""}\nreturn planPluginsSave;`)() as (
+      c: string[],
+      v: string,
+      o: string[],
+    ) => Plan)(checked, current, order);
+
+  test("both marked functions are present in the served page", () => {
+    expect(planSrc).toContain("function planPluginsSave(");
+    expect(saveSrc).toContain("async function savePlugins(");
+  });
+
+  describe("planPluginsSave (pure)", () => {
+    test("keeps a name@version pin for a still-ticked plugin, no-op when unchanged", () => {
+      expect(planPluginsSave(["warbandeer"], "warbandeer@1.0.0", ["warbandeer", "raidhelper"])).toEqual({
+        value: "warbandeer@1.0.0",
+        changed: false,
+      });
+    });
+    test("orders ticked plugins by the manifest", () => {
+      expect(planPluginsSave(["raidhelper", "warbandeer"], "raidhelper", ["warbandeer", "raidhelper"])).toEqual({
+        value: "warbandeer,raidhelper",
+        changed: true,
+      });
+    });
+    test("a newly-ticked plugin is added bare (no pin), keeping an existing pin", () => {
+      expect(planPluginsSave(["warbandeer", "raidhelper"], "warbandeer@1.0.0", ["warbandeer", "raidhelper"])).toEqual({
+        value: "warbandeer@1.0.0,raidhelper",
+        changed: true,
+      });
+    });
+    test("unticking a plugin drops it entirely", () => {
+      expect(planPluginsSave([], "warbandeer@1.0.0", ["warbandeer"])).toEqual({ value: "", changed: true });
+    });
+    test("a whitespace-only difference is not a change (no spurious restart)", () => {
+      expect(planPluginsSave(["warbandeer", "raidhelper"], "warbandeer, raidhelper", ["warbandeer", "raidhelper"]).changed).toBe(false);
+    });
+    test("a ticked plugin the manifest doesn't list is appended in its own order", () => {
+      expect(planPluginsSave(["warbandeer", "legacy"], "warbandeer,legacy", ["warbandeer"]).value).toBe("warbandeer,legacy");
+    });
+  });
+
+  interface FakePage {
+    posts: { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } }[];
+    confirms: string[];
+    msg: { textContent: string; className: string };
+    reloads: { plugins: number; env: number; status: number };
+  }
+  async function runSavePlugins(
+    pluginsData: { plugins: { name: string }[]; pluginsValue: string; stateError?: string },
+    checked: string[],
+    opts: { confirm?: boolean; response?: { ok: boolean; text: string } } = {},
+  ): Promise<FakePage> {
+    const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, reloads: { plugins: 0, env: 0, status: 0 } };
+    const checkedSet = new Set(checked);
+    const boxes = pluginsData.plugins.map((p) => ({ checked: checkedSet.has(p.name), dataset: { plugin: p.name }, type: "checkbox" }));
+    const document = {
+      getElementById: (id: string) => (id === "plugins-msg" ? page.msg : null),
+      querySelectorAll: (selector: string) => (selector === "#plugins-list input[type=checkbox]" ? boxes : []),
+    };
+    const confirm = (text: string): boolean => {
+      page.confirms.push(text);
+      return opts.confirm ?? true;
+    };
+    const api = async (path: string, o: { method?: string; body?: string; signal?: AbortSignal }) => {
+      page.posts.push({ path, opts: o });
+      const r = opts.response ?? { ok: true, text: '{"ok":true,"changed":["PLUGINS"]}' };
+      return { ok: r.ok, text: async () => r.text };
+    };
+    const timeoutSignal = (_ms: number) => ({ signal: new AbortController().signal, cancel: () => {} });
+    const savePlugins = new Function(
+      "document",
+      "confirm",
+      "api",
+      "timeoutSignal",
+      "MUTATION_TIMEOUT_MS",
+      "loadPlugins",
+      "loadEnv",
+      "loadStatus",
+      "pluginsData",
+      `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn savePlugins;`,
+    )(
+      document,
+      confirm,
+      api,
+      timeoutSignal,
+      110000,
+      () => page.reloads.plugins++,
+      () => page.reloads.env++,
+      () => page.reloads.status++,
+      pluginsData,
+    ) as () => Promise<void>;
+    await savePlugins();
+    return page;
+  }
+
+  test("savePlugins POSTs only PLUGINS with the planned value, then re-baselines all three views", async () => {
+    const page = await runSavePlugins(
+      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
+      ["warbandeer", "raidhelper"],
+    );
+    expect(page.posts).toHaveLength(1);
+    const [post] = page.posts;
+    expect(post?.path).toBe("/api/env");
+    expect(post?.opts.method).toBe("POST");
+    expect(post?.opts.body).toBe("PLUGINS=warbandeer,raidhelper");
+    expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
+    expect(page.confirms).toHaveLength(1);
+    expect(page.confirms[0]).toContain("warbandeer,raidhelper");
+    expect(page.msg.className).toBe("msg ok");
+    expect(page.reloads).toEqual({ plugins: 1, env: 1, status: 1 });
+  });
+
+  test("savePlugins with no change posts nothing and says so", async () => {
+    const page = await runSavePlugins({ plugins: [{ name: "warbandeer" }], pluginsValue: "warbandeer@1.0.0" }, ["warbandeer"]);
+    expect(page.posts).toEqual([]);
+    expect(page.confirms).toEqual([]);
+    expect(page.msg.textContent).toBe("No changes.");
+  });
+
+  test("a declined confirm posts nothing", async () => {
+    const page = await runSavePlugins(
+      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
+      ["warbandeer", "raidhelper"],
+      { confirm: false },
+    );
+    expect(page.confirms).toHaveLength(1);
+    expect(page.posts).toEqual([]);
+    expect(page.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+  });
+
+  test("a rejected save surfaces bot-ops.sh's own message", async () => {
+    const page = await runSavePlugins(
+      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
+      ["warbandeer", "raidhelper"],
+      { response: { ok: false, text: "bot-ops: env-set: value for 'PLUGINS' is invalid" } },
+    );
+    expect(page.msg.className).toBe("msg error");
+    expect(page.msg.textContent).toContain("bot-ops");
+  });
+
+  test("savePlugins refuses to post when stateError is set (no wipe against a false-empty baseline)", async () => {
+    // The dangerous case: state read failed so pluginsValue came back "", the operator ticks a
+    // subset — without the guard this would POST PLUGINS=<subset> and drop the rest.
+    const page = await runSavePlugins(
+      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "", stateError: "the bot's current state couldn't be read" },
+      ["warbandeer"],
+    );
+    expect(page.posts).toEqual([]);
+    expect(page.confirms).toEqual([]);
+  });
+});
+
+// The badge DECISIONS are pure {text, kind} functions lifted from index.html's PLUGIN_BADGES markers
+// and pinned here — the render (makeBadge → createElement) stays browser-only, but the two review-fix
+// conditions (index-outage suppression = MODERATE-2, newer-release guard = MINOR-2) are guarded.
+describe("admin panel plugin badge decisions (#102, lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const badgesSrc = indexSrc.match(/\/\/ PLUGIN_BADGES:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_BADGES:end/)?.[1];
+  type Badge = { text: string; kind: string | null } | null;
+  const fns = new Function(`"use strict";\n${badgesSrc ?? ""}\nreturn { pluginStateBadge, pluginUpdateBadge };`)() as {
+    pluginStateBadge: (p: Record<string, unknown>, indexAvailable: boolean) => Badge;
+    pluginUpdateBadge: (p: Record<string, unknown>) => Badge;
+  };
+
+  test("both marked functions are present in the served page", () => {
+    expect(badgesSrc).toContain("function pluginStateBadge(");
+    expect(badgesSrc).toContain("function pluginUpdateBadge(");
+  });
+
+  describe("pluginStateBadge", () => {
+    test("MODERATE-2: labels 'not in index' only when the index is available", () => {
+      // During an outage every row is inIndex:false — it must NOT be labelled 'not in index'.
+      expect(fns.pluginStateBadge({ inIndex: false, active: true }, false)).toEqual({ text: "active", kind: "active" });
+      // But a genuinely-unknown plugin (index loaded, absent) still is.
+      expect(fns.pluginStateBadge({ inIndex: false, active: true }, true)).toEqual({ text: "not in index", kind: "warn" });
+    });
+    test("precedence: error > needs-config > active > enabled > disabled", () => {
+      expect(fns.pluginStateBadge({ inIndex: true, error: "boom" }, true)).toEqual({ text: "failed: boom", kind: "warn" });
+      expect(fns.pluginStateBadge({ inIndex: true, enabled: true, missingEnv: ["A"] }, true)).toEqual({ text: "needs config: A", kind: "warn" });
+      expect(fns.pluginStateBadge({ inIndex: true, active: true }, true)).toEqual({ text: "active", kind: "active" });
+      expect(fns.pluginStateBadge({ inIndex: true, enabled: true, missingEnv: [] }, true)).toEqual({ text: "enabled, not active", kind: null });
+      expect(fns.pluginStateBadge({ inIndex: true, enabled: false }, true)).toEqual({ text: "disabled", kind: null });
+    });
+  });
+
+  describe("pluginUpdateBadge", () => {
+    test("shows 'update to X' when a newer release exists", () => {
+      expect(fns.pluginUpdateBadge({ installedVersion: "1.0.0", latestVersion: "1.1.0", releases: [{ version: "1.1.0" }] })).toEqual({ text: "update to 1.1.0", kind: "update" });
+    });
+    test("MINOR-2: no badge when latest === installed (even if releasesNewerThan returned entries)", () => {
+      expect(fns.pluginUpdateBadge({ installedVersion: "1.0.0", latestVersion: "1.0.0", releases: [{ version: "1.0.0" }] })).toBeNull();
+    });
+    test("no badge when not installed, or no releases", () => {
+      expect(fns.pluginUpdateBadge({ latestVersion: "2.0.0", releases: [{ version: "2.0.0" }] })).toBeNull();
+      expect(fns.pluginUpdateBadge({ installedVersion: "1.0.0", latestVersion: "1.1.0", releases: [] })).toBeNull();
+    });
   });
 });
