@@ -9,7 +9,6 @@ import { startScheduler, announceTo } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
-import { startWarbandeerServer, warbandeerConnectorConfigured } from "./warbandeer/server";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
@@ -148,23 +147,6 @@ async function activate(c: Client<true>): Promise<void> {
   });
 
   startScheduler(client, pluginTicks(loadResult.loaded, console));
-  // Absent WARBANDEER_INGEST_PORT means the connector never starts at all — fail closed
-  // (docs/adr/0001) rather than binding a port nobody asked for. Guarded the same way command
-  // registration is above: Bun.serve throwing (a privileged port under the non-root `bun` user,
-  // the port already in use) must not become an unhandled rejection that crashes the whole bot
-  // into a restart:unless-stopped loop over one optional feature failing to bind.
-  if (warbandeerConnectorConfigured()) {
-    try {
-      startWarbandeerServer(config.warbandeerIngestPort!);
-    } catch (err) {
-      console.error(
-        `[startup] Warbandeer connector failed to start on :${config.warbandeerIngestPort} — ` +
-          "the bot keeps running without it; /link will report the feature disabled. Check the " +
-          "port isn't already in use and isn't a privileged one the container's non-root user can't bind.",
-        err,
-      );
-    }
-  }
 
   // Activate plugins AFTER the scheduler is up (pluginTicks are running-gated, so a tick that fires
   // before this resolves is skipped) — a throwing activate() is isolated, never crashing the bot.

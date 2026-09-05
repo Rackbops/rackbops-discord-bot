@@ -52,8 +52,7 @@ describe("index.ts wiring", () => {
     expect(activatePlugins).toBeLessThan(report);
   });
 
-  test("does not add a second ./warbandeer import (the baked-in connector import stays until #100)", () => {
-    const count = (source.match(/from "\.\/warbandeer\//g) ?? []).length;
-    expect(count).toBe(1); // only ./warbandeer/server
+  test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
+    expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });
 });
