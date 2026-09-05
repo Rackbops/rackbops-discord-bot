@@ -147,7 +147,7 @@ async function activate(c: Client<true>): Promise<void> {
     }
   });
 
-  startScheduler(client, pluginTicks(loadResult.loaded));
+  startScheduler(client, pluginTicks(loadResult.loaded, console));
   // Absent WARBANDEER_INGEST_PORT means the connector never starts at all — fail closed
   // (docs/adr/0001) rather than binding a port nobody asked for. Guarded the same way command
   // registration is above: Bun.serve throwing (a privileged port under the non-root `bun` user,

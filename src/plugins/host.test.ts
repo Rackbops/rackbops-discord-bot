@@ -118,6 +118,18 @@ describe("pluginCommandMap", () => {
     expect(map.get("y")?.entry.name).toBe("a");
     expect(calls.filter((l) => l.level === "warn")).toHaveLength(2); // b and c dropped
   });
+
+  test("a malformed (non-iterable) commands field is skipped, not thrown — other plugins survive", () => {
+    const { log, calls } = makeLog();
+    const bad = loaded(entry({ name: "bad" }), { commands: 5 as unknown as [] });
+    const good = loaded(entry({ name: "good" }), { commands: [cmd("hi")] });
+    let map: ReturnType<typeof pluginCommandMap> = new Map();
+    expect(() => {
+      map = pluginCommandMap([bad, good], [], log);
+    }).not.toThrow();
+    expect([...map.keys()]).toEqual(["hi"]); // bad skipped, good kept
+    expect(calls.some((l) => l.level === "error" && l.message.includes("malformed commands"))).toBe(true);
+  });
 });
 
 describe("buildCommandBody", () => {
@@ -166,13 +178,26 @@ describe("pluginTicks", () => {
   test("a plugin's tick runs only while its running flag is true", async () => {
     let ran = 0;
     const lp = loaded(entry({ name: "p" }), { ticks: [{ name: "t", run: async () => { ran += 1; } }] });
-    const checks = pluginTicks([lp]);
+    const checks = pluginTicks([lp], makeLog().log);
     expect(checks[0]?.name).toBe("p:t");
     await checks[0]?.run();
     expect(ran).toBe(0); // running=false → skipped
     lp.running = true;
     await checks[0]?.run();
     expect(ran).toBe(1);
+  });
+
+  test("a malformed (non-iterable) ticks field is skipped, not thrown — other plugins' ticks survive", () => {
+    const { log, calls } = makeLog();
+    // `ticks` typed readonly TickCheck[] but plugin-controlled; a bad bundle can return a non-array.
+    const bad = loaded(entry({ name: "bad" }), { ticks: {} as unknown as [] });
+    const good = loaded(entry({ name: "good" }), { ticks: [{ name: "t", run: async () => {} }] });
+    let checks: ReturnType<typeof pluginTicks> = [];
+    expect(() => {
+      checks = pluginTicks([bad, good], log);
+    }).not.toThrow();
+    expect(checks.map((c) => c.name)).toEqual(["good:t"]); // bad skipped, good kept
+    expect(calls.some((l) => l.level === "error" && l.message.includes("malformed ticks"))).toBe(true);
   });
 });
 

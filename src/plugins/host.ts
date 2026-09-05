@@ -108,15 +108,21 @@ export function pluginCommandMap(
   const map: PluginCommandMap = new Map();
   const claimed = new Set<string>(coreCommandNames);
   for (const { entry, plugin } of loaded) {
-    const commands = plugin.commands ?? [];
-    const collision = commands.find((c) => claimed.has(c.name));
-    if (collision) {
-      log.warn(`[plugins] ${entry.name}: command "${collision.name}" collides with an already-registered command — skipping this plugin's commands`);
-      continue;
-    }
-    for (const command of commands) {
-      claimed.add(command.name);
-      map.set(command.name, { entry, command });
+    try {
+      // `plugin.commands` is plugin-controlled and only type-asserted, not validated — a malformed
+      // value (non-array, throwing getter) must skip this plugin, never throw out of here.
+      const commands = plugin.commands ?? [];
+      const collision = commands.find((c) => claimed.has(c.name));
+      if (collision) {
+        log.warn(`[plugins] ${entry.name}: command "${collision.name}" collides with an already-registered command — skipping this plugin's commands`);
+        continue;
+      }
+      for (const command of commands) {
+        claimed.add(command.name);
+        map.set(command.name, { entry, command });
+      }
+    } catch (err) {
+      log.error(`[plugins] ${entry.name}: ignoring malformed commands — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return map;
@@ -156,16 +162,23 @@ export function buildCommandBody(
 
 /** Each plugin tick wrapped so it only runs while that plugin's `running` flag is true — a tick
  * can fire between startScheduler and activatePlugins, and must not run before activate() resolved. */
-export function pluginTicks(loaded: readonly LoadedPlugin[]): TickCheck[] {
+export function pluginTicks(loaded: readonly LoadedPlugin[], log: BaseLog): TickCheck[] {
   const checks: TickCheck[] = [];
   for (const lp of loaded) {
-    for (const tick of lp.plugin.ticks ?? []) {
-      checks.push({
-        name: `${lp.entry.name}:${tick.name}`,
-        run: async () => {
-          if (lp.running) await tick.run();
-        },
-      });
+    try {
+      // `plugin.ticks` is plugin-controlled and only type-asserted — a malformed value (non-iterable,
+      // throwing getter) must skip this plugin's ticks, never throw out of here into activate()'s
+      // caller (this runs OUTSIDE the setup try, at the startScheduler call).
+      for (const tick of lp.plugin.ticks ?? []) {
+        checks.push({
+          name: `${lp.entry.name}:${tick.name}`,
+          run: async () => {
+            if (lp.running) await tick.run();
+          },
+        });
+      }
+    } catch (err) {
+      log.error(`[plugins] ${lp.entry.name}: ignoring malformed ticks — ${err instanceof Error ? err.message : String(err)}`);
     }
   }
   return checks;
