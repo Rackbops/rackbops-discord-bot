@@ -913,4 +913,35 @@ describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-w
     expect(run.stderr).toContain("env-set: 'WARBANDEER_INGEST_PORT' is required and cannot be blank");
     expect(envText(fx)).toBe("PLUGINS=warbandeer\nWARBANDEER_INGEST_PORT=8080\n");
   });
+
+  test("a NON-OBJECT plugin ENTRY beside a well-formed one: the bad entry is skipped, the good plugin's keys still list — NOT degraded", async () => {
+    // Pins the plugin-entry `type == "object"` guard (the whole plugins array, not just one env
+    // array). Without it the bare `123` entry makes jq error on `.name`, the extraction is caught
+    // as "index unavailable", and EVERY plugin's keys vanish — a silent regression a green suite
+    // would otherwise miss.
+    const index = JSON.stringify({
+      writtenAt: "x",
+      index: { schemaVersion: 1, generatedAt: "x", plugins: [123, pluginEntry("warbandeer", [envKey("WARBANDEER_INGEST_PORT", "^[0-9]+$")])] },
+    });
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).not.toContain("index unavailable"); // the good plugin survives — not degraded
+    expect(run.json).toHaveProperty("WARBANDEER_INGEST_PORT");
+  });
+
+  test("env elements with a non-string key or non-string format are skipped; the well-formed sibling lists", async () => {
+    const index = wrapIndex([
+      pluginEntry("warbandeer", [
+        { key: 5, format: "^x$", description: "numeric key" },
+        { key: "BAD_FMT", format: 42, description: "numeric format" },
+        envKey("WARBANDEER_INGEST_PORT", "^[0-9]+$"),
+      ]),
+    ]);
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const env = await envGet(fx);
+    expect(env).not.toHaveProperty("5"); // non-string key not listed
+    expect(env).not.toHaveProperty("BAD_FMT"); // non-string format not listed
+    expect(env).toHaveProperty("WARBANDEER_INGEST_PORT");
+  });
 });
