@@ -150,6 +150,13 @@ describe("notificationMessage", () => {
     expect(msg).toContain("📦 **warbandeer** 2.0.0 is available"); // head survives
     expect(msg).toContain("`/plugins update warbandeer`"); // footer survives the clamp
   });
+  test("hard-caps even a pathologically long plugin name (belt-and-suspenders)", () => {
+    const msg = notificationMessage(
+      { ...base, name: "a".repeat(500), compatible: true, action: "notify", releases: [rel("1.1.0")] },
+      1,
+    );
+    expect(msg.length).toBeLessThanOrEqual(2000);
+  });
 });
 
 describe("renderPluginsList", () => {

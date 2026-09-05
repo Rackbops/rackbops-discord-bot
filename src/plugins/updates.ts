@@ -153,7 +153,11 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number)
   // only the notes (as before) let the assembled message overflow and Discord rejected the send,
   // silently losing the notice after retries. Same whole-message budgeting as report.ts.
   const notes = renderNotes(u.releases, MESSAGE_LIMIT - head.length - last.length - 1);
-  return `${head}${notes}\n${last}`;
+  const msg = `${head}${notes}\n${last}`;
+  // Belt-and-suspenders (mirrors renderPluginsList): the budget keeps this within the cap for any
+  // realistic input; a pathologically long plugin name (head + footer alone > cap) could still
+  // overflow, so hard-cap rather than let Discord reject the send.
+  return msg.length <= MESSAGE_LIMIT ? msg : msg.slice(0, MESSAGE_LIMIT);
 }
 
 /** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
