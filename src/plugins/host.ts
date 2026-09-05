@@ -4,6 +4,7 @@
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
 import { SlashCommandBuilder, type RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
 import { commandNamer } from "../commands";
+import { createKeyedJsonMutator } from "../storage";
 import type {
   HostApi,
   HostStorage,
@@ -292,4 +293,19 @@ export async function writePluginState(opts: {
     now: opts.now(),
   });
   await opts.storage.writeJsonAtomic(statePath(opts.dataDir), state);
+}
+
+// The ONE runtime mutator of state.json. The boot writePluginState above is a single whole-file
+// write ordered before any tick (index.ts sets the "state ready" flag only after it); every
+// subsequent runtime change (#103's notifiedVersion, #104's schedules) goes through this shared
+// keyed mutator, which serializes read-modify-write per path so concurrent ticks can't lose an
+// update. A module singleton so all callers share the one per-path queue.
+const stateMutator = createKeyedJsonMutator<PluginStateFile>();
+
+/** Race-safe read-modify-write of data/plugins/state.json (see stateMutator). */
+export async function mutatePluginState(
+  dataDir: string,
+  mutate: (state: PluginStateFile) => PluginStateFile,
+): Promise<void> {
+  await stateMutator.update(statePath(dataDir), () => ({ ...STATE_FRESH }), mutate, "plugins");
 }

@@ -5,7 +5,7 @@ import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, wr
 import { createClient, CORE_INTENTS } from "./client";
 import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler, announceTo } from "./announce";
+import { startScheduler, announceTo, markPluginStateReady } from "./announce";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
@@ -169,6 +169,10 @@ async function activate(c: Client<true>): Promise<void> {
     // tooling — it must not crash a bot that is otherwise up and serving.
     console.error("[plugins] writing data/plugins/state.json failed", err);
   }
+  // The boot state write is done (or failed and won't retry) — let the plugin-update tick run now
+  // that it can no longer race that whole-file write. Unconditional: never permanently disable
+  // update notices just because one boot write hit a full volume.
+  markPluginStateReady();
 
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own.

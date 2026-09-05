@@ -142,6 +142,31 @@ describe("handleCommand — plugin dispatch (default case)", () => {
   });
 });
 
+describe("handleCommand — /plugins", () => {
+  // config.adminUserIds is empty in this test process (ADMIN_USER_IDS unset), so this exercises the
+  // no-admins-configured refusal — which is exactly the isAdmin gate: drop it and the handler would
+  // deferReply and hit the index/state I/O instead of refusing. The rendered list body is covered by
+  // renderPluginsList's own tests (plugins/updates.test.ts) and the fixture E2E in the deploy check.
+  test("refuses a non-admin before any deferReply / index fetch", async () => {
+    let replied: { content?: string } | undefined;
+    let deferred = false;
+    const interaction = {
+      commandName: "plugins",
+      user: { id: "999" },
+      options: { getSubcommand: () => "list" },
+      reply: async (o: { content?: string }) => {
+        replied = o;
+      },
+      deferReply: async () => {
+        deferred = true;
+      },
+    } as unknown as ChatInputCommandInteraction;
+    await handleCommand(interaction);
+    expect(replied?.content).toContain("set `ADMIN_USER_IDS`");
+    expect(deferred).toBe(false); // gated before any I/O
+  });
+});
+
 describe("buildCommandBody — core-only identity", () => {
   // The framework must not change the core registration body, AND #100's connector removal is pinned
   // here: with no plugins the built body must equal the captured core JSON MINUS the two connector

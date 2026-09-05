@@ -67,6 +67,20 @@
     "type": 1
   },
   {
+    "options": [
+      {
+        "type": 1,
+        "name": "list",
+        "description": "List installed plugins and any available updates",
+        "options": []
+      }
+    ],
+    "name": "plugins",
+    "description": "Installed plugins and available updates (admins only)",
+    "default_member_permissions": "0",
+    "type": 1
+  },
+  {
     "options": [],
     "name": "link",
     "description": "Link the Warbandeer desktop app to your Discord account",

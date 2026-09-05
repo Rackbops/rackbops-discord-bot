@@ -109,6 +109,15 @@ Behavior:
 - If the bot exits to update and comes back on the same build, it says so once in the log and **stops trying** — a misconfigured deploy produces a warning, not a restart loop. `/update` overrides that suppression.
 - Without `GIT_SHA` — or with one the remote has never seen — self-update reports itself disabled rather than guessing, and says which of the two it is.
 
+## Plugin updates
+
+The bot loads plugins named in `PLUGINS=` from a published manifest and **never upgrades one on its own** — your copy changes only when you say so.
+
+- Every 15 minutes (and once at startup) the bot checks the Plugin Index for a newer version of each installed plugin. When it finds one, it **DMs the admins (`ADMIN_USER_IDS`) once**, with the release notes for everything between your installed version and the new one, and the choices: `/plugins update <name>` (now, or `at:` a time), `/plugins remind <name>`, `/plugins skip <name>` — or the admin panel. If DMs are closed it falls back to the announce channel once. Nothing installs, restarts, or moves a version from this notice.
+- A newer version that needs a newer bot is still announced — worded "needs a newer bot" — but isn't offered for install until you update the bot.
+- `/plugins list` (admins only, private reply) shows each installed plugin, any newer version, and whether it's skipped or snoozed.
+- Acting on an update — installing now, scheduling it, snoozing, or skipping — is `/plugins update|remind|skip|cancel` (and the panel's buttons). *(The action side lands in a follow-up; this release is the notifications and `/plugins list`.)*
+
 ## Character linking
 
 `/link` mints a short (10-minute), single-use code. Entered into the Warbandeer desktop app, it
