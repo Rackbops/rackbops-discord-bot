@@ -143,7 +143,8 @@ _Avoid_: plugin list, cache
 - **Realm watch** is the `wow` plugin's now (#107), not the core's: whenever Blizzard creds +
   `WOW_REALM` are configured it polls every 2 min and announces every UP↔DOWN transition. Its
   last-reading dedup lives in the plugin's own `data/wow.json` (seeded once from the legacy
-  `state.json` copy), so the first observation seeds silently and restarts never re-announce.
+  `state.json` copy), so the first observation seeds silently; a restart reuses the stored status, so it never *repeats*
+  an already-announced transition but does announce a real one that occurred while the bot was offline.
   `ops/bot-ops.sh status` reads `wow.json` first, falling back to `state.json`, for the `realmStatus`
   field the panel + `wow-companion` consume.
 - **Release polling** follows the repo's daily release cron (14:00 UTC, `.github/workflows/release.yml`):
@@ -490,15 +491,16 @@ _Avoid_: plugin list, cache
   registry image + Watchtower-style updater). The `attemptedUpdateToSha` marker exists precisely
   because the naive version exit-loops forever against a non-cooperating orchestrator: once the
   bot has exited for a sha and come back unchanged, it warns instead of exiting again.
-- **Staleness is ancestry, not sha equality (#871).** `GIT_SHA` is baked as `git rev-parse HEAD` —
-  the tip the image was built from — which is only occasionally the last commit to touch
-  `apps/warbandeer-discord`, because non-bot commits land on `main` most days. Asking "is my sha
-  *the* newest bot commit" therefore called a correct deploy stale as its **normal** state: one
-  wasted exit-75 per deploy under `AUTO_UPDATE`, and every `/update` (always `force`) overriding
-  the suppression to waste another. `decideUpdate` takes a `ShaRelation` from
-  `fetchShaRelation()` (`GET /compare/{latest}...{running}`) instead: `identical`/`ahead` →
-  `current`, `behind`/`diverged` → `restart`. It's only fetched when the shas differ, so the
-  common path still costs one request.
+- **Staleness is ancestry (containment), not sha equality (#871).** `GIT_SHA` is `git rev-parse HEAD`
+  — the tip the image was built from. `decideUpdate` asks whether that build *contains* the newest
+  `BOT_BRANCH` commit, via a `ShaRelation` from `fetchShaRelation()`
+  (`GET /compare/{latest}...{running}`): `identical`/`ahead` → `current`, `behind`/`diverged` →
+  `restart`, fetched only when the shas differ so the common path still costs one request. Post-fork
+  there is no path filter (the whole repo is the bot — see the Fork-gotchas bullet), so a deploy is
+  `identical` right after a build and `behind` once newer code lands. (#871 originally adopted
+  ancestry for the monorepo era, where the whole-repo HEAD was usually *ahead* of the last
+  bot-subdirectory commit and bare equality wrongly flagged a correct deploy stale — a divergence
+  that no longer arises now that every commit is a bot commit.)
 - **`BOT_BRANCH` is queried through the GitHub API, so it must exist on the remote.** A deploy
   running a local-only branch (e.g. an unpushed integration branch that merges several PRs) can't
   point at it. The *running sha* being unpushed is handled, though: the compare 404s, which is its

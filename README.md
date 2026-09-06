@@ -57,7 +57,7 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
 
 It works by **starting the replacement before retiring the original**, which is what makes it safe:
 
-1. **Build.** The bot builds a new image through the Docker daemon. It's fully alive for this, so a build failure is reported straight back to you and nothing else happens.
+1. **Build.** The bot builds a new image through the Docker daemon. Its Discord connection stays up, so a build failure is reported straight back to you and nothing is torn down — but the scheduler is paused for the whole build (no release or plugin announcements until the swap completes or is abandoned), and the build itself isn't time-bounded, so a wedged build pauses announcements until someone notices.
 2. **Start alongside.** It creates a second container on the new image. Created by the daemon, that container is a sibling — nothing about its lifetime is tied to the bot's.
 3. **Verify.** The new instance has to complete a Discord gateway login to count as working. Until it does it stays in standby: connected, but answering nothing.
 4. **Retire.** The verified new instance stops and removes the old container, takes its name, and goes active.
@@ -86,17 +86,17 @@ If you don't want any of this, remove the socket mount — the bot detects its a
 
 Behavior:
 
-- Staleness is "my build doesn't **contain** the newest commit on `BOT_BRANCH` (default `main`) touching `apps/warbandeer-discord`", checked at startup and every 15 minutes when `AUTO_UPDATE=true`, and on demand via `/update`.
-- It's a containment question, not an equality one, because `GIT_SHA` is the tip you built from and non-bot commits land on `main` most days — so the sha you built is usually *newer* than the last bot-touching commit, not equal to it. When the two differ the bot asks GitHub's compare endpoint how they relate: if your build is `ahead` of (or identical to) the newest bot commit it's **current**; only `behind` or a diverged side branch counts as stale.
+- Staleness is "my build doesn't **contain** the newest commit on `BOT_BRANCH` (default `main`)", checked at startup and every 15 minutes when `AUTO_UPDATE=true`, and on demand via `/update`. (The whole repo is the bot — there's no subdirectory path filter.)
+- It's a containment question, not an equality one: right after a deploy your `GIT_SHA` is `identical` to the newest commit, and once newer code lands your build is `behind` it. When the two differ the bot asks GitHub's compare endpoint how they relate: if your build **contains** the newest commit (`identical`, or `ahead` — a build also carrying commits the compared sha lacks) it's **current**; only `behind` (newer code has landed) or a diverged side branch counts as stale.
 - `BOT_BRANCH` must name a branch that exists on `GITHUB_REPO` — it's queried through the GitHub API, so a branch that only exists on your machine can't be used. Point a staging deploy at its own pushed branch.
 - A deploy running **unpushed** commits is recognised rather than mishandled: the compare comes back 404, and self-update reports itself **disabled naming the sha** instead of offering an update it could never deliver. You no longer need to build without `GIT_SHA` to get sane behaviour there.
 - If the compare call fails (GitHub down, rate limited), the check falls back to treating a sha mismatch as stale — the pre-existing behaviour — rather than failing startup.
 - The overlap is silent. Both containers hold the same `DISCORD_TOKEN`, and Discord delivers every event to both sessions, so the standby registers no commands, no handlers and no scheduler until it has taken over. You won't see doubled replies or doubled announcements.
 - The two containers never write `data/state.json` at once: the original stops its scheduler before the replacement starts, and the handoff signal is a separate file with one writer.
 - Each build is also tagged with its short sha, and the newest three are kept — so the previous build stays on disk and addressable if you ever need to pin back to it.
-- A swap never lands mid-announcement: it waits for the in-flight tick and its `data/state.json` write to finish.
+- The swap won't land mid-`data/state.json` write: at handoff the original quiesces its scheduler — no new tick or state write starts — and the replacement doesn't read state until after the whole build, by which point any tick that was already running has finished. (It isn't an explicit wait on the in-flight tick; it leans on the build taking far longer than a tick.)
 - A second `/update` while a swap is in flight is **refused**, not queued — it would otherwise tear down the in-flight replacement.
-- Every wait has an end: if a replacement verifies but then never manages to retire the original (daemon trouble mid-swap), the original reclaims after 3 minutes and reports, rather than sitting quiesced until someone notices.
+- The retirement wait has an end: if a replacement verifies but then never manages to retire the original (daemon trouble mid-swap), the original reclaims after 3 minutes and reports, rather than sitting quiesced until someone notices. (The build step ahead of it is not yet time-bounded — see the Build note above.)
 - Without the daemon socket the bot exits with code **75** instead (distinct from a crash, so a supervisor can tell an update apart from a failure).
 - **Once it's back up, it messages whoever ran `/update`** with the build it actually came back on, and which of three things happened:
   - ✅ **updated** — came back on the build it was picking up.
@@ -202,7 +202,7 @@ settings in the dashboard.
 
 - Announcement state persists in `data/state.json`, so restarts never repeat an announcement.
 - Each watched repo's first release poll seeds silently (no backlog spam); only releases published after that are announced, and each repo tracks what it's seen independently.
-- The wow plugin's realm-status watch runs continuously (whenever `WOW_REALM` + Blizzard credentials are set), polling every 2 minutes and announcing each up/down transition once. The first reading after a start seeds silently, so a fresh install or restart never posts a phantom up/down. Its dedup state lives in the plugin's own `data/wow.json`.
+- The wow plugin's realm-status watch runs continuously (whenever `WOW_REALM` + Blizzard credentials are set), polling every 2 minutes and announcing each up/down transition once. The **first-ever** reading seeds silently — a fresh install, or an instance with no stored status, never posts a phantom up/down — but after that the status is persisted, so a genuine transition that happened while the bot was offline is announced on its next reading (a real, if late, transition, not a phantom). Its dedup state lives in the plugin's own `data/wow.json`.
 - Releases publish from a daily cron at 14:00 UTC, so GitHub is only polled in a 90-minute window after that (every 5 minutes), plus once at startup to catch anything published while the bot was offline.
 - `COMMAND_PREFIX` lets a second (debug) instance run in the same server: it prefixes every slash-command name (e.g. `r_` → `/r_status`). A second instance needs its own Discord application/token and its own state volume.
 - A filed `/report` is **public in the channel it was filed from** — that's the point of it, so the channel knows what's been raised, but it does mean a report is visible to everyone who can see that channel. `/report` stays role-gated via `REPORT_ROLE_ID`. Only the outcome is public: being refused for a missing role, or for an unconfigured bot, is still shown to you alone. Mentions in a report never ping — an `@everyone` typed into the form renders as text. A description too long for Discord's 2000-character message limit is truncated with a note, and the issue itself always has the full text.
