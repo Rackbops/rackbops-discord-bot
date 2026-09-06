@@ -60,6 +60,17 @@ export interface PluginIndexEntry {
   /** Bare slash-command names the bundle contributes; uniqueness (core + every enabled plugin) is checked BEFORE any code loads. */
   commands: string[];
   env: PluginEnvKey[];
+  /** jsDelivr-npm URL of the plugin's admin bundle (`dist/admin.js`), DERIVED by the plugins repo's
+   *  `generate-index` when a plugin advertises admin support (by declaring `botPlugin.adminApiVersion`).
+   *  Absent = the plugin contributes no admin UI. The admin panel fetches it and serves it same-origin
+   *  under its own tab; see the admin contract (a SEPARATE module from this file). */
+  adminUrl?: string;
+  /** The `ADMIN_API_VERSION` the plugin's admin bundle was built against; the panel mounts the bundle
+   *  only when this equals the panel's own `ADMIN_API_VERSION`, else it shows a version-mismatch note.
+   *  Absent = no admin bundle. The admin contract (`AdminApi`/`mountAdmin`/`ADMIN_API_VERSION`) lives
+   *  in its own module (browser/DOM-typed) so this file can stay the single-const, side-effect-free
+   *  module read at boot before the Client exists. */
+  adminApiVersion?: number;
   /** Latest first, at most 10. */
   releases: PluginRelease[];
 }
