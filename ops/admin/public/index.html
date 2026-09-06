@@ -144,6 +144,9 @@
   .plugin-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .plugin-row:last-child { border-bottom: none; }
   .plugin-row input[type="checkbox"] { width: auto; margin-top: 3px; flex: none; }
+  .plugin-admin-tab { padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .plugin-admin-tab:last-child { border-bottom: none; }
+  .plugin-admin-tab h3 { margin: 0 0 8px; font-size: 13px; }
   .plugin-info { flex: 1; min-width: 0; }
   .plugin-name { font-weight: 600; word-break: break-all; }
   .plugin-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
@@ -239,6 +242,15 @@
       <button id="save-plugins">Save changes</button>
     </div>
     <div id="plugins-msg" class="msg"></div>
+  </section>
+
+  <section id="plugin-admin-section" hidden>
+    <h2>Plugin Settings</h2>
+    <p style="color: var(--muted); margin: 0 0 10px">
+      Settings contributed by installed plugins. Each plugin renders its own controls here; changes go
+      through the same guarded save (and bot recreate) as the config above, scoped to that plugin's own keys.
+    </p>
+    <div id="plugin-admin-list"></div>
   </section>
 
   <section id="admins-section">
@@ -489,6 +501,9 @@
     try {
       const data = await (await api("/api/plugins")).json();
       pluginsData = data;
+      // #124: render each installed plugin's own admin tab from the same response (independent of the
+      // add/remove list below, and of a stateError — env editing still works when state is unreadable).
+      renderPluginAdmin(data);
       // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy —
       // disable Save so a change can't be planned against a false-empty selection and wipe it.
       const saveBtn = document.getElementById("save-plugins");
@@ -523,6 +538,135 @@
       container.appendChild(note);
     } catch (e) {
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    }
+  }
+
+  // ---- #124: per-plugin admin tabs -------------------------------------------------------------
+  // PLUGIN_ADMIN_HELPERS:begin
+  // Pure helpers for the admin tabs, lifted so ops/admin/server.test.ts can pin them.
+  // scopeToPluginKeys filters a tab's env reads/writes to its OWN plugin's declared keys — the guard
+  // against an HONEST bundle touching another key. It is NOT a sandbox: the bundle runs same-origin
+  // inline (per #123's first-party posture), so a malicious one bypasses it; the real backstop is the
+  // server (bot-ops env-set validates every key against its ALLOWED set, and secrets are always
+  // refused). adminTabState decides the render mode; buildSetEnvBody builds the guarded-save payload
+  // (scoped + newline-safe); viewToState maps a /api/plugins row to the AdminApi getState shape.
+  function scopeToPluginKeys(obj, envKeys) {
+    const keys = new Set(envKeys || []);
+    const out = {};
+    for (const k of Object.keys(obj || {})) if (keys.has(k)) out[k] = obj[k];
+    return out;
+  }
+  function adminTabState(plugin, panelAdminApiVersion) {
+    if (!plugin || typeof plugin.adminUrl !== "string" || !plugin.enabled) return { kind: "none" };
+    if (plugin.adminApiVersion !== panelAdminApiVersion) {
+      return { kind: "mismatch", declared: plugin.adminApiVersion, panel: panelAdminApiVersion };
+    }
+    return { kind: "mount" };
+  }
+  function buildSetEnvBody(changes, envKeys) {
+    const scoped = scopeToPluginKeys(changes, envKeys);
+    const keys = Object.keys(scoped);
+    for (const k of keys) {
+      // Refuse a newline in a value — "8080\nANNOUNCE_CHANNEL_ID=1" would smuggle a second env-set line
+      // past the key scope (bot-ops reads stdin line by line). Env values are single-line by nature.
+      if (/[\r\n]/.test(String(scoped[k]))) return { error: "value for " + k + " must not contain a newline" };
+    }
+    return { body: keys.map((k) => k + "=" + scoped[k]).join("\n") };
+  }
+  function viewToState(p) {
+    if (!p) return null;
+    // Map the panel's merged view row to the PluginStateEntry shape the AdminApi contract documents.
+    // The view calls the index's current version `latestVersion`; the state field is `availableVersion`
+    // and is present only when it's newer than what's installed.
+    return {
+      name: p.name, enabled: p.enabled, installedVersion: p.installedVersion,
+      availableVersion: (p.latestVersion && p.latestVersion !== p.installedVersion) ? p.latestVersion : undefined,
+      configured: p.configured, missingEnv: p.missingEnv, active: p.active, error: p.error,
+      skippedVersion: p.skippedVersion, remindAt: p.remindAt, scheduled: p.scheduled,
+    };
+  }
+  // PLUGIN_ADMIN_HELPERS:end
+
+  // The AdminApi bridge handed to a plugin's mountAdmin — the panel-side analog of the bot's HostApi.
+  // The plugin owns its UI; the panel keeps authority: setEnv is scoped to the plugin's keys and goes
+  // through the same guarded POST /api/env (auth + bot-ops validation + recreate) a manual edit uses.
+  function makeAdminApi(plugin) {
+    return {
+      meta: { name: plugin.name, version: plugin.installedVersion || plugin.latestVersion || "", adminApiVersion: plugin.adminApiVersion },
+      async getEnv() {
+        const env = await (await api("/api/env")).json();
+        return scopeToPluginKeys(env, plugin.envKeys);
+      },
+      async setEnv(changes) {
+        const plan = buildSetEnvBody(changes, plugin.envKeys);
+        if (plan.error) return { ok: false, error: plan.error };
+        if (!plan.body) return { ok: true }; // nothing in-scope to change
+        const res = await api("/api/env", { method: "POST", body: plan.body });
+        let j = {};
+        try { j = await res.json(); } catch (e) {}
+        if (res.ok && j.ok !== false) return { ok: true };
+        return { ok: false, error: (j && j.log) || ("save failed (" + res.status + ")") };
+      },
+      async getState() {
+        const data = await (await api("/api/plugins")).json();
+        return viewToState((data.plugins || []).find((p) => p.name === plugin.name) || null);
+      },
+      proxyFetch(path) {
+        return api("/api/plugin-proxy/" + encodeURIComponent(plugin.name) + "?path=" + encodeURIComponent(path));
+      },
+    };
+  }
+
+  // Cleanup fns from the tabs the last render mounted — called before a re-render replaces them. The
+  // render generation counter guards the async-import race: a mount whose import resolves after a newer
+  // render started is dropped (its root is already detached), so no stale cleanup or double-mount leaks.
+  let mountedAdminCleanups = [];
+  let adminRenderGen = 0;
+  function renderPluginAdmin(data) {
+    const gen = ++adminRenderGen;
+    for (const cleanup of mountedAdminCleanups) { try { cleanup(); } catch (e) {} }
+    mountedAdminCleanups = [];
+    const section = document.getElementById("plugin-admin-section");
+    const list = document.getElementById("plugin-admin-list");
+    if (!section || !list) return;
+    list.innerHTML = "";
+    const panelVer = data && data.adminApiVersion;
+    const tabs = ((data && data.plugins) || []).filter((p) => adminTabState(p, panelVer).kind !== "none");
+    section.hidden = tabs.length === 0;
+    for (const p of tabs) {
+      const state = adminTabState(p, panelVer);
+      const wrap = document.createElement("div");
+      wrap.className = "plugin-admin-tab";
+      const h = document.createElement("h3");
+      h.textContent = p.name;
+      wrap.appendChild(h);
+      if (state.kind === "mismatch") {
+        const note = document.createElement("div");
+        note.className = "field-hint";
+        note.textContent = "This plugin's settings target admin API v" + state.declared + ", but this panel is v" + state.panel + " — they can't be shown until the versions match.";
+        wrap.appendChild(note);
+      } else {
+        const root = document.createElement("div");
+        root.id = "plugin-admin-root-" + p.name;
+        wrap.appendChild(root);
+        mountPluginAdmin(p, root, gen);
+      }
+      list.appendChild(wrap);
+    }
+  }
+
+  // Dynamically import the plugin's own admin bundle (served same-origin from /plugin-admin/<name>.js)
+  // and mount it. Fully isolated: an import failure or a throwing mountAdmin shows a note in that tab,
+  // never breaking the rest of the panel. `gen` drops a mount a newer render has already superseded.
+  async function mountPluginAdmin(plugin, root, gen) {
+    try {
+      const mod = await import("/plugin-admin/" + encodeURIComponent(plugin.name) + ".js");
+      if (gen !== adminRenderGen) return; // a newer render superseded this one — drop the stale mount
+      if (!mod || typeof mod.mountAdmin !== "function") throw new Error("bundle has no mountAdmin export");
+      const cleanup = mod.mountAdmin(root, makeAdminApi(plugin));
+      if (typeof cleanup === "function") mountedAdminCleanups.push(cleanup);
+    } catch (e) {
+      if (gen === adminRenderGen) root.textContent = "Couldn't load this plugin's settings: " + (e && e.message ? e.message : e);
     }
   }
 

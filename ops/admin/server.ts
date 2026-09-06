@@ -6,6 +6,7 @@
 // token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
+import { ADMIN_API_VERSION } from "./admin-contract";
 
 /** Constant-time compare — a length mismatch is an immediate, safe `false` (no byte scan). */
 export function tokensMatch(provided: string, expected: string): boolean {
@@ -450,6 +451,11 @@ export const DEFAULT_PLUGIN_INDEX_URL = "https://raw.githubusercontent.com/Rackb
  *  (the bot itself enforces compatibility); a test pins it against contract.ts. */
 export const HOST_API_VERSION = 1;
 
+// ADMIN_API_VERSION (+ the AdminApi/SaveResult types) is vendored in ./admin-contract — a copy of the
+// plugins repo's packages/api/admin.ts. Re-exported so the routes, the merge, and the tests all read
+// one source. Drift is safe-fail and caught by #125 (see admin-contract.ts) — not a same-repo pin.
+export { ADMIN_API_VERSION };
+
 export interface PluginRelease {
   version: string;
   publishedAt: string;
@@ -464,6 +470,15 @@ export interface PluginIndexEntry {
   commands?: string[];
   releases?: PluginRelease[];
   hostApiVersion?: number;
+  /** #124: the plugin's declared env keys (from the manifest `env` block) — the panel uses the KEY
+   *  names to scope an admin tab's env reads/writes to this plugin's own keys. */
+  env?: { key: string; secret?: boolean }[];
+  /** #124: a jsDelivr URL of the plugin's admin bundle (`dist/admin.js`), present only when the
+   *  plugin ships an admin tab. Derived by the plugins repo's generate-index; the panel fetches it
+   *  (host-allowlisted, size-capped) and serves it same-origin. */
+  adminUrl?: string;
+  /** #124: the ADMIN_API_VERSION the admin bundle targets; the panel mounts it only on a match. */
+  adminApiVersion?: number;
 }
 export interface PluginIndex {
   schemaVersion: number;
@@ -513,9 +528,21 @@ export interface PluginView {
   compatible: boolean;
   /** The host API the index entry declares, surfaced only when it exceeds the bot's (the note text). */
   neededHostApi?: number;
+  /** #124: this plugin's admin-tab bundle URL, present only when it ships one (the panel imports it
+   *  same-origin via /plugin-admin/<name>.js and mounts it). Absent = no admin tab. */
+  adminUrl?: string;
+  /** #124: the ADMIN_API_VERSION the admin bundle targets — the panel compares it to its own
+   *  `PluginsView.adminApiVersion` to mount vs. show a version-mismatch note. */
+  adminApiVersion?: number;
+  /** #124: this plugin's declared env KEY names (from the manifest) — the admin bridge scopes the
+   *  tab's env reads/writes to exactly these, so a tab can only ever touch its own plugin's keys. */
+  envKeys: string[];
 }
 export interface PluginsView {
   plugins: PluginView[];
+  /** #124: the PANEL's own `ADMIN_API_VERSION`, so the client compares each plugin's declared
+   *  `adminApiVersion` against one authoritative value (kept server-side) rather than a second mirror. */
+  adminApiVersion: number;
   /** The instance's raw `PLUGINS=` value, verbatim — the panel's Save diffs against it and reuses
    *  any `name@version` pin it holds, so the merge stays the sole reader of the env value. */
   pluginsValue: string;
@@ -618,11 +645,162 @@ export function mergePluginsView(
       scheduled: st?.scheduled,
       compatible,
       ...(!compatible && typeof entry?.hostApiVersion === "number" ? { neededHostApi: entry.hostApiVersion } : {}),
+      // #124: the plugin's declared env key names (for the admin bridge's own-keys-only scoping), plus
+      // its admin-bundle URL + version when it ships an admin tab. env is untrusted manifest JSON, so
+      // guard each element before reading `.key`.
+      envKeys: (entry?.env ?? [])
+        .filter((e): e is { key: string } => !!e && typeof (e as { key?: unknown }).key === "string")
+        .map((e) => e.key),
+      ...(typeof entry?.adminUrl === "string" ? { adminUrl: entry.adminUrl } : {}),
+      ...(typeof entry?.adminApiVersion === "number" ? { adminApiVersion: entry.adminApiVersion } : {}),
     };
   });
   return index === null
-    ? { plugins, pluginsValue, indexError: "the Plugin Index couldn't be fetched" }
-    : { plugins, pluginsValue };
+    ? { plugins, pluginsValue, adminApiVersion: ADMIN_API_VERSION, indexError: "the Plugin Index couldn't be fetched" }
+    : { plugins, pluginsValue, adminApiVersion: ADMIN_API_VERSION };
+}
+
+// ---- #124: admin-tab delivery (bundle + data-asset proxy) -------------------------------------
+
+/** The ONLY host a plugin's admin bundle / data asset may come from — the plugins' published npm
+ *  package on this CDN. Both delivery routes resolve to it and nothing else, so a manifest `adminUrl`
+ *  pointing elsewhere is refused and a bundle can never make the panel fetch an arbitrary origin. */
+export const ADMIN_ASSET_HOST = "cdn.jsdelivr.net";
+/** Cap on a fetched admin bundle / proxied asset. A plugin's admin.js is a few KB; this bounds a
+ *  broken or hostile source from streaming an unbounded body into the panel. */
+export const ADMIN_ASSET_MAX_BYTES = 512 * 1024;
+
+/** The result of fetching an admin asset — injected (`HandlerConfig.fetchAdminAsset`) so the delivery
+ *  routes test without a real network call, and so the size cap is enforced at the I/O edge. */
+export interface AdminAssetResult {
+  ok: boolean;
+  status: number;
+  contentType: string;
+  body: string;
+  /** Set when `ok` is false — a human reason (upstream status, too large, fetch error). */
+  error?: string;
+}
+
+/** Resolve `name` to its admin-bundle URL from the index, or null when it declares none, isn't in the
+ *  index, or the URL isn't on the allowlisted host. Pure over the parsed index (no I/O), so the
+ *  allowlist gate is unit-tested directly. */
+export function resolveAdminBundleUrl(index: PluginIndex | null, name: string): string | null {
+  const entry = index?.plugins.find((e) => e.name === name);
+  if (!entry || typeof entry.adminUrl !== "string") return null;
+  // Only resolve a bundle the panel would actually mount: it must target THIS panel's
+  // ADMIN_API_VERSION (a server-side version gate — the client gates too, but don't fetch/serve an
+  // incompatible bundle), and its URL must be https on the allowlisted host (never http, never an
+  // arbitrary origin — see the @/subdomain/userinfo cases the host check rejects).
+  if (entry.adminApiVersion !== ADMIN_API_VERSION) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(entry.adminUrl);
+  } catch {
+    return null;
+  }
+  return parsed.protocol === "https:" && parsed.host === ADMIN_ASSET_HOST ? entry.adminUrl : null;
+}
+
+/** Resolve a plugin-relative asset `path` to a URL inside THAT plugin's own published npm package on
+ *  the CDN — never an arbitrary URL. Returns null on a missing plugin/package or an unsafe path: a
+ *  scheme (`http:`/`data:`/…), a leading slash or any backslash, an empty/`.`/`..` segment. Pure, so
+ *  the traversal/SSRF gate is unit-tested directly. */
+export function resolvePluginProxyUrl(index: PluginIndex | null, name: string, path: string): string | null {
+  const entry = index?.plugins.find((e) => e.name === name);
+  if (!entry || typeof entry.package !== "string" || !entry.package) return null;
+  // A data-asset path is a plain relative path: no scheme, no leading slash/backslash, no backslash,
+  // and NO `%` — a percent-encoded `..`/`/` (e.g. `%2e%2e`) sneaks past the literal-segment check
+  // below and is then normalized by the URL parser inside fetch, escaping the package prefix (even
+  // reaching jsDelivr's /gh/ endpoint). Reject `%` outright, then re-check the literal segments.
+  if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || /^[/\\]/.test(path) || path.includes("\\") || path.includes("%")) return null;
+  const segments = path.split("/");
+  if (segments.some((s) => s === "" || s === "." || s === "..")) return null;
+  const prefix = `https://${ADMIN_ASSET_HOST}/npm/${entry.package}@${entry.version}/`;
+  const resolved = `${prefix}${segments.join("/")}`;
+  // Defense in depth: after WHATWG normalization the URL must still be same-origin AND under this
+  // plugin's own package prefix — catches any encoded/normalization escape the checks above missed.
+  let u: URL;
+  try {
+    u = new URL(resolved);
+  } catch {
+    return null;
+  }
+  if (u.origin !== `https://${ADMIN_ASSET_HOST}` || !u.href.startsWith(prefix)) return null;
+  return resolved;
+}
+
+/** `GET /plugin-admin/<name>.js` — serve a plugin's admin bundle SAME-ORIGIN. Public at this layer
+ *  like the page itself (Access already gated reaching the panel, and the bundle is public CDN
+ *  content); the server fetches it from the allowlisted host, size-capped, so the browser never
+ *  reaches cross-origin for plugin code. 404 when the plugin ships no admin bundle. */
+export async function serveAdminBundle(pathname: string, config: HandlerConfig): Promise<Response> {
+  const m = /^\/plugin-admin\/([a-z][a-z0-9-]*)\.js$/.exec(pathname);
+  if (!m) return new Response("not found", { status: 404 });
+  const name = m[1]!;
+  if (!config.listPluginIndex || !config.fetchAdminAsset) return new Response("not found", { status: 404 });
+  const bundleUrl = resolveAdminBundleUrl(await config.listPluginIndex(), name);
+  if (!bundleUrl) return new Response("not found", { status: 404 });
+  const asset = await config.fetchAdminAsset(bundleUrl);
+  if (!asset.ok) {
+    console.error(`[admin] admin bundle "${name}" unavailable: ${asset.error ?? asset.status}`);
+    return new Response("admin bundle unavailable", { status: 502 });
+  }
+  // Always served as JS regardless of what the CDN labelled it (we fetched exactly the manifest's
+  // adminUrl); the browser caches it, so no server-side cache is needed.
+  return new Response(asset.body, {
+    headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=300" },
+  });
+}
+
+/** `GET /api/plugin-proxy/<name>?path=<rel>` — the admin bridge's `proxyFetch`: GET a data asset from
+ *  THIS plugin's own published package (e.g. a realm list), scoped by `resolvePluginProxyUrl` so a
+ *  bundle can only reach its own files. Authenticated (an /api/ route). */
+export async function servePluginProxy(url: URL, config: HandlerConfig): Promise<Response> {
+  const m = /^\/api\/plugin-proxy\/([a-z][a-z0-9-]*)$/.exec(url.pathname);
+  if (!m) return new Response("not found", { status: 404 });
+  if (!config.listPluginIndex || !config.fetchAdminAsset) return new Response("not found", { status: 404 });
+  const assetUrl = resolvePluginProxyUrl(await config.listPluginIndex(), m[1]!, url.searchParams.get("path") ?? "");
+  if (!assetUrl) return new Response("bad asset path", { status: 400 });
+  const asset = await config.fetchAdminAsset(assetUrl);
+  if (!asset.ok) return new Response("asset unavailable", { status: 502 });
+  return new Response(asset.body, {
+    headers: { "Content-Type": asset.contentType || "application/octet-stream", "Cache-Control": "public, max-age=300" },
+  });
+}
+
+/** The minimal `Response` shape the asset fetcher needs — so a test can pass a fake without a real
+ *  network, and the byte-cap logic is exercised directly. `fetch`'s `Response` satisfies it. */
+interface AssetResponse {
+  ok: boolean;
+  status: number;
+  headers: { get(name: string): string | null };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+/** Builds the injected `fetchAdminAsset`: fetch `url`, reject early on a too-large Content-Length (so a
+ *  hostile length can't make us buffer gigabytes), then read bytes with a hard cap and a 5 s abort.
+ *  fetch-injected + exported so the size cap is unit-tested; `import.meta.main` passes the real fetch. */
+export function makeAdminAssetFetcher(
+  fetchImpl: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<AssetResponse>,
+  maxBytes = ADMIN_ASSET_MAX_BYTES,
+): (url: string) => Promise<AdminAssetResult> {
+  return async (assetUrl) => {
+    try {
+      const res = await fetchImpl(assetUrl, { headers: { "User-Agent": "rackbops-admin-panel" }, signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return { ok: false, status: res.status, contentType: "", body: "", error: `upstream ${res.status}` };
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        return { ok: false, status: 502, contentType: "", body: "", error: `asset exceeds ${maxBytes} bytes (content-length)` };
+      }
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength > maxBytes) {
+        return { ok: false, status: 502, contentType: "", body: "", error: `asset exceeds ${maxBytes} bytes` };
+      }
+      return { ok: true, status: 200, contentType: res.headers.get("content-type") ?? "", body: new TextDecoder().decode(buf) };
+    } catch (err) {
+      return { ok: false, status: 502, contentType: "", body: "", error: String(err) };
+    }
+  };
 }
 
 /** The five request actions the panel can POST — a subset of the bot's PluginRequest union
@@ -744,6 +922,9 @@ export interface HandlerConfig {
    * so /api/plugins tests without a real fetch; absent when no config dir is set, in which case the
    * route returns an indexError and the view shows installed plugins only. */
   listPluginIndex?: () => Promise<PluginIndex | null>;
+  /** #124: fetches a plugin's admin bundle / data asset (size-capped) for the delivery routes.
+   *  Injected so those routes test without a real network call; absent → the routes 404. */
+  fetchAdminAsset?: (url: string) => Promise<AdminAssetResult>;
   /** Injected so request-handling logic tests without spawning a real subprocess. */
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>;
   /** Absent (not a stub that always fails) when Access isn't configured for this instance — the
@@ -1013,6 +1194,12 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     return new Response(config.realmsJson, { headers: { "Content-Type": "application/json; charset=utf-8" } });
   }
 
+  // #124: a plugin's admin bundle, served same-origin (public at this layer like the page + realms,
+  // Access already gated getting here). Before the /api/ gate; a GET, so isCrossSiteWrite never applies.
+  if (req.method === "GET" && url.pathname.startsWith("/plugin-admin/")) {
+    return serveAdminBundle(url.pathname, config);
+  }
+
   if (!url.pathname.startsWith("/api/")) {
     return new Response("not found", { status: 404 });
   }
@@ -1086,6 +1273,12 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
       view.stateError = "the bot's current state couldn't be read";
     }
     return jsonResponse(view);
+  }
+
+  // #124: the admin bridge's proxyFetch — GET a data asset from a plugin's own published package,
+  // scoped by resolvePluginProxyUrl (no arbitrary URL). Authenticated like every /api/* route.
+  if (req.method === "GET" && url.pathname.startsWith("/api/plugin-proxy/")) {
+    return servePluginProxy(url, config);
   }
 
   // A Modify Plugins action button (Update now / Schedule / Remind / Skip / Cancel) → one request file
@@ -1326,7 +1519,13 @@ if (import.meta.main) {
       })
     : undefined;
 
-  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, listPluginIndex, runBotOps, verifyAccessJwt, adminStore };
+  // #124: fetch a plugin's admin bundle / data asset from the allowlisted CDN, size-capped. The cap +
+  // early Content-Length reject live in makeAdminAssetFetcher (tested); this just supplies the real
+  // fetch. Stateless — the delivery routes still 404 without listPluginIndex to resolve a name, and
+  // resolveAdminBundleUrl / resolvePluginProxyUrl already constrained the host + path.
+  const fetchAdminAsset = makeAdminAssetFetcher(fetch);
+
+  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore };
   // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
   // restart/env-set request out from under the client while bot-ops.sh is still legitimately
   // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.

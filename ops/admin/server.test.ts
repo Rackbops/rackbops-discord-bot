@@ -29,6 +29,14 @@ import {
   isEmailAllowed,
   logDynamicAdminsStartup,
   mergePluginsView,
+  ADMIN_API_VERSION,
+  ADMIN_ASSET_HOST,
+  ADMIN_ASSET_MAX_BYTES,
+  resolveAdminBundleUrl,
+  resolvePluginProxyUrl,
+  serveAdminBundle,
+  servePluginProxy,
+  makeAdminAssetFetcher,
   normalizeAdminEmail,
   normalizeTeamDomain,
   parseAllowedEmails,
@@ -44,6 +52,7 @@ import {
   type Authorization,
   type BotOpsInvocation,
   type BotOpsResult,
+  type AdminAssetResult,
   type HandlerConfig,
   type PluginIndex,
   type PluginsView,
@@ -2336,6 +2345,315 @@ describe("mergePluginsView (#102)", () => {
     expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
     expect(view.plugins[0]!.inIndex).toBe(false);
     expect(view.pluginsValue).toBe("warbandeer");
+  });
+});
+
+// #124 — the admin-tab delivery surface: the merge's admin passthrough, the pure URL resolvers
+// (allowlist + traversal gate), and the two delivery routes over a fake fetcher.
+describe("mergePluginsView surfaces #124 admin fields", () => {
+  const idx = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
+    schemaVersion: 1,
+    plugins: [{ name: "warbandeer", version: "1.1.0", description: "d", ...over }],
+  });
+
+  test("top-level adminApiVersion is the panel's ADMIN_API_VERSION (index present OR null)", () => {
+    expect(mergePluginsView(idx(), [], "warbandeer").adminApiVersion).toBe(ADMIN_API_VERSION);
+    expect(mergePluginsView(null, [], "").adminApiVersion).toBe(ADMIN_API_VERSION);
+  });
+
+  test("carries adminUrl + adminApiVersion + envKeys from the manifest entry", () => {
+    const wb = mergePluginsView(
+      idx({
+        adminUrl: "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+        adminApiVersion: 1,
+        env: [{ key: "WARBANDEER_INGEST_PORT", secret: false }, { key: "WB_SECRET", secret: true }],
+      }),
+      [],
+      "warbandeer",
+    ).plugins[0]!;
+    // Dropping any of these passthroughs (the mutation) means the panel can't render/mount the tab.
+    expect(wb.adminUrl).toBe("https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js");
+    expect(wb.adminApiVersion).toBe(1);
+    expect(wb.envKeys).toEqual(["WARBANDEER_INGEST_PORT", "WB_SECRET"]);
+  });
+
+  test("a plugin with no admin bundle omits adminUrl/adminApiVersion and has empty envKeys", () => {
+    const wb = mergePluginsView(idx(), [], "warbandeer").plugins[0]!;
+    expect("adminUrl" in wb).toBe(false);
+    expect("adminApiVersion" in wb).toBe(false);
+    expect(wb.envKeys).toEqual([]);
+  });
+
+  test("a malformed env array element is dropped rather than crashing the merge", () => {
+    const malformed = {
+      schemaVersion: 1,
+      plugins: [{ name: "warbandeer", version: "1.1.0", env: [{ key: "OK" }, null, { notKey: "x" }, { key: 5 }] }],
+    } as unknown as PluginIndex;
+    expect(mergePluginsView(malformed, [], "warbandeer").plugins[0]!.envKeys).toEqual(["OK"]);
+  });
+});
+
+describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => {
+  const entry = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
+    schemaVersion: 1,
+    plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: ADMIN_API_VERSION, ...over }],
+  });
+  const withAdmin = (adminUrl: string) => entry({ adminUrl });
+
+  test("returns the URL for an allowlisted https host + matching adminApiVersion", () => {
+    const u = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
+    expect(resolveAdminBundleUrl(withAdmin(u), "warbandeer")).toBe(u);
+  });
+  test("null when the host is not allowlisted — incl. @-userinfo and subdomain-suffix tricks", () => {
+    // Mutation: dropping the host check lets the panel fetch an attacker-chosen origin.
+    expect(resolveAdminBundleUrl(withAdmin("https://evil.example.com/admin.js"), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net@evil.example.com/x.js"), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net.evil.example.com/x.js"), "warbandeer")).toBeNull();
+  });
+  test("null for a non-https scheme even on the allowlisted host", () => {
+    // Mutation: dropping the https pin serves plugin code over http.
+    expect(resolveAdminBundleUrl(withAdmin("http://cdn.jsdelivr.net/x.js"), "warbandeer")).toBeNull();
+  });
+  test("null when adminApiVersion doesn't match the panel's (server-side version gate)", () => {
+    const u = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
+    // Mutation: dropping the version gate serves/mounts an incompatible bundle.
+    expect(resolveAdminBundleUrl(entry({ adminUrl: u, adminApiVersion: ADMIN_API_VERSION + 1 }), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(entry({ adminUrl: u }), "warbandeer")).toBe(u); // matching version → served
+  });
+  test("null when the plugin has no adminUrl, isn't in the index, or the index is null", () => {
+    expect(resolveAdminBundleUrl(entry(), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/x.js"), "nope")).toBeNull();
+    expect(resolveAdminBundleUrl(null, "warbandeer")).toBeNull();
+  });
+  test("the host allowlist + size cap are the expected constants", () => {
+    expect(ADMIN_ASSET_HOST).toBe("cdn.jsdelivr.net");
+    expect(ADMIN_ASSET_MAX_BYTES).toBe(512 * 1024);
+  });
+});
+
+describe("resolvePluginProxyUrl (#124 traversal/SSRF gate)", () => {
+  const idx: PluginIndex = {
+    schemaVersion: 1,
+    plugins: [{ name: "wow", version: "1.2.3", package: "@rackbops/plugin-wow" }],
+  };
+  test("resolves a safe relative path inside the plugin's own package", () => {
+    expect(resolvePluginProxyUrl(idx, "wow", "dist/realms.json")).toBe(
+      "https://cdn.jsdelivr.net/npm/@rackbops/plugin-wow@1.2.3/dist/realms.json",
+    );
+  });
+  test.each([
+    ["a scheme", "https://evil.example.com/x"],
+    ["a data URL", "data:text/js,alert(1)"],
+    ["a leading slash", "/etc/passwd"],
+    ["a backslash", "dist\\..\\secret"],
+    ["a .. segment", "dist/../../secret"],
+    ["a . segment", "dist/./x"],
+    ["an empty path", ""],
+    ["a trailing-slash empty segment", "dist/"],
+    // Percent-encoded traversal: the URL parser inside fetch normalizes %2e%2e -> .. and escapes the
+    // package prefix (even into jsDelivr's /gh/ endpoint). The `%` reject + prefix assertion catch it.
+    ["a percent-encoded .. (lowercase)", "%2e%2e/secret"],
+    ["a percent-encoded .. (uppercase)", "%2E%2E/secret"],
+    ["a mixed encoded dot", ".%2e/secret"],
+    ["a percent-encoded slash", "dist%2f..%2fsecret"],
+    ["a deep encoded escape to /gh/", "%2e%2e/%2e%2e/%2e%2e/gh/o/r@main/e.js"],
+    // Control chars (tab/newline) are STRIPPED by the URL parser, so `..\t`/`..\n` become `..` AFTER the
+    // literal-segment check and escape the package prefix. ONLY the resolved-URL prefix assertion
+    // catches these — so they pin that backstop line (a mutant that drops it stays green without them).
+    ["a tab-stripped ..", "..\t/secret"],
+    ["a newline-stripped ..", "..\n/secret"],
+    ["a carriage-return-stripped ..", "..\r/secret"],
+  ])("null for %s (mutation: dropping the sanitizer/prefix-assert lets it through)", (_label, path) => {
+    expect(resolvePluginProxyUrl(idx, "wow", path)).toBeNull();
+  });
+  test("null for a missing plugin or one with no package", () => {
+    expect(resolvePluginProxyUrl(idx, "nope", "dist/x")).toBeNull();
+    expect(
+      resolvePluginProxyUrl({ schemaVersion: 1, plugins: [{ name: "np", version: "1.0.0" }] }, "np", "dist/x"),
+    ).toBeNull();
+  });
+});
+
+describe("serveAdminBundle / servePluginProxy delivery routes (#124)", () => {
+  const TOKEN = "the-real-token";
+  const bundleUrl = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
+  const index: PluginIndex = {
+    schemaVersion: 1,
+    plugins: [{ name: "warbandeer", version: "1.0.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: 1 }],
+  };
+  const okAsset = (body: string, contentType = "text/javascript"): AdminAssetResult => ({ ok: true, status: 200, contentType, body });
+  const failAsset: AdminAssetResult = { ok: false, status: 502, contentType: "", body: "", error: "boom" };
+  function cfg(over: Partial<HandlerConfig> = {}): HandlerConfig {
+    return {
+      adminToken: TOKEN,
+      indexHtml: "<html></html>",
+      runBotOps: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      listPluginIndex: async () => index,
+      fetchAdminAsset: async (url) =>
+        url === bundleUrl ? okAsset("export const adminApiVersion=1;export function mountAdmin(){return()=>{}}") : failAsset,
+      ...over,
+    };
+  }
+
+  test("GET /plugin-admin/<name>.js serves the bundle same-origin as JS", async () => {
+    const res = await serveAdminBundle("/plugin-admin/warbandeer.js", cfg());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/javascript");
+    expect(await res.text()).toContain("mountAdmin");
+  });
+  test("404 when the plugin ships no admin bundle", async () => {
+    expect((await serveAdminBundle("/plugin-admin/ghost.js", cfg())).status).toBe(404);
+  });
+  test("404 when the index/fetcher deps are absent", async () => {
+    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ fetchAdminAsset: undefined }))).status).toBe(404);
+    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: undefined }))).status).toBe(404);
+  });
+  test("502 when the upstream fetch fails", async () => {
+    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ fetchAdminAsset: async () => failAsset }))).status).toBe(502);
+  });
+  test("an off-host adminUrl is refused (404), never proxied", async () => {
+    const offHost: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: 1, adminUrl: "https://evil.example.com/admin.js" }] };
+    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: async () => offHost }))).status).toBe(404);
+  });
+  test("a version-incompatible bundle is refused (404) — not fetched or served", async () => {
+    const incompat: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: 99, adminUrl: bundleUrl }] };
+    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: async () => incompat }))).status).toBe(404);
+  });
+
+  test("GET /api/plugin-proxy/<name>?path= serves a scoped asset with its content-type", async () => {
+    const proxied = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/realms.json";
+    const c = cfg({ fetchAdminAsset: async (url) => (url === proxied ? okAsset('{"ok":true}', "application/json") : failAsset) });
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), c);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("application/json");
+  });
+  test("400 for a traversal path — refused before any fetch", async () => {
+    let fetched = false;
+    const c = cfg({ fetchAdminAsset: async () => { fetched = true; return okAsset("x"); } });
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=../secret"), c);
+    expect(res.status).toBe(400);
+    expect(fetched).toBe(false);
+  });
+
+  test("handleRequest serves the bundle route BEFORE the /api/ gate (no token needed)", async () => {
+    const res = await handleRequest(new Request("http://x/plugin-admin/warbandeer.js"), cfg());
+    expect(res.status).toBe(200); // same public layer as / and /realms.json
+  });
+  test("handleRequest gates the proxy route behind auth (401 without a token)", async () => {
+    const res = await handleRequest(new Request("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), cfg());
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("makeAdminAssetFetcher (#124 size cap)", () => {
+  const res = (o: { ok?: boolean; status?: number; contentLength?: string | null; contentType?: string | null; bytes?: number }) => ({
+    ok: o.ok ?? true,
+    status: o.status ?? 200,
+    headers: { get: (h: string) => (h === "content-length" ? o.contentLength ?? null : h === "content-type" ? o.contentType ?? null : null) },
+    arrayBuffer: async () => new ArrayBuffer(o.bytes ?? 0),
+  });
+
+  test("rejects early on an oversized Content-Length — WITHOUT buffering the body", async () => {
+    let bodyRead = false;
+    const fetcher = makeAdminAssetFetcher(async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: (h: string) => (h === "content-length" ? "999999999" : null) },
+      arrayBuffer: async () => {
+        bodyRead = true;
+        return new ArrayBuffer(0);
+      },
+    }), 100);
+    const r = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(r.ok).toBe(false);
+    // Mutation: dropping the Content-Length pre-check reads the (huge) body first.
+    expect(bodyRead).toBe(false);
+  });
+
+  test("rejects an oversized body when no Content-Length is declared (the byteLength backstop)", async () => {
+    const fetcher = makeAdminAssetFetcher(async () => res({ bytes: 200 }), 100);
+    // Mutation: dropping the byteLength check serves an unbounded body.
+    expect((await fetcher("https://cdn.jsdelivr.net/x")).ok).toBe(false);
+  });
+
+  test("returns the body + content-type when within the cap", async () => {
+    const fetcher = makeAdminAssetFetcher(async () => res({ bytes: 10, contentType: "application/json" }), 100);
+    const out = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(out.ok).toBe(true);
+    expect(out.contentType).toBe("application/json");
+  });
+
+  test("a non-ok upstream is an error", async () => {
+    const fetcher = makeAdminAssetFetcher(async () => res({ ok: false, status: 404 }), 100);
+    expect((await fetcher("https://cdn.jsdelivr.net/x")).ok).toBe(false);
+  });
+});
+
+// The admin-tab pure helpers (scopeToPluginKeys, adminTabState) are lifted from index.html between
+// their PLUGIN_ADMIN_HELPERS markers and evaluated here, so the panel's own client logic is pinned in
+// the same suite (the pattern the ENV_SAVE / TZ_FILTER lifts already use).
+describe("plugin admin helpers (lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.match(/\/\/ PLUGIN_ADMIN_HELPERS:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_ADMIN_HELPERS:end/)?.[1];
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+  });
+
+  const scopeToPluginKeys = new Function(`"use strict";\n${src ?? ""}\nreturn scopeToPluginKeys;`)() as (
+    obj: Record<string, unknown>,
+    keys: string[],
+  ) => Record<string, unknown>;
+  const adminTabState = new Function(`"use strict";\n${src ?? ""}\nreturn adminTabState;`)() as (
+    plugin: unknown,
+    panelVer: number,
+  ) => { kind: string; declared?: number; panel?: number };
+  const buildSetEnvBody = new Function(`"use strict";\n${src ?? ""}\nreturn buildSetEnvBody;`)() as (
+    changes: Record<string, unknown>,
+    keys: string[],
+  ) => { body?: string; error?: string };
+  const viewToState = new Function(`"use strict";\n${src ?? ""}\nreturn viewToState;`)() as (
+    p: unknown,
+  ) => Record<string, unknown> | null;
+
+  test("scopeToPluginKeys keeps ONLY the plugin's declared keys (the getEnv/setEnv scope)", () => {
+    // Mutation: dropping the filter lets a tab read/write a core or another plugin's key.
+    expect(
+      scopeToPluginKeys({ WARBANDEER_INGEST_PORT: "8082", DISCORD_TOKEN: "x", ANNOUNCE_CHANNEL_ID: "1" }, ["WARBANDEER_INGEST_PORT"]),
+    ).toEqual({ WARBANDEER_INGEST_PORT: "8082" });
+    expect(scopeToPluginKeys({ A: "1" }, [])).toEqual({});
+    expect(scopeToPluginKeys({}, ["A"])).toEqual({});
+  });
+
+  test("adminTabState: none without a bundle or when disabled; mismatch on a version gap; mount on a match", () => {
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1 }, 1)).toEqual({ kind: "mount" });
+    expect(adminTabState({ enabled: false, adminUrl: "u", adminApiVersion: 1 }, 1).kind).toBe("none"); // not enabled
+    expect(adminTabState({ enabled: true, adminApiVersion: 1 }, 1).kind).toBe("none"); // no adminUrl
+    // A version gap in EITHER direction is a mismatch, never a mount — a `!==`→`===` mutant would run a
+    // bundle built against a different contract.
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 2 }, 1)).toEqual({ kind: "mismatch", declared: 2, panel: 1 });
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1 }, 2).kind).toBe("mismatch");
+  });
+
+  test("buildSetEnvBody scopes to the plugin's keys AND refuses a newline value (no env-set injection)", () => {
+    // The scope is APPLIED here (not just in scopeToPluginKeys) — mutation: dropping it includes the
+    // core key in the body.
+    expect(buildSetEnvBody({ WARBANDEER_INGEST_PORT: "8082", ANNOUNCE_CHANNEL_ID: "1" }, ["WARBANDEER_INGEST_PORT"]))
+      .toEqual({ body: "WARBANDEER_INGEST_PORT=8082" });
+    expect(buildSetEnvBody({}, ["A"])).toEqual({ body: "" });
+    // A \n or \r in a value would smuggle a second env-set line past the key scope — refused.
+    expect(buildSetEnvBody({ WARBANDEER_INGEST_PORT: "8080\nANNOUNCE_CHANNEL_ID=1" }, ["WARBANDEER_INGEST_PORT"]).error).toBeTruthy();
+    expect(buildSetEnvBody({ WARBANDEER_INGEST_PORT: "8080\rX=1" }, ["WARBANDEER_INGEST_PORT"]).error).toBeTruthy();
+  });
+
+  test("viewToState maps a /api/plugins row to the PluginStateEntry shape (availableVersion when newer)", () => {
+    expect(viewToState(null)).toBeNull();
+    const s = viewToState({ name: "wb", enabled: true, installedVersion: "1.0.0", latestVersion: "1.1.0", active: true, configured: true, missingEnv: [] })!;
+    expect(s.installedVersion).toBe("1.0.0");
+    expect(s.availableVersion).toBe("1.1.0"); // the view's latestVersion, since it's newer than installed
+    expect(s.active).toBe(true);
+    // No newer version → availableVersion undefined (mutation: always-copying latestVersion leaks it).
+    expect(viewToState({ name: "wb", installedVersion: "1.1.0", latestVersion: "1.1.0" })!.availableVersion).toBeUndefined();
   });
 });
 
