@@ -55,7 +55,9 @@ export type ShaRelation =
  * Whether a stale build should exit to be replaced.
  *
  * `relation` is the ancestry answer; it decides everything the bare sha comparison used to
- * get wrong. `ahead` is the ordinary state of a correct deploy, so it must read as `current`.
+ * get wrong. `ahead` and `identical` both mean the build already contains the newest commit, so
+ * both read as `current` (a fresh deploy reads `identical`; `ahead` also covers a build carrying
+ * commits the compared sha lacks). Once newer code lands the ordinary stale state is `behind`.
  * `unpublished` disables rather than restarts: a build whose sha the remote has never seen
  * (an unpushed branch) can never be matched, so offering an update would be offering one that
  * can never be delivered. `unknown` — an API failure — deliberately falls through to the old
@@ -230,8 +232,9 @@ let checkInFlight = false;
  * explicit /update: it overrides the anti-loop suppression. `requester` is that
  * admin, recorded so the next boot can report back what build it landed on.
  *
- * The restart is only *requested* — `restart.ts` holds it until any in-flight
- * announcement and state write have finished.
+ * The restart is only *requested*. On the exit-75 fallback path (`requestRestart`) that request
+ * is held until any in-flight announcement and state write finish; the socket-mounted redeploy path
+ * instead quiesces via `beginHandoff`, which stops new ticks but does not await a tick already running.
  */
 export async function checkForUpdate(
   o: { force?: boolean; requester?: UpdateRequester } = {},

@@ -216,8 +216,11 @@ install: next steps for '$INSTANCE'
      panel section) — it has no published host port, so until a tunnel routes to it, this
      just starts a sidecar reachable from nothing but the docker network it's on. ADMIN_TOKEN
      and the CLOUDFLARE_ACCESS_*/ADMIN_ALLOWED_EMAILS vars are read out of .env just for this
-     one command (not the whole file) — the admin container never gets the rest of your
-     secrets. Fill CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD into .env in step 1 to
+     one command (not the whole file), so they aren't baked into the image or shown in docker
+     inspect. This is not a secrets boundary, though: the admin container bind-mounts the config
+     dir read-write (to write admins.json and back up .env), so it can read every secret in .env
+     off the filesystem — panel access is effectively deploy/root-equivalent. Fill
+     CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD into .env in step 1 to
      have the panel verify Access's own signed JWT directly (ADMIN_TOKEN then becomes a
      fallback, not the only check) — leave them blank to keep ADMIN_TOKEN as the sole door-2
      check for now. ADMIN_ALLOWED_EMAILS further narrows which verified identities the JWT

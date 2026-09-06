@@ -231,8 +231,9 @@ printed commands).
 
 ## Admin panel
 
-A small per-instance web panel (`ops/admin/`) — a thin, authenticated wrapper around this
-script's own five operations, nothing more. Built primarily to sidestep the `ops.json` gap
+A small per-instance web panel (`ops/admin/`) — an authenticated wrapper around this
+script's own operations, plus a few read-only / self-contained server-native routes (see "What it
+exposes" below). Built primarily to sidestep the `ops.json` gap
 above rather than fix it: reachable from anywhere, not just wherever the desktop app is
 installed, and structurally incapable of touching an instance other than its own (it only ever
 knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance).
@@ -294,7 +295,7 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    `ADMIN_TOKEN` exported). If this token has leaked, editing `.env` alone is not enough: the
    leaked token keeps working until that recreate happens.
 
-**What it exposes — `bot-ops.sh`'s five operations plus a few read-only or self-contained,
+**What it exposes — `bot-ops.sh`'s operations plus a few read-only or self-contained,
 server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`,
 `POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
 they're signed in as, plus the JWT's claims for the panel's Identity view), and
@@ -310,13 +311,18 @@ saving a plugin's *enabled* state still goes through the ordinary `POST /api/env
 `/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
 routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
-rule's `httpHostHeader`, which the `install.sh`/tunnel setup already sets); don't rewrite it to
+rule's `httpHostHeader`, which you set when you configure the ingress rule — operator work, not automated by anything in this repo); don't rewrite it to
 the internal origin or same-origin browser writes would be wrongly blocked.
 A `restart`/`env-set` invocation that runs past 90s (a wedged `dockerd`, a slow image pull) is
 killed and answered with a `504`, distinct from the `502` a normal `bot-ops.sh` failure gets;
 `Bun.serve`'s own idle timeout is raised to 120s so a legitimately slow-but-under-90s request is
 never cut off by the HTTP layer first.
-No rebuild/deploy capability lives here — that stays Discord's `/update`. The config form on the
+There's no *direct* rebuild/deploy button — that stays Discord's `/update` — but the panel edits
+`BOT_BRANCH` and `AUTO_UPDATE`, and with `AUTO_UPDATE=true` the bot's own self-update rebuilds from
+`BOT_BRANCH` through the mounted docker socket within ~15 minutes. Combined with the read-write
+config-dir mount (the panel reads secrets straight from the mounted `.env` — e.g. `GITHUB_TOKEN` for
+the branch chooser below), **panel access is effectively deploy and root-equivalent access — treat it
+like SSH to the box.** The config form on the
 page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
 `ALLOWED` whitelist above. Save posts only the fields that changed — the same list the confirm
 dialog previews — never the untouched ones echoed back (issue #44): a stored value the whitelist
