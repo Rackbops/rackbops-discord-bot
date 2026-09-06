@@ -14,7 +14,10 @@ RUN apt-get update \
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
-COPY server.ts ./
+# server.ts imports ./admin-contract (the vendored ADMIN_API_VERSION + AdminApi types, #124), so it
+# MUST be copied too — a missing local import crash-loops the container at boot. Keep this in sync
+# with server.ts's relative imports; nothing but the image build catches a missing one.
+COPY server.ts admin-contract.ts ./
 COPY public ./public
 
 EXPOSE 8080
