@@ -1,20 +1,13 @@
-export type Region = "us" | "eu";
-
 export interface Config {
   discordToken: string;
   announceChannelId: string;
   releaseAnnounceChannelId: string;
   guildId?: string;
-  region: Region;
-  realmSlug?: string;
-  blizzardClientId?: string;
-  blizzardClientSecret?: string;
   githubRepo: string;
   /** Repos whose releases get announced (`owner/repo`). Distinct from `githubRepo`, which
    * anchors self-update; defaults to `[githubRepo]`. */
   watchedRepos: string[];
   githubToken?: string;
-  dmfTimezone: string;
   /** Commit this build was made from, baked in via the GIT_SHA build arg. Absent = self-update disabled. */
   gitSha?: string;
   /** Branch self-update measures staleness against. Must exist on `githubRepo`. */
@@ -72,11 +65,6 @@ export function resolveConfig(env: Env): Config {
     ),
   ];
 
-  const region = (optional("WOW_REGION") ?? "us") as Region;
-  if (region !== "us" && region !== "eu") {
-    throw new Error(`WOW_REGION must be "us" or "eu", got "${region}"`);
-  }
-
   const announceChannelId = required("ANNOUNCE_CHANNEL_ID");
 
   const githubRepo = optional("GITHUB_REPO") ?? "Rackbops/rackbops-discord-bot";
@@ -92,17 +80,6 @@ export function resolveConfig(env: Env): Config {
       `COMMAND_PREFIX must be 1-20 chars of lowercase letters, numbers, "-" or "_" ` +
         `(Discord slash-command name rules), got "${commandPrefix}"`,
     );
-  }
-
-  // Validated here, not left to fail wherever dmf.ts first calls Intl.DateTimeFormat with it —
-  // an invalid zone would otherwise throw on every scheduler tick (checkDmf runs first, with no
-  // per-check isolation before this fix) instead of refusing to boot at all (issue #43).
-  const dmfTimezone =
-    optional("DMF_TIMEZONE") ?? (region === "us" ? "America/Los_Angeles" : "Europe/Paris");
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: dmfTimezone });
-  } catch {
-    throw new Error(`DMF_TIMEZONE is not a valid IANA time zone, got "${dmfTimezone}"`);
   }
 
   // name, or name@version to pin a version; duplicate names rejected separately from list()'s
@@ -139,14 +116,9 @@ export function resolveConfig(env: Env): Config {
     announceChannelId,
     releaseAnnounceChannelId: optional("RELEASE_ANNOUNCE_CHANNEL_ID") ?? announceChannelId,
     guildId: optional("DISCORD_SERVER_ID"),
-    region,
-    realmSlug: optional("WOW_REALM"),
-    blizzardClientId: optional("BLIZZARD_CLIENT_ID"),
-    blizzardClientSecret: optional("BLIZZARD_CLIENT_SECRET"),
     githubRepo,
     watchedRepos: watchedRepos.length ? watchedRepos : [githubRepo],
     githubToken: optional("GITHUB_TOKEN"),
-    dmfTimezone,
     gitSha: optional("GIT_SHA"),
     botBranch: optional("BOT_BRANCH") ?? "main",
     autoUpdate: optional("AUTO_UPDATE") === "true",

@@ -96,27 +96,11 @@ declare -A ALLOWED=(
   [RELEASE_ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
   [REPORT_ROLE_ID]='^[0-9]{5,25}$'
   [ADMIN_USER_IDS]='^[0-9]{5,25}(,[0-9]{5,25})*$'
-  # Blizzard realm slugs are lowercase ASCII plus accented Latin letters (7 live EU realms use
-  # à/é/ê/ü — e.g. chants-éternels, aggra-português; the other lowercase Latin-1 letters are listed
-  # for realms Blizzard may add later). ENUMERATE them — never a range like à-ÿ: env-set can run in
-  # the admin container's C locale, where [[ =~ ]] matches byte-wise, so a multibyte range does NOT
-  # error — it silently decomposes into an over-broad byte range that wrongly admits ÷ (U+00F7) and
-  # other non-slug characters. Each enumerated char is admitted under both C (byte-wise) and UTF-8
-  # (char-wise); only the {1,40} bound differs (bytes vs chars), which is moot — real slugs run well
-  # under 40. Stays tight otherwise (the value is interpolated into a Blizzard API URL in realm.ts
-  # and shown in Discord). REALM_SLUG_RE in ops/admin/public/index.html mirrors this; server.test.ts
-  # guards them from drift.
-  [WOW_REALM]='^[a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]{1,40}$'
-  [WOW_REGION]='^(us|eu)$'
+  # WOW_REALM / WOW_REGION / DMF_TIMEZONE were static rows here until #107 moved the WoW features into
+  # @rackbops/plugin-wow. They are the wow plugin's manifest env keys now, merged into this whitelist at
+  # runtime by load_plugin_keys (the same #101 path WARBANDEER_INGEST_PORT uses) — validated with the
+  # FORMAT the Plugin Index carries, so their regexes live in the plugin's package.json, not here.
   [WATCHED_REPOS]='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
-  # Shape only, not a real-zone check (same philosophy as WOW_REALM above) — the old
-  # exactly-one-slash, letters-only pattern both accepted garbage (e.g. "Europe/Pari") and
-  # rejected real IANA zones: 3-segment names (America/Argentina/Buenos_Aires,
-  # America/Indiana/Indianapolis), hyphens (America/Port-au-Prince), a "+" (Etc/GMT+1), and
-  # no-slash names (UTC). The bot's own resolveConfig is the real gate (issue #43): it rejects
-  # anything Intl.DateTimeFormat doesn't recognize as a zone, at startup, before this shape check
-  # ever gets a chance to be the only thing standing between a typo and a silently-dead scheduler.
-  [DMF_TIMEZONE]='^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+){0,2}$'
   [AUTO_UPDATE]='^(true|false)$'
   [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
   [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
@@ -152,10 +136,7 @@ ALLOWED_ORDER=(
   RELEASE_ANNOUNCE_CHANNEL_ID
   REPORT_ROLE_ID
   ADMIN_USER_IDS
-  WOW_REALM
-  WOW_REGION
   WATCHED_REPOS
-  DMF_TIMEZONE
   AUTO_UPDATE
   BOT_BRANCH
   COMMAND_PREFIX
@@ -358,8 +339,12 @@ cmd_status() {
   running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
   status="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.Status}}' 2>/dev/null || true)"
   image="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-  # Best-effort: the persisted last-observed realm status (may be absent on a fresh install).
-  realm="$(docker exec "$CONTAINER" cat /app/data/state.json 2>/dev/null \
+  # Best-effort: the persisted last-observed realm status. Since #107 the wow plugin owns it in its own
+  # data/wow.json; fall back to the legacy state.json copy (frozen there) for an instance still on an
+  # older bot or not yet running the wow plugin. May be absent on a fresh install.
+  realm="$(docker exec "$CONTAINER" cat /app/data/wow.json 2>/dev/null \
+            | jq -r '.realmStatus // ""' 2>/dev/null || true)"
+  [ -n "$realm" ] || realm="$(docker exec "$CONTAINER" cat /app/data/state.json 2>/dev/null \
             | jq -r '.realmStatus // ""' 2>/dev/null || true)"
   # Best-effort: the plugins the bot recorded after activation (PluginStateFile.plugins — a
   # different file from state.json above). Normalised to a JSON array so --argjson never chokes:

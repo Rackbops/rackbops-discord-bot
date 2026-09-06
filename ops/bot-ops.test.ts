@@ -199,6 +199,12 @@ const dockerCalls = (fx: Fixture): string[] => {
   const log = join(fx.bin, "docker.log");
   return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
 };
+/** dockerCalls with the read-only `exec … cat /app/data/plugins/index.json` reads load_plugin_keys
+ *  makes dropped — for the .env-mechanics tests, whose fixtures now carry PLUGINS=wow (so the whitelist
+ *  is built from the plugin index) but which assert on the recreate/guard ops, not that read. Tests that
+ *  DO assert on the index read (or a plugin-request write) use `dockerCalls` directly. */
+const recreateCalls = (fx: Fixture): string[] =>
+  dockerCalls(fx).filter((c) => !(c.includes("exec") && c.includes("/app/data/plugins/index.json")));
 const envText = (fx: Fixture): string => readFileSync(fx.envFile, "utf8");
 
 /** The pre-#44 panel body — every env-get key echoed back, `overrides` applied — which a
@@ -257,9 +263,40 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
   });
 });
 
+// The three keys #107 moved off bot-ops.sh's static whitelist into @rackbops/plugin-wow. The
+// .env-mechanics tests below use them as their permissive-key palette (region / realm-slug / IANA-zone
+// shapes) — which post-#107 means seeding a cached Plugin Index so load_plugin_keys merges them back
+// when PLUGINS=wow, exactly as they become editable in production. `wowSetup` prepends PLUGINS=wow +
+// seeds the index; `wowEnv` is the matching expected-.env prefix.
+const WOW_INDEX = JSON.stringify({
+  writtenAt: "2026-09-05T00:00:00.000Z",
+  index: {
+    schemaVersion: 1,
+    generatedAt: "2026-09-05T00:00:00.000Z",
+    plugins: [
+      {
+        name: "wow",
+        package: "@rackbops/plugin-wow",
+        version: "1.0.0",
+        description: "wow plugin",
+        hostApiVersion: 1,
+        commands: [],
+        env: [
+          { key: "WOW_REGION", format: "^(us|eu)$", description: "region" },
+          { key: "WOW_REALM", format: "^[a-z0-9àáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ-]{1,40}$", description: "realm" },
+          { key: "DMF_TIMEZONE", format: "^[A-Za-z0-9+_-]+(/[A-Za-z0-9+_-]+){0,2}$", description: "tz" },
+        ],
+        releases: [],
+      },
+    ],
+  },
+});
+const wowSetup = (envText: string): Fixture => setup(`PLUGINS=wow\n${envText}`, { pluginIndex: WOW_INDEX });
+const wowEnv = (text: string): string => `PLUGINS=wow\n${text}`;
+
 describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_file loader does (issue #44)", () => {
   test("the LAST occurrence of a duplicated key wins, not the first", async () => {
-    const fx = setup("WOW_REGION=us\nWOW_REGION=eu\n");
+    const fx = wowSetup("WOW_REGION=us\nWOW_REGION=eu\n");
     expect((await envGet(fx)).WOW_REGION).toBe("eu");
   });
 
@@ -268,7 +305,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_
     // value", verified with `docker compose config`), so there is no effective value to mirror
     // there: the raw text is the honest reading, and saving that key from the panel rewrites it
     // unquoted — which repairs the file.
-    const fx = setup(`WOW_REALM="stormrage"\nDMF_TIMEZONE='UTC'\nCOMMAND_PREFIX="abc\nBOT_BRANCH="\nWATCHED_REPOS='"'\n`);
+    const fx = wowSetup(`WOW_REALM="stormrage"\nDMF_TIMEZONE='UTC'\nCOMMAND_PREFIX="abc\nBOT_BRANCH="\nWATCHED_REPOS='"'\n`);
     const env = await envGet(fx);
     expect(env.WOW_REALM).toBe("stormrage");
     expect(env.DMF_TIMEZONE).toBe("UTC");
@@ -278,7 +315,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_
   });
 
   test("a CRLF-saved file yields values without the trailing CR", async () => {
-    const fx = setup('ANNOUNCE_CHANNEL_ID=11111\r\nWOW_REGION=us\r\nWOW_REALM="hyjal"\r\n');
+    const fx = wowSetup('ANNOUNCE_CHANNEL_ID=11111\r\nWOW_REGION=us\r\nWOW_REALM="hyjal"\r\n');
     const env = await envGet(fx);
     expect(env.ANNOUNCE_CHANNEL_ID).toBe("11111");
     expect(env.WOW_REGION).toBe("us");
@@ -286,26 +323,26 @@ describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_
   });
 
   test("an `export KEY=` line defines the key", async () => {
-    const fx = setup("export WOW_REGION=eu\n");
+    const fx = wowSetup("export WOW_REGION=eu\n");
     expect((await envGet(fx)).WOW_REGION).toBe("eu");
   });
 
   test("an indented line defines the key too, as it does for compose", async () => {
-    const fx = setup("  WOW_REGION=eu\n\texport BOT_BRANCH=dev\n");
+    const fx = wowSetup("  WOW_REGION=eu\n\texport BOT_BRANCH=dev\n");
     const env = await envGet(fx);
     expect(env.WOW_REGION).toBe("eu");
     expect(env.BOT_BRANCH).toBe("dev");
   });
 
   test("whitespace around an unquoted value is trimmed; inside quotes it is kept", async () => {
-    const fx = setup('WOW_REGION=  eu \t\nCOMMAND_PREFIX="  r_  "\n');
+    const fx = wowSetup('WOW_REGION=  eu \t\nCOMMAND_PREFIX="  r_  "\n');
     const env = await envGet(fx);
     expect(env.WOW_REGION).toBe("eu");
     expect(env.COMMAND_PREFIX).toBe("  r_  ");
   });
 
   test("a longer key and a commented-out line don't define the key; an absent key is empty", async () => {
-    const fx = setup("WOW_REGIONX=eu\n# WOW_REGION=eu\n\n");
+    const fx = wowSetup("WOW_REGIONX=eu\n# WOW_REGION=eu\n\n");
     const env = await envGet(fx);
     expect(env.WOW_REGION).toBe("");
     expect(env.ANNOUNCE_CHANNEL_ID).toBe("");
@@ -318,28 +355,28 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     // ADMIN_USER_IDS with a space: config.ts trims it, the regex here doesn't. WOW_REALM quoted:
     // compose strips the quotes, the old env_value didn't. Both used to fail EVERY panel save.
     const stored = 'ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=11111\n';
-    const fx = setup(stored);
+    const fx = wowSetup(stored);
     const body = await fullBody(fx, { ANNOUNCE_CHANNEL_ID: "22222" });
-    // 14 static whitelisted keys now (#101 dropped WARBANDEER_INGEST_PORT, added PLUGINS +
-    // PLUGIN_INDEX_URL); no PLUGINS set here, so no plugin keys are merged in.
-    expect(body.split("\n")).toHaveLength(14); // every whitelisted key echoed, like the old panel
+    // 11 static whitelisted keys (#101 dropped WARBANDEER_INGEST_PORT; #107 moved the 3 WoW keys to the
+    // wow plugin) + the 3 wow plugin keys merged via PLUGINS=wow = 14 echoed, like the old panel.
+    expect(body.split("\n")).toHaveLength(14);
     const run = await botOps(fx, ["env-set"], body);
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"], recreated: true });
-    expect(envText(fx)).toBe('ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=22222\n');
+    expect(envText(fx)).toBe(wowEnv('ADMIN_USER_IDS=123456, 234567\nWOW_REALM="stormrage"\nANNOUNCE_CHANNEL_ID=22222\n'));
     // The #51-item-5 guard's `docker ps` check runs first, then the real recreate.
-    expect(dockerCalls(fx)).toEqual([
+    expect(recreateCalls(fx)).toEqual([
       expect.stringContaining("ps -a --filter"),
       expect.stringContaining("up -d --force-recreate"),
     ]);
   });
 
   test("the issue's literal case — a 3-segment DMF_TIMEZONE stored — keeps working (regex widened by #69)", async () => {
-    const fx = setup("DMF_TIMEZONE=America/Indiana/Indianapolis\nANNOUNCE_CHANNEL_ID=11111\n");
+    const fx = wowSetup("DMF_TIMEZONE=America/Indiana/Indianapolis\nANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-set"], await fullBody(fx, { ANNOUNCE_CHANNEL_ID: "22222" }));
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["ANNOUNCE_CHANNEL_ID"] });
-    expect(envText(fx)).toBe("DMF_TIMEZONE=America/Indiana/Indianapolis\nANNOUNCE_CHANNEL_ID=22222\n");
+    expect(envText(fx)).toBe(wowEnv("DMF_TIMEZONE=America/Indiana/Indianapolis\nANNOUNCE_CHANNEL_ID=22222\n"));
   });
 
   test("a value that IS changing is still validated: invalid -> exit 1 naming the key, nothing touched", async () => {
@@ -358,14 +395,14 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     // The stored WOW_REGION=US is itself regex-invalid (uppercase): submitted unchanged it must never
     // be judged — the old validate-everything order named it. The two changed-and-invalid lines are
     // named in the order they were sent, whichever comes first.
-    const fx = setup("WOW_REGION=US\n");
+    const fx = wowSetup("WOW_REGION=US\n");
     const a = await botOps(fx, ["env-set"], "WOW_REGION=US\nAUTO_UPDATE=maybe\nBOT_BRANCH=bad branch\n");
     expect(a.exitCode).toBe(1);
     expect(a.stderr).toContain("value for 'AUTO_UPDATE' is invalid");
     const b = await botOps(fx, ["env-set"], "WOW_REGION=US\nBOT_BRANCH=bad branch\nAUTO_UPDATE=maybe\n");
     expect(b.exitCode).toBe(1);
     expect(b.stderr).toContain("value for 'BOT_BRANCH' is invalid");
-    expect(envText(fx)).toBe("WOW_REGION=US\n");
+    expect(envText(fx)).toBe(wowEnv("WOW_REGION=US\n"));
   });
 
   test("a key repeated on stdin: the last value wins, like .env itself, and only it is judged", async () => {
@@ -405,29 +442,29 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
 
   test("submitting the stored value spelled differently (quotes, CR, export, duplicate) is a no-op", async () => {
     const stored = 'WOW_REALM="stormrage"\r\nexport WOW_REGION=eu\nBOT_BRANCH=main\nBOT_BRANCH=dev\n';
-    const fx = setup(stored);
+    const fx = wowSetup(stored);
     const run = await botOps(fx, ["env-set"], "WOW_REALM=stormrage\nWOW_REGION=eu\nBOT_BRANCH=dev\n");
     expect(run.exitCode).toBe(0);
     expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
-    expect(envText(fx)).toBe(stored); // byte-identical: no rewrite, quotes and CR left alone
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    expect(envText(fx)).toBe(wowEnv(stored)); // byte-identical: no rewrite, quotes and CR left alone
+    expect(recreateCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("a duplicated key is diffed against its LAST (effective) value, and every copy is rewritten", async () => {
-    const fx = setup("WOW_REGION=us\nWOW_REGION=eu\n");
+    const fx = wowSetup("WOW_REGION=us\nWOW_REGION=eu\n");
     const run = await botOps(fx, ["env-set"], "WOW_REGION=us\n"); // equals the first copy, not the effective one
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["WOW_REGION"] });
-    expect(envText(fx)).toBe("WOW_REGION=us\nWOW_REGION=us\n");
+    expect(envText(fx)).toBe(wowEnv("WOW_REGION=us\nWOW_REGION=us\n"));
     expect((await envGet(fx)).WOW_REGION).toBe("us");
   });
 
   test("changing an exported or indented key rewrites that line in place — no duplicate appended", async () => {
-    const fx = setup("export WOW_REGION=eu\n  BOT_BRANCH=dev\nANNOUNCE_CHANNEL_ID=11111\n");
+    const fx = wowSetup("export WOW_REGION=eu\n  BOT_BRANCH=dev\nANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-set"], "WOW_REGION=us\nBOT_BRANCH=main\n");
     expect(run.exitCode).toBe(0);
-    expect(envText(fx)).toBe("WOW_REGION=us\nBOT_BRANCH=main\nANNOUNCE_CHANNEL_ID=11111\n");
-    expect(dockerCalls(fx)).toHaveLength(2); // the #51-item-5 guard's `ps` check, then the recreate
+    expect(envText(fx)).toBe(wowEnv("WOW_REGION=us\nBOT_BRANCH=main\nANNOUNCE_CHANNEL_ID=11111\n"));
+    expect(recreateCalls(fx)).toHaveLength(2); // the #51-item-5 guard's `ps` check, then the recreate
   });
 
   test("a .env whose LAST line has no trailing newline is still read by load_env_values", async () => {
@@ -435,7 +472,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     // and env-set's diff) is a SEPARATE read loop from the rewrite loop below, and a fixture that
     // only puts the no-newline line in an unwhitelisted key would never exercise this one — env-get
     // only reports ALLOWED_ORDER keys, so a dropped unwhitelisted line is invisible either way.
-    const fx = setup("DISCORD_TOKEN=secret\nWOW_REGION=us"); // no final \n — writeFileSync writes it raw
+    const fx = wowSetup("DISCORD_TOKEN=secret\nWOW_REGION=us"); // no final \n — writeFileSync writes it raw
     expect(readFileSync(fx.envFile, "utf8").endsWith("\n")).toBe(false);
     expect((await envGet(fx)).WOW_REGION).toBe("us");
     // And the diff sees it too: submitting the same value is a no-op, not a "was empty" false change.
@@ -446,40 +483,40 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
   test("a real change preserves an untouched, no-trailing-newline LAST line through the rewrite", async () => {
     // Here the no-newline last line is the one the rewrite loop (a separate read loop again) must
     // carry through untouched while a DIFFERENT key is the one being changed.
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us"); // no final \n
+    const fx = wowSetup("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us"); // no final \n
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).toBe(0);
-    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\nWOW_REGION=us\n"); // survives, gains its \n
+    expect(envText(fx)).toBe(wowEnv("ANNOUNCE_CHANNEL_ID=22222\nWOW_REGION=us\n")); // survives, gains its \n
   });
 
   test("a real change to a CRLF file leaves the untouched lines' CR in place", async () => {
-    const fx = setup("WOW_REGION=us\r\nexport DMF_TIMEZONE=UTC\r\nANNOUNCE_CHANNEL_ID=11111\r\n");
+    const fx = wowSetup("WOW_REGION=us\r\nexport DMF_TIMEZONE=UTC\r\nANNOUNCE_CHANNEL_ID=11111\r\n");
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).toBe(0);
-    expect(envText(fx)).toBe("WOW_REGION=us\r\nexport DMF_TIMEZONE=UTC\r\nANNOUNCE_CHANNEL_ID=22222\n");
+    expect(envText(fx)).toBe(wowEnv("WOW_REGION=us\r\nexport DMF_TIMEZONE=UTC\r\nANNOUNCE_CHANNEL_ID=22222\n"));
   });
 
   test("saving a key whose stored value has an unterminated quote rewrites it clean (repairs the file)", async () => {
-    const fx = setup('WOW_REALM="abc\n');
+    const fx = wowSetup('WOW_REALM="abc\n');
     expect((await envGet(fx)).WOW_REALM).toBe('"abc');
     const run = await botOps(fx, ["env-set"], "WOW_REALM=abc\n");
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["WOW_REALM"] });
-    expect(envText(fx)).toBe("WOW_REALM=abc\n");
+    expect(envText(fx)).toBe(wowEnv("WOW_REALM=abc\n"));
   });
 
   test("a real change backs up, rewrites only the changed lines, appends a new key, recreates once", async () => {
     const stored = "# comment kept\nDISCORD_TOKEN=secret\nANNOUNCE_CHANNEL_ID=11111\n";
-    const fx = setup(stored);
+    const fx = wowSetup(stored);
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\nWOW_REGION=eu\n");
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ ok: true, recreated: true });
     expect([...(run.json!.changed as string[])].sort()).toEqual(["ANNOUNCE_CHANNEL_ID", "WOW_REGION"]);
-    expect(envText(fx)).toBe("# comment kept\nDISCORD_TOKEN=secret\nANNOUNCE_CHANNEL_ID=22222\nWOW_REGION=eu\n");
+    expect(envText(fx)).toBe(wowEnv("# comment kept\nDISCORD_TOKEN=secret\nANNOUNCE_CHANNEL_ID=22222\nWOW_REGION=eu\n"));
     const backups = readdirSync(join(fx.cfg, "backups"));
     expect(backups).toHaveLength(1);
-    expect(readFileSync(join(fx.cfg, "backups", backups[0]!), "utf8")).toBe(stored);
-    expect(dockerCalls(fx)).toEqual([
+    expect(readFileSync(join(fx.cfg, "backups", backups[0]!), "utf8")).toBe(wowEnv(stored));
+    expect(recreateCalls(fx)).toEqual([
       expect.stringContaining("ps -a --filter"),
       expect.stringContaining("-p probe-project up -d --force-recreate"),
     ]);
@@ -521,12 +558,12 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
   });
 
   test("blanking a required key alongside a valid, unrelated change rejects the WHOLE submission", async () => {
-    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n");
+    const fx = wowSetup("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n");
     const run = await botOps(fx, ["env-set"], "WOW_REGION=eu\nANNOUNCE_CHANNEL_ID=\n");
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
-    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n"); // WOW_REGION change never applied either
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    expect(envText(fx)).toBe(wowEnv("ANNOUNCE_CHANNEL_ID=11111\nWOW_REGION=us\n")); // WOW_REGION change never applied either
+    expect(recreateCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
   });
 
   test("a non-required key still clears to blank normally — REQUIRED doesn't block unrelated keys", async () => {
@@ -541,11 +578,11 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     // Mirrors the existing "submitting the stored value spelled differently is a no-op" test:
     // a value that isn't CHANGING was never this script's to judge, even a required one that's
     // already broken from before this fix existed.
-    const fx = setup("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=us\n");
+    const fx = wowSetup("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=us\n");
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n");
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["WOW_REGION"] });
-    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n");
+    expect(envText(fx)).toBe(wowEnv("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n"));
   });
 });
 
@@ -841,7 +878,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-get is graceful when the Plugin Index
     const env = run.json as Record<string, string>;
     expect(env).toHaveProperty("PLUGINS", "warbandeer");
     expect(env).not.toHaveProperty("WARBANDEER_INGEST_PORT"); // couldn't read the manifest
-    expect(Object.keys(env)).toHaveLength(14); // the 14 static keys, nothing merged
+    expect(Object.keys(env)).toHaveLength(11); // the 11 static keys, nothing merged
   });
 
   test("no PLUGINS set → no docker read at all, no note", async () => {
@@ -905,7 +942,7 @@ describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-w
     expect(run.exitCode).toBe(0);
     expect(run.stderr).toContain("plugins: index unavailable");
     expect(run.stderr).not.toContain("jq: error");
-    expect(Object.keys(run.json as object)).toHaveLength(14); // the static keys only
+    expect(Object.keys(run.json as object)).toHaveLength(11); // the static keys only
   });
 
   test("a required plugin key cannot be blanked — same rule as a required static key", async () => {

@@ -910,10 +910,6 @@ export function createPluginIndexLister(deps: PluginIndexListerDeps): () => Prom
 export interface HandlerConfig {
   adminToken: string;
   indexHtml: string;
-  /** The static WOW_REALM chooser data (ops/admin/public/realms.json), served verbatim at
-   * /realms.json for the panel to read. Absent when the file wasn't generated — the route then
-   * 404s and the panel's WOW_REALM field degrades to a plain text input. */
-  realmsJson?: string;
   /** Lists the configured repo's branches (for the BOT_BRANCH chooser), or null on any failure.
    * Injected so the route tests without a real GitHub call; absent when no config dir is set, in
    * which case /api/branches 404s and the panel's BOT_BRANCH field degrades to a text input. */
@@ -1186,15 +1182,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     return new Response(config.indexHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
-  // The static realm list for the WOW_REALM chooser. Public at this layer, exactly like the page
-  // itself — it's non-secret data (WoW realm names) and Access already gated reaching the panel.
-  // A GET, so isCrossSiteWrite never applies. 404 when unset so the panel falls back gracefully.
-  if (req.method === "GET" && url.pathname === "/realms.json") {
-    if (!config.realmsJson) return new Response("not found", { status: 404 });
-    return new Response(config.realmsJson, { headers: { "Content-Type": "application/json; charset=utf-8" } });
-  }
-
-  // #124: a plugin's admin bundle, served same-origin (public at this layer like the page + realms,
+  // #124: a plugin's admin bundle, served same-origin (public at this layer like the page,
   // Access already gated getting here). Before the /api/ gate; a GET, so isCrossSiteWrite never applies.
   if (req.method === "GET" && url.pathname.startsWith("/plugin-admin/")) {
     return serveAdminBundle(url.pathname, config);
@@ -1381,21 +1369,6 @@ if (import.meta.main) {
   );
   console.log(`[admin] serving admin panel for instance "${instanceName}"`);
 
-  // Optional: the generated realm list for the WOW_REALM chooser. Absent is fine — the panel then
-  // renders WOW_REALM as a plain text input. Read once at startup; it's immutable in the image.
-  let realmsJson: string | undefined;
-  try {
-    const realmsFile = Bun.file(new URL("./public/realms.json", import.meta.url));
-    if (await realmsFile.exists()) {
-      realmsJson = await realmsFile.text();
-      console.log("[admin] WOW_REALM chooser data loaded (realms.json)");
-    } else {
-      console.log("[admin] no realms.json — WOW_REALM will be a free-text field");
-    }
-  } catch (err) {
-    console.error(`[admin] couldn't read realms.json (WOW_REALM stays free-text): ${err}`);
-  }
-
   const runBotOps = createRunBotOps(BOT_OPS_SH, { timeoutMs: SUBPROCESS_TIMEOUT_MS });
 
   const rawTeamDomain = process.env.CLOUDFLARE_ACCESS_TEAM_DOMAIN;
@@ -1525,7 +1498,7 @@ if (import.meta.main) {
   // resolveAdminBundleUrl / resolvePluginProxyUrl already constrained the host + path.
   const fetchAdminAsset = makeAdminAssetFetcher(fetch);
 
-  const config: HandlerConfig = { adminToken, indexHtml, realmsJson, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore };
+  const config: HandlerConfig = { adminToken, indexHtml, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore };
   // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
   // restart/env-set request out from under the client while bot-ops.sh is still legitimately
   // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.

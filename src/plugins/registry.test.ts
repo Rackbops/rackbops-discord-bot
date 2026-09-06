@@ -19,7 +19,7 @@ function index(plugins: PluginIndexEntry[]): PluginIndex {
   return { schemaVersion: 1, generatedAt: "2026-09-04T00:00:00.000Z", plugins };
 }
 
-const CORE_COMMANDS = ["dmf", "reset", "status", "report", "update"];
+const CORE_COMMANDS = ["report", "update", "plugins"];
 
 describe("selectPlugins", () => {
   test("selects a plugin present in the index with no collisions", () => {
@@ -47,9 +47,9 @@ describe("selectPlugins", () => {
   });
 
   test("a command colliding with a core command is skipped, naming the command", () => {
-    const idx = index([entry({ name: "clashes-core", commands: ["status"] })]);
+    const idx = index([entry({ name: "clashes-core", commands: ["plugins"] })]);
     const result = selectPlugins(idx, [{ name: "clashes-core" }], 1, CORE_COMMANDS);
-    expect(result[0]!.skipped).toBe('command "status" collides with the core command');
+    expect(result[0]!.skipped).toBe('command "plugins" collides with the core command');
   });
 
   test("a command colliding with an earlier-selected plugin is skipped, naming that plugin", () => {

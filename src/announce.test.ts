@@ -12,7 +12,7 @@ const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements,
 
 describe("tickChecks", () => {
   // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates), then extras.
-  const CORE = ["dmf", "weeklyReset", "realm", "releases", "autoUpdate", "pluginRequests", "pluginUpdates"];
+  const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates"];
 
   test("is the core checks in order, then the extras", () => {
     const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
@@ -61,27 +61,27 @@ describe("announceTo", () => {
   });
 });
 
-// Scoped to runTick's isolation guarantee (issue #43) — not a wider push at #57's broader
-// "no announce/dmf tests" gap. checkDmf/checkWeeklyReset/etc. call real discord.js/Blizzard/
-// GitHub APIs and aren't exported, so this exercises the actual extracted isolation mechanism
-// onTick delegates to, rather than mocking discord.js's Client end-to-end.
+// Scoped to runTick's isolation guarantee (issue #43). The remaining core checks (checkReleases,
+// checkAutoUpdate, and the plugin-request/update passes) call real discord.js / GitHub APIs and aren't
+// exported, so this exercises the actual extracted isolation mechanism onTick delegates to, rather than
+// mocking discord.js's Client end-to-end.
 describe("runTick", () => {
   test("a throwing check doesn't stop the rest from running", async () => {
     const ran: string[] = [];
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
     await runTick([
-      { name: "dmf", run: async () => void ran.push("dmf") },
+      { name: "first", run: async () => void ran.push("first") },
       {
         name: "boom",
         run: async () => {
-          throw new Error("bad DMF_TIMEZONE");
+          throw new Error("kaboom");
         },
       },
-      { name: "realm", run: async () => void ran.push("realm") },
+      { name: "third", run: async () => void ran.push("third") },
     ]);
-    // The crux of the fix: realm still ran despite boom throwing between it and dmf. Asserted
+    // The crux of the fix: "third" still ran despite boom throwing between it and "first". Asserted
     // before mockRestore(), which clears the spy's own call history.
-    expect(ran).toEqual(["dmf", "realm"]);
+    expect(ran).toEqual(["first", "third"]);
     expect(errorSpy).toHaveBeenCalled();
     errorSpy.mockRestore();
   });
@@ -90,13 +90,13 @@ describe("runTick", () => {
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
     await runTick([
       {
-        name: "dmf",
+        name: "first",
         run: async () => {
-          throw new Error("bad DMF_TIMEZONE");
+          throw new Error("kaboom");
         },
       },
     ]);
-    expect(errorSpy.mock.calls[0]?.[0]).toContain("dmf");
+    expect(errorSpy.mock.calls[0]?.[0]).toContain("first");
     errorSpy.mockRestore();
   });
 
@@ -133,7 +133,7 @@ describe("runTick", () => {
 // #52 item 1: without this guard, a second tick starting while the first is still stalled (e.g.
 // a slow Discord send — discord.js retries 3x with a 15s timeout each) can race the same
 // dedup-key check the first tick hasn't written yet, producing a duplicate announcement. Driven
-// directly rather than through checkWeeklyReset (which calls real discord.js), since the guard
+// directly rather than through a real check like checkReleases (which calls real discord.js), since the guard
 // is what actually closes the race for every check that goes through onTick — matching this
 // file's existing pattern of testing the extracted isolation mechanism, not the discord.js-
 // dependent checks themselves.

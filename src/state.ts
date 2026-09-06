@@ -1,7 +1,6 @@
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { config } from "./config";
-import type { RealmStatus } from "./wow/realm";
 
 /**
  * A `/update`-initiated restart, recorded so the bot can tell the requester what build it
@@ -23,9 +22,11 @@ export interface BotState {
   // Seen release ids keyed by `owner/repo`, so watched repos never collide and each seeds
   // its "first poll is silent" backlog independently.
   seenReleaseIds: Record<string, number[]>;
-  dmfAnnouncedFor?: string; // "2026-7"
-  weeklyAnnouncedFor?: string; // ISO timestamp of the reset announced
-  realmStatus?: RealmStatus; // last observed realm status; drives up/down transition announcements
+  // Keys a prior version wrote but the core no longer defines — the WoW dedup keys (dmfAnnouncedFor,
+  // weeklyAnnouncedFor, realmStatus), removed here in #107 now that the wow plugin owns them in its own
+  // data/wow.json — are deliberately NOT re-added above, yet are PRESERVED on disk untouched: loadStateFrom
+  // spreads the raw JSON (`{ ...raw }`) and saveStateTo re-serialises the whole object, so unknown keys
+  // round-trip. A rollback that reintroduces the old core code finds its dedup history intact.
   attemptedUpdateToSha?: string; // sha we last exited to update to; guards against an exit loop
   pendingUpdateReport?: PendingUpdateReport; // /update follow-up owed on next boot; consumed once
 }

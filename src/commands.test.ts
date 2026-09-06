@@ -120,6 +120,17 @@ describe("commandData", () => {
     expect(commandData.map((c) => c.name)).not.toContain("link");
     expect(commandData.map((c) => c.name)).not.toContain("unlink");
   });
+
+  // #107 moved the WoW features into @rackbops/plugin-wow: /dmf /reset /status /transmog are no longer
+  // core (the plugin registers them when loaded). Pin the exact surviving core set so leaving any WoW
+  // builder behind fails here (a leftover handler `case` would instead fail the typecheck — its WoW
+  // imports are gone).
+  test("is exactly the three core commands, with no WoW commands", () => {
+    expect(commandData.map((c) => c.name)).toEqual(["report", "update", "plugins"]);
+    for (const gone of ["dmf", "reset", "status", "transmog"]) {
+      expect(commandData.map((c) => c.name)).not.toContain(gone);
+    }
+  });
 });
 
 describe("handleCommand — plugin dispatch (default case)", () => {
@@ -205,12 +216,14 @@ describe("handleCommand — /plugins", () => {
 });
 
 describe("buildCommandBody — core-only identity", () => {
-  // The framework must not change the core registration body, AND #100's connector removal is pinned
-  // here: with no plugins the built body must equal the captured core JSON MINUS the two connector
-  // commands (fixtures/command-body.main.json was captured pre-#100 with /link + /unlink present).
-  test("with no plugins, the body equals the fixture minus the removed connector commands", () => {
+  // The framework must not change the core registration body, AND the plugin-migration removals are
+  // pinned here: with no plugins the built body must equal the captured full JSON MINUS every command
+  // that is now plugin-provided — the connector's /link + /unlink (#100) and the WoW plugin's
+  // /dmf /reset /status /transmog (#107). fixtures/command-body.main.json is the pre-migration capture.
+  const NOW_PLUGIN_PROVIDED = ["link", "unlink", "dmf", "reset", "status", "transmog"];
+  test("with no plugins, the body equals the fixture minus the now-plugin-provided commands", () => {
     const body = buildCommandBody(config.commandPrefix, commandData, new Map(), { info() {}, warn() {}, error() {} });
-    const expected = coreBodyFixture.filter((c: { name: string }) => c.name !== "link" && c.name !== "unlink");
+    const expected = coreBodyFixture.filter((c: { name: string }) => !NOW_PLUGIN_PROVIDED.includes(c.name));
     expect(body).toEqual(expected);
   });
 });
