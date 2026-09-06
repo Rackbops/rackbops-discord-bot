@@ -782,7 +782,7 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
   });
 
   test("parseChangedKeys pulls string keys from env-set JSON, tolerating anything else", () => {
-    expect(parseChangedKeys('{"changed":["BOT_BRANCH","WOW_REALM"]}')).toEqual(["BOT_BRANCH", "WOW_REALM"]);
+    expect(parseChangedKeys('{"changed":["BOT_BRANCH","REPORT_ROLE_ID"]}')).toEqual(["BOT_BRANCH", "REPORT_ROLE_ID"]);
     expect(parseChangedKeys('{"changed":[]}')).toEqual([]);
     expect(parseChangedKeys("{}")).toEqual([]);
     expect(parseChangedKeys("not json")).toEqual([]);
@@ -823,11 +823,11 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     const auth: Authorization = { via: "bearer" };
     const result: BotOpsResult = {
       exitCode: 1,
-      stdout: '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
+      stdout: '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
       stderr: "",
     };
     expect(auditLogLine(okEnvSet, result, auth)).toBe(
-      "[admin] env-set (changed: WOW_REALM) — recreate FAILED by the ADMIN_TOKEN bearer token",
+      "[admin] env-set (changed: REPORT_ROLE_ID) — recreate FAILED by the ADMIN_TOKEN bearer token",
     );
   });
 
@@ -1235,29 +1235,6 @@ describe("handleRequest", () => {
     expect(res.headers.get("Content-Type")).toContain("text/html");
   });
 
-  test("serves /realms.json unauthenticated when configured", async () => {
-    const realmsJson = '{"regions":{"us":[{"slug":"eitrigg","name":"Eitrigg"}]}}';
-    // No Authorization header — proves the route is served before the auth gate, like the page.
-    const res = await handleRequest(new Request("http://x/realms.json"), {
-      adminToken: TOKEN,
-      indexHtml: INDEX_HTML,
-      realmsJson,
-      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
-    });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe(realmsJson);
-    expect(res.headers.get("Content-Type")).toContain("application/json");
-  });
-
-  test("404s /realms.json when no realm data was generated", async () => {
-    const res = await handleRequest(new Request("http://x/realms.json"), {
-      adminToken: TOKEN,
-      indexHtml: INDEX_HTML,
-      runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
-    });
-    expect(res.status).toBe(404);
-  });
-
   const branchCfg = (overrides: Partial<HandlerConfig> = {}): HandlerConfig => ({
     adminToken: TOKEN,
     indexHtml: INDEX_HTML,
@@ -1489,7 +1466,7 @@ describe("handleRequest", () => {
   });
 
   test("a failed env-set recreate returns its JSON stdout (backup/log), logs an audit line, not the empty stderr (issue #47)", async () => {
-    const stdout = '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+    const stdout = '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
     // Spied rather than left to the pure auditLogLine unit test alone — that only proves the
     // function's own logic, not that handleRequest's failure branch actually calls and logs it
     // (a prior review round mutation-tested this exact wiring by deleting it: the suite stayed
@@ -1500,7 +1477,7 @@ describe("handleRequest", () => {
         new Request("http://x/api/env", {
           method: "POST",
           headers: { Authorization: `Bearer ${TOKEN}` },
-          body: "WOW_REALM=stormrage",
+          body: "REPORT_ROLE_ID=stormrage",
         }),
         {
           adminToken: TOKEN,
@@ -1512,7 +1489,7 @@ describe("handleRequest", () => {
       expect(await res.text()).toBe(stdout);
       expect(res.headers.get("Content-Type")).toBe("application/json");
       expect(logSpy).toHaveBeenCalledWith(
-        "[admin] env-set (changed: WOW_REALM) — recreate FAILED by the ADMIN_TOKEN bearer token",
+        "[admin] env-set (changed: REPORT_ROLE_ID) — recreate FAILED by the ADMIN_TOKEN bearer token",
       );
     } finally {
       logSpy.mockRestore();
@@ -1649,74 +1626,6 @@ describe("handleRequest", () => {
   });
 });
 
-// WOW_REALM slug validation lives in TWO hand-duplicated places: the authority is bot-ops.sh's
-// ALLOWED[WOW_REALM] regex (bash, on the box), mirrored by REALM_SLUG_RE in the panel's index.html
-// (client JS that filters the realm chooser). This block reads both from source and pins them so
-// they can't drift, then pins the behaviour that matters — the accented EU realm slugs Blizzard's
-// connected-realm search only matches in their accented form (its ASCII-folded spelling returns zero
-// results, verified against the live API) must validate; URL/shell-metacharacter and out-of-charset
-// input must not. It runs in JS, so it mirrors bash ERE for this simple pattern rather than proving
-// the bash engine itself — the on-box env-set check does that.
-describe("WOW_REALM slug validation (bot-ops.sh ↔ panel filter stay in sync)", () => {
-  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
-  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const botOpsPattern = botOpsSrc.match(/\[WOW_REALM\]='([^']+)'/)?.[1];
-  const panelPattern = indexSrc.match(/REALM_SLUG_RE\s*=\s*\/(.+?)\/\s*;/)?.[1];
-
-  test("both source patterns are present and identical (mirror can't drift)", () => {
-    expect(botOpsPattern).toBeDefined();
-    expect(panelPattern).toBeDefined();
-    expect(panelPattern).toBe(botOpsPattern);
-  });
-
-  // The 7 EU realms Blizzard only matches by their accented slug, plus plain-ASCII controls.
-  const mustAccept = [
-    "aggra-português",
-    "chants-éternels",
-    "confrérie-du-thorium",
-    "festung-der-stürme",
-    "la-croisade-écarlate",
-    "marécage-de-zangar",
-    "pozzo-delleternità",
-    "eitrigg",
-    "hyjal",
-    "thorium-brotherhood",
-  ];
-  // Whitespace, shell/URL metacharacters, path traversal, uppercase, out-of-charset symbols, empty,
-  // and over-length must never validate — the value is interpolated into a URL and shown in Discord.
-  const mustReject = [
-    "chants eternels",
-    "a&b",
-    "a=b",
-    "a$(x)",
-    "a`x`",
-    "a;b",
-    "a|b",
-    "a/b",
-    "a?b",
-    "a#b",
-    "a%b",
-    "a@b",
-    "a<b",
-    "a>b",
-    "a'b",
-    'a"b',
-    "a\\b",
-    "../etc",
-    "Hyjal",
-    "a÷b",
-    "a×b",
-    "",
-    "x".repeat(41),
-  ];
-
-  test("accepts real accented + ASCII slugs, rejects unsafe / out-of-charset input", () => {
-    const re = new RegExp(botOpsPattern ?? "(?!)");
-    for (const slug of mustAccept) expect(re.test(slug)).toBe(true);
-    for (const bad of mustReject) expect(re.test(bad)).toBe(false);
-  });
-});
-
 // The panel's save path, pinned against the page's OWN source: the pure planEnvSave and saveEnv
 // itself are lifted from index.html (between their ENV_SAVE_PLAN / ENV_SAVE markers) and evaluated
 // here, so what issue #44 hinged on — the POST body carries ONLY the keys whose value changed, never
@@ -1800,7 +1709,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
 
   test("saveEnv POSTs only the changed fields, diffed against the LOADED env, and previews the same", async () => {
     // The issue's exact setup: two stored values the whitelist would reject, both untouched.
-    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "111", ADMIN_USER_IDS: "123456, 234567", WOW_REALM: "stormrage" };
+    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage" };
     const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "222" });
     expect(page.posts).toHaveLength(1);
     const [post] = page.posts;
@@ -1817,7 +1726,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   });
 
   test("saveEnv with nothing changed posts nothing and says so", async () => {
-    const same = { ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" };
+    const same = { ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" };
     const page = await runSaveEnv(same, { ...same });
     expect(page.posts).toEqual([]);
     expect(page.confirms).toEqual([]);
@@ -1825,7 +1734,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   });
 
   test("a declined confirm posts nothing", async () => {
-    const page = await runSaveEnv({ WOW_REGION: "us" }, { WOW_REGION: "eu" }, { confirm: false });
+    const page = await runSaveEnv({ WATCHED_REPOS: "us" }, { WATCHED_REPOS: "eu" }, { confirm: false });
     expect(page.confirms).toHaveLength(1);
     expect(page.posts).toEqual([]);
     expect(page.reloads).toBe(0);
@@ -1833,11 +1742,11 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
 
   test("a rejected save surfaces bot-ops.sh's own message and re-baselines (issue #47)", async () => {
     const page = await runSaveEnv(
-      { WOW_REGION: "us" },
-      { WOW_REGION: "eu" },
-      { response: { ok: false, text: "bot-ops: env-set: value for 'WOW_REGION' is invalid" } },
+      { WATCHED_REPOS: "us" },
+      { WATCHED_REPOS: "eu" },
+      { response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" } },
     );
-    expect(page.msg).toEqual({ textContent: "Failed: bot-ops: env-set: value for 'WOW_REGION' is invalid", className: "msg error" });
+    expect(page.msg).toEqual({ textContent: "Failed: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", className: "msg error" });
     // .env may already have been rewritten even though this particular response is plain text
     // (a die() before any rewrite, in this case) — saveEnv can't tell the difference from the
     // response shape alone, so it re-baselines unconditionally on any failure.
@@ -1846,12 +1755,12 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
 
   test("a failed recreate shows the compose error and backup path, not the raw JSON, and re-baselines (issue #47)", async () => {
     const page = await runSaveEnv(
-      { WOW_REALM: "stormrage" },
-      { WOW_REALM: "orgrimmar" },
+      { REPORT_ROLE_ID: "stormrage" },
+      { REPORT_ROLE_ID: "orgrimmar" },
       {
         response: {
           ok: false,
-          text: '{"ok":false,"changed":["WOW_REALM"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
+          text: '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
         },
       },
     );
@@ -1861,15 +1770,15 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   });
 
   test("the body carries only the keys whose value differs, in field order (not alphabetical)", () => {
-    // WOW_REGION before ANNOUNCE_CHANNEL_ID: bot-ops.sh's own ALLOWED_ORDER puts WOW_REALM/WOW_REGION
-    // ahead of ANNOUNCE_CHANNEL_ID's later cousins, so a real field order is never alphabetical — an
-    // Object.keys(...).sort() mutant must fail this, not just happen to match by coincidence.
-    const loaded = { WOW_REGION: "us", WOW_REALM: "stormrage", ANNOUNCE_CHANNEL_ID: "111", DISCORD_SERVER_ID: "" };
-    const current = { WOW_REGION: "eu", WOW_REALM: "stormrage", ANNOUNCE_CHANNEL_ID: "222", DISCORD_SERVER_ID: "" };
+    // WATCHED_REPOS first though it sorts AFTER ANNOUNCE_CHANNEL_ID: the body must preserve the loaded
+    // field order (env-get emits keys in bot-ops.sh's ALLOWED_ORDER, and the panel keeps that order),
+    // never re-sort — an Object.keys(...).sort() mutant would put ANNOUNCE_CHANNEL_ID first and fail here.
+    const loaded = { WATCHED_REPOS: "acme/one", ANNOUNCE_CHANNEL_ID: "111", DISCORD_SERVER_ID: "" };
+    const current = { WATCHED_REPOS: "acme/two", ANNOUNCE_CHANNEL_ID: "222", DISCORD_SERVER_ID: "" };
     const plan = planEnvSave(loaded, current);
-    expect(plan.body).toBe("WOW_REGION=eu\nANNOUNCE_CHANNEL_ID=222");
+    expect(plan.body).toBe("WATCHED_REPOS=acme/two\nANNOUNCE_CHANNEL_ID=222");
     expect(plan.changes).toEqual([
-      { key: "WOW_REGION", before: "us", now: "eu" },
+      { key: "WATCHED_REPOS", before: "acme/one", now: "acme/two" },
       { key: "ANNOUNCE_CHANNEL_ID", before: "111", now: "222" },
     ]);
   });
@@ -1883,8 +1792,8 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   });
 
   test("a field absent from the loaded env diffs against the empty string", () => {
-    expect(planEnvSave({}, { WOW_REGION: "" }).changes).toEqual([]);
-    expect(planEnvSave({}, { WOW_REGION: "eu" }).changes).toEqual([{ key: "WOW_REGION", before: "", now: "eu" }]);
+    expect(planEnvSave({}, { WATCHED_REPOS: "" }).changes).toEqual([]);
+    expect(planEnvSave({}, { WATCHED_REPOS: "eu" }).changes).toEqual([{ key: "WATCHED_REPOS", before: "", now: "eu" }]);
   });
 
   test("clearing a value is a change (an empty value clears the key back to its default)", () => {
@@ -1905,7 +1814,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   // dialog, not after a failed save — bot-ops.sh's env-set would reject it anyway, but only once
   // the container has already been recreated with the bad value.
   test("blanking a required field is refused before the confirm dialog — nothing is posted", async () => {
-    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" }, { ANNOUNCE_CHANNEL_ID: "", WOW_REGION: "us" });
+    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" }, { ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "us" });
     expect(page.confirms).toEqual([]);
     expect(page.posts).toEqual([]);
     expect(page.msg).toEqual({ textContent: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.", className: "msg error" });
@@ -1913,8 +1822,8 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   });
 
   test("blanking a required field alongside an unrelated valid change blocks the WHOLE save", async () => {
-    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WOW_REGION: "us" }, { ANNOUNCE_CHANNEL_ID: "", WOW_REGION: "eu" });
-    expect(page.posts).toEqual([]); // the WOW_REGION change is not posted either
+    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" }, { ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" });
+    expect(page.posts).toEqual([]); // the WATCHED_REPOS change is not posted either
     expect(page.msg.className).toBe("msg error");
   });
 });
@@ -2078,44 +1987,7 @@ describe("admin panel hasAccessSession (issue #53 item 6: probes via /api/whoami
   });
 });
 
-// DMF_TIMEZONE's shape check is hand-duplicated like WOW_REALM's above: ALLOWED[DMF_TIMEZONE] in
-// bot-ops.sh and TZ_SHAPE_RE in the panel (which filters the datalist so it never offers a zone the
-// server rejects). #69 widened the server side to 3-segment / hyphen / "+" / no-slash zones and the
-// panel's filter was left on the old exactly-one-slash shape, silently under-offering — pinned here
-// so the two can't drift again. filterTimezones (not just TZ_SHAPE_RE) is lifted and called so a
-// filter that stopped applying the regex — or stopped filtering at all — would fail this even
-// though the regex string itself still matched bot-ops.sh's.
-describe("DMF_TIMEZONE shape (bot-ops.sh ↔ panel datalist filter stay in sync)", () => {
-  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
-  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const botOpsPattern = botOpsSrc.match(/\[DMF_TIMEZONE\]='([^']+)'/)?.[1];
-  const filterSrc = indexSrc.match(/\/\/ TZ_FILTER:begin\n([\s\S]*?)\n\s*\/\/ TZ_FILTER:end/)?.[1];
-  const panelPattern = filterSrc?.match(/TZ_SHAPE_RE\s*=\s*new RegExp\("([^"]+)"\)/)?.[1];
-  const filterTimezones = (zones: string[]): string[] =>
-    (new Function(`"use strict";\n${filterSrc ?? ""}\nreturn filterTimezones;`)() as (z: string[]) => string[])(zones);
-
-  test("both source patterns are present and identical (mirror can't drift)", () => {
-    expect(botOpsPattern).toBeDefined();
-    expect(panelPattern).toBeDefined();
-    expect(panelPattern).toBe(botOpsPattern);
-  });
-
-  test("every IANA zone this runtime knows survives filterTimezones, so the datalist offers all of them", () => {
-    const zones: string[] = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : [];
-    expect(zones.length).toBeGreaterThan(300); // a runtime with no zone list would make this vacuous
-    expect(filterTimezones(zones)).toEqual(zones); // nothing real gets dropped
-    const withJunk = [...zones, "Europe/Paris/x/y", "Europe Paris", "a;b", "a$(x)", ""];
-    expect(filterTimezones(withJunk)).toEqual(zones); // and the junk actually gets filtered OUT
-    expect(filterTimezones(["America/Indiana/Indianapolis", "America/Port-au-Prince", "Etc/GMT+1", "UTC"])).toEqual([
-      "America/Indiana/Indianapolis",
-      "America/Port-au-Prince",
-      "Etc/GMT+1",
-      "UTC",
-    ]);
-  });
-});
-
-// Which keys may never be blanked is hand-duplicated like WOW_REALM/DMF_TIMEZONE above: the
+// Which keys may never be blanked is a bot-ops.sh ↔ panel mirror like the others above: the
 // authority is bot-ops.sh's REQUIRED set (env-set refuses an empty value for them, since they have
 // no documented default — issue #45), mirrored by REQUIRED_KEYS in the panel so a blank submit is
 // refused client-side instead of surfacing only after a failed, restart-triggering save.
@@ -2591,7 +2463,7 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
 
 // The admin-tab pure helpers (scopeToPluginKeys, adminTabState) are lifted from index.html between
 // their PLUGIN_ADMIN_HELPERS markers and evaluated here, so the panel's own client logic is pinned in
-// the same suite (the pattern the ENV_SAVE / TZ_FILTER lifts already use).
+// the same suite (the pattern the ENV_SAVE lift already uses).
 describe("plugin admin helpers (lifted from index.html)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const src = indexSrc.match(/\/\/ PLUGIN_ADMIN_HELPERS:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_ADMIN_HELPERS:end/)?.[1];

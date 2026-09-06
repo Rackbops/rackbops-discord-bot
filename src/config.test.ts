@@ -34,10 +34,6 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ ANNOUNCE_CHANNEL_ID: "100" })).toThrow(/DISCORD_TOKEN/);
   });
 
-  test("rejects an invalid WOW_REGION", () => {
-    expect(() => resolveConfig({ ...base, WOW_REGION: "kr" })).toThrow(/WOW_REGION/);
-  });
-
   test("command prefix defaults to empty and passes through when set", () => {
     expect(resolveConfig(base).commandPrefix).toBe("");
     expect(resolveConfig({ ...base, COMMAND_PREFIX: "r_" }).commandPrefix).toBe("r_");
@@ -45,23 +41,6 @@ describe("resolveConfig", () => {
 
   test("rejects an uppercase / invalid COMMAND_PREFIX", () => {
     expect(() => resolveConfig({ ...base, COMMAND_PREFIX: "R_" })).toThrow(/COMMAND_PREFIX/);
-  });
-
-  test("DMF_TIMEZONE defaults per region when unset", () => {
-    expect(resolveConfig(base).dmfTimezone).toBe("America/Los_Angeles");
-    expect(resolveConfig({ ...base, WOW_REGION: "eu" }).dmfTimezone).toBe("Europe/Paris");
-  });
-
-  test("accepts a real multi-segment IANA zone", () => {
-    expect(resolveConfig({ ...base, DMF_TIMEZONE: "America/Argentina/Buenos_Aires" }).dmfTimezone).toBe(
-      "America/Argentina/Buenos_Aires",
-    );
-  });
-
-  // The acceptance bullet itself (issue #43): a shape-plausible but non-existent zone must be
-  // rejected at startup, not left to throw on the first scheduler tick.
-  test("rejects a non-existent DMF_TIMEZONE", () => {
-    expect(() => resolveConfig({ ...base, DMF_TIMEZONE: "Europe/Pari" })).toThrow(/DMF_TIMEZONE/);
   });
 
   test("REPORT_ROLE_ID is optional and passes through", () => {

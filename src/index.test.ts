@@ -37,7 +37,7 @@ describe("index.ts wiring", () => {
     expect(source.slice(0, activateFn)).not.toMatch(/\bimport\(/);
   });
 
-  test("installs+loads plugins inside activate() before rest.put, and activates after the scheduler", () => {
+  test("installs+loads plugins inside activate() before rest.put, and activates before the scheduler", () => {
     const activateFn = source.indexOf("async function activate(");
     const install = source.indexOf("installPlugins(", activateFn);
     const load = source.indexOf("loadPlugins(", activateFn);
@@ -54,7 +54,7 @@ describe("index.ts wiring", () => {
       expect(pos).toBeGreaterThan(-1);
     expect(install).toBeLessThan(restPut); // builders come from the bundles
     expect(load).toBeLessThan(restPut);
-    expect(startSched).toBeLessThan(activatePlugins); // ticks are running-gated before activate resolves
+    expect(activatePlugins).toBeLessThan(startSched); // #107: activate first so the scheduler's first synchronous tick runs plugin ticks (running=true) at boot
     expect(activatePlugins).toBeLessThan(report);
     expect(markReady).toBeLessThan(pluginReport); // report-back clears its marker via the now-live mutator
   });

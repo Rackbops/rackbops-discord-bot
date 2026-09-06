@@ -4,9 +4,6 @@ import type { Client } from "discord.js";
 import { config } from "./config";
 import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
-import { decideDmfAnnouncement } from "./wow/dmf";
-import { lastWeeklyReset } from "./wow/reset";
-import { realmStatus, realmWatchConfigured, decideRealmTransition, type RealmStatus } from "./wow/realm";
 import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
 import { checkForUpdate } from "./update";
 import { restartPending, requestRestart, withCritical } from "./restart";
@@ -18,10 +15,6 @@ import { consumePluginRequests, type PluginRequestDeps } from "./plugins/request
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 
 const TICK_MS = 60 * 1000;
-const RESET_ANNOUNCE_WINDOW_MS = 10 * 60 * 1000;
-// Poll the realm continuously (not only around reset) so an unscheduled outage at any hour is
-// caught. The gap keeps the Blizzard call cadence gentle while still catching short outages.
-const REALM_POLL_GAP_MS = 2 * 60 * 1000;
 
 // Releases publish from a daily cron at 14:00 UTC (.github/workflows/release.yml),
 // so poll only inside a window after it — plus once at startup to catch anything
@@ -35,7 +28,6 @@ const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
 
 let lastReleasePollAt = 0;
 let lastUpdatePollAt = 0;
-let lastRealmPollAt = 0;
 let lastPluginPollAt = 0;
 
 // The plugin-update check must not run until the boot writePluginState (index.ts, after the
@@ -64,11 +56,13 @@ export function startScheduler(client: Client, extraChecks: TickCheck[] = []): v
   setInterval(tick, TICK_MS);
 }
 
-type AnnounceKind = "dmf" | "weeklyReset" | "serverUp" | "serverDown" | "release";
+type AnnounceKind = "release";
 
-// Per-kind channel routing: future announcement kinds plug in here (see issue #528).
-function channelFor(kind: AnnounceKind): string {
-  return kind === "release" ? config.releaseAnnounceChannelId : config.announceChannelId;
+// Per-kind channel routing: the seam future announcement kinds plug into (see issue #528). Only
+// `release` remains a core announcement — the WoW announcements moved to the wow plugin (#107), which
+// posts through host.announce → ANNOUNCE_CHANNEL_ID — so this currently always resolves the release channel.
+function channelFor(_kind: AnnounceKind): string {
+  return config.releaseAnnounceChannelId;
 }
 
 /** Posts `message` to a specific channel, through the bot's own send path. Split out from
@@ -108,21 +102,20 @@ let consecutiveSkips = 0;
 // in-flight one — see the watchdog comment below.
 let tickGeneration = 0;
 
-// None of the checks a tick can reach (Blizzard/GitHub calls in wow/realm.ts, wow/blizzard.ts,
-// github.ts, update.ts) carry a timeout of their own — a genuinely hung socket (connected, but
-// the far end never responds and never closes) leaves `run()` below never settling. Without this
-// bound, that would leave tickInFlight stuck true forever, silently freezing EVERY future tick —
-// not just the one stuck check, all five, since they all now go through this one guard. Generous
-// on purpose: a real tick should finish in well under a minute, even a slow one. Adding a timeout
-// to each individual fetch (closing the hang itself, not just its blast radius here) is tracked
-// as a separate follow-up rather than folded into this fix.
+// None of the checks a tick can reach (GitHub calls in github.ts and update.ts, plus a plugin's own
+// ticks) carry a timeout of their own — a genuinely hung socket (connected, but the far end never
+// responds and never closes) leaves `run()` below never settling. Without this bound, that would leave
+// tickInFlight stuck true forever, silently freezing EVERY future tick — not just the one stuck check,
+// since they all now go through this one guard. Generous on purpose: a real tick should finish in well
+// under a minute, even a slow one. Adding a timeout to each individual fetch (closing the hang itself,
+// not just its blast radius here) is tracked as a separate follow-up rather than folded into this fix.
 const TICK_WATCHDOG_MS = 5 * 60 * 1000;
 
 /**
  * Prevents a tick from starting while the previous one is still running (issue #52 item 1):
  * without this, a stalled send (discord.js retries 3x with a 15s timeout each and waits out a
  * 429's `retry_after`, so a single `announce()` can exceed the 60s tick interval) lets a second
- * tick pass the same dedup-key check (`weeklyAnnouncedFor`, `dmfAnnouncedFor`, `realmStatus`)
+ * tick pass the same dedup-key check (the release `seenReleaseIds`, or a plugin's own dedup state)
  * before the first tick has written it — producing a duplicate announcement.
  *
  * Skips outright rather than queuing, so a merely-slow tick never piles up work — the next tick
@@ -182,9 +175,6 @@ export function resetTickGuardForTest(): void {
  * core names in order, then the extras) is tested directly. */
 export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
   return [
-    { name: "dmf", run: () => checkDmf(client) },
-    { name: "weeklyReset", run: () => checkWeeklyReset(client) },
-    { name: "realm", run: () => checkRealm(client) },
     {
       name: "releases",
       run: async () => {
@@ -308,52 +298,6 @@ function shouldPollReleases(now: Date): boolean {
   );
   const inWindow = now.getTime() >= windowStart && now.getTime() < windowStart + RELEASE_WINDOW_MS;
   return inWindow && now.getTime() - lastReleasePollAt >= RELEASE_POLL_GAP_MS;
-}
-
-async function checkDmf(client: Client): Promise<void> {
-  const decision = decideDmfAnnouncement(new Date(), state.dmfAnnouncedFor);
-  if (!decision) return;
-  const closes = Math.floor(decision.window.end.getTime() / 1000);
-  await announce(client, "dmf", `🎪 The **Darkmoon Faire** is open! It runs until <t:${closes}:F>.`);
-  state.dmfAnnouncedFor = decision.key;
-  await saveState();
-}
-
-async function checkWeeklyReset(client: Client): Promise<void> {
-  const now = new Date();
-  const last = lastWeeklyReset(now);
-  if (now.getTime() - last.getTime() > RESET_ANNOUNCE_WINDOW_MS) return;
-  const key = last.toISOString();
-  if (state.weeklyAnnouncedFor === key) return;
-  await announce(client, "weeklyReset", "📅 **Weekly reset!** Vault, lockouts, and quests have rolled over.");
-  state.weeklyAnnouncedFor = key;
-  await saveState();
-}
-
-// Continuously watch the realm and announce every UP↔DOWN transition, so an outage at any hour
-// is reported — not only weekly-reset maintenance. A Blizzard error is swallowed: it must never
-// masquerade as a DOWN, nor block the rest of the tick.
-async function checkRealm(client: Client): Promise<void> {
-  if (!realmWatchConfigured()) return;
-  if (Date.now() - lastRealmPollAt < REALM_POLL_GAP_MS) return;
-  lastRealmPollAt = Date.now();
-  let status: RealmStatus;
-  try {
-    status = await realmStatus();
-  } catch (err) {
-    console.error("[realm]", err);
-    return;
-  }
-  const transition = decideRealmTransition(state.realmStatus, status);
-  if (transition === "down") {
-    await announce(client, "serverDown", `🔴 **${config.realmSlug}** is down — servers are offline.`);
-  } else if (transition === "up") {
-    await announce(client, "serverUp", `🟢 **${config.realmSlug}** is back up — servers are live!`);
-  }
-  if (state.realmStatus !== status) {
-    state.realmStatus = status;
-    await saveState();
-  }
 }
 
 async function checkReleases(client: Client): Promise<void> {

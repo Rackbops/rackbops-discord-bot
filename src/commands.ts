@@ -6,16 +6,6 @@ import {
 } from "discord.js";
 import { config, REPORT_PROJECTS } from "./config";
 import { handleReportCommand } from "./report";
-import { currentOrNextDmf } from "./wow/dmf";
-import { nextDailyReset, nextWeeklyReset } from "./wow/reset";
-import { realmStatus, realmWatchConfigured } from "./wow/realm";
-import { blizzardConfigured } from "./wow/blizzard";
-import {
-  fetchTransmog,
-  formatTransmogReply,
-  realmSlug,
-  TransmogLookupError,
-} from "./wow/transmog";
 import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./update";
 import { withCritical, requestRestart } from "./restart";
 import { handoffFailureMessage } from "./handoff";
@@ -34,9 +24,6 @@ import {
 } from "./plugins/updates";
 import { HOST_API_VERSION, type PluginCommand, type PluginStateFile } from "./plugins/contract";
 
-const ts = (d: Date, style: "F" | "R" = "F") => `<t:${Math.floor(d.getTime() / 1000)}:${style}>`;
-const when = (d: Date) => `${ts(d)} (${ts(d, "R")})`;
-
 /**
  * /update is gated on an explicit Discord user-ID allowlist rather than a guild role:
  * roles get reassigned and inherited, an ID list only changes when the operator edits
@@ -46,8 +33,8 @@ export function isAdmin(userId: string, adminUserIds: string[]): boolean {
   return adminUserIds.includes(userId);
 }
 
-// COMMAND_PREFIX namespaces the command names (e.g. `r_` → `r_dmf`) so a second debug/staging
-// bot can coexist in the same server. Empty by default → plain `dmf`/`reset`/`status`.
+// COMMAND_PREFIX namespaces the command names (e.g. `r_` → `r_report`) so a second debug/staging
+// bot can coexist in the same server. Empty by default → plain `report`/`update`/`plugins`.
 const prefix = config.commandPrefix;
 
 /** Start a command under the configured prefix. Build every command with this — a hand-written
@@ -64,11 +51,6 @@ export function bareName(commandName: string, p: string = prefix): string {
 }
 
 export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
-  cmd("dmf").setDescription("Darkmoon Faire schedule"),
-  cmd("reset").setDescription("Next daily and weekly reset times"),
-  cmd("status").setDescription(
-    `Realm status${config.realmSlug ? ` for ${config.realmSlug}` : ""}`,
-  ),
   cmd("report")
     .setDescription("File a GitHub issue for a project")
     .addStringOption((o) =>
@@ -77,14 +59,6 @@ export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
         .setDescription("Which project the report is about")
         .setRequired(true)
         .addChoices(...Object.keys(REPORT_PROJECTS).map((k) => ({ name: k, value: k }))),
-    ),
-  cmd("transmog")
-    .setDescription("Get a /customset import string for a character's transmog")
-    .addStringOption((o) =>
-      o.setName("character").setDescription("Character name").setRequired(true),
-    )
-    .addStringOption((o) =>
-      o.setName("realm").setDescription('Realm, e.g. "Argent Dawn"').setRequired(true),
     ),
   cmd("update")
     .setDescription("Restart the bot to pick up the latest build (admins only)")
@@ -135,43 +109,6 @@ export async function handleCommand(
 ): Promise<void> {
   const bare = bareName(interaction.commandName);
   switch (bare) {
-    case "dmf": {
-      const { active, window } = currentOrNextDmf();
-      await interaction.reply(
-        active
-          ? `🎪 The Darkmoon Faire is **open**! It closes ${when(window.end)}.`
-          : `🎪 The Darkmoon Faire opens ${when(window.start)}.`,
-      );
-      return;
-    }
-    case "reset": {
-      await interaction.reply(
-        `🕒 Daily reset: ${when(nextDailyReset())}\n📅 Weekly reset: ${when(nextWeeklyReset())}`,
-      );
-      return;
-    }
-    case "status": {
-      if (!realmWatchConfigured()) {
-        await interaction.reply({
-          content:
-            "Realm status is not configured — set `WOW_REALM`, `BLIZZARD_CLIENT_ID`, and `BLIZZARD_CLIENT_SECRET`.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      await interaction.deferReply();
-      try {
-        const status = await realmStatus();
-        await interaction.editReply(
-          status === "UP"
-            ? `🟢 **${config.realmSlug}** is up.`
-            : `🔴 **${config.realmSlug}** is down.`,
-        );
-      } catch (err) {
-        await interaction.editReply(`⚠️ Could not query realm status: ${(err as Error).message}`);
-      }
-      return;
-    }
     case "update": {
       if (!isAdmin(interaction.user.id, config.adminUserIds)) {
         await interaction.reply({
@@ -205,33 +142,6 @@ export async function handleCommand(
       });
       return;
     }
-    case "transmog": {
-      if (!blizzardConfigured()) {
-        await interaction.reply({
-          content:
-            "Transmog lookup is not configured — set `BLIZZARD_CLIENT_ID` and `BLIZZARD_CLIENT_SECRET`.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
-      const character = interaction.options.getString("character", true);
-      const realm = interaction.options.getString("realm", true);
-      // Deferred: a token refresh plus the profile call can outrun Discord's 3s reply window.
-      await interaction.deferReply();
-      try {
-        const result = await fetchTransmog(character, realm);
-        await interaction.editReply(formatTransmogReply(character, realmSlug(realm), result));
-      } catch (err) {
-        // A lookup error is the user's to act on (wrong name/realm), so it carries its own
-        // wording; anything else is ours and gets the generic shape.
-        await interaction.editReply(
-          err instanceof TransmogLookupError
-            ? `⚠️ ${err.message}`
-            : `⚠️ Transmog lookup failed: ${(err as Error).message}`,
-        );
-      }
-      return;
-    }
     case "report": {
       await handleReportCommand(interaction);
       return;
@@ -263,7 +173,7 @@ export async function handleCommand(
           ]);
           await interaction.editReply(renderPluginsList(state, index, new Date()));
         } catch (err) {
-          // Match the transmog/update deferred convention: a failure edits the deferred reply with an
+          // Match the /update deferred convention: a failure edits the deferred reply with an
           // error rather than leaving the admin's "thinking…" hanging.
           await interaction.editReply(`⚠️ Couldn't list plugins: ${(err as Error).message}`);
         }

@@ -11,12 +11,10 @@ Discord bot for the guild channel: WoW timers and announcements.
 
 ## Features
 
-- **Darkmoon Faire** — `/dmf` shows when the Faire opens/closes; announces in the channel when it opens (first Sunday of each month, computed in realm-local time with DST handled).
-- **Resets** — `/reset` shows the next daily and weekly reset; announces the weekly reset when it happens.
-- **Server status** — continuously polls the Blizzard API for your realm's status and announces whenever it goes **down** or comes back **up** — for any outage, not just weekly-reset maintenance. `/status` checks the realm on demand.
+- **World of Warcraft** — the `wow` plugin (set `PLUGINS=…,wow`): the **Darkmoon Faire** schedule (`/dmf`, plus an announcement when the Faire opens — first Sunday of each month, realm-local with DST handled), daily/weekly **resets** (`/reset`, plus a weekly-reset announcement), and a continuous **realm up/down watch** (`/status` on demand; announces every down/up transition, for any outage — not just weekly maintenance). Also `/transmog` (below). Needs Blizzard API credentials for `/status`, `/transmog`, and the realm watch.
 - **Release notifications** — polls GitHub and announces new releases. Watches `GITHUB_REPO` by default (this fork, `Rackbops/rackbops-discord-bot`), or any list of repos you configure via `WATCHED_REPOS` (e.g. `roshne/ActionBarMaster` too).
 - **Self-update** — `/update` (admins only) builds the latest code and moves the bot onto it, with nothing outside Discord involved. It verifies the new build before retiring the old one, so a bad build leaves the bot running, and messages you with the build it actually landed on. See [Self-update](#self-update).
-- **Transmog import strings** — `/transmog <character> <realm>` returns a `/customset v1 …` string for what a character is wearing, pasteable into `/collected outfit import`. For the characters you *can't* inspect in-game: offline, another realm, or a name someone pasted in chat. Needs the same Blizzard API credentials as realm status. Two caveats it states in every reply: weapon illusions aren't in the profile data, and profile data is a snapshot from the character's **last logout** — so someone online right now reports what they wore last session.
+- **Transmog import strings** (also the `wow` plugin) — `/transmog <character> <realm>` returns a `/customset v1 …` string for what a character is wearing, pasteable into `/collected outfit import`. For the characters you *can't* inspect in-game: offline, another realm, or a name someone pasted in chat. Needs the same Blizzard API credentials as realm status. Two caveats it states in every reply: weapon illusions aren't in the profile data, and profile data is a snapshot from the character's **last logout** — so someone online right now reports what they wore last session.
 - **Issue reports** — `/report` lets members with a configured role file a GitHub issue (Title + Description via a popup form) straight into the mapped project's repo (`wow`, `abm`), labeled `automated` and noting who filed it. The confirmation posts **in the channel the report was filed from**, carrying the title, the description and the issue link, so the channel can see what's been raised.
 - **Character linking** — `/link` mints a one-time code you enter in the Warbandeer desktop app to connect its character data (gear, currencies, and more) to your Discord account; `/unlink` disconnects it. Off by default — see [Character linking](#character-linking).
 
@@ -32,7 +30,7 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
 
    (`2048` = Send Messages. No privileged intents are needed.)
 
-2. **Configure**: copy `.env.example` to `.env` and fill it in. `DISCORD_TOKEN` and `ANNOUNCE_CHANNEL_ID` are required (right-click a channel → Copy Channel ID, with Developer Mode enabled). Set `RELEASE_ANNOUNCE_CHANNEL_ID` to post release notifications to their own channel (optional — they go to `ANNOUNCE_CHANNEL_ID` if unset). Set `WATCHED_REPOS` (comma-separated `owner/repo`) to announce releases from more repos than just this one (e.g. `nazumods/wow,roshne/ActionBarMaster`). A watched repo the bot can't see — misspelled, deleted, or private to its `GITHUB_TOKEN` — is skipped with a single warning rather than failing on every poll, and starts announcing on its own if it later becomes visible. Set `DISCORD_SERVER_ID` so slash commands register instantly. For `/status` and server-up announcements, create a client at <https://develop.battle.net> and set `BLIZZARD_CLIENT_ID`, `BLIZZARD_CLIENT_SECRET`, and `WOW_REALM`. To enable `/report`, set `REPORT_ROLE_ID` (the Discord role allowed to file reports) and give `GITHUB_TOKEN` a PAT with **issues:write** on the reportable repos. To run a second **debug/staging** bot in the same server, set `COMMAND_PREFIX` (e.g. `r_`) so its commands register as `/r_dmf`, `/r_reset`, `/r_status` instead of colliding with the live bot's — lowercase only (Discord rule).
+2. **Configure**: copy `.env.example` to `.env` and fill it in. `DISCORD_TOKEN` and `ANNOUNCE_CHANNEL_ID` are required (right-click a channel → Copy Channel ID, with Developer Mode enabled). Set `RELEASE_ANNOUNCE_CHANNEL_ID` to post release notifications to their own channel (optional — they go to `ANNOUNCE_CHANNEL_ID` if unset). Set `WATCHED_REPOS` (comma-separated `owner/repo`) to announce releases from more repos than just this one (e.g. `nazumods/wow,roshne/ActionBarMaster`). A watched repo the bot can't see — misspelled, deleted, or private to its `GITHUB_TOKEN` — is skipped with a single warning rather than failing on every poll, and starts announcing on its own if it later becomes visible. Set `DISCORD_SERVER_ID` so slash commands register instantly. For the World of Warcraft features (`/dmf`, `/reset`, `/status`, `/transmog`, and the Darkmoon Faire / weekly-reset / realm-watch announcements), set `PLUGINS=…,wow` and configure the wow plugin's keys — `WOW_REGION`, `WOW_REALM`, `DMF_TIMEZONE`, and, for `/status`/`/transmog`/the realm watch, a Blizzard client from <https://develop.battle.net> in `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET`. To enable `/report`, set `REPORT_ROLE_ID` (the Discord role allowed to file reports) and give `GITHUB_TOKEN` a PAT with **issues:write** on the reportable repos. To run a second **debug/staging** bot in the same server, set `COMMAND_PREFIX` (e.g. `r_`) so its commands register as `/r_report`, `/r_update`, `/r_plugins` instead of colliding with the live bot's — lowercase only (Discord rule).
 
 3. **Run** ([Bun](https://bun.sh) required):
 
@@ -204,7 +202,7 @@ settings in the dashboard.
 
 - Announcement state persists in `data/state.json`, so restarts never repeat an announcement.
 - Each watched repo's first release poll seeds silently (no backlog spam); only releases published after that are announced, and each repo tracks what it's seen independently.
-- The server status watch runs continuously (whenever `WOW_REALM` + Blizzard credentials are set), polling every 2 minutes and announcing each up/down transition once. The first reading after a start seeds silently, so a fresh install or restart never posts a phantom up/down.
+- The wow plugin's realm-status watch runs continuously (whenever `WOW_REALM` + Blizzard credentials are set), polling every 2 minutes and announcing each up/down transition once. The first reading after a start seeds silently, so a fresh install or restart never posts a phantom up/down. Its dedup state lives in the plugin's own `data/wow.json`.
 - Releases publish from a daily cron at 14:00 UTC, so GitHub is only polled in a 90-minute window after that (every 5 minutes), plus once at startup to catch anything published while the bot was offline.
 - `COMMAND_PREFIX` lets a second (debug) instance run in the same server: it prefixes every slash-command name (e.g. `r_` → `/r_status`). A second instance needs its own Discord application/token and its own state volume.
 - A filed `/report` is **public in the channel it was filed from** — that's the point of it, so the channel knows what's been raised, but it does mean a report is visible to everyone who can see that channel. `/report` stays role-gated via `REPORT_ROLE_ID`. Only the outcome is public: being refused for a missing role, or for an unconfigured bot, is still shown to you alone. Mentions in a report never ping — an `@everyone` typed into the form renders as text. A description too long for Discord's 2000-character message limit is truncated with a note, and the issue itself always has the full text.
@@ -215,21 +213,16 @@ settings in the dashboard.
 |---|---|
 | `src/index.ts` | Client login, command registration, interaction routing (commands + `/report` modals) |
 | `src/config.ts` | Env config (`.env`); `/report` project→repo map |
-| `src/commands.ts` | `/dmf`, `/reset`, `/status`, `/transmog`, `/update`, `/report`, `/plugins list\|update\|remind\|skip\|cancel` handlers (`/link`/`/unlink` come from the `warbandeer` plugin) |
-| `src/wow/transmog.ts` | `/transmog` — equipment → `/customset` import string, realm slugs, reply text |
-| `src/wow/blizzard.ts` | Shared Blizzard client-credentials token |
+| `src/commands.ts` | `/update`, `/report`, `/plugins list\|update\|remind\|skip\|cancel` handlers (`/dmf`, `/reset`, `/status`, `/transmog` come from the `wow` plugin; `/link`, `/unlink` from `warbandeer`) |
 | `src/report.ts` | `/report` — role gate, modal form, files a GitHub issue, announces it in the channel |
-| `src/announce.ts` | Scheduler tick: DMF/reset/release announcements, realm watch |
+| `src/announce.ts` | Scheduler tick: release announcements + plugin ticks (the DMF/reset/realm announcements are the `wow` plugin's now) |
 | `src/update.ts` | Self-update: staleness check against the bot's newest commit |
 | `src/redeploy.ts` | The swap: builds the new image, starts the replacement, hands over |
 | `src/handoff.ts` | Standby/verify/retire protocol shared by both instances |
 | `src/docker.ts` | Docker Engine API client over the daemon socket |
 | `src/updateReport.ts` | The follow-up after a `/update` restart: which build it came back on |
 | `src/restart.ts` | Graceful restart, deferred past in-flight announcements |
-| `src/state.ts` | Announcement dedup state (`data/state.json`) |
-| `src/wow/dmf.ts` | Darkmoon Faire schedule math (timezone-correct) |
-| `src/wow/reset.ts` | Daily/weekly reset math per region |
-| `src/wow/realm.ts` | Blizzard OAuth + connected-realm status |
+| `src/state.ts` | Release-announcement dedup state (`data/state.json`) |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
 | `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), handed to plugins as `HostApi.storage`/`dataDir` |
 | `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |

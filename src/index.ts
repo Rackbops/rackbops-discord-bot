@@ -153,11 +153,14 @@ async function activate(c: Client<true>): Promise<void> {
     }
   });
 
-  startScheduler(client, pluginTicks(loadResult.loaded, console));
-
-  // Activate plugins AFTER the scheduler is up (pluginTicks are running-gated, so a tick that fires
-  // before this resolves is skipped) — a throwing activate() is isolated, never crashing the bot.
+  // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
+  // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
+  // the core WoW checks used to make on that first synchronous tick (the wow plugin owns them now, #107).
+  // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
+  // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
+
+  startScheduler(client, pluginTicks(loadResult.loaded, console));
   try {
     await writePluginState({
       dataDir: DATA_DIR,

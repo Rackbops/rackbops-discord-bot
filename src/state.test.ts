@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { BotState } from "./state";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time), so
 // prime the required vars before pulling the module in — see config.test.ts.
@@ -49,11 +50,19 @@ describe("loadStateFrom / saveStateTo / createStateWriter", () => {
     expect(result).toEqual({ seenReleaseIds: {} });
   });
 
-  test("a well-formed file round-trips through saveStateTo/loadStateFrom", async () => {
+  test("preserves unknown/legacy keys (e.g. a removed feature's dedup key) across load→save", async () => {
     const file = join(dir, "state.json");
-    await saveStateTo(file, { seenReleaseIds: { "nazumods/wow": [1, 2, 3] }, dmfAnnouncedFor: "2026-7" });
+    // `dmfAnnouncedFor` is a legacy WoW key the core no longer defines (#107) — it must round-trip
+    // untouched (the additive-migration guarantee). Typed through a Record so the compiler allows the
+    // now-unknown key while the runtime value is asserted below. Dropping loadStateFrom's `{ ...raw }`
+    // spread — or saveStateTo re-serialising the whole object — would lose it and turn this red.
+    const payload: BotState & Record<string, unknown> = {
+      seenReleaseIds: { "nazumods/wow": [1, 2, 3] },
+      dmfAnnouncedFor: "2026-7",
+    };
+    await saveStateTo(file, payload);
     const result = await loadStateFrom(file);
-    expect(result).toEqual({ seenReleaseIds: { "nazumods/wow": [1, 2, 3] }, dmfAnnouncedFor: "2026-7" });
+    expect(result).toEqual(payload); // the legacy dmfAnnouncedFor survives the round-trip untouched
   });
 
   test("an empty file loads as fresh state, logs a warning, and is moved aside — not a throw", async () => {
