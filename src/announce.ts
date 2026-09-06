@@ -82,7 +82,7 @@ async function announce(client: Client, kind: AnnounceKind, message: string): Pr
 /**
  * Runs each check in order, isolating failures so one throwing can't starve the rest of the tick
  * (issue #43) — the same per-item try/catch shape `checkReleases` already uses per repo, now
- * applied across all five checks instead of just that one. Exported so the isolation itself is
+ * applied across every check the scheduler runs instead of just that one. Exported so the isolation itself is
  * tested directly, without mocking discord.js's `Client` end-to-end.
  */
 export async function runTick(checks: TickCheck[]): Promise<void> {

@@ -123,7 +123,8 @@ describe("commandData", () => {
 
   // #107 moved the WoW features into @rackbops/plugin-wow: /dmf /reset /status /transmog are no longer
   // core (the plugin registers them when loaded). Pin the exact surviving core set so leaving any WoW
-  // builder or handler case behind fails here.
+  // builder behind fails here (a leftover handler `case` would instead fail the typecheck — its WoW
+  // imports are gone).
   test("is exactly the three core commands, with no WoW commands", () => {
     expect(commandData.map((c) => c.name)).toEqual(["report", "update", "plugins"]);
     for (const gone of ["dmf", "reset", "status", "transmog"]) {

@@ -2409,7 +2409,7 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124)", () => {
 
   test("handleRequest serves the bundle route BEFORE the /api/ gate (no token needed)", async () => {
     const res = await handleRequest(new Request("http://x/plugin-admin/warbandeer.js"), cfg());
-    expect(res.status).toBe(200); // same public layer as / and /realms.json
+    expect(res.status).toBe(200); // same public layer as / — served before the /api/ auth gate
   });
   test("handleRequest gates the proxy route behind auth (401 without a token)", async () => {
     const res = await handleRequest(new Request("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), cfg());
