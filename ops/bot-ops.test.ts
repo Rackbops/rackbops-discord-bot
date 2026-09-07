@@ -63,6 +63,11 @@ function setup(
      *  - "gone": fully removed. Matches neither.
      *  Ignored unless nextRunning is set. */
     originalState?: "running" | "stopped" | "gone";
+    /** cmd_status's single `docker ps -a --filter ... --format '{{.State}}\t{{.Status}}\t{{.Image}}'`
+     *  call (#59/#143) — matched on the literal `{{.State}}` template text, distinct from the
+     *  `{{.Names}}`-format `ps` calls `nextRunning`/`originalState` simulate. Absent → the shim
+     *  prints nothing, same as a `status` call against a container that doesn't exist. */
+    containerMeta?: { state: string; status: string; image: string };
     /** Fixture JSON the fake `docker exec … cat` returns for the bot's cached Plugin Index
      *  (`/app/data/plugins/index.json` — the CachedPluginIndex wrapper `{writtenAt, index}`) and
      *  Plugin State (`/app/data/plugins/state.json`). Absent → the shim prints nothing for that
@@ -120,6 +125,16 @@ function setup(
             `  printf '%s\\n' "probe-container-next"`,
             `elif [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container"* ]]; then`,
             `  if ${answersCanonicalQuery}; then printf '%s\\n' "probe-container"; fi`,
+            `fi`,
+          ].join("\n")
+        : "",
+      // cmd_status's one-shot metadata read — matched on the `{{.State}}` template text, which is
+      // unique to that call (the swap-guard's `ps` queries above use `{{.Names}}`). Not meant to be
+      // combined with nextRunning in the same fixture (no test needs both).
+      opts.containerMeta
+        ? [
+            `if [[ "$1" == "ps" ]] && [[ "$*" == *'{{.State}}'* ]]; then`,
+            `  printf '%s\\t%s\\t%s\\n' ${JSON.stringify(opts.containerMeta.state)} ${JSON.stringify(opts.containerMeta.status)} ${JSON.stringify(opts.containerMeta.image)}`,
             `fi`,
           ].join("\n")
         : "",
@@ -910,6 +925,36 @@ describe.skipIf(!runnable)("bot-ops.sh status includes the plugin state (#101)",
     const run = await botOps(fx, ["status"]);
     expect(run.exitCode).toBe(0);
     expect(run.json?.plugins).toEqual([]);
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh status reads running/status/image from one docker ps call (#59/#143)", () => {
+  test("one `ps -a --filter` call covers running/status/image — no `docker inspect` at all", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      containerMeta: { state: "running", status: "Up 3 hours", image: "ghcr.io/rackbops/bot:abc123" },
+    });
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ running: true, status: "Up 3 hours", image: "ghcr.io/rackbops/bot:abc123" });
+    const psCalls = dockerCalls(fx).filter((c) => c.startsWith("docker ps"));
+    expect(psCalls).toHaveLength(1); // was 1 `ps` + 2 `inspect` before #143
+    expect(dockerCalls(fx).some((c) => c.startsWith("docker inspect"))).toBe(false);
+  });
+
+  test("a stopped container: running is false, the human status string still comes through", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      containerMeta: { state: "exited", status: "Exited (0) 2 hours ago", image: "ghcr.io/rackbops/bot:old" },
+    });
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ running: false, status: "Exited (0) 2 hours ago", image: "ghcr.io/rackbops/bot:old" });
+  });
+
+  test("container absent: running false, status/image empty, no crash", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n"); // no containerMeta fixture — shim answers nothing
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ running: false, status: "", image: "" });
   });
 });
 

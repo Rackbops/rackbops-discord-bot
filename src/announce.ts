@@ -360,9 +360,11 @@ export async function commitReleaseAnnouncements(
 ): Promise<void> {
   const { toAnnounce, nextSeen } = decideReleaseAnnouncements(releases, seen);
   if (toAnnounce.length === 0) {
-    // Nothing to post — still commit nextSeen: covers the first-poll seed (seen was undefined,
-    // so nextSeen is the full current list) and the ordinary no-new-releases case.
-    await deps.persist(nextSeen);
+    // Nothing to post. Persist only on the genuine first-poll seed (seen was undefined, so
+    // nextSeen is the full current list, worth recording once) — the ordinary no-new-releases
+    // case has nextSeen content-identical to seen (decideReleaseAnnouncements above), so saving
+    // it would just be a state.json rewrite for zero information gain, every ~5 min, per repo.
+    if (seen === undefined) await deps.persist(nextSeen);
     return;
   }
   const committed = [...(seen ?? [])];
