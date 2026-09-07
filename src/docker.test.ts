@@ -137,4 +137,9 @@ describe("daemon calls", () => {
     stub(() => new Response("boom", { status: 500 }));
     await expect(stopContainer("abc")).rejects.toThrow("docker stop abc failed: 500");
   });
+
+  test("a real remove failure still throws", async () => {
+    stub(() => new Response("boom", { status: 500 }));
+    await expect(removeContainer("abc")).rejects.toThrow("docker rm abc failed: 500");
+  });
 });
