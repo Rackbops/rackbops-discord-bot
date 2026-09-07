@@ -178,7 +178,7 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
     {
       name: "releases",
       run: async () => {
-        if (shouldPollReleases(new Date())) await checkReleases(client);
+        if (shouldPollReleases(new Date(), lastReleasePollAt)) await checkReleases(client);
       },
     },
     {
@@ -288,8 +288,8 @@ export function livePluginRequestDeps(): PluginRequestDeps {
   };
 }
 
-function shouldPollReleases(now: Date): boolean {
-  if (lastReleasePollAt === 0) return true; // startup catch-up
+export function shouldPollReleases(now: Date, lastPollAt: number): boolean {
+  if (lastPollAt === 0) return true; // startup catch-up
   const windowStart = Date.UTC(
     now.getUTCFullYear(),
     now.getUTCMonth(),
@@ -297,7 +297,7 @@ function shouldPollReleases(now: Date): boolean {
     RELEASE_CRON_HOUR_UTC,
   );
   const inWindow = now.getTime() >= windowStart && now.getTime() < windowStart + RELEASE_WINDOW_MS;
-  return inWindow && now.getTime() - lastReleasePollAt >= RELEASE_POLL_GAP_MS;
+  return inWindow && now.getTime() - lastPollAt >= RELEASE_POLL_GAP_MS;
 }
 
 async function checkReleases(client: Client): Promise<void> {
