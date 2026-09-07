@@ -7,8 +7,15 @@ import type { TickCheck } from "./plugins/contract";
 // prime the required vars before pulling the module in — see config.test.ts.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { runTick, guardedTick, resetTickGuardForTest, commitReleaseAnnouncements, tickChecks, announceTo } =
-  await import("./announce");
+const {
+  runTick,
+  guardedTick,
+  resetTickGuardForTest,
+  commitReleaseAnnouncements,
+  tickChecks,
+  announceTo,
+  shouldPollReleases,
+} = await import("./announce");
 
 describe("tickChecks", () => {
   // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates), then extras.
@@ -27,6 +34,41 @@ describe("tickChecks", () => {
   test("pluginRequests drains the mailbox before pluginUpdates notifies/schedules", () => {
     const names = tickChecks({} as unknown as Client, []).map((c) => c.name);
     expect(names.indexOf("pluginRequests")).toBeLessThan(names.indexOf("pluginUpdates"));
+  });
+});
+
+// The release window is [14:00:00.000, 15:30:00.000) UTC (RELEASE_CRON_HOUR_UTC=14,
+// RELEASE_WINDOW_MS=90min); RELEASE_POLL_GAP_MS is 5min. lastPollAt is passed in (not read off
+// module state) so every boundary can be pinned directly — see the src/announce.ts refactor.
+describe("shouldPollReleases", () => {
+  const WINDOW_START = Date.UTC(2026, 0, 1, 14, 0, 0, 0);
+  const WINDOW_END = Date.UTC(2026, 0, 1, 15, 30, 0, 0);
+  const FAR_PAST = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+
+  test("startup catch-up: lastPollAt = 0 is always true, even outside the window", () => {
+    expect(shouldPollReleases(new Date(Date.UTC(2026, 0, 1, 10, 0, 0, 0)), 0)).toBe(true);
+  });
+
+  test("top of the window (14:00:00.000) is true", () => {
+    expect(shouldPollReleases(new Date(WINDOW_START), FAR_PAST)).toBe(true);
+  });
+
+  test("tail of the window (15:29:59.999) is true", () => {
+    expect(shouldPollReleases(new Date(WINDOW_END - 1), FAR_PAST)).toBe(true);
+  });
+
+  test("just past the window (15:30:00.000) is false", () => {
+    expect(shouldPollReleases(new Date(WINDOW_END), FAR_PAST)).toBe(false);
+  });
+
+  test("in-window but the gap hasn't elapsed is false", () => {
+    const now = WINDOW_START + 10 * 60 * 1000;
+    expect(shouldPollReleases(new Date(now), now - 1 * 60 * 1000)).toBe(false);
+  });
+
+  test("in-window with the gap exactly elapsed is true", () => {
+    const now = WINDOW_START + 10 * 60 * 1000;
+    expect(shouldPollReleases(new Date(now), now - 5 * 60 * 1000)).toBe(true);
   });
 });
 
