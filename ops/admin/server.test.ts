@@ -2018,8 +2018,8 @@ describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
 
   test("BOT_BRANCH: panel's BRANCH_NAME_RE matches bot-ops.sh's ALLOWED regex", () => {
     const botOpsBranchRe = botOpsSrc.match(/\[BOT_BRANCH\]='([^']*)'/)?.[1];
-    // Greedy, not lazy: the regex literal's own character class contains a `/`
-    // ([A-Za-z0-9._/-]), which a lazy match would stop at instead of the line's real end.
+    // Greedy: defensive against a future BRANCH_NAME_RE whose character class embeds a literal
+    // "/;" — today's `/` is followed by `-`, so lazy would happen to land here too.
     const panelBranchRe = indexSrc.match(/const BRANCH_NAME_RE = \/(.+)\/;/)?.[1];
     expect(botOpsBranchRe).toBeTruthy();
     expect(panelBranchRe).toBe(botOpsBranchRe);
