@@ -41,22 +41,29 @@ describe("index.ts wiring", () => {
     const activateFn = source.indexOf("async function activate(");
     const install = source.indexOf("installPlugins(", activateFn);
     const load = source.indexOf("loadPlugins(", activateFn);
-    const restPut = source.indexOf("rest.put(", activateFn);
-    const startSched = source.indexOf("startScheduler(client", activateFn);
+    const interactionOn = source.indexOf("client.on(Events.InteractionCreate", activateFn);
     const activatePlugins = source.indexOf("await activatePlugins(", activateFn);
+    const startSched = source.indexOf("startScheduler(client", activateFn);
+    const restPut = source.indexOf("rest.put(", activateFn);
     const report = source.indexOf("reportUpdateOutcome(", activateFn);
     // #104: the plugin update-report call. "reportUpdateOutcome(" is NOT a substring of
     // "reportPluginUpdateOutcome(" (…report P lugin…, not …report U pdate…), so the scan above finds
     // the /update report, and this finds the plugin one.
     const markReady = source.indexOf("markPluginStateReady(", activateFn);
     const pluginReport = source.indexOf("reportPluginUpdateOutcome(", activateFn);
-    for (const pos of [install, load, restPut, startSched, activatePlugins, report, markReady, pluginReport])
+    for (const pos of [install, load, interactionOn, activatePlugins, startSched, restPut, report, markReady, pluginReport])
       expect(pos).toBeGreaterThan(-1);
     expect(install).toBeLessThan(restPut); // builders come from the bundles
     expect(load).toBeLessThan(restPut);
     expect(activatePlugins).toBeLessThan(startSched); // #107: activate first so the scheduler's first synchronous tick runs plugin ticks (running=true) at boot
     expect(activatePlugins).toBeLessThan(report);
     expect(markReady).toBeLessThan(pluginReport); // report-back clears its marker via the now-live mutator
+    // #59/#143: neither the interaction handler nor plugin activation/the scheduler depends on
+    // command registration having completed — attaching/starting them first cuts the "no handler,
+    // no ticks" window (worst on a self-update handoff) by the rest.put round-trip.
+    expect(interactionOn).toBeLessThan(restPut);
+    expect(activatePlugins).toBeLessThan(restPut);
+    expect(startSched).toBeLessThan(restPut);
   });
 
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {

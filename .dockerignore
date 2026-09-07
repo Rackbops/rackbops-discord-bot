@@ -6,3 +6,4 @@ data/
 *.md
 Dockerfile
 docker-compose.yml
+**/*.test.ts

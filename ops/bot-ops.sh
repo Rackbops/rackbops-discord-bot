@@ -335,10 +335,17 @@ load_plugin_keys() {
 
 cmd_status() {
   need docker; need jq
-  local running status image realm plugins
-  running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || echo false)"
-  status="$(docker ps -a --filter "name=^/${CONTAINER}$" --format '{{.Status}}' 2>/dev/null || true)"
-  image="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
+  local ps_line ps_state status image running realm plugins
+  # One `docker ps` covers all three container-metadata fields: its `.State` is the same short
+  # word `docker inspect -f '{{.State.Running}}'`/`.State.Status` gave, and `.Image` the same
+  # reference `docker inspect -f '{{.Config.Image}}'` gave — so this replaces two `docker inspect`
+  # calls, not just reads alongside them. `.Status` (kept as-is) is the human uptime string
+  # (ops/admin/public/index.html renders it verbatim as "Container") that `.State` does NOT carry,
+  # so it's not dropped as "redundant" the way #59 originally suggested (#59/#143).
+  ps_line="$(docker ps -a --filter "name=^/${CONTAINER}$" \
+              --format '{{.State}}'$'\t''{{.Status}}'$'\t''{{.Image}}' 2>/dev/null || true)"
+  IFS=$'\t' read -r ps_state status image <<<"$ps_line"
+  [ "$ps_state" = "running" ] && running=true || running=false
   # Best-effort: the persisted last-observed realm status. Since #107 the wow plugin owns it in its own
   # data/wow.json; fall back to the legacy state.json copy (frozen there) for an instance still on an
   # older bot or not yet running the wow plugin. May be absent on a fresh install.

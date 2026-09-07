@@ -407,7 +407,7 @@ describe("commitReleaseAnnouncements", () => {
     expect(persisted).toEqual([2, 1]);
   });
 
-  test("no new releases still persists (a harmless no-op save), nothing announced", async () => {
+  test("no new releases and seen already known: no save at all — nextSeen would be identical", async () => {
     const releases = [release(1)];
     const announced: number[] = [];
     let persisted: number[] | undefined;
@@ -416,6 +416,6 @@ describe("commitReleaseAnnouncements", () => {
       persist: async (seen) => void (persisted = seen),
     });
     expect(announced).toEqual([]);
-    expect(persisted).toEqual([1]);
+    expect(persisted).toBeUndefined(); // #59/#143: was a provable no-op write every poll
   });
 });

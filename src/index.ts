@@ -113,6 +113,32 @@ async function activate(c: Client<true>): Promise<void> {
     console.error("[plugins] plugin setup failed — the bot starts core-only", err);
   }
 
+  // Attach the interaction handler and bring plugins/the scheduler live BEFORE registering slash
+  // commands with Discord: neither depends on that REST round-trip (commandMap/loadResult are
+  // already populated above), so doing it first used to leave the bot with no interaction handler
+  // and no ticks for the length of one Discord API call, on every boot — worst on a self-update,
+  // where takeOver() has already stopped the original and this delay lands inside the no-bot window.
+  client.on(Events.InteractionCreate, async (interaction) => {
+    try {
+      if (interaction.isChatInputCommand()) {
+        await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
+      } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
+        await handleReportModal(interaction);
+      }
+    } catch (err) {
+      console.error("[interaction]", err);
+    }
+  });
+
+  // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
+  // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
+  // the core WoW checks used to make on that first synchronous tick (the wow plugin owns them now, #107).
+  // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
+  // pluginTicks' running-gate is kept as defence in depth.
+  await activatePlugins(loadResult.loaded, console);
+
+  startScheduler(client, pluginTicks(loadResult.loaded, console));
+
   try {
     await rest.put(
       config.guildId
@@ -141,26 +167,6 @@ async function activate(c: Client<true>): Promise<void> {
     );
   }
 
-  client.on(Events.InteractionCreate, async (interaction) => {
-    try {
-      if (interaction.isChatInputCommand()) {
-        await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
-      } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
-        await handleReportModal(interaction);
-      }
-    } catch (err) {
-      console.error("[interaction]", err);
-    }
-  });
-
-  // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
-  // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
-  // the core WoW checks used to make on that first synchronous tick (the wow plugin owns them now, #107).
-  // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
-  // pluginTicks' running-gate is kept as defence in depth.
-  await activatePlugins(loadResult.loaded, console);
-
-  startScheduler(client, pluginTicks(loadResult.loaded, console));
   try {
     await writePluginState({
       dataDir: DATA_DIR,
