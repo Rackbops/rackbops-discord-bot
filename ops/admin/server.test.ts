@@ -2008,6 +2008,33 @@ describe("REQUIRED keys (bot-ops.sh ↔ panel REQUIRED_KEYS stay in sync)", () =
   });
 });
 
+// BOT_BRANCH and AUTO_UPDATE are two more bot-ops.sh ↔ panel mirrors like REQUIRED_KEYS above:
+// bot-ops.sh's ALLOWED regex is the authority (env-set's format check), and the panel hardcodes
+// its own copy for client-side validation/options — nothing pins the two together, so either side
+// can drift silently.
+describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
+  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("BOT_BRANCH: panel's BRANCH_NAME_RE matches bot-ops.sh's ALLOWED regex", () => {
+    const botOpsBranchRe = botOpsSrc.match(/\[BOT_BRANCH\]='([^']*)'/)?.[1];
+    // Greedy, not lazy: the regex literal's own character class contains a `/`
+    // ([A-Za-z0-9._/-]), which a lazy match would stop at instead of the line's real end.
+    const panelBranchRe = indexSrc.match(/const BRANCH_NAME_RE = \/(.+)\/;/)?.[1];
+    expect(botOpsBranchRe).toBeTruthy();
+    expect(panelBranchRe).toBe(botOpsBranchRe);
+  });
+
+  test("AUTO_UPDATE: panel's select options match bot-ops.sh's ALLOWED alternation", () => {
+    const botOpsAlternation = botOpsSrc.match(/\[AUTO_UPDATE\]='\^\(([^)]+)\)\$'/)?.[1];
+    const botOpsOptions = (botOpsAlternation ?? "").split("|").sort();
+    const panelOptionsSrc = indexSrc.match(/AUTO_UPDATE:\s*\{[^}]*options:\s*(\[[^\]]*\])/)?.[1];
+    const panelOptions = (JSON.parse(panelOptionsSrc ?? "[]") as string[]).sort();
+    expect(botOpsOptions.length).toBeGreaterThan(0);
+    expect(panelOptions).toEqual(botOpsOptions);
+  });
+});
+
 describe("parsePluginIndex (#102)", () => {
   test("parses a valid raw index (top-level .plugins)", () => {
     const idx = parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0" }] }));
