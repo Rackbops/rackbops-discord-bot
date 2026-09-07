@@ -41,6 +41,8 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
 
    `bun run dev` restarts on file changes; `bun run check` typechecks.
 
+   The `ops/admin` panel is a separate package with its own dependencies — run `cd ops/admin && bun install` too if you plan to run its test suite (`bun test` from the repo root covers both projects' suites once both are installed; CI does the same two installs).
+
    Or with **Docker**, from this checkout (reads the same `.env`; state persists in a named volume):
 
    ```
