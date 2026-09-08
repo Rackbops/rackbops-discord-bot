@@ -191,14 +191,12 @@ export async function redeploy(
   // retirement wait (item 3) without actually waiting out the real 3-minute deadline.
   retirementOpts: { deadlineMs?: number; pollMs?: number } = {},
 ): Promise<RedeployResult> {
-  beginHandoff(`redeploy -> ${latestSha.slice(0, 7)}`);
   await clearMarker();
 
   let self: ContainerInspect;
   try {
     self = await inspectSelf();
   } catch (err) {
-    endHandoff();
     return { error: `could not inspect own container: ${(err as Error).message}` };
   }
 
@@ -214,8 +212,9 @@ export async function redeploy(
   }).catch((err) => ({ ok: false, error: (err as Error).message }));
 
   if (!built.ok) {
-    // A failed build is inert: nothing has been created, so there is nothing to unwind.
-    endHandoff();
+    // A failed build is inert: nothing has been created, so there is nothing to unwind — and the
+    // scheduler was never quiesced (beginHandoff runs only just before the create below), so it
+    // keeps announcing right through a wedged or failed build.
     return { error: `build failed: ${built.error ?? "unknown error"}` };
   }
   await pruneOldImages(self.Config.Image);
@@ -228,6 +227,11 @@ export async function redeploy(
     .catch(() => []);
 
   const name = replacementName(self.Name);
+  // Quiesce the scheduler now, not before the build: only the create→verify window needs the
+  // scheduler quiet (the replacement shares the state volume once it exists), and the build —
+  // now the one long, timeout-bounded call — writes nothing, so pausing announcements through it
+  // bought nothing but an outage risk if it wedged (#130).
+  beginHandoff(`redeploy -> ${latestSha.slice(0, 7)}`);
   let replacementId: string | undefined;
   try {
     await removeContainer(name, true); // a leftover from an earlier failed attempt
@@ -518,12 +522,11 @@ export async function redeployAvailable(): Promise<boolean> {
 }
 
 /** How long `resolveBootMode` waits on the one daemon call it makes before `client.login()` is
- *  even attempted. `docker.ts` carries no timeout of its own on any call, and this is the first
- *  place a hung (not merely erroring) daemon socket could block *boot itself* rather than
- *  something already gated behind a successful gateway login — bounded here so that case falls
- *  through to the same "can't confirm" handling as any other inspect failure, instead of hanging
- *  forever. Comfortably under `VERIFY_DEADLINE_MS` (90s), so it can't meaningfully eat into that
- *  budget on a boot that turns out to be a genuine handoff. */
+ *  even attempted. `docker.ts` now bounds every call (`DEFAULT_TIMEOUT_MS`, 60s); this keeps a
+ *  tighter bound on the first daemon dependency on the path *before* a gateway login, so a hung
+ *  (not merely erroring) socket falls through to the same "can't confirm" handling as any other
+ *  inspect failure without eating 60s of boot. Comfortably under `VERIFY_DEADLINE_MS` (90s), so it
+ *  can't meaningfully eat into that budget on a boot that turns out to be a genuine handoff. */
 const RESOLVE_BOOT_MODE_TIMEOUT_MS = 10_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {

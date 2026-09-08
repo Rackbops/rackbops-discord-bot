@@ -66,12 +66,12 @@ describe("parseBuildOutput", () => {
 
 describe("daemon calls", () => {
   const realFetch = globalThis.fetch;
-  let calls: { url: string; method: string }[] = [];
+  let calls: { url: string; method: string; signal?: AbortSignal }[] = [];
 
   const stub = (impl: (url: string, init?: RequestInit) => Response) => {
     calls = [];
     globalThis.fetch = ((url: string, init?: RequestInit & { unix?: string }) => {
-      calls.push({ url: String(url), method: init?.method ?? "GET" });
+      calls.push({ url: String(url), method: init?.method ?? "GET", signal: init?.signal ?? undefined });
       return Promise.resolve(impl(String(url), init));
     }) as unknown as typeof fetch;
   };
@@ -105,6 +105,38 @@ describe("daemon calls", () => {
     expect(decodeURIComponent(url)).toContain("t=img:latest");
     expect(decodeURIComponent(url)).toContain("t=img:abc1234");
     expect(decodeURIComponent(url)).toContain('buildargs={"GIT_SHA":"abc1234"}');
+  });
+
+  // #130: every daemon call carries an AbortSignal at the api() funnel so a hung socket fails
+  // cleanly instead of leaving redeploy()'s await unsettled forever.
+  test("buildImage attaches an abort signal to the daemon request", async () => {
+    stub(() => new Response('{"stream":"done"}', { status: 200 }));
+    await buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} });
+    expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  // buildImage owns its own signal (it has to span the streamed body read); this pins the OTHER
+  // branch — the api() funnel's own default bound, which is what covers every remaining call.
+  test("an ordinary daemon call carries an abort signal too, not just the build", async () => {
+    stub(() => new Response("", { status: 204 }));
+    await stopContainer("abc");
+    expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(calls[0]!.signal!.aborted).toBe(false); // bounded, but not already spent
+  });
+
+  // The signal has to actually abort a stuck call — not just be attached. A stub that never
+  // resolves unless the signal fires stands in for a wedged dockerd; buildImage's own tiny
+  // timeout override lets this run without waiting out the real 15-min bound.
+  test("buildImage rejects when the build exceeds its timeout instead of hanging forever", async () => {
+    globalThis.fetch = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+        );
+      })) as unknown as typeof fetch;
+    await expect(
+      buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
+    ).rejects.toThrow();
   });
 
   // The Engine API wants repo and tag as separate query params, not one combined "repo:tag"

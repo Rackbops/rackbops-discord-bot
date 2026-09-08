@@ -343,10 +343,11 @@ describe("checkForUpdate — concurrent calls before any handoff begins (#51 ite
     }) as typeof fetch;
   }
 
-  // `handoffActive()` alone doesn't read true until `redeploy()`'s own `beginHandoff()` — its
-  // first line — so a second call fired while the first is still mid-flight (two GitHub fetches,
-  // a state save, `redeployAvailable()`) used to sail straight past the guard and reach
-  // `redeploy()` too, racing two builds/containers targeting the same tag and container name.
+  // `handoffActive()` alone doesn't read true until `redeploy()` calls `beginHandoff()` just
+  // before creating the replacement (#130 moved it past the build) — so a second call fired while
+  // the first is still mid-flight (two GitHub fetches, a state save, `redeployAvailable()`, and
+  // the build) used to sail straight past the guard and reach `redeploy()` too, racing two
+  // builds/containers targeting the same tag and container name.
   // Fired back-to-back with neither awaited first — mirrors two /update presses landing before
   // either has finished its own async work — this only exercises the guard if it is claimed
   // synchronously, before the first `await`.

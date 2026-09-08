@@ -59,7 +59,7 @@ All times are posted as Discord timestamps, so everyone sees them in their own t
 
 It works by **starting the replacement before retiring the original**, which is what makes it safe:
 
-1. **Build.** The bot builds a new image through the Docker daemon. Its Discord connection stays up, so a build failure is reported straight back to you and nothing is torn down — but the scheduler is paused for the whole build (no release or plugin announcements until the swap completes or is abandoned), and the build itself isn't time-bounded, so a wedged build pauses announcements until someone notices.
+1. **Build.** The bot builds a new image through the Docker daemon. Its Discord connection stays up and the scheduler keeps running (releases and plugin announcements still fire), so a build failure is reported straight back to you and nothing is torn down. The build is time-bounded (15 minutes), so a wedged build fails cleanly instead of hanging forever. Only the brief create-and-verify window afterwards pauses the scheduler.
 2. **Start alongside.** It creates a second container on the new image. Created by the daemon, that container is a sibling — nothing about its lifetime is tied to the bot's.
 3. **Verify.** The new instance has to complete a Discord gateway login to count as working. Until it does it stays in standby: connected, but answering nothing.
 4. **Retire.** The verified new instance stops and removes the old container, takes its name, and goes active.
@@ -96,9 +96,9 @@ Behavior:
 - The overlap is silent. Both containers hold the same `DISCORD_TOKEN`, and Discord delivers every event to both sessions, so the standby registers no commands, no handlers and no scheduler until it has taken over. You won't see doubled replies or doubled announcements.
 - The two containers never write `data/state.json` at once: the original stops its scheduler before the replacement starts, and the handoff signal is a separate file with one writer.
 - Each build is also tagged with its short sha, and the newest three are kept — so the previous build stays on disk and addressable if you ever need to pin back to it.
-- The swap won't land mid-`data/state.json` write: at handoff the original quiesces its scheduler — no new tick or state write starts — and the replacement doesn't read state until after the whole build, by which point any tick that was already running has finished. (It isn't an explicit wait on the in-flight tick; it leans on the build taking far longer than a tick.)
+- The swap won't land mid-`data/state.json` write: just before the replacement is created, the original quiesces its scheduler — no new tick or state write starts — and any tick already running finishes before the replacement reads state. (It isn't an explicit wait on the in-flight tick; it leans on the create-and-verify step taking longer than a tick.)
 - A second `/update` while a swap is in flight is **refused**, not queued — it would otherwise tear down the in-flight replacement.
-- The retirement wait has an end: if a replacement verifies but then never manages to retire the original (daemon trouble mid-swap), the original reclaims after 3 minutes and reports, rather than sitting quiesced until someone notices. (The build step ahead of it is not yet time-bounded — see the Build note above.)
+- The retirement wait has an end: if a replacement verifies but then never manages to retire the original (daemon trouble mid-swap), the original reclaims after 3 minutes and reports, rather than sitting quiesced until someone notices.
 - Without the daemon socket the bot exits with code **75** instead (distinct from a crash, so a supervisor can tell an update apart from a failure).
 - **Once it's back up, it messages whoever ran `/update`** with the build it actually came back on, and which of three things happened:
   - ✅ **updated** — came back on the build it was picking up.

@@ -19,7 +19,7 @@ const {
   takeOver,
 } = await import("./redeploy");
 const { clearMarker, writeMarker, HANDOFF_FROM_ENV } = await import("./handoff");
-const { handoffActive, resetForTest } = await import("./restart");
+const { handoffActive, restartPending, resetForTest } = await import("./restart");
 
 const SELF_ID = "a".repeat(64);
 const SELF_SHORT_ID = SELF_ID.slice(0, 12);
@@ -515,10 +515,13 @@ describe("redeploy — cleanup always runs", () => {
   const HOSTNAME = "self-container-id";
   const REPLACEMENT_ID = "c".repeat(64);
   let calls: { path: string; method: string; url: string; body?: string }[] = [];
+  // `restartPending()` sampled at the moment of each daemon call the fix's timing hinges on.
+  let pendingAt: Record<string, boolean> = {};
 
   beforeEach(async () => {
     process.env.HOSTNAME = HOSTNAME;
     calls = [];
+    pendingAt = {};
     resetForTest();
     await clearMarker();
   });
@@ -557,6 +560,9 @@ describe("redeploy — cleanup always runs", () => {
     /** Makes `POST /containers/{id}/start` fail after `create` already succeeded, to drive the
      *  cleanup-on-failure path so a failed start doesn't leak the replacement container. */
     startFails?: boolean;
+    /** Makes `POST /build` come back with an error line in its stream (a 200 that failed —
+     *  parseBuildOutput's whole reason for being), to drive redeploy()'s `!built.ok` branch. */
+    buildFails?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -564,13 +570,22 @@ describe("redeploy — cleanup always runs", () => {
       calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
       if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
-      if (pathname === "/build") return new Response('{"stream":"done"}', { status: 200 });
+      if (pathname === "/build") {
+        pendingAt.build = restartPending();
+        if (o.buildFails) {
+          return new Response('{"error":"boom","errorDetail":{"message":"boom"}}', { status: 200 });
+        }
+        return new Response('{"stream":"done"}', { status: 200 });
+      }
       if (pathname === "/images/json") return jsonRes([]);
       if (pathname.startsWith("/images/") && pathname.endsWith("/json")) {
         if (o.imageInspectFails) return new Response("boom", { status: 500 });
         return jsonRes({ Config: { Env: o.oldImageEnv ?? [] } });
       }
-      if (pathname === "/containers/create") return jsonRes({ Id: REPLACEMENT_ID });
+      if (pathname === "/containers/create") {
+        pendingAt.create = restartPending();
+        return jsonRes({ Id: REPLACEMENT_ID });
+      }
       if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
         if (o.startFails) return new Response("boom", { status: 500 });
         await o.afterStart?.();
@@ -585,6 +600,39 @@ describe("redeploy — cleanup always runs", () => {
 
   const wasRemovalAttempted = () =>
     calls.some((c) => c.method === "DELETE" && c.path === `/containers/${REPLACEMENT_ID}`);
+
+  // #130: beginHandoff moved past the build. The scheduler must stay live through the build (it
+  // writes no state, and is the one long, now-timeout-bounded call) and only quiesce for the
+  // create→verify window, where the replacement shares the state volume.
+  test("the scheduler keeps running through the build and only quiesces for create→verify", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("a".repeat(40));
+    expect(pendingAt.build).toBe(false); // build ran with the scheduler live
+    expect(pendingAt.create).toBe(true); // quiesced by the time the replacement is created
+    expect(handoffActive()).toBe(false); // and resumed on the failed outcome
+  });
+
+  // #130: a build that fails (or, in production, hangs until its timeout aborts it) must leave the
+  // scheduler untouched — beginHandoff never ran, so there is nothing to resume and announcements
+  // never stopped.
+  test("a failed build leaves the scheduler un-quiesced — beginHandoff never ran", async () => {
+    stubDaemon({
+      pollReplacement: () => {
+        throw new Error("must not poll — redeploy() returns on the failed build");
+      },
+      removeReplacement: () => new Response("", { status: 404 }),
+      buildFails: true,
+    });
+    const result = await redeploy("b".repeat(40));
+    expect(result.error).toContain("build failed");
+    expect(pendingAt.build).toBe(false);
+    expect(restartPending()).toBe(false);
+    expect(handoffActive()).toBe(false);
+    expect(pendingAt.create).toBeUndefined(); // never reached create
+  });
 
   // The crux of the fix: a rejection from `tryInspectContainer` mid-poll (a dropped socket, one
   // 500) used to propagate straight out of `redeploy()`, skipping `endHandoff()` entirely.
@@ -844,11 +892,11 @@ describe("resolveBootMode", () => {
     expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect)).toBe("standby");
   });
 
-  // The other new failure mode this fix could introduce: the daemon call now happens before
-  // `client.login()` is even attempted, and `docker.ts` carries no timeout of its own. A hung
-  // (not merely erroring) socket must not block boot forever — it has to fall through to the
-  // same "can't confirm" handling as any other inspect failure, bounded well under the real
-  // default so this test stays fast.
+  // The other new failure mode this fix could introduce: the daemon call happens before
+  // `client.login()` is even attempted. `docker.ts` bounds every call at 60s since #130, but this
+  // one keeps its own tighter bound — a hung (not merely erroring) socket must not eat 60s of boot
+  // before a login is even attempted; it has to fall through to the same "can't confirm" handling
+  // as any other inspect failure, bounded well under the real default so this test stays fast.
   test("a daemon call that never resolves times out and stays standby, not hung forever", async () => {
     const inspect = () => new Promise<ContainerInspect | undefined>(() => {}); // never settles
     expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect, 20)).toBe("standby");

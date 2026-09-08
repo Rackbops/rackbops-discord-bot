@@ -10,6 +10,36 @@
 const SOCKET = "/var/run/docker.sock";
 const BASE = "http://docker";
 
+// Every daemon call is bounded, so a genuinely hung socket (connected, far end never responds and
+// never closes — a network partition, a wedged `dockerd`) fails cleanly instead of leaving an
+// `await` unsettled forever, which is what turned a stuck build into a silent announce outage
+// (#130).
+//
+// Deliberately an `AbortController` + a `clearTimeout` in `finally`, NOT `AbortSignal.timeout()`:
+// under Bun a pending `AbortSignal.timeout` timer keeps the event loop alive, so a suite making
+// hundreds of stubbed daemon calls never exits. `unref`'ing it is worse still — with nothing else
+// ref'd the abort then never fires at all, so the hang it exists to break becomes permanent. A
+// ref'd timer cleared on completion is the only shape that both bounds a real hang and leaves
+// nothing pending afterwards.
+//
+// The bound has to span the response *body* read as well as the connect: for `/build` the body IS
+// the build, streaming back as JSONL. So `buildImage` owns its own controller across both and
+// clears it only after `res.text()`, passing the signal in via `ApiOpts.signal`; every other call
+// reads its (small) body inside `ok`, so clearing when `api` returns is enough for them.
+const DEFAULT_TIMEOUT_MS = 60_000;
+/** The one long call: the remote-context build is clone + prod-deps install, 1-3 min typical. */
+export const BUILD_TIMEOUT_MS = 900_000; // 15 min
+
+/** A ref'd abort timer plus the `clearTimeout` that retires it. Callers must clear in a `finally`. */
+function abortAfter(ms: number, what: string): { signal: AbortSignal; clear: () => void } {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error(`docker ${what} timed out after ${ms}ms`)), ms);
+  return { signal: ac.signal, clear: () => clearTimeout(timer) };
+}
+
+/** Either a timeout this call should manage itself, or a signal whose lifetime the caller owns. */
+type ApiOpts = { timeoutMs?: number; signal?: AbortSignal };
+
 export interface ContainerInspect {
   Id: string;
   Name: string;
@@ -45,12 +75,19 @@ export interface CreateContainerSpec {
   NetworkingConfig?: { EndpointsConfig: Record<string, { Aliases?: string[] }> };
 }
 
-async function api(path: string, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${BASE}${path}`, { ...init, unix: SOCKET });
+async function api(path: string, init: RequestInit = {}, opts: ApiOpts = {}): Promise<Response> {
+  // Caller-owned signal (buildImage): it clears its own timer once the streamed body is read.
+  if (opts.signal) return fetch(`${BASE}${path}`, { ...init, unix: SOCKET, signal: opts.signal });
+  const { signal, clear } = abortAfter(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS, `call to ${path}`);
+  try {
+    return await fetch(`${BASE}${path}`, { ...init, unix: SOCKET, signal });
+  } finally {
+    clear();
+  }
 }
 
-async function ok(path: string, init: RequestInit = {}): Promise<Response> {
-  const res = await api(path, init);
+async function ok(path: string, init: RequestInit = {}, opts: ApiOpts = {}): Promise<Response> {
+  const res = await api(path, init, opts);
   if (!res.ok) {
     throw new Error(`docker ${init.method ?? "GET"} ${path} failed: ${res.status} ${await res.text()}`);
   }
@@ -139,11 +176,15 @@ export function parseBuildOutput(body: string): { ok: boolean; error?: string } 
  * image needs no git binary, no tar handling, and no scratch space of its own.
  * `remote` is a git URL of the form `https://host/owner/repo.git#ref:subdir`.
  */
-export async function buildImage(o: {
-  remote: string;
-  tags: string[];
-  buildArgs: Record<string, string>;
-}): Promise<{ ok: boolean; error?: string }> {
+export async function buildImage(
+  o: {
+    remote: string;
+    tags: string[];
+    buildArgs: Record<string, string>;
+  },
+  // Overridable so a test can drive the abort path without waiting out the real 15-min bound.
+  timeoutMs = BUILD_TIMEOUT_MS,
+): Promise<{ ok: boolean; error?: string }> {
   const params = new URLSearchParams({
     remote: o.remote,
     buildargs: JSON.stringify(o.buildArgs),
@@ -153,8 +194,15 @@ export async function buildImage(o: {
     forcerm: "1",
   });
   for (const t of o.tags) params.append("t", t);
-  const res = await ok(`/build?${params}`, { method: "POST" });
-  return parseBuildOutput(await res.text());
+  // One signal spanning BOTH the request and the streamed body read: the build streams back as the
+  // response body, so `res.text()` — not the connect — is where a wedged build actually hangs.
+  const { signal, clear } = abortAfter(timeoutMs, "build");
+  try {
+    const res = await ok(`/build?${params}`, { method: "POST" }, { signal });
+    return parseBuildOutput(await res.text());
+  } finally {
+    clear();
+  }
 }
 
 export async function createContainer(name: string, spec: CreateContainerSpec): Promise<string> {

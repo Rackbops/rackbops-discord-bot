@@ -54,7 +54,9 @@ export async function withCritical<T>(fn: () => Promise<T>): Promise<T> {
 
 /**
  * Quiesce for a handoff (#879): the scheduler stops ticking, so nothing else writes
- * `data/state.json` while the replacement container comes up sharing that volume.
+ * `data/state.json` while the replacement container is created and verifies, sharing that volume.
+ * `redeploy()` calls this only just before the create — not before the build ahead of it, which
+ * writes no state and is the one long call (#130).
  *
  * Deliberately *not* a restart — this process must stay alive through the handoff. It is the
  * only thing left that can remove a replacement which fails to verify, and the only thing that

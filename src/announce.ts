@@ -100,13 +100,14 @@ let consecutiveSkips = 0;
 // in-flight one — see the watchdog comment below.
 let tickGeneration = 0;
 
-// None of the checks a tick can reach (GitHub calls in github.ts and update.ts, plus a plugin's own
-// ticks) carry a timeout of their own — a genuinely hung socket (connected, but the far end never
-// responds and never closes) leaves `run()` below never settling. Without this bound, that would leave
-// tickInFlight stuck true forever, silently freezing EVERY future tick — not just the one stuck check,
-// since they all now go through this one guard. Generous on purpose: a real tick should finish in well
-// under a minute, even a slow one. Adding a timeout to each individual fetch (closing the hang itself,
-// not just its blast radius here) is tracked as a separate follow-up rather than folded into this fix.
+// Most of the network a tick can reach still carries no timeout of its own — the GitHub calls in
+// github.ts and update.ts, plus a plugin's own ticks (#88; the docker-daemon calls under
+// update.ts's redeploy path ARE bounded since #130). A genuinely hung socket (connected, but the
+// far end never responds and never closes) leaves `run()` below never settling. Without this bound,
+// that would leave tickInFlight stuck true forever, silently freezing EVERY future tick — not just
+// the one stuck check, since they all now go through this one guard. Generous on purpose: a real
+// tick should finish in well under a minute, even a slow one. Adding a timeout to each remaining
+// fetch (closing the hang itself, not just its blast radius here) is #88.
 const TICK_WATCHDOG_MS = 5 * 60 * 1000;
 
 /**
