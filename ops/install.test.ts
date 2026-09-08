@@ -208,9 +208,12 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
 //
 // Comment lines are blanked before the scan: matching them would fail *closed* (a comment merely
 // mentioning mktemp would redden this test), which is only maintenance friction, but it is still a
-// false alarm. Deliberately NOT narrowed to `mktemp -p` — a bare `mktemp`, which puts the file in
-// /tmp instead of beside its destination, is a real bug (it is the one #96 fixed in bot-ops.sh) and
-// must be caught by this scan, not skipped by it.
+// false alarm. The match stays the bare `\bmktemp\b` rather than `mktemp -p` so that a `mktemp`
+// written without -p is still required to register — narrowing the regex would SKIP such a line
+// entirely, letting an unregistered one through silently. What this scan does not check is the -p
+// itself: a registered `mktemp` with no -p passes here (verified), and putting the temp file in
+// /tmp rather than beside its destination is a separate defect — the EXDEV one #96 fixed in
+// bot-ops.sh, argued for install.sh at ops/install.sh:117-120.
 const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
 
 test("every mktemp in install.sh registers its temp file for the sweep", () => {
