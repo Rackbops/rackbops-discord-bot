@@ -646,7 +646,7 @@ describe("redeploy — cleanup always runs", () => {
   // progress", refusing restart/env-set until some later redeploy's leftover sweep runs, which the
   // anti-loop suppression can defer indefinitely for the same sha. Cleanup must fall back to the
   // NAME. Before the fix this test saw only the pre-create sweep, never a cleanup removal.
-  test("a create that times out still cleans up the orphan, by name, since there is no id", async () => {
+  test("a create that times out sweeps the name it may have orphaned, forcibly", async () => {
     stubDaemon({
       pollReplacement: () => {
         throw new Error("must not poll — redeploy() returns on the failed create");
@@ -662,6 +662,12 @@ describe("redeploy — cleanup always runs", () => {
       (c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`,
     );
     expect(byName.length).toBe(2);
+    // force=1 is load-bearing, not incidental. The abort case this exists for is a daemon that
+    // already CREATED — and, on the startContainer leg, already STARTED — the container before
+    // failing to answer. A plain DELETE on a running container is a 409, which removeContainer
+    // throws on, and the orphan left behind would be a *running* second bot rather than a stopped
+    // one: strictly worse than the state this cleanup is here to remove.
+    for (const c of byName) expect(new URL(c.url).searchParams.get("force")).toBe("1");
     expect(handoffActive()).toBe(false);
   });
 

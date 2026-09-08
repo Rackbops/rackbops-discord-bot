@@ -315,8 +315,13 @@ export async function redeploy(
     // `endHandoff()` below either, for the same reason a poll failure above must not.
     console.error(`[redeploy] could not remove the replacement: ${(err as Error).message}`);
   } finally {
-    await clearMarker();
+    // endHandoff FIRST, and synchronously. Everything this block exists to guarantee is that the
+    // bot un-quiesces on every exit (#37); an await ahead of it puts a rejection between the
+    // failure and the un-quiesce, which is the permanent-quiesce bug itself. `clearMarker` swallows
+    // its own errors today, so the old order was safe by someone else's implementation detail
+    // rather than by construction — this ordering costs nothing and needs no such assumption.
     endHandoff();
+    await clearMarker();
   }
   console.warn(`[redeploy] handoff ${outcome} — staying on the current build`);
   return { outcome, error: pollError ?? marker?.error };

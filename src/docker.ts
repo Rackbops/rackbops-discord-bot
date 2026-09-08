@@ -137,17 +137,20 @@ export function parseContainerId(mountinfo: string): string | undefined {
  * to some other container that happens to be called that).
  */
 export async function inspectSelf(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ContainerInspect> {
-  const host = process.env.HOSTNAME;
-  if (host) {
-    const self = await bounded(timeoutMs, `inspect ${host}`, async (s) => {
+  // ONE bound across both attempts, not one each. Two nested bounds would make the worst case
+  // 2 x timeoutMs (a fast non-ok hostname inspect, then a wedge on the fallback) — undocumented,
+  // and 120s on the default. It also gave the fallback its own bound that only a Linux-only test
+  // could reach, so it could be widened without any test noticing.
+  return bounded(timeoutMs, "inspect self", async (s) => {
+    const host = process.env.HOSTNAME;
+    if (host) {
       const res = await api(`/containers/${encodeURIComponent(host)}/json`, s);
-      return res.ok ? ((await res.json()) as ContainerInspect) : undefined;
-    });
-    if (self) return self;
-  }
-  const id = parseContainerId(await Bun.file("/proc/self/mountinfo").text());
-  if (!id) throw new Error("cannot determine own container id (not running under Docker?)");
-  return inspectContainer(id, timeoutMs);
+      if (res.ok) return (await res.json()) as ContainerInspect;
+    }
+    const id = parseContainerId(await Bun.file("/proc/self/mountinfo").text());
+    if (!id) throw new Error("cannot determine own container id (not running under Docker?)");
+    return (await (await ok(`/containers/${encodeURIComponent(id)}/json`, s)).json()) as ContainerInspect;
+  });
 }
 
 export async function inspectContainer(id: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ContainerInspect> {
