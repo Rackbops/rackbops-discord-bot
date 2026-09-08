@@ -122,21 +122,20 @@ describe("daemon calls", () => {
     expect(decodeURIComponent(url)).toContain('buildargs={"GIT_SHA":"abc1234"}');
   });
 
-  // #130: every daemon call carries an AbortSignal at the api() funnel so a hung socket fails
-  // cleanly instead of leaving redeploy()'s await unsettled forever.
+  // #130: every daemon call is wrapped in `bounded()`, which hands `api()` a signal — `api()`
+  // itself creates no bound, so these two only prove a signal is ATTACHED. Proving it actually
+  // fires is the table further down; these stay as a cheap shape check.
   test("buildImage attaches an abort signal to the daemon request", async () => {
     stub(() => new Response('{"stream":"done"}', { status: 200 }));
     await buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} });
     expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
   });
 
-  // buildImage owns its own signal (it has to span the streamed body read); this pins the OTHER
-  // branch — the api() funnel's own default bound, which is what covers every remaining call.
   test("an ordinary daemon call carries an abort signal too, not just the build", async () => {
     stub(() => new Response("", { status: 204 }));
     await stopContainer("abc");
     expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
-    expect(calls[0]!.signal!.aborted).toBe(false); // bounded, but not already spent
+    expect(calls[0]!.signal!.aborted).toBe(false); // attached, but not already spent
   });
 
   // The signal has to actually abort a stuck call — not just be attached. A stub that never
@@ -290,6 +289,18 @@ describe("daemon calls", () => {
       1000,
     );
   }
+
+  // Every test above passes an explicit tiny `timeoutMs`; no production caller passes one at all
+  // (`src/redeploy.ts` never does), so without this both defaults could be raised to infinity —
+  // silently un-bounding the real bot — with the whole suite green. A value pin is the honest
+  // guard here: the numbers are operational decisions, and changing one should require editing
+  // this line and saying why in review.
+  test("the default bounds are the reviewed values", async () => {
+    const { DEFAULT_TIMEOUT_MS, BUILD_TIMEOUT_MS } = await import("./docker");
+    expect(DEFAULT_TIMEOUT_MS).toBe(60_000); // ample for every non-build call
+    expect(BUILD_TIMEOUT_MS).toBe(900_000); // 15 min — clone + prod-deps install, 1-3 min typical
+    expect(BUILD_TIMEOUT_MS).toBeGreaterThan(DEFAULT_TIMEOUT_MS);
+  });
 
   // The other half of the bound: a call that finishes well inside its budget must RETIRE its
   // timer, or every completed call leaves a live abort armed against a signal nobody is watching

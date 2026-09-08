@@ -23,12 +23,14 @@ const BASE = "http://docker";
 //
 // Deliberately an `AbortController` + a ref'd `setTimeout`, NOT `AbortSignal.timeout()`: Bun backs
 // `AbortSignal.timeout` with an UNREF'd timer, so it never fires when nothing else is keeping the
-// event loop alive — precisely the case a hung daemon call produces, where the abort is the only
-// thing left that could break the deadlock. (Measured on Bun 1.3.14: awaiting an
-// `AbortSignal.timeout(20)` with nothing else ref'd never resolves; with any ref'd timer alive it
-// fires on schedule.) A ref'd timer fires unconditionally; `clearTimeout` on completion is what
-// keeps a finished call from leaving one pending.
-const DEFAULT_TIMEOUT_MS = 60_000;
+// event loop alive. (Measured on Bun 1.3.14: awaiting an `AbortSignal.timeout(20)` with nothing
+// else ref'd never resolves; with any ref'd timer alive it fires on schedule.) A running bot
+// usually does have one — `startScheduler`'s 60s `setInterval` — so on the redeploy path it would
+// in practice fire; the genuinely bare window is `resolveBootMode`, the one daemon call made
+// before `client.login()` and before the scheduler exists. A ref'd timer fires unconditionally and
+// needs no such reasoning, which is the point. `clearTimeout` on completion is what keeps a
+// finished call from leaving one pending.
+export const DEFAULT_TIMEOUT_MS = 60_000;
 /** The one long call: the remote-context build is clone + prod-deps install, 1-3 min typical. */
 export const BUILD_TIMEOUT_MS = 900_000; // 15 min
 

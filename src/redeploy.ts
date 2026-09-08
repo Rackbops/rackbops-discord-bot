@@ -213,8 +213,8 @@ export async function redeploy(
 
   if (!built.ok) {
     // A failed build is inert: nothing has been created, so there is nothing to unwind — and the
-    // scheduler was never quiesced (beginHandoff runs only just before the create below), so it
-    // keeps announcing right through a wedged or failed build.
+    // scheduler was never quiesced (beginHandoff runs only just before the create below), so a
+    // failed or wedged build leaves nothing to resume.
     return { error: `build failed: ${built.error ?? "unknown error"}` };
   }
   await pruneOldImages(self.Config.Image);
@@ -228,9 +228,15 @@ export async function redeploy(
 
   const name = replacementName(self.Name);
   // Quiesce the scheduler now, not before the build: only the create→verify window needs the
-  // scheduler quiet (the replacement shares the state volume once it exists), and the build —
-  // now the one long, timeout-bounded call — writes nothing, so pausing announcements through it
-  // bought nothing but an outage risk if it wedged (#130).
+  // scheduler quiet (the replacement shares the state volume once it exists), and the build writes
+  // no state at all. Quiescing through it therefore bought nothing but risk — an unbounded pause on
+  // a wedged build (#130).
+  //
+  // This does NOT mean the scheduler always keeps ticking during the build. On the auto-update path
+  // the build runs INSIDE a tick, so `guardedTick`'s own `tickInFlight` skips later ticks until its
+  // 5-min watchdog releases them; only an admin `/update` (an interaction, outside the scheduler)
+  // genuinely announces throughout. The win is that the pause is bounded either way, and the build
+  // itself is now timeout-bounded.
   beginHandoff(`redeploy -> ${latestSha.slice(0, 7)}`);
   let replacementId: string | undefined;
   try {
