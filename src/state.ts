@@ -1,6 +1,7 @@
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { config } from "./config";
+import { DATA_DIR } from "./storage";
 
 /**
  * A `/update`-initiated restart, recorded so the bot can tell the requester what build it
@@ -33,7 +34,8 @@ export interface BotState {
 
 const RELEASE_ID_CAP = 100;
 
-const DATA_DIR = join(import.meta.dir, "..", "data");
+// Imported, never recomputed (#139): the shared resolver is what an override relocates, and a
+// second local copy of this expression is how the suite ended up writing the real checkout.
 const STATE_FILE = join(DATA_DIR, "state.json");
 
 export const state: BotState = await loadStateFrom(STATE_FILE);

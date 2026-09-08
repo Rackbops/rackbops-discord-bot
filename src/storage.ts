@@ -1,14 +1,56 @@
 import { mkdirSync, renameSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 /**
- * The one `data/` directory (`/app/data` in the image), computed once here now that storage is a
- * top-level `src/` module. The same value `src/state.ts` and `src/handoff.ts` compute for their own
- * files, and `src/index.ts` imports from here; `HostApi.dataDir` handed to plugins is this too.
+ * Resolve the one `data/` directory. Defaults to `<repo>/data` (`/app/data` in the image); a
+ * `BOT_DATA_DIR` override relocates it wholesale.
+ *
+ * **The override exists for tests, not for operators** (#139). Every test that transitively imports
+ * `commands`/`update`/`announce` pulls in `state.ts`, whose top-level `await` reads this directory
+ * at import — and the suite then *writes* it, silently destroying a developer's real
+ * `attemptedUpdateToSha` and `pendingUpdateReport`. Redirecting the whole directory is what
+ * contains that, which is why the override lives here rather than on `state.ts` alone: `handoff.ts`
+ * writes here too, and three separate spellings of "the data dir" is the underlying defect.
+ *
+ * Deliberately NOT documented in `.env.example` and NOT on `bot-ops.sh`'s editable whitelist. In a
+ * deployment it is a footgun: `buildCreateSpec` copies the container's env onto the replacement but
+ * derives `Binds` from the mounts, so a value pointing off the named volume means the original and
+ * the replacement write *different* filesystems — the replacement's `handoff.json` is never seen,
+ * every `/update` waits out `HANDOFF_DEADLINE_MS` and reports a replacement that "never reported
+ * in", and self-update is broken with nothing naming the cause. That is why `index.ts` logs the
+ * resolved path on every boot — it is the one thing that turns that into a one-line diagnosis.
+ * (Absolute-only is a *separate* guard, and not a mitigation for the above: `/srv/elsewhere` is
+ * absolute and is exactly the failure case. It exists because a relative value resolves against
+ * cwd, which can land back inside a checkout — the same reason `BOT_OPS_CONFIG_DIR` is
+ * absolute-only.)
+ *
+ * Under `bun test` an unset override is a hard error rather than a silent fall back to the
+ * checkout: without that, a preload that fails to run restores the corruption invisibly.
+ */
+export function resolveDataDir(env: Record<string, string | undefined> = process.env): string {
+  const override = env.BOT_DATA_DIR;
+  if (override !== undefined && override !== "") {
+    if (!isAbsolute(override)) {
+      throw new Error(`BOT_DATA_DIR must be an absolute path, got "${override}"`);
+    }
+    return override;
+  }
+  if (env.NODE_ENV === "test") {
+    throw new Error(
+      "BOT_DATA_DIR must be set under `bun test` — refusing to read or write the checkout's data/ " +
+        "(#139). The bunfig.toml preload sets it; if you are seeing this, the preload did not run.",
+    );
+  }
+  return join(import.meta.dir, "..", "data");
+}
+
+/**
+ * The one `data/` directory. `src/state.ts` and `src/handoff.ts` **import** this rather than
+ * recomputing it, and `src/index.ts` imports it too; `HostApi.dataDir` handed to plugins is this.
  * Never recompute a data path from `import.meta.dir` under `src/plugins/` — that module is two hops
  * from `data/`, not one.
  */
-export const DATA_DIR = join(import.meta.dir, "..", "data");
+export const DATA_DIR = resolveDataDir();
 
 /**
  * Atomically writes `data` as JSON to `path`: a temp file in the same directory, then a rename —

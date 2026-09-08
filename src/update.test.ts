@@ -8,7 +8,7 @@ const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelati
   await import("./update");
 const { beginHandoff, endHandoff } = await import("./restart");
 const { config } = await import("./config");
-const { state, saveState } = await import("./state");
+const { state } = await import("./state");
 
 const OLD = "a".repeat(40);
 const NEW = "b".repeat(40);
@@ -243,16 +243,15 @@ describe("checkForUpdate — anti-loop suppression after a failed in-process red
     state.pendingUpdateReport = undefined;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     globalThis.fetch = realFetch;
     config.gitSha = realGitSha;
     state.attemptedUpdateToSha = undefined;
     state.pendingUpdateReport = undefined;
-    // checkForUpdate/applyUpdate call the REAL saveState() against the real (gitignored)
-    // data/state.json — the in-memory reset above is invisible on disk unless it's flushed too,
-    // or the test's last real write (a fake 40-char sha) is what a subsequent `bun run start`
-    // would find there.
-    await saveState();
+    // No saveState() flush here any more (#139). This used to write the real, gitignored
+    // data/state.json on purpose — mitigating the corruption by writing MORE — because the real
+    // saveState() went to the checkout. It now goes to the test override, so there is nothing to
+    // clean up and the in-memory reset above is the whole job.
   });
 
   function stubGitHub(): void {
@@ -322,12 +321,12 @@ describe("checkForUpdate — concurrent calls before any handoff begins (#51 ite
     state.pendingUpdateReport = undefined;
   });
 
-  afterEach(async () => {
+  afterEach(() => {
     globalThis.fetch = realFetch;
     config.gitSha = realGitSha;
     state.attemptedUpdateToSha = undefined;
     state.pendingUpdateReport = undefined;
-    await saveState();
+    // No saveState() flush — see the note on the sibling afterEach above (#139).
   });
 
   function stubGitHub(): void {

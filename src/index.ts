@@ -30,6 +30,12 @@ import {
 } from "./plugins/host";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 
+// Logged on every boot (#139): `BOT_DATA_DIR` can relocate this, and a value pointing off the
+// named volume breaks self-update in a way nothing else names — the replacement writes a
+// handoff marker the original never sees, so every /update waits out its deadline and reports a
+// replacement that "never reported in". One line here turns that into a one-line diagnosis.
+console.log(`[boot] data dir: ${DATA_DIR}`);
+
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
 const pluginIndexResult = await loadPluginIndex(config.pluginIndexUrl, DATA_DIR);
