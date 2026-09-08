@@ -37,6 +37,31 @@ on:
 
 jobs:
   notify:
-    uses: roshne/addon-ci/.github/workflows/push-notify.yml@main
+    # Pinned to a commit, not `@main` (#61). This is a CROSS-OWNER reusable workflow that runs in
+    # THIS repo's context with DISCORD_PUSH_WEBHOOK, so at `@main` whatever addon-ci's default
+    # branch happened to hold at run time would execute with that secret, with nothing in this
+    # repo's history recording the change. The pin is what closes that; `permissions:` below does
+    # NOT -- the secret is passed explicitly regardless of token scopes.
+    #
+    # The `# main` comment is load-bearing, not decoration, and its FORM matters. Renovate matches
+    # the comment body against an anchored single-token pattern: it must be the bare ref and
+    # NOTHING ELSE. Appending prose (`# main -- pinned per #61`) makes it unparseable; Renovate
+    # then sees a bare SHA with no version comment, which it does not track by default -- so the
+    # pin would rot forever with no CI signal and, because this workflow skips green when it can't
+    # post, no Discord message either. Exactly the silent failure the pin exists to prevent.
+    # Keep the comment to the ref alone; prose belongs in this block.
+    #
+    # addon-ci cuts no tags today. If it ever does, pin the tag's COMMIT and name the tag in the
+    # comment (`@<sha> # v1`) -- a git tag is force-movable, so `@v1` in the ref position would
+    # reintroduce a mutable ref and undo the point of this pin.
+    #
+    # The pinned commit is byte-identical, for this file, to the 2026-09-02 state.
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@d609b00bcdaa7efc16536ec4f5f5e07caa9cbbdc # main
+    # The called workflow needs no GITHUB_TOKEN at all: it checks nothing out, calls no GitHub
+    # API, and only reads `github.event.*` before curling Discord (verified at the pinned commit).
+    # A called workflow inherits the caller job's permissions and can only reduce them, so an empty
+    # set is the tightest correct posture. If addon-ci ever adds a step that does need the token,
+    # this is where it would surface -- untested, since nothing here uses one today.
+    permissions: {}
     secrets:
       DISCORD_PUSH_WEBHOOK: ${{ secrets.DISCORD_PUSH_WEBHOOK }}
