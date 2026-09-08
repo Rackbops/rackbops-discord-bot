@@ -46,6 +46,7 @@ import {
   parsePluginRequestInput,
   readDynamicAdmins,
   resolveAdminsFile,
+  resolveAdminStorePaths,
   renderIndexHtml,
   SUBPROCESS_TIMEOUT_MS,
   tokensMatch,
@@ -294,6 +295,47 @@ describe("resolveAdminsFile rejects a relative BOT_OPS_CONFIG_DIR (issue #60 ite
       expect(resolveAdminsFile(value)).toBeUndefined();
     });
   }
+});
+
+// The consumer boundary for the guard above. Round 2 of the review gate showed that reverting the
+// entry point's two wiring statements to their pre-guard shape left all 919 tests green — the fix
+// was pinned, its *use* was not, which is the "break lives between changed and unchanged code"
+// failure mode. resolveAdminStorePaths makes the pairing testable; the source scan below pins that
+// the entry point actually calls it, since nothing can execute `import.meta.main` from a test.
+describe("resolveAdminStorePaths keeps configDir and adminsFile in agreement", () => {
+  test("both defined, sharing a base, when the value is absolute", () => {
+    expect(resolveAdminStorePaths({ BOT_OPS_CONFIG_DIR: "/opt/bot" })).toEqual({
+      configDir: "/opt/bot",
+      adminsFile: "/opt/bot/admins.json",
+    });
+  });
+
+  test("both undefined when unset — never one without the other", () => {
+    expect(resolveAdminStorePaths({})).toEqual({ configDir: undefined, adminsFile: undefined });
+  });
+
+  test("configDir is the trimmed value, so statSync and the .env reads see what adminsFile is built from", () => {
+    const { configDir, adminsFile } = resolveAdminStorePaths({ BOT_OPS_CONFIG_DIR: "  /opt/bot  " });
+    expect(configDir).toBe("/opt/bot");
+    expect(adminsFile).toBe("/opt/bot/admins.json");
+    expect(adminsFile!.startsWith(configDir!)).toBe(true);
+  });
+
+  test("a relative value throws rather than returning a half-resolved pair", () => {
+    expect(() => resolveAdminStorePaths({ BOT_OPS_CONFIG_DIR: "./config" })).toThrow("must be an absolute path");
+  });
+});
+
+test("the panel entry point resolves its paths through the guard, not from raw env", () => {
+  const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const marker = "if (import.meta.main) {";
+  const entry = serverSrc.slice(serverSrc.indexOf(marker));
+  expect(entry).toContain(marker); // the block still exists; guards against a silent no-op scan
+  expect(entry).toContain("resolveAdminStorePaths(process.env)");
+  // The exact pre-guard shape, which must not come back. Scoped to the entry block so the
+  // definitions above (which legitimately mention both) can't satisfy it.
+  expect(entry).not.toMatch(/process\.env\.BOT_OPS_CONFIG_DIR\?\.trim\(\)/);
+  expect(entry).not.toMatch(/\$\{configDir\}\/admins\.json/);
 });
 
 describe("readDynamicAdmins", () => {

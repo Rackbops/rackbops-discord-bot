@@ -218,12 +218,23 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
 // bot-ops.sh, argued for install.sh at ops/install.sh:117-120.
 const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
 
-test("every mktemp in install.sh registers its temp file for the sweep", () => {
+// The registration must name the SAME variable the mktemp assigned. Requiring only "some
+// TMP_FILES+= on the next line" is not enough, and the failure it misses is severe rather than
+// cosmetic: registering `TMP_FILES+=("$CONFIG_DIR/.env")` next to a mktemp both strands the temp
+// file AND makes the EXIT trap `rm -f` the instance's live secrets .env. That is a plausible
+// copy-paste slip when adding a third mktemp, and it passed this scan before.
+test("every mktemp in install.sh registers the temp file it just assigned", () => {
   let checked = 0;
   CODE_LINES.forEach((line, i) => {
     if (!/\bmktemp\b/.test(line)) return;
     checked += 1;
-    expect(`${i + 1}: ${CODE_LINES[i + 1] ?? "<end of file>"}`).toMatch(/TMP_FILES\+=\(/);
+    // The variable this mktemp assigns to, e.g. `tmp` in `tmp="$(mktemp -p ...)"`.
+    const assigned = line.match(/^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+    const where = `install.sh:${i + 1} (${line.trim()})`;
+    expect(assigned ?? `<no assignment at ${where}>`).toMatch(/^[A-Za-z_]/);
+    expect(`${where} -> ${(CODE_LINES[i + 1] ?? "<end of file>").trim()}`).toBe(
+      `${where} -> TMP_FILES+=("$${assigned}")`,
+    );
   });
   expect(checked).toBe(2); // fetch()'s, and the one for $STACK_DIR/.env
 });
@@ -234,7 +245,14 @@ test("every mktemp in install.sh registers its temp file for the sweep", () => {
 // ops/bot-ops.sh:579 (`trap "rm -f \"$tmp\"" EXIT` inside a function), and it is the reason this
 // change registers into an array instead of trapping per-function. Pinned as an exact list so both
 // directions fail — a second trap, or the sweep's own trap going missing.
-test("install.sh installs exactly one EXIT trap, so nothing can silently replace the sweep", () => {
-  const traps = CODE_LINES.filter((l) => /\btrap\b/.test(l) && /\bEXIT\b/.test(l)).map((l) => l.trim());
+//
+// Matched on `trap` alone, NOT on the word EXIT: bash signal 0 *is* EXIT, so `trap ':' 0` replaces
+// the sweep just as silently while containing no "EXIT" to match. Verified:
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; trap ":" 0; echo body'  ->  body        (no SWEEP)
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT;            echo body'  ->  body SWEEP
+// Listing every trap line regardless of signal also means a future ERR/INT trap shows up here to
+// be considered rather than slipping in unnoticed.
+test("install.sh installs exactly one trap, so nothing can silently replace the sweep", () => {
+  const traps = CODE_LINES.filter((l) => /^\s*trap\b/.test(l)).map((l) => l.trim());
   expect(traps).toEqual(["trap cleanup_tmp_files EXIT"]);
 });

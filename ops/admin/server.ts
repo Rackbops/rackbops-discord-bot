@@ -166,9 +166,16 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
  * Unset stays a supported degraded mode (bootstrap-only, no persistence — see
  * `logDynamicAdminsStartup`). A relative value is not, and is rejected rather than narrowed to
  * that mode: it *looks* like working persistence while writing somewhere the operator didn't
- * choose. Failing at startup is also the kinder failure — a wrong-directory `admins.json` means
- * `readDynamicAdmins` fails closed, which narrows JWT auth to nobody anyway; a panel that refuses
- * to start at least says why.
+ * choose.
+ *
+ * Refusing to start matters because the silent alternative fails **open**, not closed. A
+ * wrong-directory `admins.json` is *absent*, not malformed, so `readDynamicAdmins` takes its
+ * `file.exists()` early return and yields an empty set without throwing — the fail-closed branch
+ * never runs. Empty dynamic plus an empty `ADMIN_ALLOWED_EMAILS` bootstrap makes
+ * `effectiveAllowlist` return `undefined`, the "no narrowing configured" sentinel, and
+ * `isEmailAllowed` then returns `true` for *every* Access identity. So the panel would come up
+ * looking healthy while its admin list silently authorized anyone — and the operator's real
+ * `admins.json`, sitting in the directory they meant, would never be read.
  *
  * One deliberate asymmetry with the script, since "matching" below is about the `/` test only:
  * this trims before testing, while `ops/bot-ops.sh`'s `case "${!var}"` matches the raw value. So a
@@ -190,6 +197,28 @@ export function resolveAdminsFile(rawConfigDir: string | undefined): string | un
     );
   }
   return `${configDir}/admins.json`;
+}
+
+/**
+ * The whole `BOT_OPS_CONFIG_DIR` resolution the entry point needs, as one call.
+ *
+ * Exists because the two values must agree: `configDir` feeds `statSync` (for admins.json's
+ * ownership) and the two `${configDir}/.env` reads, while `adminsFile` is the guarded path — and
+ * everything downstream assumes `configDir` is defined exactly when `adminsFile` is. Computing
+ * them as two separate statements in the entry point put that invariant in the one place no test
+ * can execute (everything under `import.meta.main` is import-inert by design); the review gate
+ * demonstrated it by reverting those statements to their pre-guard form with all 919 tests still
+ * green. Here the pairing is a pure function, so it is pinned like anything else.
+ */
+export function resolveAdminStorePaths(env: Record<string, string | undefined>): {
+  configDir: string | undefined;
+  adminsFile: string | undefined;
+} {
+  const adminsFile = resolveAdminsFile(env.BOT_OPS_CONFIG_DIR);
+  // Non-null assertion is safe: adminsFile is defined only when the trimmed value was non-empty
+  // (and absolute, or resolveAdminsFile would have thrown), so the re-read cannot be undefined.
+  const configDir = adminsFile ? env.BOT_OPS_CONFIG_DIR!.trim() : undefined;
+  return { configDir, adminsFile };
 }
 
 export async function logDynamicAdminsStartup(
@@ -1440,14 +1469,14 @@ if (import.meta.main) {
   // letting resolveAdminsFile's throw escape as an unhandled rejection with a stack trace. The
   // function still throws (that is what makes it testable without an entry point); the entry point
   // is what turns a misconfiguration into a legible refusal to start.
-  let adminsFile: string | undefined;
+  let storePaths: ReturnType<typeof resolveAdminStorePaths>;
   try {
-    adminsFile = resolveAdminsFile(process.env.BOT_OPS_CONFIG_DIR);
+    storePaths = resolveAdminStorePaths(process.env);
   } catch (err) {
     console.error(`[admin] ${err instanceof Error ? err.message : err} — refusing to start`);
     process.exit(1);
   }
-  const configDir = adminsFile ? process.env.BOT_OPS_CONFIG_DIR!.trim() : undefined;
+  const { configDir, adminsFile } = storePaths;
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
     bootstrap,
