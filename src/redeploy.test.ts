@@ -563,6 +563,9 @@ describe("redeploy — cleanup always runs", () => {
     /** Makes `POST /build` come back with an error line in its stream (a 200 that failed —
      *  parseBuildOutput's whole reason for being), to drive redeploy()'s `!built.ok` branch. */
     buildFails?: boolean;
+    /** Makes `POST /containers/create` abort the way docker.ts's timeout bound does — the daemon
+     *  may still have created the container, but redeploy() never learns its id (#130). */
+    createTimesOut?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -584,6 +587,9 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === "/containers/create") {
         pendingAt.create = restartPending();
+        // The daemon created it but never answered in time — the abort surfaces as a rejection
+        // with no id, exactly as docker.ts's `bounded` produces it.
+        if (o.createTimesOut) throw new Error("docker create warbandeer-discord-next timed out after 60000ms");
         return jsonRes({ Id: REPLACEMENT_ID });
       }
       if (pathname === `/containers/${REPLACEMENT_ID}/start`) {
@@ -632,6 +638,31 @@ describe("redeploy — cleanup always runs", () => {
     expect(restartPending()).toBe(false);
     expect(handoffActive()).toBe(false);
     expect(pendingAt.create).toBeUndefined(); // never reached create
+  });
+
+  // #130: createContainer is timeout-bounded now, so it can abort while the daemon goes on to
+  // create the container anyway. redeploy() never learns the id, so an id-only cleanup would skip
+  // the orphan — and a lingering `<name>-next` reads to bot-ops.sh as "a swap is still in
+  // progress", refusing restart/env-set until some later redeploy's leftover sweep runs, which the
+  // anti-loop suppression can defer indefinitely for the same sha. Cleanup must fall back to the
+  // NAME. Before the fix this test saw only the pre-create sweep, never a cleanup removal.
+  test("a create that times out still cleans up the orphan, by name, since there is no id", async () => {
+    stubDaemon({
+      pollReplacement: () => {
+        throw new Error("must not poll — redeploy() returns on the failed create");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+      createTimesOut: true,
+    });
+    const result = await redeploy("8".repeat(40));
+    expect(result.error).toContain("could not start the replacement");
+    expect(result.error).toContain("timed out");
+    // Two DELETEs against the NAME: the pre-create leftover sweep, then the post-failure cleanup.
+    const byName = calls.filter(
+      (c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`,
+    );
+    expect(byName.length).toBe(2);
+    expect(handoffActive()).toBe(false);
   });
 
   // The crux of the fix: a rejection from `tryInspectContainer` mid-poll (a dropped socket, one

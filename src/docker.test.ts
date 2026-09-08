@@ -142,9 +142,12 @@ describe("daemon calls", () => {
   // resolves unless the signal fires stands in for a wedged dockerd; buildImage's own tiny
   // timeout override lets this run without waiting out the real 15-min bound.
   //
-  // The explicit per-test timeout matters: if the bound regresses, the abort never fires and
-  // nothing else is ref'd, so bun's own default timeout can't interrupt it either — without this
-  // the failure mode is a silent CI wedge instead of a red test.
+  // Goes through `settleWithin` like every other bound assertion. An explicit per-test timeout is
+  // NOT enough on its own: bun's timeout is itself unref'd, so when a regressed bound leaves
+  // nothing ref'd it cannot interrupt either, and the run wedges with no output. This test used to
+  // rely on that timeout alone — mutating buildImage's bound was the one call site of fourteen
+  // that survived, reaching a reviewer as a hung CI job rather than a red test. Worse, it runs
+  // before the two body-read tests, so it suppressed those too.
   test(
     "buildImage rejects when the build exceeds its timeout instead of hanging forever",
     async () => {
@@ -154,9 +157,12 @@ describe("daemon calls", () => {
             reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
           );
         })) as unknown as typeof fetch;
-      await expect(
+      const r = await settleWithin(
         buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
-      ).rejects.toThrow(/timed out after 20ms/);
+        "buildImage request",
+      );
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
     },
     1000,
   );

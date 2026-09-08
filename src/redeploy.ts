@@ -255,11 +255,17 @@ export async function redeploy(
     // bot-ops.sh's guard, refusing restart/env-set for however long until that next attempt —
     // which the update scheduler's own anti-loop suppression can push out indefinitely for the
     // same sha. Best-effort: a cleanup failure here must not shadow the real error being reported.
-    if (replacementId) {
-      await removeContainer(replacementId, true).catch((cleanupErr) => {
-        console.error(`[redeploy] could not clean up the failed replacement: ${(cleanupErr as Error).message}`);
-      });
-    }
+    //
+    // Cleans up by NAME when there is no id (#130). `createContainer` is now timeout-bounded, so it
+    // can abort while the daemon goes on to create the container anyway — a slow-then-recovering
+    // daemon is exactly the case that bound exists for. `replacementId` is then never assigned, and
+    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` that bot-ops.sh
+    // reads as "a swap is still in progress" until some LATER redeploy's leftover sweep above runs
+    // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the
+    // same handle that sweep uses, so removing by it is already proven to work.
+    await removeContainer(replacementId ?? name, true).catch((cleanupErr) => {
+      console.error(`[redeploy] could not clean up the failed replacement: ${(cleanupErr as Error).message}`);
+    });
     endHandoff();
     return { error: `could not start the replacement: ${(err as Error).message}` };
   }
