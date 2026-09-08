@@ -37,6 +37,23 @@ on:
 
 jobs:
   notify:
-    uses: roshne/addon-ci/.github/workflows/push-notify.yml@main
+    # Pinned to a commit, not `@main` (#61). This is a CROSS-OWNER reusable workflow that runs in
+    # THIS repo's context with DISCORD_PUSH_WEBHOOK, so at `@main` whatever addon-ci's default
+    # branch happened to hold at run time would execute with that secret, with nothing in this
+    # repo's history recording the change. The pin is what closes that; `permissions:` below does
+    # NOT -- the secret is passed explicitly regardless of token scopes.
+    #
+    # The `# main` comment is load-bearing, not decoration: Renovate reads the first token after
+    # `#` as the ref to track, and drops the dependency entirely if it can't parse one. Keep the
+    # ref first and any prose here, so digest bumps keep arriving (Dependency Dashboard #150).
+    # addon-ci cuts no tags today; if it ever does, re-pin to `@v<n>` and change the comment to
+    # match. The pinned commit is byte-identical to the 2026-09-02 state of this workflow file.
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@d609b00bcdaa7efc16536ec4f5f5e07caa9cbbdc # main
+    # The called workflow needs no GITHUB_TOKEN at all: it checks nothing out, calls no GitHub
+    # API, and only reads `github.event.*` before curling Discord. A called workflow inherits the
+    # caller job's permissions and can only reduce them, so an empty set is the tightest correct
+    # posture. If addon-ci ever adds a checkout it fails LOUDLY here (403), which is the outcome
+    # we want from a workflow whose other failure modes are deliberately silent.
+    permissions: {}
     secrets:
       DISCORD_PUSH_WEBHOOK: ${{ secrets.DISCORD_PUSH_WEBHOOK }}
