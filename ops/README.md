@@ -88,7 +88,10 @@ Dockge's own Start/Stop/Restart buttons — which run compose with none of `inst
 shell prefix — resolve this instance's actual identity instead of the compose file's own
 monorepo-era fallbacks (issue #41). All three are written to a temp file first and moved into
 place atomically, so a dropped connection (or interrupted write) never leaves a truncated file a
-later run's existence-check could mistake for something real. It prints the exact `docker compose
+later run's existence-check could mistake for something real. Each temp file is registered with a
+script-level `EXIT` trap as it is created (issue #60), so an abort *between* the `mktemp` and the
+`mv` — a typo'd `BRANCH`, which isn't validated until after all three fetches have 404'd — sweeps
+its `tmp.XXXXXX` instead of stranding it beside the real files. It prints the exact `docker compose
 up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*` exports for day-2
 `bin/bot-ops.sh` use afterward — see the script's own output, or read `ops/install.sh` directly.
 
@@ -141,6 +144,14 @@ out and `env-set` refuses to write them. Edit those by hand with `nano` on the b
   longer derives anything from its own location — those two independent paths (config dir vs.
   the Dockge-managed compose file, see [Bootstrapping](#bootstrapping-a-fresh-instance-no-checkout))
   must always be passed explicitly. An unset one is a loud, named error, not a guess.
+- **Both of those must be absolute, and a relative one is rejected outright** (issue #60). A
+  relative path resolves against whatever cwd the script was invoked from, so a maintainer
+  hand-running it out of a checkout would have `env-set` rewrite the *checkout's* `.env` and drop
+  `backups/.env.bak.*` — a live token — beside it; `.gitignore` covers those two but not the
+  `admins.json` the panel writes into the same directory. Every deployed invocation already passes
+  an absolute `/opt` path (`install.sh` generates them), so this rejects only the hand-run mistake.
+  The error names the offending value, quoted, next to the variable. `src/storage.ts` cites this as
+  the absolute-only precedent for its own `BOT_DATA_DIR` guard.
 - **`env-set` rebuilds `.env` line-by-line** (no `sed`), so a value can never inject into the
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
   `<config-dir>/backups/.env.bak.<stamp>` is written before any change; a no-op (new value equals

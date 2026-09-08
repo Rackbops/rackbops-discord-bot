@@ -292,8 +292,11 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
       const fx = setup("");
       const run = await botOps(fx, ["status"], undefined, { [name]: value });
       expect(run.exitCode).not.toBe(0);
-      expect(run.stderr).toContain(`${name} must be an absolute path`);
-      expect(run.stderr).toContain(value); // names the offending value, not just the variable
+      // Matched as the one whole quoted phrase, not `${name}` and `${value}` separately: for
+      // value "." a bare toContain(value) passes against any stderr with a full stop in it —
+      // vacuously true of the message itself. This pins that the offending value is echoed back,
+      // quoted, so the operator can see the empty-looking path they actually passed.
+      expect(run.stderr).toContain(`${name} must be an absolute path, got "${value}"`);
       expect(dockerCalls(fx)).toHaveLength(0);
     });
   }
@@ -301,7 +304,12 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
   test("an absolute config dir and compose file still run normally", async () => {
     const fx = setup("");
     const run = await botOps(fx, ["status"]);
+    // Not just "no rejection message": the guard runs before docker is touched, so proving it
+    // didn't fire means proving the run got all the way *past* it to a normal successful status.
+    // Asserting only the absent string would still pass if the script died for some other reason.
+    expect(run.exitCode).toBe(0);
     expect(run.stderr).not.toContain("must be an absolute path");
+    expect(dockerCalls(fx).length).toBeGreaterThan(0);
   });
 });
 

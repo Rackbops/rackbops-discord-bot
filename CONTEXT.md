@@ -275,8 +275,13 @@ _Avoid_: plugin list, cache
   (`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`), along with `BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER`
   (issue #41 — a monorepo-era default on these last two once let a var-less invocation silently
   target a project/container no real deploy produces), with no fallback to its own script location
-  or to any built-in name. `ops/install.sh` bootstraps a fresh instance's layout; see
-  `ops/README.md` for the full runbook.
+  or to any built-in name. **Both paths must be absolute; a relative one is rejected before docker
+  is touched** (issue #60) — a relative path resolves against the invoking cwd, so hand-running the
+  script from a checkout would point `env-set` at the *checkout's* `.env` and write
+  `backups/.env.bak.*` (a live token) beside it, next to the `admins.json` `.gitignore` doesn't
+  cover. `src/storage.ts`'s `resolveDataDir` cites this as the absolute-only precedent for
+  `BOT_DATA_DIR`. `ops/install.sh` bootstraps a fresh instance's layout; see `ops/README.md` for
+  the full runbook.
 - **`docker-compose.yml`'s interpolation vars have TWO sources, in Compose's own precedence
   order: shell-exported values first, then a `.env` file in the stack directory** (Compose loads
   one automatically for `${VAR}` substitution — a mechanism entirely separate from the `env_file:`

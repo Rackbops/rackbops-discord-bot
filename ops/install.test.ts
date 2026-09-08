@@ -7,7 +7,8 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,6 +19,15 @@ function extractFunction(name: string): string {
   const match = installShSource.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
   if (!match) {
     throw new Error(`ops/install.sh: couldn't find a ${name}() function to extract — did it get renamed or reshaped?`);
+  }
+  return match[0];
+}
+
+/** Same contract as extractFunction, for a bare top-level line rather than a function body. */
+function extractLine(pattern: RegExp, what: string): string {
+  const match = installShSource.match(pattern);
+  if (!match) {
+    throw new Error(`ops/install.sh: couldn't find ${what} — did it get removed or reshaped?`);
   }
   return match[0];
 }
@@ -115,3 +125,91 @@ describe.skipIf(!runnable)(
     });
   },
 );
+
+// ---------------------------------------------------------------------------
+// The temp-file sweep (issue #60, item 3)
+// ---------------------------------------------------------------------------
+// Same extraction discipline as above: the trap, the cleanup function and fetch() are all pulled
+// from the live install.sh, so deleting any of them there fails these tests rather than silently
+// leaving them unguarded. The abort is driven by a fake `curl` that exits 22 — curl -f's own code
+// for an HTTP 4xx, which is exactly what a typo'd BRANCH does, and BRANCH isn't validated until
+// after all three fetches have already run. Hermetic: no network, no /opt, no sudo.
+const TMP_FILES_DECL = extractLine(/^TMP_FILES=\(\)$/m, "the TMP_FILES=() declaration");
+const CLEANUP_TMP_FILES = extractFunction("cleanup_tmp_files");
+const CLEANUP_TRAP = extractLine(/^trap cleanup_tmp_files EXIT$/m, "the cleanup_tmp_files EXIT trap");
+const FETCH = extractFunction("fetch");
+
+interface Sweep {
+  exitCode: number;
+  /** Files still named tmp.* in the destination dir — i.e. stranded temp files. */
+  leftovers: number;
+  /** Whether fetch() completed its mv to the real destination. */
+  destExists: boolean;
+}
+
+async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Sweep> {
+  const dir = mkdtempSync(join(tmpdir(), "install-sweep-"));
+  try {
+    const script = [
+      "set -euo pipefail",
+      `cd "${dir.replaceAll("\\", "/")}"`,
+      TMP_FILES_DECL,
+      CLEANUP_TMP_FILES,
+      // The one knob under test. Omitted, the same run must strand a file — that is what makes
+      // the passing case evidence of the trap rather than of mv having already moved the file.
+      o.withTrap ? CLEANUP_TRAP : "# trap deliberately omitted (mutation control)",
+      // Fakes: curl is the failure injector; chown can't work on a Windows/CI checkout and isn't
+      // what's under test. chmod is real — it's harmless and keeps the extracted body honest.
+      `curl() { return ${o.curlExit}; }`,
+      "chown() { :; }",
+      'RAW_BASE="http://example.invalid"; BRANCH="typo"; DEPLOY_UID=1000; DEPLOY_GID=1000',
+      FETCH,
+      'fetch "docker-compose.yml" 644 "./out.yml"',
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const exitCode = await proc.exited;
+    const entries = readdirSync(dir);
+    return { exitCode, leftovers: entries.filter((f) => f.startsWith("tmp.")).length, destExists: entries.includes("out.yml") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts the script (issue #60)", () => {
+  test("a failed download strands nothing in the destination directory", async () => {
+    const r = await runSweep({ withTrap: true, curlExit: 22 });
+    expect(r.exitCode).not.toBe(0); // set -e propagated curl -f's 404 exit
+    expect(r.destExists).toBe(false); // it never got as far as the mv
+    expect(r.leftovers).toBe(0); // ...and the trap took the mktemp file with it
+  });
+
+  test("without the trap that same failure DOES strand one, so the test above isn't vacuous", async () => {
+    const r = await runSweep({ withTrap: false, curlExit: 22 });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.leftovers).toBe(1);
+  });
+
+  test("on the success path the sweep can't eat the file fetch() already moved into place", async () => {
+    const r = await runSweep({ withTrap: true, curlExit: 0 });
+    expect(r.exitCode).toBe(0);
+    expect(r.destExists).toBe(true);
+    expect(r.leftovers).toBe(0);
+  });
+});
+
+// The behavioural tests above drive fetch()'s mktemp only. install.sh's other mktemp — the one for
+// $STACK_DIR/.env — sits mid-function behind git ls-remote and a populated $STACK_DIR, so running
+// it would cost more harness than it guards. This is the anti-rot check instead: every mktemp in
+// the script must register with TMP_FILES on the very next line, and the count is pinned so the
+// scan can't quietly pass by matching nothing (the failure mode that made an earlier guard of mine
+// vacuous). Adding a fourth mktemp without registering it fails here.
+test("every mktemp in install.sh registers its temp file for the sweep", () => {
+  const lines = installShSource.split("\n");
+  let checked = 0;
+  lines.forEach((line, i) => {
+    if (!/\bmktemp\b/.test(line)) return;
+    checked += 1;
+    expect(`${i + 1}: ${lines[i + 1] ?? "<end of file>"}`).toMatch(/TMP_FILES\+=\(/);
+  });
+  expect(checked).toBe(2); // fetch()'s, and the one for $STACK_DIR/.env
+});
