@@ -147,9 +147,8 @@ _Avoid_: plugin list, cache
   an already-announced transition but does announce a real one that occurred while the bot was offline.
   `ops/bot-ops.sh status` reads `wow.json` first, falling back to `state.json`, for the `realmStatus`
   field the panel + `wow-companion` consume.
-- **Release polling** follows the repo's daily release cron (14:00 UTC, `.github/workflows/release.yml`):
-  polls every 5 min inside a 90-min window from 14:00 UTC, plus once at startup to catch
-  anything published while the bot was offline. Each repo in `config.watchedRepos` is polled
+- **Release polling** runs on a flat 15-min cadence plus a startup catch-up (there is no release
+  cron in this fork — same shape as the self-update / plugin-update checks). Each repo in `config.watchedRepos` is polled
   independently; a repo's first-ever poll (its key absent from `seenReleaseIds`) seeds silently.
 - **Self-update** asks whether the baked-in `GIT_SHA` **contains** the newest `BOT_BRANCH` (default
   `main`) commit on `GITHUB_REPO` (flat 15-min cadence + startup, only when `AUTO_UPDATE=true`;
