@@ -53,6 +53,11 @@ set -euo pipefail
 # replace the first.
 TMP_FILES=()
 cleanup_tmp_files() {
+  # The -gt 0 test is deliberately unpinned by any test, and cannot be pinned on a modern box: on
+  # bash >= 4.4 `"${empty[@]}"` under `set -u` expands to nothing instead of erroring, so deleting
+  # this line changes nothing here (verified: `a=(); rm -f "${a[@]}"` exits 0 on bash 5.x). It
+  # defends bash < 4.4, where that expansion is an unbound-variable error — reachable whenever the
+  # script dies before the first fetch() registers anything (a bad instance name, `need git`).
   if [ "${#TMP_FILES[@]}" -gt 0 ]; then rm -f "${TMP_FILES[@]}"; fi
 }
 trap cleanup_tmp_files EXIT

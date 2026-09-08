@@ -277,6 +277,12 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
     expect(dockerCalls(fx)).toHaveLength(0);
   });
 
+});
+
+// Its own describe rather than nested in the #41 block above: that one is about the vars being
+// REQUIRED, this is about the shape of the value once given, and #60 work reporting under a "(issue
+// #41)" heading is misleading in test output.
+describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE to be absolute (issue #60 item 4)", () => {
   // #60 item 4: a relative path resolves against whatever cwd the script was invoked from. For a
   // maintainer running this out of a clone that is the checkout, and `env-set` would then rewrite
   // the checkout's own .env and drop backups/.env.bak.* — a live token — beside it. Deployed

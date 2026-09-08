@@ -204,14 +204,32 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
 // it would cost more harness than it guards. This is the anti-rot check instead: every mktemp in
 // the script must register with TMP_FILES on the very next line, and the count is pinned so the
 // scan can't quietly pass by matching nothing (the failure mode that made an earlier guard of mine
-// vacuous). Adding a fourth mktemp without registering it fails here.
+// vacuous). Adding a third mktemp without registering it fails here.
+//
+// Comment lines are blanked before the scan: matching them would fail *closed* (a comment merely
+// mentioning mktemp would redden this test), which is only maintenance friction, but it is still a
+// false alarm. Deliberately NOT narrowed to `mktemp -p` — a bare `mktemp`, which puts the file in
+// /tmp instead of beside its destination, is a real bug (it is the one #96 fixed in bot-ops.sh) and
+// must be caught by this scan, not skipped by it.
+const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
+
 test("every mktemp in install.sh registers its temp file for the sweep", () => {
-  const lines = installShSource.split("\n");
   let checked = 0;
-  lines.forEach((line, i) => {
+  CODE_LINES.forEach((line, i) => {
     if (!/\bmktemp\b/.test(line)) return;
     checked += 1;
-    expect(`${i + 1}: ${lines[i + 1] ?? "<end of file>"}`).toMatch(/TMP_FILES\+=\(/);
+    expect(`${i + 1}: ${CODE_LINES[i + 1] ?? "<end of file>"}`).toMatch(/TMP_FILES\+=\(/);
   });
   expect(checked).toBe(2); // fetch()'s, and the one for $STACK_DIR/.env
+});
+
+// The behavioural tests run an extracted composite, never install.sh itself, so they cannot see a
+// SECOND `trap ... EXIT` added elsewhere in the script — which would silently REPLACE the sweep
+// rather than run alongside it. That is not hypothetical: the sibling script does exactly that at
+// ops/bot-ops.sh:579 (`trap "rm -f \"$tmp\"" EXIT` inside a function), and it is the reason this
+// change registers into an array instead of trapping per-function. Pinned as an exact list so both
+// directions fail — a second trap, or the sweep's own trap going missing.
+test("install.sh installs exactly one EXIT trap, so nothing can silently replace the sweep", () => {
+  const traps = CODE_LINES.filter((l) => /\btrap\b/.test(l) && /\bEXIT\b/.test(l)).map((l) => l.trim());
+  expect(traps).toEqual(["trap cleanup_tmp_files EXIT"]);
 });
