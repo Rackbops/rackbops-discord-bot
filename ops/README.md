@@ -153,6 +153,14 @@ out and `env-set` refuses to write them. Edit those by hand with `nano` on the b
   an absolute `/opt` path (`install.sh` generates them), so this rejects only the hand-run mistake.
   The error names the offending value, quoted, next to the variable. `src/storage.ts` cites this as
   the absolute-only precedent for its own `BOT_DATA_DIR` guard.
+- **The admin panel enforces the same rule on `BOT_OPS_CONFIG_DIR`, and refuses to start without
+  it** (issue #60 too — the item named both sites). The panel reads that variable directly to place
+  `admins.json`, so the script's guard doesn't cover it. A relative value exits 1 with the same
+  named message rather than degrading, because a misplaced `admins.json` makes the dynamic admin
+  list fail closed — narrowing JWT auth to nobody — and a panel that won't start at least says why.
+  An **unset** value is still fine and still starts: that is the documented bootstrap-only mode
+  (`ADMIN_ALLOWED_EMAILS` works, nothing persists), logged as
+  `no BOT_OPS_CONFIG_DIR — dynamic admin list can't persist`.
 - **`env-set` rebuilds `.env` line-by-line** (no `sed`), so a value can never inject into the
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
   `<config-dir>/backups/.env.bak.<stamp>` is written before any change; a no-op (new value equals

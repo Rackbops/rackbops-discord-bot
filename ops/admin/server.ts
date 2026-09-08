@@ -1430,7 +1430,17 @@ if (import.meta.main) {
   // (BOT_OPS_CONFIG_DIR); without a config dir the bootstrap still works but there's nowhere to
   // persist changes, so writes fail loudly rather than silently dropping an added admin.
   const bootstrap = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS) ?? new Set<string>();
-  const adminsFile = resolveAdminsFile(process.env.BOT_OPS_CONFIG_DIR);
+  // Same shape as the ADMIN_TOKEN refusal above: a named one-line reason and exit 1, rather than
+  // letting resolveAdminsFile's throw escape as an unhandled rejection with a stack trace. The
+  // function still throws (that is what makes it testable without an entry point); the entry point
+  // is what turns a misconfiguration into a legible refusal to start.
+  let adminsFile: string | undefined;
+  try {
+    adminsFile = resolveAdminsFile(process.env.BOT_OPS_CONFIG_DIR);
+  } catch (err) {
+    console.error(`[admin] ${err instanceof Error ? err.message : err} — refusing to start`);
+    process.exit(1);
+  }
   const configDir = adminsFile ? process.env.BOT_OPS_CONFIG_DIR!.trim() : undefined;
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
