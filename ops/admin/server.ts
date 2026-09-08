@@ -147,6 +147,98 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
 }
 
 /**
+ * Turns a raw `BOT_OPS_CONFIG_DIR` into the admins.json path, or `undefined` when it isn't set.
+ *
+ * **Absolute-only**, the second half of issue #60 item 4 — which named this call site alongside
+ * `ops/bot-ops.sh`'s, for the same reason: a relative value resolves against whatever cwd the
+ * process happens to have, and for a panel run out of a clone that is the checkout. `admins.json`
+ * is precisely the file that makes this worse than the script's case — `.gitignore` covers `.env`
+ * and `.env.bak.*`, but nothing covers the admin list, so it lands untracked-but-uncovered in a
+ * public repo's working tree.
+ *
+ * Unset stays a supported degraded mode (bootstrap-only, no persistence — see
+ * `logDynamicAdminsStartup`). A relative value is not, and is rejected rather than narrowed to
+ * that mode: it *looks* like working persistence while writing somewhere the operator didn't
+ * choose.
+ *
+ * Refusing to start matters because the silent alternative fails **open**, not closed. A
+ * wrong-directory `admins.json` is *absent*, not malformed, so `readDynamicAdmins` takes its
+ * `file.exists()` early return and yields an empty set without throwing — the fail-closed branch
+ * never runs. Empty dynamic plus an empty `ADMIN_ALLOWED_EMAILS` bootstrap makes
+ * `effectiveAllowlist` return `undefined`, the "no narrowing configured" sentinel, and
+ * `isEmailAllowed` then returns `true` for *every* Access identity. So the panel would come up
+ * looking healthy while its admin list silently authorized anyone — and the operator's real
+ * `admins.json`, sitting in the directory they meant, would never be read.
+ *
+ * One deliberate asymmetry with the script, since "matching" below is about the `/` test only:
+ * this trims before testing, while `ops/bot-ops.sh`'s `case "${!var}"` matches the raw value. So a
+ * value with a leading space starts the panel but makes every `bot-ops.sh` the panel spawns die.
+ * Left as-is rather than tightened here: no deployed path produces one (both `install.sh` writers
+ * emit a bare `/opt/...`), and the trim is pre-existing behaviour this change should not alter.
+ *
+ * Absolute means POSIX-absolute (a leading `/`), matching `ops/bot-ops.sh`'s `/*` case rather than
+ * `node:path`'s `isAbsolute` — the panel is a Linux-only container (the profile-gated `admin`
+ * service), so accepting a Windows `C:\...` shape here would only ever admit a path that is
+ * relative on the machine this actually runs on.
+ */
+export function resolveAdminsFile(rawConfigDir: string | undefined): string | undefined {
+  const configDir = rawConfigDir?.trim();
+  if (!configDir) return undefined;
+  if (!configDir.startsWith("/")) {
+    throw new Error(
+      `BOT_OPS_CONFIG_DIR must be an absolute path, got "${configDir}" — it holds .env, backups/ and admins.json, and a relative path resolves against the panel's cwd`,
+    );
+  }
+  return `${configDir}/admins.json`;
+}
+
+/**
+ * The whole `BOT_OPS_CONFIG_DIR` resolution the entry point needs, as one call.
+ *
+ * Exists because the two values must agree: `configDir` feeds `statSync` (for admins.json's
+ * ownership) and the two `${configDir}/.env` reads, while `adminsFile` is the guarded path — and
+ * everything downstream assumes `configDir` is defined exactly when `adminsFile` is. Computing
+ * them as two separate statements in the entry point put that invariant in the one place no test
+ * can execute (everything under `import.meta.main` is import-inert by design); the review gate
+ * demonstrated it by reverting those statements to their pre-guard form with all 919 tests still
+ * green. Here the pairing is a pure function, so it is pinned like anything else.
+ */
+export function resolveAdminStorePaths(env: Record<string, string | undefined>): {
+  configDir: string | undefined;
+  adminsFile: string | undefined;
+} {
+  const adminsFile = resolveAdminsFile(env.BOT_OPS_CONFIG_DIR);
+  // Non-null assertion is safe: adminsFile is defined only when the trimmed value was non-empty
+  // (and absolute, or resolveAdminsFile would have thrown), so the re-read cannot be undefined.
+  const configDir = adminsFile ? env.BOT_OPS_CONFIG_DIR!.trim() : undefined;
+  return { configDir, adminsFile };
+}
+
+/**
+ * `resolveAdminStorePaths` plus the entry point's reaction to a rejection: log it with the
+ * `[admin]` prefix and exit 1, the same shape as the ADMIN_TOKEN refusal.
+ *
+ * A function rather than a `try`/`catch` in the entry point because `process.exit(1)` is a
+ * production line and has to be pinnable. As inline code under `import.meta.main` it wasn't:
+ * replacing it with "log and carry on" left the whole suite green while producing exactly the
+ * outcome this guard exists to prevent — a panel that comes up and authorizes every Access
+ * identity. `logError`/`exit` are injected for the same reason `logDynamicAdminsStartup` injects
+ * its loggers: so the refusal is test-pinned rather than only ever eyeballed in a container log.
+ */
+export function resolveAdminStorePathsOrExit(
+  env: Record<string, string | undefined>,
+  logError: (msg: string) => void = console.error,
+  exit: (code: number) => never = process.exit,
+): { configDir: string | undefined; adminsFile: string | undefined } {
+  try {
+    return resolveAdminStorePaths(env);
+  } catch (err) {
+    logError(`[admin] ${err instanceof Error ? err.message : err} — refusing to start`);
+    return exit(1);
+  }
+}
+
+/**
  * Startup-time validation for the dynamic admin list — logs the file path and admin count on
  * success, or the parse/read error via `logError` when `admins.json` exists but is broken (this
  * exact silent failure is what issue #40 fixed: it used to be indistinguishable from "no dynamic
@@ -1397,8 +1489,11 @@ if (import.meta.main) {
   // (BOT_OPS_CONFIG_DIR); without a config dir the bootstrap still works but there's nowhere to
   // persist changes, so writes fail loudly rather than silently dropping an added admin.
   const bootstrap = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS) ?? new Set<string>();
-  const configDir = process.env.BOT_OPS_CONFIG_DIR?.trim();
-  const adminsFile = configDir ? `${configDir}/admins.json` : undefined;
+  // Same shape as the ADMIN_TOKEN refusal above: a named one-line reason and exit 1, rather than
+  // letting resolveAdminsFile's throw escape as an unhandled rejection with a stack trace. The
+  // function still throws (that is what makes it testable without an entry point); the entry point
+  // is what turns a misconfiguration into a legible refusal to start.
+  const { configDir, adminsFile } = resolveAdminStorePathsOrExit(process.env);
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
     bootstrap,

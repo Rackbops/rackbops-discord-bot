@@ -43,6 +43,25 @@
 # the file is fully fetched, runs the whole thing — never a partial prefix.
 set -euo pipefail
 
+# Every temp file this script creates is registered here and swept however we leave — including
+# the `set -e` abort that is the realistic case. `BRANCH` isn't validated until after all three
+# fetches, so a typo'd branch 404s inside `fetch()` and aborts mid-run, stranding a `tmp.XXXXXX`
+# in the install tree. Nothing sensitive leaks (curl -f writes no body on a 404, all three sources
+# are public, and the stack .env holds no secrets by design) — but the litter lands one directory
+# from the real ones. A script-level EXIT trap rather than a per-function one: a RETURN trap does
+# not fire when `set -e` unwinds, and a second EXIT trap set inside a function would silently
+# replace the first.
+TMP_FILES=()
+cleanup_tmp_files() {
+  # The -gt 0 test is deliberately unpinned by any test, and cannot be pinned on a modern box: on
+  # bash >= 4.4 `"${empty[@]}"` under `set -u` expands to nothing instead of erroring, so deleting
+  # this line changes nothing here (verified: `a=(); rm -f "${a[@]}"` exits 0 on bash 5.x). It
+  # defends bash < 4.4, where that expansion is an unbound-variable error — reachable whenever the
+  # script dies before the first fetch() registers anything (a bad instance name, `need git`).
+  if [ "${#TMP_FILES[@]}" -gt 0 ]; then rm -f "${TMP_FILES[@]}"; fi
+}
+trap cleanup_tmp_files EXIT
+
 REPO_URL="https://github.com/Rackbops/rackbops-discord-bot.git"
 RAW_BASE="https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot"
 
@@ -100,6 +119,7 @@ fetch() {
   # filesystem mv falls back to copy-then-unlink, which reopens the exact truncated-file window
   # this function exists to close.
   tmp="$(mktemp -p "$(dirname "$dest")")"
+  TMP_FILES+=("$tmp")
   curl -fsSL "$RAW_BASE/$BRANCH/$src" -o "$tmp"
   chmod "$mode" "$tmp"
   chown "$DEPLOY_UID:$DEPLOY_GID" "$tmp"
@@ -176,6 +196,7 @@ main() {
   # branch (not `.`) so even an accidental rebuild through this fallback has a real Dockerfile to
   # build from instead of failing on the stack dir, which holds none.
   STACK_ENV_TMP="$(mktemp -p "$STACK_DIR")"
+  TMP_FILES+=("$STACK_ENV_TMP")
   cat > "$STACK_ENV_TMP" <<STACKENV
 BOT_ENV_FILE=$CONFIG_DIR/.env
 BOT_OPS_CONTAINER=$PROJECT

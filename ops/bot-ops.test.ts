@@ -276,6 +276,47 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
     expect(run.stderr).toContain("invalid BOT_OPS_CONTAINER");
     expect(dockerCalls(fx)).toHaveLength(0);
   });
+
+});
+
+// Its own describe rather than nested in the #41 block above: that one is about the vars being
+// REQUIRED, this is about the shape of the value once given, and #60 work reporting under a "(issue
+// #41)" heading is misleading in test output.
+describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE to be absolute (issue #60 item 4)", () => {
+  // #60 item 4: a relative path resolves against whatever cwd the script was invoked from. For a
+  // maintainer running this out of a clone that is the checkout, and `env-set` would then rewrite
+  // the checkout's own .env and drop backups/.env.bak.* — a live token — beside it. Deployed
+  // invocations are always absolute, so this rejects only the hand-run mistake. `src/storage.ts`
+  // has cited BOT_OPS_CONFIG_DIR as the absolute-only precedent for BOT_DATA_DIR since #139; until
+  // this guard existed that was a claim about a rule nothing enforced.
+  for (const [name, value] of [
+    ["BOT_OPS_CONFIG_DIR", "."],
+    ["BOT_OPS_CONFIG_DIR", "./config"],
+    ["BOT_OPS_COMPOSE_FILE", "docker-compose.yml"],
+  ] as const) {
+    test(`a relative ${name} (${value}) dies before touching docker`, async () => {
+      const fx = setup("");
+      const run = await botOps(fx, ["status"], undefined, { [name]: value });
+      expect(run.exitCode).not.toBe(0);
+      // Matched as the one whole quoted phrase, not `${name}` and `${value}` separately: for
+      // value "." a bare toContain(value) passes against any stderr with a full stop in it —
+      // vacuously true of the message itself. This pins that the offending value is echoed back,
+      // quoted, so the operator can see the empty-looking path they actually passed.
+      expect(run.stderr).toContain(`${name} must be an absolute path, got "${value}"`);
+      expect(dockerCalls(fx)).toHaveLength(0);
+    });
+  }
+
+  test("an absolute config dir and compose file still run normally", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"]);
+    // Not just "no rejection message": the guard runs before docker is touched, so proving it
+    // didn't fire means proving the run got all the way *past* it to a normal successful status.
+    // Asserting only the absent string would still pass if the script died for some other reason.
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).not.toContain("must be an absolute path");
+    expect(dockerCalls(fx).length).toBeGreaterThan(0);
+  });
 });
 
 // The three keys #107 moved off bot-ops.sh's static whitelist into @rackbops/plugin-wow. The

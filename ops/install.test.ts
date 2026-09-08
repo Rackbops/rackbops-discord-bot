@@ -7,7 +7,8 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -18,6 +19,15 @@ function extractFunction(name: string): string {
   const match = installShSource.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"));
   if (!match) {
     throw new Error(`ops/install.sh: couldn't find a ${name}() function to extract — did it get renamed or reshaped?`);
+  }
+  return match[0];
+}
+
+/** Same contract as extractFunction, for a bare top-level line rather than a function body. */
+function extractLine(pattern: RegExp, what: string): string {
+  const match = installShSource.match(pattern);
+  if (!match) {
+    throw new Error(`ops/install.sh: couldn't find ${what} — did it get removed or reshaped?`);
   }
   return match[0];
 }
@@ -115,3 +125,165 @@ describe.skipIf(!runnable)(
     });
   },
 );
+
+// ---------------------------------------------------------------------------
+// The temp-file sweep (issue #60, item 3)
+// ---------------------------------------------------------------------------
+// Same extraction discipline as above: the trap, the cleanup function and fetch() are all pulled
+// from the live install.sh, so deleting any of them there fails these tests rather than silently
+// leaving them unguarded. The abort is driven by a fake `curl` that exits 22 — curl -f's own code
+// for an HTTP 4xx, which is exactly what a typo'd BRANCH produces: BRANCH is only checked against
+// the remote by the `no branch '$BRANCH' found` guard, which sits *after* all three `fetch` calls,
+// so the very first one 404s and set -e aborts there — the validation never runs. (Cited by the
+// landmark rather than a line number on purpose: an earlier revision of this comment named
+// :156/:169/:171 and went stale five lines out the moment install.sh grew a comment.) Hermetic: no
+// network, no /opt, no sudo.
+const TMP_FILES_DECL = extractLine(/^TMP_FILES=\(\)$/m, "the TMP_FILES=() declaration");
+const CLEANUP_TMP_FILES = extractFunction("cleanup_tmp_files");
+const CLEANUP_TRAP = extractLine(/^trap cleanup_tmp_files EXIT$/m, "the cleanup_tmp_files EXIT trap");
+const FETCH = extractFunction("fetch");
+
+interface Sweep {
+  exitCode: number;
+  /** Files still named tmp.* in the destination dir — i.e. stranded temp files. */
+  leftovers: number;
+  /** Whether fetch() completed its mv to the real destination. */
+  destExists: boolean;
+}
+
+async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Sweep> {
+  const dir = mkdtempSync(join(tmpdir(), "install-sweep-"));
+  try {
+    const script = [
+      "set -euo pipefail",
+      `cd "${dir.replaceAll("\\", "/")}"`,
+      TMP_FILES_DECL,
+      CLEANUP_TMP_FILES,
+      // The one knob under test. Omitted, the same run must strand a file — that is what makes
+      // the passing case evidence of the trap rather than of mv having already moved the file.
+      o.withTrap ? CLEANUP_TRAP : "# trap deliberately omitted (mutation control)",
+      // Fakes: curl is the failure injector; chown can't work on a Windows/CI checkout and isn't
+      // what's under test. chmod is real — it's harmless and keeps the extracted body honest.
+      `curl() { return ${o.curlExit}; }`,
+      "chown() { :; }",
+      'RAW_BASE="http://example.invalid"; BRANCH="typo"; DEPLOY_UID=1000; DEPLOY_GID=1000',
+      FETCH,
+      'fetch "docker-compose.yml" 644 "./out.yml"',
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const exitCode = await proc.exited;
+    const entries = readdirSync(dir);
+    return { exitCode, leftovers: entries.filter((f) => f.startsWith("tmp.")).length, destExists: entries.includes("out.yml") };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts the script (issue #60)", () => {
+  test("a failed download strands nothing in the destination directory", async () => {
+    const r = await runSweep({ withTrap: true, curlExit: 22 });
+    expect(r.exitCode).not.toBe(0); // set -e propagated curl -f's 404 exit
+    expect(r.destExists).toBe(false); // it never got as far as the mv
+    expect(r.leftovers).toBe(0); // ...and the trap took the mktemp file with it
+  });
+
+  test("without the trap that same failure DOES strand one, so the test above isn't vacuous", async () => {
+    const r = await runSweep({ withTrap: false, curlExit: 22 });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.leftovers).toBe(1);
+  });
+
+  test("on the success path the sweep can't eat the file fetch() already moved into place", async () => {
+    const r = await runSweep({ withTrap: true, curlExit: 0 });
+    expect(r.exitCode).toBe(0);
+    expect(r.destExists).toBe(true);
+    expect(r.leftovers).toBe(0);
+  });
+});
+
+// The behavioural tests above drive fetch()'s mktemp only. install.sh's other mktemp — the one for
+// $STACK_DIR/.env — sits mid-function behind git ls-remote and a populated $STACK_DIR, so running
+// it would cost more harness than it guards. This is the anti-rot check instead: every mktemp in
+// the script must register with TMP_FILES on the very next line, and the count is pinned so the
+// scan can't quietly pass by matching nothing (the failure mode that made an earlier guard of mine
+// vacuous). Adding a third mktemp without registering it fails here.
+//
+// Comment lines are blanked before the scan: matching them would fail *closed* (a comment merely
+// mentioning mktemp would redden this test), which is only maintenance friction, but it is still a
+// false alarm. The match stays the bare `\bmktemp\b` rather than `mktemp -p` so that a `mktemp`
+// written without -p is still required to register — narrowing the regex would SKIP such a line
+// entirely, letting an unregistered one through silently. What this scan does not check is the -p
+// itself: a registered `mktemp` with no -p passes here (verified), and putting the temp file in
+// /tmp rather than beside its destination is a separate defect — the EXDEV one #96 fixed in
+// bot-ops.sh, argued for install.sh at ops/install.sh:117-120.
+const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
+
+// The registration must name the SAME variable the mktemp assigned. Requiring only "some
+// TMP_FILES+= on the next line" is not enough, and the failure it misses is severe rather than
+// cosmetic: registering `TMP_FILES+=("$CONFIG_DIR/.env")` next to a mktemp both strands the temp
+// file AND makes the EXIT trap `rm -f` the instance's live secrets .env. That is a plausible
+// copy-paste slip when adding a third mktemp, and it passed this scan before.
+test("every mktemp in install.sh registers the temp file it just assigned", () => {
+  let checked = 0;
+  CODE_LINES.forEach((line, i) => {
+    if (!/\bmktemp\b/.test(line)) return;
+    checked += 1;
+    // The variable this mktemp assigns to, e.g. `tmp` in `tmp="$(mktemp -p ...)"`.
+    const assigned = line.match(/^\s*(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)=/)?.[1];
+    const where = `install.sh:${i + 1} (${line.trim()})`;
+    expect(assigned ?? `<no assignment at ${where}>`).toMatch(/^[A-Za-z_]/);
+    expect(`${where} -> ${(CODE_LINES[i + 1] ?? "<end of file>").trim()}`).toBe(
+      `${where} -> TMP_FILES+=("$${assigned}")`,
+    );
+  });
+  expect(checked).toBe(2); // fetch()'s, and the one for $STACK_DIR/.env
+});
+
+// The scan above only looks forward from each mktemp, so a TMP_FILES+= written ANYWHERE ELSE was
+// invisible to it. That is the more dangerous direction, and the more plausible spelling: adding
+// `TMP_FILES+=("$dest")` beside an `mv` ("clean this up if we abort") registers a file that is
+// meant to survive, and the EXIT trap then rm -f's it on every single run — the freshly installed
+// compose file, bin/bot-ops.sh, or the instance's live secrets .env. Reproduced against the real
+// cleanup_tmp_files body: a .env holding DISCORD_TOKEN was gone after a clean exit 0.
+// So: every registration must also point back at an immediately preceding mktemp of that same
+// variable. Together the two scans make the mktemp/registration pairing bidirectional.
+test("every TMP_FILES registration in install.sh belongs to the mktemp right above it", () => {
+  let checked = 0;
+  CODE_LINES.forEach((line, i) => {
+    const registered = line.match(/^\s*TMP_FILES\+=\("\$([A-Za-z_][A-Za-z0-9_]*)"\)\s*$/)?.[1];
+    if (!/TMP_FILES\+=/.test(line)) return;
+    checked += 1;
+    const where = `install.sh:${i + 1} (${line.trim()})`;
+    // Rejects a registration of anything but a bare "$VAR" — e.g. TMP_FILES+=("$CONFIG_DIR/.env").
+    expect(registered ?? `<not a bare variable registration at ${where}>`).toMatch(/^[A-Za-z_]/);
+    const prev = CODE_LINES[i - 1] ?? "<start of file>";
+    expect(`${where} <- ${prev.trim()}`).toMatch(
+      new RegExp(`<- .*\\b${registered}="\\$\\(mktemp\\b`),
+    );
+  });
+  expect(checked).toBe(2); // exactly the two registrations the scan above accounts for
+});
+
+// The behavioural tests run an extracted composite, never install.sh itself, so they cannot see a
+// SECOND `trap ... EXIT` added elsewhere in the script — which would silently REPLACE the sweep
+// rather than run alongside it. That is not hypothetical: the sibling script does exactly that at
+// ops/bot-ops.sh:579 (`trap "rm -f \"$tmp\"" EXIT` inside a function), and it is the reason this
+// change registers into an array instead of trapping per-function. Pinned as an exact list so both
+// directions fail — a second trap, or the sweep's own trap going missing.
+//
+// Matched on `trap` alone — NOT on the word EXIT, and NOT anchored to the start of the line.
+// Both narrowings were tried and both were defeated:
+//   - /\bEXIT\b/ misses `trap ':' 0`, because bash signal 0 *is* EXIT.
+//   - /^\s*trap/ misses `[ -z "${KEEP_TMP:-}" ] || trap ':' 0`, and (a regression on the first
+//     version) also misses a mid-line `|| trap ... EXIT` that the EXIT match would have caught.
+// Verified, including that a trap set inside a function replaces it too — traps are process-global:
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; [ -n "$HOME" ] && trap ":" 0; echo body' -> body
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; f(){ trap ":" 0; }; f;        echo body' -> body
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT;                              echo body' -> body SWEEP
+// Listing every trap regardless of signal or position also means a future ERR/INT trap surfaces
+// here to be considered rather than slipping in unnoticed. Comment lines are already blanked, and
+// no non-comment line in either script contains the word otherwise, so it stays non-vacuous.
+test("install.sh installs exactly one trap, so nothing can silently replace the sweep", () => {
+  const traps = CODE_LINES.filter((l) => /\btrap\b/.test(l)).map((l) => l.trim());
+  expect(traps).toEqual(["trap cleanup_tmp_files EXIT"]);
+});

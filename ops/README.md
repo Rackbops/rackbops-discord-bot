@@ -88,7 +88,11 @@ Dockge's own Start/Stop/Restart buttons — which run compose with none of `inst
 shell prefix — resolve this instance's actual identity instead of the compose file's own
 monorepo-era fallbacks (issue #41). All three are written to a temp file first and moved into
 place atomically, so a dropped connection (or interrupted write) never leaves a truncated file a
-later run's existence-check could mistake for something real. It prints the exact `docker compose
+later run's existence-check could mistake for something real. Each temp file is registered with a
+script-level `EXIT` trap as it is created (issue #60), so an abort *between* the `mktemp` and the
+`mv` sweeps its `tmp.XXXXXX` instead of stranding it beside the real files. The reachable case is a
+typo'd `BRANCH`: it is only checked against the remote *after* the three downloads, so the first one
+404s and `set -e` aborts inside `fetch()` before the branch check ever runs. It prints the exact `docker compose
 up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*` exports for day-2
 `bin/bot-ops.sh` use afterward — see the script's own output, or read `ops/install.sh` directly.
 
@@ -141,6 +145,26 @@ out and `env-set` refuses to write them. Edit those by hand with `nano` on the b
   longer derives anything from its own location — those two independent paths (config dir vs.
   the Dockge-managed compose file, see [Bootstrapping](#bootstrapping-a-fresh-instance-no-checkout))
   must always be passed explicitly. An unset one is a loud, named error, not a guess.
+- **Both of those must be absolute, and a relative one is rejected outright** (issue #60). A
+  relative path resolves against whatever cwd the script was invoked from, so a maintainer
+  hand-running it out of a checkout would have `env-set` rewrite the *checkout's* `.env` and drop
+  `backups/.env.bak.*` — a live token — beside it; `.gitignore` covers those two but not the
+  `admins.json` the panel writes into the same directory. Every deployed invocation already passes
+  an absolute `/opt` path (`install.sh` generates them), so this rejects only the hand-run mistake.
+  The error names the offending value, quoted, next to the variable. `src/storage.ts` cites this as
+  the absolute-only precedent for its own `BOT_DATA_DIR` guard.
+- **The admin panel enforces the same rule on `BOT_OPS_CONFIG_DIR`, and refuses to start without an
+  absolute one** (issue #60 too — the item named both sites). The panel reads that variable directly
+  to place `admins.json`, so the script's guard doesn't cover it. A relative value exits 1 with the
+  same named message rather than degrading, because the silent alternative fails **open**, not
+  closed: a misplaced `admins.json` is *absent* rather than malformed, so it reads as an empty
+  dynamic list without erroring, and an empty dynamic list plus an empty `ADMIN_ALLOWED_EMAILS` is
+  the "no narrowing configured" state in which **every** Access identity authorizes. The panel would
+  look healthy while the operator's real admin list sat unread in the directory they meant. A panel
+  that won't start at least says why.
+  An **unset** value is still fine and still starts: that is the documented bootstrap-only mode
+  (`ADMIN_ALLOWED_EMAILS` works, nothing persists), logged as
+  `no BOT_OPS_CONFIG_DIR — dynamic admin list can't persist`.
 - **`env-set` rebuilds `.env` line-by-line** (no `sed`), so a value can never inject into the
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
   `<config-dir>/backups/.env.bak.<stamp>` is written before any change; a no-op (new value equals
@@ -268,7 +292,10 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    able to act on this bot specifically. It's the union of two sources: **`ADMIN_ALLOWED_EMAILS`**
    (comma-separated, in `.env`) — the permanent *bootstrap* floor, editable only on the box — plus
    a **dynamic list managed live from the panel's Admins section**, persisted to `admins.json`
-   beside `.env`. With both empty there's no narrowing (any identity Access already let through
+   beside `.env` — at the path the panel builds from `BOT_OPS_CONFIG_DIR` itself, which is why a
+   **relative** value makes the panel exit 1 at startup rather than start and write the admin list
+   somewhere unintended (issue #60; an *unset* value is fine and starts in bootstrap-only mode).
+   With both empty there's no narrowing (any identity Access already let through
    authorizes); adding even one admin (env or panel) turns narrowing on. Editing
    `ADMIN_ALLOWED_EMAILS` in `.env` after bring-up needs the same admin-container recreate as the
    Access vars above — it isn't picked up live. If `admins.json` exists
