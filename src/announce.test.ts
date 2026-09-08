@@ -37,38 +37,34 @@ describe("tickChecks", () => {
   });
 });
 
-// The release window is [14:00:00.000, 15:30:00.000) UTC (RELEASE_CRON_HOUR_UTC=14,
-// RELEASE_WINDOW_MS=90min); RELEASE_POLL_GAP_MS is 5min. lastPollAt is passed in (not read off
-// module state) so every boundary can be pinned directly — see the src/announce.ts refactor.
+// Flat 15-min cadence + startup catch-up, no time-of-day window (there is no release cron in this
+// fork — #134). `now` and `lastPollAt` are both passed in (ms) so every boundary is pinnable.
 describe("shouldPollReleases", () => {
-  const WINDOW_START = Date.UTC(2026, 0, 1, 14, 0, 0, 0);
-  const WINDOW_END = Date.UTC(2026, 0, 1, 15, 30, 0, 0);
-  const FAR_PAST = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+  const GAP_MS = 15 * 60 * 1000;
+  const T0 = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
 
-  test("startup catch-up: lastPollAt = 0 is always true, even outside the window", () => {
-    expect(shouldPollReleases(new Date(Date.UTC(2026, 0, 1, 10, 0, 0, 0)), 0)).toBe(true);
+  test("startup catch-up: lastPollAt = 0 is true even before the gap has elapsed", () => {
+    // Synthetic small `now` so this pins the `=== 0` branch itself, not just `now - 0 >= GAP`.
+    expect(shouldPollReleases(0, 0)).toBe(true);
+    expect(shouldPollReleases(GAP_MS - 1, 0)).toBe(true);
+    expect(shouldPollReleases(Date.UTC(2026, 0, 1, 10, 0, 0, 0), 0)).toBe(true);
   });
 
-  test("top of the window (14:00:00.000) is true", () => {
-    expect(shouldPollReleases(new Date(WINDOW_START), FAR_PAST)).toBe(true);
+  test("polls at an arbitrary early-morning hour once the gap has elapsed — no time-of-day window", () => {
+    const at0300 = Date.UTC(2026, 0, 1, 3, 0, 0, 0);
+    expect(shouldPollReleases(at0300, at0300 - GAP_MS)).toBe(true);
   });
 
-  test("tail of the window (15:29:59.999) is true", () => {
-    expect(shouldPollReleases(new Date(WINDOW_END - 1), FAR_PAST)).toBe(true);
+  test("the gap hasn't elapsed → false", () => {
+    expect(shouldPollReleases(T0 + GAP_MS, T0 + 1)).toBe(false);
   });
 
-  test("just past the window (15:30:00.000) is false", () => {
-    expect(shouldPollReleases(new Date(WINDOW_END), FAR_PAST)).toBe(false);
+  test("the gap exactly elapsed → true", () => {
+    expect(shouldPollReleases(T0 + GAP_MS, T0)).toBe(true);
   });
 
-  test("in-window but the gap hasn't elapsed is false", () => {
-    const now = WINDOW_START + 10 * 60 * 1000;
-    expect(shouldPollReleases(new Date(now), now - 1 * 60 * 1000)).toBe(false);
-  });
-
-  test("in-window with the gap exactly elapsed is true", () => {
-    const now = WINDOW_START + 10 * 60 * 1000;
-    expect(shouldPollReleases(new Date(now), now - 5 * 60 * 1000)).toBe(true);
+  test("one ms short of the 15-min gap → false (pins the cadence value)", () => {
+    expect(shouldPollReleases(T0 + GAP_MS - 1, T0)).toBe(false);
   });
 });
 

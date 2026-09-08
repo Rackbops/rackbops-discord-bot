@@ -16,14 +16,12 @@ import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 
 const TICK_MS = 60 * 1000;
 
-// Releases publish from a daily cron at 14:00 UTC (.github/workflows/release.yml),
-// so poll only inside a window after it — plus once at startup to catch anything
-// published while the bot was offline.
-const RELEASE_CRON_HOUR_UTC = 14;
-const RELEASE_WINDOW_MS = 90 * 60 * 1000;
-const RELEASE_POLL_GAP_MS = 5 * 60 * 1000;
+// A watched repo's releases can be published at any hour (config.watchedRepos is an arbitrary
+// operator list — there is no release cron in this fork), so poll on a flat cadence like the
+// self-update check, plus once at startup to catch anything published while the bot was offline.
+const RELEASE_POLL_GAP_MS = 15 * 60 * 1000;
 
-// Bot commits land at any hour, so — unlike releases — this polls on a flat cadence.
+// Bot commits land at any hour, so this polls on a flat cadence too.
 const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
 
 let lastReleasePollAt = 0;
@@ -178,7 +176,7 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
     {
       name: "releases",
       run: async () => {
-        if (shouldPollReleases(new Date(), lastReleasePollAt)) await checkReleases(client);
+        if (shouldPollReleases(Date.now(), lastReleasePollAt)) await checkReleases(client);
       },
     },
     {
@@ -288,16 +286,12 @@ export function livePluginRequestDeps(): PluginRequestDeps {
   };
 }
 
-export function shouldPollReleases(now: Date, lastPollAt: number): boolean {
+// Flat cadence with a startup catch-up (mirrors shouldPollPluginUpdates), so a release published
+// while the bot was offline is polled for on the first eligible tick after boot. `now` and
+// `lastPollAt` are both passed in (not read off module state) so every boundary is pinnable.
+export function shouldPollReleases(now: number, lastPollAt: number): boolean {
   if (lastPollAt === 0) return true; // startup catch-up
-  const windowStart = Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
-    RELEASE_CRON_HOUR_UTC,
-  );
-  const inWindow = now.getTime() >= windowStart && now.getTime() < windowStart + RELEASE_WINDOW_MS;
-  return inWindow && now.getTime() - lastPollAt >= RELEASE_POLL_GAP_MS;
+  return now - lastPollAt >= RELEASE_POLL_GAP_MS;
 }
 
 async function checkReleases(client: Client): Promise<void> {
