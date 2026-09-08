@@ -1,0 +1,115 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { settleWithin } from "../test/settleWithin";
+
+const { fetchReleases, createIssue, ensureLabel, GITHUB_TIMEOUT_MS } = await import("./github");
+const { fetchLatestBotSha, fetchShaRelation } = await import("./update");
+const { config } = await import("./config");
+
+/**
+ * Every GitHub call carries a timeout (#88).
+ *
+ * Table-driven over ALL of them on purpose. A per-call-site convention is exactly what rots —
+ * #130 shipped with 12 of 14 daemon calls un-boundable while the suite stayed green, because only
+ * two shapes were spot-checked. The mutation this table exists to catch is deleting the `signal:`
+ * from any one site.
+ *
+ * Both stubs model a genuinely hung socket rather than an error: one never answers at all, the
+ * other answers headers and then wedges mid-body. The body case matters because these functions
+ * all `await res.json()` after the fetch resolves — a bound that covered only the request would
+ * miss it. (It doesn't: `AbortSignal.timeout` stays armed through the body read.)
+ */
+describe("every GitHub call is timeout-bounded", () => {
+  // Every call takes an overridable timeout so each can be driven — and mutated —
+  // independently, without waiting out the real 10s bound.
+  const TINY = 20;
+
+  const realFetch = globalThis.fetch;
+  const realToken = config.githubToken;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    config.githubToken = realToken;
+  });
+
+  /** Never answers; rejects only when the request's signal aborts, as a hung socket would. */
+  const neverAnswers = () =>
+    ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+        );
+      })) as unknown as typeof fetch;
+
+  /** Headers land immediately, then the body never completes — and errors when the signal fires,
+   *  which is what a real `fetch` body does. A hand-built Response ignores the signal entirely. */
+  const wedgedBody = () =>
+    ((_url: string, init?: RequestInit) =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              init?.signal?.addEventListener("abort", () =>
+                controller.error((init.signal as AbortSignal).reason),
+              );
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )) as unknown as typeof fetch;
+
+  // `fetchShaRelation` is deliberately absent: it never throws by contract, so it gets its own
+  // outcome assertion below rather than a rejection assertion here.
+  const throwingCalls: [string, () => Promise<unknown>][] = [
+    ["fetchReleases", () => fetchReleases("owner/repo", TINY)],
+    ["fetchLatestBotSha", () => fetchLatestBotSha(TINY)],
+    ["createIssue", () => createIssue("owner/repo", "t", "b", [], TINY)],
+  ];
+
+  for (const [name, call] of throwingCalls) {
+    for (const [shape, stub] of [
+      ["never answers", neverAnswers],
+      ["answers then wedges mid-body", wedgedBody],
+    ] as const) {
+      test(
+        `${name} aborts when the socket ${shape}`,
+        async () => {
+          config.githubToken = "test-token"; // createIssue requires one
+          globalThis.fetch = stub();
+          const r = await settleWithin(call(), name);
+          expect(r.ok).toBe(false);
+        },
+        2000,
+      );
+    }
+  }
+
+  // Best-effort by contract: it warns rather than throwing on a bad status. What matters is that
+  // it SETTLES — an unbounded hang here stalls /report just as hard as a throw would.
+  test(
+    "ensureLabel settles rather than hanging",
+    async () => {
+      config.githubToken = "test-token";
+      globalThis.fetch = neverAnswers();
+      await settleWithin(ensureLabel("owner/repo", "bug", TINY), "ensureLabel");
+    },
+    2000,
+  );
+
+  // fetchShaRelation swallows everything into a relation, so assert the OUTCOME, not a rejection.
+  // `unknown` is what `decideUpdate` reads as the pre-ancestry fallback.
+  test(
+    "fetchShaRelation degrades a timeout to `unknown`, not a throw",
+    async () => {
+      globalThis.fetch = neverAnswers();
+      const r = await settleWithin(fetchShaRelation("a".repeat(40), "b".repeat(40), TINY), "fetchShaRelation");
+      expect(r).toEqual({ ok: true, v: "unknown" });
+    },
+    2000,
+  );
+
+  // The floor on the value, and why. Pinned so lowering it needs a deliberate edit here: a
+  // timed-out compare becomes `unknown` -> `restart`, i.e. a real self-redeploy.
+  test("the timeout is generous enough that a compare failure stays unlikely", () => {
+    expect(GITHUB_TIMEOUT_MS).toBe(10_000);
+  });
+});

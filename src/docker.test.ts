@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { parseBuildOutput, parseContainerId } from "./docker";
+import { settleWithin } from "../test/settleWithin";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
@@ -184,25 +185,6 @@ describe("daemon calls", () => {
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
 
-  /**
-   * Await `p`, but fail loudly if it outlives `ms` instead of hanging.
-   *
-   * Every bound test must go through this. A regressed bound leaves nothing ref'd, and bun's own
-   * per-test timeout cannot interrupt that — the suite wedges with no output until the CI job
-   * limit rather than going red. The `Bun.sleep` here is ref'd, so it always wins that race and
-   * turns a wedge into a clean failure.
-   */
-  const settleWithin = async <T>(p: Promise<T>, label: string, ms = 500) => {
-    const outcome = await Promise.race([
-      p.then(
-        (v) => ({ ok: true as const, v }),
-        (e) => ({ ok: false as const, e: e as Error }),
-      ),
-      Bun.sleep(ms).then(() => null),
-    ]);
-    if (outcome === null) throw new Error(`${label} hung past its bound — never aborted`);
-    return outcome;
-  };
 
   test(
     "a response whose body never completes is aborted too, not just a stalled request",
