@@ -307,9 +307,36 @@ export async function redeploy(
     outcome = "failed";
   }
 
+  // Timestamped BEFORE the marker read, so "after" below means strictly after we gave up.
+  const decidedAt = Date.now();
   const marker = await readMarker();
+
+  // #85: don't remove a replacement that has come back and signalled `ready` since we decided.
+  //
+  // The standby inherits `unless-stopped` (buildCreateSpec), so a replacement that dies without
+  // completing the handoff is restarted by Docker as the SAME container id — the id this removal
+  // targets. If that resurrected generation then succeeds, it stops the original (an explicit stop
+  // is exempt from the restart policy, so the original does not come back) at the same moment this
+  // force-removes it. Both landing is zero bots with no self-recovery.
+  //
+  // The comparison is on `at`, not on `status === "ready"` alone: `stalled` is DEFINED as the
+  // marker having stayed `ready` for the whole retirement deadline, so a bare status check would
+  // skip the removal on every stall and leave a wedged `<name>-next` behind — which bot-ops.sh
+  // then reads as a swap in progress and refuses restart/env-set until an operator intervenes.
+  // Both containers share the host clock. An equal millisecond falls to the safe default (remove).
+  //
+  // This narrows the race rather than closing it — it makes the REPLACEMENT the loser instead of
+  // "whichever one loses", and one live bot plus a leftover container is the survivable side.
+  const resurrected = marker?.status === "ready" && marker.at > decidedAt;
   try {
-    await removeContainer(replacementId, true);
+    if (resurrected) {
+      console.warn(
+        "[redeploy] the replacement signalled ready after we gave up — leaving it to finish rather " +
+          "than removing a container that may already have stopped us",
+      );
+    } else {
+      await removeContainer(replacementId, true);
+    }
   } catch (err) {
     // Cleanup, not the verdict — a stuck removal (e.g. a 409 mid-teardown) must not skip the
     // `endHandoff()` below either, for the same reason a poll failure above must not.

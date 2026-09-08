@@ -542,7 +542,8 @@ describe("redeploy — cleanup always runs", () => {
    * the two calls the fix touches: the handoff poll, and the final removal of the replacement.
    */
   function stubDaemon(o: {
-    pollReplacement: () => Response;
+    /** May be async, so a test can land a marker write between the poll and the decision. */
+    pollReplacement: () => Response | Promise<Response>;
     removeReplacement: () => Response;
     /** Runs (awaited) when the replacement is started — before `awaitHandoff` ever polls, so a
      *  marker written here is guaranteed on disk for the very first poll to see. Used by the
@@ -597,7 +598,7 @@ describe("redeploy — cleanup always runs", () => {
         await o.afterStart?.();
         return new Response("", { status: 204 });
       }
-      if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
+      if (pathname === `/containers/${REPLACEMENT_ID}/json`) return await o.pollReplacement();
       if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
       if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
       throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
@@ -864,6 +865,54 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(handoffActive()).toBe(false);
+    // Load-bearing, and it was missing: `stalled` means the marker STAYED `ready` for the whole
+    // deadline, so #85's resurrection guard must not mistake it for a replacement that came back.
+    // Without this assertion the naive form of that guard — skipping the removal whenever the
+    // marker reads `ready` — would wedge a `<name>-next` on every stall and still ship green.
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // #85: the standby inherits `unless-stopped`, so one that dies un-verified is restarted by
+  // Docker as the same container id. If it then succeeds it stops the original — and the original,
+  // having already decided `failed`, force-removes it at the same moment. Both landing is zero
+  // bots with no self-recovery. The guard is scoped by timestamp so it cannot swallow `stalled`.
+  // Driven through a poll ERROR rather than a not-running container, deliberately. `awaitHandoff`
+  // reads the marker BEFORE the container state and lets `ready` outrank it (handoff.ts says so
+  // explicitly), so a pre-written `ready` marker would send the poll into the 3-minute retirement
+  // wait instead of reaching the removal this test is about. A rejecting poll skips
+  // decideHandoffOutcome entirely — the catch sets `failed` — which puts the marker read where it
+  // actually matters: after the decision.
+  test("a replacement that signals ready AFTER we gave up is left alone, not removed", async () => {
+    stubDaemon({
+      // Written from inside the poll, not before the call: redeploy() clears the marker as its
+      // first action, so anything staged earlier is wiped. Dated in the future, standing in for
+      // the resurrected generation verifying between our decision and our removal.
+      pollReplacement: async () => {
+        await writeMarker({ status: "ready", sha: "9999999", at: Date.now() + 10_000 });
+        return new Response("boom", { status: 500 });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+
+    const result = await redeploy("9".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(wasRemovalAttempted()).toBe(false); // the whole point
+    expect(handoffActive()).toBe(false); // still un-quiesces
+  });
+
+  // The other side of the timestamp: a `ready` written BEFORE we decided is an already-seen
+  // marker, not a resurrection, and must not suppress the cleanup.
+  test("a ready marker predating our decision still gets the replacement removed", async () => {
+    stubDaemon({
+      pollReplacement: async () => {
+        await writeMarker({ status: "ready", sha: "8888888", at: Date.now() - 10_000 });
+        return new Response("boom", { status: 500 });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+
+    await redeploy("8".repeat(40));
+    expect(wasRemovalAttempted()).toBe(true);
   });
 });
 
