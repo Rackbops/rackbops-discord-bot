@@ -1,5 +1,35 @@
 import { config } from "./config";
 
+/**
+ * Bound on every GitHub call (#88). Without one, a genuinely hung socket — TCP-connected, far end
+ * never responds and never closes — leaves the promise unsettled forever. Since #87 that freezes
+ * `guardedTick`'s shared `tickInFlight`, and worse, `update.ts`'s `checkInFlight` latch never
+ * clears, so `/update` answers `busy` for the life of the process. The 5-minute tick watchdog
+ * releases the former and cannot touch the latter.
+ *
+ * **The budget is aggregate, not per-call.** `checkReleases` walks `config.watchedRepos`
+ * *serially* (`announce.ts`), so a tick's **GitHub-fetch** budget is
+ * `N_repos x TIMEOUT + 2 x TIMEOUT (the update check) + 2 x 5s (the plugin index)` — at 10s,
+ * `10N + 30` seconds. Five repos is 80s. It stays strictly under `TICK_WATCHDOG_MS` (300s) up to
+ * **26** repos; 27 hits it exactly and 28 exceeds it. Past that the watchdog releases
+ * `tickInFlight` while the tick is still inside `checkReleases`, the next tick starts, and two
+ * generations race the same un-persisted `seenReleaseIds` — the duplicate-announcement bug #87
+ * closed. Adding many more watched repos means revisiting this number.
+ *
+ * Deliberately "GitHub-fetch budget" and not "the tick's worst case": the same tick can also spend
+ * discord.js REST retries per announced release, and on the `restart` path a whole `redeploy()`
+ * under `BUILD_TIMEOUT_MS`. A tick's genuine worst case exceeds the watchdog at any repo count.
+ *
+ * Not tighter than 10s: a timed-out `fetchShaRelation` degrades to `relation: "unknown"`, which
+ * `decideUpdate` resolves to **`"restart"`** — a real self-redeploy. On the exit-75 fallback the
+ * `attemptedUpdateToSha` marker suppresses the repeat, but on the socket-mounted path the swap
+ * *succeeds*, and since `redeploy` builds the exact compared sha, a running build that was `ahead`
+ * gets swapped onto an OLDER commit — after which the replacement reads `current` and clears the
+ * marker, so nothing reverts it. Pre-existing (any compare 5xx did this too), but it is why this
+ * value should stay generous.
+ */
+export const GITHUB_TIMEOUT_MS = 10_000;
+
 export interface Release {
   id: number;
   name: string;
@@ -15,13 +45,16 @@ export interface Release {
  * 403 rate-limit, 401 bad token, 5xx — still throws, so a real outage stays loud. A repo with
  * no releases answers 200 with `[]`, so it never reaches the 404 path.
  */
-export async function fetchReleases(repo: string): Promise<Release[] | null> {
+export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<Release[] | null> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "rackbops-discord-bot",
   };
   if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=15`, { headers });
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=15`, {
+    headers,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GitHub releases query failed for ${repo}: ${res.status}`);
   const data = (await res.json()) as {
@@ -108,11 +141,16 @@ export async function createIssue(
   title: string,
   body: string,
   labels: string[],
+  timeoutMs = GITHUB_TIMEOUT_MS,
 ): Promise<CreatedIssue> {
+  // Bounded like the read paths. Not tick-reachable — this runs from `/report` — but `ensureLabel`
+  // and `createIssue` are awaited back-to-back in `report.ts`, so an unbounded hang here leaves the
+  // user's interaction dead with no follow-up, and the worst case is 2x the timeout.
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: "POST",
     headers: writeHeaders(),
     body: JSON.stringify({ title, body, labels }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`GitHub create-issue failed: ${res.status} ${await res.text()}`);
   const data = (await res.json()) as { number: number; html_url: string };
@@ -121,12 +159,13 @@ export async function createIssue(
 
 /** Idempotently ensure a label exists so create-issue never fails on a missing label:
  * 201 = created, 422 = already exists — both are success. Best-effort; other errors warn. */
-export async function ensureLabel(repo: string, name: string): Promise<void> {
+export async function ensureLabel(repo: string, name: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<void> {
   if (!config.githubToken) return;
   const res = await fetch(`https://api.github.com/repos/${repo}/labels`, {
     method: "POST",
     headers: writeHeaders(),
     body: JSON.stringify({ name, color: "ededed" }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok && res.status !== 422) console.warn(`ensureLabel "${name}" on ${repo}: ${res.status}`);
 }

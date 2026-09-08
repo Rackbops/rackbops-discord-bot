@@ -2,6 +2,7 @@ import { config } from "./config";
 import { state, saveState, type PendingUpdateReport } from "./state";
 import { handoffActive, requestRestart } from "./restart";
 import { redeploy, redeployAvailable, type RedeployResult } from "./redeploy";
+import { GITHUB_TIMEOUT_MS } from "./github";
 
 // Self-update detection. The bot has no releases of its own, so "am I stale?" is answered
 // against the newest commit on `config.botBranch` (in `config.githubRepo`, the whole repo —
@@ -118,12 +119,12 @@ function apiHeaders(): Record<string, string> {
 }
 
 /** Newest commit on `config.botBranch`. */
-export async function fetchLatestBotSha(): Promise<string> {
+export async function fetchLatestBotSha(timeoutMs = GITHUB_TIMEOUT_MS): Promise<string> {
   const headers = apiHeaders();
   const res = await fetch(
     `https://api.github.com/repos/${config.githubRepo}/commits` +
       `?sha=${encodeURIComponent(config.botBranch)}&per_page=1`,
-    { headers },
+    { headers, signal: AbortSignal.timeout(timeoutMs) },
   );
   // 404 here is usually BOT_BRANCH naming a branch that doesn't exist on the remote.
   if (!res.ok) {
@@ -150,12 +151,16 @@ export async function fetchLatestBotSha(): Promise<string> {
 export async function fetchShaRelation(
   latestSha: string,
   runningSha: string,
+  timeoutMs = GITHUB_TIMEOUT_MS,
 ): Promise<ShaRelation> {
   try {
     const res = await fetch(
       `https://api.github.com/repos/${config.githubRepo}/compare/` +
         `${encodeURIComponent(latestSha)}...${encodeURIComponent(runningSha)}`,
-      { headers: apiHeaders() },
+      // A timeout here lands in the catch below as `unknown` — which `decideUpdate` resolves to
+      // `restart`, i.e. a real self-redeploy. That is why GITHUB_TIMEOUT_MS is generous: this is
+      // the one call where being too eager to give up is expensive rather than merely noisy.
+      { headers: apiHeaders(), signal: AbortSignal.timeout(timeoutMs) },
     );
     if (res.status === 404) {
       // GitHub answers 404 for two different questions: the running sha genuinely isn't on the
