@@ -185,7 +185,6 @@ describe("daemon calls", () => {
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
 
-
   test(
     "a response whose body never completes is aborted too, not just a stalled request",
     async () => {

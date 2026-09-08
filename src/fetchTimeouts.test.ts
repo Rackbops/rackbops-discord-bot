@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { settleWithin } from "../test/settleWithin";
 
 const { fetchReleases, createIssue, ensureLabel, GITHUB_TIMEOUT_MS } = await import("./github");
@@ -111,5 +111,31 @@ describe("every GitHub call is timeout-bounded", () => {
   // timed-out compare becomes `unknown` -> `restart`, i.e. a real self-redeploy.
   test("the timeout is generous enough that a compare failure stays unlikely", () => {
     expect(GITHUB_TIMEOUT_MS).toBe(10_000);
+  });
+
+  // Pinning the constant is NOT enough on its own. Every test above drives its site with TINY, so
+  // nothing above exercises the production configuration — the five `timeoutMs = GITHUB_TIMEOUT_MS`
+  // defaults could each be changed to an arbitrary literal with the whole suite green (verified:
+  // setting two of them to an hour left 891 pass / 0 fail). That is the same "per-call-site
+  // convention rots" failure this file exists to prevent, one level up: the VALUE becomes the
+  // unguarded convention. So call each site with no timeout at all and watch what it asks for.
+  test("every site defaults to GITHUB_TIMEOUT_MS, not a literal of its own", async () => {
+    config.githubToken = "test-token";
+    globalThis.fetch = (() =>
+      Promise.resolve(new Response("[]", { status: 200 }))) as unknown as typeof fetch;
+
+    const spy = spyOn(AbortSignal, "timeout");
+    try {
+      await fetchReleases("owner/repo");
+      await fetchLatestBotSha().catch(() => {}); // empty [] -> throws on no commits; irrelevant here
+      await fetchShaRelation("a".repeat(40), "b".repeat(40));
+      await createIssue("owner/repo", "t", "b", []).catch(() => {});
+      await ensureLabel("owner/repo", "bug");
+
+      expect(spy).toHaveBeenCalledTimes(5);
+      for (const call of spy.mock.calls) expect(call[0]).toBe(GITHUB_TIMEOUT_MS);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

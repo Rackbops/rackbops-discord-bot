@@ -8,14 +8,25 @@ import { config } from "./config";
  * releases the former and cannot touch the latter.
  *
  * **The budget is aggregate, not per-call.** `checkReleases` walks `config.watchedRepos`
- * *serially* (`announce.ts`), so a tick's worst case is roughly
- * `N_repos x TIMEOUT + 2 x TIMEOUT (the update check) + 2 x 5s (the plugin index)`. At 10s that is
- * ~70s for five repos and stays under `TICK_WATCHDOG_MS` (5 min) up to ~28 repos. Adding many more
- * watched repos means revisiting this number.
+ * *serially* (`announce.ts`), so a tick's **GitHub-fetch** budget is
+ * `N_repos x TIMEOUT + 2 x TIMEOUT (the update check) + 2 x 5s (the plugin index)` — at 10s,
+ * `10N + 30` seconds. Five repos is 80s. It stays strictly under `TICK_WATCHDOG_MS` (300s) up to
+ * **26** repos; 27 hits it exactly and 28 exceeds it. Past that the watchdog releases
+ * `tickInFlight` while the tick is still inside `checkReleases`, the next tick starts, and two
+ * generations race the same un-persisted `seenReleaseIds` — the duplicate-announcement bug #87
+ * closed. Adding many more watched repos means revisiting this number.
+ *
+ * Deliberately "GitHub-fetch budget" and not "the tick's worst case": the same tick can also spend
+ * discord.js REST retries per announced release, and on the `restart` path a whole `redeploy()`
+ * under `BUILD_TIMEOUT_MS`. A tick's genuine worst case exceeds the watchdog at any repo count.
  *
  * Not tighter than 10s: a timed-out `fetchShaRelation` degrades to `relation: "unknown"`, which
- * `decideUpdate` resolves to **`"restart"`** — a real self-redeploy. Bounded (the
- * `attemptedUpdateToSha` marker suppresses the repeat) but expensive, so don't make it likely.
+ * `decideUpdate` resolves to **`"restart"`** — a real self-redeploy. On the exit-75 fallback the
+ * `attemptedUpdateToSha` marker suppresses the repeat, but on the socket-mounted path the swap
+ * *succeeds*, and since `redeploy` builds the exact compared sha, a running build that was `ahead`
+ * gets swapped onto an OLDER commit — after which the replacement reads `current` and clears the
+ * marker, so nothing reverts it. Pre-existing (any compare 5xx did this too), but it is why this
+ * value should stay generous.
  */
 export const GITHUB_TIMEOUT_MS = 10_000;
 
