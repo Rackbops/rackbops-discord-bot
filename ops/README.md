@@ -288,7 +288,10 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    able to act on this bot specifically. It's the union of two sources: **`ADMIN_ALLOWED_EMAILS`**
    (comma-separated, in `.env`) — the permanent *bootstrap* floor, editable only on the box — plus
    a **dynamic list managed live from the panel's Admins section**, persisted to `admins.json`
-   beside `.env`. With both empty there's no narrowing (any identity Access already let through
+   beside `.env` — at the path the panel builds from `BOT_OPS_CONFIG_DIR` itself, which is why a
+   **relative** value makes the panel exit 1 at startup rather than start and write the admin list
+   somewhere unintended (issue #60; an *unset* value is fine and starts in bootstrap-only mode).
+   With both empty there's no narrowing (any identity Access already let through
    authorizes); adding even one admin (env or panel) turns narrowing on. Editing
    `ADMIN_ALLOWED_EMAILS` in `.env` after bring-up needs the same admin-container recreate as the
    Access vars above — it isn't picked up live. If `admins.json` exists

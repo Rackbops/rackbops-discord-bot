@@ -170,6 +170,12 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
  * `readDynamicAdmins` fails closed, which narrows JWT auth to nobody anyway; a panel that refuses
  * to start at least says why.
  *
+ * One deliberate asymmetry with the script, since "matching" below is about the `/` test only:
+ * this trims before testing, while `ops/bot-ops.sh`'s `case "${!var}"` matches the raw value. So a
+ * value with a leading space starts the panel but makes every `bot-ops.sh` the panel spawns die.
+ * Left as-is rather than tightened here: no deployed path produces one (both `install.sh` writers
+ * emit a bare `/opt/...`), and the trim is pre-existing behaviour this change should not alter.
+ *
  * Absolute means POSIX-absolute (a leading `/`), matching `ops/bot-ops.sh`'s `/*` case rather than
  * `node:path`'s `isAbsolute` — the panel is a Linux-only container (the profile-gated `admin`
  * service), so accepting a Windows `C:\...` shape here would only ever admit a path that is
