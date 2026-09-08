@@ -276,6 +276,33 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINE
     expect(run.stderr).toContain("invalid BOT_OPS_CONTAINER");
     expect(dockerCalls(fx)).toHaveLength(0);
   });
+
+  // #60 item 4: a relative path resolves against whatever cwd the script was invoked from. For a
+  // maintainer running this out of a clone that is the checkout, and `env-set` would then rewrite
+  // the checkout's own .env and drop backups/.env.bak.* — a live token — beside it. Deployed
+  // invocations are always absolute, so this rejects only the hand-run mistake. `src/storage.ts`
+  // has cited BOT_OPS_CONFIG_DIR as the absolute-only precedent for BOT_DATA_DIR since #139; until
+  // this guard existed that was a claim about a rule nothing enforced.
+  for (const [name, value] of [
+    ["BOT_OPS_CONFIG_DIR", "."],
+    ["BOT_OPS_CONFIG_DIR", "./config"],
+    ["BOT_OPS_COMPOSE_FILE", "docker-compose.yml"],
+  ] as const) {
+    test(`a relative ${name} (${value}) dies before touching docker`, async () => {
+      const fx = setup("");
+      const run = await botOps(fx, ["status"], undefined, { [name]: value });
+      expect(run.exitCode).not.toBe(0);
+      expect(run.stderr).toContain(`${name} must be an absolute path`);
+      expect(run.stderr).toContain(value); // names the offending value, not just the variable
+      expect(dockerCalls(fx)).toHaveLength(0);
+    });
+  }
+
+  test("an absolute config dir and compose file still run normally", async () => {
+    const fx = setup("");
+    const run = await botOps(fx, ["status"]);
+    expect(run.stderr).not.toContain("must be an absolute path");
+  });
 });
 
 // The three keys #107 moved off bot-ops.sh's static whitelist into @rackbops/plugin-wow. The

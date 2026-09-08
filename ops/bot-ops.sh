@@ -84,6 +84,24 @@ COMPOSE_FILE="${BOT_OPS_COMPOSE_FILE:-}"
   echo "bot-ops: BOT_OPS_COMPOSE_FILE not set — point it at the deployed docker-compose.yml" >&2
   exit 1
 }
+
+# Absolute only. A relative path resolves against whatever cwd this was invoked from, which for a
+# maintainer running it out of a clone is the checkout itself — `env-set` would then rewrite the
+# checkout's own .env and drop backups/.env.bak.* (a live token) beside it. .gitignore covers those
+# two, but not admins.json, which the panel writes into the same directory. Deployed invocations
+# are always absolute (install.sh writes /opt/... into the stack .env), so this rejects only the
+# hand-run mistake. `src/storage.ts` documents BOT_OPS_CONFIG_DIR as absolute-only and cites it as
+# the precedent for BOT_DATA_DIR's own guard — until now that was a claim about a rule nothing
+# enforced.
+for var in BOT_OPS_CONFIG_DIR BOT_OPS_COMPOSE_FILE; do
+  case "${!var}" in
+    /*) ;;
+    *)
+      echo "bot-ops: $var must be an absolute path, got \"${!var}\"" >&2
+      exit 1
+      ;;
+  esac
+done
 ENV_FILE="$CONFIG_DIR/.env"
 
 # Non-secret keys the panel may read and write. Anything not here is rejected by env-set and
