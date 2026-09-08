@@ -1,4 +1,4 @@
-// The handoff contract between the outgoing bot and its replacement (#879).
+// The handoff contract between the outgoing bot and its replacement (nazumods/wow#879).
 //
 // The replacement is started *before* the original is retired, so nothing ever has to outlive
 // its own shutdown. That inverts who does what: the old bot only starts things, and the new
@@ -29,7 +29,7 @@ export const VERIFY_DEADLINE_MS = 90_000;
  * to stop it — normally within a second or two. But the marker is written *before* the retiring,
  * so a `retireOriginal` that throws in between leaves the original waiting on a stop that is
  * never coming: quiesced, not announcing, and silent until someone SSHes in. That is the exact
- * failure #879 set out to remove, so the quiesce gets an outer bound of its own. Generous on
+ * failure nazumods/wow#879 set out to remove, so the quiesce gets an outer bound of its own. Generous on
  * purpose — every second here is one the ordinary path spends already dead.
  */
 export const RETIREMENT_DEADLINE_MS = 180_000;

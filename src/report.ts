@@ -20,7 +20,7 @@ export function reportBody(description: string, username: string): string {
 }
 
 // Discord's hard cap on a message's content. The modal's Description field is unbounded, so a
-// long report has to be clamped rather than rejected at send time (#870).
+// long report has to be clamped rather than rejected at send time (nazumods/wow#870).
 const MESSAGE_LIMIT = 2000;
 const TRUNCATED = "\n… (truncated — the issue has the rest)";
 
@@ -100,7 +100,7 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
 
 /**
  * Modal submit → create the GitHub issue in the mapped repo, then say so **in the channel the
- * report was filed from** (#870).
+ * report was filed from** (nazumods/wow#870).
  *
  * The outcome is deliberately not ephemeral: the point is transparency about what's been
  * reported, so the confirmation is the announcement. The refusals above stay private, since a

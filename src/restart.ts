@@ -53,7 +53,7 @@ export async function withCritical<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Quiesce for a handoff (#879): no NEW scheduler tick starts, so nothing new begins writing
+ * Quiesce for a handoff (nazumods/wow#879): no NEW scheduler tick starts, so nothing new begins writing
  * `data/state.json` while the replacement container is created and verifies, sharing that volume.
  * `redeploy()` calls this only just before the create — not before the build ahead of it, which
  * writes no state and is the one long call (#130).

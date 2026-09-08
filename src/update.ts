@@ -7,7 +7,7 @@ import { redeploy, redeployAvailable, type RedeployResult } from "./redeploy";
 // against the newest commit on `config.botBranch` (in `config.githubRepo`, the whole repo —
 // this fork lives at its root, not a monorepo subdirectory, so no path filter is needed).
 //
-// The question is ANCESTRY, not equality (#871). GIT_SHA is baked as `git rev-parse HEAD`
+// The question is ANCESTRY, not equality (nazumods/wow#871). GIT_SHA is baked as `git rev-parse HEAD`
 // — the tip you built from — which is only occasionally the newest commit on the branch,
 // because a build can lag behind commits landed after it. Asking "is my sha THE newest
 // commit" therefore called a correct, up-to-date deploy stale as its normal state: one
@@ -199,7 +199,7 @@ export interface UpdateCheck {
   latestSha: string;
   /** Set only when `decision` is `disabled`. */
   reason?: DisabledReason;
-  /** Set when `decision` is `restart` and the swap was attempted in-process (#879). Present
+  /** Set when `decision` is `restart` and the swap was attempted in-process (nazumods/wow#879). Present
    *  only on failure — a successful handoff never returns, since the replacement retires us. */
   redeploy?: RedeployResult;
 }
@@ -291,7 +291,7 @@ export async function checkForUpdate(
     if (decision === "restart") {
       state.attemptedUpdateToSha = latestSha;
       // Written before the replacement starts and read by it after — never by both at once,
-      // which is what keeps two containers off the same state file (#879).
+      // which is what keeps two containers off the same state file (nazumods/wow#879).
       state.pendingUpdateReport = buildUpdateReport({
         runningSha: config.gitSha,
         latestSha,
