@@ -9,7 +9,7 @@ it: `src/warbandeer/links.ts:215` is an unconditional top-level `await` reached 
 `src/commands.ts:23` and `src/index.ts:10`, so a bot with the connector *disabled* still reads
 `data/links.json` at every boot; and a self-update replacement snapshots `links` at module load —
 before `takeOver()` — while the original keeps serving `/link`, `/unlink` and the ingest endpoint
-(`beginHandoff()`, `src/restart.ts:63-66`, only quiesces the scheduler via `restartPending()`,
+(`beginHandoff()`, `src/restart.ts:65-68`, only quiesces the scheduler via `restartPending()`,
 `src/announce.ts:151`, and refuses a second `/update` via `handoffActive()`) for the length of the
 handoff — bounded by `VERIFY_DEADLINE_MS` (`src/handoff.ts:22`) plus boot-mode resolution and the
 retire step — so the replacement's first whole-file `saveLinks()` overwrites whatever the original
@@ -107,7 +107,7 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
   by design (`src/warbandeer/storage.ts:10-16` is explicit that `writeJsonAtomic` is unsafe under a
   second concurrent writer).
 - **Build-time inclusion through a Docker build arg** — rejected: self-update's rebuild passes
-  exactly one build arg of its own (`src/redeploy.ts:210-214`, `GIT_SHA`), so a plugin-selecting arg
+  exactly one build arg of its own (`src/redeploy.ts:208-212`, `GIT_SHA`), so a plugin-selecting arg
   would be silently lost on the first `/update`.
 
 ## Consequences
