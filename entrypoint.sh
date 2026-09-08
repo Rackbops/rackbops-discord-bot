@@ -3,7 +3,7 @@
 #
 # The socket is mode 0660 root:docker and the docker group's GID is host-specific (115 on the
 # box, 999 on stock Debian), so naming a GID anywhere would be operator-supplied config — the
-# thing #879 rules out. Instead the compose file starts the container as root, this script
+# thing nazumods/wow#879 rules out. Instead the compose file starts the container as root, this script
 # reads the GID off the socket itself, and drops to `bun` carrying that one supplementary
 # group. Not a security boundary: anything holding the socket is root-equivalent on the host
 # regardless (see the compose file). What it buys is a long-running process on a conventional
