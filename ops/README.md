@@ -90,8 +90,9 @@ monorepo-era fallbacks (issue #41). All three are written to a temp file first a
 place atomically, so a dropped connection (or interrupted write) never leaves a truncated file a
 later run's existence-check could mistake for something real. Each temp file is registered with a
 script-level `EXIT` trap as it is created (issue #60), so an abort *between* the `mktemp` and the
-`mv` — a typo'd `BRANCH`, which isn't validated until after all three fetches have 404'd — sweeps
-its `tmp.XXXXXX` instead of stranding it beside the real files. It prints the exact `docker compose
+`mv` sweeps its `tmp.XXXXXX` instead of stranding it beside the real files. The reachable case is a
+typo'd `BRANCH`: it is only checked against the remote *after* the three downloads, so the first one
+404s and `set -e` aborts inside `fetch()` before the branch check ever runs. It prints the exact `docker compose
 up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*` exports for day-2
 `bin/bot-ops.sh` use afterward — see the script's own output, or read `ops/install.sh` directly.
 

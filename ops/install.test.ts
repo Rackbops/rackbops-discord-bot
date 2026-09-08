@@ -132,8 +132,10 @@ describe.skipIf(!runnable)(
 // Same extraction discipline as above: the trap, the cleanup function and fetch() are all pulled
 // from the live install.sh, so deleting any of them there fails these tests rather than silently
 // leaving them unguarded. The abort is driven by a fake `curl` that exits 22 — curl -f's own code
-// for an HTTP 4xx, which is exactly what a typo'd BRANCH does, and BRANCH isn't validated until
-// after all three fetches have already run. Hermetic: no network, no /opt, no sudo.
+// for an HTTP 4xx, which is exactly what a typo'd BRANCH produces: BRANCH is only checked against
+// the remote at install.sh:179, *after* the three fetch() calls at :156/:169/:171, so the very
+// first one 404s and set -e aborts there — the validation never runs. Hermetic: no network, no
+// /opt, no sudo.
 const TMP_FILES_DECL = extractLine(/^TMP_FILES=\(\)$/m, "the TMP_FILES=() declaration");
 const CLEANUP_TMP_FILES = extractFunction("cleanup_tmp_files");
 const CLEANUP_TRAP = extractLine(/^trap cleanup_tmp_files EXIT$/m, "the cleanup_tmp_files EXIT trap");
