@@ -239,6 +239,31 @@ test("every mktemp in install.sh registers the temp file it just assigned", () =
   expect(checked).toBe(2); // fetch()'s, and the one for $STACK_DIR/.env
 });
 
+// The scan above only looks forward from each mktemp, so a TMP_FILES+= written ANYWHERE ELSE was
+// invisible to it. That is the more dangerous direction, and the more plausible spelling: adding
+// `TMP_FILES+=("$dest")` beside an `mv` ("clean this up if we abort") registers a file that is
+// meant to survive, and the EXIT trap then rm -f's it on every single run — the freshly installed
+// compose file, bin/bot-ops.sh, or the instance's live secrets .env. Reproduced against the real
+// cleanup_tmp_files body: a .env holding DISCORD_TOKEN was gone after a clean exit 0.
+// So: every registration must also point back at an immediately preceding mktemp of that same
+// variable. Together the two scans make the mktemp/registration pairing bidirectional.
+test("every TMP_FILES registration in install.sh belongs to the mktemp right above it", () => {
+  let checked = 0;
+  CODE_LINES.forEach((line, i) => {
+    const registered = line.match(/^\s*TMP_FILES\+=\("\$([A-Za-z_][A-Za-z0-9_]*)"\)\s*$/)?.[1];
+    if (!/TMP_FILES\+=/.test(line)) return;
+    checked += 1;
+    const where = `install.sh:${i + 1} (${line.trim()})`;
+    // Rejects a registration of anything but a bare "$VAR" — e.g. TMP_FILES+=("$CONFIG_DIR/.env").
+    expect(registered ?? `<not a bare variable registration at ${where}>`).toMatch(/^[A-Za-z_]/);
+    const prev = CODE_LINES[i - 1] ?? "<start of file>";
+    expect(`${where} <- ${prev.trim()}`).toMatch(
+      new RegExp(`<- .*\\b${registered}="\\$\\(mktemp\\b`),
+    );
+  });
+  expect(checked).toBe(2); // exactly the two registrations the scan above accounts for
+});
+
 // The behavioural tests run an extracted composite, never install.sh itself, so they cannot see a
 // SECOND `trap ... EXIT` added elsewhere in the script — which would silently REPLACE the sweep
 // rather than run alongside it. That is not hypothetical: the sibling script does exactly that at
@@ -246,13 +271,19 @@ test("every mktemp in install.sh registers the temp file it just assigned", () =
 // change registers into an array instead of trapping per-function. Pinned as an exact list so both
 // directions fail — a second trap, or the sweep's own trap going missing.
 //
-// Matched on `trap` alone, NOT on the word EXIT: bash signal 0 *is* EXIT, so `trap ':' 0` replaces
-// the sweep just as silently while containing no "EXIT" to match. Verified:
-//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; trap ":" 0; echo body'  ->  body        (no SWEEP)
-//   bash -c 'c(){ echo SWEEP; }; trap c EXIT;            echo body'  ->  body SWEEP
-// Listing every trap line regardless of signal also means a future ERR/INT trap shows up here to
-// be considered rather than slipping in unnoticed.
+// Matched on `trap` alone — NOT on the word EXIT, and NOT anchored to the start of the line.
+// Both narrowings were tried and both were defeated:
+//   - /\bEXIT\b/ misses `trap ':' 0`, because bash signal 0 *is* EXIT.
+//   - /^\s*trap/ misses `[ -z "${KEEP_TMP:-}" ] || trap ':' 0`, and (a regression on the first
+//     version) also misses a mid-line `|| trap ... EXIT` that the EXIT match would have caught.
+// Verified, including that a trap set inside a function replaces it too — traps are process-global:
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; [ -n "$HOME" ] && trap ":" 0; echo body' -> body
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT; f(){ trap ":" 0; }; f;        echo body' -> body
+//   bash -c 'c(){ echo SWEEP; }; trap c EXIT;                              echo body' -> body SWEEP
+// Listing every trap regardless of signal or position also means a future ERR/INT trap surfaces
+// here to be considered rather than slipping in unnoticed. Comment lines are already blanked, and
+// no non-comment line in either script contains the word otherwise, so it stays non-vacuous.
 test("install.sh installs exactly one trap, so nothing can silently replace the sweep", () => {
-  const traps = CODE_LINES.filter((l) => /^\s*trap\b/.test(l)).map((l) => l.trim());
+  const traps = CODE_LINES.filter((l) => /\btrap\b/.test(l)).map((l) => l.trim());
   expect(traps).toEqual(["trap cleanup_tmp_files EXIT"]);
 });

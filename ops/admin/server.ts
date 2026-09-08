@@ -215,6 +215,30 @@ export function resolveAdminStorePaths(env: Record<string, string | undefined>):
 }
 
 /**
+ * `resolveAdminStorePaths` plus the entry point's reaction to a rejection: log it with the
+ * `[admin]` prefix and exit 1, the same shape as the ADMIN_TOKEN refusal.
+ *
+ * A function rather than a `try`/`catch` in the entry point because `process.exit(1)` is a
+ * production line and has to be pinnable. As inline code under `import.meta.main` it wasn't:
+ * replacing it with "log and carry on" left the whole suite green while producing exactly the
+ * outcome this guard exists to prevent — a panel that comes up and authorizes every Access
+ * identity. `logError`/`exit` are injected for the same reason `logDynamicAdminsStartup` injects
+ * its loggers: so the refusal is test-pinned rather than only ever eyeballed in a container log.
+ */
+export function resolveAdminStorePathsOrExit(
+  env: Record<string, string | undefined>,
+  logError: (msg: string) => void = console.error,
+  exit: (code: number) => never = process.exit,
+): { configDir: string | undefined; adminsFile: string | undefined } {
+  try {
+    return resolveAdminStorePaths(env);
+  } catch (err) {
+    logError(`[admin] ${err instanceof Error ? err.message : err} — refusing to start`);
+    return exit(1);
+  }
+}
+
+/**
  * Startup-time validation for the dynamic admin list — logs the file path and admin count on
  * success, or the parse/read error via `logError` when `admins.json` exists but is broken (this
  * exact silent failure is what issue #40 fixed: it used to be indistinguishable from "no dynamic
@@ -1469,14 +1493,7 @@ if (import.meta.main) {
   // letting resolveAdminsFile's throw escape as an unhandled rejection with a stack trace. The
   // function still throws (that is what makes it testable without an entry point); the entry point
   // is what turns a misconfiguration into a legible refusal to start.
-  let storePaths: ReturnType<typeof resolveAdminStorePaths>;
-  try {
-    storePaths = resolveAdminStorePaths(process.env);
-  } catch (err) {
-    console.error(`[admin] ${err instanceof Error ? err.message : err} — refusing to start`);
-    process.exit(1);
-  }
-  const { configDir, adminsFile } = storePaths;
+  const { configDir, adminsFile } = resolveAdminStorePathsOrExit(process.env);
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
     bootstrap,

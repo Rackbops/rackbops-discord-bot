@@ -47,6 +47,7 @@ import {
   readDynamicAdmins,
   resolveAdminsFile,
   resolveAdminStorePaths,
+  resolveAdminStorePathsOrExit,
   renderIndexHtml,
   SUBPROCESS_TIMEOUT_MS,
   tokensMatch,
@@ -326,12 +327,50 @@ describe("resolveAdminStorePaths keeps configDir and adminsFile in agreement", (
   });
 });
 
+// The refusal itself, which used to be an inline try/catch under `import.meta.main` where
+// `process.exit(1)` was unpinnable — swapping it for "log and carry on" left the whole suite green
+// while producing exactly what the guard exists to prevent: a panel that starts and authorizes
+// every Access identity. Injected logError/exit make it an ordinary unit test.
+describe("resolveAdminStorePathsOrExit refuses to start rather than degrading", () => {
+  /** Stands in for process.exit's `never` by actually not returning. */
+  const throwingExit = ((code: number) => {
+    throw new Error(`EXIT:${code}`);
+  }) as (code: number) => never;
+
+  test("a relative value logs the [admin]-prefixed reason and exits 1", () => {
+    const errors: string[] = [];
+    expect(() =>
+      resolveAdminStorePathsOrExit({ BOT_OPS_CONFIG_DIR: "./config" }, (m) => errors.push(m), throwingExit),
+    ).toThrow("EXIT:1");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toBe(
+      '[admin] BOT_OPS_CONFIG_DIR must be an absolute path, got "./config" — it holds .env, backups/ and admins.json, and a relative path resolves against the panel\'s cwd — refusing to start',
+    );
+  });
+
+  test("an absolute value returns the pair and never exits or logs", () => {
+    const errors: string[] = [];
+    const paths = resolveAdminStorePathsOrExit({ BOT_OPS_CONFIG_DIR: "/opt/bot" }, (m) => errors.push(m), throwingExit);
+    expect(paths).toEqual({ configDir: "/opt/bot", adminsFile: "/opt/bot/admins.json" });
+    expect(errors).toEqual([]);
+  });
+
+  test("unset returns the degraded pair and never exits — bootstrap-only must still start", () => {
+    const errors: string[] = [];
+    expect(resolveAdminStorePathsOrExit({}, (m) => errors.push(m), throwingExit)).toEqual({
+      configDir: undefined,
+      adminsFile: undefined,
+    });
+    expect(errors).toEqual([]);
+  });
+});
+
 test("the panel entry point resolves its paths through the guard, not from raw env", () => {
   const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
   const marker = "if (import.meta.main) {";
   const entry = serverSrc.slice(serverSrc.indexOf(marker));
   expect(entry).toContain(marker); // the block still exists; guards against a silent no-op scan
-  expect(entry).toContain("resolveAdminStorePaths(process.env)");
+  expect(entry).toContain("resolveAdminStorePathsOrExit(process.env)");
   // The exact pre-guard shape, which must not come back. Scoped to the entry block so the
   // definitions above (which legitimately mention both) can't satisfy it.
   expect(entry).not.toMatch(/process\.env\.BOT_OPS_CONFIG_DIR\?\.trim\(\)/);
