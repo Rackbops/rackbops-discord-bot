@@ -153,6 +153,39 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
  * admins"). `log`/`logError` are injected (default to `console.log`/`console.error`) so the exact
  * message text is test-pinned rather than only ever eyeballed against a running container's logs.
  */
+/**
+ * Turns a raw `BOT_OPS_CONFIG_DIR` into the admins.json path, or `undefined` when it isn't set.
+ *
+ * **Absolute-only**, the second half of issue #60 item 4 — which named this call site alongside
+ * `ops/bot-ops.sh`'s, for the same reason: a relative value resolves against whatever cwd the
+ * process happens to have, and for a panel run out of a clone that is the checkout. `admins.json`
+ * is precisely the file that makes this worse than the script's case — `.gitignore` covers `.env`
+ * and `.env.bak.*`, but nothing covers the admin list, so it lands untracked-but-uncovered in a
+ * public repo's working tree.
+ *
+ * Unset stays a supported degraded mode (bootstrap-only, no persistence — see
+ * `logDynamicAdminsStartup`). A relative value is not, and is rejected rather than narrowed to
+ * that mode: it *looks* like working persistence while writing somewhere the operator didn't
+ * choose. Failing at startup is also the kinder failure — a wrong-directory `admins.json` means
+ * `readDynamicAdmins` fails closed, which narrows JWT auth to nobody anyway; a panel that refuses
+ * to start at least says why.
+ *
+ * Absolute means POSIX-absolute (a leading `/`), matching `ops/bot-ops.sh`'s `/*` case rather than
+ * `node:path`'s `isAbsolute` — the panel is a Linux-only container (the profile-gated `admin`
+ * service), so accepting a Windows `C:\...` shape here would only ever admit a path that is
+ * relative on the machine this actually runs on.
+ */
+export function resolveAdminsFile(rawConfigDir: string | undefined): string | undefined {
+  const configDir = rawConfigDir?.trim();
+  if (!configDir) return undefined;
+  if (!configDir.startsWith("/")) {
+    throw new Error(
+      `BOT_OPS_CONFIG_DIR must be an absolute path, got "${configDir}" — it holds .env, backups/ and admins.json, and a relative path resolves against the panel's cwd`,
+    );
+  }
+  return `${configDir}/admins.json`;
+}
+
 export async function logDynamicAdminsStartup(
   adminsFile: string | undefined,
   log: (msg: string) => void = console.log,
@@ -1397,8 +1430,8 @@ if (import.meta.main) {
   // (BOT_OPS_CONFIG_DIR); without a config dir the bootstrap still works but there's nowhere to
   // persist changes, so writes fail loudly rather than silently dropping an added admin.
   const bootstrap = parseAllowedEmails(process.env.ADMIN_ALLOWED_EMAILS) ?? new Set<string>();
-  const configDir = process.env.BOT_OPS_CONFIG_DIR?.trim();
-  const adminsFile = configDir ? `${configDir}/admins.json` : undefined;
+  const adminsFile = resolveAdminsFile(process.env.BOT_OPS_CONFIG_DIR);
+  const configDir = adminsFile ? process.env.BOT_OPS_CONFIG_DIR!.trim() : undefined;
   const { chownSync, renameSync, statSync } = await import("node:fs");
   const adminStore: AdminStore = {
     bootstrap,

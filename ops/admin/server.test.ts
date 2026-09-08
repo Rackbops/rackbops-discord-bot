@@ -45,6 +45,7 @@ import {
   parsePluginIndex,
   parsePluginRequestInput,
   readDynamicAdmins,
+  resolveAdminsFile,
   renderIndexHtml,
   SUBPROCESS_TIMEOUT_MS,
   tokensMatch,
@@ -255,6 +256,46 @@ describe("effectiveAllowlist", () => {
 // trailing comma, or "emails" as an object instead of an array, both must fail LOUDLY (throw) —
 // not be swallowed into "no dynamic admins", which is what let every one of those cases fail
 // open to any Access identity.
+// Issue #60 item 4 named TWO sites that accepted a relative BOT_OPS_CONFIG_DIR: ops/bot-ops.sh
+// (fixed by the guard loop there) and this one, which builds the admins.json path. This is the
+// panel process reading the variable itself — separate from, and not covered by, createRunBotOps
+// spawning bot-ops.sh, which inherits process.env and so gets the script's own guard.
+describe("resolveAdminsFile rejects a relative BOT_OPS_CONFIG_DIR (issue #60 item 4)", () => {
+  test("an absolute config dir yields the admins.json path beside .env", () => {
+    expect(resolveAdminsFile("/opt/rackbops-discord-bot/debug")).toBe("/opt/rackbops-discord-bot/debug/admins.json");
+  });
+
+  test("surrounding whitespace is trimmed before the check, not after", () => {
+    expect(resolveAdminsFile("  /opt/bot  ")).toBe("/opt/bot/admins.json");
+  });
+
+  for (const relative of [".", "./config", "config", "../bot", "opt/bot"]) {
+    test(`a relative dir (${relative}) throws, naming the variable and the value`, () => {
+      // The whole quoted phrase, not the value alone: for "." a bare toThrow(value) matches almost
+      // any message, including this one's own trailing sentence.
+      expect(() => resolveAdminsFile(relative)).toThrow(`BOT_OPS_CONFIG_DIR must be an absolute path, got "${relative}"`);
+    });
+  }
+
+  // A Windows-shaped path is relative on the Linux container the panel actually runs in, so it
+  // must be rejected here even though node:path's isAbsolute would accept it on this dev box.
+  test("a Windows-absolute path is still rejected — the panel is Linux-only", () => {
+    expect(() => resolveAdminsFile("C:\\opt\\bot")).toThrow("must be an absolute path");
+  });
+
+  // Unset stays the supported degraded mode: bootstrap-only, no persistence. It must NOT throw,
+  // or a panel with no config dir at all would stop starting.
+  for (const [label, value] of [
+    ["unset", undefined],
+    ["empty", ""],
+    ["whitespace only", "   "],
+  ] as const) {
+    test(`${label} is undefined, not a throw — bootstrap-only is still supported`, () => {
+      expect(resolveAdminsFile(value)).toBeUndefined();
+    });
+  }
+});
+
 describe("readDynamicAdmins", () => {
   let dir: string;
   beforeEach(() => {
