@@ -147,13 +147,6 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
 }
 
 /**
- * Startup-time validation for the dynamic admin list — logs the file path and admin count on
- * success, or the parse/read error via `logError` when `admins.json` exists but is broken (this
- * exact silent failure is what issue #40 fixed: it used to be indistinguishable from "no dynamic
- * admins"). `log`/`logError` are injected (default to `console.log`/`console.error`) so the exact
- * message text is test-pinned rather than only ever eyeballed against a running container's logs.
- */
-/**
  * Turns a raw `BOT_OPS_CONFIG_DIR` into the admins.json path, or `undefined` when it isn't set.
  *
  * **Absolute-only**, the second half of issue #60 item 4 — which named this call site alongside
@@ -221,6 +214,13 @@ export function resolveAdminStorePaths(env: Record<string, string | undefined>):
   return { configDir, adminsFile };
 }
 
+/**
+ * Startup-time validation for the dynamic admin list — logs the file path and admin count on
+ * success, or the parse/read error via `logError` when `admins.json` exists but is broken (this
+ * exact silent failure is what issue #40 fixed: it used to be indistinguishable from "no dynamic
+ * admins"). `log`/`logError` are injected (default to `console.log`/`console.error`) so the exact
+ * message text is test-pinned rather than only ever eyeballed against a running container's logs.
+ */
 export async function logDynamicAdminsStartup(
   adminsFile: string | undefined,
   log: (msg: string) => void = console.log,
