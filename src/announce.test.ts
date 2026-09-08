@@ -282,7 +282,8 @@ describe("guardedTick", () => {
     }
   });
 
-  // A network call with no timeout of its own (every fetch a tick can reach) could hang forever;
+  // A network call with no timeout of its own (the GitHub fetches and plugin ticks — #88; the
+  // docker-daemon calls are bounded since #130) could hang forever;
   // without a bound here that would leave tickInFlight stuck true permanently, silently freezing
   // every future tick — not just the one stuck check. `watchdogMs` is the injected test seam so
   // this doesn't actually wait out the real 5-minute bound.

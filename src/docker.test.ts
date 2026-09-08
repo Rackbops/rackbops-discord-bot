@@ -3,7 +3,22 @@ import { parseBuildOutput, parseContainerId } from "./docker";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
-const { buildImage, daemonReachable, stopContainer, removeContainer, tagImage } = await import("./docker");
+const {
+  buildImage,
+  createContainer,
+  daemonReachable,
+  inspectContainer,
+  inspectImage,
+  inspectSelf,
+  listImages,
+  removeContainer,
+  removeImage,
+  renameContainer,
+  startContainer,
+  stopContainer,
+  tagImage,
+  tryInspectContainer,
+} = await import("./docker");
 
 describe("parseContainerId", () => {
   const ID = "f".repeat(64);
@@ -66,12 +81,12 @@ describe("parseBuildOutput", () => {
 
 describe("daemon calls", () => {
   const realFetch = globalThis.fetch;
-  let calls: { url: string; method: string }[] = [];
+  let calls: { url: string; method: string; signal?: AbortSignal }[] = [];
 
   const stub = (impl: (url: string, init?: RequestInit) => Response) => {
     calls = [];
     globalThis.fetch = ((url: string, init?: RequestInit & { unix?: string }) => {
-      calls.push({ url: String(url), method: init?.method ?? "GET" });
+      calls.push({ url: String(url), method: init?.method ?? "GET", signal: init?.signal ?? undefined });
       return Promise.resolve(impl(String(url), init));
     }) as unknown as typeof fetch;
   };
@@ -105,6 +120,233 @@ describe("daemon calls", () => {
     expect(decodeURIComponent(url)).toContain("t=img:latest");
     expect(decodeURIComponent(url)).toContain("t=img:abc1234");
     expect(decodeURIComponent(url)).toContain('buildargs={"GIT_SHA":"abc1234"}');
+  });
+
+  // #130: every daemon call is wrapped in `bounded()`, which hands `api()` a signal — `api()`
+  // itself creates no bound, so these two only prove a signal is ATTACHED. Proving it actually
+  // fires is the table further down; these stay as a cheap shape check.
+  test("buildImage attaches an abort signal to the daemon request", async () => {
+    stub(() => new Response('{"stream":"done"}', { status: 200 }));
+    await buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} });
+    expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("an ordinary daemon call carries an abort signal too, not just the build", async () => {
+    stub(() => new Response("", { status: 204 }));
+    await stopContainer("abc");
+    expect(calls[0]!.signal).toBeInstanceOf(AbortSignal);
+    expect(calls[0]!.signal!.aborted).toBe(false); // attached, but not already spent
+  });
+
+  // The signal has to actually abort a stuck call — not just be attached. A stub that never
+  // resolves unless the signal fires stands in for a wedged dockerd; buildImage's own tiny
+  // timeout override lets this run without waiting out the real 15-min bound.
+  //
+  // Goes through `settleWithin` like every other bound assertion. An explicit per-test timeout is
+  // NOT enough on its own: bun's timeout is itself unref'd, so when a regressed bound leaves
+  // nothing ref'd it cannot interrupt either, and the run wedges with no output. This test used to
+  // rely on that timeout alone — mutating buildImage's bound was the one call site of fourteen
+  // that survived, reaching a reviewer as a hung CI job rather than a red test. Worse, it runs
+  // before the two body-read tests, so it suppressed those too.
+  test(
+    "buildImage rejects when the build exceeds its timeout instead of hanging forever",
+    async () => {
+      globalThis.fetch = ((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+          );
+        })) as unknown as typeof fetch;
+      const r = await settleWithin(
+        buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
+        "buildImage request",
+      );
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  // The bound must cover the response BODY, not just the request. A daemon that answers with
+  // headers and then wedges mid-body hangs exactly as hard — and this is the shape that caught a
+  // first cut of #130, where the timer was retired the moment the headers landed and every
+  // non-build call (inspectSelf included, which the issue names) was left unbounded again.
+  // Headers land immediately, then the body never completes — and, as a real `fetch` body does,
+  // the stream errors when the request's signal aborts. That last part is what makes this a
+  // faithful double: a hand-built Response ignores the signal, a network one does not.
+  const wedgedBody = (signal?: AbortSignal | null) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason));
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+
+  /**
+   * Await `p`, but fail loudly if it outlives `ms` instead of hanging.
+   *
+   * Every bound test must go through this. A regressed bound leaves nothing ref'd, and bun's own
+   * per-test timeout cannot interrupt that — the suite wedges with no output until the CI job
+   * limit rather than going red. The `Bun.sleep` here is ref'd, so it always wins that race and
+   * turns a wedge into a clean failure.
+   */
+  const settleWithin = async <T>(p: Promise<T>, label: string, ms = 500) => {
+    const outcome = await Promise.race([
+      p.then(
+        (v) => ({ ok: true as const, v }),
+        (e) => ({ ok: false as const, e: e as Error }),
+      ),
+      Bun.sleep(ms).then(() => null),
+    ]);
+    if (outcome === null) throw new Error(`${label} hung past its bound — never aborted`);
+    return outcome;
+  };
+
+  test(
+    "a response whose body never completes is aborted too, not just a stalled request",
+    async () => {
+      stub((_url, init) => wedgedBody(init?.signal));
+      const r = await settleWithin(inspectContainer("abc", 20), "inspectContainer");
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  test(
+    "the build's body read is bounded by the same signal as its request",
+    async () => {
+      stub((_url, init) => wedgedBody(init?.signal));
+      const r = await settleWithin(
+        buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
+        "buildImage body",
+      );
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  // EVERY exported daemon call must be bounded, not just the two shapes spot-checked above.
+  // Without this table the bound is per-call-site convention: `api()` takes whatever signal it is
+  // handed, so a new call — or an edit handing one a signal that never fires — reopens #130's
+  // defect with a fully green suite. Driven both ways: a request that never answers, and a
+  // request that answers then wedges mid-body. `daemonReachable` swallows its own errors by
+  // design, so it is asserted to RESOLVE false rather than reject; everything else must reject.
+  const everyDaemonCall: [string, (timeoutMs: number) => Promise<unknown>][] = [
+    ["daemonReachable", (t) => daemonReachable(t)],
+    ["inspectSelf", (t) => inspectSelf(t)],
+    ["inspectContainer", (t) => inspectContainer("abc", t)],
+    ["tryInspectContainer", (t) => tryInspectContainer("abc", t)],
+    ["buildImage", (t) => buildImage({ remote: "https://x/y.git#main", tags: ["i:abc1234"], buildArgs: {} }, t)],
+    ["createContainer", (t) => createContainer("n", {} as never, t)],
+    ["startContainer", (t) => startContainer("abc", t)],
+    ["stopContainer", (t) => stopContainer("abc", 10, t)],
+    ["removeContainer", (t) => removeContainer("abc", false, t)],
+    ["renameContainer", (t) => renameContainer("abc", "n", t)],
+    ["listImages", (t) => listImages(t)],
+    ["inspectImage", (t) => inspectImage("abc", t)],
+    ["removeImage", (t) => removeImage("i:abc1234", t)],
+    ["tagImage", (t) => tagImage("i:abc1234", "i:latest", t)],
+  ];
+
+  // `inspectSelf` consults HOSTNAME first; pin it so the table drives that branch deterministically.
+  const withHostname = (fn: () => Promise<void>) => async () => {
+    process.env.HOSTNAME = "self-container-id";
+    try {
+      await fn();
+    } finally {
+      delete process.env.HOSTNAME;
+    }
+  };
+
+  for (const [name, call] of everyDaemonCall) {
+    test(
+      `${name} is bounded when the daemon never answers`,
+      withHostname(async () => {
+        stub(() => new Response("", { status: 200 })); // replaced below; keeps `calls` reset
+        globalThis.fetch = ((_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+            );
+          })) as unknown as typeof fetch;
+        const settled = await settleWithin(call(20), name);
+        if (name === "daemonReachable") {
+          expect(settled).toEqual({ ok: true, v: false }); // swallows the abort, but must not hang
+        } else {
+          expect(settled.ok).toBe(false);
+          expect((settled as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+        }
+      }),
+      1000,
+    );
+
+    test(
+      `${name} is bounded when the daemon answers then wedges mid-body`,
+      withHostname(async () => {
+        stub((_url, init) => wedgedBody(init?.signal));
+        // A call that reads no body settles on headers alone; one that does must abort. Either
+        // way it must SETTLE within its bound rather than hang.
+        await settleWithin(call(20), name);
+      }),
+      1000,
+    );
+  }
+
+  // Every test above passes an explicit tiny `timeoutMs`; no production caller passes one at all
+  // (`src/redeploy.ts` never does), so without this both defaults could be raised to infinity —
+  // silently un-bounding the real bot — with the whole suite green. A value pin is the honest
+  // guard here: the numbers are operational decisions, and changing one should require editing
+  // this line and saying why in review.
+  test("the default bounds are the reviewed values", async () => {
+    const { DEFAULT_TIMEOUT_MS, BUILD_TIMEOUT_MS } = await import("./docker");
+    expect(DEFAULT_TIMEOUT_MS).toBe(60_000); // ample for every non-build call
+    expect(BUILD_TIMEOUT_MS).toBe(900_000); // 15 min — clone + prod-deps install, 1-3 min typical
+    expect(BUILD_TIMEOUT_MS).toBeGreaterThan(DEFAULT_TIMEOUT_MS);
+  });
+
+  // `inspectSelf` has two legs and the table above only ever drives the first: it pins HOSTNAME,
+  // so the mountinfo fallback — the leg that runs when a compose file pins `hostname:` — was
+  // reachable by no test at all, and its signal could be swapped for a never-firing one with the
+  // whole suite green. Drive it explicitly: no HOSTNAME, and a stubbed /proc/self/mountinfo.
+  test(
+    "inspectSelf's mountinfo fallback is bounded too, not just the hostname leg",
+    async () => {
+      const realFile = Bun.file;
+      const realHost = process.env.HOSTNAME;
+      delete process.env.HOSTNAME;
+      // The id has to be 64 hex for parseContainerId to accept it (a short id is rejected).
+      (Bun as { file: unknown }).file = () => ({
+        text: async () => `1 1 0:1 /containers/${"f".repeat(64)}/hostname /etc/hostname rw`,
+      });
+      try {
+        stub((_url, init) => wedgedBody(init?.signal));
+        const r = await settleWithin(inspectSelf(20), "inspectSelf fallback");
+        expect(r.ok).toBe(false);
+        expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+        // Proves the fallback leg actually ran, rather than the hostname leg being hit by accident.
+        expect(calls[0]!.url).toContain("f".repeat(64));
+      } finally {
+        (Bun as { file: unknown }).file = realFile;
+        if (realHost !== undefined) process.env.HOSTNAME = realHost;
+      }
+    },
+    1000,
+  );
+
+  // The other half of the bound: a call that finishes well inside its budget must RETIRE its
+  // timer, or every completed call leaves a live abort armed against a signal nobody is watching
+  // — and in a suite, hundreds of them.
+  test("a completed call clears its abort timer instead of leaving it armed", async () => {
+    stub(() => new Response(JSON.stringify({ Id: "abc" }), { status: 200 }));
+    await inspectContainer("abc", 20);
+    const signal = calls[0]!.signal!;
+    expect(signal.aborted).toBe(false);
+    await Bun.sleep(60); // well past the 20ms bound
+    expect(signal.aborted).toBe(false); // still false => clearTimeout ran
   });
 
   // The Engine API wants repo and tag as separate query params, not one combined "repo:tag"

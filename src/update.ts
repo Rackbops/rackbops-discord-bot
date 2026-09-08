@@ -214,11 +214,12 @@ export interface RedeployDeps {
 const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy };
 
 // Closes the gap `handoffActive()` alone leaves open (#51 item 4): that flag doesn't read true
-// until `redeploy()` calls `beginHandoff()` as its very first line, but everything before
-// `redeploy()` — both GitHub fetches, `saveState()`, and `redeployAvailable()`'s daemon ping —
-// is async and yields the event loop while `handoffActive()` still reads false. A second call
-// landing in that stretch (two /updates in quick succession, or an admin's /update racing the
-// scheduler's auto-update tick) would otherwise sail through and reach `redeploy()` too: both
+// until `redeploy()` calls `beginHandoff()` just before creating the replacement (#130 moved it
+// past the build), so everything before that — both GitHub fetches, `saveState()`,
+// `redeployAvailable()`'s daemon ping, and now the build itself — is async and yields the event
+// loop while `handoffActive()` still reads false. A second call landing in that stretch (two
+// /updates in quick succession, or an admin's /update racing the scheduler's auto-update tick)
+// would otherwise sail through and reach `redeploy()` too: both
 // build the same `shaTag`, both target the same `replacementName`, and a losing call's failure
 // path calls `endHandoff()` unconditionally — un-quiescing the scheduler while the winner's
 // replacement is still coming up. Set synchronously (no `await` before it) so a second call
@@ -234,7 +235,8 @@ let checkInFlight = false;
  *
  * The restart is only *requested*. On the exit-75 fallback path (`requestRestart`) that request
  * is held until any in-flight announcement and state write finish; the socket-mounted redeploy path
- * instead quiesces via `beginHandoff`, which stops new ticks but does not await a tick already running.
+ * instead quiesces via `beginHandoff` — now only for the create→verify window, after the build (#130) —
+ * which stops new ticks but does not await a tick already running.
  */
 export async function checkForUpdate(
   o: { force?: boolean; requester?: UpdateRequester } = {},
