@@ -357,7 +357,7 @@ export async function commitReleaseAnnouncements(
     // Nothing to post. Persist only on the genuine first-poll seed (seen was undefined, so
     // nextSeen is the full current list, worth recording once) — the ordinary no-new-releases
     // case has nextSeen content-identical to seen (decideReleaseAnnouncements above), so saving
-    // it would just be a state.json rewrite for zero information gain, every ~5 min, per repo.
+    // it would just be a state.json rewrite for zero information gain, every poll, per repo.
     if (seen === undefined) await deps.persist(nextSeen);
     return;
   }

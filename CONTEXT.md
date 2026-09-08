@@ -148,7 +148,7 @@ _Avoid_: plugin list, cache
   `ops/bot-ops.sh status` reads `wow.json` first, falling back to `state.json`, for the `realmStatus`
   field the panel + `wow-companion` consume.
 - **Release polling** runs on a flat 15-min cadence plus a startup catch-up (there is no release
-  cron in this fork — mirrors the self-update check). Each repo in `config.watchedRepos` is polled
+  cron in this fork — same shape as the self-update / plugin-update checks). Each repo in `config.watchedRepos` is polled
   independently; a repo's first-ever poll (its key absent from `seenReleaseIds`) seeds silently.
 - **Self-update** asks whether the baked-in `GIT_SHA` **contains** the newest `BOT_BRANCH` (default
   `main`) commit on `GITHUB_REPO` (flat 15-min cadence + startup, only when `AUTO_UPDATE=true`;
