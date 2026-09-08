@@ -14,6 +14,15 @@ describe("index.ts wiring", () => {
     expect(source).not.toMatch(/new Client\(/);
   });
 
+  // #139: BOT_DATA_DIR can relocate the data dir, and a value off the mounted volume breaks
+  // self-update in a way nothing else names — the replacement writes a handoff marker the original
+  // never sees, so every /update waits out its deadline. Both `storage.ts` and CONTEXT.md cite this
+  // log line as one of the three mitigations, so deleting it silently invalidates documented
+  // behaviour. Pinned at source level for the same reason as the rest of this file.
+  test("logs the resolved data dir at boot", () => {
+    expect(source).toMatch(/\[boot\] data dir/);
+  });
+
   test("loads the Plugin Index, selects plugins, and logs skip reasons before the Client is constructed", () => {
     const loadCall = source.indexOf("loadPluginIndex(");
     const selectCall = source.indexOf("selectPlugins(");

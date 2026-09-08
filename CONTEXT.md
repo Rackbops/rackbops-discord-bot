@@ -209,11 +209,17 @@ _Avoid_: plugin list, cache
   means the original and the replacement write **different filesystems** — the replacement's
   `handoff.json` is never seen, every `/update` waits out `HANDOFF_DEADLINE_MS` and reports a
   replacement that "never reported in", and self-update is broken with nothing naming the cause.
-  Hence absolute-only, hence not in `.env.example` or `bot-ops.sh`'s `ALLOWED`, and hence
-  `index.ts` logs the resolved path on every boot. The `bunfig.toml` preload is what sets it for
-  tests, and it **must** be a preload: Bun runs every test file in one process with one module
-  registry, so per-file `process.env` priming is first-importer-wins and a single new unprimed file
-  sorting first would silently revert the whole protection.
+  Mitigated by keeping it out of `.env.example` and `bot-ops.sh`'s `ALLOWED`, and by `index.ts`
+  logging the resolved path on every boot — that log is what turns the symptom into a one-line
+  diagnosis, and `index.test.ts` pins it. (Absolute-only is a *separate* guard against a relative
+  value resolving against cwd back into a checkout; it does **not** help here, since the dangerous
+  values are absolute.) The `bunfig.toml` preload is what sets it for tests, and it **must** be a
+  preload: Bun runs every test file in one process with one module registry, so per-file
+  `process.env` priming is first-importer-wins and a single new unprimed file sorting first would
+  silently revert the whole protection. Note the preload is rooted at the repo — `bunfig.toml` is
+  not walked up to, so `ops/admin`'s own package does not get it. Harmless today (no `ops/**` test
+  imports `src/`), and the `NODE_ENV=test` refusal makes it fail loudly rather than corrupt if one
+  ever does — but **run the suite from the repo root**.
 - **Plugin ticks are `running`-gated, and `activatePlugins()` runs BEFORE `startScheduler()`.**
   `activate()` awaits `activatePlugins()` (`index.ts:161`) — which flips each `LoadedPlugin.running`
   true once that plugin's `activate()` has succeeded — and only *then* calls `startScheduler(client,

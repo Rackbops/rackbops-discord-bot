@@ -17,8 +17,12 @@ import { dirname, isAbsolute, join } from "node:path";
  * derives `Binds` from the mounts, so a value pointing off the named volume means the original and
  * the replacement write *different* filesystems — the replacement's `handoff.json` is never seen,
  * every `/update` waits out `HANDOFF_DEADLINE_MS` and reports a replacement that "never reported
- * in", and self-update is broken with nothing naming the cause. Hence absolute-only, and hence
- * `index.ts` logs the resolved path on every boot.
+ * in", and self-update is broken with nothing naming the cause. That is why `index.ts` logs the
+ * resolved path on every boot — it is the one thing that turns that into a one-line diagnosis.
+ * (Absolute-only is a *separate* guard, and not a mitigation for the above: `/srv/elsewhere` is
+ * absolute and is exactly the failure case. It exists because a relative value resolves against
+ * cwd, which can land back inside a checkout — the same reason `BOT_OPS_CONFIG_DIR` is
+ * absolute-only.)
  *
  * Under `bun test` an unset override is a hard error rather than a silent fall back to the
  * checkout: without that, a preload that fails to run restores the corruption invisibly.
