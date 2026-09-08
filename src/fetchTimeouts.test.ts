@@ -76,7 +76,12 @@ describe("every GitHub call is timeout-bounded", () => {
           config.githubToken = "test-token"; // createIssue requires one
           globalThis.fetch = stub();
           const r = await settleWithin(call(), name);
+          // Assert WHY it rejected, not just that it did. Without this the guard rests on an
+          // unasserted precondition: drop the token line above and `createIssue` rejects with
+          // "GITHUB_TOKEN is not set" instead, the suite stays green, and the mutation-catch
+          // silently evaporates.
           expect(r.ok).toBe(false);
+          expect((r as { e: Error }).e.name).toBe("TimeoutError");
         },
         2000,
       );
@@ -111,6 +116,47 @@ describe("every GitHub call is timeout-bounded", () => {
   // timed-out compare becomes `unknown` -> `restart`, i.e. a real self-redeploy.
   test("the timeout is generous enough that a compare failure stays unlikely", () => {
     expect(GITHUB_TIMEOUT_MS).toBe(10_000);
+  });
+
+  // The table above is a hand-maintained literal list, so a SIXTH GitHub call added later is
+  // simply absent from it rather than red — the same rot mode this file exists to prevent, one
+  // level up again. This closes that: it reads the sources and requires every `fetch(` in them to
+  // carry a signal, so a new unbounded call fails here without anyone remembering to add a row.
+  // Source-level for the same reason `index.test.ts` is: these modules can't be re-imported per
+  // test, and the property is syntactic anyway.
+  test("no fetch( in github.ts or update.ts is missing a signal", async () => {
+    // Paren-balanced, not a regex: these calls close with `});`, and a first attempt at this
+    // matching `\n\s*\);` found ZERO of them — so the loop body never ran and the test passed
+    // vacuously while a deliberately-added unbounded sixth call sat right there. Hence the
+    // explicit count assertion below: a scanner that finds nothing must fail, not pass.
+    const argsOfEachFetchCall = (source: string): string[] => {
+      const out: string[] = [];
+      for (const m of source.matchAll(/\bfetch\(/g)) {
+        let depth = 1;
+        let i = m.index! + m[0].length;
+        for (; i < source.length && depth > 0; i++) {
+          if (source[i] === "(") depth++;
+          else if (source[i] === ")") depth--;
+        }
+        out.push(source.slice(m.index! + m[0].length, i - 1));
+      }
+      return out;
+    };
+
+    let checked = 0;
+    for (const file of ["./github.ts", "./update.ts"]) {
+      const source = await Bun.file(new URL(file, import.meta.url)).text();
+      for (const args of argsOfEachFetchCall(source)) {
+        // Thrown rather than `expect`ed so the message can name the offending call — a bare
+        // toContain on the whole argument text is unreadable, and truncating it for readability
+        // is what made the first version of this assertion wrong.
+        if (!args.includes("signal:")) {
+          throw new Error(`${file}: a fetch( call carries no signal — ${args.trim().slice(0, 80)}`);
+        }
+        checked++;
+      }
+    }
+    expect(checked).toBe(5); // the five known calls — a sixth must be added here deliberately
   });
 
   // Pinning the constant is NOT enough on its own. Every test above drives its site with TINY, so
