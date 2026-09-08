@@ -10,6 +10,7 @@
 // never touched by two writers at once.
 
 import { join } from "node:path";
+import { DATA_DIR } from "./storage";
 
 /** Set on the replacement only. Its presence *is* the instruction to boot in standby. */
 export const HANDOFF_FROM_ENV = "HANDOFF_FROM";
@@ -34,7 +35,8 @@ export const VERIFY_DEADLINE_MS = 90_000;
  */
 export const RETIREMENT_DEADLINE_MS = 180_000;
 
-const DATA_DIR = join(import.meta.dir, "..", "data");
+// Imported, never recomputed (#139) — the suite writes and deletes this marker on every
+// redeploy test, and before the shared resolver that landed in the developer's real data/.
 export const MARKER_FILE = join(DATA_DIR, "handoff.json");
 
 export interface HandoffMarker {

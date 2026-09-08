@@ -2,13 +2,41 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, DATA_DIR, readJsonOrFresh, writeJsonAtomic } from "./storage";
+import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, writeJsonAtomic } from "./storage";
 
-describe("DATA_DIR", () => {
-  test("resolves to the repo's data/ directory (one hop up from src/)", () => {
-    // storage.test.ts sits in src/ alongside storage.ts, so import.meta.dir is the same src/;
-    // the mutation this guards is a wrong hop count (e.g. an extra "..").
-    expect(DATA_DIR).toBe(join(import.meta.dir, "..", "data"));
+describe("resolveDataDir", () => {
+  // The default is still one hop up from src/ — the mutation this guards is a wrong hop count.
+  // Driven through the pure resolver with an explicit env, since the live DATA_DIR is the test
+  // override (see dataIsolation.test.ts) and can no longer be compared against the checkout path.
+  test("defaults to the repo's data/ directory when nothing overrides it", () => {
+    expect(resolveDataDir({})).toBe(join(import.meta.dir, "..", "data"));
+  });
+
+  test("an absolute override wins", () => {
+    const abs = process.platform === "win32" ? "C:\\tmp\\elsewhere" : "/tmp/elsewhere";
+    expect(resolveDataDir({ BOT_DATA_DIR: abs })).toBe(abs);
+  });
+
+  // A relative path can resolve back into a checkout depending on cwd — the same reason
+  // BOT_OPS_CONFIG_DIR is absolute-only. Refused loudly rather than quietly resolved.
+  test("a relative override is refused, naming the offending value", () => {
+    expect(() => resolveDataDir({ BOT_DATA_DIR: "./data" })).toThrow(/absolute path/);
+    expect(() => resolveDataDir({ BOT_DATA_DIR: "./data" })).toThrow(/\.\/data/);
+  });
+
+  test("an empty override falls through rather than resolving to nothing", () => {
+    expect(resolveDataDir({ BOT_DATA_DIR: "" })).toBe(join(import.meta.dir, "..", "data"));
+  });
+
+  // Without this, a preload that silently fails to run would drop straight back to the checkout
+  // and re-corrupt the developer's state.json with the whole suite green.
+  test("under bun test with no override it refuses instead of using the checkout", () => {
+    expect(() => resolveDataDir({ NODE_ENV: "test" })).toThrow(/BOT_DATA_DIR must be set/);
+  });
+
+  test("the live DATA_DIR is the override, never the checkout", () => {
+    expect(DATA_DIR).toBe(process.env.BOT_DATA_DIR!);
+    expect(DATA_DIR).not.toBe(join(import.meta.dir, "..", "data"));
   });
 });
 

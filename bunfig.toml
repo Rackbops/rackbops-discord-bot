@@ -1,0 +1,4 @@
+[test]
+# Runs before any test file is imported. Redirects the data directory away from the checkout —
+# see test/setup.ts for why this cannot be done per-file (#139).
+preload = ["./test/setup.ts"]
