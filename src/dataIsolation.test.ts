@@ -60,14 +60,21 @@ describe("the test run is isolated from the checkout's data/ (#139)", () => {
   });
 
   test("a real saveState() writes to the override and leaves the checkout untouched", async () => {
+    // Cleaned up in the `finally`, symmetrically with the marker test below: `state` is the shared
+    // singleton, and #139's own review lane asks that no test leave mutable global state behind
+    // for another file to trip over.
     state.seenReleaseIds["rackbops/isolation-probe"] = [1, 2, 3];
-    await saveState();
+    try {
+      await saveState();
 
-    const written = join(DATA_DIR, "state.json");
-    expect(existsSync(written)).toBe(true); // the write really happened — not a vacuous pass
-    expect(readFileSync(written, "utf8")).toContain("rackbops/isolation-probe");
+      const written = join(DATA_DIR, "state.json");
+      expect(existsSync(written)).toBe(true); // the write really happened — not a vacuous pass
+      expect(readFileSync(written, "utf8")).toContain("rackbops/isolation-probe");
 
-    assertCheckoutUntouched();
+      assertCheckoutUntouched();
+    } finally {
+      delete state.seenReleaseIds["rackbops/isolation-probe"];
+    }
   });
 
   test("a real writeMarker() writes to the override and leaves the checkout untouched", async () => {

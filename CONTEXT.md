@@ -209,6 +209,8 @@ _Avoid_: plugin list, cache
   means the original and the replacement write **different filesystems** — the replacement's
   `handoff.json` is never seen, every `/update` waits out `HANDOFF_DEADLINE_MS` and reports a
   replacement that "never reported in", and self-update is broken with nothing naming the cause.
+  It breaks the ops surface too: `bot-ops.sh` hardcodes `/app/data/...` in six places, so `status`'s
+  realm and plugin reads and `plugin-request` delivery would all be looking at the wrong directory.
   Mitigated by keeping it out of `.env.example` and `bot-ops.sh`'s `ALLOWED`, and by `index.ts`
   logging the resolved path on every boot — that log is what turns the symptom into a one-line
   diagnosis, and `index.test.ts` pins it. (Absolute-only is a *separate* guard against a relative
@@ -221,7 +223,7 @@ _Avoid_: plugin list, cache
   imports `src/`), and the `NODE_ENV=test` refusal makes it fail loudly rather than corrupt if one
   ever does — but **run the suite from the repo root**.
 - **Plugin ticks are `running`-gated, and `activatePlugins()` runs BEFORE `startScheduler()`.**
-  `activate()` awaits `activatePlugins()` (`index.ts:161`) — which flips each `LoadedPlugin.running`
+  `activate()` awaits `activatePlugins()` (`index.ts:144`) — which flips each `LoadedPlugin.running`
   true once that plugin's `activate()` has succeeded — and only *then* calls `startScheduler(client,
   pluginTicks(loaded))` (`:163`). So the scheduler's first (synchronous) tick already sees
   `running:true` and fires each plugin's ticks at boot, preserving the boot-time announcements the
