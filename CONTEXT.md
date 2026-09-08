@@ -403,8 +403,11 @@ _Avoid_: plugin list, cache
   - **An unconfirmed daemon error — including a timeout — stays `standby`, never downgrades.** A
     genuine handoff boot needs a live daemon connection for the rest of the protocol regardless, so
     treating "can't tell" as "gone" risks two live bots on the shared token, same reasoning as the
-    running-state case above. `docker.ts` bounds every call at the `api()` funnel
-    (`DEFAULT_TIMEOUT_MS`, 60s — #130); the one daemon call `resolveBootMode` makes keeps a
+    running-state case above. `docker.ts` bounds every exported call in its own `bounded()`
+    wrapper, spanning the request AND the response-body read (`DEFAULT_TIMEOUT_MS`, 60s — #130;
+    deliberately *not* at the `api()` funnel, which takes whatever signal it is handed, so the
+    bound can cover a body read that happens after the headers land); the one daemon call
+    `resolveBootMode` makes keeps a
     *tighter* 10s bound (`RESOLVE_BOOT_MODE_TIMEOUT_MS`) because it's the first daemon dependency
     `index.ts` has *before* `client.login()`, so a hung socket there falls through to "can't
     confirm" without eating 60s of boot before a login is even attempted.

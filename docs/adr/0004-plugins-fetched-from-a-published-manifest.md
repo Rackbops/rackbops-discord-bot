@@ -10,7 +10,7 @@ it: `src/warbandeer/links.ts:215` is an unconditional top-level `await` reached 
 `data/links.json` at every boot; and a self-update replacement snapshots `links` at module load —
 before `takeOver()` — while the original keeps serving `/link`, `/unlink` and the ingest endpoint
 (`beginHandoff()`, `src/restart.ts:65-68`, only quiesces the scheduler via `restartPending()`,
-`src/announce.ts:151`, and refuses a second `/update` via `handoffActive()`) for the length of the
+`src/announce.ts:217`, and refuses a second `/update` via `handoffActive()`) for the length of the
 handoff — bounded by `VERIFY_DEADLINE_MS` (`src/handoff.ts:22`) plus boot-mode resolution and the
 retire step — so the replacement's first whole-file `saveLinks()` overwrites whatever the original
 wrote in that window.

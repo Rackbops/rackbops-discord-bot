@@ -53,10 +53,16 @@ export async function withCritical<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Quiesce for a handoff (#879): the scheduler stops ticking, so nothing else writes
+ * Quiesce for a handoff (#879): no NEW scheduler tick starts, so nothing new begins writing
  * `data/state.json` while the replacement container is created and verifies, sharing that volume.
  * `redeploy()` calls this only just before the create — not before the build ahead of it, which
  * writes no state and is the one long call (#130).
+ *
+ * It does not await a tick already running (see `checkForUpdate`'s docstring). Before #130 the
+ * build sat between this call and the create, which incidentally gave an in-flight tick minutes to
+ * drain; it now has only the create→verify window. Nothing is corrupted — state writes are atomic
+ * — but a tick stopped mid-write when the original is retired can leave an announcement it already
+ * posted to be repeated. An explicit drain is tracked as a follow-up.
  *
  * Deliberately *not* a restart — this process must stay alive through the handoff. It is the
  * only thing left that can remove a replacement which fails to verify, and the only thing that

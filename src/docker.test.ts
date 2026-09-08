@@ -3,8 +3,22 @@ import { parseBuildOutput, parseContainerId } from "./docker";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
-const { buildImage, daemonReachable, inspectContainer, stopContainer, removeContainer, tagImage } =
-  await import("./docker");
+const {
+  buildImage,
+  createContainer,
+  daemonReachable,
+  inspectContainer,
+  inspectImage,
+  inspectSelf,
+  listImages,
+  removeContainer,
+  removeImage,
+  renameContainer,
+  startContainer,
+  stopContainer,
+  tagImage,
+  tryInspectContainer,
+} = await import("./docker");
 
 describe("parseContainerId", () => {
   const ID = "f".repeat(64);
@@ -165,11 +179,33 @@ describe("daemon calls", () => {
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
 
+  /**
+   * Await `p`, but fail loudly if it outlives `ms` instead of hanging.
+   *
+   * Every bound test must go through this. A regressed bound leaves nothing ref'd, and bun's own
+   * per-test timeout cannot interrupt that — the suite wedges with no output until the CI job
+   * limit rather than going red. The `Bun.sleep` here is ref'd, so it always wins that race and
+   * turns a wedge into a clean failure.
+   */
+  const settleWithin = async <T>(p: Promise<T>, label: string, ms = 500) => {
+    const outcome = await Promise.race([
+      p.then(
+        (v) => ({ ok: true as const, v }),
+        (e) => ({ ok: false as const, e: e as Error }),
+      ),
+      Bun.sleep(ms).then(() => null),
+    ]);
+    if (outcome === null) throw new Error(`${label} hung past its bound — never aborted`);
+    return outcome;
+  };
+
   test(
     "a response whose body never completes is aborted too, not just a stalled request",
     async () => {
       stub((_url, init) => wedgedBody(init?.signal));
-      await expect(inspectContainer("abc", 20)).rejects.toThrow(/timed out after 20ms/);
+      const r = await settleWithin(inspectContainer("abc", 20), "inspectContainer");
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
     },
     1000,
   );
@@ -178,12 +214,82 @@ describe("daemon calls", () => {
     "the build's body read is bounded by the same signal as its request",
     async () => {
       stub((_url, init) => wedgedBody(init?.signal));
-      await expect(
+      const r = await settleWithin(
         buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
-      ).rejects.toThrow(/timed out after 20ms/);
+        "buildImage body",
+      );
+      expect(r.ok).toBe(false);
+      expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
     },
     1000,
   );
+
+  // EVERY exported daemon call must be bounded, not just the two shapes spot-checked above.
+  // Without this table the bound is per-call-site convention: `api()` takes whatever signal it is
+  // handed, so a new call — or an edit handing one a signal that never fires — reopens #130's
+  // defect with a fully green suite. Driven both ways: a request that never answers, and a
+  // request that answers then wedges mid-body. `daemonReachable` swallows its own errors by
+  // design, so it is asserted to RESOLVE false rather than reject; everything else must reject.
+  const everyDaemonCall: [string, (timeoutMs: number) => Promise<unknown>][] = [
+    ["daemonReachable", (t) => daemonReachable(t)],
+    ["inspectSelf", (t) => inspectSelf(t)],
+    ["inspectContainer", (t) => inspectContainer("abc", t)],
+    ["tryInspectContainer", (t) => tryInspectContainer("abc", t)],
+    ["buildImage", (t) => buildImage({ remote: "https://x/y.git#main", tags: ["i:abc1234"], buildArgs: {} }, t)],
+    ["createContainer", (t) => createContainer("n", {} as never, t)],
+    ["startContainer", (t) => startContainer("abc", t)],
+    ["stopContainer", (t) => stopContainer("abc", 10, t)],
+    ["removeContainer", (t) => removeContainer("abc", false, t)],
+    ["renameContainer", (t) => renameContainer("abc", "n", t)],
+    ["listImages", (t) => listImages(t)],
+    ["inspectImage", (t) => inspectImage("abc", t)],
+    ["removeImage", (t) => removeImage("i:abc1234", t)],
+    ["tagImage", (t) => tagImage("i:abc1234", "i:latest", t)],
+  ];
+
+  // `inspectSelf` consults HOSTNAME first; pin it so the table drives that branch deterministically.
+  const withHostname = (fn: () => Promise<void>) => async () => {
+    process.env.HOSTNAME = "self-container-id";
+    try {
+      await fn();
+    } finally {
+      delete process.env.HOSTNAME;
+    }
+  };
+
+  for (const [name, call] of everyDaemonCall) {
+    test(
+      `${name} is bounded when the daemon never answers`,
+      withHostname(async () => {
+        stub(() => new Response("", { status: 200 })); // replaced below; keeps `calls` reset
+        globalThis.fetch = ((_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+            );
+          })) as unknown as typeof fetch;
+        const settled = await settleWithin(call(20), name);
+        if (name === "daemonReachable") {
+          expect(settled).toEqual({ ok: true, v: false }); // swallows the abort, but must not hang
+        } else {
+          expect(settled.ok).toBe(false);
+          expect((settled as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+        }
+      }),
+      1000,
+    );
+
+    test(
+      `${name} is bounded when the daemon answers then wedges mid-body`,
+      withHostname(async () => {
+        stub((_url, init) => wedgedBody(init?.signal));
+        // A call that reads no body settles on headers alone; one that does must abort. Either
+        // way it must SETTLE within its bound rather than hang.
+        await settleWithin(call(20), name);
+      }),
+      1000,
+    );
+  }
 
   // The other half of the bound: a call that finishes well inside its budget must RETIRE its
   // timer, or every completed call leaves a live abort armed against a signal nobody is watching
