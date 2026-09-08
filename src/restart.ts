@@ -62,7 +62,7 @@ export async function withCritical<T>(fn: () => Promise<T>): Promise<T> {
  * build sat between this call and the create, which incidentally gave an in-flight tick minutes to
  * drain; it now has only the create→verify window. Nothing is corrupted — state writes are atomic
  * — but a tick stopped mid-write when the original is retired can leave an announcement it already
- * posted to be repeated. An explicit drain is tracked as a follow-up.
+ * posted to be repeated. An explicit drain is tracked as #154.
  *
  * Deliberately *not* a restart — this process must stay alive through the handoff. It is the
  * only thing left that can remove a replacement which fails to verify, and the only thing that
