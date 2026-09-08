@@ -292,7 +292,7 @@ export function updateReply(
       return "⏳ An update is already in progress — I'll report how it went; ask again after that.";
     case "disabled":
       // Two ways to end up here, and they need different things from the operator: bake a
-      // GIT_SHA, versus push the branch you built from (#871).
+      // GIT_SHA, versus push the branch you built from (nazumods/wow#871).
       if (o.reason === "unpublished-sha") {
         return (
           `⚠️ Self-update is disabled — this build's commit \`${running}\` ` +
@@ -308,7 +308,7 @@ export function updateReply(
       // A self-contained redeploy that *worked* never reaches here: the replacement retires
       // this process mid-await, and delivers the ✅ itself from `pendingUpdateReport`. So a
       // result present at all is a failed swap, and the reply says so instead of promising a
-      // return that isn't coming (#879).
+      // return that isn't coming (nazumods/wow#879).
       if (o.redeploy) {
         const kind =
           o.redeploy.outcome === "timeout" || o.redeploy.outcome === "stalled"

@@ -1,4 +1,4 @@
-// Self-contained redeploy (#879): the bot builds its own replacement through the Docker
+// Self-contained redeploy (nazumods/wow#879): the bot builds its own replacement through the Docker
 // daemon, starts it alongside, and lets it retire the original once it has verified itself.
 //
 // Everything here that talks to the daemon about the swap lives in this file; the protocol
@@ -280,7 +280,7 @@ export async function redeploy(
       // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
       // between writing the marker and stopping us, that promise is never kept, and without a
       // bound here this process would sit quiesced forever: alive, silent, and doing nothing,
-      // which is the outage #879 exists to prevent. So the wait for our own death gets a
+      // which is the outage nazumods/wow#879 exists to prevent. So the wait for our own death gets a
       // deadline too. Reaching it demotes the outcome to `stalled` and falls through to the
       // same cleanup as any other failed swap.
       //
@@ -385,7 +385,7 @@ async function pruneOldImages(currentImage: string): Promise<void> {
  * original, then take its name.
  *
  * Removal, not just a stop — under `restart: unless-stopped` an exited container is brought
- * back on its old image, which is the original #868 failure and would now leave two bots
+ * back on its old image, which is the original nazumods/wow#868 failure and would now leave two bots
  * running. An explicit `docker stop` is exempt from that policy, and the `rm` makes it moot.
  *
  * This can also run a second time against the same original id, with nothing left alive to

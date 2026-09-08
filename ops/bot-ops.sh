@@ -148,7 +148,7 @@ die() { echo "bot-ops: $*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
-# A self-update (#879) briefly runs the replacement alongside the original under
+# A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
 # "<container>-next" before it takes the canonical name over. Recreating or restarting the
 # ORIGINAL while that container exists races retireOriginal's own stop/remove/rename and can leave
 # two bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
@@ -589,7 +589,7 @@ cmd_env_set() {
     || echo "bot-ops: warning: couldn't restore .env ownership to $target_owner" >&2
 
   # Apply: recreate the container so the new env is loaded (a plain restart would not reload it).
-  # Deliberately NO --build: a self-update (#879) tags its freshly built image as the same
+  # Deliberately NO --build: a self-update (nazumods/wow#879) tags its freshly built image as the same
   # `<project>-bot:latest` compose expects, so recreating without building reuses it. Adding
   # --build here would rebuild from whatever this checkout happens to be on, silently rolling
   # the bot back to older code every time someone edits a setting.

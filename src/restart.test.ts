@@ -64,7 +64,7 @@ describe("requestRestart", () => {
   });
 });
 
-// #879: the outgoing bot has to stay alive through a handoff — it is the only thing that can
+// nazumods/wow#879: the outgoing bot has to stay alive through a handoff — it is the only thing that can
 // remove a replacement which fails to verify, and the only thing that can report the failure.
 describe("beginHandoff", () => {
   test("quiesces the scheduler without exiting", () => {

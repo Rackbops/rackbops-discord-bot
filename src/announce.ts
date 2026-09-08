@@ -56,7 +56,7 @@ export function startScheduler(client: Client, extraChecks: TickCheck[] = []): v
 
 type AnnounceKind = "release";
 
-// Per-kind channel routing: the seam future announcement kinds plug into (see issue #528). Only
+// Per-kind channel routing: the seam future announcement kinds plug into (see issue nazumods/wow#528). Only
 // `release` remains a core announcement — the WoW announcements moved to the wow plugin (#107), which
 // posts through host.announce → ANNOUNCE_CHANNEL_ID — so this currently always resolves the release channel.
 function channelFor(_kind: AnnounceKind): string {

@@ -99,7 +99,7 @@ describe("report helpers", () => {
   });
 });
 
-// #870: the confirmation is posted in the channel now, so it has to carry the report itself
+// nazumods/wow#870: the confirmation is posted in the channel now, so it has to carry the report itself
 // rather than just a link — and it has to survive a description longer than Discord allows.
 describe("reportAnnouncement", () => {
   const base = {

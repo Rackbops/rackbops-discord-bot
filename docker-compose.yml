@@ -26,7 +26,7 @@ services:
     env_file: ${BOT_ENV_FILE:-.env}
     volumes:
       - state:/app/data
-      # Self-update (#879): the bot builds its own replacement and hands off to it through the
+      # Self-update (nazumods/wow#879): the bot builds its own replacement and hands off to it through the
       # daemon. This is root-equivalent on the host — accepted deliberately, because it is the
       # only way `/update` completes with nothing installed outside the container. The trigger
       # stays ADMIN_USER_IDS-gated and fails closed.

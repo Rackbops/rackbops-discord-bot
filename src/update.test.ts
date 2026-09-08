@@ -79,7 +79,7 @@ describe("decideUpdate", () => {
   });
 });
 
-// #871: staleness is an ancestry question, not an equality one. GIT_SHA is the tip the image was
+// nazumods/wow#871: staleness is an ancestry question, not an equality one. GIT_SHA is the tip the image was
 // built from, which on most days is a main commit NEWER than the last bot-touching commit.
 describe("decideUpdate ancestry", () => {
   // The regression that motivated the issue: a correct, current deploy built from a main tip that
@@ -120,7 +120,7 @@ describe("decideUpdate ancestry", () => {
     ).toBe("disabled");
   });
 
-  // An API failure must not invent a verdict — it degrades to the pre-#871 behaviour.
+  // An API failure must not invent a verdict — it degrades to the pre-nazumods/wow#871 behaviour.
   test("unknown falls back to treating a sha mismatch as stale", () => {
     expect(decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unknown" })).toBe("restart");
     expect(

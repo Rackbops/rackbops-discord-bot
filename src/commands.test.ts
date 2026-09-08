@@ -67,7 +67,7 @@ describe("updateReply", () => {
   });
 
   // The bot now answers this itself, with a follow-up naming the build it landed on —
-  // handing the verification back to the user was the whole complaint in #681.
+  // handing the verification back to the user was the whole complaint in nazumods/wow#681.
   test("no longer asks the user to check whether the build changed", () => {
     const reply = updateReply("restart", SHA);
     expect(reply).not.toContain("same build");
@@ -79,7 +79,7 @@ describe("updateReply", () => {
     expect(updateReply("current", SHA)).toContain("latest build");
   });
 
-  // #871: `disabled` has two causes now, and they ask different things of the operator.
+  // nazumods/wow#871: `disabled` has two causes now, and they ask different things of the operator.
   test("names the unpublished sha rather than blaming a missing GIT_SHA", () => {
     const running = "def4567890abcdef";
     const reply = updateReply("disabled", "", { runningSha: running, reason: "unpublished-sha" });

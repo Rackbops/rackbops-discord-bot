@@ -134,7 +134,7 @@ describe("handoffFailureMessage", () => {
     expect(handoffFailureMessage("stalled", { targetSha: sha })).not.toContain("undefined");
   });
 
-  // The headline of #879: whatever went wrong, the original is still serving.
+  // The headline of nazumods/wow#879: whatever went wrong, the original is still serving.
   test("every failure says the current build is still running", () => {
     for (const outcome of ["failed", "timeout", "stalled"] as const) {
       expect(handoffFailureMessage(outcome, { targetSha: sha })).toContain("current build");
