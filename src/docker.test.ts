@@ -3,7 +3,8 @@ import { parseBuildOutput, parseContainerId } from "./docker";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
-const { buildImage, daemonReachable, stopContainer, removeContainer, tagImage } = await import("./docker");
+const { buildImage, daemonReachable, inspectContainer, stopContainer, removeContainer, tagImage } =
+  await import("./docker");
 
 describe("parseContainerId", () => {
   const ID = "f".repeat(64);
@@ -127,16 +128,73 @@ describe("daemon calls", () => {
   // The signal has to actually abort a stuck call — not just be attached. A stub that never
   // resolves unless the signal fires stands in for a wedged dockerd; buildImage's own tiny
   // timeout override lets this run without waiting out the real 15-min bound.
-  test("buildImage rejects when the build exceeds its timeout instead of hanging forever", async () => {
-    globalThis.fetch = ((_url: string, init?: RequestInit) =>
-      new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () =>
-          reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
-        );
-      })) as unknown as typeof fetch;
-    await expect(
-      buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
-    ).rejects.toThrow();
+  //
+  // The explicit per-test timeout matters: if the bound regresses, the abort never fires and
+  // nothing else is ref'd, so bun's own default timeout can't interrupt it either — without this
+  // the failure mode is a silent CI wedge instead of a red test.
+  test(
+    "buildImage rejects when the build exceeds its timeout instead of hanging forever",
+    async () => {
+      globalThis.fetch = ((_url: string, init?: RequestInit) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject((init.signal as AbortSignal).reason ?? new Error("aborted")),
+          );
+        })) as unknown as typeof fetch;
+      await expect(
+        buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
+      ).rejects.toThrow(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  // The bound must cover the response BODY, not just the request. A daemon that answers with
+  // headers and then wedges mid-body hangs exactly as hard — and this is the shape that caught a
+  // first cut of #130, where the timer was retired the moment the headers landed and every
+  // non-build call (inspectSelf included, which the issue names) was left unbounded again.
+  // Headers land immediately, then the body never completes — and, as a real `fetch` body does,
+  // the stream errors when the request's signal aborts. That last part is what makes this a
+  // faithful double: a hand-built Response ignores the signal, a network one does not.
+  const wedgedBody = (signal?: AbortSignal | null) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          signal?.addEventListener("abort", () => controller.error(signal.reason));
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+
+  test(
+    "a response whose body never completes is aborted too, not just a stalled request",
+    async () => {
+      stub((_url, init) => wedgedBody(init?.signal));
+      await expect(inspectContainer("abc", 20)).rejects.toThrow(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  test(
+    "the build's body read is bounded by the same signal as its request",
+    async () => {
+      stub((_url, init) => wedgedBody(init?.signal));
+      await expect(
+        buildImage({ remote: "https://github.com/o/r.git#main", tags: ["img:abc1234"], buildArgs: {} }, 20),
+      ).rejects.toThrow(/timed out after 20ms/);
+    },
+    1000,
+  );
+
+  // The other half of the bound: a call that finishes well inside its budget must RETIRE its
+  // timer, or every completed call leaves a live abort armed against a signal nobody is watching
+  // — and in a suite, hundreds of them.
+  test("a completed call clears its abort timer instead of leaving it armed", async () => {
+    stub(() => new Response(JSON.stringify({ Id: "abc" }), { status: 200 }));
+    await inspectContainer("abc", 20);
+    const signal = calls[0]!.signal!;
+    expect(signal.aborted).toBe(false);
+    await Bun.sleep(60); // well past the 20ms bound
+    expect(signal.aborted).toBe(false); // still false => clearTimeout ran
   });
 
   // The Engine API wants repo and tag as separate query params, not one combined "repo:tag"
