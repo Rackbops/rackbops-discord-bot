@@ -15,8 +15,8 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
 # server.ts imports ./admin-contract (the vendored ADMIN_API_VERSION + AdminApi types, #124), so it
-# MUST be copied too — a missing local import crash-loops the container at boot. Keep this in sync
-# with server.ts's relative imports; nothing but the image build catches a missing one.
+# MUST be copied too — a missing local import crash-loops the container at boot (#128). Keep this in
+# sync with server.ts's relative imports; guarded by server.test.ts's "Dockerfile COPY ratchet" (#163).
 COPY server.ts admin-contract.ts ./
 COPY public ./public
 

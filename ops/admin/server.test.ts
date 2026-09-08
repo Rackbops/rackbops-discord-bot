@@ -3245,3 +3245,53 @@ describe("admin panel sendPluginRequest (#105, lifted from index.html)", () => {
     expect(reloads).toEqual({ plugins: 0, status: 0 });
   });
 });
+
+// #124's server.ts gained a local import (./admin-contract) that the Dockerfile's `COPY server.ts
+// admin-contract.ts ./` had to name explicitly; #128 was a missed one — the container crash-looped
+// at boot with "Cannot find module './admin-contract'" because nothing but the real image build
+// caught it. This ratchets that: every relative local import server.ts has must appear among the
+// Dockerfile's COPY sources, so a future added import that isn't COPYed fails here instead of at boot.
+describe("Dockerfile COPY ratchet: every server.ts local import is copied into the image (#128, #163)", () => {
+  const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const dockerfileSrc = readFileSync(new URL("./Dockerfile", import.meta.url), "utf8");
+
+  // Static `from "./x"` / `from "./x.js"` and dynamic `import("./x")` relative specifiers, mapped
+  // to their on-disk filename (Bun resolves a `.js` specifier to the sibling `.ts` file).
+  function extractLocalImportFilenames(src: string): string[] {
+    const specifiers: string[] = [];
+    for (const m of src.matchAll(/from\s+["'](\.\/[^"']+)["']/g)) specifiers.push(m[1]!);
+    for (const m of src.matchAll(/import\(\s*["'](\.\/[^"']+)["']\s*\)/g)) specifiers.push(m[1]!);
+    return specifiers.map((spec) => {
+      const base = spec.slice(2).replace(/\.js$/, "");
+      return base.endsWith(".ts") ? base : `${base}.ts`;
+    });
+  }
+
+  // Every COPY instruction's source tokens (all but the last, which is the destination);
+  // `--chown=`/`--from=` flags are ignored, not treated as sources.
+  function extractDockerfileCopySources(src: string): string[] {
+    const sources: string[] = [];
+    for (const line of src.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("COPY ")) continue;
+      const tokens = trimmed
+        .slice("COPY ".length)
+        .split(/\s+/)
+        .filter((t) => t.length > 0 && !t.startsWith("--"));
+      sources.push(...tokens.slice(0, -1));
+    }
+    return sources;
+  }
+
+  test("the extractor finds at least one local import (can't pass vacuously)", () => {
+    expect(extractLocalImportFilenames(serverSrc).length).toBeGreaterThanOrEqual(1);
+  });
+
+  test("every server.ts local import filename is among the Dockerfile's COPY sources", () => {
+    const imports = extractLocalImportFilenames(serverSrc);
+    const copied = extractDockerfileCopySources(dockerfileSrc);
+    for (const filename of imports) {
+      expect(copied).toContain(filename);
+    }
+  });
+});
