@@ -308,6 +308,35 @@ describe("daemon calls", () => {
     expect(BUILD_TIMEOUT_MS).toBeGreaterThan(DEFAULT_TIMEOUT_MS);
   });
 
+  // `inspectSelf` has two legs and the table above only ever drives the first: it pins HOSTNAME,
+  // so the mountinfo fallback — the leg that runs when a compose file pins `hostname:` — was
+  // reachable by no test at all, and its signal could be swapped for a never-firing one with the
+  // whole suite green. Drive it explicitly: no HOSTNAME, and a stubbed /proc/self/mountinfo.
+  test(
+    "inspectSelf's mountinfo fallback is bounded too, not just the hostname leg",
+    async () => {
+      const realFile = Bun.file;
+      const realHost = process.env.HOSTNAME;
+      delete process.env.HOSTNAME;
+      // The id has to be 64 hex for parseContainerId to accept it (a short id is rejected).
+      (Bun as { file: unknown }).file = () => ({
+        text: async () => `1 1 0:1 /containers/${"f".repeat(64)}/hostname /etc/hostname rw`,
+      });
+      try {
+        stub((_url, init) => wedgedBody(init?.signal));
+        const r = await settleWithin(inspectSelf(20), "inspectSelf fallback");
+        expect(r.ok).toBe(false);
+        expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
+        // Proves the fallback leg actually ran, rather than the hostname leg being hit by accident.
+        expect(calls[0]!.url).toContain("f".repeat(64));
+      } finally {
+        (Bun as { file: unknown }).file = realFile;
+        if (realHost !== undefined) process.env.HOSTNAME = realHost;
+      }
+    },
+    1000,
+  );
+
   // The other half of the bound: a call that finishes well inside its budget must RETIRE its
   // timer, or every completed call leaves a live abort armed against a signal nobody is watching
   // — and in a suite, hundreds of them.
