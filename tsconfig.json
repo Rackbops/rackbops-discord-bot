@@ -9,6 +9,10 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "verbatimModuleSyntax": true,
+    // #136: catches an unused local, param, or plain (non-aliased) import/type-import --
+    // reproduced and confirmed does NOT catch an unused import that uses `as` aliasing
+    // (`import { X as Y }`), under this repo's verbatimModuleSyntax. Nothing in this repo today
+    // catches that specific case; eslint's no-unused-vars or knip would, if ever added.
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "skipLibCheck": true,
