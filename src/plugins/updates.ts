@@ -65,9 +65,9 @@ function splitPrerelease(v: string): [string, string] {
   return dash === -1 ? [noBuild, ""] : [noBuild.slice(0, dash), noBuild.slice(dash + 1)];
 }
 
-export type PluginUpdateAction = "notify" | "remind" | "none";
+type PluginUpdateAction = "notify" | "remind" | "none";
 
-export interface PluginUpdateDecision {
+interface PluginUpdateDecision {
   name: string;
   /** The pinned/installed version the notice compares against. */
   from: string;

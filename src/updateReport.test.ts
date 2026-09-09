@@ -1,9 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-// `updateReport.ts` reaches the `config` singleton, which resolves process.env at import
-// time — satisfy the required vars before importing so this file runs standalone.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// `updateReport.ts` reaches the `config` singleton, which resolves process.env at import time --
+// the required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
   decideUpdateOutcome,
   updateOutcomeMessage,

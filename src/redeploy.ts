@@ -29,7 +29,6 @@ import {
   bootMode,
   clearMarker,
   decideHandoffOutcome,
-  HANDOFF_DEADLINE_MS,
   HANDOFF_FROM_ENV,
   HANDOFF_RESTART_POLICY_ENV,
   readMarker,

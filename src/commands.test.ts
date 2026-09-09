@@ -2,10 +2,8 @@ import { describe, expect, spyOn, test } from "bun:test";
 import type { ChatInputCommandInteraction } from "discord.js";
 import type { PluginCommand } from "./plugins/contract";
 
-// `commands.ts` pulls in the `config` singleton, which resolves process.env at import
-// time — satisfy the required vars before importing so this file runs standalone.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// `commands.ts` pulls in the `config` singleton, which resolves process.env at import time --
+// the required vars are primed once by test/setup.ts's bunfig preload (#136).
 const { isAdmin, bareName, updateReply, commandData, handleCommand } = await import("./commands");
 const { buildCommandBody } = await import("./plugins/host");
 const { config } = await import("./config");

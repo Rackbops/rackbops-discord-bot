@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-// `update.ts` pulls in the `config` singleton, which resolves process.env at import
-// time — satisfy the required vars before importing so this file runs standalone.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// `update.ts` pulls in the `config` singleton, which resolves process.env at import time -- the
+// required vars are primed once by test/setup.ts's bunfig preload (#136).
 const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelation } =
   await import("./update");
 const { beginHandoff, endHandoff } = await import("./restart");

@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-// The `config` singleton resolves process.env at import time, so satisfy the
-// required vars before pulling the module in.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// The `config` singleton resolves process.env at import time. DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID
+// are primed once, for every test file, by test/setup.ts's bunfig preload (#136) -- this file's
+// own tests below cover resolveConfig's OTHER vars directly, with their own explicit env.
 const { resolveConfig, repoForProject } = await import("./config");
 const { reportBody, reportAnnouncement } = await import("./report");
 

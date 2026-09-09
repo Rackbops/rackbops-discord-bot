@@ -7,14 +7,14 @@ import { mkdirSync, renameSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { PluginIndex } from "./contract";
 
-export type PluginIndexSource = "fresh" | "cache" | "none";
+type PluginIndexSource = "fresh" | "cache" | "none";
 
-export interface LoadPluginIndexResult {
+interface LoadPluginIndexResult {
   index: PluginIndex;
   source: PluginIndexSource;
 }
 
-export interface LoadPluginIndexDeps {
+interface LoadPluginIndexDeps {
   fetch?: (url: string, init?: RequestInit) => Promise<Response>;
   /** Stamped into the cache file as `writtenAt` when a fetch succeeds. */
   now?: () => Date;

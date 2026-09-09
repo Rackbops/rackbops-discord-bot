@@ -3,10 +3,8 @@ import type { Client } from "discord.js";
 import type { Release } from "./github";
 import type { TickCheck } from "./plugins/contract";
 
-// announce.ts imports the `config` singleton (resolved from process.env at import time), so
-// prime the required vars before pulling the module in — see config.test.ts.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// announce.ts imports the `config` singleton (resolved from process.env at import time) -- the
+// required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
   runTick,
   guardedTick,

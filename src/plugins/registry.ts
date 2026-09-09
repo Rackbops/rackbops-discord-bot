@@ -3,7 +3,7 @@
 // (src/index.ts), so every skip decision here is made from data alone, never from plugin code.
 import type { PluginIndex, PluginIndexEntry } from "./contract";
 
-export interface ConfiguredPlugin {
+interface ConfiguredPlugin {
   name: string;
   version?: string;
 }

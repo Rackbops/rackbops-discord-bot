@@ -1,6 +1,5 @@
 import {
   MessageFlags,
-  SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
