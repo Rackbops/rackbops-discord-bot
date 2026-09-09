@@ -1,6 +1,12 @@
 # EP — Production readiness — implementation plan
 
-Status: **filed, not started** (2026-09-09). Epic issue:
+Status: **in progress** (2026-09-09). #83 done (PR #188 `e8b1dd6`, one round — a claims finding
+corrected this plan's own false statement that a build-only job guards the #163 missing-COPY class;
+it does not, since neither Dockerfile resolves imports at build time). #9 step 2 done (bootstrap
+re-run from `main`, Blizzard creds copied); steps 1/3/4 **deferred by roshne** (a shared token with
+the live debug bot was declined — two connections on one token double-handle everything). #84 is
+unblocked (context name `docker-build`) and awaits roshne's PUT; #11 waits on #9; #10 waits on the
+old-token disposition. Epic issue:
 [#182](https://github.com/Rackbops/rackbops-discord-bot/issues/182). Children (in order):
 [#83](https://github.com/Rackbops/rackbops-discord-bot/issues/83),
 [#84](https://github.com/Rackbops/rackbops-discord-bot/issues/84),
