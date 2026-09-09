@@ -524,6 +524,20 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     }
   });
 
+  test("empty stdin (nothing submitted) is a no-op, not an 'unbound variable' crash (issue #135 item 13)", async () => {
+    // Guards the SUBMITTED/DIFF associative arrays staying genuinely empty end to end — the
+    // hand-kept n_submitted/n_diff counters this used to lean on are gone (item 13); this proves
+    // `${#SUBMITTED[@]}`/`${#DIFF[@]}` on a never-populated associative array behaves under
+    // `set -u`, not just that the JSON shape is right. Mutation: reintroducing either counter
+    // wrong (e.g. never zero-checked) would either crash under set -u or mis-skip this early
+    // return.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+  });
+
   test("submitting the stored value spelled differently (quotes, CR, export, duplicate) is a no-op", async () => {
     const stored = 'WOW_REALM="stormrage"\r\nexport WOW_REGION=eu\nBOT_BRANCH=main\nBOT_BRANCH=dev\n';
     const fx = wowSetup(stored);
