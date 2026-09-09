@@ -126,6 +126,19 @@ export interface CreatedIssue {
 }
 
 /**
+ * `text.slice(0, max)` bounds UTF-16 code units — the same unit Discord's content-length limit
+ * counts in — but can cut a surrogate pair (e.g. an emoji) in half, leaving a lone high surrogate
+ * at the end that mangles on the way out. Dropping that one trailing unit keeps the true
+ * ≤`max`-unit bound (round 2 of #189's review: an earlier fix switched to counting *code points*
+ * instead, which silently let an emoji-heavy body through roughly 2x over Discord's real cap).
+ */
+function sliceUtf16(text: string, max: number): string {
+  const cut = text.slice(0, max);
+  const lastUnit = cut.charCodeAt(cut.length - 1);
+  return lastUnit >= 0xd800 && lastUnit <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/**
  * Clamp raw upstream text before it's embedded in a thrown message: first line only (a GitHub
  * 5xx can answer with several KB of HTML), trimmed and capped to `max` chars with a `…` suffix on
  * truncation. Applied at every `res.text()` embed under `src/` that can end up in an `Error`
@@ -134,10 +147,7 @@ export interface CreatedIssue {
  */
 export function clampUpstreamBody(text: string, max = 300): string {
   const line = (text.split("\n")[0] ?? "").trim();
-  // Array.from splits by code point, not UTF-16 code unit, so a surrogate pair (e.g. an emoji)
-  // landing right at the cut can't be split into a lone surrogate that mangles on the way out.
-  const codePoints = Array.from(line);
-  return codePoints.length > max ? `${codePoints.slice(0, max).join("")}…` : line;
+  return line.length > max ? `${sliceUtf16(line, max)}…` : line;
 }
 
 /**
@@ -147,8 +157,7 @@ export function clampUpstreamBody(text: string, max = 300): string {
  * line of defense so *any* long message can't strand the interaction, not just an upstream one.
  */
 export function clampReply(text: string, max = 1900): string {
-  const codePoints = Array.from(text); // see clampUpstreamBody — avoids splitting a surrogate pair
-  return codePoints.length > max ? `${codePoints.slice(0, max).join("")}…` : text;
+  return text.length > max ? `${sliceUtf16(text, max)}…` : text;
 }
 
 function writeHeaders(): Record<string, string> {

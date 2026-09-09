@@ -56,9 +56,11 @@ describe("clampUpstreamBody", () => {
     expect(clampUpstreamBody(html)).toBe("<!doctype html>"); // fits whole — no truncation suffix
   });
 
-  // #189 review: text.slice(0, max) slices by UTF-16 code unit, so a non-BMP character (e.g. an
-  // emoji, which is a surrogate pair) landing exactly at the cut point would split it into a lone
-  // surrogate — garbling the trailing character once re-encoded. Array.from-based slicing avoids it.
+  // #189 review round 2: plain `text.slice(0, max)` slices by UTF-16 code unit, so a non-BMP
+  // character (e.g. an emoji, a surrogate pair) landing exactly at the cut point would split it
+  // into a lone surrogate — garbling the trailing character once re-encoded. `sliceUtf16` drops
+  // that one trailing unit instead. (A first attempt at this fix switched to counting *code
+  // points* instead of code units — see the next test for why that was itself a regression.)
   test("does not split a surrogate pair sitting right at the cut point", () => {
     const emoji = "\u{1F600}"; // U+1F600, a surrogate pair in UTF-16 (2 code units, 1 code point)
     const body = "x".repeat(299) + emoji + "y".repeat(10); // the pair straddles the 300-char cut
@@ -71,6 +73,16 @@ describe("clampUpstreamBody", () => {
         expect(clamped.charCodeAt(i + 1)).toBeLessThanOrEqual(0xdfff);
       }
     }
+    expect(clamped.endsWith("…")).toBe(true);
+  });
+
+  // THE regression this round exists to close: a code-point-counting cap lets an astral-heavy
+  // body (each character = 2 UTF-16 units, 1 code point) through at up to ~2x the real unit count
+  // Discord enforces — reintroducing #186's own bug through the fix meant to prevent it.
+  test("an emoji-heavy body is still bounded by UTF-16 units, not code points", () => {
+    const body = "\u{1F600}".repeat(500); // 500 code points, 1000 UTF-16 units — over the 300 cap
+    const clamped = clampUpstreamBody(body);
+    expect(clamped.length).toBeLessThanOrEqual(301); // UTF-16 length, the unit Discord counts in
     expect(clamped.endsWith("…")).toBe(true);
   });
 });
@@ -108,6 +120,16 @@ describe("clampReply", () => {
         expect(clamped.charCodeAt(i + 1)).toBeLessThanOrEqual(0xdfff);
       }
     }
+  });
+
+  // THE round-2 regression, pinned for clampReply too: a code-point-counting cap would let this
+  // through at ~3800 UTF-16 units — nearly double Discord's real 2000-char content limit — and
+  // reintroduce the exact "editReply throws, interaction left thinking" bug #186 exists to close.
+  test("an emoji-heavy message is still bounded by UTF-16 units, not code points", () => {
+    const text = "\u{1F600}".repeat(1900); // 1900 code points, 3800 UTF-16 units
+    const clamped = clampReply(text);
+    expect(clamped.length).toBeLessThanOrEqual(1901); // UTF-16 length, the unit Discord counts in
+    expect(clamped.endsWith("…")).toBe(true);
   });
 });
 
