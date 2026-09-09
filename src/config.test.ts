@@ -92,6 +92,16 @@ describe("report helpers", () => {
     expect(repoForProject("nope")).toBeUndefined();
   });
 
+  // #55/#186: REPORT_PROJECTS[project] on a plain object used to resolve these as truthy
+  // Object.prototype values, passing handleReportModal's `if (!repo)` fence. Mutation: reverting
+  // repoForProject to a bracket lookup must fail every case here.
+  test("ignores inherited Object.prototype keys", () => {
+    expect(repoForProject("constructor")).toBeUndefined();
+    expect(repoForProject("__proto__")).toBeUndefined();
+    expect(repoForProject("toString")).toBeUndefined();
+    expect(repoForProject("hasOwnProperty")).toBeUndefined();
+  });
+
   test("reportBody keeps the description and names the reporter", () => {
     const b = reportBody("it crashed on login", "alice");
     expect(b).toContain("it crashed on login");

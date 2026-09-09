@@ -37,9 +37,12 @@ export const REPORT_PROJECTS: Record<string, string> = {
   abm: "roshne/ActionBarMaster",
 };
 
-/** The GitHub repo a `/report` project token maps to, or undefined if unknown. */
+/** The GitHub repo a `/report` project token maps to, or undefined if unknown. Deliberately
+ * `Object.hasOwn` rather than a bracket lookup: `REPORT_PROJECTS[project]` on a plain object
+ * resolves inherited `Object.prototype` keys too, so `"constructor"`/`"__proto__"`/`"toString"`
+ * would return truthy values and pass `handleReportModal`'s `if (!repo)` fence (#55). */
 export function repoForProject(project: string): string | undefined {
-  return REPORT_PROJECTS[project];
+  return Object.hasOwn(REPORT_PROJECTS, project) ? REPORT_PROJECTS[project] : undefined;
 }
 
 type Env = Record<string, string | undefined>;

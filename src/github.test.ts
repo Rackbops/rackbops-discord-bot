@@ -4,9 +4,97 @@ import { afterEach, describe, expect, test } from "bun:test";
 // prime the required vars before pulling the module in — see config.test.ts.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { decideReleaseAnnouncements, fetchReleases, createReachabilityLog } = await import("./github");
+const { clampReply, clampUpstreamBody, createIssue, decideReleaseAnnouncements, fetchReleases, createReachabilityLog } =
+  await import("./github");
+const { config } = await import("./config");
 
 const rel = (id: number) => ({ id, name: `v${id}`, tag: `v${id}`, url: `https://x/${id}` });
+
+describe("clampUpstreamBody", () => {
+  test("passes short text through unchanged", () => {
+    expect(clampUpstreamBody("not found")).toBe("not found");
+  });
+
+  test("keeps only the first line", () => {
+    expect(clampUpstreamBody("line one\nline two\nline three")).toBe("line one");
+  });
+
+  test("trims surrounding whitespace on the first line", () => {
+    expect(clampUpstreamBody("  spaced out  \nrest")).toBe("spaced out");
+  });
+
+  test("caps at the default 300 chars and appends a truncation suffix", () => {
+    const body = "x".repeat(500);
+    const clamped = clampUpstreamBody(body);
+    expect(clamped.length).toBe(301); // 300 chars + the … suffix
+    expect(clamped.endsWith("…")).toBe(true);
+    expect(clamped.startsWith("x".repeat(300))).toBe(true);
+  });
+
+  test("respects a caller-supplied max", () => {
+    expect(clampUpstreamBody("x".repeat(50), 10)).toBe(`${"x".repeat(10)}…`);
+  });
+
+  test("text at exactly the limit is not truncated", () => {
+    const body = "x".repeat(300);
+    expect(clampUpstreamBody(body)).toBe(body);
+    expect(clampUpstreamBody(body).endsWith("…")).toBe(false);
+  });
+
+  test("a multi-KB HTML error page collapses to a short first line", () => {
+    const html = `<!doctype html>\n${"<div>filler</div>".repeat(500)}`; // several KB, no newline in line 1
+    const clamped = clampUpstreamBody(html);
+    expect(clamped.length).toBeLessThanOrEqual(301);
+  });
+});
+
+describe("clampReply", () => {
+  test("passes short text through unchanged", () => {
+    expect(clampReply("all good")).toBe("all good");
+  });
+
+  test("caps at the default 1900 chars and appends a truncation suffix", () => {
+    const text = "y".repeat(3000);
+    const clamped = clampReply(text);
+    expect(clamped.length).toBe(1901); // 1900 chars + the … suffix
+    expect(clamped.endsWith("…")).toBe(true);
+  });
+
+  test("text at exactly the limit is not truncated", () => {
+    const text = "y".repeat(1900);
+    expect(clampReply(text)).toBe(text);
+  });
+
+  test("respects a caller-supplied max", () => {
+    expect(clampReply("y".repeat(20), 5)).toBe(`${"y".repeat(5)}…`);
+  });
+});
+
+describe("createIssue — upstream body clamping (#55, #186)", () => {
+  const realFetch = globalThis.fetch;
+  const realToken = config.githubToken;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    config.githubToken = realToken;
+  });
+
+  // The mutation this guards: removing `clampUpstreamBody(...)` at github.ts's create-issue throw
+  // site lets a multi-KB GitHub error page straight into the thrown message, which is exactly what
+  // blows Discord's 2000-char editReply cap and strands the interaction (#55).
+  test("a 5 KB GitHub 502 body yields a thrown message well under 400 chars", async () => {
+    config.githubToken = "test-token";
+    const bigHtmlBody = `<html><body>Bad Gateway</body></html>${"x".repeat(5000)}`;
+    globalThis.fetch = (() => new Response(bigHtmlBody, { status: 502 })) as unknown as typeof fetch;
+    await expect(createIssue("owner/repo", "t", "b", [])).rejects.toThrow();
+    try {
+      await createIssue("owner/repo", "t", "b", []);
+    } catch (err) {
+      expect((err as Error).message.length).toBeLessThan(400);
+      expect((err as Error).message).toContain("GitHub create-issue failed: 502");
+      expect((err as Error).message).toContain("Bad Gateway");
+    }
+  });
+});
 
 describe("decideReleaseAnnouncements", () => {
   test("a never-polled repo (undefined) seeds silently — announces nothing, remembers all", () => {

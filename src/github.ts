@@ -125,6 +125,28 @@ export interface CreatedIssue {
   url: string;
 }
 
+/**
+ * Clamp raw upstream text before it's embedded in a thrown message: first line only (a GitHub
+ * 5xx can answer with several KB of HTML), trimmed and capped to `max` chars with a `…` suffix on
+ * truncation. Applied at every `res.text()` embed under `src/` that can end up in an `Error`
+ * message — without it, a long body blows Discord's 2000-char reply cap and `editReply` throws,
+ * leaving the interaction "thinking" until the token expires (#55, #186).
+ */
+export function clampUpstreamBody(text: string, max = 300): string {
+  const line = (text.split("\n")[0] ?? "").trim();
+  return line.length > max ? `${line.slice(0, max)}…` : line;
+}
+
+/**
+ * Defensive clamp for anything about to go into an `editReply` failure path. `clampUpstreamBody`
+ * already bounds what an upstream body contributes to an `Error.message`, but a failure message
+ * can carry other text too (a thrown validation error, a stack-free JS error) — this is the last
+ * line of defense so *any* long message can't strand the interaction, not just an upstream one.
+ */
+export function clampReply(text: string, max = 1900): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
 function writeHeaders(): Record<string, string> {
   if (!config.githubToken) throw new Error("GITHUB_TOKEN is not set — cannot write to GitHub");
   return {
@@ -152,7 +174,7 @@ export async function createIssue(
     body: JSON.stringify({ title, body, labels }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!res.ok) throw new Error(`GitHub create-issue failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`GitHub create-issue failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
   const data = (await res.json()) as { number: number; html_url: string };
   return { number: data.number, url: data.html_url };
 }

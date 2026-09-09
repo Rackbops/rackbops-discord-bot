@@ -5,6 +5,7 @@ import {
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { config, REPORT_PROJECTS } from "./config";
+import { clampReply } from "./github";
 import { handleReportCommand } from "./report";
 import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./update";
 import { withCritical, requestRestart } from "./restart";
@@ -137,7 +138,7 @@ export async function handleCommand(
             updateReply(decision, latestSha, { runningSha: config.gitSha, reason, redeploy }),
           );
         } catch (err) {
-          await interaction.editReply(`⚠️ Update check failed: ${(err as Error).message}`);
+          await interaction.editReply(clampReply(`⚠️ Update check failed: ${(err as Error).message}`));
         }
       });
       return;
@@ -175,7 +176,7 @@ export async function handleCommand(
         } catch (err) {
           // Match the /update deferred convention: a failure edits the deferred reply with an
           // error rather than leaving the admin's "thinking…" hanging.
-          await interaction.editReply(`⚠️ Couldn't list plugins: ${(err as Error).message}`);
+          await interaction.editReply(clampReply(`⚠️ Couldn't list plugins: ${(err as Error).message}`));
         }
         return;
       }
@@ -259,7 +260,7 @@ export async function handleCommand(
           await interaction.editReply(result.reply);
         }
       } catch (err) {
-        await interaction.editReply(`⚠️ Couldn't act on the plugin: ${(err as Error).message}`);
+        await interaction.editReply(clampReply(`⚠️ Couldn't act on the plugin: ${(err as Error).message}`));
       }
       return;
     }

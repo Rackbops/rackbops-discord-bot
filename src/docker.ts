@@ -7,6 +7,8 @@
 // then answers with its own current version, so this doesn't break against an older or newer
 // Docker than whichever one it was written on.
 
+import { clampUpstreamBody } from "./github";
+
 const SOCKET = "/var/run/docker.sock";
 const BASE = "http://docker";
 
@@ -97,7 +99,7 @@ async function api(path: string, signal: AbortSignal, init: RequestInit = {}): P
 async function ok(path: string, signal: AbortSignal, init: RequestInit = {}): Promise<Response> {
   const res = await api(path, signal, init);
   if (!res.ok) {
-    throw new Error(`docker ${init.method ?? "GET"} ${path} failed: ${res.status} ${await res.text()}`);
+    throw new Error(`docker ${init.method ?? "GET"} ${path} failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
   }
   return res;
 }
@@ -249,7 +251,7 @@ export async function stopContainer(id: string, timeoutSec = 10, timeoutMs = DEF
     const res = await api(`/containers/${encodeURIComponent(id)}/stop?${params}`, s, { method: "POST" });
     // 304 = already stopped, 404 = already gone. Both are the state we wanted.
     if (!res.ok && res.status !== 304 && res.status !== 404) {
-      throw new Error(`docker stop ${id} failed: ${res.status} ${await res.text()}`);
+      throw new Error(`docker stop ${id} failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
     }
   });
 }
@@ -259,7 +261,7 @@ export async function removeContainer(id: string, force = false, timeoutMs = DEF
   await bounded(timeoutMs, `rm ${id}`, async (s) => {
     const res = await api(`/containers/${encodeURIComponent(id)}?${params}`, s, { method: "DELETE" });
     if (!res.ok && res.status !== 404) {
-      throw new Error(`docker rm ${id} failed: ${res.status} ${await res.text()}`);
+      throw new Error(`docker rm ${id} failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
     }
   });
 }

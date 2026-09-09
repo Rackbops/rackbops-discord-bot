@@ -614,9 +614,15 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   before the first `await` and released in `finally`, closes that window:
   two calls fired back-to-back (no `await` between them) can never both observe it as false.
 - **`/report`** (`src/report.ts`) is disabled unless BOTH `REPORT_ROLE_ID` and `GITHUB_TOKEN`
-  are set (it replies "not configured" otherwise). `project` is a fixed choices list, so an
-  unknown project can't reach the handler; the modal `customId` (`report:<project>`) carries the
-  selection to the submit handler. `ensureLabel` treats HTTP 422 (label already exists) as success,
+  are set (it replies "not configured" otherwise). `project` is a fixed choices list, so
+  `handleReportCommand` only ever builds a modal `customId` (`report:<project>`) for a real
+  project — but the submit handler can't lean on that alone (a forged `modal_submit` interaction
+  can carry any `customId`), so `handleReportModal` looks the project up via
+  `config.ts`'s `repoForProject`, which uses `Object.hasOwn` rather than a bracket lookup: on a
+  plain object, `REPORT_PROJECTS[project]` resolves inherited `Object.prototype` keys too, so
+  `"constructor"`/`"__proto__"`/`"toString"` returned truthy and reached `createIssue` before this
+  fix (#55, #186). With the fence closed, an unknown project genuinely can't reach the handler —
+  it's refused at `if (!repo)` instead. `ensureLabel` treats HTTP 422 (label already exists) as success,
   so `/report` never fails on a missing `automated` label — it creates it on first use. Role check
   reads `member.roles` from the interaction payload (cached manager **or** raw `string[]`), so no
   privileged Members intent is needed.
@@ -626,10 +632,14 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   confirmation *is* the announcement, so there's no second message and no channel config. The three
   pre-flight refusals stay ephemeral on purpose: an unconfigured bot, a missing role, and an unknown
   project are the reporter's own business, not something the channel needs. Two consequences of
-  going public: the send passes `allowedMentions: { parse: [] }`, because the description is
-  now untrusted free text in a public message and an `@everyone` typed into the modal would
-  otherwise fire; and the message is clamped to 2000 chars by `reportAnnouncement`, since the
-  modal's Description field is unbounded and Discord rejects an over-long send outright.
+  going public, and both apply to **either** outcome the edit can carry — the success confirmation
+  and the failure message that replaces it: the send passes `allowedMentions: { parse: [] }`,
+  because the description is now untrusted free text in a public message and an `@everyone` typed
+  into the modal would otherwise fire; and the content is clamped before it reaches `editReply` —
+  `reportAnnouncement` clamps the success case to 2000 chars (the modal's Description field is
+  unbounded), and the failure case runs the thrown `Error.message` through `clampReply` (`github.ts`),
+  since it can embed an upstream body already bounded by `clampUpstreamBody` at the GitHub call site
+  but the defensive clamp catches anything else that ends up in `err.message` too (#55, #186).
 - `config.ts` reads env at import time (the `config` singleton) — tests/scripts must set
   `DISCORD_TOKEN` and `ANNOUNCE_CHANNEL_ID` **before** importing any module that imports it
   (see `config.test.ts`: env vars + dynamic import). Config *logic* is testable without env

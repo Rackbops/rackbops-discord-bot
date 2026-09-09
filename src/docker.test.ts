@@ -384,4 +384,18 @@ describe("daemon calls", () => {
     stub(() => new Response("boom", { status: 500 }));
     await expect(removeContainer("abc")).rejects.toThrow("docker rm abc failed: 500");
   });
+
+  // Same class of bug as GitHub's create-issue throw (#55, #186): a docker daemon error body can
+  // reach /update's reply through checkForUpdate/redeploy, so it gets the same clamp at the throw
+  // site. Mutation: dropping `clampUpstreamBody(...)` here lets the raw body straight through.
+  test("a large docker error body is clamped in the thrown message", async () => {
+    stub(() => new Response("x".repeat(5000), { status: 500 }));
+    try {
+      await stopContainer("abc");
+      throw new Error("expected stopContainer to reject");
+    } catch (err) {
+      expect((err as Error).message.length).toBeLessThan(400);
+      expect((err as Error).message).toContain("docker stop abc failed: 500");
+    }
+  });
 });

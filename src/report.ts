@@ -8,7 +8,7 @@ import {
   type ModalSubmitInteraction,
 } from "discord.js";
 import { config, repoForProject } from "./config";
-import { createIssue, ensureLabel } from "./github";
+import { clampReply, createIssue, ensureLabel } from "./github";
 
 const REPORT_LABEL = "automated";
 const MODAL_PREFIX = "report:"; // modal customId = report:<project>
@@ -109,6 +109,12 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
  *
  * `allowedMentions: { parse: [] }` because the description is now free text on its way into a
  * public message — an `@everyone` typed into the modal must render as text, not fire.
+ *
+ * No `hasReportRole` re-check here (#55): Discord scopes a modal submission to the interaction
+ * that showed it, so a member can't submit a modal `/report` popped for someone else — the gate
+ * in `handleReportCommand` above is the only enforcement point that can actually be reached, and
+ * it stays sufficient. A role revoked in the (typically seconds-long) window between showing the
+ * modal and submitting it is an accepted, pre-existing race, not introduced or fixed here.
  */
 export async function handleReportModal(interaction: ModalSubmitInteraction): Promise<void> {
   const project = interaction.customId.slice(MODAL_PREFIX.length);
@@ -130,6 +136,9 @@ export async function handleReportModal(interaction: ModalSubmitInteraction): Pr
       allowedMentions: { parse: [] },
     });
   } catch (err) {
-    await interaction.editReply(`⚠️ Couldn't file the issue: ${(err as Error).message}`);
+    await interaction.editReply({
+      content: clampReply(`⚠️ Couldn't file the issue: ${(err as Error).message}`),
+      allowedMentions: { parse: [] },
+    });
   }
 }
