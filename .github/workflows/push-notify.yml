@@ -56,7 +56,7 @@ jobs:
     # reintroduce a mutable ref and undo the point of this pin.
     #
     # The pinned commit is byte-identical, for this file, to the 2026-09-02 state.
-    uses: roshne/addon-ci/.github/workflows/push-notify.yml@16bd2f5b8a17f4aa1e50efc15541fc207bf78ddc # main
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@3b4efc86043134ee5564d58941717e54b12b5305 # main
     # The called workflow needs no GITHUB_TOKEN at all: it checks nothing out, calls no GitHub
     # API, and only reads `github.event.*` before curling Discord (verified at the pinned commit).
     # A called workflow inherits the caller job's permissions and can only reduce them, so an empty
