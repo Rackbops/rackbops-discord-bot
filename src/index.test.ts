@@ -81,4 +81,31 @@ describe("index.ts wiring", () => {
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });
+
+  // #154: the first (and only) signal handler in this codebase. Registered before resolveBootMode
+  // so even a standby stopped mid-verify (nothing has started yet — trivially idle) drains cleanly,
+  // rather than the daemon's SIGKILL being the first thing that ever touches it.
+  test("registers SIGTERM and SIGINT handlers before resolveBootMode is called (#154)", () => {
+    const sigterm = source.indexOf('process.on("SIGTERM"');
+    const sigint = source.indexOf('process.on("SIGINT"');
+    const resolveBootModeCall = source.indexOf("await resolveBootMode(");
+    expect(sigterm).toBeGreaterThan(-1);
+    expect(sigint).toBeGreaterThan(-1);
+    expect(resolveBootModeCall).toBeGreaterThan(-1);
+    expect(sigterm).toBeLessThan(resolveBootModeCall);
+    expect(sigint).toBeLessThan(resolveBootModeCall);
+  });
+
+  // Both signals must share the exact same handler instance (createShutdownHandler called once) —
+  // two separately-built handlers would each hold their own `draining` flag, so a SIGTERM then a
+  // SIGINT would wrongly start a second, independent drain instead of being recognised as "already
+  // draining, exit now."
+  test("both signals are registered against the SAME handler instance, not two separately-built ones", () => {
+    const createCalls = (source.match(/createShutdownHandler\(/g) ?? []).length;
+    expect(createCalls).toBe(1);
+    const handlerVar = source.match(/const (\w+) = createShutdownHandler\(/)?.[1];
+    expect(handlerVar).toBeTruthy();
+    expect(source).toMatch(new RegExp(`process\\.on\\("SIGTERM",\\s*${handlerVar}\\)`));
+    expect(source).toMatch(new RegExp(`process\\.on\\("SIGINT",\\s*${handlerVar}\\)`));
+  });
 });

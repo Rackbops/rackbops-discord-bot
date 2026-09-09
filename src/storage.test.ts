@@ -104,4 +104,26 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     expect(typeof parsed.n).toBe("number");
   });
+
+  // #154: writeJsonAtomic's temp name used to be fixed (`${path}.tmp`), safe only because every
+  // IN-PROCESS caller goes through createJsonWriter/createKeyedJsonMutator above — neither of which
+  // helps two DIFFERENT processes racing the same path, which the handoff overlap genuinely does
+  // (the replacement's boot-time loadPluginIndex cache write vs. the original's still-running
+  // pluginUpdates tick re-fetching the same manifest). `writeJsonAtomic` itself doesn't serialize —
+  // this drives two direct, unserialized, "concurrent process" calls to prove the temp names no longer
+  // collide: both writes land whole, and neither rename throws ENOENT reaching for a temp file the
+  // other call already consumed.
+  test("two concurrent, UNSERIALIZED writeJsonAtomic calls to the same path both land a whole file, never ENOENT", async () => {
+    const file = join(dir, "concurrent.json");
+    // Deliberately NOT through createJsonWriter — this is exactly the cross-process shape neither
+    // in-process serializer can help with; writeJsonAtomic's own temp-name uniqueness is what must
+    // carry this, not caller-side serialization.
+    const results = await Promise.allSettled([
+      writeJsonAtomic(file, { writer: "a" }),
+      writeJsonAtomic(file, { writer: "b" }),
+    ]);
+    for (const r of results) expect(r.status).toBe("fulfilled"); // neither rename failed with ENOENT
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    expect(["a", "b"]).toContain(parsed.writer); // last-rename-wins is fine; a torn/missing file is not
+  });
 });

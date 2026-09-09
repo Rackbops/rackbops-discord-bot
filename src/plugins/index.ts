@@ -40,9 +40,23 @@ async function defaultReadFile(path: string): Promise<string | undefined> {
   return file.text();
 }
 
-async function defaultWriteFile(path: string, data: string): Promise<void> {
+// #154: same per-process-unique temp name as src/storage.ts's writeJsonAtomic, and for the same
+// reason — this is the write site that motivated the fix. The replacement writes this exact cache
+// file at boot (loadPluginIndex below, called from index.ts before takeOver, so before the "the
+// standby writes nothing until it has taken over" invariant state.json relies on applies here) at
+// the same time the ORIGINAL's own pluginUpdates tick can independently re-fetch and re-cache the
+// same manifest — two processes, same path, the fixed `${path}.tmp` this used to write let either
+// process's rename fail out from under the other. Kept as its own copy rather than importing
+// src/storage.ts (see this file's header comment) — the two must be kept in sync by hand.
+let tmpCounter = 0;
+
+/** Exported (only) so storage.test.ts-style direct concurrent-call tests can drive it without the
+ *  extra async work (fetch, response parsing, validation) `loadPluginIndex` does first — that
+ *  work desynchronizes two top-level `loadPluginIndex` calls enough that their writes rarely
+ *  genuinely overlap, unlike two direct back-to-back calls to this function. */
+export async function defaultWriteFile(path: string, data: string): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.${++tmpCounter}.tmp`;
   await Bun.write(tmp, data);
   renameSync(tmp, path);
 }

@@ -14,6 +14,8 @@ import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
+import { awaitCriticalIdle, beginShutdown } from "./restart";
+import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
@@ -50,6 +52,23 @@ console.log(
 );
 
 const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
+
+// #154: the first (and only) signal handler in this codebase, registered before resolveBootMode's
+// own daemon call below so even a standby stopped mid-verify drains cleanly (trivially idle —
+// nothing has started yet). destroyClient closes over `client`, which exists by now even though
+// login hasn't happened — destroying a not-yet-logged-in Client is safe. Both signals share the
+// SAME handler instance (see shutdown.ts's own comment on why that matters for a repeat signal).
+const shutdownHandler = createShutdownHandler({
+  beginShutdown,
+  awaitIdle: awaitCriticalIdle,
+  destroyClient: () => client.destroy(),
+  exit: (code) => process.exit(code),
+  log: console,
+  graceMs: SHUTDOWN_GRACE_MS,
+});
+process.on("SIGTERM", shutdownHandler);
+process.on("SIGINT", shutdownHandler);
+
 // A daemon call only happens here when the env actually says standby (#46) — an ordinary boot
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);

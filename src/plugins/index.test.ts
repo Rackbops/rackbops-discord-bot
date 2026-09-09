@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadPluginIndex } from "./index";
+import { defaultWriteFile, loadPluginIndex } from "./index";
 import type { PluginIndex } from "./contract";
 
 const VALID_INDEX: PluginIndex = {
@@ -206,5 +206,40 @@ describe("loadPluginIndex", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  // #154: two DIRECT, back-to-back calls (mirrors storage.test.ts's own equivalent test for
+  // writeJsonAtomic) — deterministic, unlike going through loadPluginIndex itself, where the
+  // extra async work (fetch, parsing, validation) ahead of the write desynchronizes two top-level
+  // calls enough that their writes rarely genuinely overlap. This is the real, actual mutation
+  // guard for the per-process-unique temp name; the integration test below it proves the real
+  // wiring reaches this function, not that the race is caught deterministically through it.
+  test("two concurrent, unserialized defaultWriteFile calls to the same path both land a whole file, never ENOENT", async () => {
+    const results = await Promise.allSettled([
+      defaultWriteFile(cachePath, JSON.stringify({ writtenAt: "a", index: VALID_INDEX })),
+      defaultWriteFile(cachePath, JSON.stringify({ writtenAt: "b", index: VALID_INDEX })),
+    ]);
+    for (const r of results) expect(r.status).toBe("fulfilled"); // neither rename failed with ENOENT
+    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+    expect(["a", "b"]).toContain(cached.writtenAt); // last-rename-wins is fine; a torn/missing file is not
+  });
+
+  // The concrete scenario that motivated the fix, end to end: the replacement's boot-time
+  // loadPluginIndex call and the original's still-running pluginUpdates tick both re-caching this
+  // exact file during a handoff. Uses the REAL default writeFile (only `fetch` is overridden), so
+  // this is an integration proof that the real wiring reaches defaultWriteFile above — not itself
+  // a reliable mutation guard for the race (see that test's own comment for why).
+  test("two concurrent loadPluginIndex calls both writing the real cache file still return the right index", async () => {
+    const fetch = async () => jsonResponse(VALID_INDEX);
+    const results = await Promise.allSettled([
+      loadPluginIndex("https://example/plugins.json", dir, { fetch }),
+      loadPluginIndex("https://example/plugins.json", dir, { fetch }),
+    ]);
+    for (const r of results) {
+      expect(r.status).toBe("fulfilled");
+      if (r.status === "fulfilled") expect(r.value).toEqual({ index: VALID_INDEX, source: "fresh" });
+    }
+    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+    expect(cached.index).toEqual(VALID_INDEX);
   });
 });
