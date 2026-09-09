@@ -187,9 +187,14 @@ describe.skipIf(!runnable)("admin's BOT_OPS_PROJECT/BOT_OPS_CONTAINER resolve em
     const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
     const { exitCode, json } = await composeConfig(dir, { COMPOSE_PROFILES: "admin" });
     expect(exitCode).toBe(0);
-    expect(json!.services.admin).toBeTruthy();
+    // Asserted on the two forwarded env values specifically, NOT the whole service object —
+    // admin's own `container_name` legitimately resolves to `warbandeer-discord-admin` (the
+    // deliberate local-dev default the test above pins), so a blanket "doesn't contain
+    // warbandeer-discord" over the whole service false-positives on that unrelated field.
     // Mutation: reverting either default back to `:-warbandeer-discord*` turns this red.
-    expect(JSON.stringify(json!.services.admin)).not.toContain("warbandeer-discord");
+    const env = (json!.services.admin as { environment?: Record<string, string> }).environment;
+    expect(env?.BOT_OPS_PROJECT).toBe("");
+    expect(env?.BOT_OPS_CONTAINER).toBe("");
   });
 });
 
