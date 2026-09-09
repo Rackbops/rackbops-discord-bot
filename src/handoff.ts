@@ -10,7 +10,7 @@
 // never touched by two writers at once.
 
 import { join } from "node:path";
-import { DATA_DIR } from "./storage";
+import { DATA_DIR, shortSha } from "./storage";
 
 /** Set on the replacement only. Its presence *is* the instruction to boot in standby. */
 export const HANDOFF_FROM_ENV = "HANDOFF_FROM";
@@ -135,7 +135,7 @@ export function handoffFailureMessage(outcome: "failed" | "timeout" | "stalled",
   targetSha: string;
   error?: string;
 }): string {
-  const short = o.targetSha.slice(0, 7);
+  const short = shortSha(o.targetSha);
   if (outcome === "timeout") {
     return (
       `⚠️ The replacement for \`${short}\` never reported in within ` +

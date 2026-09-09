@@ -20,6 +20,7 @@ const {
 } = await import("./redeploy");
 const { clearMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV } = await import("./handoff");
 const { handoffActive, restartPending, resetForTest } = await import("./restart");
+const { SHORT_SHA_LEN } = await import("./storage");
 
 const SELF_ID = "a".repeat(64);
 const SELF_SHORT_ID = SELF_ID.slice(0, 12);
@@ -151,6 +152,21 @@ describe("selectImagesToPrune", () => {
       0,
     );
     expect(pruned).toEqual(["registry.example.com/bot:2222222"]);
+  });
+
+  // #132: shaTag's tag width and this function's tag-shape regex must never drift apart — a
+  // hand-written same-width fixture (the tests above) would stay green even if they did, since
+  // both sides would just happen to agree at test-writing time. Driving a REAL shaTag() output
+  // through selectImagesToPrune closes that gap: if shaTag's width ever moves independently of
+  // SHORT_SHA_LEN (or the regex is ever hand-written back to a literal {7}), this fails because
+  // the produced tag's length no longer matches what the regex expects.
+  test("a real shaTag() output is recognized as prunable — the shaTag/regex coupling", () => {
+    const repo = "warbandeer-discord-debug-bot";
+    const currentImage = `${repo}:latest`;
+    const tag = shaTag(currentImage, "abcdef1234567890");
+    expect(tag).toBe(`${repo}:${"abcdef1234567890".slice(0, SHORT_SHA_LEN)}`);
+    const pruned = selectImagesToPrune([img([tag], 1), img([`${repo}:latest`], 2)], currentImage, 0);
+    expect(pruned).toContain(tag);
   });
 });
 

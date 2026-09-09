@@ -2,6 +2,21 @@ import { mkdirSync, renameSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
 /**
+ * #132: the width every short-sha site (`shaTag`, log lines, update/handoff messages) agrees on.
+ * `redeploy.ts`'s `selectImagesToPrune` rebuilds its tag-shape regex from this constant so the two
+ * can never drift apart again — see its own comment for the failure mode that made this necessary.
+ */
+export const SHORT_SHA_LEN = 7;
+
+/** The short form of a git sha used in logs, messages and image tags — always `SHORT_SHA_LEN`
+ *  characters. A config-free leaf (this module imports only `node:*`) so `handoff.ts` can use it
+ *  without pulling in `./config`, which it must stay free of (it runs before config is guaranteed
+ *  resolved during a handoff). */
+export function shortSha(sha: string): string {
+  return sha.slice(0, SHORT_SHA_LEN);
+}
+
+/**
  * Resolve the one `data/` directory. Defaults to `<repo>/data` (`/app/data` in the image); a
  * `BOT_DATA_DIR` override relocates it wholesale.
  *

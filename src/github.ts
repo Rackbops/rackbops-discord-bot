@@ -46,13 +46,8 @@ export interface Release {
  * no releases answers 200 with `[]`, so it never reaches the 404 path.
  */
 export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<Release[] | null> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "User-Agent": "rackbops-discord-bot",
-  };
-  if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
   const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=15`, {
-    headers,
+    headers: githubHeaders(),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (res.status === 404) return null;
@@ -160,14 +155,27 @@ export function clampReply(text: string, max = 1900): string {
   return text.length > max ? `${sliceUtf16(text, max)}…` : text;
 }
 
-function writeHeaders(): Record<string, string> {
-  if (!config.githubToken) throw new Error("GITHUB_TOKEN is not set — cannot write to GitHub");
-  return {
+/**
+ * #132: the one place every GitHub request-header shape in this repo's `src/` is assembled
+ * (`update.ts`'s `fetchLatestBotSha`/`fetchShaRelation` call this directly -- update.ts's own
+ * former `apiHeaders` wrapper is gone, folded into this function). Default (read) is
+ * Accept + User-Agent, plus `Authorization` when a token is configured -- reading is fine
+ * unauthenticated, just rate-limited harder. `{ write: true }` additionally REQUIRES a token
+ * (this repo's only write paths, `createIssue`/`ensureLabel`, need `repo`/`issues:write` scope) and
+ * adds `Content-Type`. `ops/admin/server.ts`'s own copies are a separate package with a different
+ * User-Agent (`rackbops-admin-panel`) -- deliberately not consolidated with this one.
+ */
+export function githubHeaders(opts?: { write?: boolean }): Record<string, string> {
+  const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
     "User-Agent": "rackbops-discord-bot",
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${config.githubToken}`,
   };
+  if (opts?.write) {
+    if (!config.githubToken) throw new Error("GITHUB_TOKEN is not set — cannot write to GitHub");
+    headers["Content-Type"] = "application/json";
+  }
+  if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
+  return headers;
 }
 
 /** Create a GitHub issue. Requires GITHUB_TOKEN with issues:write on `repo`. */
@@ -183,7 +191,7 @@ export async function createIssue(
   // user's interaction dead with no follow-up, and the worst case is 2x the timeout.
   const res = await fetch(`https://api.github.com/repos/${repo}/issues`, {
     method: "POST",
-    headers: writeHeaders(),
+    headers: githubHeaders({ write: true }),
     body: JSON.stringify({ title, body, labels }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -198,7 +206,7 @@ export async function ensureLabel(repo: string, name: string, timeoutMs = GITHUB
   if (!config.githubToken) return;
   const res = await fetch(`https://api.github.com/repos/${repo}/labels`, {
     method: "POST",
-    headers: writeHeaders(),
+    headers: githubHeaders({ write: true }),
     body: JSON.stringify({ name, color: "ededed" }),
     signal: AbortSignal.timeout(timeoutMs),
   });

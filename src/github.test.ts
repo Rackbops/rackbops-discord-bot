@@ -4,8 +4,15 @@ import { afterEach, describe, expect, test } from "bun:test";
 // prime the required vars before pulling the module in — see config.test.ts.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
-const { clampReply, clampUpstreamBody, createIssue, decideReleaseAnnouncements, fetchReleases, createReachabilityLog } =
-  await import("./github");
+const {
+  clampReply,
+  clampUpstreamBody,
+  createIssue,
+  decideReleaseAnnouncements,
+  fetchReleases,
+  createReachabilityLog,
+  githubHeaders,
+} = await import("./github");
 const { config } = await import("./config");
 
 const rel = (id: number) => ({ id, name: `v${id}`, tag: `v${id}`, url: `https://x/${id}` });
@@ -130,6 +137,45 @@ describe("clampReply", () => {
     const clamped = clampReply(text);
     expect(clamped.length).toBeLessThanOrEqual(1901); // UTF-16 length, the unit Discord counts in
     expect(clamped.endsWith("…")).toBe(true);
+  });
+});
+
+// #132: the one place every GitHub request-header shape is assembled — update.ts's read-only
+// apiHeaders and this file's own fetchReleases/createIssue/ensureLabel all route through this.
+describe("githubHeaders", () => {
+  const realToken = config.githubToken;
+  afterEach(() => {
+    config.githubToken = realToken;
+  });
+
+  test("read headers (default) omit Authorization when no token is configured", () => {
+    config.githubToken = "";
+    const headers = githubHeaders();
+    expect(headers.Accept).toBe("application/vnd.github+json");
+    expect(headers["User-Agent"]).toBe("rackbops-discord-bot");
+    expect(headers.Authorization).toBeUndefined();
+    expect(headers["Content-Type"]).toBeUndefined();
+  });
+
+  test("read headers include Authorization when a token is configured", () => {
+    config.githubToken = "test-token";
+    expect(githubHeaders().Authorization).toBe("Bearer test-token");
+  });
+
+  // The exact wording matters: this string is what an admin actually sees when a /report create-issue
+  // or ensureLabel call fails for a missing token — changing it silently would be a real regression.
+  test("write headers throw the exact message when no token is configured", () => {
+    config.githubToken = "";
+    expect(() => githubHeaders({ write: true })).toThrow("GITHUB_TOKEN is not set — cannot write to GitHub");
+  });
+
+  test("write headers add Content-Type and Authorization when a token is configured", () => {
+    config.githubToken = "test-token";
+    const headers = githubHeaders({ write: true });
+    expect(headers["Content-Type"]).toBe("application/json");
+    expect(headers.Authorization).toBe("Bearer test-token");
+    expect(headers.Accept).toBe("application/vnd.github+json");
+    expect(headers["User-Agent"]).toBe("rackbops-discord-bot");
   });
 });
 
