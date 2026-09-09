@@ -52,6 +52,25 @@ describe("selectPlugins", () => {
     expect(result[0]!.skipped).toBe('command "plugins" collides with the core command');
   });
 
+  // #185: a plugin literally named "report" would take over the "report:" interaction-routing
+  // prefix core's own report modal already owns (src/report.ts's MODAL_PREFIX) -- refused even
+  // when its OWN commands don't collide with anything, since it's the plugin's NAME (not its
+  // commands) that becomes the routing prefix.
+  test("a plugin named after a reserved core command is skipped, even with non-colliding commands", () => {
+    const idx = index([entry({ name: "report", commands: ["totally-unrelated"] })]);
+    const result = selectPlugins(idx, [{ name: "report" }], 1, CORE_COMMANDS);
+    expect(result[0]!.skipped).toBe(
+      'plugin name "report" collides with the core command "report" — its interaction-routing prefix "report:" is reserved',
+    );
+    expect(result[0]!.entry).toBe(idx.plugins[0]);
+  });
+
+  test("a plugin NOT named after a reserved core command is unaffected by this guard", () => {
+    const idx = index([entry({ name: "warbandeer", commands: ["link"] })]);
+    const result = selectPlugins(idx, [{ name: "warbandeer" }], 1, CORE_COMMANDS);
+    expect(result[0]!.skipped).toBeUndefined();
+  });
+
   test("a command colliding with an earlier-selected plugin is skipped, naming that plugin", () => {
     const idx = index([entry({ name: "first", commands: ["hello"] }), entry({ name: "second", commands: ["hello"] })]);
     const result = selectPlugins(idx, [{ name: "first" }, { name: "second" }], 1, CORE_COMMANDS);

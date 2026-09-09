@@ -2,7 +2,13 @@
 // data/plugins/state.json. Everything here is pure/DI'd (importer, makeHost, storage, log injected)
 // so host.test.ts drives it with fake bundles and a temp dir, no discord.js Client and no network.
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
-import { SlashCommandBuilder, type RESTPostAPIChatInputApplicationCommandsJSONBody } from "discord.js";
+import {
+  MessageFlags,
+  SlashCommandBuilder,
+  type MessageComponentInteraction,
+  type ModalSubmitInteraction,
+  type RESTPostAPIChatInputApplicationCommandsJSONBody,
+} from "discord.js";
 import { commandNamer } from "../commandNaming";
 import { createKeyedJsonMutator } from "../storage";
 import type {
@@ -244,6 +250,54 @@ export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseL
       }
     }),
   );
+}
+
+/**
+ * #185: which plugin (by name) a component/modal `customId` belongs to, by an exact split on the
+ * FIRST colon — plugin names are `^[a-z][a-z0-9-]*$` (no colon can appear in one), so the
+ * longest-name-wins ambiguity a generic prefix scheme would need to resolve never arises; a plain
+ * split is exact. `undefined` for no colon at all, or a prefix that doesn't match any of `names`.
+ */
+export function routeInteractionByPrefix(customId: string, names: readonly string[]): string | undefined {
+  const i = customId.indexOf(":");
+  if (i === -1) return undefined;
+  const prefix = customId.slice(0, i);
+  return names.includes(prefix) ? prefix : undefined;
+}
+
+/**
+ * Routes one component/modal interaction to the plugin its `customId` names, if any — called from
+ * index.ts's InteractionCreate handler AFTER the core `report:` modal check, so that reserved
+ * prefix never reaches here regardless of what plugins are installed. Dispatches ONLY to a
+ * `running` plugin (activate() already resolved) that actually declared `interactions`; prefix
+ * resolution itself runs over every LOADED plugin (not just running ones) so a match against a
+ * not-yet-running plugin is deliberately blocked by this running check, not silently absent from
+ * routing. A throwing handler is isolated — logged as "[plugins] <name> interaction failed" — and
+ * the caller gets a best-effort ephemeral "something went wrong" reply, sent only if the plugin
+ * hadn't already replied/deferred (a plugin that started its own reply flow keeps ownership of it).
+ * Returns whether a plugin actually claimed this interaction, so the caller can tell that apart
+ * from "no plugin's prefix matched."
+ */
+export async function dispatchPluginInteraction(
+  loaded: readonly LoadedPlugin[],
+  interaction: MessageComponentInteraction | ModalSubmitInteraction,
+  log: BaseLog,
+): Promise<boolean> {
+  const routedName = routeInteractionByPrefix(
+    interaction.customId,
+    loaded.map((lp) => lp.entry.name),
+  );
+  const lp = routedName ? loaded.find((l) => l.entry.name === routedName) : undefined;
+  if (!lp?.running || !lp.plugin.interactions) return false;
+  try {
+    await lp.plugin.interactions(interaction);
+  } catch (err) {
+    log.error(`[plugins] ${lp.entry.name} interaction failed`, err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+  }
+  return true;
 }
 
 const STATE_FRESH: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };

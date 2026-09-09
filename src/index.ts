@@ -27,6 +27,7 @@ import {
   activatePlugins,
   buildCommandBody,
   createHostApi,
+  dispatchPluginInteraction,
   disposePlugins,
   loadPlugins,
   mutatePluginState,
@@ -161,6 +162,10 @@ async function activate(c: Client<true>): Promise<void> {
         await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
         await handleReportModal(interaction);
+      } else if (interaction.isMessageComponent() || interaction.isModalSubmit()) {
+        // #185: core's report: modal check above always wins that prefix, regardless of what
+        // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
+        await dispatchPluginInteraction(loadResult.loaded, interaction, console);
       }
     } catch (err) {
       console.error("[interaction]", err);
