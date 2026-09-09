@@ -18,6 +18,7 @@ const {
   buildCommandBody,
   pluginTicks,
   activatePlugins,
+  disposePlugins,
   buildPluginStateFile,
   readPluginState,
   writePluginState,
@@ -362,6 +363,102 @@ describe("dispatchPluginInteraction", () => {
     // NAME (routing doesn't require `interactions` to exist) but is safely dropped, not thrown.
     const claimed = await dispatchPluginInteraction(loadedPlugins, fakeInteraction("warbandeer:link-confirm"), log);
     expect(claimed).toBe(false);
+  });
+});
+
+describe("disposePlugins (#184)", () => {
+  test("calls dispose only for running plugins, and flips running=false for each it disposes", async () => {
+    const { log } = makeLog();
+    const disposed: string[] = [];
+    const running = loaded(entry({ name: "running" }), { dispose: async () => { disposed.push("running"); } }, true);
+    const notRunning = loaded(entry({ name: "not-running" }), { dispose: async () => { disposed.push("not-running"); } }, false);
+    await disposePlugins([running, notRunning], log, 50);
+    expect(disposed).toEqual(["running"]); // not-running's dispose is never called
+    expect(running.running).toBe(false);
+    expect(notRunning.running).toBe(false); // already false — unaffected either way
+  });
+
+  test("a running plugin with no dispose() is simply skipped, and still flipped not-running", async () => {
+    const { log } = makeLog();
+    const noDispose = loaded(entry({ name: "no-dispose" }), {}, true); // no dispose() at all — the wow-plugin case
+    await expect(disposePlugins([noDispose], log, 50)).resolves.toBeUndefined();
+    expect(noDispose.running).toBe(false);
+  });
+
+  test("a throwing dispose is isolated and logged — the next plugin is still disposed", async () => {
+    const { log, calls } = makeLog();
+    const order: string[] = [];
+    const boom = loaded(entry({ name: "boom" }), { dispose: async () => { order.push("boom"); throw new Error("dispose blew up"); } }, true);
+    const ok = loaded(entry({ name: "ok" }), { dispose: async () => { order.push("ok"); } }, true);
+    await disposePlugins([boom, ok], log, 50);
+    expect(order).toEqual(["boom", "ok"]); // boom's throw didn't stop ok
+    expect(boom.running).toBe(false);
+    expect(ok.running).toBe(false);
+    expect(calls.some((c) => c.level === "error" && c.message.includes("boom") && c.message.includes("dispose failed"))).toBe(true);
+  });
+
+  // A synchronously-throwing (or malformed, non-function) dispose must be isolated the same way an
+  // async rejection is — plugin.dispose is plugin-controlled and only type-asserted, like commands/ticks.
+  test("a synchronously-throwing dispose is isolated the same as an async rejection", async () => {
+    const { log, calls } = makeLog();
+    const syncBoom = loaded(entry({ name: "sync-boom" }), { dispose: () => { throw new Error("sync blew up"); } }, true);
+    const ok = loaded(entry({ name: "ok" }), { dispose: async () => {} }, true);
+    await expect(disposePlugins([syncBoom, ok], log, 50)).resolves.toBeUndefined();
+    expect(syncBoom.running).toBe(false);
+    expect(ok.running).toBe(false);
+    expect(calls.some((c) => c.level === "error" && c.message.includes("sync-boom"))).toBe(true);
+  });
+
+  // The mutation this guards: dropping the per-plugin timeout entirely, which would leave this test
+  // hanging on a dispose() that never resolves on its own.
+  test("a dispose that never resolves is bounded by the per-plugin timeout", async () => {
+    const { log } = makeLog();
+    const wedged = loaded(entry({ name: "wedged" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const settled = await Promise.race([
+      disposePlugins([wedged], log, 20).then(() => "settled" as const),
+      Bun.sleep(2_000).then(() => "hung" as const),
+    ]);
+    expect(settled).toBe("settled");
+    expect(wedged.running).toBe(false); // still flipped false even though dispose itself never resolved
+  });
+
+  test("one wedged plugin's timeout doesn't block the next plugin's own dispose", async () => {
+    const { log } = makeLog();
+    const order: string[] = [];
+    const wedged = loaded(entry({ name: "wedged" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const after = loaded(entry({ name: "after" }), { dispose: async () => { order.push("after"); } }, true);
+    const settled = await Promise.race([
+      disposePlugins([wedged, after], log, 20).then(() => "settled" as const),
+      Bun.sleep(2_000).then(() => "hung" as const),
+    ]);
+    expect(settled).toBe("settled");
+    expect(order).toEqual(["after"]);
+  });
+
+  // Review finding: an earlier, sequential version disposed one plugin after another, so N wedged
+  // plugins cost N * timeoutMs — at N=2 that already exceeds shutdown.ts's own outer
+  // DISPOSE_PLUGINS_TIMEOUT_MS (3s), which could fire and let the process exit mid-way through a
+  // LATER plugin's dispose, never having given it a real chance to run at all. Disposing
+  // concurrently (Promise.allSettled, not a sequential loop) is what keeps N plugins' worst case
+  // the SAME as one plugin's — this is the direct regression guard for that.
+  test("multiple wedged plugins are disposed CONCURRENTLY — total time is one timeout, not the sum", async () => {
+    const { log } = makeLog();
+    const a = loaded(entry({ name: "a" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const b = loaded(entry({ name: "b" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const c = loaded(entry({ name: "c" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const startedAt = Date.now();
+    const settled = await Promise.race([
+      disposePlugins([a, b, c], log, 100).then(() => "settled" as const),
+      // A sequential implementation would take ~300ms (3 * 100ms) for three wedged plugins;
+      // concurrent takes ~100ms. This bound sits between the two, so it separates them.
+      Bun.sleep(220).then(() => "hung" as const),
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    expect(settled).toBe("settled");
+    expect(elapsedMs).toBeLessThan(220);
+    expect(a.running).toBe(false);
+    expect(b.running).toBe(false);
+    expect(c.running).toBe(false);
   });
 });
 

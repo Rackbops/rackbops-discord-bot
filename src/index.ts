@@ -22,14 +22,16 @@ import { HOST_API_VERSION } from "./plugins/contract";
 import type { HostApi, HostStorage, PluginIndexEntry, PluginModule, PluginStateFile } from "./plugins/contract";
 import { installPlugins, tarExtract } from "./plugins/install";
 import type { InstallResult } from "./plugins/install";
-import type { LoadResult, PluginCommandMap } from "./plugins/host";
+import type { LoadedPlugin, LoadResult, PluginCommandMap } from "./plugins/host";
 import {
   activatePlugins,
   buildCommandBody,
   createHostApi,
   dispatchPluginInteraction,
+  disposePlugins,
   loadPlugins,
   mutatePluginState,
+  PLUGIN_DISPOSE_TIMEOUT_MS,
   pluginCommandMap,
   pluginTicks,
   readPluginState,
@@ -54,6 +56,12 @@ console.log(
 
 const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
 
+// #184: the plugins actually loaded this boot, kept in module scope (not activate()-local, unlike
+// loadResult below) so the shutdown handler — wired here, before activate() has ever run — can
+// dispose them by the time a signal actually arrives. Empty until activate() assigns it, which
+// correctly makes disposePlugins a no-op for a signal that arrives before any plugin has loaded.
+let currentLoadedPlugins: readonly LoadedPlugin[] = [];
+
 // #154: the first (and only) signal handler in this codebase, registered before resolveBootMode's
 // own daemon call below so even a standby stopped mid-verify drains cleanly (trivially idle —
 // nothing has started yet). destroyClient closes over `client`, which exists by now even though
@@ -62,6 +70,9 @@ const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
 const shutdownHandler = createShutdownHandler({
   beginShutdown,
   awaitIdle: awaitCriticalIdle,
+  // #184: reads currentLoadedPlugins live at call time, not at wiring time (this closure is built
+  // before activate() ever runs) — see that variable's own comment.
+  disposePlugins: () => disposePlugins(currentLoadedPlugins, console, PLUGIN_DISPOSE_TIMEOUT_MS),
   destroyClient: () => client.destroy(),
   exit: (code) => process.exit(code),
   log: console,
@@ -131,6 +142,9 @@ async function activate(c: Client<true>): Promise<void> {
       async (bundlePath) => (await import(pathToFileURL(bundlePath).href)) as PluginModule,
       console,
     );
+    // #184: visible to the shutdown handler's disposePlugins closure from this point on — see
+    // currentLoadedPlugins' own comment above.
+    currentLoadedPlugins = loadResult.loaded;
     commandMap = pluginCommandMap(loadResult.loaded, CORE_COMMAND_NAMES, console);
     commandBody = buildCommandBody(config.commandPrefix, commandData, commandMap, console);
   } catch (err) {

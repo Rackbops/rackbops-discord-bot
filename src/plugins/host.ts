@@ -205,6 +205,53 @@ export async function activatePlugins(loaded: readonly LoadedPlugin[], log: Base
   }
 }
 
+/** The most one plugin's `dispose()` gets (#184) — a server close or a handle release is normally
+ *  near-instant; this exists only so one wedged plugin can't consume the whole shutdown grace and
+ *  starve every other plugin's own dispose. `shutdown.ts` separately bounds the WHOLE
+ *  `disposePlugins` call to whatever's left of its own grace budget — the two nest the same way
+ *  `SHUTDOWN_GRACE_MS`/`DESTROY_CLIENT_TIMEOUT_MS` do. Disposing plugins CONCURRENTLY (see
+ *  `disposePlugins` below), not one after another, is what makes that claim actually hold for any
+ *  number of running plugins: N plugins each bounded by this SAME timeout, run at once, cost the
+ *  same worst case as one — never N times as long. A sequential loop was tried first and reverted
+ *  in review: it let two-or-more wedged plugins' timeouts sum past `shutdown.ts`'s own outer bound,
+ *  so the outer bound could fire and the process could exit mid-way through a LATER plugin's
+ *  dispose, never having given it a real chance to run at all. */
+export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
+
+/**
+ * `activatePlugins`'s counterpart (#184), called once on the way out (`shutdown.ts`'s drain, after
+ * in-flight critical sections have settled and before the gateway connection closes). Only plugins
+ * that are actually `running` are disposed — one that never activated, or whose `activate()` threw,
+ * has nothing `dispose()` could safely release. Unlike `activatePlugins` (deliberately sequential,
+ * "in order"), every running plugin's `dispose?.()` starts at once and each is bounded
+ * independently by the SAME `timeoutMs` (see that constant's own comment for why concurrent, not
+ * sequential, is what actually keeps one wedged plugin from delaying another's chance to even
+ * start) — nothing about shutdown depends on dispose ordering the way `activate()`'s setup might. A
+ * throw — sync or async, including a malformed non-function `dispose` — is isolated exactly like
+ * `activatePlugins` isolates a throwing `activate()`, logged and never propagated, and never stops
+ * any other plugin's own dispose (`Promise.allSettled`, not `Promise.all`). `running` is flipped
+ * false for every plugin this touches regardless of outcome, so `pluginTicks`' gate (`:166`) stops
+ * ticking against a resource that dispose either released or failed to release — a dying handle is
+ * not a reason to keep using it. Mutates each LoadedPlugin in place, like `activatePlugins`.
+ */
+export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number): Promise<void> {
+  const running = loaded.filter((lp) => lp.running);
+  await Promise.allSettled(
+    running.map(async (lp) => {
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => lp.plugin.dispose?.()),
+          new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+        ]);
+      } catch (err) {
+        log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        lp.running = false;
+      }
+    }),
+  );
+}
+
 /**
  * #185: which plugin (by name) a component/modal `customId` belongs to, by an exact split on the
  * FIRST colon — plugin names are `^[a-z][a-z0-9-]*$` (no colon can appear in one), so the
