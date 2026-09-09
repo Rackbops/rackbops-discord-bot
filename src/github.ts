@@ -134,7 +134,10 @@ export interface CreatedIssue {
  */
 export function clampUpstreamBody(text: string, max = 300): string {
   const line = (text.split("\n")[0] ?? "").trim();
-  return line.length > max ? `${line.slice(0, max)}…` : line;
+  // Array.from splits by code point, not UTF-16 code unit, so a surrogate pair (e.g. an emoji)
+  // landing right at the cut can't be split into a lone surrogate that mangles on the way out.
+  const codePoints = Array.from(line);
+  return codePoints.length > max ? `${codePoints.slice(0, max).join("")}…` : line;
 }
 
 /**
@@ -144,7 +147,8 @@ export function clampUpstreamBody(text: string, max = 300): string {
  * line of defense so *any* long message can't strand the interaction, not just an upstream one.
  */
 export function clampReply(text: string, max = 1900): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
+  const codePoints = Array.from(text); // see clampUpstreamBody — avoids splitting a surrogate pair
+  return codePoints.length > max ? `${codePoints.slice(0, max).join("")}…` : text;
 }
 
 function writeHeaders(): Record<string, string> {

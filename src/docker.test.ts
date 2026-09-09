@@ -386,9 +386,11 @@ describe("daemon calls", () => {
   });
 
   // Same class of bug as GitHub's create-issue throw (#55, #186): a docker daemon error body can
-  // reach /update's reply through checkForUpdate/redeploy, so it gets the same clamp at the throw
-  // site. Mutation: dropping `clampUpstreamBody(...)` here lets the raw body straight through.
-  test("a large docker error body is clamped in the thrown message", async () => {
+  // reach /update's reply through checkForUpdate/redeploy, so it gets the same clamp at all three
+  // res.text()-into-Error throw sites (stopContainer, removeContainer, and the generic ok() helper
+  // that every other daemon call — e.g. inspectContainer — goes through). Mutation: dropping
+  // `clampUpstreamBody(...)` from any one of these lets the raw body straight through.
+  test("a large docker error body is clamped in stopContainer's thrown message", async () => {
     stub(() => new Response("x".repeat(5000), { status: 500 }));
     try {
       await stopContainer("abc");
@@ -396,6 +398,28 @@ describe("daemon calls", () => {
     } catch (err) {
       expect((err as Error).message.length).toBeLessThan(400);
       expect((err as Error).message).toContain("docker stop abc failed: 500");
+    }
+  });
+
+  test("a large docker error body is clamped in removeContainer's thrown message", async () => {
+    stub(() => new Response("y".repeat(5000), { status: 500 }));
+    try {
+      await removeContainer("abc");
+      throw new Error("expected removeContainer to reject");
+    } catch (err) {
+      expect((err as Error).message.length).toBeLessThan(400);
+      expect((err as Error).message).toContain("docker rm abc failed: 500");
+    }
+  });
+
+  test("a large docker error body is clamped via the generic ok() helper (inspectContainer)", async () => {
+    stub(() => new Response("z".repeat(5000), { status: 500 }));
+    try {
+      await inspectContainer("abc");
+      throw new Error("expected inspectContainer to reject");
+    } catch (err) {
+      expect((err as Error).message.length).toBeLessThan(400);
+      expect((err as Error).message).toContain("failed: 500");
     }
   });
 });

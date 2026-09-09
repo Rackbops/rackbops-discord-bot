@@ -41,10 +41,37 @@ describe("clampUpstreamBody", () => {
     expect(clampUpstreamBody(body).endsWith("…")).toBe(false);
   });
 
-  test("a multi-KB HTML error page collapses to a short first line", () => {
-    const html = `<!doctype html>\n${"<div>filler</div>".repeat(500)}`; // several KB, no newline in line 1
+  // A body with an early newline (see the next test) doesn't actually exercise the length cap —
+  // the first-line split alone already gets it under `max`. This one has no newline at all, so it
+  // genuinely drives both rules at once: the whole several-KB body is "line one" until the cap cuts it.
+  test("a multi-KB single-line HTML body is cut by the length cap, not just the line split", () => {
+    const html = `<html><body>Bad Gateway</body></html>${"<div>filler</div>".repeat(500)}`;
     const clamped = clampUpstreamBody(html);
     expect(clamped.length).toBeLessThanOrEqual(301);
+    expect(clamped.endsWith("…")).toBe(true);
+  });
+
+  test("a genuinely multi-line HTML error page keeps only the (short) first line", () => {
+    const html = `<!doctype html>\n${"<div>filler</div>".repeat(500)}`; // several KB, but line 1 is short
+    expect(clampUpstreamBody(html)).toBe("<!doctype html>"); // fits whole — no truncation suffix
+  });
+
+  // #189 review: text.slice(0, max) slices by UTF-16 code unit, so a non-BMP character (e.g. an
+  // emoji, which is a surrogate pair) landing exactly at the cut point would split it into a lone
+  // surrogate — garbling the trailing character once re-encoded. Array.from-based slicing avoids it.
+  test("does not split a surrogate pair sitting right at the cut point", () => {
+    const emoji = "\u{1F600}"; // U+1F600, a surrogate pair in UTF-16 (2 code units, 1 code point)
+    const body = "x".repeat(299) + emoji + "y".repeat(10); // the pair straddles the 300-char cut
+    const clamped = clampUpstreamBody(body);
+    // A valid string has no lone surrogate: every high surrogate is immediately followed by its low.
+    for (let i = 0; i < clamped.length; i++) {
+      const code = clamped.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        expect(clamped.charCodeAt(i + 1)).toBeGreaterThanOrEqual(0xdc00);
+        expect(clamped.charCodeAt(i + 1)).toBeLessThanOrEqual(0xdfff);
+      }
+    }
+    expect(clamped.endsWith("…")).toBe(true);
   });
 });
 
@@ -67,6 +94,20 @@ describe("clampReply", () => {
 
   test("respects a caller-supplied max", () => {
     expect(clampReply("y".repeat(20), 5)).toBe(`${"y".repeat(5)}…`);
+  });
+
+  // Same surrogate-pair hazard as clampUpstreamBody (#189 review) — pin it here too.
+  test("does not split a surrogate pair sitting right at the cut point", () => {
+    const emoji = "\u{1F600}";
+    const text = "y".repeat(1899) + emoji + "z".repeat(10);
+    const clamped = clampReply(text);
+    for (let i = 0; i < clamped.length; i++) {
+      const code = clamped.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        expect(clamped.charCodeAt(i + 1)).toBeGreaterThanOrEqual(0xdc00);
+        expect(clamped.charCodeAt(i + 1)).toBeLessThanOrEqual(0xdfff);
+      }
+    }
   });
 });
 
