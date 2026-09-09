@@ -528,11 +528,15 @@ cmd_env_set() {
   load_env_values
   load_plugin_keys
 
-  # Counters track sizes explicitly: `${#assoc[@]}` on a still-empty associative array trips
-  # "unbound variable" under `set -u`, so we never expand a possibly-empty array for its length.
+  # `${#assoc[@]}` on a still-empty associative array once tripped "unbound variable" under
+  # `set -u` (pre-bash-4.4); this repo's deploy target (Debian trixie) ships bash 5.3, and
+  # `${#PLUGIN_KEY_ORDER[@]}` above already relies on the general form. Confirmed for real on both
+  # the deploy host and dev: `bash -c 'set -u; declare -A a=(); echo "${#a[@]}"'` prints `0`, no
+  # error (issue #135 item 13) — so SUBMITTED/DIFF's sizes below are read directly off the arrays,
+  # no hand-kept counter to drift from what was actually inserted.
   declare -A SUBMITTED=()
   local -a submitted_order=()
-  local line key val n_submitted=0
+  local line key val
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" == *=* ]] || die "env-set: malformed input line (need KEY=VALUE)"
@@ -549,7 +553,6 @@ cmd_env_set() {
     [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
     [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
     SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
-    n_submitted=$((n_submitted + 1))
   done
 
   # Reduce to real changes (new value differs from the EFFECTIVE current value — see
@@ -560,8 +563,8 @@ cmd_env_set() {
   # changing was never this script's to judge. A no-op must not restart the bot.
   load_env_values
   declare -A DIFF=()
-  local n_diff=0 fmt is_required
-  if [ "$n_submitted" -gt 0 ]; then
+  local fmt is_required
+  if [ "${#SUBMITTED[@]}" -gt 0 ]; then
     for key in "${submitted_order[@]}"; do
       val="${SUBMITTED[$key]}"
       [ "$val" != "$(env_value "$key")" ] || continue
@@ -580,10 +583,9 @@ cmd_env_set() {
         die "env-set: value for '$key' is invalid"
       fi
       DIFF["$key"]="$val"
-      n_diff=$((n_diff + 1))
     done
   fi
-  if [ "$n_diff" -eq 0 ]; then
+  if [ "${#DIFF[@]}" -eq 0 ]; then
     jq -n '{ok: true, changed: [], recreated: false, note: "no changes"}'
     return 0
   fi
