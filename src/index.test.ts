@@ -82,6 +82,25 @@ describe("index.ts wiring", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });
 
+  // #185: core's report: modal check must be an EARLIER branch in the same if/else-if chain as
+  // plugin interaction dispatch, so core always wins that prefix regardless of what plugins are
+  // installed -- a reordering (or splitting them into two independent `if`s that could both fire)
+  // would let a plugin's dispatch run even for a report: modal submit.
+  test("core's report: modal check comes before plugin interaction dispatch, in the same else-if chain", () => {
+    const reportCheck = source.indexOf("isReportModal(interaction.customId)");
+    const dispatchBranch = source.indexOf(
+      '} else if (interaction.isMessageComponent() || interaction.isModalSubmit())',
+    );
+    const dispatchCall = source.indexOf("dispatchPluginInteraction(");
+    expect(reportCheck).toBeGreaterThan(-1);
+    expect(dispatchBranch).toBeGreaterThan(-1);
+    expect(dispatchCall).toBeGreaterThan(-1);
+    // Mutation: reordering the branches, or splitting them into two independent `if`s (either of
+    // which could then both fire on the same interaction) fails one of these three.
+    expect(reportCheck).toBeLessThan(dispatchBranch);
+    expect(dispatchBranch).toBeLessThan(dispatchCall);
+  });
+
   // #154: the first (and only) signal handler in this codebase. Registered before resolveBootMode
   // so even a standby stopped mid-verify (nothing has started yet — trivially idle) drains cleanly,
   // rather than the daemon's SIGKILL being the first thing that ever touches it.

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SlashCommandBuilder } from "discord.js";
+import { SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
 import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
 import type { InstalledPlugin } from "./install";
 import type { LoadedPlugin } from "./host";
@@ -21,6 +21,8 @@ const {
   buildPluginStateFile,
   readPluginState,
   writePluginState,
+  routeInteractionByPrefix,
+  dispatchPluginInteraction,
 } = await import("./host");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
@@ -61,6 +63,22 @@ const cmd = (name: string, build?: PluginCommand["build"]): PluginCommand => ({
   build: build ?? ((b) => b.setDescription(`the ${name} command`)),
   handle: async () => {},
 });
+
+/** A minimal fake component/modal interaction -- only what dispatchPluginInteraction actually
+ *  touches (customId, replied/deferred, reply()), matching this file's existing `as unknown as`
+ *  cast convention for discord.js interaction fakes (see commands.test.ts). */
+function fakeInteraction(
+  customId: string,
+  over: Partial<{ replied: boolean; deferred: boolean; reply: (opts: unknown) => Promise<unknown> }> = {},
+): MessageComponentInteraction {
+  return {
+    customId,
+    replied: false,
+    deferred: false,
+    reply: async () => {},
+    ...over,
+  } as unknown as MessageComponentInteraction;
+}
 
 describe("createHostApi", () => {
   test("env is only the declared keys, and log is prefixed with the plugin name", () => {
@@ -215,6 +233,135 @@ describe("activatePlugins", () => {
     expect(lp2.running).toBe(false);
     expect(lp2.error).toContain("boom");
     expect(lp3.running).toBe(true);
+  });
+});
+
+describe("routeInteractionByPrefix", () => {
+  test("exact split on the first colon", () => {
+    expect(routeInteractionByPrefix("wow:realm:pick", ["warbandeer", "wow"])).toBe("wow");
+  });
+
+  test("no colon at all -> undefined", () => {
+    expect(routeInteractionByPrefix("noColonHere", ["warbandeer", "wow"])).toBeUndefined();
+  });
+
+  test("a prefix that matches no known plugin name -> undefined", () => {
+    expect(routeInteractionByPrefix("unknown:thing", ["warbandeer", "wow"])).toBeUndefined();
+  });
+
+  // Distinguishes an EXACT colon-split from a mere `startsWith` prefix scan: "wowie" is not "wow",
+  // even though "wowie:x" starts with the string "wow". Mutation: swapping the exact split for
+  // `names.find(n => customId.startsWith(n))` wrongly returns "wow" here.
+  test("a name that is a PREFIX of the actual segment (not equal to it) does not match", () => {
+    expect(routeInteractionByPrefix("wowie:x", ["wow"])).toBeUndefined();
+  });
+});
+
+describe("dispatchPluginInteraction", () => {
+  test("a routed interaction reaches the plugin's interactions with the FULL customId, unstripped", async () => {
+    const { log } = makeLog();
+    let received: string | undefined;
+    const lp = loaded(
+      entry({ name: "wow" }),
+      { interactions: async (i) => { received = i.customId; } },
+      true, // running
+    );
+    const claimed = await dispatchPluginInteraction([lp], fakeInteraction("wow:realm:pick"), log);
+    expect(claimed).toBe(true);
+    expect(received).toBe("wow:realm:pick"); // mutation: stripping the prefix fails this
+  });
+
+  test("a non-running plugin's interactions are not dispatched", async () => {
+    const { log } = makeLog();
+    let called = false;
+    const lp = loaded(
+      entry({ name: "wow" }),
+      { interactions: async () => { called = true; } },
+      false, // NOT running
+    );
+    const claimed = await dispatchPluginInteraction([lp], fakeInteraction("wow:realm:pick"), log);
+    expect(claimed).toBe(false); // mutation: ignoring `running` makes this true and `called` true
+    expect(called).toBe(false);
+  });
+
+  test("no plugin's prefix matches -> not claimed, nothing throws", async () => {
+    const { log } = makeLog();
+    const lp = loaded(entry({ name: "wow" }), { interactions: async () => {} }, true);
+    const claimed = await dispatchPluginInteraction([lp], fakeInteraction("unrelated:thing"), log);
+    expect(claimed).toBe(false);
+  });
+
+  test("a plugin with no `interactions` handler at all is not dispatched to, even if running and routed", async () => {
+    const { log } = makeLog();
+    const lp = loaded(entry({ name: "wow" }), {}, true); // no `interactions` key
+    const claimed = await dispatchPluginInteraction([lp], fakeInteraction("wow:x"), log);
+    expect(claimed).toBe(false);
+  });
+
+  test("a throwing handler is isolated and logged; the NEXT interaction still routes normally", async () => {
+    const { log, calls } = makeLog();
+    let secondCallReceived: string | undefined;
+    const lp = loaded(
+      entry({ name: "wow" }),
+      {
+        interactions: async (i) => {
+          if (i.customId === "wow:first") throw new Error("boom");
+          secondCallReceived = i.customId;
+        },
+      },
+      true,
+    );
+    const first = await dispatchPluginInteraction([lp], fakeInteraction("wow:first"), log);
+    expect(first).toBe(true); // claimed even though the handler threw
+    expect(calls).toEqual([{ level: "error", message: "[plugins] wow interaction failed" }]);
+
+    const second = await dispatchPluginInteraction([lp], fakeInteraction("wow:second"), log);
+    expect(second).toBe(true);
+    expect(secondCallReceived).toBe("wow:second"); // the throw didn't corrupt anything for the next call
+  });
+
+  test("a throwing handler gets a best-effort ephemeral reply IF it hadn't already replied/deferred", async () => {
+    const { log } = makeLog();
+    let replyCalledWith: unknown;
+    const lp = loaded(entry({ name: "wow" }), { interactions: async () => { throw new Error("boom"); } }, true);
+    const interaction = fakeInteraction("wow:x", {
+      reply: async (opts) => { replyCalledWith = opts; },
+    });
+    await dispatchPluginInteraction([lp], interaction, log);
+    expect(replyCalledWith).toMatchObject({ content: expect.any(String) });
+  });
+
+  test("a throwing handler that ALREADY replied/deferred gets no extra reply attempt", async () => {
+    const { log } = makeLog();
+    let replyCalls = 0;
+    const lp = loaded(entry({ name: "wow" }), { interactions: async () => { throw new Error("boom"); } }, true);
+    const interaction = fakeInteraction("wow:x", {
+      replied: true,
+      reply: async () => { replyCalls++; },
+    });
+    await dispatchPluginInteraction([lp], interaction, log);
+    // Mutation: dropping the replied/deferred guard would call reply() here too.
+    expect(replyCalls).toBe(0);
+  });
+
+  // #185 acceptance bullet 3: a plugin built against the PRE-#185 contract (no `interactions`
+  // field at all -- exactly the published shape of warbandeer 1.x and wow 1.0.0, both of which
+  // declare only `commands` and `activate()`) must load, activate, and safely no-op on interaction
+  // dispatch against the new host -- `interactions` being optional is what makes this compatible,
+  // no HOST_API_VERSION bump.
+  test("a pre-#185 plugin shape (commands + activate, no interactions) loads/activates/no-ops safely", async () => {
+    const { log } = makeLog();
+    const warbandeerLike: Plugin = { commands: [cmd("link"), cmd("unlink")], activate: async () => {} };
+    const installed: InstalledPlugin[] = [{ entry: entry({ name: "warbandeer" }), version: "1.1.0", bundlePath: "/w" }];
+    const makeHost = (e: PluginIndexEntry): HostApi =>
+      createHostApi({ entry: e, processEnv: {}, dataDir: "/d", baseLog: log, storage: realStorage, announce: async () => {} });
+    const { loaded: loadedPlugins } = await loadPlugins(installed, makeHost, async () => ({ createPlugin: () => warbandeerLike }), log);
+    await activatePlugins(loadedPlugins, log);
+    expect(loadedPlugins[0]!.running).toBe(true);
+    // A button whose customId happens to be prefixed "warbandeer:" still resolves to this plugin by
+    // NAME (routing doesn't require `interactions` to exist) but is safely dropped, not thrown.
+    const claimed = await dispatchPluginInteraction(loadedPlugins, fakeInteraction("warbandeer:link-confirm"), log);
+    expect(claimed).toBe(false);
   });
 });
 

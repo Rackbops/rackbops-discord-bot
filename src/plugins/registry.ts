@@ -21,9 +21,11 @@ export interface SelectedPlugin {
 
 /**
  * Walks `configured` (parsed `PLUGINS=` tokens, in order) against the Plugin Index, skipping a
- * plugin that isn't published, needs a newer host, or whose command names collide with core or an
- * earlier-selected plugin. A skipped plugin is still returned (with `skipped` set) so a caller can
- * report why — this is what #99/#101/#102 read to build `state.json` and the panel's listing.
+ * plugin that isn't published, needs a newer host, is itself named after a reserved core command
+ * (#185 — its interaction-routing prefix would collide), or whose command names collide with core
+ * or an earlier-selected plugin. A skipped plugin is still returned (with `skipped` set) so a
+ * caller can report why — this is what #99/#101/#102 read to build `state.json` and the panel's
+ * listing.
  */
 export function selectPlugins(
   index: PluginIndex,
@@ -49,6 +51,24 @@ export function selectPlugins(
         entry,
         pinnedVersion: cfg.version,
         skipped: `needs host API v${entry.hostApiVersion}, this bot is v${hostApiVersion}`,
+      });
+      continue;
+    }
+
+    // #185: a plugin's OWN name (not its commands) becomes its interaction-routing prefix
+    // (`<name>:`) — core's `report:` modal prefix is already reserved (src/report.ts's
+    // MODAL_PREFIX), so a plugin literally named "report" would have every one of its own modal
+    // submissions silently swallowed by the core handler instead of reaching it, regardless of
+    // whether any of its commands happen to collide. `coreCommandNames` already IS that reserved
+    // set (it's what the command-collision check below guards), so reusing it here for the name
+    // itself is the same reservation, extended to the one place a plugin's `name` (not its
+    // `commands`) is what actually matters.
+    if (coreCommandNames.includes(cfg.name)) {
+      selected.push({
+        name: cfg.name,
+        entry,
+        pinnedVersion: cfg.version,
+        skipped: `plugin name "${cfg.name}" collides with the core command "${cfg.name}" — its interaction-routing prefix "${cfg.name}:" is reserved`,
       });
       continue;
     }
