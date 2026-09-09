@@ -602,19 +602,25 @@ export function renderIndexHtml(template: string, instanceName: string): string 
  * the mounted config dir: the token is read on demand and never enters this process's environment
  * (so it stays out of `docker inspect`), and it's deliberately absent from bot-ops.sh's env-get
  * whitelist, so there's no other way to reach it. Returns undefined when the key isn't present.
+ * Mirrors `ops/bot-ops.sh`'s `load_env_values` / compose's `env_file:` loader — the LAST
+ * occurrence of a key wins, an `export KEY=` or indented line defines the key, surrounding
+ * whitespace and a trailing CR are trimmed, one layer of matching quotes is stripped (issue #195).
  */
 export function parseEnvValue(envText: string, key: string): string | undefined {
+  // Same line grammar as bot-ops.sh's ENV_LINE_RE (optional indentation, optional `export `, the
+  // whole key, `=`): a key name is an identifier, so no escaping is needed to embed it.
+  const def = new RegExp(`^\\s*(?:export\\s+)?${key}=(.*)$`);
+  let found: string | undefined;
   for (const raw of envText.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-    if (line.startsWith(key + "=")) {
-      let v = line.slice(key.length + 1).trim();
-      if (v.length >= 2 && ((v[0] === '"' && v.at(-1) === '"') || (v[0] === "'" && v.at(-1) === "'"))) {
-        v = v.slice(1, -1);
-      }
-      return v;
+    const m = raw.replace(/\r$/, "").match(def);
+    if (!m) continue;
+    let v = (m[1] ?? "").trim();
+    if (v.length >= 2 && ((v[0] === '"' && v.at(-1) === '"') || (v[0] === "'" && v.at(-1) === "'"))) {
+      v = v.slice(1, -1);
     }
+    found = v; // keep scanning: the LAST occurrence wins, as in compose's env_file loader
   }
-  return undefined;
+  return found;
 }
 
 /** Branch names out of a GitHub `GET /repos/{owner}/{repo}/branches` response body; tolerant of a

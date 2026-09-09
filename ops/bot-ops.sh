@@ -289,6 +289,7 @@ readonly ENV_LINE_RE='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)
 # compose's `env_file:` loader reads the same file — checked against `docker compose config`
 # (Compose 2.40) on the box, issue #44 — so env-get shows, and env-set diffs against, what the
 # bot is actually running with:
+# ops/admin/server.ts's parseEnvValue mirrors these same rules for the keys the panel reads itself (#195).
 #   - the LAST occurrence of a key wins (the old `grep -m1` took the first);
 #   - an `export KEY=...` line defines KEY, indented or not (both used to be invisible);
 #   - surrounding whitespace is trimmed — which also drops a CRLF-saved file's trailing "\r",

@@ -1192,6 +1192,28 @@ describe("parseEnvValue", () => {
   test("trims surrounding whitespace and a trailing CR", () => expect(parseEnvValue(env, "SPACED")).toBe("trimmed"));
   test("a missing key is undefined", () => expect(parseEnvValue(env, "NOPE")).toBeUndefined());
   test("matches a whole key, not a prefix", () => expect(parseEnvValue("GITHUB_REPOSITORY=x", "GITHUB_REPO")).toBeUndefined());
+  test("a key that is a suffix of another key doesn't match", () => expect(parseEnvValue("MY_GITHUB_REPO=x", "GITHUB_REPO")).toBeUndefined());
+
+  // #195: parity with ops/bot-ops.sh's load_env_values / compose's env_file: loader.
+  test("the LAST occurrence of a duplicated key wins, not the first", () => {
+    expect(parseEnvValue("GITHUB_TOKEN=old-value\nGITHUB_TOKEN=new-value", "GITHUB_TOKEN")).toBe("new-value");
+  });
+  test("a later duplicate that is empty still wins", () => {
+    expect(parseEnvValue("GITHUB_TOKEN=x\nGITHUB_TOKEN=", "GITHUB_TOKEN")).toBe("");
+  });
+  test("an `export KEY=` line defines the key", () => {
+    expect(parseEnvValue("export GITHUB_REPO=owner/name", "GITHUB_REPO")).toBe("owner/name");
+  });
+  test("an indented line, tab or spaces, defines the key", () => {
+    expect(parseEnvValue("  GITHUB_REPO=a\n\texport GITHUB_TOKEN=b", "GITHUB_REPO")).toBe("a");
+    expect(parseEnvValue("  GITHUB_REPO=a\n\texport GITHUB_TOKEN=b", "GITHUB_TOKEN")).toBe("b");
+  });
+  test("a key that appears only as a later export wins over an earlier plain line", () => {
+    expect(parseEnvValue("GITHUB_REPO=first\nexport GITHUB_REPO=second", "GITHUB_REPO")).toBe("second");
+  });
+  test("CRLF duplicate: last wins and the CR is trimmed", () => {
+    expect(parseEnvValue("GITHUB_TOKEN=a\r\nGITHUB_TOKEN=b\r\n", "GITHUB_TOKEN")).toBe("b");
+  });
 });
 
 describe("branchNamesFromApi", () => {
