@@ -52,7 +52,8 @@ set -euo pipefail
 # visible warning instead of a generic "bot-ops: usage: ..." failure the next time someone clicks
 # a button the old script doesn't have (the #173 incident: Update now failed on debug because
 # install.sh hadn't been re-run since #121 added plugin-request).
-readonly BOT_OPS_SCHEMA=1
+# 2: adds env-schema (#205).
+readonly BOT_OPS_SCHEMA=2
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -506,6 +507,41 @@ cmd_env_get() {
   jq -n "${args[@]}" '$ARGS.named'
 }
 
+# #205: JSON of the same keys env-get lists, in the same order, but carrying the validation env-set
+# itself enforces rather than the effective value — {KEY: {pattern, required, source}}. Reuses
+# env-get's exact loading sequence (need jq, the .env-exists check, load_env_values, load_plugin_keys,
+# the same "index unavailable" stderr note) so the two subcommands can never disagree about which
+# keys exist or their order.
+cmd_env_schema() {
+  need jq
+  [ -f "$ENV_FILE" ] || die "env-schema: $ENV_FILE not found"
+  local key
+  load_env_values
+  load_plugin_keys
+  # Build the object with jq positional args in groups of four -- key, pattern, required, source --
+  # so a pattern's backslashes and quotes pass through untouched (never string-interpolate a regex
+  # into a jq program).
+  local args=()
+  for key in "${ENV_KEY_ORDER[@]}"; do
+    args+=("$key" "${ALLOWED[$key]}" "$([[ -n "${REQUIRED[$key]+x}" ]] && echo true || echo false)" core)
+  done
+  for key in "${PLUGIN_KEY_ORDER[@]}"; do
+    [[ -n "${ALLOWED[$key]+x}" ]] && continue   # a plugin key colliding with a static one: static wins, exactly as env-get
+    args+=("$key" "${PLUGIN_FORMAT[$key]}" "${PLUGIN_REQUIRED[$key]:-false}" plugin)
+  done
+  if [ "$PLUGIN_KEYS_STATUS" = "index unavailable" ]; then
+    echo "bot-ops: plugins: index unavailable — showing static keys only (the bot isn't running or hasn't cached the Plugin Index yet)" >&2
+  fi
+  # `_nwise`/`nwise` is NOT a real jq builtin -- it's a documentation example jq's own manual shows
+  # as something you could define yourself, never compiled into the interpreter (confirmed: absent
+  # from `jq -n 'builtins'` on 1.8.2, and `_nwise(4)` fails "not defined" on a plain CLI invocation
+  # with no such def in scope). Group the flat positional array into 4s by index/slice instead --
+  # portable back to jq 1.5, and avoids the plan's original `_nwise(4)` call entirely (#205 deviation).
+  jq -n --args \
+    '[$ARGS.positional as $a | range(0; ($a|length)/4) | $a[.*4:.*4+4] | {(.[0]): {pattern: .[1], required: (.[2] == "true"), source: .[3]}}] | add // {}' \
+    -- "${args[@]}"
+}
+
 cmd_env_set() {
   need docker; need jq
   guard_no_handoff_in_progress
@@ -742,12 +778,13 @@ main() {
     restart) cmd_restart ;;
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
+    env-schema) cmd_env_schema ;;
     plugin-request) cmd_plugin_request ;;
     # #173 round 3: version is dispatched near the very top of the script, before this function
     # (and its .env/compose-file preconditions) is ever reached — see the comment above readonly
     # BOT_OPS_SCHEMA. No case arm needed here; kept in the usage string below since it's still a
     # real, documented subcommand.
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request|version}" ;;
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|env-schema|plugin-request|version}" ;;
   esac
 }
 

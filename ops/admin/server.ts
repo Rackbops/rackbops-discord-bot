@@ -468,6 +468,9 @@ export function buildInvocation(
   if (method === "POST" && pathname === "/api/env") {
     return { args: ["env-set"], stdin: body ?? "", contentType: "application/json" };
   }
+  if (method === "GET" && pathname === "/api/env-schema") {
+    return { args: ["env-schema"], contentType: "application/json" };
+  }
   return undefined;
 }
 
@@ -656,8 +659,9 @@ export const HOST_API_VERSION = 1;
  *  HOST_API_VERSION's drift, this one is NOT cosmetic — an outdated deployed script is missing real
  *  subcommands/whitelist rows the panel image already assumes exist (the incident this issue is
  *  named for: `Update now` failing with a generic error because `plugin-request` didn't exist yet
- *  on the deployed copy). */
-export const REQUIRED_BOT_OPS_SCHEMA = 1;
+ *  on the deployed copy).
+ *  2 = env-schema (#205). */
+export const REQUIRED_BOT_OPS_SCHEMA = 2;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed

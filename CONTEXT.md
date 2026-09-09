@@ -824,7 +824,7 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   internal refactor only. Carved out of the same issue, needing a design decision first: emitting
   each key's `pattern`/`required` to the panel so `ops/admin/public/index.html`'s hard-coded
   `BRANCH_NAME_RE` could go away — that's a contract change across `bot-ops.sh`/`server.ts`/the
-  panel, tracked as a follow-up, not implemented here.
+  panel, done by #205 (`env-schema`) and #207 (the panel consumes it).
 - **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178
   extends #173's mechanism to cover it rather than inventing a second one.** `install.sh` fetches
   the compose file once too and nothing refreshes it — a real incident: `debug`'s stack compose was

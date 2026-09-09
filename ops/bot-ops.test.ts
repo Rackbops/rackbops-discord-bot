@@ -210,6 +210,16 @@ const envGet = async (fx: Fixture): Promise<Record<string, string>> => {
   expect(run.exitCode).toBe(0);
   return run.json as Record<string, string>;
 };
+interface SchemaEntry {
+  pattern: string;
+  required: boolean;
+  source: string;
+}
+const envSchema = async (fx: Fixture): Promise<Record<string, SchemaEntry>> => {
+  const run = await botOps(fx, ["env-schema"]);
+  expect(run.exitCode).toBe(0);
+  return run.json as unknown as Record<string, SchemaEntry>;
+};
 const dockerCalls = (fx: Fixture): string[] => {
   const log = join(fx.bin, "docker.log");
   return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
@@ -988,6 +998,76 @@ describe.skipIf(!runnable)("bot-ops.sh env-get is graceful when the Plugin Index
   });
 });
 
+describe.skipIf(!runnable)("bot-ops.sh env-schema emits env-get's validation, not its values (#205)", () => {
+  test("env-schema lists exactly env-get's keys, in the same order", async () => {
+    const index = wrapIndex([pluginEntry("a", [envKey("A_ONE", "^[a-z]+$")])]);
+    const fx = setup("PLUGINS=a\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const [schema, env] = await Promise.all([envSchema(fx), envGet(fx)]);
+    expect(Object.keys(schema)).toEqual(Object.keys(env));
+  });
+
+  test("a core key carries its ALLOWED_SPEC pattern, its REQUIRED flag and source core", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const schema = await envSchema(fx);
+    expect(schema.ANNOUNCE_CHANNEL_ID).toEqual({ pattern: "^[0-9]{5,25}$", required: true, source: "core" });
+    expect(schema.BOT_BRANCH!.required).toBe(false);
+  });
+
+  test("every emitted core pattern is the verbatim ALLOWED_SPEC string", async () => {
+    // Scrape the 'KEY|regex' rows straight from the script source rather than hand-copying them
+    // here, so this test can't silently drift from ALLOWED_SPEC the way a hand-mirrored copy could.
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    const block = src.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/);
+    expect(block).not.toBeNull();
+    const expected: Record<string, string> = {};
+    for (const line of block![1]!.split("\n")) {
+      const m = line.match(/^\s*'([A-Z0-9_]+)\|(.*)'\s*$/);
+      if (m) expected[m[1]!] = m[2]!;
+    }
+    expect(Object.keys(expected).length).toBeGreaterThan(0);
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const schema = await envSchema(fx);
+    for (const [key, pattern] of Object.entries(expected)) {
+      expect(schema[key]?.pattern).toBe(pattern);
+    }
+    // The load-bearing case: an ERE with alternation AND a POSIX class survives jq's quoting/escaping
+    // round-trip untouched, rather than the collapsed/escaped-differently string a naive interpolation
+    // (or the plan's original `_nwise`-based grouping) could produce.
+    expect(schema.PLUGIN_INDEX_URL!.pattern).toBe(expected.PLUGIN_INDEX_URL!);
+    expect(schema.PLUGIN_INDEX_URL!.pattern).toContain("[:space:]");
+  });
+
+  test("a plugin key reports its manifest format and required with source plugin; a colliding static key stays core", async () => {
+    const index = wrapIndex([
+      pluginEntry("x", [
+        envKey("X_PORT", PORT_RE, { required: true }),
+        envKey("ANNOUNCE_CHANNEL_ID", "^.+$"), // collides with a static key -- static must win, exactly as env-get
+      ]),
+    ]);
+    const fx = setup("PLUGINS=x\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const schema = await envSchema(fx);
+    expect(schema.X_PORT).toEqual({ pattern: PORT_RE, required: true, source: "plugin" });
+    expect(schema.ANNOUNCE_CHANNEL_ID).toEqual({ pattern: "^[0-9]{5,25}$", required: true, source: "core" });
+  });
+
+  test("index unavailable: static keys only and the stderr note", async () => {
+    // No pluginIndex fixture, so the shim prints nothing for the exec cat — the file isn't there.
+    const fx = setup("PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-schema"]);
+    expect(run.exitCode).toBe(0); // never an error (D3), same posture as env-get
+    expect(run.stderr).toContain("plugins: index unavailable");
+    const schema = run.json as unknown as Record<string, SchemaEntry>;
+    expect(Object.keys(schema)).toHaveLength(11); // the 11 static keys, nothing merged
+  });
+
+  test("env-schema is a recognised subcommand and appears in usage", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["bogus-subcommand"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("env-schema");
+  });
+});
+
 describe.skipIf(!runnable)("bot-ops.sh status includes the plugin state (#101)", () => {
   test("status.plugins carries the state file's .plugins array", async () => {
     const state = JSON.stringify({
@@ -1220,15 +1300,15 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+    expect(run.json).toEqual({ schema: 2, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
-  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 1)", () => {
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 2, #205)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=1\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=2\b/);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
@@ -1248,7 +1328,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+    expect(run.json).toEqual({ schema: 2, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -1261,7 +1341,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+    expect(run.json).toEqual({ schema: 2, composeSchema: null });
   });
 });
 
@@ -1274,7 +1354,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 1, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 2, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -1285,7 +1365,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+    expect(run.json).toEqual({ schema: 2, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -1293,7 +1373,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+    expect(run.json).toEqual({ schema: 2, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -1301,6 +1381,6 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 1, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 2, composeSchema: 2 });
   });
 });
