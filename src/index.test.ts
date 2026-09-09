@@ -108,4 +108,27 @@ describe("index.ts wiring", () => {
     expect(source).toMatch(new RegExp(`process\\.on\\("SIGTERM",\\s*${handlerVar}\\)`));
     expect(source).toMatch(new RegExp(`process\\.on\\("SIGINT",\\s*${handlerVar}\\)`));
   });
+
+  // #184: the shutdown handler is wired (and process.on registered) before activate() ever runs,
+  // so disposePlugins can't just close over loadResult.loaded directly — it needs a module-level
+  // variable activate() assigns into, read live at signal time.
+  test("createShutdownHandler is passed a disposePlugins dep", () => {
+    const createCallStart = source.indexOf("createShutdownHandler(");
+    expect(createCallStart).toBeGreaterThan(-1);
+    const createCallEnd = source.indexOf("});", createCallStart);
+    const createCallBody = source.slice(createCallStart, createCallEnd);
+    expect(createCallBody).toMatch(/disposePlugins:\s*\(\)\s*=>\s*disposePlugins\(/);
+  });
+
+  test("assigns the module-level loaded-plugins variable inside activate(), after loadPlugins resolves", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const loadCall = source.indexOf("await loadPlugins(", activateFn);
+    // the variable the shutdown handler's disposePlugins closure reads — declared once, at module
+    // scope, before the handler is built, then assigned here once real plugins exist.
+    const varDecl = source.match(/let (\w+): readonly LoadedPlugin\[\] = \[\];/)?.[1];
+    expect(varDecl).toBeTruthy();
+    expect(loadCall).toBeGreaterThan(-1);
+    const assignment = source.indexOf(`${varDecl} = loadResult.loaded;`, loadCall);
+    expect(assignment).toBeGreaterThan(loadCall); // assigned only after the real load result exists
+  });
 });
