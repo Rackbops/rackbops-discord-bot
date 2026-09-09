@@ -406,6 +406,34 @@ describe.skipIf(!runnable)("bot-ops.sh env-get reads .env the way compose's env_
   });
 });
 
+// #133: ALLOWED and its display order are both derived from ALLOWED_SPEC now, so there is nothing
+// left to drift — this pins the observable result of that (every whitelisted key present, in
+// ALLOWED_SPEC's own declared order) against real bot-ops.sh output, the way the issue's own test
+// table calls for. A hand-listed expected order, not scraped from the script's source: if
+// ALLOWED_SPEC's order ever changes on purpose, this list gets a matching one-line update, same as
+// any other pinned expectation.
+describe.skipIf(!runnable)("bot-ops.sh env-get emits every whitelisted key, in ALLOWED_SPEC's order (#133)", () => {
+  const EXPECTED_ORDER = [
+    "DISCORD_SERVER_ID",
+    "ANNOUNCE_CHANNEL_ID",
+    "RELEASE_ANNOUNCE_CHANNEL_ID",
+    "REPORT_ROLE_ID",
+    "ADMIN_USER_IDS",
+    "WATCHED_REPOS",
+    "AUTO_UPDATE",
+    "BOT_BRANCH",
+    "COMMAND_PREFIX",
+    "PLUGINS",
+    "PLUGIN_INDEX_URL",
+  ];
+
+  test("every ALLOWED_SPEC key is present and in the declared order, with no plugins installed", async () => {
+    const fx = setup("");
+    const env = await envGet(fx);
+    expect(Object.keys(env)).toEqual(EXPECTED_ORDER);
+  });
+});
+
 describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value BEFORE validating (issue #44)", () => {
   test("a stored value the whitelist rejects no longer blocks saving an unrelated key", async () => {
     // ADMIN_USER_IDS with a space: config.ts trims it, the regex here doesn't. WOW_REALM quoted:
@@ -496,6 +524,20 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     }
   });
 
+  test("empty stdin (nothing submitted) is a no-op, not an 'unbound variable' crash (issue #135 item 13)", async () => {
+    // Guards the SUBMITTED/DIFF associative arrays staying genuinely empty end to end — the
+    // hand-kept n_submitted/n_diff counters this used to lean on are gone (item 13); this proves
+    // `${#SUBMITTED[@]}`/`${#DIFF[@]}` on a never-populated associative array behaves under
+    // `set -u`, not just that the JSON shape is right. Mutation: reintroducing either counter
+    // wrong (e.g. never zero-checked) would either crash under set -u or mis-skip this early
+    // return.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+  });
+
   test("submitting the stored value spelled differently (quotes, CR, export, duplicate) is a no-op", async () => {
     const stored = 'WOW_REALM="stormrage"\r\nexport WOW_REGION=eu\nBOT_BRANCH=main\nBOT_BRANCH=dev\n';
     const fx = wowSetup(stored);
@@ -527,7 +569,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     // The whitelisted key is deliberately the unterminated last line: load_env_values (env-get,
     // and env-set's diff) is a SEPARATE read loop from the rewrite loop below, and a fixture that
     // only puts the no-newline line in an unwhitelisted key would never exercise this one — env-get
-    // only reports ALLOWED_ORDER keys, so a dropped unwhitelisted line is invisible either way.
+    // only reports whitelisted keys, so a dropped unwhitelisted line is invisible either way.
     const fx = wowSetup("DISCORD_TOKEN=secret\nWOW_REGION=us"); // no final \n — writeFileSync writes it raw
     expect(readFileSync(fx.envFile, "utf8").endsWith("\n")).toBe(false);
     expect((await envGet(fx)).WOW_REGION).toBe("us");

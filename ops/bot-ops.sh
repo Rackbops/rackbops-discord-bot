@@ -46,8 +46,7 @@
 #     here rejects failed every save that echoed it back, naming a key the operator never touched.
 set -euo pipefail
 
-# #173: bumped in the SAME PR whenever a subcommand or ALLOWED/ALLOWED_ORDER row is added or
-# changed — the admin panel (ops/admin/server.ts's REQUIRED_BOT_OPS_SCHEMA, hand-mirrored and
+# #173: bumped in the SAME PR whenever a subcommand or an ALLOWED_SPEC row is added or changed — the admin panel (ops/admin/server.ts's REQUIRED_BOT_OPS_SCHEMA, hand-mirrored and
 # drift-pinned by a test) compares this against its own copy at startup, so a deployed instance
 # whose bin/bot-ops.sh has drifted behind the panel image it's paired with shows up as a loud,
 # visible warning instead of a generic "bot-ops: usage: ..." failure the next time someone clicks
@@ -158,35 +157,61 @@ for var in BOT_OPS_CONFIG_DIR BOT_OPS_COMPOSE_FILE; do
 done
 ENV_FILE="$CONFIG_DIR/.env"
 
-# Non-secret keys the panel may read and write. Anything not here is rejected by env-set and
-# omitted by env-get. Each key pairs with a validation regex (empty string is always allowed —
-# it clears the key back to its documented default) EXCEPT the keys named in REQUIRED below, which
-# have no default to clear back to.
-declare -A ALLOWED=(
-  [DISCORD_SERVER_ID]='^[0-9]{5,25}$'
-  [ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
-  [RELEASE_ANNOUNCE_CHANNEL_ID]='^[0-9]{5,25}$'
-  [REPORT_ROLE_ID]='^[0-9]{5,25}$'
-  [ADMIN_USER_IDS]='^[0-9]{5,25}(,[0-9]{5,25})*$'
+# Non-secret keys the panel may read and write, ONE ordered spec (#133) — order and membership are
+# a single source, so they can't drift by construction. Anything not here is rejected by env-set
+# and omitted by env-get. Each entry is "KEY|regex" (empty string is always allowed — it clears the
+# key back to its documented default) EXCEPT the keys named in REQUIRED below, which have no
+# default to clear back to. A plain indexed array, not an associative one, on purpose: bash does
+# not preserve an associative array's insertion order (hash-bucket order instead), which is exactly
+# why an earlier version of this file carried a second, hand-maintained order array alongside
+# ALLOWED — and why the two could (and, per issue #133, did) drift apart. `ALLOWED` and
+# `ENV_KEY_ORDER` below are now DERIVED from this once, at load, rather than declared by hand —
+# every `${ALLOWED[$key]}` regex lookup elsewhere in this file is unchanged; only where ALLOWED and
+# its display order come from moved.
+ALLOWED_SPEC=(
+  'DISCORD_SERVER_ID|^[0-9]{5,25}$'
+  'ANNOUNCE_CHANNEL_ID|^[0-9]{5,25}$'
+  'RELEASE_ANNOUNCE_CHANNEL_ID|^[0-9]{5,25}$'
+  'REPORT_ROLE_ID|^[0-9]{5,25}$'
+  'ADMIN_USER_IDS|^[0-9]{5,25}(,[0-9]{5,25})*$'
   # WOW_REALM / WOW_REGION / DMF_TIMEZONE were static rows here until #107 moved the WoW features into
   # @rackbops/plugin-wow. They are the wow plugin's manifest env keys now, merged into this whitelist at
   # runtime by load_plugin_keys (the same #101 path WARBANDEER_INGEST_PORT uses) — validated with the
   # FORMAT the Plugin Index carries, so their regexes live in the plugin's package.json, not here.
-  [WATCHED_REPOS]='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
-  [AUTO_UPDATE]='^(true|false)$'
-  [BOT_BRANCH]='^[A-Za-z0-9._/-]{1,100}$'
-  [COMMAND_PREFIX]='^[a-z0-9_-]{1,20}$'
+  'WATCHED_REPOS|^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
+  'AUTO_UPDATE|^(true|false)$'
+  'BOT_BRANCH|^[A-Za-z0-9._/-]{1,100}$'
+  'COMMAND_PREFIX|^[a-z0-9_-]{1,20}$'
   # `PLUGINS=` selects which plugins to install (operator-controlled, panel-edited): a bare `name`
   # or `name@version` to pin, comma-separated; empty = no plugins. The manifest-declared env keys of
   # the plugins named here are merged into this whitelist at runtime by load_plugin_keys, so a
   # plugin's own key (e.g. WARBANDEER_INGEST_PORT, a static row here until #100 removed the baked-in
   # connector) is validated with the FORMAT the Plugin Index carries rather than hand-mirrored per
   # plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
-  [PLUGINS]='^[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?(,[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?)*$'
+  'PLUGINS|^[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?(,[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?)*$'
   # Where the bot fetches the Plugin Index from: an http(s) URL, a file:// URL, or a bare absolute
   # path (config.ts accepts all three; empty clears back to the published default).
-  [PLUGIN_INDEX_URL]='^(https?://[^[:space:]]+|file://[^[:space:]]+|/[^[:space:]]+)$'
+  'PLUGIN_INDEX_URL|^(https?://[^[:space:]]+|file://[^[:space:]]+|/[^[:space:]]+)$'
 )
+
+# Derived once, here, from ALLOWED_SPEC above — never hand-declared. Split on the FIRST "|" only
+# (AUTO_UPDATE's and PLUGIN_INDEX_URL's regexes both DO contain "|" today, as alternation — the
+# split still cuts at the first "|", the one separating the key from its regex, leaving every later
+# "|" alone as part of the regex value): ALLOWED is the KEY->regex lookup every validation site
+# below already expects;
+# ENV_KEY_ORDER is env-get's display order, in the exact sequence ALLOWED_SPEC lists — named to
+# match PLUGIN_KEY_ORDER's own convention below.
+declare -A ALLOWED=()
+ENV_KEY_ORDER=()
+build_allowed_from_spec() {
+  local spec key
+  for spec in "${ALLOWED_SPEC[@]}"; do
+    key="${spec%%|*}"
+    ALLOWED["$key"]="${spec#*|}"
+    ENV_KEY_ORDER+=("$key")
+  done
+}
+build_allowed_from_spec
 
 # Keys env-set must refuse to blank — the exception to ALLOWED's "empty string is always allowed"
 # rule above. A parallel set, not a stricter ALLOWED regex, because ALLOWED's regex is a FORMAT
@@ -197,23 +222,6 @@ declare -A ALLOWED=(
 # genuinely optional.
 declare -A REQUIRED=(
   [ANNOUNCE_CHANNEL_ID]=1
-)
-
-# Display order for env-get's output — a plain indexed array, not ALLOWED's own iteration order,
-# which as a bash associative array is unspecified (hash-bucket order, not declaration order).
-# Must contain exactly the same keys as ALLOWED; cmd_env_get asserts this so the two can't drift.
-ALLOWED_ORDER=(
-  DISCORD_SERVER_ID
-  ANNOUNCE_CHANNEL_ID
-  RELEASE_ANNOUNCE_CHANNEL_ID
-  REPORT_ROLE_ID
-  ADMIN_USER_IDS
-  WATCHED_REPOS
-  AUTO_UPDATE
-  BOT_BRANCH
-  COMMAND_PREFIX
-  PLUGINS
-  PLUGIN_INDEX_URL
 )
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
@@ -464,24 +472,14 @@ cmd_restart() {
 cmd_env_get() {
   need jq
   [ -f "$ENV_FILE" ] || die "env-get: $ENV_FILE not found"
-  # ALLOWED_ORDER must name exactly ALLOWED's keys, each exactly once — a key added to one and
-  # not the other would otherwise silently drop it from the panel (missing from ALLOWED_ORDER) or
-  # crash on an unset array element (missing from ALLOWED, present in ALLOWED_ORDER). A duplicate
-  # in ALLOWED_ORDER is checked explicitly (not just "same length as ALLOWED") — a length-and-
-  # membership check alone would pass for e.g. one key duplicated and a different key dropped,
-  # since the count still matches and every listed key still exists in ALLOWED.
+  # #133: ALLOWED and ENV_KEY_ORDER are both derived from the single ALLOWED_SPEC above — there is
+  # nothing left for them to drift against each other, so the runtime assertion that used to live
+  # here (checking the old parallel order array named exactly ALLOWED's keys, each exactly once)
+  # is gone with it.
   local key
-  declare -A seen=()
-  for key in "${ALLOWED_ORDER[@]}"; do
-    [[ -n "${ALLOWED[$key]+x}" ]] || die "env-get: '$key' is in ALLOWED_ORDER but not ALLOWED"
-    [[ -z "${seen[$key]+x}" ]] || die "env-get: '$key' appears more than once in ALLOWED_ORDER"
-    seen["$key"]=1
-  done
-  (( ${#seen[@]} == ${#ALLOWED[@]} )) \
-    || die "env-get: ALLOWED_ORDER (${#seen[@]} unique) and ALLOWED (${#ALLOWED[@]}) have drifted"
   load_env_values
   local args=()
-  for key in "${ALLOWED_ORDER[@]}"; do
+  for key in "${ENV_KEY_ORDER[@]}"; do
     args+=(--arg "$key" "$(env_value "$key")")
   done
   # After the static keys, append each INSTALLED plugin's non-secret env keys in manifest order, so
@@ -512,8 +510,10 @@ cmd_env_set() {
   guard_no_handoff_in_progress
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
-  # Every REQUIRED key must also be an ALLOWED one — same drift worry as ALLOWED_ORDER vs ALLOWED
-  # in cmd_env_get: a typo here would otherwise silently never enforce that key.
+  # Every REQUIRED key must also be an ALLOWED one — REQUIRED is a separate, hand-maintained set
+  # (unlike ENV_KEY_ORDER, it isn't derived from ALLOWED_SPEC, since "has no default to clear back
+  # to" is a genuinely independent fact about a key, not something ALLOWED_SPEC's shape could carry
+  # for free) — a typo here would otherwise silently never enforce that key.
   local rkey
   for rkey in "${!REQUIRED[@]}"; do
     [[ -n "${ALLOWED[$rkey]+x}" ]] || die "env-set: '$rkey' is in REQUIRED but not ALLOWED"
@@ -528,11 +528,15 @@ cmd_env_set() {
   load_env_values
   load_plugin_keys
 
-  # Counters track sizes explicitly: `${#assoc[@]}` on a still-empty associative array trips
-  # "unbound variable" under `set -u`, so we never expand a possibly-empty array for its length.
+  # `${#assoc[@]}` on a still-empty associative array once tripped "unbound variable" under
+  # `set -u` (pre-bash-4.4); this repo's deploy target (Debian trixie) ships bash 5.3, and
+  # `${#PLUGIN_KEY_ORDER[@]}` above already relies on the general form. Confirmed for real on both
+  # the deploy host and dev: `bash -c 'set -u; declare -A a=(); echo "${#a[@]}"'` prints `0`, no
+  # error (issue #135 item 13) — so SUBMITTED/DIFF's sizes below are read directly off the arrays,
+  # no hand-kept counter to drift from what was actually inserted.
   declare -A SUBMITTED=()
   local -a submitted_order=()
-  local line key val n_submitted=0
+  local line key val
   while IFS= read -r line || [ -n "$line" ]; do
     [ -z "$line" ] && continue
     [[ "$line" == *=* ]] || die "env-set: malformed input line (need KEY=VALUE)"
@@ -549,7 +553,6 @@ cmd_env_set() {
     [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
     [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
     SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
-    n_submitted=$((n_submitted + 1))
   done
 
   # Reduce to real changes (new value differs from the EFFECTIVE current value — see
@@ -560,8 +563,8 @@ cmd_env_set() {
   # changing was never this script's to judge. A no-op must not restart the bot.
   load_env_values
   declare -A DIFF=()
-  local n_diff=0 fmt is_required
-  if [ "$n_submitted" -gt 0 ]; then
+  local fmt is_required
+  if [ "${#SUBMITTED[@]}" -gt 0 ]; then
     for key in "${submitted_order[@]}"; do
       val="${SUBMITTED[$key]}"
       [ "$val" != "$(env_value "$key")" ] || continue
@@ -580,10 +583,9 @@ cmd_env_set() {
         die "env-set: value for '$key' is invalid"
       fi
       DIFF["$key"]="$val"
-      n_diff=$((n_diff + 1))
     done
   fi
-  if [ "$n_diff" -eq 0 ]; then
+  if [ "${#DIFF[@]}" -eq 0 ]; then
     jq -n '{ok: true, changed: [], recreated: false, note: "no changes"}'
     return 0
   fi
