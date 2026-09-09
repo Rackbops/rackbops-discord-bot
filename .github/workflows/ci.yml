@@ -40,3 +40,21 @@ jobs:
       # files, root + ops/admin/server.test.ts together, ~19s locally.
       - name: Test
         run: bun test
+
+  # #83, Phase 2 of #80's CI plan: build-only validation that both images still build --
+  # no push, no registry, no secrets. Every var docker-compose.yml's admin service
+  # interpolates has a `${VAR:-}` fallback (none are `${VAR:?required}`), so a plain
+  # `docker compose build`/`--profile admin build` succeeds with nothing exported into
+  # the job's shell. GIT_SHA is deliberately left unset -- it builds as empty, which is
+  # fine for a build-only job; exporting the real sha here would mask a build that
+  # secretly depends on it being set.
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build bot image
+        run: docker compose build bot
+
+      - name: Build admin image
+        run: docker compose --profile admin build admin
