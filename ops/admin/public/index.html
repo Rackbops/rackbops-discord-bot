@@ -558,10 +558,35 @@
   }
   function adminTabState(plugin, panelAdminApiVersion) {
     if (!plugin || typeof plugin.adminUrl !== "string" || !plugin.enabled) return { kind: "none" };
-    if (plugin.adminApiVersion !== panelAdminApiVersion) {
+    // #165: a tab configures the RUNNING code, not the index's current release — never mount the
+    // manifest's version over code that isn't installed yet (next restart brings it).
+    if (!plugin.installedVersion) return { kind: "pending" };
+    // The manifest's adminApiVersion describes the index's CURRENT bundle. It's only the right gate
+    // to check here when the installed version IS that current one; otherwise the bundle actually
+    // being fetched is a different (pinned) one, and its OWN declared version is the authority —
+    // checked client-side after import, in bundleMountDecision.
+    if (plugin.installedVersion === plugin.latestVersion && plugin.adminApiVersion !== panelAdminApiVersion) {
       return { kind: "mismatch", declared: plugin.adminApiVersion, panel: panelAdminApiVersion };
     }
     return { kind: "mount" };
+  }
+  // #165: the bundle-level version gate — checked against the imported module's OWN declared
+  // adminApiVersion, since a pinned (non-current) bundle isn't described by the manifest's field.
+  // A missing export is treated as a mismatch: every published admin bundle must declare it.
+  function bundleMountDecision(mod, panelAdminApiVersion) {
+    const declared = mod && typeof mod.adminApiVersion === "number" ? mod.adminApiVersion : undefined;
+    if (declared === undefined || declared !== panelAdminApiVersion) return { kind: "mismatch", declared };
+    return { kind: "mount" };
+  }
+  // #165: `import()` can't distinguish a 404 (no bundle at this pinned version) from a script error,
+  // so the caller preflights with `fetch` first and hands the status here. A pinned version that
+  // predates the plugin's first admin bundle is a real, expected state (e.g. a not-yet-updated
+  // plugin) and gets its own note; any other status keeps the existing generic failure wording.
+  function describeBundleFailure(status, installedVersion, latestVersion) {
+    if (status === 404) {
+      return "v" + installedVersion + " of this plugin has no settings tab; v" + latestVersion + " does — update to get it";
+    }
+    return "Couldn't load this plugin's settings (status " + status + ")";
   }
   function buildSetEnvBody(changes, envKeys) {
     const scoped = scopeToPluginKeys(changes, envKeys);
@@ -592,7 +617,10 @@
   // through the same guarded POST /api/env (auth + bot-ops validation + recreate) a manual edit uses.
   function makeAdminApi(plugin) {
     return {
-      meta: { name: plugin.name, version: plugin.installedVersion || plugin.latestVersion || "", adminApiVersion: plugin.adminApiVersion },
+      // #165: version now always the INSTALLED one (adminTabState only reaches "mount" once
+      // installedVersion is set) — the split between "the tab's version" and "the code that's
+      // actually running" is gone.
+      meta: { name: plugin.name, version: plugin.installedVersion, adminApiVersion: plugin.adminApiVersion },
       async getEnv() {
         const env = await (await api("/api/env")).json();
         return scopeToPluginKeys(env, plugin.envKeys);
@@ -612,7 +640,11 @@
         return viewToState((data.plugins || []).find((p) => p.name === plugin.name) || null);
       },
       proxyFetch(path) {
-        return api("/api/plugin-proxy/" + encodeURIComponent(plugin.name) + "?path=" + encodeURIComponent(path));
+        // #165: pin the proxied asset to the same version as the bundle asking for it.
+        return api(
+          "/api/plugin-proxy/" + encodeURIComponent(plugin.name) +
+          "?path=" + encodeURIComponent(path) + "&v=" + encodeURIComponent(plugin.installedVersion),
+        );
       },
     };
   }
@@ -645,24 +677,47 @@
         note.className = "field-hint";
         note.textContent = "This plugin's settings target admin API v" + state.declared + ", but this panel is v" + state.panel + " — they can't be shown until the versions match.";
         wrap.appendChild(note);
+      } else if (state.kind === "pending") {
+        const note = document.createElement("div");
+        note.className = "field-hint";
+        note.textContent = "Settings appear once the plugin is installed (next restart).";
+        wrap.appendChild(note);
       } else {
         const root = document.createElement("div");
         root.id = "plugin-admin-root-" + p.name;
         wrap.appendChild(root);
-        mountPluginAdmin(p, root, gen);
+        mountPluginAdmin(p, root, gen, panelVer);
       }
       list.appendChild(wrap);
     }
   }
 
-  // Dynamically import the plugin's own admin bundle (served same-origin from /plugin-admin/<name>.js)
-  // and mount it. Fully isolated: an import failure or a throwing mountAdmin shows a note in that tab,
-  // never breaking the rest of the panel. `gen` drops a mount a newer render has already superseded.
-  async function mountPluginAdmin(plugin, root, gen) {
+  // Dynamically import the plugin's own admin bundle (served same-origin from
+  // /plugin-admin/<name>.js?v=<installedVersion>, #165) and mount it. Fully isolated: an import
+  // failure or a throwing mountAdmin shows a note in that tab, never breaking the rest of the panel.
+  // `gen` drops a mount a newer render has already superseded.
+  async function mountPluginAdmin(plugin, root, gen, panelAdminApiVersion) {
+    const bundleUrl = "/plugin-admin/" + encodeURIComponent(plugin.name) + ".js?v=" + encodeURIComponent(plugin.installedVersion);
     try {
-      const mod = await import("/plugin-admin/" + encodeURIComponent(plugin.name) + ".js");
+      // #165: `import()` can't tell a 404 (no bundle at this pinned version) from a script error, so
+      // preflight with `fetch` on the SAME url — the browser's cache (max-age=300 on this route)
+      // means the import below costs no extra network round trip.
+      const preflight = await fetch(bundleUrl);
       if (gen !== adminRenderGen) return; // a newer render superseded this one — drop the stale mount
-      if (!mod || typeof mod.mountAdmin !== "function") throw new Error("bundle has no mountAdmin export");
+      if (!preflight.ok) {
+        root.textContent = describeBundleFailure(preflight.status, plugin.installedVersion, plugin.latestVersion);
+        return;
+      }
+      const mod = await import(bundleUrl);
+      if (gen !== adminRenderGen) return;
+      const decision = bundleMountDecision(mod, panelAdminApiVersion);
+      if (decision.kind === "mismatch") {
+        root.textContent = "This plugin's settings target admin API v" +
+          (decision.declared === undefined ? "unknown" : decision.declared) +
+          ", but this panel is v" + panelAdminApiVersion + " — they can't be shown until the versions match.";
+        return;
+      }
+      if (typeof mod.mountAdmin !== "function") throw new Error("bundle has no mountAdmin export");
       const cleanup = mod.mountAdmin(root, makeAdminApi(plugin));
       if (typeof cleanup === "function") mountedAdminCleanups.push(cleanup);
     } catch (e) {

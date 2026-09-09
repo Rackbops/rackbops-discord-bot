@@ -578,3 +578,17 @@ _Avoid_: plugin list, cache
   `activate()` time and have it take effect that boot. `src/plugins/*` (index.ts, registry.ts)
   stays free of `src/config.ts` on purpose — it's read-only data plumbing that has to work before
   config exists in the boot sequence.
+- **The admin tab (bundle + `proxyFetch` assets) follows the plugin's INSTALLED version; `getEnv`
+  scope / `env-set` validation / `HostApi.env` still follow the index's CURRENT entry (#165).**
+  `ops/admin/server.ts`'s `resolveAdminBundleUrl`/`resolvePluginProxyUrl` derive a
+  `cdn.jsdelivr.net/npm/<package>@<installedVersion>/...` URL from an `?v=` query param (the client
+  supplies it from `/api/plugins`' `installedVersion`, never a server-side `bot-ops status` lookup
+  per fetch) so the tab configures the code that's actually running, not the manifest's current
+  release — before #165, `debug` served the 1.1.0 tab over the running 1.0.0 warbandeer plugin. A
+  malformed `?v=` is a 400, never a silent fallback to the manifest's version. `getEnv`/`setEnv` are a
+  **deliberate, documented exception**: they still read the manifest's `env` keys (`host.ts:57`,
+  `bot-ops.sh load_plugin_keys`, `server.ts:743`) regardless of which version's tab is mounted —
+  per-version env-key scoping would need the bot to cache each installed version's manifest entry
+  and is not built. A plugin's admin tab therefore configures the running code's UI, but a config
+  key that changed shape between versions is validated against the CURRENT manifest, not the
+  installed one.

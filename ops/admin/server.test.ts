@@ -2450,6 +2450,100 @@ describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => 
     expect(ADMIN_ASSET_HOST).toBe("cdn.jsdelivr.net");
     expect(ADMIN_ASSET_MAX_BYTES).toBe(512 * 1024);
   });
+
+  // #165: the admin tab follows the INSTALLED version, not the index's current one.
+  describe("#165 installedVersion pinning", () => {
+    const pinnedIdx = (): PluginIndex => ({
+      schemaVersion: 1,
+      plugins: [{
+        name: "warbandeer",
+        version: "1.1.0",
+        package: "@rackbops/plugin-warbandeer",
+        adminUrl: "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+        adminApiVersion: ADMIN_API_VERSION,
+      }],
+    });
+
+    test("a pinned version that differs from the manifest's derives that version's own bundle URL", () => {
+      // Mutation: ignoring installedVersion serves the manifest's (wrong) version.
+      expect(resolveAdminBundleUrl(pinnedIdx(), "warbandeer", "1.0.0")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js",
+      );
+    });
+    test("a pinned version equal to the manifest's uses today's path (manifest URL + its gate)", () => {
+      expect(resolveAdminBundleUrl(pinnedIdx(), "warbandeer", "1.1.0")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+      );
+    });
+    test("no installedVersion behaves exactly as before (manifest URL + its gate)", () => {
+      expect(resolveAdminBundleUrl(pinnedIdx(), "warbandeer")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+      );
+    });
+    test.each([
+      ["a non-semver string", "not-a-version"],
+      ["a .. traversal segment", "1.0.0/../../secret"],
+      ["a percent-encoded traversal", "1.0.0/%2e%2e/secret"],
+      ["an npm scope injection", "1.0.0@other"],
+      ["a path with a slash", "1.0.0/extra"],
+      ["whitespace", " 1.0.0"],
+    ])("a malformed installedVersion (%s) is treated as absent, not trusted", (_label, bad) => {
+      // Mutation: dropping the semver regex would let this flow into the URL template untested.
+      // Falls back to the manifest's own (safe) URL — never derives a URL from the bad string.
+      expect(resolveAdminBundleUrl(pinnedIdx(), "warbandeer", bad)).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+      );
+    });
+    test("a pinned version with no `package` on the manifest entry can't be derived", () => {
+      const noPkg: PluginIndex = {
+        schemaVersion: 1,
+        plugins: [{ name: "warbandeer", version: "1.1.0", adminUrl: "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js", adminApiVersion: ADMIN_API_VERSION }],
+      };
+      expect(resolveAdminBundleUrl(noPkg, "warbandeer", "1.0.0")).toBeNull();
+    });
+    test("the manifest's own adminApiVersion gate is SKIPPED for a genuinely pinned (differing) version", () => {
+      const mismatched: PluginIndex = {
+        schemaVersion: 1,
+        plugins: [{
+          name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer",
+          adminUrl: "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+          adminApiVersion: ADMIN_API_VERSION + 99, // the CURRENT bundle is incompatible
+        }],
+      };
+      // Mutation: keeping the manifest gate here would 404 a perfectly-servable pinned bundle.
+      expect(resolveAdminBundleUrl(mismatched, "warbandeer", "1.0.0")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js",
+      );
+      // But the SAME manifest, pinned to the version THAT gate describes, still refuses it.
+      // Mutation: inverting the !== to === (or dropping the branch) would serve this too.
+      expect(resolveAdminBundleUrl(mismatched, "warbandeer", "1.1.0")).toBeNull();
+      expect(resolveAdminBundleUrl(mismatched, "warbandeer")).toBeNull();
+    });
+    test("the post-new URL prefix re-assert catches a traversal-shaped `package` field on the manifest", () => {
+      // The strict semver regex fully sanitizes `pinned` itself, so THIS defense-in-depth line is only
+      // reachable via a hostile `package` field (a pre-existing, not #165-introduced, manifest-trust
+      // assumption also present in resolvePluginProxyUrl below).
+      const hostilePackage: PluginIndex = {
+        schemaVersion: 1,
+        plugins: [{
+          name: "warbandeer", version: "1.1.0", package: "../../evil",
+          adminUrl: "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js",
+          adminApiVersion: ADMIN_API_VERSION,
+        }],
+      };
+      // Mutation: dropping the re-assert would return the un-verified candidate URL instead of null.
+      expect(resolveAdminBundleUrl(hostilePackage, "warbandeer", "1.0.0")).toBeNull();
+    });
+    test("the manifest's own URL must still pass https+allowlist even when pinning a different version", () => {
+      const offHost: PluginIndex = {
+        schemaVersion: 1,
+        plugins: [{ name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer", adminUrl: "https://evil.example.com/admin.js", adminApiVersion: ADMIN_API_VERSION }],
+      };
+      // Mutation: skipping the manifest sanity gate when a pin is present lets an unlisted manifest
+      // URL through as long as SOME installedVersion is supplied.
+      expect(resolveAdminBundleUrl(offHost, "warbandeer", "1.0.0")).toBeNull();
+    });
+  });
 });
 
 describe("resolvePluginProxyUrl (#124 traversal/SSRF gate)", () => {
@@ -2493,14 +2587,46 @@ describe("resolvePluginProxyUrl (#124 traversal/SSRF gate)", () => {
       resolvePluginProxyUrl({ schemaVersion: 1, plugins: [{ name: "np", version: "1.0.0" }] }, "np", "dist/x"),
     ).toBeNull();
   });
+
+  // #165: the asset must come from the SAME published version as the bundle asking for it.
+  describe("#165 installedVersion pinning", () => {
+    test("a valid installedVersion overrides the manifest's entry.version in the package prefix", () => {
+      // Mutation: ignoring installedVersion serves the (wrong) manifest-current asset instead.
+      expect(resolvePluginProxyUrl(idx, "wow", "dist/realms.json", "1.0.0")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-wow@1.0.0/dist/realms.json",
+      );
+    });
+    test("no installedVersion behaves exactly as before (entry.version)", () => {
+      expect(resolvePluginProxyUrl(idx, "wow", "dist/realms.json")).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-wow@1.2.3/dist/realms.json",
+      );
+    });
+    test.each([
+      ["a non-semver string", "not-a-version"],
+      ["a .. traversal segment", "1.0.0/../../secret"],
+      ["a percent-encoded traversal", "1.0.0/%2e%2e/secret"],
+      ["an npm scope injection", "1.0.0@other"],
+    ])("a malformed installedVersion (%s) falls back to entry.version, never trusted raw", (_label, bad) => {
+      // Mutation: dropping the semver validation on installedVersion here would let it flow straight
+      // into the prefix template UNTESTED by the path-traversal cases above (which target `path`, not
+      // this parameter).
+      expect(resolvePluginProxyUrl(idx, "wow", "dist/realms.json", bad)).toBe(
+        "https://cdn.jsdelivr.net/npm/@rackbops/plugin-wow@1.2.3/dist/realms.json",
+      );
+    });
+    test("existing traversal/SSRF gate on `path` is unaffected by a valid installedVersion", () => {
+      expect(resolvePluginProxyUrl(idx, "wow", "../secret", "1.0.0")).toBeNull();
+    });
+  });
 });
 
-describe("serveAdminBundle / servePluginProxy delivery routes (#124)", () => {
+describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () => {
   const TOKEN = "the-real-token";
-  const bundleUrl = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
+  const bundleUrl = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js";
+  const pinnedBundleUrl = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
   const index: PluginIndex = {
     schemaVersion: 1,
-    plugins: [{ name: "warbandeer", version: "1.0.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: 1 }],
+    plugins: [{ name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: 1 }],
   };
   const okAsset = (body: string, contentType = "text/javascript"): AdminAssetResult => ({ ok: true, status: 200, contentType, body });
   const failAsset: AdminAssetResult = { ok: false, status: 502, contentType: "", body: "", error: "boom" };
@@ -2511,38 +2637,80 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124)", () => {
       runBotOps: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
       listPluginIndex: async () => index,
       fetchAdminAsset: async (url) =>
-        url === bundleUrl ? okAsset("export const adminApiVersion=1;export function mountAdmin(){return()=>{}}") : failAsset,
+        url === bundleUrl || url === pinnedBundleUrl
+          ? okAsset("export const adminApiVersion=1;export function mountAdmin(){return()=>{}}")
+          : failAsset,
       ...over,
     };
   }
+  // A route call always needs a URL (for the ?v= query param) — a small helper to build one for the
+  // bundle route, matching how the proxy route below is already called.
+  const bundleReq = (path: string) => new URL("http://x" + path);
 
   test("GET /plugin-admin/<name>.js serves the bundle same-origin as JS", async () => {
-    const res = await serveAdminBundle("/plugin-admin/warbandeer.js", cfg());
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg());
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("text/javascript");
     expect(await res.text()).toContain("mountAdmin");
   });
   test("404 when the plugin ships no admin bundle", async () => {
-    expect((await serveAdminBundle("/plugin-admin/ghost.js", cfg())).status).toBe(404);
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/ghost.js"), cfg())).status).toBe(404);
   });
   test("404 when the index/fetcher deps are absent", async () => {
-    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ fetchAdminAsset: undefined }))).status).toBe(404);
-    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: undefined }))).status).toBe(404);
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ fetchAdminAsset: undefined }))).status).toBe(404);
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ listPluginIndex: undefined }))).status).toBe(404);
   });
   test("502 when the upstream fetch fails", async () => {
-    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ fetchAdminAsset: async () => failAsset }))).status).toBe(502);
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ fetchAdminAsset: async () => failAsset }))).status).toBe(502);
+  });
+  // #165: a real upstream 404 (a candidate URL that resolves but jsDelivr doesn't have — exactly a
+  // pinned older version that predates the plugin's first admin bundle) must surface as 404, not a
+  // flat 502, so the client's describeBundleFailure renders its "no settings tab at this version"
+  // note instead of the generic "couldn't load" one.
+  test("a genuine upstream 404 (asset.status===404) propagates as 404, distinct from a 502 error", async () => {
+    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: "", error: "upstream 404" };
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ fetchAdminAsset: async () => upstream404 }));
+    // Mutation: collapsing every !asset.ok to 502 (the pre-fix bug) would return 502 here instead.
+    expect(res.status).toBe(404);
   });
   test("an off-host adminUrl is refused (404), never proxied", async () => {
-    const offHost: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: 1, adminUrl: "https://evil.example.com/admin.js" }] };
-    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: async () => offHost }))).status).toBe(404);
+    const offHost: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.1.0", adminApiVersion: 1, adminUrl: "https://evil.example.com/admin.js" }] };
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ listPluginIndex: async () => offHost }))).status).toBe(404);
   });
   test("a version-incompatible bundle is refused (404) — not fetched or served", async () => {
-    const incompat: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: 99, adminUrl: bundleUrl }] };
-    expect((await serveAdminBundle("/plugin-admin/warbandeer.js", cfg({ listPluginIndex: async () => incompat }))).status).toBe(404);
+    const incompat: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.1.0", adminApiVersion: 99, adminUrl: bundleUrl }] };
+    expect((await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ listPluginIndex: async () => incompat }))).status).toBe(404);
+  });
+
+  // #165
+  test("?v=<installedVersion> serves that version's own bundle, not the manifest's current one", async () => {
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js?v=1.0.0"), cfg());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("mountAdmin");
+  });
+  test("?v= equal to the manifest's current version behaves exactly like no ?v=", async () => {
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js?v=1.1.0"), cfg());
+    expect(res.status).toBe(200);
+  });
+  test("a malformed ?v= is 400, never a silent fallback to the manifest's version", async () => {
+    let fetched = false;
+    const c = cfg({ fetchAdminAsset: async () => { fetched = true; return okAsset("x"); } });
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js?v=not-a-version"), c);
+    // Mutation: falling back to resolveAdminBundleUrl(index, name) on a malformed v would serve 200
+    // here instead of refusing — re-creating exactly the installed/current split #165 exists to fix.
+    expect(res.status).toBe(400);
+    expect(fetched).toBe(false);
+  });
+  test("a pinned version whose manifest current-bundle is version-incompatible is still served", async () => {
+    // The CURRENT bundle (1.1.0) is incompatible with this panel, but the pinned 1.0.0 bundle isn't
+    // gated by that — its own export (checked client-side) is the authority.
+    const incompatCurrent: PluginIndex = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: 99 }] };
+    const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js?v=1.0.0"), cfg({ listPluginIndex: async () => incompatCurrent }));
+    expect(res.status).toBe(200);
   });
 
   test("GET /api/plugin-proxy/<name>?path= serves a scoped asset with its content-type", async () => {
-    const proxied = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/realms.json";
+    const proxied = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/realms.json";
     const c = cfg({ fetchAdminAsset: async (url) => (url === proxied ? okAsset('{"ok":true}', "application/json") : failAsset) });
     const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), c);
     expect(res.status).toBe(200);
@@ -2552,6 +2720,28 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124)", () => {
     let fetched = false;
     const c = cfg({ fetchAdminAsset: async () => { fetched = true; return okAsset("x"); } });
     const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=../secret"), c);
+    expect(res.status).toBe(400);
+    expect(fetched).toBe(false);
+  });
+  // #165: same status-propagation fix as serveAdminBundle — a genuine upstream 404 for a data asset
+  // (e.g. missing at this pinned version) surfaces as 404, not a flat 502.
+  test("a genuine upstream 404 (asset.status===404) propagates as 404, distinct from a 502 error", async () => {
+    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: "", error: "upstream 404" };
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), cfg({ fetchAdminAsset: async () => upstream404 }));
+    // Mutation: collapsing every !asset.ok to 502 (the pre-fix bug) would return 502 here instead.
+    expect(res.status).toBe(404);
+  });
+  // #165
+  test("?v=<installedVersion> scopes the proxied asset to that version's package prefix", async () => {
+    const pinnedAsset = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/realms.json";
+    const c = cfg({ fetchAdminAsset: async (url) => (url === pinnedAsset ? okAsset('{"ok":true}', "application/json") : failAsset) });
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json&v=1.0.0"), c);
+    expect(res.status).toBe(200);
+  });
+  test("a malformed ?v= on the proxy route is 400, never a silent fallback", async () => {
+    let fetched = false;
+    const c = cfg({ fetchAdminAsset: async () => { fetched = true; return okAsset("x"); } });
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json&v=not-a-version"), c);
     expect(res.status).toBe(400);
     expect(fetched).toBe(false);
   });
@@ -2629,6 +2819,15 @@ describe("plugin admin helpers (lifted from index.html)", () => {
     plugin: unknown,
     panelVer: number,
   ) => { kind: string; declared?: number; panel?: number };
+  const bundleMountDecision = new Function(`"use strict";\n${src ?? ""}\nreturn bundleMountDecision;`)() as (
+    mod: unknown,
+    panelVer: number,
+  ) => { kind: string; declared?: number };
+  const describeBundleFailure = new Function(`"use strict";\n${src ?? ""}\nreturn describeBundleFailure;`)() as (
+    status: number,
+    installedVersion: string,
+    latestVersion: string | undefined,
+  ) => string;
   const buildSetEnvBody = new Function(`"use strict";\n${src ?? ""}\nreturn buildSetEnvBody;`)() as (
     changes: Record<string, unknown>,
     keys: string[],
@@ -2646,14 +2845,48 @@ describe("plugin admin helpers (lifted from index.html)", () => {
     expect(scopeToPluginKeys({}, ["A"])).toEqual({});
   });
 
-  test("adminTabState: none without a bundle or when disabled; mismatch on a version gap; mount on a match", () => {
-    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1 }, 1)).toEqual({ kind: "mount" });
-    expect(adminTabState({ enabled: false, adminUrl: "u", adminApiVersion: 1 }, 1).kind).toBe("none"); // not enabled
-    expect(adminTabState({ enabled: true, adminApiVersion: 1 }, 1).kind).toBe("none"); // no adminUrl
-    // A version gap in EITHER direction is a mismatch, never a mount — a `!==`→`===` mutant would run a
-    // bundle built against a different contract.
-    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 2 }, 1)).toEqual({ kind: "mismatch", declared: 2, panel: 1 });
-    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1 }, 2).kind).toBe("mismatch");
+  test("adminTabState (#165): none without a bundle/when disabled; pending with no installedVersion", () => {
+    expect(adminTabState({ enabled: false, adminUrl: "u", adminApiVersion: 1, installedVersion: "1.0.0", latestVersion: "1.0.0" }, 1).kind).toBe("none"); // not enabled
+    expect(adminTabState({ enabled: true, adminApiVersion: 1, installedVersion: "1.0.0", latestVersion: "1.0.0" }, 1).kind).toBe("none"); // no adminUrl
+    // Mutation: dropping this check would mount the manifest's version over code that isn't running.
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1, latestVersion: "1.0.0" }, 1)).toEqual({ kind: "pending" });
+  });
+  test("adminTabState (#165): the manifest gate applies ONLY when installed === latest", () => {
+    // installed === latest (running the index's current bundle) → the manifest's adminApiVersion IS
+    // describing what will actually be fetched, so a gap there is a real mismatch.
+    // Mutation: inverting !== to === (or dropping the branch) would mount an incompatible bundle.
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 2, installedVersion: "1.0.0", latestVersion: "1.0.0" }, 1))
+      .toEqual({ kind: "mismatch", declared: 2, panel: 1 });
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 1, installedVersion: "1.0.0", latestVersion: "1.0.0" }, 1))
+      .toEqual({ kind: "mount" });
+    // installed !== latest (pinned to an older/different version) → the manifest's gate describes a
+    // DIFFERENT bundle, so it must NOT block the mount here even though it's numerically a "mismatch";
+    // the client checks the fetched bundle's own declared version instead (bundleMountDecision).
+    // Mutation: dropping the installed===latest condition would refuse this legitimate pinned mount.
+    expect(adminTabState({ enabled: true, adminUrl: "u", adminApiVersion: 99, installedVersion: "1.0.0", latestVersion: "1.1.0" }, 1))
+      .toEqual({ kind: "mount" });
+  });
+
+  test("bundleMountDecision (#165): mounts only when the bundle's OWN declared version matches", () => {
+    // Mutation: mounting regardless of the declared version runs code built against a different
+    // contract.
+    expect(bundleMountDecision({ adminApiVersion: 1 }, 1)).toEqual({ kind: "mount" });
+    expect(bundleMountDecision({ adminApiVersion: 2 }, 1)).toEqual({ kind: "mismatch", declared: 2 });
+    // A bundle missing the export entirely is treated as a mismatch, not mounted — every published
+    // admin bundle must declare it.
+    expect(bundleMountDecision({}, 1)).toEqual({ kind: "mismatch", declared: undefined });
+    expect(bundleMountDecision(null, 1)).toEqual({ kind: "mismatch", declared: undefined });
+  });
+
+  test("describeBundleFailure (#165): names both versions on 404; a generic note otherwise", () => {
+    // Mutation: swapping the branches would put version numbers in a plain fetch-error note, or a
+    // generic note where the "no settings tab yet" one belongs.
+    expect(describeBundleFailure(404, "1.0.0", "1.1.0")).toContain("v1.0.0");
+    expect(describeBundleFailure(404, "1.0.0", "1.1.0")).toContain("v1.1.0");
+    expect(describeBundleFailure(404, "1.0.0", "1.1.0")).not.toContain("v404");
+    const other = describeBundleFailure(502, "1.0.0", "1.1.0");
+    expect(other).not.toContain("1.0.0");
+    expect(other).not.toContain("1.1.0");
   });
 
   test("buildSetEnvBody scopes to the plugin's keys AND refuses a newline value (no env-set injection)", () => {

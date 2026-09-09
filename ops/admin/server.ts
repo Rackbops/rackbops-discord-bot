@@ -773,31 +773,86 @@ export interface AdminAssetResult {
   error?: string;
 }
 
+// #165: the panel configures the plugin's RUNNING code, not the index's current release — an
+// `installedVersion` query param (untrusted input) pins delivery to that specific version. Anchored
+// semver only, no slashes/dots-only — same authoritative shape as requests.ts's VERSION_RE (both
+// gate a value that flows into an npm URL segment / filesystem path).
+const INSTALLED_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+
+/** True when `v` is present and a strictly-anchored semver — the only shape #165 accepts for pinning
+ *  a bundle/asset to a specific installed version (no `/`, `%`, `..`, `@`, whitespace). */
+function isValidInstalledVersion(v: string | undefined): v is string {
+  return typeof v === "string" && INSTALLED_VERSION_RE.test(v);
+}
+
 /** Resolve `name` to its admin-bundle URL from the index, or null when it declares none, isn't in the
  *  index, or the URL isn't on the allowlisted host. Pure over the parsed index (no I/O), so the
- *  allowlist gate is unit-tested directly. */
-export function resolveAdminBundleUrl(index: PluginIndex | null, name: string): string | null {
+ *  allowlist gate is unit-tested directly.
+ *
+ *  `installedVersion` (#165, untrusted): when given and it differs from the manifest's `entry.version`,
+ *  the panel is configuring a version other than the index's current one — derive that version's own
+ *  bundle inside the plugin's package (same template `resolvePluginProxyUrl` uses) instead of serving
+ *  the manifest's `adminUrl`. The manifest's `adminApiVersion` describes the CURRENT bundle, so it is
+ *  not the authority for a pinned-elsewhere bundle; the client checks the bundle's own export instead
+ *  (see index.html's `bundleMountDecision`). When `installedVersion` is absent or equals `entry.version`,
+ *  behaviour is unchanged: the manifest's own URL, gated by the manifest's `adminApiVersion`. */
+export function resolveAdminBundleUrl(
+  index: PluginIndex | null,
+  name: string,
+  installedVersion?: string,
+): string | null {
   const entry = index?.plugins.find((e) => e.name === name);
   if (!entry || typeof entry.adminUrl !== "string") return null;
-  // Only resolve a bundle the panel would actually mount: it must target THIS panel's
-  // ADMIN_API_VERSION (a server-side version gate — the client gates too, but don't fetch/serve an
-  // incompatible bundle), and its URL must be https on the allowlisted host (never http, never an
-  // arbitrary origin — see the @/subdomain/userinfo cases the host check rejects).
-  if (entry.adminApiVersion !== ADMIN_API_VERSION) return null;
-  let parsed: URL;
+  // The manifest's own URL is a sanity gate regardless of which version we end up serving: it must be
+  // https on the allowlisted host (never http, never an arbitrary origin — see the @/subdomain/userinfo
+  // cases the host check rejects).
+  let manifestUrl: URL;
   try {
-    parsed = new URL(entry.adminUrl);
+    manifestUrl = new URL(entry.adminUrl);
   } catch {
     return null;
   }
-  return parsed.protocol === "https:" && parsed.host === ADMIN_ASSET_HOST ? entry.adminUrl : null;
+  if (manifestUrl.protocol !== "https:" || manifestUrl.host !== ADMIN_ASSET_HOST) return null;
+
+  const pinned = isValidInstalledVersion(installedVersion) ? installedVersion : undefined;
+  if (pinned !== undefined && pinned !== entry.version) {
+    if (typeof entry.package !== "string" || !entry.package) return null;
+    const prefix = `https://${ADMIN_ASSET_HOST}/npm/${entry.package}@${pinned}/`;
+    const candidate = `${prefix}dist/admin.js`;
+    let u: URL;
+    try {
+      u = new URL(candidate);
+    } catch {
+      return null;
+    }
+    // Defense in depth, same pattern as resolvePluginProxyUrl below: re-assert under the resolved
+    // (WHATWG-normalized) URL, not just the pre-parse string. The strict semver regex on `pinned`
+    // means THIS specific escape route needs a hostile `entry.package` to reach — the manifest field
+    // itself isn't otherwise validated here, matching resolvePluginProxyUrl's existing assumption.
+    if (u.origin !== `https://${ADMIN_ASSET_HOST}` || !u.href.startsWith(prefix)) return null;
+    return candidate;
+  }
+  // No pin, or the pin matches the manifest's current version → today's behaviour: the manifest's own
+  // URL, gated by its ADMIN_API_VERSION (a server-side version gate — the client gates too, but don't
+  // fetch/serve an incompatible bundle; cheap refusal, no fetch).
+  if (entry.adminApiVersion !== ADMIN_API_VERSION) return null;
+  return entry.adminUrl;
 }
 
 /** Resolve a plugin-relative asset `path` to a URL inside THAT plugin's own published npm package on
  *  the CDN — never an arbitrary URL. Returns null on a missing plugin/package or an unsafe path: a
  *  scheme (`http:`/`data:`/…), a leading slash or any backslash, an empty/`.`/`..` segment. Pure, so
- *  the traversal/SSRF gate is unit-tested directly. */
-export function resolvePluginProxyUrl(index: PluginIndex | null, name: string, path: string): string | null {
+ *  the traversal/SSRF gate is unit-tested directly.
+ *
+ *  `installedVersion` (#165, untrusted, semver-validated): when given, the package-prefix uses it
+ *  instead of the manifest's `entry.version` — the plugin's own data assets (e.g. a realm list) must
+ *  come from the SAME published version as the bundle that's asking for them. */
+export function resolvePluginProxyUrl(
+  index: PluginIndex | null,
+  name: string,
+  path: string,
+  installedVersion?: string,
+): string | null {
   const entry = index?.plugins.find((e) => e.name === name);
   if (!entry || typeof entry.package !== "string" || !entry.package) return null;
   // A data-asset path is a plain relative path: no scheme, no leading slash/backslash, no backslash,
@@ -807,7 +862,8 @@ export function resolvePluginProxyUrl(index: PluginIndex | null, name: string, p
   if (!path || /^[a-z][a-z0-9+.-]*:/i.test(path) || /^[/\\]/.test(path) || path.includes("\\") || path.includes("%")) return null;
   const segments = path.split("/");
   if (segments.some((s) => s === "" || s === "." || s === "..")) return null;
-  const prefix = `https://${ADMIN_ASSET_HOST}/npm/${entry.package}@${entry.version}/`;
+  const version = isValidInstalledVersion(installedVersion) ? installedVersion : entry.version;
+  const prefix = `https://${ADMIN_ASSET_HOST}/npm/${entry.package}@${version}/`;
   const resolved = `${prefix}${segments.join("/")}`;
   // Defense in depth: after WHATWG normalization the URL must still be same-origin AND under this
   // plugin's own package prefix — catches any encoded/normalization escape the checks above missed.
@@ -821,21 +877,30 @@ export function resolvePluginProxyUrl(index: PluginIndex | null, name: string, p
   return resolved;
 }
 
-/** `GET /plugin-admin/<name>.js` — serve a plugin's admin bundle SAME-ORIGIN. Public at this layer
- *  like the page itself (Access already gated reaching the panel, and the bundle is public CDN
- *  content); the server fetches it from the allowlisted host, size-capped, so the browser never
- *  reaches cross-origin for plugin code. 404 when the plugin ships no admin bundle. */
-export async function serveAdminBundle(pathname: string, config: HandlerConfig): Promise<Response> {
-  const m = /^\/plugin-admin\/([a-z][a-z0-9-]*)\.js$/.exec(pathname);
+/** `GET /plugin-admin/<name>.js?v=<installedVersion>` — serve a plugin's admin bundle SAME-ORIGIN.
+ *  Public at this layer like the page itself (Access already gated reaching the panel, and the bundle
+ *  is public CDN content); the server fetches it from the allowlisted host, size-capped, so the
+ *  browser never reaches cross-origin for plugin code. 404 when the plugin ships no admin bundle (or
+ *  none at the pinned version). #165: an optional `v` pins delivery to the installed version rather
+ *  than the manifest's current one — a malformed `v` is 400, never silently treated as absent (a
+ *  silent fallback would re-create the installed/current split under a typo). */
+export async function serveAdminBundle(url: URL, config: HandlerConfig): Promise<Response> {
+  const m = /^\/plugin-admin\/([a-z][a-z0-9-]*)\.js$/.exec(url.pathname);
   if (!m) return new Response("not found", { status: 404 });
   const name = m[1]!;
+  const vParam = url.searchParams.get("v");
+  if (vParam !== null && !isValidInstalledVersion(vParam)) return new Response("bad version", { status: 400 });
   if (!config.listPluginIndex || !config.fetchAdminAsset) return new Response("not found", { status: 404 });
-  const bundleUrl = resolveAdminBundleUrl(await config.listPluginIndex(), name);
+  const bundleUrl = resolveAdminBundleUrl(await config.listPluginIndex(), name, vParam ?? undefined);
   if (!bundleUrl) return new Response("not found", { status: 404 });
   const asset = await config.fetchAdminAsset(bundleUrl);
   if (!asset.ok) {
     console.error(`[admin] admin bundle "${name}" unavailable: ${asset.error ?? asset.status}`);
-    return new Response("admin bundle unavailable", { status: 502 });
+    // #165: propagate a genuine upstream 404 as 404, not a flat 502 — this is exactly the "pinned
+    // version predates the plugin's first admin bundle" case (step 7), and the client's
+    // describeBundleFailure only renders its "no settings tab at this version" note on a real 404.
+    // Collapsing it to 502 would silently fall back to the generic "couldn't load" message instead.
+    return new Response("admin bundle unavailable", { status: asset.status === 404 ? 404 : 502 });
   }
   // Always served as JS regardless of what the CDN labelled it (we fetched exactly the manifest's
   // adminUrl); the browser caches it, so no server-side cache is needed.
@@ -844,17 +909,24 @@ export async function serveAdminBundle(pathname: string, config: HandlerConfig):
   });
 }
 
-/** `GET /api/plugin-proxy/<name>?path=<rel>` — the admin bridge's `proxyFetch`: GET a data asset from
- *  THIS plugin's own published package (e.g. a realm list), scoped by `resolvePluginProxyUrl` so a
- *  bundle can only reach its own files. Authenticated (an /api/ route). */
+/** `GET /api/plugin-proxy/<name>?path=<rel>&v=<installedVersion>` — the admin bridge's `proxyFetch`:
+ *  GET a data asset from THIS plugin's own published package (e.g. a realm list), scoped by
+ *  `resolvePluginProxyUrl` so a bundle can only reach its own files. Authenticated (an /api/ route).
+ *  #165: an optional `v` pins the asset to the installed version, mirroring `serveAdminBundle` — a
+ *  malformed `v` is 400, never a silent fallback to the manifest's current version. */
 export async function servePluginProxy(url: URL, config: HandlerConfig): Promise<Response> {
   const m = /^\/api\/plugin-proxy\/([a-z][a-z0-9-]*)$/.exec(url.pathname);
   if (!m) return new Response("not found", { status: 404 });
+  const vParam = url.searchParams.get("v");
+  if (vParam !== null && !isValidInstalledVersion(vParam)) return new Response("bad version", { status: 400 });
   if (!config.listPluginIndex || !config.fetchAdminAsset) return new Response("not found", { status: 404 });
-  const assetUrl = resolvePluginProxyUrl(await config.listPluginIndex(), m[1]!, url.searchParams.get("path") ?? "");
+  const assetUrl = resolvePluginProxyUrl(await config.listPluginIndex(), m[1]!, url.searchParams.get("path") ?? "", vParam ?? undefined);
   if (!assetUrl) return new Response("bad asset path", { status: 400 });
   const asset = await config.fetchAdminAsset(assetUrl);
-  if (!asset.ok) return new Response("asset unavailable", { status: 502 });
+  // Same status-propagation fix as serveAdminBundle: a genuine upstream 404 (e.g. a data asset that
+  // doesn't exist at this pinned version) surfaces as 404, not a flat 502, so a plugin's own admin
+  // bundle can tell "missing" from "errored" the way any other fetch response would let it.
+  if (!asset.ok) return new Response("asset unavailable", { status: asset.status === 404 ? 404 : 502 });
   return new Response(asset.body, {
     headers: { "Content-Type": asset.contentType || "application/octet-stream", "Cache-Control": "public, max-age=300" },
   });
@@ -1277,7 +1349,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   // #124: a plugin's admin bundle, served same-origin (public at this layer like the page,
   // Access already gated getting here). Before the /api/ gate; a GET, so isCrossSiteWrite never applies.
   if (req.method === "GET" && url.pathname.startsWith("/plugin-admin/")) {
-    return serveAdminBundle(url.pathname, config);
+    return serveAdminBundle(url, config);
   }
 
   if (!url.pathname.startsWith("/api/")) {
