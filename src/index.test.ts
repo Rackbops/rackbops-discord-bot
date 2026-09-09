@@ -14,13 +14,16 @@ describe("index.ts wiring", () => {
     expect(source).not.toMatch(/new Client\(/);
   });
 
-  // #139: BOT_DATA_DIR can relocate the data dir, and a value off the mounted volume breaks
-  // self-update in a way nothing else names — the replacement writes a handoff marker the original
-  // never sees, so every /update waits out its deadline. Both `storage.ts` and CONTEXT.md cite this
-  // log line as one of the three mitigations, so deleting it silently invalidates documented
-  // behaviour. Pinned at source level for the same reason as the rest of this file.
-  test("logs the resolved data dir at boot", () => {
-    expect(source).toMatch(/\[boot\] data dir/);
+  // #168: the data-dir log line MOVED into src/bootLog.ts (so it and the new env-file line both
+  // print before ./config's module-body resolveConfig can throw) — index.ts itself no longer
+  // contains the literal text, only the import that runs it first. See bootLog.test.ts for the
+  // #139 data-dir coverage this test used to carry directly.
+  test("imports ./bootLog as its FIRST import, so the boot log runs before ./config can throw (#168)", () => {
+    const firstImport = source.match(/^import\s+(?:[^;]+?\s+from\s+)?["']([^"']+)["'];/m)?.[1];
+    expect(firstImport).toBe("./bootLog");
+    // Mutation: a bare literal-string check alone would still pass if a real import moved above the
+    // bootLog line but happened to also match some other regex — assert ordering explicitly too.
+    expect(source.indexOf('import "./bootLog";')).toBeLessThan(source.indexOf('from "./config"'));
   });
 
   test("loads the Plugin Index, selects plugins, and logs skip reasons before the Client is constructed", () => {

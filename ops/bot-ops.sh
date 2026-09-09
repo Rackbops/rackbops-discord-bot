@@ -401,6 +401,10 @@ cmd_restart() {
   # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
   # different mechanism from the container's own runtime env, which env_file: itself supplies
   # once that interpolation resolves.
+  # #60 item 2 / #168: name which file this restart is acting on, on stderr — env-get/status's
+  # stdout is JSON the panel parses (#101), so a stray stdout line here would be echoed back and
+  # rejected the same way.
+  echo "bot-ops: env file $ENV_FILE" >&2
   BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" restart 2>&1
   echo "restarted $CONTAINER"
 }
@@ -611,6 +615,9 @@ cmd_env_set() {
   # `<project>-bot:latest` compose expects, so recreating without building reuses it. Adding
   # --build here would rebuild from whatever this checkout happens to be on, silently rolling
   # the bot back to older code every time someone edits a setting.
+  # #60 item 2 / #168: same stderr-only convention as cmd_restart — named right before the actual
+  # recreate, not earlier, so a save that hits the "no changes" early return above never logs it.
+  echo "bot-ops: env file $ENV_FILE" >&2
   local recreate_log rc=0
   recreate_log="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
 

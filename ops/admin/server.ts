@@ -265,6 +265,20 @@ export async function logDynamicAdminsStartup(
 }
 
 /**
+ * The panel's other operator-precious path fact, alongside the config dir `logDynamicAdminsStartup`
+ * names: WHICH bot-ops.sh script this instance shells out to, and (when set) which compose file it
+ * targets. Issue #60 item 2 / #168 — two instances per host means a panel pointed at the wrong
+ * script/compose file is otherwise indistinguishable from a correct one in `docker logs`. Pure
+ * (returns the lines rather than printing) so the message shape is test-pinned without capturing
+ * `console.log`.
+ */
+export function describeBotOpsStartup(botOpsSh: string, composeFile: string | undefined): string[] {
+  const lines = [`[admin] bot-ops: ${botOpsSh}`];
+  if (composeFile) lines.push(`[admin] compose file: ${composeFile}`);
+  return lines;
+}
+
+/**
  * Trims and lowercases a raw `CLOUDFLARE_ACCESS_TEAM_DOMAIN` value, then rejects anything that
  * isn't a bare hostname — throws on a value carrying a scheme, port, or path (e.g. pasted with an
  * "https://" prefix still on it), which `new URL(...)` alone would silently accept as a garbage
@@ -1592,6 +1606,7 @@ if (import.meta.main) {
     console.log("[admin] no ADMIN_ALLOWED_EMAILS bootstrap — any Access identity authorizes until admins are added");
   }
   await logDynamicAdminsStartup(adminsFile);
+  for (const line of describeBotOpsStartup(BOT_OPS_SH, process.env.BOT_OPS_COMPOSE_FILE)) console.log(line);
 
   // The BOT_BRANCH chooser's data source: the configured repo's branches from the GitHub API.
   // GITHUB_REPO/GITHUB_TOKEN are read on demand from the mounted .env (never this process's env, so

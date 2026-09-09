@@ -24,6 +24,12 @@ services:
     # see ops/README.md), so ops/bot-ops.sh and ops/install.sh both export BOT_ENV_FILE
     # to point here at its absolute path.
     env_file: ${BOT_ENV_FILE:-.env}
+    # #60 item 2 / #168: tell the bot which file it actually got, so src/bootLog.ts can log it on
+    # every boot. Same interpolation as env_file: above (${BOT_ENV_FILE:-.env}), so the two can never
+    # disagree about which file was loaded — this is a runtime env var the container reads, distinct
+    # from env_file:'s own compose-time load of that file's contents.
+    environment:
+      - BOT_ENV_FILE=${BOT_ENV_FILE:-.env}
     volumes:
       - state:/app/data
       # Self-update (nazumods/wow#879): the bot builds its own replacement and hands off to it through the

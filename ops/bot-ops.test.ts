@@ -1130,3 +1130,39 @@ describe.skipIf(!runnable)("plugin-request (#105)", () => {
     expect((await botOps(fx, ["plugin-request"], req({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7, requestedBy: "t" }))).exitCode).toBe(0);
   });
 });
+
+// #60 item 2 / #168: name which .env this command is acting on, on stderr — env-get/status's
+// stdout is JSON the panel parses (#101's lesson), so the new line must never land on stdout.
+describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they act on (issue #60 item 2 / #168)", () => {
+  test("restart prints the env file path on stderr, and stdout is unchanged", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
+    // Mutation: printing to stdout instead of stderr, or dropping the line, both turn this red.
+    expect(run.stderr).toContain(`bot-ops: env file ${bashPath(fx.envFile)}`);
+    expect(run.stdout).not.toContain("bot-ops: env file");
+    expect(run.stdout).toBe("restarted probe-container\n");
+  });
+
+  test("env-set (a real change) prints the env file path on stderr, before the recreate", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["ANNOUNCE_CHANNEL_ID"] });
+    expect(run.stderr).toContain(`bot-ops: env file ${bashPath(fx.envFile)}`);
+    // env-set's stdout is the JSON result the panel parses — the new line must never land there,
+    // or a stray non-JSON line would be echoed back and rejected (the #101 lesson this issue cites).
+    expect(() => JSON.parse(run.stdout)).not.toThrow();
+  });
+
+  test("env-set with NO real change (the early-return path) never logs the env file line", async () => {
+    // The line sits right before the recreate call, deliberately AFTER the "no changes" early
+    // return — a save that changes nothing must not claim to have acted on the file.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=11111\n"); // same value, no-op
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
+    // Mutation: moving the echo above the no-change early return would turn this red.
+    expect(run.stderr).not.toContain("bot-ops: env file");
+  });
+});
