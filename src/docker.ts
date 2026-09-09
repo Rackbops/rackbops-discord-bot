@@ -58,7 +58,7 @@ export interface ContainerInspect {
   Id: string;
   Name: string;
   Image: string;
-  State: { Running: boolean; Status: string; ExitCode: number };
+  State: { Running: boolean; Status: string; ExitCode: number; StartedAt?: string };
   Config: { Image: string; Env: string[]; Labels: Record<string, string>; User?: string };
   HostConfig: {
     Binds?: string[] | null;
@@ -268,6 +268,24 @@ export async function renameContainer(id: string, name: string, timeoutMs = DEFA
   const params = new URLSearchParams({ name });
   await bounded(timeoutMs, `rename ${id}`, (s) =>
     ok(`/containers/${encodeURIComponent(id)}/rename?${params}`, s, { method: "POST" }),
+  );
+}
+
+/**
+ * `POST /containers/{id}/update` (Engine API >= 1.22) — the only field this bot ever changes on a
+ * running container: its restart policy. Takes effect instantly, no restart needed. Rejected for
+ * a container created with `AutoRemove`; `buildCreateSpec` never sets that, so this is unconditional
+ * here. #160: used to restore the ORIGINAL's real restart policy onto the now-verified replacement
+ * before the original is stopped — see `redeploy.ts`'s `takeOver`. Never pass
+ * `{ Name: "on-failure", MaximumRetryCount: 0 }` — Docker reads `0` as unlimited, not zero.
+ */
+export async function updateContainer(
+  id: string,
+  hostConfig: { RestartPolicy: { Name: string; MaximumRetryCount?: number } },
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<void> {
+  await bounded(timeoutMs, `update ${id}`, (s) =>
+    ok(`/containers/${encodeURIComponent(id)}/update`, s, json(hostConfig)),
   );
 }
 

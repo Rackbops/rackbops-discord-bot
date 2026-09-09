@@ -497,6 +497,64 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   failure the same as every later step). An earlier version of this fix only covered the
   not-running case and missed `undefined`, which is in practice the *more* commonly reached of the
   two — caught in review before merging.
+- **The standby is created with `RestartPolicy: {Name:"no"}`, never the original's — #160.** The
+  original's real policy (`self.HostConfig.RestartPolicy?.Name || "unless-stopped"`) rides along
+  instead, in the env (`HANDOFF_RESTART_POLICY_ENV`, stripped-then-reset exactly like
+  `HANDOFF_FROM_ENV` so it can't stack across a chain of standbys). **`takeOver` restores it onto
+  itself AFTER `tagLatest` and BEFORE `retire(originalId)` — that order is the whole fix, not an
+  implementation detail.** #130 bounds `stopContainer` at 60s, so a stop the daemon genuinely
+  performed but answered slowly is now indistinguishable, from the replacement's side, from one
+  that never happened — if the restore ran only *after* that stop, the window between "original
+  stopped" and "policy restored" would have BOTH containers down with neither's restart policy
+  able to bring either back: a permanent outage, no race required. Restoring first means a throw
+  at the stop is caught before the original is touched, and the original — still alive — reclaims
+  normally. Never `{Name:"on-failure", MaximumRetryCount:0}` as an alternative to `"no"` — Docker
+  reads `0` as *unlimited* retries, not zero; a trap, not a middle ground. `restorePolicy` is
+  deliberately **not** best-effort like `tagLatest` — a swallowed failure would leave the
+  *surviving* bot on `RestartPolicy:"no"` forever, silently, discovered only when a host reboot
+  doesn't bring it back weeks later. Its own `exit(1)` (via `takeOver`'s outer catch) is **not**
+  the `unless-stopped`-recoverable case the gotcha above describes for a *retire* failure — ON A
+  FIRST ATTEMPT this container's own policy is still `"no"` when this failure fires (it's the very
+  thing that failed to get restored), so recovery there is the ORIGINAL's job: still live, still
+  polling (this is the only path that reaches this exit with the original genuinely alive — see the
+  ⚠️ design-constraint section on #160), it reclaims via its own `RETIREMENT_DEADLINE_MS`/
+  failed-marker path exactly as if the replacement had never signalled at all. A RE-ENTRANT
+  `takeOver` (the "nothing left to reclaim" gotcha above — a stale `HANDOFF_FROM` re-arming standby
+  on a later restart of a container that already retired successfully once) is different: this
+  container's policy was already restored to the ORIGINAL's real value the first time around, so
+  it is *not* still `"no"` here, and `unless-stopped` (or whatever that real value was) recovers it
+  regardless of whether the stale `originalId` still names anything live. Don't read "recovery is
+  the original's job" as universal — it's the first-attempt case; the retry case recovers by the
+  policy already being right from before.
+- **A stop that *throws* during `retireOriginal`'s live branch is no longer automatically a failed
+  stop — #160.** Before the standby's own policy could be `"no"`, any `stopContainer` failure on a
+  live original was unambiguous: propagate, let the still-alive original reclaim. Post-#160, #130's
+  60s bound means a stop the daemon actually performed but answered slowly looks identical to one
+  that never ran — and treating it as a failure would exit the replacement (now the only bot that
+  can go live) over what was in fact success. The fix re-inspects on any throw: original confirmed
+  gone or not running → the stop worked, log and proceed to remove/rename exactly as the ordinary
+  path would; original still confirmed running → the stop genuinely failed, rethrow, unchanged.
+  Only the live branch gets this — the already-stopped/already-gone branches already tolerated a
+  stop failure outright (see the gotcha above) and don't need a re-inspect to tell why.
+- **`redeploy()`'s pre-removal generation check compares the replacement's `State.StartedAt`
+  against when its outcome was decided, not just whether it's currently running — #160, defence in
+  depth.** Change 2 above already stops Docker itself from resurrecting an unverified standby, so
+  this covers what's left: a manual `docker start` on a removed-but-still-present replacement, a
+  standby a pre-#160 original created (still on `unless-stopped`), or `restorePolicy`'s own
+  transport-drop mirror case (see `takeOver`'s docstring) genuinely restarting the replacement mid
+  retirement-wait. `Date.parse(current.State.StartedAt) > observedAt` means a *different life* of
+  the same container id — force-removing it would kill a bot that may be genuinely up and serving. A
+  tie (same instant) is not `>` and is removed, matching the ordinary case exactly (nothing races
+  its own `StartedAt` against itself). **`observedAt` is NOT always `awaitHandoff`'s own timestamp**
+  — that's true only for `failed`/`timeout` decided directly from a poll. When `ready` is later
+  demoted to `stalled` or `failed` (the retirement wait, up to `RETIREMENT_DEADLINE_MS` — 3 real
+  minutes — after "ready" first arrived), `redeploy()` re-samples `observedAt` at THAT decision
+  instead: an unrefreshed baseline pinned to the stale "ready" moment would wrongly read a
+  replacement that restarted anywhere in that 3-minute window as "a later generation," silently
+  skipping a removal it should make (found in review; `redeploy.test.ts`'s dedicated "between
+  'ready' and the LATE stalled decision" test is the mutation guard). A confirmation inspect that
+  itself fails must NOT skip the removal — that would be a new, silent way to leak a replacement
+  container on an ordinary daemon blip; only a *positive* confirmed later generation ever skips it.
 - **A second `/update` mid-swap answers `busy`** — the guard sits at the top of
   `checkForUpdate`, before any state write or network call, because interaction handling does
   not quiesce during a handoff (only the scheduler does) and `/update`'s `force: true` bypasses

@@ -20,6 +20,7 @@ import {
   stopContainer,
   tagImage,
   tryInspectContainer,
+  updateContainer,
   type ContainerInspect,
   type CreateContainerSpec,
   type ImageSummary,
@@ -30,6 +31,7 @@ import {
   decideHandoffOutcome,
   HANDOFF_DEADLINE_MS,
   HANDOFF_FROM_ENV,
+  HANDOFF_RESTART_POLICY_ENV,
   readMarker,
   RETIREMENT_DEADLINE_MS,
   writeMarker,
@@ -131,16 +133,28 @@ export function selectImagesToPrune(
  * container's own short id to this same array on top of any deliberately-configured alias, so
  * that one entry is dropped — it names the OLD container specifically and means nothing on the
  * new one, unlike a real service alias which is meant to be shared.
+ *
+ * #160: the replacement's OWN restart policy is always `{ Name: "no" }` — never the original's —
+ * so Docker itself can never resurrect an unverified standby mid-boot-loop or mid-crash. The
+ * original's real policy name rides along in the env instead (`HANDOFF_RESTART_POLICY_ENV`,
+ * alongside `HANDOFF_FROM_ENV`), for `takeOver` to restore onto this container once it has
+ * actually verified — see `takeOver`'s own docstring for why the ordering there is load-bearing.
  */
 export function buildCreateSpec(
   self: ContainerInspect,
   o: { image: string; handoffFrom: string; oldImageEnv: string[] },
 ): CreateContainerSpec {
   const oldImageEnvSet = new Set(o.oldImageEnv);
+  const originalPolicyName = self.HostConfig.RestartPolicy?.Name || "unless-stopped";
   const env = self.Config.Env.filter(
-    (e) => !e.startsWith("GIT_SHA=") && !e.startsWith(`${HANDOFF_FROM_ENV}=`) && !oldImageEnvSet.has(e),
+    (e) =>
+      !e.startsWith("GIT_SHA=") &&
+      !e.startsWith(`${HANDOFF_FROM_ENV}=`) &&
+      !e.startsWith(`${HANDOFF_RESTART_POLICY_ENV}=`) &&
+      !oldImageEnvSet.has(e),
   );
   env.push(`${HANDOFF_FROM_ENV}=${o.handoffFrom}`);
+  env.push(`${HANDOFF_RESTART_POLICY_ENV}=${originalPolicyName}`);
   const netMode = self.HostConfig.NetworkMode;
   const selfShortId = self.Id.slice(0, 12);
   const aliases = netMode
@@ -161,7 +175,9 @@ export function buildCreateSpec(
       Binds: self.Mounts.map(
         (m) => `${m.Name ?? m.Source}:${m.Destination}:${m.RW ? "rw" : "ro"}`,
       ),
-      RestartPolicy: { Name: self.HostConfig.RestartPolicy?.Name || "unless-stopped" },
+      // #160: never the original's policy — see this function's own docstring. Never
+      // {Name:"on-failure", MaximumRetryCount:0} either; Docker reads 0 as unlimited, not zero.
+      RestartPolicy: { Name: "no" },
       NetworkMode: netMode,
       // Compose's `init: true` lives on the container, not the image — without carrying it
       // over, the replacement runs its process as PID 1 instead of under docker-init.
@@ -272,9 +288,14 @@ export async function redeploy(
   console.log(`[redeploy] replacement ${name} started — waiting for it to verify`);
 
   let outcome: HandoffOutcome;
+  // Sampled by awaitHandoff right before the observation that decided the outcome; 0 (epoch) on
+  // the catch-below path, where nothing was ever decided by an observation at all — see the
+  // removal guard below for why that default is safe (a genuinely running replacement with any
+  // real StartedAt is always > 0, so the guard only ever SKIPS a removal on real, later evidence).
+  let observedAt = 0;
   let pollError: string | undefined;
   try {
-    outcome = await awaitHandoff(replacementId);
+    ({ outcome, observedAt } = await awaitHandoff(replacementId));
     if (outcome === "ready") {
       // It has verified and is retiring us; this process is about to be stopped mid-sentence.
       // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
@@ -295,6 +316,15 @@ export async function redeploy(
         console.error("[redeploy] verified replacement never retired us — reclaiming");
         outcome = "stalled";
       }
+      // #160: re-sample the removal guard's baseline HERE, not the much-earlier "ready" observation
+      // above. awaitRetirementFailure can run for up to RETIREMENT_DEADLINE_MS (3 minutes) — a
+      // replacement whose restorePolicy update genuinely landed at the daemon but whose response was
+      // lost (the exact transport-drop class retireOriginal's own re-inspect already treats as
+      // realistic) restarts under its now-correctly-restored policy sometime in that window, and its
+      // StartedAt must be judged against when THIS decision was actually made, not against the stale
+      // moment "ready" first arrived — an unrefreshed baseline biases the guard toward wrongly
+      // skipping a removal it should make.
+      observedAt = Date.now();
     }
   } catch (err) {
     // A daemon blip anywhere in this stretch (a dropped socket, one 500 from the poll, or —
@@ -309,7 +339,36 @@ export async function redeploy(
 
   const marker = await readMarker();
   try {
-    await removeContainer(replacementId, true);
+    // #160 change 5, defence in depth: change 2 (the standby's RestartPolicy:"no") already stops
+    // Docker itself from producing this, so this guard is for what's left — a manual `docker
+    // start` on the replacement, or a standby created by a pre-#160 original mid-rollout (still on
+    // "unless-stopped"). Compares container GENERATIONS, not identity: if the replacement is
+    // running again and its CURRENT StartedAt is strictly after the moment we decided its outcome,
+    // it's a different life of the same container than the one we just judged — leave it alone
+    // rather than force-remove a bot that may be genuinely up and serving. A tie (same instant) is
+    // not ">" and is removed, same as before — an ordinary same-generation removal never races its
+    // own StartedAt against itself.
+    //
+    // The confirmation inspect is allowed to fail WITHOUT skipping removal — a daemon blip here
+    // must degrade to the ordinary attempt (same as before this guard existed), never become a new
+    // reason cleanup is skipped; only a POSITIVE, confirmed "it's a later generation" ever does.
+    let restartedSinceDecision = false;
+    try {
+      const current = await tryInspectContainer(replacementId);
+      restartedSinceDecision =
+        current?.State.Running === true &&
+        !!current.State.StartedAt &&
+        Date.parse(current.State.StartedAt) > observedAt;
+    } catch (inspectErr) {
+      console.warn(
+        `[redeploy] couldn't confirm the replacement's generation before removing it — proceeding as usual: ${(inspectErr as Error).message}`,
+      );
+    }
+    if (restartedSinceDecision) {
+      console.warn(`[redeploy] replacement restarted after we decided ${outcome} — leaving it alone`);
+    } else {
+      await removeContainer(replacementId, true);
+    }
   } catch (err) {
     // Cleanup, not the verdict — a stuck removal (e.g. a 409 mid-teardown) must not skip the
     // `endHandoff()` below either, for the same reason a poll failure above must not.
@@ -327,10 +386,15 @@ export async function redeploy(
   return { outcome, error: pollError ?? marker?.error };
 }
 
-/** Poll the marker and the replacement's own state until one of them decides it. */
-async function awaitHandoff(replacementId: string): Promise<HandoffOutcome> {
+/** Poll the marker and the replacement's own state until one of them decides it. `observedAt` is
+ *  sampled right before the observation that produced the terminal outcome (#160, change 5) — the
+ *  baseline `redeploy()`'s pre-removal generation check compares the replacement's later
+ *  `State.StartedAt` against, so a replacement that restarted after this observation isn't
+ *  force-removed as if it were still the one this outcome was decided about. */
+async function awaitHandoff(replacementId: string): Promise<{ outcome: HandoffOutcome; observedAt: number }> {
   const startedAt = Date.now();
   for (;;) {
+    const observedAt = Date.now();
     const [marker, container] = await Promise.all([
       readMarker(),
       tryInspectContainer(replacementId),
@@ -344,7 +408,7 @@ async function awaitHandoff(replacementId: string): Promise<HandoffOutcome> {
       },
       elapsedMs: Date.now() - startedAt,
     });
-    if (outcome !== "waiting") return outcome;
+    if (outcome !== "waiting") return { outcome, observedAt };
     await Bun.sleep(POLL_MS);
   }
 }
@@ -407,7 +471,23 @@ export async function retireOriginal(originalId: string): Promise<void> {
   // reclaim," so both get the same tolerant handling.
   const originalStillLive = original !== undefined && original.State.Running;
   if (originalStillLive) {
-    await stopContainer(originalId);
+    // #160: with the replacement's own RestartPolicy now "no" until takeOver restores it, a stop
+    // that THROWS here is no longer necessarily a failed stop — #130 bounds this call at 60s, so a
+    // stop the daemon actually performed but answered slowly now looks identical to one that never
+    // happened at all. Re-inspecting tells the two apart: if the original is confirmed down, the
+    // stop worked and a slow response is not a reason to leave the sole live bot exiting — proceed
+    // to remove/rename below exactly as the ordinary path would. If it's still running, the stop
+    // genuinely failed and the original really is alive to reclaim — rethrow, unchanged from before.
+    try {
+      await stopContainer(originalId);
+    } catch (err) {
+      const stillThere = await tryInspectContainer(originalId);
+      if (stillThere === undefined || !stillThere.State.Running) {
+        console.warn("[handoff] stop answered late — the original is already down; continuing");
+      } else {
+        throw err;
+      }
+    }
   } else {
     await stopContainer(originalId).catch((err) => {
       console.warn(`[handoff] stop of the already-gone-or-stopped original failed: ${(err as Error).message}`);
@@ -448,6 +528,13 @@ export interface TakeOverEffects {
   /** Applies `:latest` onto this (now-verified) replacement's own image. Best-effort — see its
    *  call site in {@link takeOver}. */
   tagLatest?: () => Promise<void>;
+  /** Restores the ORIGINAL's real restart policy onto this (now-verified) container. Runs after
+   *  `tagLatest` and BEFORE `retire` — see {@link takeOver}'s own docstring for why the ordering
+   *  is load-bearing. **Not** best-effort like `tagLatest`: a throw here propagates to the outer
+   *  catch (failed marker + exit), because a swallowed failure would leave the *surviving* bot on
+   *  `RestartPolicy: "no"` forever — silently, until a host reboot doesn't bring it back and
+   *  someone notices weeks later. */
+  restorePolicy?: () => Promise<void>;
   exit?: (code: number) => void;
 }
 
@@ -458,26 +545,57 @@ async function tagSelfAsLatest(): Promise<void> {
   await tagImage(self.Config.Image, latestTag(self.Config.Image));
 }
 
+/** The real `restorePolicy` effect (#160): reads the original's restart-policy name carried in
+ *  this (standby) container's own env — `HANDOFF_RESTART_POLICY_ENV`, set by `buildCreateSpec` —
+ *  and restores it onto THIS, now-verified, container before the original is ever stopped. Falls
+ *  back to `"unless-stopped"` when the env is absent (a `takeOver` invoked outside the normal
+ *  create path, or a standby created by a pre-#160 original mid-rollout). */
+async function restoreOriginalRestartPolicy(): Promise<void> {
+  const name = process.env[HANDOFF_RESTART_POLICY_ENV] ?? "unless-stopped";
+  const self = await inspectSelf();
+  await updateContainer(self.Id, { RestartPolicy: { Name: name } });
+}
+
 /**
  * Complete the swap from the replacement's side, and make that completion crash-proof.
  *
  * Runs in the *replacement*: it announces `ready` (which stops the original counting toward its
  * deadline), applies `:latest` onto its own now-verified image (issue #39 — best-effort; a tag
- * hiccup must not turn a genuinely successful handoff into a reported failure), retires the
- * *original* — `retireOriginal` stops that other container, never this one — and clears the
- * marker. On success this returns, and `index.ts` goes on to `activate()`; this process is the
- * survivor that becomes the live bot.
+ * hiccup must not turn a genuinely successful handoff into a reported failure), restores the
+ * *original's* restart policy onto itself (#160 — not best-effort, see {@link TakeOverEffects}),
+ * retires the *original* — `retireOriginal` stops that other container, never this one — and
+ * clears the marker. On success this returns, and `index.ts` goes on to `activate()`; this
+ * process is the survivor that becomes the live bot.
  *
  * The guard is for the unhappy path. Almost every throw site inside is at or before the original
- * is stopped: `write` and the pre-stop inspect precede it, and `stopContainer` throws on an HTTP
- * error before the stop has taken — so a throw normally leaves the original still alive and about
- * to reclaim us, via `failed` if it is still polling or `stalled` once it gives up waiting for a
- * stop that never comes. The lone exception is a transport-level drop *after* the daemon has
- * already stopped the original but before its response returns; then both bots are momentarily
- * down, but only momentarily — `unless-stopped` restarts this process, its next `takeOver` finds
- * the original already stopped (a no-op stop, then it removes it and takes the name) and goes
- * live. So the worst case is a bounded, self-recovering blip: never a permanent outage, and never
- * two live bots.
+ * is stopped: `write`, `restorePolicy`, and the pre-stop inspect all precede it, and
+ * `stopContainer` throws on an HTTP error before the stop has taken — so a throw normally leaves
+ * the original still alive and about to reclaim us, via `failed` if it is still polling or
+ * `stalled` once it gives up waiting for a stop that never comes. Past the stop, `retireOriginal`
+ * itself re-inspects a slow-but-real stop rather than treating it as a failure (#160) — so the one
+ * remaining way both bots end up momentarily down is a transport-level drop *after* the daemon has
+ * genuinely stopped the original but before its response returns *and* the re-inspect that follows
+ * also can't confirm it; then `unless-stopped` restarts this process — this container's own policy
+ * is restored by this point, so it is no longer `"no"` — its next `takeOver` finds the original
+ * already stopped (a no-op stop, then it removes it and takes the name) and goes live. So the
+ * worst case is a bounded, self-recovering blip: never a permanent outage, and never two live bots.
+ * (Before #160 the standby's own policy stayed the original's `unless-stopped` throughout, so this
+ * recovery path existed unconditionally; now it depends on `restorePolicy` having already run —
+ * which is exactly why that call is NOT best-effort and sits before the stop, never after it.)
+ *
+ * `restorePolicy` has a mirror transport-drop case of its own: the daemon genuinely applies the
+ * policy update, but the response is lost before this process reads it, so `takeOver` treats it as
+ * a failure and exits (this container's *own* policy is still `"no"` at that exact instant — the
+ * update it doesn't know succeeded is the very thing it's about to be judged on). Recovery here is
+ * NOT the cheap no-op-stop path above — this container comes back under the now-genuinely-restored
+ * policy and re-runs the WHOLE standby cycle from scratch (boot, `resolveBootMode`, gateway login,
+ * `ClientReady`, a fresh `takeOver`), bounded by the same `VERIFY_DEADLINE_MS`/`HANDOFF_DEADLINE_MS`
+ * as any other standby attempt. It never produces two live bots or a permanent outage (the original
+ * is never touched by anything before `retire`, so it stays live and reclaims on its own deadline
+ * regardless of what this container does), but it is a materially heavier retry than the stop-drop
+ * case, and `redeploy()`'s generation-keyed removal guard (`awaitHandoff`'s `observedAt`, resampled
+ * at the point the *original* actually decides `stalled`/`failed` — see its own comment) is what
+ * keeps the original from force-removing that retrying replacement out from under itself mid-flight.
  *
  * On failure, then, we do the one safe thing: write a `failed` marker — which lets an original
  * still polling reclaim at once instead of waiting its deadline out — and exit. We must not fall
@@ -493,6 +611,7 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
   const retire = effects.retire ?? retireOriginal;
   const clear = effects.clear ?? clearMarker;
   const tagLatest = effects.tagLatest ?? tagSelfAsLatest;
+  const restorePolicy = effects.restorePolicy ?? restoreOriginalRestartPolicy;
   const exit = effects.exit ?? ((code: number) => process.exit(code));
   try {
     await write({ status: "ready", sha: config.gitSha, at: Date.now() });
@@ -508,6 +627,12 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
           `the previous one, until the next successful update retags it): ${(err as Error).message}`,
       );
     });
+    // #160: restore the ORIGINAL's restart policy onto THIS container — AFTER tagLatest, BEFORE
+    // retire(originalId). The standby was created with RestartPolicy:"no" precisely so Docker can
+    // never resurrect it half-verified; that protection only stays safe if a policy-restored,
+    // genuinely-live bot exists before the one still-answering bot is torn down. Deliberately NOT
+    // wrapped in a `.catch` like tagLatest above — see TakeOverEffects.restorePolicy's own comment.
+    await restorePolicy();
     await retire(originalId);
     await clear();
   } catch (err) {
