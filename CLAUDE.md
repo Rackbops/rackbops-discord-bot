@@ -53,6 +53,34 @@ separate from the compose file) -- see the config-dir gotcha in `CONTEXT.md`.
 
 ---
 
+## Override of the personal one-answer-file rule (deployment config)
+
+Personal `CLAUDE.md`'s Application config & deployment section calls for **one** operator-edited
+answer file per service deployment -- secrets and params together -- with everything else rendered
+from it. **This repo deviates from that letter on purpose (decided 2026-09-08, issue #169, #60 item
+1):** deployment stays **two** files, never merged into one --
+
+- `/opt/stacks/rackbops-discord-bot-<instance>/.env` -- generated, refreshed on every
+  `ops/install.sh` run, holds only non-secret params (container name, paths, build context, the
+  resolved commit). Compose's own `${VAR}` interpolation source.
+- `/opt/rackbops-discord-bot/<instance>/.env` -- hand-edited from `.env.example` once, holds
+  secrets (`DISCORD_TOKEN` and friends), never touched again by anything but the operator.
+
+**Why the override is still allowed:** the personal rule exists to guarantee three things, and all
+three hold here without merging the files -- no deployment param lives in the operator's head or
+shell history (it's in the generated file, and `validate_stack_env` fails loudly naming the exact
+field if a future rendering bug produces a bad one); a generated file is never hand-edited
+(`ops/install.sh` always refreshes the stack `.env`, same as `bin/bot-ops.sh` and the compose file);
+and the one precious, operator-edited file is never auto-touched. Promoting the stack `.env` to also
+hold secrets would need migrating live secrets on every already-deployed instance for no behaviour
+change; a single answer file rendering both `.env`s and the compose file would give up the property
+that lets self-update stay independent of this file and `ops/install.sh` be safely re-run (the
+compose file is fetched **verbatim** from the target branch on every run, never rendered). Full
+option table and the decision: issue #169. Details: `ops/README.md`'s "Why two files, not one
+answer file" and `CONTEXT.md`'s matching gotcha.
+
+---
+
 ## Testing & checks
 
 Run before staging (they do not substitute for the **review gate**):

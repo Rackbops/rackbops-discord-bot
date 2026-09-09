@@ -149,6 +149,49 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
   });
 });
 
+// install.sh's printed "bring it up" step (#169) is shortened to a bare `docker compose -f
+// $STACK_DIR/docker-compose.yml -p $PROJECT up -d --build`, with none of GIT_SHA/BOT_ENV_FILE/
+// BOT_BUILD_CONTEXT/BOT_OPS_CONTAINER exported as shell prefixes any more — they're all already in
+// the generated $STACK_DIR/.env (install.sh:200-208), so dropping them relies entirely on Compose
+// resolving its project directory (and therefore which .env it auto-loads) from the directory of
+// the file passed via -f, regardless of the invoking shell's own cwd. The test above only proves
+// that auto-load when cwd already IS the stack dir (Dockge's own invocation shape, matching this
+// file's own top comment); install.sh's real invocation is different — an ABSOLUTE -f path, run
+// from wherever the operator's shell happens to be, never a `cd` into the stack dir first. Proven
+// for real here rather than trusted from Compose's docs, since a wrong assumption would silently
+// break every future bring-up install.sh prints.
+describe.skipIf(!runnable)("an absolute -f path resolves its OWN directory's .env regardless of cwd (#169)", () => {
+  test("docker compose -f <absolute path> config still picks up that directory's .env from an unrelated cwd", async () => {
+    const dir = makeStack(null);
+    const botEnvFile = join(dir, "bot-secrets.env");
+    writeFileSync(botEnvFile, "PROBE_ENV_MARKER=absolute-path-cwd-probe\n");
+    const stackEnv = [
+      `BOT_ENV_FILE=${botEnvFile}`,
+      "BOT_OPS_CONTAINER=probe-abs-cwd-instance",
+      "BOT_OPS_PROJECT=probe-abs-cwd-instance",
+      `BOT_OPS_CONFIG_DIR=${dir}`,
+      `BOT_OPS_COMPOSE_FILE=${join(dir, "docker-compose.yml")}`,
+      "BOT_BUILD_CONTEXT=https://example.invalid/repo.git#main",
+      "GIT_SHA=deadbeef",
+      "",
+    ].join("\n");
+    writeFileSync(join(dir, ".env"), stackEnv);
+
+    // The one thing that differs from every other test in this file: cwd is deliberately NOT dir
+    // (an unrelated tmp dir), and -f carries dir's own ABSOLUTE path, not a bare relative filename.
+    const proc = Bun.spawn(
+      ["docker", "compose", "-f", join(dir, "docker-compose.yml"), "-p", "probe-abs-cwd", "config", "--format", "json"],
+      { cwd: tmpdir(), stdout: "pipe", stderr: "pipe", env: cleanEnv() },
+    );
+    const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    expect(exitCode).toBe(0);
+    const json: ComposeConfig = JSON.parse(stdout);
+    expect(json.services.bot!.container_name).toBe("probe-abs-cwd-instance");
+    expect(json.services.bot!.container_name).not.toBe("warbandeer-discord");
+    expect(JSON.stringify(json.services.bot)).toContain("absolute-path-cwd-probe");
+  });
+});
+
 // cloudflared's TUNNEL_TOKEN is Compose *interpolation* (${CLOUDFLARE_TUNNEL_TOKEN} in the
 // environment: block), resolved only from a shell-exported var or the stack directory's own
 // .env — never from BOT_ENV_FILE/$CONFIG_DIR/.env, which is a completely separate env_file:
