@@ -81,16 +81,17 @@ services:
     # invoking shell first — see ops/install.sh's printed command), so only those values ever
     # reach this container, not the rest of the file.
     #
-    # BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE deliberately use a plain `:-` default here, NOT
-    # `:?required` — compose interpolates and validates every service in the file up front,
-    # regardless of which --profile is active, so a `:?` on this service would break a plain
-    # `docker compose up -d --build` for the *bot* service too (verified: it does, immediately,
-    # with no --profile admin in sight). An empty default instead surfaces as a "no such file or
-    # directory" error from bot-ops.sh's own `[ -f ... ] || die` checks (its `main()` guard) if
-    # `admin` is ever actually started without these set — Docker itself auto-creates a missing
-    # bind-mount directory rather than erroring, so the failure is bot-ops.sh's, not Docker's —
-    # but it's still a clean, immediate 502 rather than a crash, and only when this profile is
-    # the one being brought up.
+    # BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE/BOT_OPS_PROJECT/BOT_OPS_CONTAINER deliberately use a
+    # plain `:-` default here, NOT `:?required` — compose interpolates and validates every service
+    # in the file up front, regardless of which --profile is active, so a `:?` on this service
+    # would break a plain `docker compose up -d --build` for the *bot* service too (verified: it
+    # does, immediately, with no --profile admin in sight). An empty default instead surfaces as
+    # bot-ops.sh's own top-level "not set" die (ops/bot-ops.sh:106-140, before `main()` ever runs)
+    # if `admin` is ever actually started without these set — this is the layer-up fix for #41: a
+    # `:-warbandeer-discord*` default here would set the var to a bogus monorepo name, so
+    # bot-ops.sh's "unset" guard never fires and it silently targets a project no deploy produces
+    # (issue #135 item 10). It's still a clean, immediate failure rather than a crash, and only
+    # when this profile is the one being brought up.
     environment:
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - CLOUDFLARE_ACCESS_TEAM_DOMAIN=${CLOUDFLARE_ACCESS_TEAM_DOMAIN:-}
@@ -98,8 +99,8 @@ services:
       - ADMIN_ALLOWED_EMAILS=${ADMIN_ALLOWED_EMAILS:-}
       - BOT_OPS_CONFIG_DIR=${BOT_OPS_CONFIG_DIR:-}
       - BOT_OPS_COMPOSE_FILE=${BOT_OPS_COMPOSE_FILE:-}
-      - BOT_OPS_PROJECT=${BOT_OPS_PROJECT:-warbandeer-discord-debug}
-      - BOT_OPS_CONTAINER=${BOT_OPS_CONTAINER:-warbandeer-discord}
+      - BOT_OPS_PROJECT=${BOT_OPS_PROJECT:-}
+      - BOT_OPS_CONTAINER=${BOT_OPS_CONTAINER:-}
     volumes:
       # Root-equivalent on the host, same accepted tradeoff as the bot service's own socket
       # mount above — it's the only way this panel can shell out to `docker compose` at all.
