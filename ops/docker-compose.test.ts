@@ -135,6 +135,17 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     // Whole-object stringify rather than a specific key — robust to wherever Compose's resolved
     // JSON actually places a loaded env_file's contents (see the comment above).
     expect(JSON.stringify(json!.services.bot)).toContain("rackbops-instance-secrets");
+    // #60 item 2 / #168: BOT_ENV_FILE itself must ALSO reach the bot's runtime `environment` (a
+    // separate mechanism from env_file: above, which only loads that file's CONTENTS) — this is
+    // what src/bootLog.ts reads to log which file it was actually started against. Whole-object
+    // stringify (not a specific key/format) for the same Compose-rendering-shape-not-guaranteed
+    // reason as the assertion above — `config --format json` may render `environment:` as either
+    // an object or an array depending on version, so check both the key name and the resolved
+    // value appear, rather than assume a `KEY=value` shape. Mutation: removing docker-compose.yml's
+    // `environment: BOT_ENV_FILE: ...` entry turns this red.
+    const botServiceJson = JSON.stringify(json!.services.bot);
+    expect(botServiceJson).toContain("BOT_ENV_FILE");
+    expect(botServiceJson).toContain(botEnvFile);
   });
 
   test("a bare stack dir with a plain local .env (no BOT_OPS_* keys) keeps the local-dev default", async () => {

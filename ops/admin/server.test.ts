@@ -27,6 +27,7 @@ import {
   isAuthorized,
   isCrossSiteWrite,
   isEmailAllowed,
+  describeBotOpsStartup,
   logDynamicAdminsStartup,
   mergePluginsView,
   ADMIN_API_VERSION,
@@ -467,6 +468,34 @@ describe("logDynamicAdminsStartup", () => {
     expect(logs.length).toBe(0);
     expect(errors.length).toBe(1);
     expect(errors[0]).toContain(file);
+  });
+});
+
+// #60 item 2 / #168: the panel's other operator-precious path fact, alongside the config dir above.
+describe("describeBotOpsStartup (issue #60 item 2 / #168)", () => {
+  test("names the bot-ops script unconditionally", () => {
+    // Mutation: dropping this line would leave the script path invisible at startup.
+    expect(describeBotOpsStartup("/opt/rackbops-discord-bot/bin/bot-ops.sh", undefined)).toEqual([
+      "[admin] bot-ops: /opt/rackbops-discord-bot/bin/bot-ops.sh",
+    ]);
+  });
+
+  test("also names the compose file when BOT_OPS_COMPOSE_FILE is set", () => {
+    const lines = describeBotOpsStartup(
+      "/opt/rackbops-discord-bot/bin/bot-ops.sh",
+      "/opt/stacks/rackbops-discord-bot-debug/docker-compose.yml",
+    );
+    expect(lines).toEqual([
+      "[admin] bot-ops: /opt/rackbops-discord-bot/bin/bot-ops.sh",
+      "[admin] compose file: /opt/stacks/rackbops-discord-bot-debug/docker-compose.yml",
+    ]);
+  });
+
+  test("omits the compose-file line when it's unset or empty — never prints it as undefined/blank", () => {
+    // Mutation: always pushing the second line would print a bare "[admin] compose file: " or
+    // "...undefined" when the env var genuinely isn't configured for this instance.
+    expect(describeBotOpsStartup("x", undefined)).toHaveLength(1);
+    expect(describeBotOpsStartup("x", "")).toHaveLength(1);
   });
 });
 
