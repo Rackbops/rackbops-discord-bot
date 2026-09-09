@@ -1,12 +1,23 @@
 # EP — Production readiness — implementation plan
 
-Status: **in progress** (2026-09-09). #83 done (PR #188 `e8b1dd6`, one round — a claims finding
-corrected this plan's own false statement that a build-only job guards the #163 missing-COPY class;
-it does not, since neither Dockerfile resolves imports at build time). #9 step 2 done (bootstrap
-re-run from `main`, Blizzard creds copied); steps 1/3/4 **deferred by roshne** (a shared token with
-the live debug bot was declined — two connections on one token double-handle everything). #84 is
-unblocked (context name `docker-build`) and awaits roshne's PUT; #11 waits on #9; #10 waits on the
-old-token disposition. Epic issue:
+Status: **CLOSED — epic complete 2026-09-09.** All five children done; exit criterion met: prod's
+three containers healthy beside debug's, prod's panel at `bot.rackbops.com` behind Access with both
+schema lines, `main` refusing a direct push and a pre-checks merge (GH006 / "2 of 2 required status
+checks are expected"), and the old `warbandeer-discord` container + `~/repos/wow-debug` gone. The
+running log follows. Was: in progress (2026-09-09) — three of five done. #83 (PR #188 `e8b1dd6`; a claims finding
+corrected this plan's own false "second layer against the #163 class" statement). #9: prod is up as
+**`Rackbops-Bot#9518`** on its own Discord application (a shared token with debug was declined),
+"same as debug for everything" except `COMMAND_PREFIX` cleared on prod; announce channel still
+shared (duplicate announcements until one changes). #11: `bot.rackbops.com` behind Access — the
+Cloudflare objects were created by a fresh subordinate with the authorized MCP (six-email policy,
+"six and six" per roshne), the nucbox side by the orchestrator after that session's own permission
+gate blocked its SSH reads (roshne chose the takeover; not done on the peer's request); a guarded
+write proven both ways; Kuma monitor 17 paused pending the service-token headers; the tools-site
+card carries both URLs (Tooling#579, published). Lesson: `--profile tunnel up` recreates the bot
+through `depends_on` when its env changed — use `--no-deps`. #10 done: the old container, four
+images, two state volumes and the 2.6 GB checkout (token identical to debug's, so hygiene only) are
+gone; root-owned `node_modules` left by the old root-run container needed `sudo` to delete. Left:
+**#84 only** (roshne's PUT; two rejection probes then close). Epic issue:
 [#182](https://github.com/Rackbops/rackbops-discord-bot/issues/182). Children (in order):
 [#83](https://github.com/Rackbops/rackbops-discord-bot/issues/83),
 [#84](https://github.com/Rackbops/rackbops-discord-bot/issues/84),

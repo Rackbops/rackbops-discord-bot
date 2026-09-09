@@ -95,7 +95,11 @@ Run before staging (they do not substitute for the **review gate**):
 (`checks` job) plus a build-only validation of both Docker images (`docker-build` job, #83) on
 `pull_request` (not on push to `main`). Some tests `skipIf(win32)`, or skip when `docker compose` / `jq`
 is absent -- those run only on CI's Linux, so a green run on this Windows box is **not** proof they
-pass; name that gap per personal's **Done means**.
+pass; name that gap per personal's **Done means**. **`main` is branch-protected (#84):** both jobs
+must be green and the branch up to date with `main` (strict) before GitHub allows a merge, admins
+included -- a PR that has fallen behind needs `gh pr update-branch` first. Direct pushes to `main`
+are rejected. This is per-repository; it changes nothing for `claude-memory-sync`'s direct-to-main
+convention.
 
 ---
 
