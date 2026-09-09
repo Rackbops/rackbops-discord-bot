@@ -9,10 +9,10 @@
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "verbatimModuleSyntax": true,
-    // #136: catches an unused local, param, or plain (non-aliased) import/type-import --
-    // reproduced and confirmed does NOT catch an unused import that uses `as` aliasing
-    // (`import { X as Y }`), under this repo's verbatimModuleSyntax. Nothing in this repo today
-    // catches that specific case; eslint's no-unused-vars or knip would, if ever added.
+    // #136: catches an unused local, param, or import/type-import, aliased or not -- EXCEPT an
+    // import whose local name starts with `_` (`import { X as _y }`): TypeScript treats that as
+    // deliberately unused, as it does a `_param`. A `_`-prefixed local `const` is still flagged.
+    // Nothing in this repo today catches that case; eslint's no-unused-vars would, if ever added.
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "skipLibCheck": true,
