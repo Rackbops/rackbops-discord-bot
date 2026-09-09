@@ -157,7 +157,8 @@ export function clampReply(text: string, max = 1900): string {
 
 /**
  * #132: the one place every GitHub request-header shape in this repo's `src/` is assembled
- * (`update.ts`'s read-only `apiHeaders` imports and calls this too). Default (read) is
+ * (`update.ts`'s `fetchLatestBotSha`/`fetchShaRelation` call this directly -- update.ts's own
+ * former `apiHeaders` wrapper is gone, folded into this function). Default (read) is
  * Accept + User-Agent, plus `Authorization` when a token is configured -- reading is fine
  * unauthenticated, just rate-limited harder. `{ write: true }` additionally REQUIRES a token
  * (this repo's only write paths, `createIssue`/`ensureLabel`, need `repo`/`issues:write` scope) and
