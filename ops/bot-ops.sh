@@ -60,10 +60,25 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
 cmd_version() {
   need jq
+  # #178: composeSchema is read straight from $BOT_OPS_COMPOSE_FILE's own x-rackbops-schema: line —
+  # NOT the $COMPOSE_FILE local below, which isn't resolved until AFTER version's early dispatch —
+  # ONLY when that path is set and the file exists, so this stays precondition-free (#173 round 3).
+  # An unset var, a missing file, or a missing/malformed x-rackbops-schema line are ALL the same
+  # `composeSchema: null`, never an error — this must never crash regardless of what state the
+  # instance's compose file is in.
+  local compose_schema="" raw_compose_file
+  raw_compose_file="${BOT_OPS_COMPOSE_FILE:-}"
+  if [ -n "$raw_compose_file" ] && [ -f "$raw_compose_file" ]; then
+    compose_schema="$(grep -m1 '^x-rackbops-schema:[[:space:]]*[0-9]\+[[:space:]]*$' "$raw_compose_file" 2>/dev/null | grep -o '[0-9]\+' || true)"
+  fi
   # #173: stdout JSON only, same convention as status/env-get — the panel's runBotOps reads this
   # subcommand's stdout as JSON, so a stray non-JSON line here would break the same way a stray
   # stdout line already breaks env-get/status (#101).
-  jq -n --argjson schema "$BOT_OPS_SCHEMA" '{schema: $schema}'
+  if [ -n "$compose_schema" ]; then
+    jq -n --argjson schema "$BOT_OPS_SCHEMA" --argjson composeSchema "$compose_schema" '{schema: $schema, composeSchema: $composeSchema}'
+  else
+    jq -n --argjson schema "$BOT_OPS_SCHEMA" '{schema: $schema, composeSchema: null}'
+  fi
 }
 
 # #173 round 3: `version` is dispatched HERE — before ANY of the BOT_OPS_PROJECT/CONTAINER/

@@ -24,7 +24,9 @@ import {
   handleRequest,
   HOST_API_VERSION,
   REQUIRED_BOT_OPS_SCHEMA,
+  REQUIRED_COMPOSE_SCHEMA,
   decideBotOpsSchema,
+  decideComposeSchema,
   checkBotOpsSchemaStartup,
   mergeStatusOutdated,
   IDLE_TIMEOUT_SECONDS,
@@ -1478,31 +1480,41 @@ describe("handleRequest", () => {
     expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
   });
 
-  // #173: GET /api/status merges botOpsOutdated into cmd_status's own JSON — the one route this
-  // panel augments server-side. Also proves the whole point of the design: an outdated script never
-  // stops the panel from serving day-2 ops (status here, restart below), only makes the drift visible.
-  test("GET /api/status merges botOpsOutdated:true when the startup check found drift", async () => {
+  // #173/#178: GET /api/status merges botOpsOutdated+outdatedFiles into cmd_status's own JSON — the
+  // one route this panel augments server-side. Also proves the whole point of the design: outdated
+  // file(s) never stop the panel from serving day-2 ops (status here, restart below), only make
+  // the drift visible.
+  test("GET /api/status merges botOpsOutdated:true + outdatedFiles when the startup check found drift", async () => {
     const res = await handleRequest(
       authed("/api/status"),
-      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true,"realmStatus":"UP"}', stderr: "" }), botOpsOutdated: true }),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true,"realmStatus":"UP"}', stderr: "" }), outdatedFiles: ["bot-ops.sh"] }),
     );
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true });
+    expect(await res.json()).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true, outdatedFiles: ["bot-ops.sh"] });
   });
 
-  test("GET /api/status carries no botOpsOutdated field when the script is up to date", async () => {
+  test("GET /api/status names BOTH files when both are behind — never conflates them into one flag", async () => {
     const res = await handleRequest(
       authed("/api/status"),
-      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }), botOpsOutdated: false }),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }), outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ running: true, botOpsOutdated: true, outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] });
+  });
+
+  test("GET /api/status carries no botOpsOutdated/outdatedFiles fields when both files are up to date", async () => {
+    const res = await handleRequest(
+      authed("/api/status"),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }), outdatedFiles: [] }),
     );
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ running: true });
   });
 
-  test("POST /api/restart still succeeds with an outdated script — the panel degrades, never refuses to start or serve (#173)", async () => {
+  test("POST /api/restart still succeeds with an outdated script/compose — the panel degrades, never refuses to start or serve (#173/#178)", async () => {
     const res = await handleRequest(
       new Request("http://x/api/restart", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } }),
-      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "restarted probe\n", stderr: "" }), botOpsOutdated: true }),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "restarted probe\n", stderr: "" }), outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] }),
     );
     // Mutation: a stray "refuse when outdated" guard anywhere on the request path turns this red.
     expect(res.status).toBe(200);
@@ -2279,6 +2291,17 @@ describe("REQUIRED_BOT_OPS_SCHEMA mirrors ops/bot-ops.sh's BOT_OPS_SCHEMA (#173,
   });
 });
 
+// #178: same mirror class, for the deployed docker-compose.yml's x-rackbops-schema: key.
+describe("REQUIRED_COMPOSE_SCHEMA mirrors docker-compose.yml's x-rackbops-schema (#178, can't drift)", () => {
+  test("matches the repo compose file's x-rackbops-schema", () => {
+    const composeSrc = readFileSync(new URL("../../docker-compose.yml", import.meta.url), "utf8");
+    const composeSchema = composeSrc.match(/^x-rackbops-schema:\s*(\d+)\s*$/m)?.[1];
+    // Mutation: bumping either side without the other turns this red.
+    expect(composeSchema).toBeTruthy();
+    expect(REQUIRED_COMPOSE_SCHEMA).toBe(Number(composeSchema));
+  });
+});
+
 describe("decideBotOpsSchema (#173)", () => {
   test("matching schema -> not outdated, got the real number", () => {
     expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":1}' }, 1)).toEqual({ outdated: false, got: 1 });
@@ -2298,93 +2321,158 @@ describe("decideBotOpsSchema (#173)", () => {
     expect(decideBotOpsSchema({ exitCode: 0, stdout: "not json" }, 1)).toEqual({ outdated: true, got: null });
     expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":"one"}' }, 1)).toEqual({ outdated: true, got: null });
   });
+  // #178: composeSchema being present/absent/malformed must never affect the SCRIPT's own decision —
+  // proves the two files' drift can't be conflated at the decision layer.
+  test("an unrelated composeSchema field never affects the schema decision", () => {
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":1,"composeSchema":99}' }, 1)).toEqual({ outdated: false, got: 1 });
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":2,"composeSchema":1}' }, 1)).toEqual({ outdated: true, got: 2 });
+  });
 });
 
-describe("checkBotOpsSchemaStartup (#173)", () => {
+// #178: the same shape as decideBotOpsSchema, reading composeSchema instead — kept as a genuinely
+// separate function/describe block so the two are never accidentally merged into one that could
+// conflate the two files' drift.
+describe("decideComposeSchema (#178)", () => {
+  test("matching composeSchema -> not outdated, got the real number", () => {
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":1,"composeSchema":1}' }, 1)).toEqual({ outdated: false, got: 1 });
+  });
+  test("a real mismatch -> outdated, got the wrong number", () => {
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":1,"composeSchema":2}' }, 1)).toEqual({ outdated: true, got: 2 });
+  });
+  test("composeSchema: null (a pre-#178 compose file) -> outdated, got null", () => {
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":1,"composeSchema":null}' }, 1)).toEqual({ outdated: true, got: null });
+  });
+  test("the version call itself failed (nonzero exit) -> outdated, got null — same as decideBotOpsSchema", () => {
+    expect(decideComposeSchema({ exitCode: 1, stdout: "" }, 1)).toEqual({ outdated: true, got: null });
+  });
+  test("exit 0 but an unexpected shape (no composeSchema field at all) -> outdated, got null", () => {
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":1}' }, 1)).toEqual({ outdated: true, got: null });
+    expect(decideComposeSchema({ exitCode: 0, stdout: "not json" }, 1)).toEqual({ outdated: true, got: null });
+  });
+  // Mirrors decideBotOpsSchema's own "unrelated field" test, the other direction.
+  test("an unrelated schema field never affects the compose decision", () => {
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":99,"composeSchema":1}' }, 1)).toEqual({ outdated: false, got: 1 });
+    expect(decideComposeSchema({ exitCode: 0, stdout: '{"schema":1,"composeSchema":2}' }, 1)).toEqual({ outdated: true, got: 2 });
+  });
+});
+
+describe("checkBotOpsSchemaStartup (#173/#178)", () => {
   function capture() {
     const logs: string[] = [];
     const errors: string[] = [];
     return { logs, errors, log: (m: string) => logs.push(m), logError: (m: string) => errors.push(m) };
   }
 
-  test("matching schema -> info line via log, no logError, returns false (not outdated)", async () => {
+  test("both match -> two info lines, no logError, returns []", async () => {
     const { logs, errors, log, logError } = capture();
-    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":1}', stderr: "" });
-    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
-    expect(outdated).toBe(false);
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":1,"composeSchema":1}', stderr: "" });
+    const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
+    expect(outdatedFiles).toEqual([]);
     expect(errors.length).toBe(0);
-    expect(logs[0]).toContain("bot-ops.sh schema 1");
-    expect(logs[0]).toContain("panel needs 1");
+    // Mutation: dropping either logSchemaLine call turns this red (only one line would appear).
+    expect(logs.length).toBe(2);
+    expect(logs[0]).toBe("[admin] bot-ops.sh schema 1 (panel needs 1)");
+    expect(logs[1]).toBe("[admin] docker-compose.yml schema 1 (panel needs 1)");
   });
 
-  test("mismatch -> loud OUT OF DATE line via logError, not log, returns true", async () => {
+  test("bot-ops.sh mismatch only -> its OUT OF DATE line + compose's own info line, returns ['bot-ops.sh']", async () => {
     const { logs, errors, log, logError } = capture();
-    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":2}', stderr: "" });
-    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
-    expect(outdated).toBe(true);
-    expect(logs.length).toBe(0);
-    // Mutation: treating a mismatch as ok (dropping the outdated branch) would silently pass here.
-    expect(errors[0]).toContain("OUT OF DATE");
-    expect(errors[0]).toContain("re-run ops/install.sh");
-    // A real, numbered mismatch is unambiguous — no extra "; <detail>" clause needed or wanted.
-    expect(errors[0]).toBe("[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema 2, panel needs 1)");
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":2,"composeSchema":1}', stderr: "" });
+    const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
+    // Mutation: conflating the two decisions (e.g. one shared "outdated" flag) would either miss
+    // this or wrongly also flag docker-compose.yml.
+    expect(outdatedFiles).toEqual(["bot-ops.sh"]);
+    expect(logs).toEqual(["[admin] docker-compose.yml schema 1 (panel needs 1)"]);
+    expect(errors).toEqual(["[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema 2, panel needs 1)"]);
   });
 
-  test("a pre-#173 script's usage error -> also OUT OF DATE, names 'unknown' AND the real stderr detail", async () => {
-    // Round-1 review fix: `got === null` is ambiguous (a real usage error vs. an unrelated
-    // precondition failure), so the actual stderr must be surfaced too, not just "unknown".
+  test("docker-compose.yml mismatch only -> its OUT OF DATE line + bot-ops.sh's own info line, returns ['docker-compose.yml']", async () => {
+    const { logs, errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":1,"composeSchema":null}', stderr: "" });
+    const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
+    expect(outdatedFiles).toEqual(["docker-compose.yml"]);
+    expect(logs).toEqual(["[admin] bot-ops.sh schema 1 (panel needs 1)"]);
+    // got===null even though the version call itself succeeded (a real, valid "composeSchema: null"
+    // response — the pre-#178-compose case) still gets the "no schema reported" detail clause,
+    // since decideComposeSchema genuinely couldn't determine a real number either way.
+    expect(errors).toEqual(["[admin] docker-compose.yml is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema unknown, panel needs 1; no schema reported)"]);
+  });
+
+  test("both mismatch -> two OUT OF DATE lines, returns both names in order", async () => {
+    const { logs, errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":2,"composeSchema":2}', stderr: "" });
+    const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
+    expect(outdatedFiles).toEqual(["bot-ops.sh", "docker-compose.yml"]);
+    expect(logs.length).toBe(0);
+    expect(errors.length).toBe(2);
+    expect(errors[0]).toContain("bot-ops.sh is OUT OF DATE");
+    expect(errors[1]).toContain("docker-compose.yml is OUT OF DATE");
+  });
+
+  test("a pre-#173 script's usage error -> BOTH lines OUT OF DATE, both name 'unknown' AND the same real stderr detail", async () => {
+    // Round-1 review fix, reused for both files: the version call itself never produced JSON at
+    // all, so NEITHER file's real schema is known — both lines must say so, with the same detail.
     const { errors, log, logError } = capture();
     const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}" });
-    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
-    expect(outdated).toBe(true);
-    expect(errors[0]).toContain("OUT OF DATE");
-    expect(errors[0]).toContain("schema unknown");
-    // Mutation: discarding result.stderr here would make this the SAME message as any other
-    // unrelated failure, sending an operator to re-run install.sh for the wrong reason.
-    expect(errors[0]).toContain("bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}");
+    const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
+    expect(outdatedFiles).toEqual(["bot-ops.sh", "docker-compose.yml"]);
+    expect(errors.length).toBe(2);
+    for (const line of errors) {
+      expect(line).toContain("OUT OF DATE");
+      expect(line).toContain("schema unknown");
+      // Mutation: discarding result.stderr here would make this the SAME message as any other
+      // unrelated failure, sending an operator to re-run install.sh for the wrong reason.
+      expect(line).toContain("bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}");
+    }
   });
 
   test("an UNRELATED precondition failure (e.g. missing jq, no stderr text) -> distinguishable from a real usage error", async () => {
     const { errors, log, logError } = capture();
     const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "" });
-    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
     expect(errors[0]).toContain("no schema reported");
+    expect(errors[1]).toContain("no schema reported");
   });
 
-  test("a timed-out version call is named as a timeout, not conflated with a schema mismatch", async () => {
+  test("a timed-out version call is named as a timeout on BOTH lines, not conflated with a schema mismatch", async () => {
     const { errors, log, logError } = capture();
     const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
-    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    await checkBotOpsSchemaStartup(runBotOps, 1, 1, log, logError);
     // Mutation: ignoring result.timedOut (the MINOR gap the round-1 correctness reviewer named)
     // would fall through to "no schema reported" instead of naming the real cause.
-    expect(errors[0]).toContain("bot-ops.sh version timed out");
+    expect(errors[0]).toContain("version timed out");
     expect(errors[0]).not.toContain("no schema reported");
+    expect(errors[1]).toContain("version timed out");
   });
 
   test("passes args:['version'] to runBotOps, contentType application/json", async () => {
     let seen: unknown;
     const runBotOps = async (invocation: unknown) => {
       seen = invocation;
-      return { exitCode: 0, stdout: '{"schema":1}', stderr: "" };
+      return { exitCode: 0, stdout: '{"schema":1,"composeSchema":1}', stderr: "" };
     };
-    await checkBotOpsSchemaStartup(runBotOps, 1);
+    await checkBotOpsSchemaStartup(runBotOps, 1, 1);
     expect(seen).toEqual({ args: ["version"], contentType: "application/json" });
   });
 });
 
-describe("mergeStatusOutdated (#173)", () => {
-  test("not outdated -> stdout passed through byte-for-byte, unchanged", () => {
+describe("mergeStatusOutdated (#173/#178)", () => {
+  test("empty outdatedFiles -> stdout passed through byte-for-byte, unchanged", () => {
     const stdout = '{"running":true,"realmStatus":"UP"}';
-    // Mutation: always merging (dropping the outdated check) would add the field even when fine.
-    expect(mergeStatusOutdated(stdout, false)).toBe(stdout);
+    // Mutation: always merging (dropping the length check) would add fields even when fine.
+    expect(mergeStatusOutdated(stdout, [])).toBe(stdout);
   });
-  test("outdated -> botOpsOutdated:true merged into the existing status fields", () => {
-    const merged = JSON.parse(mergeStatusOutdated('{"running":true,"realmStatus":"UP"}', true));
-    expect(merged).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true });
+  test("one outdated file -> botOpsOutdated:true + outdatedFiles merged into the existing status fields", () => {
+    const merged = JSON.parse(mergeStatusOutdated('{"running":true,"realmStatus":"UP"}', ["bot-ops.sh"]));
+    expect(merged).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true, outdatedFiles: ["bot-ops.sh"] });
+  });
+  test("both outdated files -> outdatedFiles carries both names, never collapsed to one", () => {
+    const merged = JSON.parse(mergeStatusOutdated('{"running":true}', ["bot-ops.sh", "docker-compose.yml"]));
+    expect(merged).toEqual({ running: true, botOpsOutdated: true, outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] });
   });
   test("a genuinely broken stdout stays as-is rather than throwing", () => {
-    expect(mergeStatusOutdated("not json", true)).toBe("not json");
-    expect(mergeStatusOutdated("[]", true)).toBe("[]"); // an array, not an object — left alone
+    expect(mergeStatusOutdated("not json", ["bot-ops.sh"])).toBe("not json");
+    expect(mergeStatusOutdated("[]", ["bot-ops.sh"])).toBe("[]"); // an array, not an object — left alone
   });
 });
 
@@ -2983,6 +3071,46 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
   test("a non-ok upstream is an error", async () => {
     const fetcher = makeAdminAssetFetcher(async () => res({ ok: false, status: 404 }), 100);
     expect((await fetcher("https://cdn.jsdelivr.net/x")).ok).toBe(false);
+  });
+});
+
+// #173/#178: the drift-banner text composition is lifted from index.html between its own
+// OUTDATED_BANNER_HELPERS markers, same lift pattern as PLUGIN_ADMIN_HELPERS below — the panel's
+// exact banner wording (which file(s), singular vs plural) is pinned here, not just eyeballed.
+describe("describeOutdatedBanner (lifted from index.html, #173/#178)", () => {
+  const bannerIndexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const bannerSrc = bannerIndexSrc.match(/\/\/ OUTDATED_BANNER_HELPERS:begin\n([\s\S]*?)\n\s*\/\/ OUTDATED_BANNER_HELPERS:end/)?.[1];
+
+  test("the marked block is present", () => {
+    expect(bannerSrc).toBeTruthy();
+  });
+
+  const describeOutdatedBanner = new Function(`"use strict";\n${bannerSrc ?? ""}\nreturn describeOutdatedBanner;`)() as (
+    outdatedFiles: string[] | undefined,
+  ) => string | null;
+
+  test("no outdated files (absent or empty) -> null, so the caller hides the banner", () => {
+    // Mutation: returning a non-null value here for an empty/absent list would show a banner when
+    // both files are current.
+    expect(describeOutdatedBanner(undefined)).toBeNull();
+    expect(describeOutdatedBanner([])).toBeNull();
+  });
+
+  test("one file -> names it, singular 'is'", () => {
+    expect(describeOutdatedBanner(["bot-ops.sh"])).toBe(
+      "bot-ops.sh is out of date on this instance — re-run ops/install.sh; panel features may fail.",
+    );
+    expect(describeOutdatedBanner(["docker-compose.yml"])).toBe(
+      "docker-compose.yml is out of date on this instance — re-run ops/install.sh; panel features may fail.",
+    );
+  });
+
+  test("both files -> names both, plural 'are' — never conflated into a single generic sentence", () => {
+    // Mutation: hardcoding "bot-ops.sh" regardless of the list, or always using singular "is", both
+    // turn this red.
+    expect(describeOutdatedBanner(["bot-ops.sh", "docker-compose.yml"])).toBe(
+      "bot-ops.sh and docker-compose.yml are out of date on this instance — re-run ops/install.sh; panel features may fail.",
+    );
   });
 });
 

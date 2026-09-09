@@ -160,6 +160,22 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
   });
 });
 
+// #178: the top-level x-rackbops-schema: key must NEVER break `docker compose config` — Compose
+// ignores any top-level `x-` extension key by spec, but that's exactly the assumption worth
+// proving for real rather than just citing, since a typo (a bad indent putting the key INSIDE
+// `services:`, a duplicate top-level key) could silently turn this into a real validation error.
+describe.skipIf(!runnable)("the x-rackbops-schema: stamp doesn't break docker compose config (issue #178)", () => {
+  test("config still resolves cleanly with the schema key present", async () => {
+    const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
+    const { exitCode, stderr, json } = await composeConfig(dir);
+    // The load-bearing assertion: config succeeds — an unknown top-level key that Compose rejected
+    // (a typo nesting it under services:, a duplicate key) would turn this red with a real error.
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain("x-rackbops-schema");
+    expect(json!.services.bot).toBeTruthy();
+  });
+});
+
 // install.sh's printed "bring it up" step (#169) is shortened to a bare `docker compose -f
 // $STACK_DIR/docker-compose.yml -p $PROJECT up -d --build`, with none of GIT_SHA/BOT_ENV_FILE/
 // BOT_BUILD_CONTEXT/BOT_OPS_CONTAINER exported as shell prefixes any more — they're all already in

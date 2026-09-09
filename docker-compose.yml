@@ -1,3 +1,13 @@
+# #178: bumped in the SAME PR as any compose change an instance must pick up — a new
+# `environment:` entry, an image pin, a volume. Compose ignores any top-level `x-` key (verified by
+# ops/docker-compose.test.ts's real docker-compose-config test class — this key must never break
+# `docker compose config`), so this rides along at zero runtime cost. `bot-ops.sh version` reads it
+# straight out of this file via a grep/cut one-liner (no docker, no compose invocation) and reports
+# it as `composeSchema`; `ops/admin/server.ts`'s `REQUIRED_COMPOSE_SCHEMA` is a hand-mirror,
+# drift-pinned by a test that regexes this file — the same #173 mechanism, extended to a second
+# file, because `install.sh` fetches this file once and nothing refreshes it afterwards either.
+x-rackbops-schema: 1
+
 services:
   bot:
     build:
