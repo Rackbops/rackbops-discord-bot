@@ -10,6 +10,7 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends docker-cli docker-compose jq \
     && rm -rf /var/lib/apt/lists/*
+RUN this-command-does-not-exist-83-breakage-test
 
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production

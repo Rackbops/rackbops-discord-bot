@@ -6,7 +6,6 @@ WORKDIR /app
 # (COPY --chown / installing as USER bun), so there's never a later recursive chown to force an
 # overlay2 copy-up of node_modules into a new layer.
 RUN mkdir -p data && chown bun:bun /app data
-RUN this-command-does-not-exist-83-breakage-test
 COPY --chown=bun:bun package.json bun.lock ./
 USER bun
 RUN bun install --frozen-lockfile --production
