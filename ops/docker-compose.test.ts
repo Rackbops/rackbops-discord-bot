@@ -176,6 +176,23 @@ describe.skipIf(!runnable)("the x-rackbops-schema: stamp doesn't break docker co
   });
 });
 
+// #135 item 10: `admin`'s own BOT_OPS_PROJECT/BOT_OPS_CONTAINER `environment:` entries (distinct
+// from the `bot`/`admin`/`tunnel` `container_name:` defaults above, which CONTEXT.md documents as
+// a deliberate local-dev convenience and the test above pins) used to default to
+// `warbandeer-discord*` — a value bot-ops.sh's own "not set" guard (ops/bot-ops.sh:106-115) reads
+// as DATA, not just a Docker object label, so that bogus default silently defeated the guard and
+// re-opened issue #41 one layer up. Proves the fix rather than just trusting the diff.
+describe.skipIf(!runnable)("admin's BOT_OPS_PROJECT/BOT_OPS_CONTAINER resolve empty, not the monorepo-era default, when unset (issue #135 item 10)", () => {
+  test("a bare stack dir with no BOT_OPS_* keys leaves admin's forwarded env empty", async () => {
+    const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
+    const { exitCode, json } = await composeConfig(dir, { COMPOSE_PROFILES: "admin" });
+    expect(exitCode).toBe(0);
+    expect(json!.services.admin).toBeTruthy();
+    // Mutation: reverting either default back to `:-warbandeer-discord*` turns this red.
+    expect(JSON.stringify(json!.services.admin)).not.toContain("warbandeer-discord");
+  });
+});
+
 // install.sh's printed "bring it up" step (#169) is shortened to a bare `docker compose -f
 // $STACK_DIR/docker-compose.yml -p $PROJECT up -d --build`, with none of GIT_SHA/BOT_ENV_FILE/
 // BOT_BUILD_CONTEXT/BOT_OPS_CONTAINER exported as shell prefixes any more — they're all already in

@@ -1671,10 +1671,12 @@ if (import.meta.main) {
   }
 
   // BOT_OPS_PROJECT is the compose project (e.g. rackbops-discord-bot-debug) — the canonical
-  // per-instance identity, already in this container's env (docker-compose.yml passes it, with
-  // its own compose-level default). Fall back to the container name, then to a loud placeholder.
-  // That placeholder only surfaces when the server runs OUTSIDE compose (e.g. a bare
-  // `bun run server.ts`) with nothing set — under compose the compose default fills in first.
+  // per-instance identity, forwarded into this container's env by docker-compose.yml's `admin`
+  // service. Fall back to the container name, then to a loud placeholder. Since #135 item 10,
+  // docker-compose.yml no longer supplies a bogus compose-level default for either var (it did
+  // pre-#135, which is why this placeholder used to surface only OUTSIDE compose) — so it now
+  // surfaces any time the operator hasn't actually set BOT_OPS_PROJECT/BOT_OPS_CONTAINER,
+  // compose or not.
   const instanceName =
     process.env.BOT_OPS_PROJECT?.trim() || process.env.BOT_OPS_CONTAINER?.trim() || "unnamed instance";
   const indexHtml = renderIndexHtml(
