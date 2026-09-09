@@ -1,5 +1,9 @@
 # Research: adding CI (GitHub Actions) to this repo
 
+**Status (2026-09-09):** Phase 2 (open question 3, Docker build validation) landed as issue #83 --
+a `docker-build` job in `.github/workflows/ci.yml`, `pull_request`-triggered, building both
+images with zero env/secrets, as this research anticipated in §4.
+
 Date: 2026-09-03
 Scope: research only, no workflow files written. Primary sources only — the actions'
 own READMEs/`action.yml`, Bun's own docs (`bun.com/docs`, `bun.sh/guides`), GitHub's

@@ -91,7 +91,8 @@ Run before staging (they do not substitute for the **review gate**):
   (Bun resolves each test file relative to its own location). There is no `test` npm script -- Bun's
   runner discovers the `*.test.ts` files directly.
 
-**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those typechecks + `bun test` on
+**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those typechecks + `bun test`
+(`checks` job) plus a build-only validation of both Docker images (`docker-build` job, #83) on
 `pull_request` (not on push to `main`). Some tests `skipIf(win32)`, or skip when `docker compose` / `jq`
 is absent -- those run only on CI's Linux, so a green run on this Windows box is **not** proof they
 pass; name that gap per personal's **Done means**.
