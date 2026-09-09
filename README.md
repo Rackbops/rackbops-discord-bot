@@ -123,6 +123,29 @@ The bot loads plugins named in `PLUGINS=` from a published manifest and **never 
   - `/plugins remind <name> [days]` snoozes the reminder (default 7 days); `/plugins skip <name>` silences this version until a newer one appears; `/plugins cancel <name>` drops a schedule.
 - **From the admin panel instead of Discord.** The panel's Modify Plugins section shows the same "What changed" notes and the same choices as buttons — **Update now**, **Schedule** (a date/time picker), **Remind me in 7 days**, **Skip this version**, and **Cancel scheduled update** — for whoever is signed in through Cloudflare Access. A click is queued and applied on the bot's next check (within a minute), identical to the `/plugins` command; the panel records *who* asked (their Access email) and shows the outcome on refresh rather than DMing.
 
+## Plugin settings
+
+Some plugins ship their own settings UI in the admin panel — richer than the generic env-key
+fields every plugin gets. It shows up as its own tab in the panel's **Plugin Settings** section,
+one per installed plugin that opted in: warbandeer's ships an ingest-port field plus a live
+connector-status readout instead of a bare port number.
+
+- **What you see.** No tab for a plugin that hasn't opted in — its env keys still render as the
+  ordinary generic fields either way. A plugin that's enabled but not installed yet shows a note
+  that settings appear once it's installed, on the next restart, rather than a stale form. A plugin
+  whose tab targets a different admin version than this panel shows a version-mismatch note instead
+  of mounting. A plugin pinned to a version older than its first settings tab shows
+  `v<installed> of this plugin has no settings tab; v<latest> does — update to get it` — not an
+  error, just what that version predates.
+- **What a tab can and cannot do.** It can only read and change *its own* declared, non-secret env
+  keys — never another plugin's, never a secret — and every write goes through the same guarded save
+  the Config section uses (an Origin check, Cloudflare Access, `bot-ops.sh env-set`'s own
+  validation, then a recreate). It renders as its own tab, but it isn't a separate door.
+
+The plugin side of shipping one — how to build `dist/admin.js` and what the bridge API offers — is
+the [`rackbops-bot-plugins` authoring guide](https://github.com/Rackbops/rackbops-bot-plugins#admin-tab-optional).
+Design: [`docs/adr/0005`](docs/adr/0005-plugins-ship-their-own-admin-ui.md).
+
 ## Character linking
 
 `/link` mints a short (10-minute), single-use code. Entered into the Warbandeer desktop app, it

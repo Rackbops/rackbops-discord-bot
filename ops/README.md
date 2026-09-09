@@ -330,8 +330,12 @@ they're signed in as, plus the JWT's claims for the panel's Identity view), and
 above), `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser), and
 `GET /api/plugins` (the Modify Plugins view — the Plugin Index merged with this instance's installed
 state and current `PLUGINS`; see below), and (**#105**) `POST /api/plugins/request` (an update-action
-button → a request file the bot consumes). The
-`/api/whoami`, `/api/admins`, and `/api/branches` routes never shell out to `bot-ops.sh`;
+button → a request file the bot consumes), and (**#123/#165**) `GET /plugin-admin/<name>.js?v=` +
+`GET /api/plugin-proxy/<name>?path=&v=` (a plugin's own admin-tab bundle and its data assets,
+proxied same-origin from that plugin's own published package on the allowlisted CDN host — see
+"Plugin admin tabs" below). The
+`/api/whoami`, `/api/admins`, `/api/branches`, `/plugin-admin/<name>.js`, and
+`/api/plugin-proxy/<name>` routes never shell out to `bot-ops.sh`;
 `/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and
 `/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does), while
 saving a plugin's *enabled* state still goes through the ordinary `POST /api/env` (only `PLUGINS`).
@@ -430,6 +434,25 @@ The bot applies it on its next tick (within a minute) exactly as it does a `/plu
 outcome rather than trying to DM it. An update whose latest version needs a newer bot than this one
 shows a "needs a newer bot" note and offers no install button (the bot would reject it anyway). See
 "Plugin request mailbox" above for the file format and the `rejected/` quarantine.
+
+**Plugin admin tabs (#123/#165).** A plugin may opt in to its own settings tab instead of the
+generic env-key fields — see the root README's "Plugin settings" section for what an operator sees.
+Delivery is entirely server-side: `GET /plugin-admin/<name>.js?v=<installedVersion>` fetches the
+plugin's built `dist/admin.js` from its published npm package on `cdn.jsdelivr.net` (the only host
+either route will ever fetch from), size-capped at 512 KiB, and serves it same-origin so the browser
+never makes a cross-origin request for plugin code; `GET /api/plugin-proxy/<name>?path=&v=`
+proxies a data asset (e.g. a realm list) the same way, scoped so a bundle can only ever reach files
+inside its own package. Auth differs between the two: the bundle route sits **before** the `/api/`
+gate, public at this layer like the page itself (Cloudflare Access already gated getting here, and
+the bundle is public CDN content anyway); the proxy route is under `/api/` and goes through the
+same Access-JWT/bearer check as every other API call. Both accept an optional `?v=` (a strict
+semver, 400 on anything else) that pins delivery to the plugin's **installed** version rather than
+the Plugin Index's current one — so the tab configures the code that's actually running, not
+whatever the manifest currently advertises; a plugin pinned below its first admin-bundle release
+gets a real 404 here, which the panel renders as a dedicated note naming both the installed and the
+latest version, rather than a generic failure. `getEnv`/`setEnv` are the one deliberate exception: they still validate against
+the index's **current** manifest entry regardless of which version's tab is mounted (see
+`CONTEXT.md`'s gotcha) — per-version env-key scoping isn't built.
 
 **Bringing it up** — opt-in via compose's `admin` profile, deploy-only (needs the same
 `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` values as
