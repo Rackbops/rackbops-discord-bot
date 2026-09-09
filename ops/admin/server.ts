@@ -313,8 +313,16 @@ export async function checkBotOpsSchemaStartup(
   const result = await runBotOps({ args: ["version"], contentType: "application/json" });
   const { outdated, got } = decideBotOpsSchema(result, required);
   if (outdated) {
+    // Round-1 review fix: when `got` is null, the version call itself never produced a real schema
+    // — decideBotOpsSchema can't tell a genuine pre-#173 usage error apart from an UNRELATED
+    // precondition failure (a missing jq, a wrong BOT_OPS_CONFIG_DIR, a timed-out subprocess), and
+    // silently discarding the real reason sent an operator to re-run install.sh for a problem that
+    // wasn't schema drift at all. Surface it — never blocks startup either way, this is diagnostic
+    // detail only.
+    const detail = got !== null ? undefined : result.timedOut ? "bot-ops.sh version timed out" : result.stderr.trim() || "no schema reported";
     logError(
-      `[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema ${got ?? "unknown"}, panel needs ${required})`,
+      `[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail ` +
+        `(schema ${got ?? "unknown"}, panel needs ${required}${detail ? `; ${detail}` : ""})`,
     );
   } else {
     log(`[admin] bot-ops.sh schema ${got} (panel needs ${required})`);

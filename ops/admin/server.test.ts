@@ -2326,15 +2326,39 @@ describe("checkBotOpsSchemaStartup (#173)", () => {
     // Mutation: treating a mismatch as ok (dropping the outdated branch) would silently pass here.
     expect(errors[0]).toContain("OUT OF DATE");
     expect(errors[0]).toContain("re-run ops/install.sh");
+    // A real, numbered mismatch is unambiguous — no extra "; <detail>" clause needed or wanted.
+    expect(errors[0]).toBe("[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema 2, panel needs 1)");
   });
 
-  test("a pre-#173 script's usage error -> also OUT OF DATE, names 'unknown' for the missing got", async () => {
+  test("a pre-#173 script's usage error -> also OUT OF DATE, names 'unknown' AND the real stderr detail", async () => {
+    // Round-1 review fix: `got === null` is ambiguous (a real usage error vs. an unrelated
+    // precondition failure), so the actual stderr must be surfaced too, not just "unknown".
     const { errors, log, logError } = capture();
     const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}" });
     const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
     expect(outdated).toBe(true);
     expect(errors[0]).toContain("OUT OF DATE");
     expect(errors[0]).toContain("schema unknown");
+    // Mutation: discarding result.stderr here would make this the SAME message as any other
+    // unrelated failure, sending an operator to re-run install.sh for the wrong reason.
+    expect(errors[0]).toContain("bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}");
+  });
+
+  test("an UNRELATED precondition failure (e.g. missing jq, no stderr text) -> distinguishable from a real usage error", async () => {
+    const { errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "" });
+    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    expect(errors[0]).toContain("no schema reported");
+  });
+
+  test("a timed-out version call is named as a timeout, not conflated with a schema mismatch", async () => {
+    const { errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
+    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    // Mutation: ignoring result.timedOut (the MINOR gap the round-1 correctness reviewer named)
+    // would fall through to "no schema reported" instead of naming the real cause.
+    expect(errors[0]).toContain("bot-ops.sh version timed out");
+    expect(errors[0]).not.toContain("no schema reported");
   });
 
   test("passes args:['version'] to runBotOps, contentType application/json", async () => {
