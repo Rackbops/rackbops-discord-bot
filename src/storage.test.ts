@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, writeJsonAtomic } from "./storage";
+import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, writeJsonAtomic } from "./storage";
 
 describe("resolveDataDir", () => {
   // The default is still one hop up from src/ — the mutation this guards is a wrong hop count.
@@ -37,6 +37,26 @@ describe("resolveDataDir", () => {
   test("the live DATA_DIR is the override, never the checkout", () => {
     expect(DATA_DIR).toBe(process.env.BOT_DATA_DIR!);
     expect(DATA_DIR).not.toBe(join(import.meta.dir, "..", "data"));
+  });
+});
+
+// #132: SHORT_SHA_LEN is the single source every short-sha site (shaTag, log/message text, and
+// selectImagesToPrune's tag-shape regex) agrees on — pinning both the constant's value and that
+// shortSha genuinely derives from it (not a separately hard-coded 7) is what closes the coupling
+// redeploy.test.ts's own pin (below) proves end-to-end.
+describe("shortSha / SHORT_SHA_LEN", () => {
+  test("SHORT_SHA_LEN is 7", () => {
+    expect(SHORT_SHA_LEN).toBe(7);
+  });
+
+  test("shortSha slices to exactly SHORT_SHA_LEN characters", () => {
+    const sha = "abcdef1234567890";
+    expect(shortSha(sha)).toBe(sha.slice(0, SHORT_SHA_LEN));
+    expect(shortSha(sha)).toHaveLength(SHORT_SHA_LEN);
+  });
+
+  test("a sha shorter than SHORT_SHA_LEN passes through unchanged", () => {
+    expect(shortSha("abc")).toBe("abc");
   });
 });
 

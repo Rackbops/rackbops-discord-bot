@@ -9,6 +9,7 @@ const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelati
 const { beginHandoff, endHandoff } = await import("./restart");
 const { config } = await import("./config");
 const { state } = await import("./state");
+const { shortSha } = await import("./storage");
 
 const OLD = "a".repeat(40);
 const NEW = "b".repeat(40);
@@ -48,7 +49,7 @@ describe("decideUpdate", () => {
   });
 
   test("current when a short GIT_SHA prefixes the newest commit", () => {
-    expect(decideUpdate({ runningSha: NEW.slice(0, 7), latestSha: NEW })).toBe("current");
+    expect(decideUpdate({ runningSha: shortSha(NEW), latestSha: NEW })).toBe("current");
   });
 
   test("restart when stale", () => {
@@ -131,7 +132,7 @@ describe("decideUpdate ancestry", () => {
   // The shortcut is what keeps the common path at one request: matching shas never consult it.
   test("the equality shortcut wins before any relation is read", () => {
     expect(decideUpdate({ runningSha: NEW, latestSha: NEW, relation: "behind" })).toBe("current");
-    expect(decideUpdate({ runningSha: NEW.slice(0, 7), latestSha: NEW, relation: "unpublished" })).toBe(
+    expect(decideUpdate({ runningSha: shortSha(NEW), latestSha: NEW, relation: "unpublished" })).toBe(
       "current",
     );
   });

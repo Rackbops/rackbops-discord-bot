@@ -188,12 +188,17 @@ describe("renderPluginsList", () => {
     expect(out).toContain("**a** — installed 1.0.0 → 1.1.0 available");
     expect(out).toContain("shiny");
     expect(out).toContain("**b** — installed 2.0.0 → 2.1.0 available (skipped)");
-    expect(out).toContain("**c** — installed 3.0.0 → 3.1.0 available (remind <t:");
+    // #132: pins the FULL discordTs markup (including the "R" relative-style suffix), not just the
+    // "<t:" opener — the opener alone doesn't discriminate discordTs's style argument, so a routing
+    // mistake (e.g. dropping the "R" and silently defaulting to "F") would pass an opener-only check.
+    const remindTs = Math.floor(Date.parse("2026-09-06T00:00:00.000Z") / 1000);
+    expect(out).toContain(`**c** — installed 3.0.0 → 3.1.0 available (remind <t:${remindTs}:R>)`);
   });
   test("shows a pending scheduled update (#104), so /plugins cancel has something visible to act on", () => {
     const s = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" } })]);
     const out = renderPluginsList(s, index([entry("a", "1.1.0")]), NOW);
-    expect(out).toContain("update to 1.1.0 scheduled <t:");
+    const scheduledTs = Math.floor(Date.parse("2026-09-06T00:00:00.000Z") / 1000);
+    expect(out).toContain(`update to 1.1.0 scheduled <t:${scheduledTs}:R>`);
   });
   test("empty state → a plain line", () => {
     expect(renderPluginsList(state([]), index([]), NOW)).toBe("No plugins installed.");

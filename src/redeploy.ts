@@ -38,6 +38,7 @@ import {
   type HandoffOutcome,
 } from "./handoff";
 import { beginHandoff, endHandoff } from "./restart";
+import { SHORT_SHA_LEN, shortSha } from "./storage";
 
 const POLL_MS = 2_000;
 /** Per-sha image tags kept around. More than one is what makes rolling back to a *previous*
@@ -73,7 +74,7 @@ export function buildRemote(repo: string, ref: string): string {
  */
 export function shaTag(currentImage: string, sha: string): string {
   const repo = currentImage.split(":")[0] ?? currentImage;
-  return `${repo}:${sha.slice(0, 7)}`;
+  return `${repo}:${shortSha(sha)}`;
 }
 
 /**
@@ -100,9 +101,13 @@ export function selectImagesToPrune(
 ): string[] {
   const repo = currentImage.split(":")[0] ?? currentImage;
   // String ops, not a RegExp built from `repo` — a registry-qualified name's dots would match
-  // loosely and could sweep in another repo's sha tags.
+  // loosely and could sweep in another repo's sha tags. The WIDTH regex, on the other hand, is
+  // rebuilt from SHORT_SHA_LEN (not hand-written) so it can never silently drift from what
+  // `shaTag` above actually produces — #132: a hand-written {7} left at the old width while
+  // SHORT_SHA_LEN changed would make every future sha tag permanently un-prunable.
+  const shaTagWidthRe = new RegExp(`^[0-9a-f]{${SHORT_SHA_LEN}}$`);
   const isShaTag = (tag: string) =>
-    tag.startsWith(`${repo}:`) && /^[0-9a-f]{7}$/.test(tag.slice(repo.length + 1));
+    tag.startsWith(`${repo}:`) && shaTagWidthRe.test(tag.slice(repo.length + 1));
   const tagged = images
     .flatMap((img) => (img.RepoTags ?? []).map((tag) => ({ tag, created: img.Created })))
     .filter(({ tag }) => isShaTag(tag))
@@ -217,7 +222,7 @@ export async function redeploy(
   }
 
   const tag = shaTag(self.Config.Image, latestSha);
-  console.log(`[redeploy] building ${tag} from ${latestSha.slice(0, 7)}`);
+  console.log(`[redeploy] building ${tag} from ${shortSha(latestSha)}`);
   // Built from the exact compared sha, not `config.botBranch`'s current tip: the daemon fetches
   // at build *start*, seconds after `latestSha` was resolved, and a push landing in that window
   // would otherwise build newer code while still stamping it GIT_SHA=<the older, compared sha>.
@@ -253,7 +258,7 @@ export async function redeploy(
   // 5-min watchdog releases them; only an admin `/update` (an interaction, outside the scheduler)
   // genuinely announces throughout. The win is that the pause is bounded either way, and the build
   // itself is now timeout-bounded.
-  beginHandoff(`redeploy -> ${latestSha.slice(0, 7)}`);
+  beginHandoff(`redeploy -> ${shortSha(latestSha)}`);
   let replacementId: string | undefined;
   try {
     await removeContainer(name, true); // a leftover from an earlier failed attempt

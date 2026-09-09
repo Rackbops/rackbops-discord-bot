@@ -9,7 +9,7 @@ import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, wr
 import { createClient, CORE_INTENTS } from "./client";
 import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler, announceTo, markPluginStateReady, livePluginRequestDeps } from "./announce";
+import { startScheduler, announceTo, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
@@ -257,9 +257,7 @@ async function activate(c: Client<true>): Promise<void> {
       await user.send(content);
     },
     postChannel: async (channelId, userId, content) => {
-      const channel = await client.channels.fetch(channelId);
-      if (!channel?.isSendable()) throw new Error(`Channel ${channelId} is not sendable`);
-      await channel.send({ content: `<@${userId}> ${content}`, allowedMentions: { users: [userId] } });
+      await sendToChannel(client, channelId, `<@${userId}> ${content}`, { allowedMentions: { users: [userId] } });
     },
     log: console,
   }).catch((err) => console.error("[plugins] report-back", err));

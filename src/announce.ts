@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { mkdir, readdir, readFile, rename, unlink } from "node:fs/promises";
-import type { Client } from "discord.js";
+import type { Client, MessageMentionOptions } from "discord.js";
 import { config } from "./config";
 import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
@@ -63,13 +63,33 @@ function channelFor(_kind: AnnounceKind): string {
   return config.releaseAnnounceChannelId;
 }
 
+/**
+ * #132: "fetch the channel, check it's sendable, send" — the one shared shape three call sites
+ * (this file's own `announceTo`, `updateReport.ts`'s `viaChannel`, `index.ts`'s plugin
+ * report-back) each hand-rolled independently, with the error text already having drifted between
+ * two of them. Kept minimal: fetch, guard, send. `opts.allowedMentions` is threaded through rather
+ * than hardcoded so a caller that needs to opt a specific ping in (past the Client-wide
+ * `{ parse: [] }` default, #48) still can, while a caller with plain text keeps sending plain text
+ * (Discord treats a bare string and `{ content: string }` identically, but the two callers'
+ * existing test expectations distinguish them, so this preserves that rather than always wrapping).
+ */
+export async function sendToChannel(
+  client: Client,
+  channelId: string,
+  content: string,
+  opts?: { allowedMentions?: MessageMentionOptions },
+): Promise<void> {
+  const channel = await client.channels.fetch(channelId);
+  if (!channel?.isSendable()) throw new Error(`Channel ${channelId} is not sendable`);
+  if (opts?.allowedMentions) await channel.send({ content, allowedMentions: opts.allowedMentions });
+  else await channel.send(content);
+}
+
 /** Posts `message` to a specific channel, through the bot's own send path. Split out from
  * `announce` so a plugin's `HostApi.announce` (which posts to `ANNOUNCE_CHANNEL_ID`) reuses exactly
  * this path — the `[announce]` log line stays byte-identical. */
 export async function announceTo(client: Client, channelId: string, message: string): Promise<void> {
-  const channel = await client.channels.fetch(channelId);
-  if (!channel?.isSendable()) throw new Error(`Announce channel ${channelId} is not sendable`);
-  await channel.send(message);
+  await sendToChannel(client, channelId, message);
   console.log("[announce]", message);
 }
 

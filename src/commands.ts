@@ -11,7 +11,7 @@ import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./upda
 import { withCritical, requestRestart } from "./restart";
 import { handoffFailureMessage } from "./handoff";
 import type { RedeployResult } from "./redeploy";
-import { DATA_DIR, readJsonOrFresh } from "./storage";
+import { DATA_DIR, readJsonOrFresh, shortSha } from "./storage";
 import { commandNamer } from "./commandNaming";
 import { isPluginStateReady } from "./announce";
 import { loadPluginIndex } from "./plugins";
@@ -286,8 +286,8 @@ export function updateReply(
   latestSha: string,
   o: { runningSha?: string; reason?: DisabledReason; redeploy?: RedeployResult } = {},
 ): string {
-  const short = latestSha.slice(0, 7);
-  const running = o.runningSha?.slice(0, 7);
+  const short = shortSha(latestSha);
+  const running = o.runningSha ? shortSha(o.runningSha) : undefined;
   switch (decision) {
     case "busy":
       return "⏳ An update is already in progress — I'll report how it went; ask again after that.";
