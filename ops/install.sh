@@ -198,7 +198,11 @@ main() {
   bot_ops_schema="$(grep -m1 '^readonly BOT_OPS_SCHEMA=' "$BIN_DIR/bot-ops.sh" | cut -d= -f2)"
   echo "install: wrote $BIN_DIR/bot-ops.sh from $BRANCH (bot-ops schema ${bot_ops_schema:-unknown})"
   fetch "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
-  echo "install: wrote $STACK_DIR/docker-compose.yml from $BRANCH (Dockge will list this as a managed stack)"
+  # #178: same pattern as bot-ops.sh's schema line above — read back from the file just written, so
+  # an operator can compare this against the panel's own "docker-compose.yml schema <got> (panel
+  # needs <want>)" startup log line after a re-run.
+  compose_schema="$(grep -m1 '^x-rackbops-schema:' "$STACK_DIR/docker-compose.yml" | cut -d: -f2 | tr -d '[:space:]')"
+  echo "install: wrote $STACK_DIR/docker-compose.yml from $BRANCH (Dockge will list this as a managed stack; compose schema ${compose_schema:-unknown})"
 
   # Split from the emptiness check (rather than one combined `cmd || die`-free line) so a genuine
   # ls-remote failure — network/DNS, not just a bad branch name — is caught here instead of

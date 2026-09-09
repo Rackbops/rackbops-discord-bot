@@ -1171,12 +1171,14 @@ describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they a
 // on stdout (or the JSON landing on stderr instead) would break the same way env-get/status's own
 // stdout-is-JSON contract breaks (#101's lesson, reused here for a fourth subcommand).
 describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
-  test("prints {\"schema\": N} on stdout, nothing on stderr", async () => {
+  test("prints {\"schema\": N, \"composeSchema\": null} on stdout, nothing on stderr", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["version"]);
     expect(run.exitCode).toBe(0);
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
-    expect(run.json).toEqual({ schema: 1 });
+    // composeSchema is null here because the fixture's default compose.yml (a bare
+    // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
+    expect(run.json).toEqual({ schema: 1, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
@@ -1203,7 +1205,8 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
       BOT_OPS_COMPOSE_FILE: undefined,
     });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 1 });
+    // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
+    expect(run.json).toEqual({ schema: 1, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -1215,6 +1218,47 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: dispatching version after the .env/compose-file existence checks in main() turns
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 1 });
+    // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
+    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+  });
+});
+
+// #178: composeSchema is read from $BOT_OPS_COMPOSE_FILE's own x-rackbops-schema: line — a second,
+// independent drift signal alongside BOT_OPS_SCHEMA, for the compose file install.sh also fetches
+// once and never refreshes.
+describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178)", () => {
+  test("reads the real, stamped repo docker-compose.yml correctly", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
+    const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1, composeSchema: 1 });
+  });
+
+  test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    // The fixture's own default compose.yml is already pre-#178-shaped (no schema line) — reuse it
+    // explicitly here for a name that documents the scenario, rather than relying on the default.
+    writeFileSync(fx.compose, "services:\n  bot:\n    image: x\n");
+    const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
+    expect(run.exitCode).toBe(0);
+    // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
+    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+  });
+
+  test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
+    const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1, composeSchema: null });
+  });
+
+  test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
+    const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1, composeSchema: 2 });
   });
 });

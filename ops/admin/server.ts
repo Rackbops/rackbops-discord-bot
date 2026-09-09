@@ -295,39 +295,74 @@ export function decideBotOpsSchema(
   return { outdated: got !== required, got };
 }
 
+/** #178: the same decision as `decideBotOpsSchema`, for the DEPLOYED docker-compose.yml's own
+ *  `x-rackbops-schema:` stamp — reads the `composeSchema` field `bot-ops.sh version` now also
+ *  reports (`null` when the deployed compose file predates #178, or `BOT_OPS_COMPOSE_FILE` wasn't
+ *  set/didn't exist at check time, or the `version` call itself failed). Deliberately a SEPARATE
+ *  function from `decideBotOpsSchema`, not a shared one parameterized by field name, so the two
+ *  files' drift can never be silently conflated into one another by a refactor. */
+export function decideComposeSchema(
+  result: { exitCode: number; stdout: string },
+  required: number,
+): { outdated: boolean; got: number | null } {
+  const raw = result.exitCode === 0 ? safeJsonField(result.stdout, "composeSchema") : undefined;
+  const got = typeof raw === "number" ? raw : null;
+  return { outdated: got !== required, got };
+}
+
+/** #173/#178: logs ONE line for ONE file's schema check — an info line on a match, a loud warning
+ *  on drift (including a version call that never produced a real number for this file at all, per
+ *  `decision.got === null`). Shared by both `checkBotOpsSchemaStartup` call sites below so the two
+ *  files' wording can never independently drift from each other. The stderr/timedOut detail is
+ *  only ever attached to the `got === null` case — an unambiguous numbered mismatch needs no extra
+ *  clause (round-1 review fix, reused here for the second file). */
+function logSchemaLine(
+  fileLabel: string,
+  decision: { outdated: boolean; got: number | null },
+  required: number,
+  result: { stderr: string; timedOut?: boolean },
+  log: (msg: string) => void,
+  logError: (msg: string) => void,
+): void {
+  if (!decision.outdated) {
+    log(`[admin] ${fileLabel} schema ${decision.got} (panel needs ${required})`);
+    return;
+  }
+  const detail =
+    decision.got !== null ? undefined : result.timedOut ? "version timed out" : result.stderr.trim() || "no schema reported";
+  logError(
+    `[admin] ${fileLabel} is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail ` +
+      `(schema ${decision.got ?? "unknown"}, panel needs ${required}${detail ? `; ${detail}` : ""})`,
+  );
+}
+
 /**
- * #173: runs `bot-ops.sh version` once at startup and logs the result — an info line on a match,
- * a loud warning on drift (or a pre-stamp script's usage error, per `decideBotOpsSchema`). Returns
- * whether the panel should surface an out-of-date warning, so `import.meta.main` can bake it into
- * `HandlerConfig.botOpsOutdated` for `/api/status` to report. Never refuses to start either way —
- * day-2 ops (status/logs/restart) still work against an outdated script; this only makes the drift
+ * #173/#178: runs `bot-ops.sh version` once at startup and logs ONE line per file it stamps —
+ * `bot-ops.sh` itself and the deployed `docker-compose.yml` (#178 extends this from one file to
+ * two, per the issue's own instruction: "extend #173's mechanism rather than inventing a second
+ * one"). Returns the list of file names that are out of date (empty when both are current), so
+ * `import.meta.main` can bake it into `HandlerConfig.outdatedFiles` for `/api/status` and the
+ * panel's banner to name precisely. Never refuses to start either way — day-2 ops (status/logs/
+ * restart) still work against either or both files being outdated; this only makes the drift
  * visible instead of silent. `runBotOps`/`log`/`logError` injected so this is tested without a real
  * subprocess or eyeballing console output, the same shape as `logDynamicAdminsStartup` above.
  */
 export async function checkBotOpsSchemaStartup(
   runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>,
-  required: number,
+  requiredBotOps: number,
+  requiredCompose: number,
   log: (msg: string) => void = console.log,
   logError: (msg: string) => void = console.error,
-): Promise<boolean> {
+): Promise<string[]> {
   const result = await runBotOps({ args: ["version"], contentType: "application/json" });
-  const { outdated, got } = decideBotOpsSchema(result, required);
-  if (outdated) {
-    // Round-1 review fix: when `got` is null, the version call itself never produced a real schema
-    // — decideBotOpsSchema can't tell a genuine pre-#173 usage error apart from an UNRELATED
-    // precondition failure (a missing jq, a wrong BOT_OPS_CONFIG_DIR, a timed-out subprocess), and
-    // silently discarding the real reason sent an operator to re-run install.sh for a problem that
-    // wasn't schema drift at all. Surface it — never blocks startup either way, this is diagnostic
-    // detail only.
-    const detail = got !== null ? undefined : result.timedOut ? "bot-ops.sh version timed out" : result.stderr.trim() || "no schema reported";
-    logError(
-      `[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail ` +
-        `(schema ${got ?? "unknown"}, panel needs ${required}${detail ? `; ${detail}` : ""})`,
-    );
-  } else {
-    log(`[admin] bot-ops.sh schema ${got} (panel needs ${required})`);
-  }
-  return outdated;
+  const botOps = decideBotOpsSchema(result, requiredBotOps);
+  const compose = decideComposeSchema(result, requiredCompose);
+  logSchemaLine("bot-ops.sh", botOps, requiredBotOps, result, log, logError);
+  logSchemaLine("docker-compose.yml", compose, requiredCompose, result, log, logError);
+  const outdatedFiles: string[] = [];
+  if (botOps.outdated) outdatedFiles.push("bot-ops.sh");
+  if (compose.outdated) outdatedFiles.push("docker-compose.yml");
+  return outdatedFiles;
 }
 
 /**
@@ -617,6 +652,15 @@ export const HOST_API_VERSION = 1;
  *  named for: `Update now` failing with a generic error because `plugin-request` didn't exist yet
  *  on the deployed copy). */
 export const REQUIRED_BOT_OPS_SCHEMA = 1;
+
+/** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
+ *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed
+ *  against the repo's own docker-compose.yml. Also not cosmetic: `install.sh` fetches the compose
+ *  file once and nothing refreshes it, so a deployed instance can be running an old compose file
+ *  (missing a new `environment:` entry, an image pin) even after both bot and admin images are
+ *  rebuilt from `main` — the #178 incident: `#168`'s `BOT_ENV_FILE` and `#140`'s `cloudflared` pin
+ *  were both merged but silently not in effect on `debug`. */
+export const REQUIRED_COMPOSE_SCHEMA = 1;
 
 // ADMIN_API_VERSION (+ the AdminApi/SaveResult types) is vendored in ./admin-contract — a copy of the
 // plugins repo's packages/api/admin.ts. Re-exported so the routes, the merge, and the tests all read
@@ -1171,12 +1215,13 @@ export interface HandlerConfig {
    * the backing store for the add/remove-admins endpoints. Absent means no extra narrowing and no
    * management endpoints. Never applied to the bearer-token fallback. */
   adminStore?: AdminStore;
-  /** #173: whether the startup `bot-ops.sh version` check found a schema mismatch (or a pre-#173
-   *  script's usage error) — computed ONCE at startup via `checkBotOpsSchemaStartup`, not per
-   *  request. Absent/false means up to date; `/api/status`'s route merges `botOpsOutdated: true`
-   *  into its response only when this is true, so the field is present exactly when there's
-   *  something to report, the same convention `/api/plugins`'s `indexError`/`stateError` use. */
-  botOpsOutdated?: boolean;
+  /** #173/#178: which deployment files the startup `version` check found out of date — some subset
+   *  of `["bot-ops.sh", "docker-compose.yml"]`, or empty when both are current. Computed ONCE at
+   *  startup via `checkBotOpsSchemaStartup`, not per request. `/api/status`'s route merges
+   *  `botOpsOutdated: true` + `outdatedFiles` into its response only when this is non-empty, so
+   *  both fields are present exactly when there's something to report — the same convention
+   *  `/api/plugins`'s `indexError`/`stateError` use. */
+  outdatedFiles?: string[];
 }
 
 /** How a request authorized, carried through so mutating actions can be attributed. `email` is
@@ -1330,17 +1375,21 @@ function safeJsonField(text: string, field: string): unknown {
   }
 }
 
-/** #173: merges `botOpsOutdated: true` into `cmd_status`'s own JSON stdout — ONLY when `outdated`
- *  is true, so the field is present exactly when there's something to report (the panel checks
- *  `s.botOpsOutdated` truthy, never distinguishes false from absent). Returns `stdout` unchanged on
- *  a parse failure rather than throwing: a degraded/unparseable status response is a pre-existing,
- *  separate problem this merge shouldn't mask by crashing the route instead of returning it as-is. */
-export function mergeStatusOutdated(stdout: string, outdated: boolean): string {
-  if (!outdated) return stdout;
+/** #173/#178: merges `botOpsOutdated: true` + `outdatedFiles` into `cmd_status`'s own JSON stdout —
+ *  ONLY when `outdatedFiles` is non-empty, so both fields are present exactly when there's
+ *  something to report (the panel checks `s.outdatedFiles` truthy/non-empty, never distinguishes
+ *  an empty array from absent). `outdatedFiles` is some subset of `["bot-ops.sh",
+ *  "docker-compose.yml"]` — #178 extends this from naming one file to naming either or both,
+ *  never conflating them into a single flag that can't say WHICH is behind. Returns `stdout`
+ *  unchanged on a parse failure rather than throwing: a degraded/unparseable status response is a
+ *  pre-existing, separate problem this merge shouldn't mask by crashing the route instead of
+ *  returning it as-is. */
+export function mergeStatusOutdated(stdout: string, outdatedFiles: string[]): string {
+  if (outdatedFiles.length === 0) return stdout;
   try {
     const parsed: unknown = JSON.parse(stdout);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return stdout;
-    return JSON.stringify({ ...(parsed as Record<string, unknown>), botOpsOutdated: true });
+    return JSON.stringify({ ...(parsed as Record<string, unknown>), botOpsOutdated: true, outdatedFiles });
   } catch {
     return stdout;
   }
@@ -1603,7 +1652,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   // #173: /api/status is the one route that gets a server-side augmentation on top of bot-ops.sh's
   // own stdout — everything else here still passes it straight through unmodified.
   const stdout =
-    invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.botOpsOutdated ?? false) : result.stdout;
+    invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.outdatedFiles ?? []) : result.stdout;
   return new Response(stdout, { headers: { "Content-Type": invocation.contentType } });
 }
 
@@ -1694,9 +1743,9 @@ if (import.meta.main) {
   }
   await logDynamicAdminsStartup(adminsFile);
   for (const line of describeBotOpsStartup(BOT_OPS_SH, process.env.BOT_OPS_COMPOSE_FILE)) console.log(line);
-  // #173: never refuses to start on a mismatch — only makes the drift visible (a loud log line +
-  // /api/status's botOpsOutdated banner). Day-2 ops still work against an outdated script.
-  const botOpsOutdated = await checkBotOpsSchemaStartup(runBotOps, REQUIRED_BOT_OPS_SCHEMA);
+  // #173/#178: never refuses to start on a mismatch — only makes the drift visible (a loud log
+  // line per file + /api/status's banner). Day-2 ops still work against either or both being outdated.
+  const outdatedFiles = await checkBotOpsSchemaStartup(runBotOps, REQUIRED_BOT_OPS_SCHEMA, REQUIRED_COMPOSE_SCHEMA);
 
   // The BOT_BRANCH chooser's data source: the configured repo's branches from the GitHub API.
   // GITHUB_REPO/GITHUB_TOKEN are read on demand from the mounted .env (never this process's env, so
@@ -1772,7 +1821,7 @@ if (import.meta.main) {
 
   const config: HandlerConfig = {
     adminToken, indexHtml, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore,
-    botOpsOutdated,
+    outdatedFiles,
   };
   // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
   // restart/env-set request out from under the client while bot-ops.sh is still legitimately

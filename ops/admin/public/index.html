@@ -195,11 +195,11 @@
 </div>
 
 <main id="app" hidden>
-  <!-- #173: bot-ops.sh version-drift warning — populated from /api/status's botOpsOutdated, hidden
-       whenever that field is absent (up to date). See loadStatus() below. -->
-  <div id="bot-ops-outdated-banner" class="banner-warn" hidden>
-    bot-ops.sh is out of date on this instance — re-run ops/install.sh; panel features may fail.
-  </div>
+  <!-- #173/#178: deployment-file drift warning — text is set dynamically from /api/status's
+       outdatedFiles by describeOutdatedBanner(), naming whichever of bot-ops.sh/docker-compose.yml
+       is behind; hidden whenever that field is absent/empty (both up to date). This static content
+       is a placeholder only, never actually seen. See loadStatus() below. -->
+  <div id="bot-ops-outdated-banner" class="banner-warn" hidden></div>
   <div class="panel-header">
     <h1>Bot Admin</h1>
     <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
@@ -1163,15 +1163,31 @@
     }
   }
 
+  // OUTDATED_BANNER_HELPERS:begin
+  // #173/#178: pure text composition for the top-of-page drift banner, lifted so
+  // ops/admin/server.test.ts can pin the exact wording (which file(s) are named, singular vs
+  // plural "is"/"are") without scraping DOM. `null` means "nothing to show" — the caller hides the
+  // banner rather than rendering an empty sentence.
+  function describeOutdatedBanner(outdatedFiles) {
+    if (!outdatedFiles || outdatedFiles.length === 0) return null;
+    const verb = outdatedFiles.length > 1 ? "are" : "is";
+    return outdatedFiles.join(" and ") + " " + verb + " out of date on this instance — re-run ops/install.sh; panel features may fail.";
+  }
+  // OUTDATED_BANNER_HELPERS:end
+
   async function loadStatus() {
     const grid = document.getElementById("status-grid");
     const banner = document.getElementById("bot-ops-outdated-banner");
     try {
       const res = await api("/api/status");
       const s = await res.json();
-      // #173: present exactly when true (server convention, see mergeStatusOutdated) — absent or
-      // false both mean up to date.
-      if (banner) banner.hidden = !s.botOpsOutdated;
+      // #173/#178: outdatedFiles present exactly when non-empty (server convention, see
+      // mergeStatusOutdated) — absent or empty both mean everything's up to date.
+      const bannerText = describeOutdatedBanner(s.outdatedFiles);
+      if (banner) {
+        banner.hidden = !bannerText;
+        if (bannerText) banner.textContent = bannerText;
+      }
       const dot = s.realmStatus === "UP" ? "up" : s.realmStatus === "DOWN" ? "down" : "";
       grid.innerHTML =
         "<dt>Running</dt><dd>" + (s.running ? "yes" : "no") + "</dd>" +

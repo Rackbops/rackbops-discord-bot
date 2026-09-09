@@ -778,3 +778,26 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   configured right": only a genuine schema mismatch, or a pre-stamp script's usage error (which has
   no early `version` check to hit at all, so it still falls through to its own preconditions and
   then its `*)` usage fallback), is ever reported as out of date now.
+- **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178
+  extends #173's mechanism to cover it rather than inventing a second one.** `install.sh` fetches
+  the compose file once too and nothing refreshes it — a real incident: `debug`'s stack compose was
+  still the 2026-09-05 copy even after both bot and admin images were rebuilt from `main`, so #168's
+  `environment: BOT_ENV_FILE` and #140's `cloudflared` image pin were both merged but silently NOT
+  in effect. `docker-compose.yml` gained a top-level `x-rackbops-schema: <n>` key (Compose ignores
+  any `x-` key, verified by `ops/docker-compose.test.ts`'s real `docker compose config` test class
+  — this must never break that validation); `cmd_version` reads it straight from
+  `$BOT_OPS_COMPOSE_FILE` via a `grep '^x-rackbops-schema:' | cut` one-liner, reported as
+  `composeSchema` in `version`'s JSON — `null` (never an error) when that var is unset, the file
+  doesn't exist, or the key/value is absent or malformed, so `version` stays precondition-free
+  (#173 round 3) for compose too. `ops/admin/server.ts`'s `REQUIRED_COMPOSE_SCHEMA` is a second
+  hand-mirror, drift-pinned the same way. `checkBotOpsSchemaStartup` now decides BOTH files
+  independently (`decideBotOpsSchema` / `decideComposeSchema` — deliberately two separate pure
+  functions, never one parameterized by field name, so a refactor can't accidentally conflate the
+  two files' drift into each other) and logs one line per file via a shared `logSchemaLine` helper;
+  `/api/status` gains `outdatedFiles: string[]` (some subset of `["bot-ops.sh",
+  "docker-compose.yml"]`, present only when non-empty) alongside the existing `botOpsOutdated: true`
+  convention, and the panel's banner text is composed dynamically (`describeOutdatedBanner`,
+  lifted from `index.html` and pinned in `server.test.ts`) to name precisely which file(s) are
+  behind rather than a static sentence naming only `bot-ops.sh`. `install.sh`'s summary line for
+  `docker-compose.yml` prints the schema it just installed, read back from the file it just wrote,
+  the same pattern as its `bot-ops.sh` line.
