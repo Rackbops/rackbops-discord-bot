@@ -12,6 +12,7 @@ const {
   deliverUpdateReport,
   liveDeliverers,
 } = await import("./updateReport");
+const { shortSha } = await import("./storage");
 type PendingUpdateReport = import("./state").PendingUpdateReport;
 type Deliverers = import("./updateReport").Deliverers;
 
@@ -51,8 +52,8 @@ describe("decideUpdateOutcome", () => {
   });
 
   test("tolerates a short GIT_SHA against the full recorded sha", () => {
-    expect(decideUpdateOutcome({ report: report(), runningSha: TO.slice(0, 7) })).toBe("updated");
-    expect(decideUpdateOutcome({ report: report(), runningSha: FROM.slice(0, 7) })).toBe("noop");
+    expect(decideUpdateOutcome({ report: report(), runningSha: shortSha(TO) })).toBe("updated");
+    expect(decideUpdateOutcome({ report: report(), runningSha: shortSha(FROM) })).toBe("noop");
   });
 
   test("a report whose from and to are the same reads as updated, not noop", () => {
@@ -72,26 +73,26 @@ describe("updateOutcomeMessage", () => {
 
   test("updated names the build it came back on and the one it left", () => {
     const msg = updateOutcomeMessage("updated", report(), TO);
-    expect(msg).toContain(TO.slice(0, 7));
-    expect(msg).toContain(FROM.slice(0, 7));
+    expect(msg).toContain(shortSha(TO));
+    expect(msg).toContain(shortSha(FROM));
   });
 
   test("noop says plainly that the image wasn't rebuilt", () => {
     const msg = updateOutcomeMessage("noop", report(), FROM);
     expect(msg).toContain("same build");
     expect(msg).toContain("wasn't rebuilt");
-    expect(msg).toContain(TO.slice(0, 7));
+    expect(msg).toContain(shortSha(TO));
   });
 
   test("unexpected names all three shas", () => {
     const msg = updateOutcomeMessage("unexpected", report(), THIRD);
-    for (const sha of [THIRD, FROM, TO]) expect(msg).toContain(sha.slice(0, 7));
+    for (const sha of [THIRD, FROM, TO]) expect(msg).toContain(shortSha(sha));
   });
 
   test("unknown reports the missing GIT_SHA rather than guessing", () => {
     const msg = updateOutcomeMessage("unknown", report(), undefined);
     expect(msg).toContain("GIT_SHA");
-    expect(msg).not.toContain(FROM.slice(0, 7));
+    expect(msg).not.toContain(shortSha(FROM));
   });
 });
 
@@ -204,5 +205,16 @@ describe("liveDeliverers.viaChannel", () => {
         allowedMentions: { users: ["42"] },
       },
     ]);
+  });
+
+  // #132: routed through the shared sendToChannel (announce.ts) now, alongside announceTo's own
+  // sendable=false coverage — this pins the false case for THIS caller too (previously only the
+  // sendable=true/ping-opt-in path above was tested here, so dropping sendToChannel's isSendable
+  // guard would not have failed anything in this file).
+  test("throws when the channel isn't sendable", async () => {
+    const fakeClient = {
+      channels: { fetch: async () => ({ isSendable: () => false }) },
+    } as unknown as import("discord.js").Client;
+    await expect(liveDeliverers(fakeClient).viaChannel(report(), "x")).rejects.toThrow(/not sendable/);
   });
 });

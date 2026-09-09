@@ -2,6 +2,8 @@ import { REST, Routes, type Client } from "discord.js";
 import { config } from "./config";
 import { state, saveState, type PendingUpdateReport } from "./state";
 import { sameSha } from "./update";
+import { sendToChannel } from "./announce";
+import { shortSha as short } from "./storage";
 
 // The other half of /update: the command says what it's *trying* to become, this says what it
 // actually became. Without it the dangerous failure — a container recreated without --build,
@@ -36,8 +38,6 @@ export function decideUpdateOutcome(o: {
   if (sameSha(o.runningSha, o.report.fromSha)) return "noop";
   return "unexpected";
 }
-
-const short = (sha: string) => sha.slice(0, 7);
 
 /** Names both shas, so nobody has to compare them by eye to learn which case this is. */
 export function updateOutcomeMessage(
@@ -136,13 +136,10 @@ export function liveDeliverers(client: Client): Deliverers {
       await user.send(content);
     },
     async viaChannel(report, content) {
-      const channel = await client.channels.fetch(report.channelId!);
-      if (!channel?.isSendable()) throw new Error(`Channel ${report.channelId} is not sendable`);
       // The client default is allowedMentions: { parse: [] } (#48), so the ping here needs an
       // explicit opt-in — report.userId is trusted (it's who requested the /update, not
       // arbitrary text), unlike the content this is prefixed onto.
-      await channel.send({
-        content: `<@${report.userId}> ${content}`,
+      await sendToChannel(client, report.channelId!, `<@${report.userId}> ${content}`, {
         allowedMentions: { users: [report.userId] },
       });
     },

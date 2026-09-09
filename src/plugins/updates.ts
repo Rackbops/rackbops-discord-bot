@@ -176,14 +176,14 @@ export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _n
       if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
         line += ` → ${entry.version} available`;
         if (p.skippedVersion === entry.version) line += " (skipped)";
-        else if (p.remindAt !== undefined) line += ` (remind <t:${Math.floor(Date.parse(p.remindAt) / 1000)}:R>)`;
+        else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
         const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
         if (firstBlock) line += `\n${firstBlock.slice(0, 300)}`;
       }
       // A pending scheduled update (#104) — shown regardless of whether the index still lists that
       // version as current, so `/plugins cancel` has something visible to act on.
       if (p.scheduled) {
-        line += `\n  ⏳ update to ${p.scheduled.version} scheduled <t:${Math.floor(Date.parse(p.scheduled.at) / 1000)}:R>`;
+        line += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
       }
       return line;
     })

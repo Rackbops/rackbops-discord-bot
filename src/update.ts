@@ -2,7 +2,8 @@ import { config } from "./config";
 import { state, saveState, type PendingUpdateReport } from "./state";
 import { handoffActive, requestRestart } from "./restart";
 import { redeploy, redeployAvailable, type RedeployResult } from "./redeploy";
-import { GITHUB_TIMEOUT_MS } from "./github";
+import { GITHUB_TIMEOUT_MS, githubHeaders } from "./github";
+import { shortSha } from "./storage";
 
 // Self-update detection. The bot has no releases of its own, so "am I stale?" is answered
 // against the newest commit on `config.botBranch` (in `config.githubRepo`, the whole repo —
@@ -109,18 +110,9 @@ export function buildUpdateReport(o: {
   return { ...o.requester, fromSha: o.runningSha, toSha: o.latestSha, requestedAt: o.now };
 }
 
-function apiHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "User-Agent": "rackbops-discord-bot",
-  };
-  if (config.githubToken) headers.Authorization = `Bearer ${config.githubToken}`;
-  return headers;
-}
-
 /** Newest commit on `config.botBranch`. */
 export async function fetchLatestBotSha(timeoutMs = GITHUB_TIMEOUT_MS): Promise<string> {
-  const headers = apiHeaders();
+  const headers = githubHeaders();
   const res = await fetch(
     `https://api.github.com/repos/${config.githubRepo}/commits` +
       `?sha=${encodeURIComponent(config.botBranch)}&per_page=1`,
@@ -160,7 +152,7 @@ export async function fetchShaRelation(
       // A timeout here lands in the catch below as `unknown` — which `decideUpdate` resolves to
       // `restart`, i.e. a real self-redeploy. That is why GITHUB_TIMEOUT_MS is generous: this is
       // the one call where being too eager to give up is expensive rather than merely noisy.
-      { headers: apiHeaders(), signal: AbortSignal.timeout(timeoutMs) },
+      { headers: githubHeaders(), signal: AbortSignal.timeout(timeoutMs) },
     );
     if (res.status === 404) {
       // GitHub answers 404 for two different questions: the running sha genuinely isn't on the
@@ -274,7 +266,7 @@ export async function checkForUpdate(
     if (decision === "disabled") {
       // Reachable only via `unpublished` here — the no-sha case returned above.
       console.warn(
-        `[update] self-update is off: ${config.gitSha.slice(0, 7)} is not on ` +
+        `[update] self-update is off: ${shortSha(config.gitSha)} is not on ` +
           `${config.githubRepo}, so there is nothing to compare it against.`,
       );
       return { decision, latestSha, reason: "unpublished-sha" };
@@ -288,7 +280,7 @@ export async function checkForUpdate(
 
     if (decision === "suppressed") {
       console.warn(
-        `[update] ${latestSha.slice(0, 7)} still pending after a restart — the orchestrator ` +
+        `[update] ${shortSha(latestSha)} still pending after a restart — the orchestrator ` +
           `is not supplying new code. Rebuild the image (see README); not exiting again.`,
       );
     }
@@ -325,8 +317,8 @@ async function applyUpdate(
   latestSha: string,
   deps: RedeployDeps,
 ): Promise<RedeployResult | undefined> {
-  const shortRun = config.gitSha!.slice(0, 7);
-  const shortNew = latestSha.slice(0, 7);
+  const shortRun = shortSha(config.gitSha!);
+  const shortNew = shortSha(latestSha);
 
   if (!(await deps.redeployAvailable())) {
     console.log("[update] no docker socket — falling back to exit-and-be-respawned");
