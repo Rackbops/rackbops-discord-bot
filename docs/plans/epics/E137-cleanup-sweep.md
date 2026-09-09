@@ -27,7 +27,8 @@ intended.
 | #136 build/test hygiene | #200 | `noUnusedLocals` + `noUnusedParameters` on; ten test files' redundant env-prime lines removed (`test/setup.ts` preloads); eight intra-file-only exports de-exported |
 
 Spin-off filed from #133's parity check: #195 (the panel's `parseEnvValue` and bot-ops.sh's
-`load_env_values` disagree on duplicate keys and on `export`/indented lines).
+`load_env_values` disagree on duplicate keys). The plan posted on #195 at pick-up folds in a second
+divergence found while verifying it: the panel also ignores `export KEY=` and indented lines.
 
 ## 2. Exit criterion, executed (2026-09-09, `main` @ `a2f83e3`)
 
@@ -36,7 +37,7 @@ Spin-off filed from #133's parity check: #195 (the panel's `parseEnvValue` and b
 | none of #132/#133/#135/#136 open | none open |
 | `grep -rn "slice(0, 7)" src/` | 0 sites — `shortSha` derives from `SHORT_SHA_LEN` (#132 recorded the deviation from "exactly one") |
 | `"User-Agent": "rackbops-discord-bot"` | one site, `src/github.ts` (`githubHeaders`) |
-| `ALLOWED_ORDER` and the drift guard gone from `bot-ops.sh` | all remaining hits are comments; no identifier, no runtime guard |
+| `ALLOWED_ORDER` and the drift guard gone from `bot-ops.sh` | zero `ALLOWED_ORDER` hits; every `drift` hit is a comment; no runtime guard |
 | compose carries no `warbandeer-discord` default | the two admin env defaults are empty; the three `container_name:` defaults deliberately keep `warbandeer-discord*` (#135's ruling: the bot's is pinned by a test, the tunnel's is read by nothing) |
 | `bun run check` clean with `noUnusedLocals` on | exit 0 |
 | `bun test` | 1122 pass / 0 fail on Windows; the Linux-only `skipIf` tests ran on CI per PR |
