@@ -1,6 +1,22 @@
 # EH — Plugin-framework hardening — implementation plan
 
-Status: **filed, not started** (2026-09-09). Epic issue:
+Status: **CLOSED — epic complete 2026-09-09.** All five children merged the same day; exit demo on
+debug: both new plugin versions installed through the panel, then `docker stop` showed
+`[warbandeer] ingest server stopped` inside the drain (exit 0, 169 ms). The in-Discord Cyrillic
+`/transmog` check was deferred by roshne (unit-proven). Detail below is the running log. plugins#28 done (plugins PR #29 `b1f12e3`, one round; the
+orchestrator's pack check is only meaningful after a real `bun run build` — verified that way).
+#184 bot half done (PR #190 `2dd4d10`, two rounds: round 1 found sequential dispose could overrun
+the outer bound at N≥2 plugins — now concurrent via `Promise.allSettled`; the orchestrator's first
+"sequential" mutation was malformed and a proper for-loop rewrite confirmed the guard); plugins half
+done (plugins PR #30 `262dac5`, warbandeer 1.2.0 — the tag push is roshne's). **#184 closed.**
+#186 done (PR #189 `3e6f72f`, three rounds — round 2 caught the surrogate-pair fix switching to
+code points and re-admitting emoji-heavy overflow; final helpers verified against UTF-16 by the
+orchestrator). plugins#27 done (plugins PR #31 `141943e`, wow 1.0.1 — the embedded realm list has no
+non-Latin-1 names, so the hint alone is v1; 0/707 false positives). **#55 closed.** #185 done
+(PRs #191 `4079dac` + plugins#32; one round; the plan's claim that `selectPlugins` already refused a
+plugin named `report` was FALSE — it checked commands only — the subordinate probed it and added the
+real guard). **All five children merged.** Remaining: the two publish tags (`warbandeer-v1.2.0`,
+`wow-v1.0.1`, roshne's), then the live exit demo on debug, then close. Epic issue:
 [#183](https://github.com/Rackbops/rackbops-discord-bot/issues/183). Children (in order):
 [#184](https://github.com/Rackbops/rackbops-discord-bot/issues/184) `Plugin.dispose()`,
 [#185](https://github.com/Rackbops/rackbops-discord-bot/issues/185) `customId` routing,
