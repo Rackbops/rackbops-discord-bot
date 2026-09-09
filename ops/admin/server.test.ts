@@ -1969,7 +1969,7 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
 
   test("the body carries only the keys whose value differs, in field order (not alphabetical)", () => {
     // WATCHED_REPOS first though it sorts AFTER ANNOUNCE_CHANNEL_ID: the body must preserve the loaded
-    // field order (env-get emits keys in bot-ops.sh's ALLOWED_ORDER, and the panel keeps that order),
+    // field order (env-get emits keys in bot-ops.sh's own whitelist order, and the panel keeps that order),
     // never re-sort — an Object.keys(...).sort() mutant would put ANNOUNCE_CHANNEL_ID first and fail here.
     const loaded = { WATCHED_REPOS: "acme/one", ANNOUNCE_CHANNEL_ID: "111", DISCORD_SERVER_ID: "" };
     const current = { WATCHED_REPOS: "acme/two", ANNOUNCE_CHANNEL_ID: "222", DISCORD_SERVER_ID: "" };
@@ -2202,7 +2202,9 @@ describe("REQUIRED keys (bot-ops.sh ↔ panel REQUIRED_KEYS stay in sync)", () =
   });
 
   test("every REQUIRED key is itself a whitelisted ALLOWED key", () => {
-    for (const key of botOpsRequired) expect(botOpsSrc).toMatch(new RegExp(`\\[${key}\\]='`));
+    // #133: ALLOWED is derived from ALLOWED_SPEC's "KEY|regex" entries, not a hand-declared
+    // `[KEY]='regex'` associative-array literal — the source pattern this scrapes moved with it.
+    for (const key of botOpsRequired) expect(botOpsSrc).toMatch(new RegExp(`'${key}\\|`));
   });
 });
 
@@ -2215,7 +2217,10 @@ describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
 
   test("BOT_BRANCH: panel's BRANCH_NAME_RE matches bot-ops.sh's ALLOWED regex", () => {
-    const botOpsBranchRe = botOpsSrc.match(/\[BOT_BRANCH\]='([^']*)'/)?.[1];
+    // #133: scraped from ALLOWED_SPEC's "KEY|regex" entry now, not a `[KEY]='regex'` associative-
+    // array literal — the entry itself (and the regex it carries) is unchanged, only its source
+    // shape moved.
+    const botOpsBranchRe = botOpsSrc.match(/'BOT_BRANCH\|([^']*)'/)?.[1];
     // Greedy: defensive against a future BRANCH_NAME_RE whose character class embeds a literal
     // "/;" — today's `/` is followed by `-`, so lazy would happen to land here too.
     const panelBranchRe = indexSrc.match(/const BRANCH_NAME_RE = \/(.+)\/;/)?.[1];
@@ -2224,7 +2229,7 @@ describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
   });
 
   test("AUTO_UPDATE: panel's select options match bot-ops.sh's ALLOWED alternation", () => {
-    const botOpsAlternation = botOpsSrc.match(/\[AUTO_UPDATE\]='\^\(([^)]+)\)\$'/)?.[1];
+    const botOpsAlternation = botOpsSrc.match(/'AUTO_UPDATE\|\^\(([^)]+)\)\$'/)?.[1];
     const botOpsOptions = (botOpsAlternation ?? "").split("|").sort();
     const panelOptionsSrc = indexSrc.match(/AUTO_UPDATE:\s*\{[^}]*options:\s*(\[[^\]]*\])/)?.[1];
     const panelOptions = (JSON.parse(panelOptionsSrc ?? "[]") as string[]).sort();

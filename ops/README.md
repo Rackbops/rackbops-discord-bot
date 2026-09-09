@@ -72,7 +72,7 @@ update logs its outcome rather than DMing (there's no Discord user to reach — 
 Both `bin/bot-ops.sh` and the stack's `docker-compose.yml` on an instance are **deployment
 artifacts** — fetched once by `install.sh`, never touched by hand, never precious the way `.env`
 is — but nothing re-fetches either of them on its own. **After a merge that changes either file in
-a way an instance needs to pick up — a new `bot-ops.sh` subcommand or `ALLOWED`/`ALLOWED_ORDER`
+a way an instance needs to pick up — a new `bot-ops.sh` subcommand or `ALLOWED_SPEC`
 row, or a compose change like a new `environment:` entry, an image pin, a volume — re-run
 `install.sh` on each instance** (it always refreshes both files) — otherwise the admin panel image
 (rebuilt from the same merge) ships a feature, or a runtime setting, the deployed files don't have
@@ -172,7 +172,7 @@ re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved v
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
 `ADMIN_USER_IDS`, `WOW_REALM`, `WOW_REGION`, `WATCHED_REPOS`, `DMF_TIMEZONE`, `AUTO_UPDATE`,
-`BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_ORDER`, the order the admin panel displays
+`BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
 key back to its documented default.
