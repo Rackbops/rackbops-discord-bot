@@ -1,7 +1,9 @@
 // Graceful restart: the process exits, and the orchestrator respawns it.
 //
-// The bot never updates itself in place — a clean exit only picks up new code if
-// whatever supervises the container supplies a rebuilt image. See README.
+// This is the FALLBACK update path. update.ts's applyUpdate() tries redeploy.ts's docker-socket
+// redeploy first (it builds and hands off to the replacement in place, no exit involved) and only
+// falls back to this exit when the socket isn't reachable — see update.ts:324. A clean exit here
+// only picks up new code if whatever supervises the container supplies a rebuilt image. See README.
 //
 // A restart requested while an announcement or a state write is in flight is
 // deferred until the critical section unwinds, so `data/state.json` is never
