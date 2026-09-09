@@ -256,6 +256,14 @@ describe("routeInteractionByPrefix", () => {
   test("a name that is a PREFIX of the actual segment (not equal to it) does not match", () => {
     expect(routeInteractionByPrefix("wowie:x", ["wow"])).toBeUndefined();
   });
+
+  // The reverse direction of the case above: the SEGMENT is a strict prefix of a real plugin name
+  // ("wo" vs "wow"). Round-1 review flagged this direction as untested by direct execution; the
+  // exact split already handles it correctly (routeInteractionByPrefix normalizes list-membership,
+  // not a fuzzy match either way), but pin it so both directions are covered, not just one.
+  test("a segment that is a strict PREFIX of a real plugin name does not match either", () => {
+    expect(routeInteractionByPrefix("wo:x", ["wow"])).toBeUndefined();
+  });
 });
 
 describe("dispatchPluginInteraction", () => {
