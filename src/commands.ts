@@ -24,6 +24,11 @@ import {
 } from "./plugins/updates";
 import { HOST_API_VERSION, type PluginCommand, type PluginStateFile } from "./plugins/contract";
 
+// #206: a core command has the exact same shape a plugin's PluginCommand does (name/build/handle)
+// — the host's collision check and dispatch already speak that shape, so core commands are just
+// table rows in that shape rather than a separate array-literal + switch pair.
+export type CoreCommand = PluginCommand;
+
 /**
  * /update is gated on an explicit Discord user-ID allowlist rather than a guild role:
  * roles get reassigned and inherited, an ID list only changes when the operator edits
@@ -31,6 +36,26 @@ import { HOST_API_VERSION, type PluginCommand, type PluginStateFile } from "./pl
  */
 export function isAdmin(userId: string, adminUserIds: string[]): boolean {
   return adminUserIds.includes(userId);
+}
+
+/**
+ * The admin gate `/update` and `/plugins` both used to duplicate inline. Replies with the refusal
+ * (naming `ADMIN_USER_IDS` if none are configured, `command` so the message names the command that
+ * was actually blocked) and returns `true` when it did — the caller returns immediately in that
+ * case. Returns `false`, with nothing sent, for an admin.
+ */
+export async function refuseUnlessAdmin(
+  interaction: ChatInputCommandInteraction,
+  command: "/update" | "/plugins",
+): Promise<boolean> {
+  if (isAdmin(interaction.user.id, config.adminUserIds)) return false;
+  await interaction.reply({
+    content: config.adminUserIds.length
+      ? "⛔ You're not allowed to run this."
+      : `⛔ No admins are configured — set \`ADMIN_USER_IDS\` to enable \`${command}\`.`,
+    flags: MessageFlags.Ephemeral,
+  });
+  return true;
 }
 
 // COMMAND_PREFIX namespaces the command names (e.g. `r_` → `r_report`) so a second debug/staging
@@ -50,75 +75,38 @@ export function bareName(commandName: string, p: string = prefix): string {
   return commandName.startsWith(p) ? commandName.slice(p.length) : commandName;
 }
 
-export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [
-  cmd("report")
-    .setDescription("File a GitHub issue for a project")
-    .addStringOption((o) =>
-      o
-        .setName("project")
-        .setDescription("Which project the report is about")
-        .setRequired(true)
-        .addChoices(...Object.keys(REPORT_PROJECTS).map((k) => ({ name: k, value: k }))),
-    ),
-  cmd("update")
-    .setDescription("Restart the bot to pick up the latest build (admins only)")
-    // Hides it from non-admins in the UI. Defence in depth — the ID allowlist is the gate.
-    .setDefaultMemberPermissions(0),
-  cmd("plugins")
-    .setDescription("Installed plugins and available updates (admins only)")
-    .setDefaultMemberPermissions(0)
-    .addSubcommand((s) => s.setName("list").setDescription("List installed plugins and any available updates"))
-    .addSubcommand((s) =>
-      s
-        .setName("update")
-        .setDescription("Update a plugin now, or schedule it for a time")
-        .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true))
+/**
+ * The core commands, one table, each row the same {name, build, handle} shape a plugin's own
+ * PluginCommand has — `commandData`/`CORE_COMMAND_NAMES` are both derived from this, and
+ * `handleCommand` dispatches straight into a row's `handle`. `build` receives the already-prefixed
+ * builder (`cmd(c.name)` below), same as a plugin's own `build` does from the host.
+ */
+export const CORE_COMMANDS: readonly CoreCommand[] = [
+  {
+    name: "report",
+    build: (builder) =>
+      builder
+        .setDescription("File a GitHub issue for a project")
         .addStringOption((o) =>
-          o.setName("at").setDescription("When: HH:MM (24h, UTC) or ISO-8601 with offset. Omit = now"),
+          o
+            .setName("project")
+            .setDescription("Which project the report is about")
+            .setRequired(true)
+            .addChoices(...Object.keys(REPORT_PROJECTS).map((k) => ({ name: k, value: k }))),
         ),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("remind")
-        .setDescription("Snooze the update reminder for a plugin")
-        .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true))
-        .addIntegerOption((o) =>
-          o.setName("days").setDescription("Days to snooze (default 7)").setMinValue(1).setMaxValue(365),
-        ),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("skip")
-        .setDescription("Skip this version — no reminders until a newer one appears")
-        .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true)),
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("cancel")
-        .setDescription("Cancel a plugin's scheduled update")
-        .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true)),
-    ),
-].map((c) => c.toJSON());
-
-// What selectPlugins() checks a plugin's declared command names against before any plugin loads.
-export const CORE_COMMAND_NAMES: string[] = commandData.map((c) => bareName(c.name));
-
-export async function handleCommand(
-  interaction: ChatInputCommandInteraction,
-  lookup: (bare: string) => PluginCommand | undefined = () => undefined,
-): Promise<void> {
-  const bare = bareName(interaction.commandName);
-  switch (bare) {
-    case "update": {
-      if (!isAdmin(interaction.user.id, config.adminUserIds)) {
-        await interaction.reply({
-          content: config.adminUserIds.length
-            ? "⛔ You're not allowed to run this."
-            : "⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
+    handle: async (interaction) => {
+      await handleReportCommand(interaction);
+    },
+  },
+  {
+    name: "update",
+    build: (builder) =>
+      builder
+        .setDescription("Restart the bot to pick up the latest build (admins only)")
+        // Hides it from non-admins in the UI. Defence in depth — the ID allowlist is the gate.
+        .setDefaultMemberPermissions(0),
+    handle: async (interaction) => {
+      if (await refuseUnlessAdmin(interaction, "/update")) return;
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       // Inside a critical section so the restart waits for the reply to be delivered.
       await withCritical(async () => {
@@ -140,22 +128,47 @@ export async function handleCommand(
           await interaction.editReply(clampReply(`⚠️ Update check failed: ${(err as Error).message}`));
         }
       });
-      return;
-    }
-    case "report": {
-      await handleReportCommand(interaction);
-      return;
-    }
-    case "plugins": {
-      if (!isAdmin(interaction.user.id, config.adminUserIds)) {
-        await interaction.reply({
-          content: config.adminUserIds.length
-            ? "⛔ You're not allowed to run this."
-            : "⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.",
-          flags: MessageFlags.Ephemeral,
-        });
-        return;
-      }
+    },
+  },
+  {
+    name: "plugins",
+    build: (builder) =>
+      builder
+        .setDescription("Installed plugins and available updates (admins only)")
+        .setDefaultMemberPermissions(0)
+        .addSubcommand((s) => s.setName("list").setDescription("List installed plugins and any available updates"))
+        .addSubcommand((s) =>
+          s
+            .setName("update")
+            .setDescription("Update a plugin now, or schedule it for a time")
+            .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true))
+            .addStringOption((o) =>
+              o.setName("at").setDescription("When: HH:MM (24h, UTC) or ISO-8601 with offset. Omit = now"),
+            ),
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("remind")
+            .setDescription("Snooze the update reminder for a plugin")
+            .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true))
+            .addIntegerOption((o) =>
+              o.setName("days").setDescription("Days to snooze (default 7)").setMinValue(1).setMaxValue(365),
+            ),
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("skip")
+            .setDescription("Skip this version — no reminders until a newer one appears")
+            .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true)),
+        )
+        .addSubcommand((s) =>
+          s
+            .setName("cancel")
+            .setDescription("Cancel a plugin's scheduled update")
+            .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true)),
+        ),
+    handle: async (interaction) => {
+      if (await refuseUnlessAdmin(interaction, "/plugins")) return;
       const sub = interaction.options.getSubcommand();
       if (sub === "list") {
         // Deferred: re-fetching the Plugin Index (for "available" + notes) can outrun the 3s window.
@@ -261,17 +274,29 @@ export async function handleCommand(
       } catch (err) {
         await interaction.editReply(clampReply(`⚠️ Couldn't act on the plugin: ${(err as Error).message}`));
       }
-      return;
-    }
-    default: {
-      // A loaded plugin's command (or nothing). The lookup is keyed by bare name; a name that
-      // matches no core case and no plugin just warns rather than silently dropping.
-      const pluginCommand = lookup(bare);
-      if (pluginCommand) await pluginCommand.handle(interaction);
-      else console.warn(`[interaction] no handler for /${interaction.commandName}`);
-      return;
-    }
-  }
+    },
+  },
+];
+
+export const commandData: RESTPostAPIChatInputApplicationCommandsJSONBody[] = CORE_COMMANDS.map((c) =>
+  c.build(cmd(c.name)).toJSON(),
+);
+
+// What selectPlugins() checks a plugin's declared command names against before any plugin loads.
+export const CORE_COMMAND_NAMES: string[] = CORE_COMMANDS.map((c) => c.name);
+
+const coreByName = new Map(CORE_COMMANDS.map((c) => [c.name, c]));
+
+export async function handleCommand(
+  interaction: ChatInputCommandInteraction,
+  lookup: (bare: string) => PluginCommand | undefined = () => undefined,
+): Promise<void> {
+  const bare = bareName(interaction.commandName);
+  // A core row wins on a name collision (mirrors pluginCommandMap's own rule); the lookup is keyed
+  // by bare name, and a name that matches neither just warns rather than silently dropping.
+  const target = coreByName.get(bare) ?? lookup(bare);
+  if (target) await target.handle(interaction);
+  else console.warn(`[interaction] no handler for /${interaction.commandName}`);
 }
 
 /**
