@@ -783,7 +783,7 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   but its deployed `bin/bot-ops.sh` was still the pre-#121 copy, so `Update now` failed with a bare
   `bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}` and nothing named the real
   cause. `bot-ops.sh` gained `readonly BOT_OPS_SCHEMA=<n>` (bumped in the same PR as any subcommand
-  or `ALLOWED`/`ALLOWED_ORDER` change) and a `version` subcommand printing `{"schema": <n>}`;
+  or `ALLOWED_SPEC` change) and a `version` subcommand printing `{"schema": <n>}`;
   `ops/admin/server.ts`'s `REQUIRED_BOT_OPS_SCHEMA` is a hand-mirror, drift-pinned by a test that
   regexes the script (the `DEFAULT_PLUGIN_INDEX_URL`/`HOST_API_VERSION` pattern). The panel runs
   `version` once at startup (`checkBotOpsSchemaStartup`), logging either an info line or a loud
@@ -807,6 +807,24 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   configured right": only a genuine schema mismatch, or a pre-stamp script's usage error (which has
   no early `version` check to hit at all, so it still falls through to its own preconditions and
   then its `*)` usage fallback), is ever reported as out of date now.
+- **`bot-ops.sh`'s env whitelist is ONE ordered spec (`ALLOWED_SPEC`, an indexed array of
+  `"KEY|regex"` entries), not two hand-maintained structures — #133 collapsed what used to be a
+  `declare -A ALLOWED` (membership + format) plus a separate `ALLOWED_ORDER` indexed array (display
+  order), which existed only because a bash associative array does not preserve insertion order.
+  The two drifted in practice, so `cmd_env_get` used to carry a ~15-line runtime assertion
+  (`"... have drifted"`) that existed purely to catch that drift. `ALLOWED` (the `${ALLOWED[$key]}`
+  lookup every validation site expects) and `ENV_KEY_ORDER` (env-get's display order — named to
+  match `PLUGIN_KEY_ORDER`'s own convention, not the old `ALLOWED_ORDER`) are now both DERIVED from
+  `ALLOWED_SPEC` once, by `build_allowed_from_spec`, at load — so the two literally cannot disagree
+  now, and the drift guard was deleted rather than kept as dead insurance. `REQUIRED` stayed a
+  separate, hand-maintained set on purpose: "has no default to clear back to" is a genuinely
+  independent fact about a key, not something `ALLOWED_SPEC`'s shape could carry for free — its own
+  `REQUIRED`-vs-`ALLOWED` check in `cmd_env_set` was kept (a typo there would silently never enforce
+  a key). `env-get`'s output shape (a flat `{KEY: value}` object) is unchanged — this was an
+  internal refactor only. Carved out of the same issue, needing a design decision first: emitting
+  each key's `pattern`/`required` to the panel so `ops/admin/public/index.html`'s hard-coded
+  `BRANCH_NAME_RE` could go away — that's a contract change across `bot-ops.sh`/`server.ts`/the
+  panel, tracked as a follow-up, not implemented here.
 - **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178
   extends #173's mechanism to cover it rather than inventing a second one.** `install.sh` fetches
   the compose file once too and nothing refreshes it — a real incident: `debug`'s stack compose was
