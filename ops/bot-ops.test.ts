@@ -1186,4 +1186,35 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     const src = readFileSync(BOT_OPS_SH, "utf8");
     expect(src).toMatch(/readonly BOT_OPS_SCHEMA=1\b/);
   });
+
+  // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
+  // dispatched AFTER main()'s BOT_OPS_PROJECT/CONTAINER/CONFIG_DIR/COMPOSE_FILE/.env preconditions,
+  // so a genuinely CURRENT script pointed at a bad instance config failed `version` the same way an
+  // OLD script would, and the panel reported "OUT OF DATE — re-run install.sh" for a problem that
+  // had nothing to do with script drift. `version` is dispatched before ALL of that now.
+  test("succeeds with NO BOT_OPS_* env set at all (not even PROJECT/CONTAINER)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    // Mutation: moving the version dispatch back below main()'s preconditions turns this red —
+    // the run would instead die naming BOT_OPS_PROJECT/CONTAINER/CONFIG_DIR/COMPOSE_FILE not set.
+    const run = await botOps(fx, ["version"], undefined, {
+      BOT_OPS_PROJECT: undefined,
+      BOT_OPS_CONTAINER: undefined,
+      BOT_OPS_CONFIG_DIR: undefined,
+      BOT_OPS_COMPOSE_FILE: undefined,
+    });
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1 });
+  });
+
+  test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"], undefined, {
+      BOT_OPS_CONFIG_DIR: "/opt/does-not-exist",
+      BOT_OPS_COMPOSE_FILE: "/opt/does-not-exist/compose.yml",
+    });
+    // Mutation: dispatching version after the .env/compose-file existence checks in main() turns
+    // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1 });
+  });
 });

@@ -661,3 +661,16 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   only when true — `mergeStatusOutdated`) and the panel renders it as a banner at the top of the
   page. `install.sh`'s own summary line for `bot-ops.sh` prints the schema it just installed, read
   back from the file it just wrote, so the two numbers are easy to compare after a deploy.
+  **`version` is dispatched before ANY instance-config precondition — round-3 review caught the
+  first cut getting this backwards.** The original design ran `version` through `main()` like every
+  other subcommand, which requires `BOT_OPS_PROJECT`/`CONTAINER`/`CONFIG_DIR`/`COMPOSE_FILE` and a
+  real `.env`/compose file to exist first — so a genuinely CURRENT script pointed at a bad instance
+  config (an unset or wrong `BOT_OPS_CONFIG_DIR`, a missing `.env`) failed `version` with an
+  instance-config error, and the panel reported the SAME `OUT OF DATE — re-run ops/install.sh` line
+  as a real pre-#173 script, sending an operator to fix the wrong thing. `version` needs only `jq`
+  — no docker, no config dir, no compose file — so it (and its `need jq`/`die` helpers) are now
+  defined and dispatched right after `readonly BOT_OPS_SCHEMA=1`, before `main()`'s preconditions
+  even run. This is what actually decouples "is this script current" from "is this instance
+  configured right": only a genuine schema mismatch, or a pre-stamp script's usage error (which has
+  no early `version` check to hit at all, so it still falls through to its own preconditions and
+  then its `*)` usage fallback), is ever reported as out of date now.

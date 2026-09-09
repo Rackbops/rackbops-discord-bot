@@ -36,8 +36,10 @@ Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`
 `BOT_OPS_COMPOSE_FILE` (the deployed `docker-compose.yml`, under `/opt/stacks/` for Dockge — see
 [Bootstrapping a fresh instance](#bootstrapping-a-fresh-instance-no-checkout)), `BOT_OPS_PROJECT`
 (the compose project, e.g. `rackbops-discord-bot-debug`), and `BOT_OPS_CONTAINER` (the container
-name — same value as `BOT_OPS_PROJECT` under the current layout) are all **required**, with no
-fallback to the script's own location or to any monorepo-era default:
+name — same value as `BOT_OPS_PROJECT` under the current layout) are all **required** for every
+subcommand except `version` (deliberately checkable with none of them set — see "Keeping
+`bot-ops.sh` current"), with no fallback to the script's own location or to any monorepo-era
+default:
 
 ```sh
 export BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/debug
@@ -81,6 +83,11 @@ sentence appears as a banner at the top of the panel page. The panel still start
 `status`/`logs`/`restart` against an outdated script; it just tells you rather than staying silent
 about it. `install.sh`'s own summary line for `bot-ops.sh` prints the schema it just installed, so
 the two numbers (panel log vs. install output) are easy to compare side by side.
+
+`version` is checked deliberately WITHOUT any of the `BOT_OPS_*` config or a real `.env`/compose
+file — it needs only `jq`. That's on purpose: a check that required valid instance config first
+couldn't tell "this script is old" apart from "this instance is misconfigured," and would report
+the identical `OUT OF DATE` warning for both.
 
 ## Bootstrapping a fresh instance (no checkout)
 
