@@ -317,15 +317,24 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   file existed those buttons (and any bare `docker compose` typed by hand) fell straight through to
   `docker-compose.yml`'s own `:-` fallbacks — `env_file` pointing at a `.env` that was never there,
   `container_name` defaulting to the monorepo-era `warbandeer-discord` (issue #41). Shell-exported
-  values still win when present, so nothing about `ops/bot-ops.sh`'s own explicit exports
-  (`cmd_restart`, `cmd_env_set`) or `ops/install.sh`'s printed bootstrap command changes: those
-  continue to set `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/`BOT_BUILD_CONTEXT` per-invocation as before.
-  `docker-compose.yml`'s own `:-.`/`:-warbandeer-discord`/`:-.env` fallbacks are left in place on
+  values still win when present, so `ops/bot-ops.sh`'s own explicit exports (`cmd_restart`,
+  `cmd_env_set`) are unchanged — those still set `BOT_ENV_FILE`/`BOT_OPS_CONTAINER` per-invocation.
+  `ops/install.sh`'s OWN printed step-2 command, by contrast, stopped doing this in #169: it used
+  to shell-export `GIT_SHA`/`BOT_ENV_FILE`/`BOT_BUILD_CONTEXT`/`BOT_OPS_CONTAINER` too, redundantly
+  with what the stack `.env` this bullet describes already carries — dropped once `install.sh`
+  started writing that file itself, so the printed command now relies on the same auto-load
+  Dockge's buttons always have (proven for an absolute `-f` path + an unrelated cwd, not just
+  Dockge's cwd-equals-stack-dir case, in `ops/docker-compose.test.ts`). `docker-compose.yml`'s own
+  `:-.`/`:-warbandeer-discord`/`:-.env` fallbacks are left in place on
   purpose — a plain `docker compose up -d --build` run directly from this checkout for local dev
   (documented in the compose file's own header) has no stack-directory `.env` to fall back to, and
   relies on exactly those defaults. Self-update's own rebuilds (`src/redeploy.ts`) were already
   remote-context-based before any of this, via the Docker Engine API directly, not `docker
   compose` — untouched by it.
+- **Config lives in TWO files by design, a recorded deviation from the personal `CLAUDE.md`'s
+  one-answer-file rule** (issue #169): the generated stack `.env` above (params) and the
+  hand-edited `$CONFIG_DIR/.env` (secrets) are never merged into one — see `ops/README.md`'s
+  "Why two files, not one answer file" and the repo's own `CLAUDE.md` for the reasoning.
 - **A profile-gated service still gets fully interpolated and validated at `docker compose
   config` time, regardless of which `--profile` is active.** Profiles only filter which services
   actually get *created/started*; the whole file is parsed and every service's variables

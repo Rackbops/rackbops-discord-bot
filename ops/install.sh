@@ -32,8 +32,8 @@
 # nothing at the final path rather than a truncated file that a later run's existence-check would
 # mistake for real config.
 #
-# Deliberately does NOT run the initial `up -d --build` itself — that needs BOT_ENV_FILE and
-# GIT_SHA resolved from values only you can supply (secrets filled in, the branch to pin) and is
+# Deliberately does NOT run the initial `up -d --build` itself — the bot won't actually start
+# until you've filled in secrets (DISCORD_TOKEN etc.) that only you can supply, so the command is
 # printed at the end for you to run once .env is ready, not fired unattended against a live host.
 #
 # The whole body below lives inside main(), called only as the very last line of this file — a
@@ -131,6 +131,25 @@ fetch() {
 # are just git/curl/docker.
 random_token() { od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; }
 
+# The "render validates and fails loudly naming the exact field" half of the personal one-answer-
+# file rule, applied to the generated stack .env (see CLAUDE.md's recorded deviation for why this
+# repo splits params from secrets instead of using one answer file). Re-reads the FILE just
+# written — via the same grep '^KEY=' | cut -d= -f2- one-liner bot-ops.sh already uses for
+# ADMIN_TOKEN — rather than trusting the in-memory shell vars that built it, so a future bug in the
+# STACKENV heredoc itself is caught here too, not just a bad input. Every one of the three fields
+# is always absolute today (CONFIG_DIR/STACK_DIR are both built from a fixed /opt/... prefix), so
+# this can't actually fire in the current script — it's forward defense against a future change to
+# how those paths are built, proven able to fire at all by ops/install.test.ts's synthetic bad file.
+validate_stack_env() {
+  local file="$1" key value
+  for key in BOT_ENV_FILE BOT_OPS_CONFIG_DIR BOT_OPS_COMPOSE_FILE; do
+    value="$(grep "^${key}=" "$file" | tail -n1 | cut -d= -f2-)"
+    [[ "$value" == /* ]] || die "$key must be an absolute path, got \"$value\""
+  done
+  value="$(grep '^BOT_OPS_CONFIG_DIR=' "$file" | tail -n1 | cut -d= -f2-)"
+  [ -d "$value" ] || die "BOT_OPS_CONFIG_DIR does not exist"
+}
+
 main() {
   INSTANCE="${1:-}"
   BRANCH="${2:-main}"
@@ -208,6 +227,10 @@ GIT_SHA=$GIT_SHA
 STACKENV
   mv "$STACK_ENV_TMP" "$STACK_DIR/.env"
   chown "$DEPLOY_UID:$DEPLOY_GID" "$STACK_DIR/.env"
+  # Before this write is announced or the (now-shortened) next-steps block prints — a bad render
+  # dies here, silently. Earlier steps (the config .env, bin/bot-ops.sh, docker-compose.yml) have
+  # already logged their own real successes by this point; this only guards what comes after it.
+  validate_stack_env "$STACK_DIR/.env"
   echo "install: wrote $STACK_DIR/.env (Dockge's own interpolation source — see ops/README.md)"
 
   cat <<EOF
@@ -216,12 +239,10 @@ install: next steps for '$INSTANCE'
   1. Edit $CONFIG_DIR/.env — set DISCORD_TOKEN, ANNOUNCE_CHANNEL_ID, and anything else you need.
      Make sure BOT_BRANCH=$BRANCH and GITHUB_REPO=Rackbops/rackbops-discord-bot are set there too,
      so self-update (/update, AUTO_UPDATE) targets the same branch this bootstrap just built.
-  2. Bring it up (safe to re-run):
+  2. Bring it up (safe to re-run) — no vars to export: GIT_SHA/BOT_ENV_FILE/BOT_BUILD_CONTEXT/
+     BOT_OPS_CONTAINER all resolve from $STACK_DIR/.env, which Compose auto-loads from the
+     directory of the -f file below regardless of your shell's own cwd:
 
-     GIT_SHA=$GIT_SHA \\
-     BOT_ENV_FILE=$CONFIG_DIR/.env \\
-     BOT_BUILD_CONTEXT=$REPO_URL#$BRANCH \\
-     BOT_OPS_CONTAINER=$PROJECT \\
      docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT up -d --build
 
   3. Day-2 ops (status/logs/restart/env-get/env-set) go through $BIN_DIR/bot-ops.sh with:

@@ -84,17 +84,47 @@ scans), and `/opt/stacks/rackbops-discord-bot-<instance>/.env` — a **compose-p
 distinct from the bot's own `.env` above and holding no secrets, that Compose loads automatically
 for `${VAR}` interpolation. It carries this instance's real `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/
 `BOT_OPS_PROJECT`/`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_BUILD_CONTEXT`/`GIT_SHA`, so
-Dockge's own Start/Stop/Restart buttons — which run compose with none of `install.sh`'s printed
-shell prefix — resolve this instance's actual identity instead of the compose file's own
-monorepo-era fallbacks (issue #41). All three are written to a temp file first and moved into
-place atomically, so a dropped connection (or interrupted write) never leaves a truncated file a
-later run's existence-check could mistake for something real. Each temp file is registered with a
-script-level `EXIT` trap as it is created (issue #60), so an abort *between* the `mktemp` and the
-`mv` sweeps its `tmp.XXXXXX` instead of stranding it beside the real files. The reachable case is a
-typo'd `BRANCH`: it is only checked against the remote *after* the three downloads, so the first one
-404s and `set -e` aborts inside `fetch()` before the branch check ever runs. It prints the exact `docker compose
-up -d --build` command to run once `.env` is filled in, and the full `BOT_OPS_*` exports for day-2
-`bin/bot-ops.sh` use afterward — see the script's own output, or read `ops/install.sh` directly.
+Dockge's own Start/Stop/Restart buttons resolve this instance's actual identity instead of the
+compose file's own monorepo-era fallbacks (issue #41) — and, since #169, so does the exact command
+`install.sh` itself prints for step 2 (`docker compose -f .../docker-compose.yml -p ... up -d
+--build`, with no shell-exported prefix any more): Compose resolves its project directory, and
+therefore which `.env` it auto-loads, from the directory of the file passed via `-f`, regardless of
+the invoking shell's own cwd — proven for real in `ops/docker-compose.test.ts` with an absolute
+`-f` path invoked from an unrelated cwd, not just trusted from Compose's docs. All three are
+written to a temp file first and moved into place atomically, so a dropped connection (or
+interrupted write) never leaves a truncated file a later run's existence-check could mistake for
+something real. Each temp file is registered with a script-level `EXIT` trap as it is created
+(issue #60), so an abort *between* the `mktemp` and the `mv` sweeps its `tmp.XXXXXX` instead of
+stranding it beside the real files. The reachable case is a typo'd `BRANCH`: it is only checked
+against the remote *after* the three downloads, so the first one 404s and `set -e` aborts inside
+`fetch()` before the branch check ever runs. Immediately after the stack `.env` is written,
+`validate_stack_env` re-reads it and fails loudly, before anything below it prints or starts
+(issue #169): `install: <FIELD> must be an absolute path, got "…"` for a non-absolute
+`BOT_ENV_FILE`, `BOT_OPS_CONFIG_DIR`, or `BOT_OPS_COMPOSE_FILE` (all three), or
+`install: BOT_OPS_CONFIG_DIR does not exist` for a missing config dir (that one field only —
+`BOT_ENV_FILE`/`BOT_OPS_COMPOSE_FILE` are checked for shape, not existence). These are always
+absolute today, since `CONFIG_DIR`/`STACK_DIR` are built from a fixed `/opt/...` prefix, so
+this is forward defense against a future change to how those paths are built, not a case that fires
+in the current script). It prints the exact `docker compose up -d --build` command to run once
+`.env` is filled in, and the full `BOT_OPS_*` exports for day-2 `bin/bot-ops.sh` use afterward — see
+the script's own output, or read `ops/install.sh` directly.
+
+**Why two files, not one answer file (issue #169, #60 item 1).** The personal `CLAUDE.md`'s
+Application config & deployment rule calls for one operator-edited answer file — secrets and
+deployment params together — that everything else renders from. This repo deviates from that
+letter on purpose, recorded here and in the repo's own `CLAUDE.md`: the generated stack `.env`
+above (params — container names, paths, the build context, the resolved commit) and the
+hand-edited `$CONFIG_DIR/.env` (secrets — `DISCORD_TOKEN` and friends) are two separate files, not
+one. The rule's actual *purpose* still holds through all three of its own tests: no deployment
+param lives in the operator's head or shell history (it's in the generated file); a generated file
+is never hand-edited (`install.sh` always refreshes the stack `.env`, same as `bot-ops.sh` and the
+compose file); and the one precious, operator-edited file is never touched by anything but the
+operator (`$CONFIG_DIR/.env`, created once from `.env.example` and left alone on every later run).
+Promoting the stack `.env` to hold secrets too (so a single file covered both) would need migrating
+live secrets on every already-deployed instance for no behaviour change; a full renderer that emits
+both files from one answer file would give up the property that lets `install.sh` be safely re-run
+and self-update stay independent of this file (`docker-compose.yml`'s compose file is fetched
+verbatim from the target branch, not rendered) — see #169's own body for the full option table.
 
 The compose file's `build.context` defaults to `.` (a local checkout, unchanged for anyone
 running `docker compose up -d --build` from a clone) — the bootstrap command instead supplies

@@ -7,7 +7,7 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -286,4 +286,246 @@ test("every TMP_FILES registration in install.sh belongs to the mktemp right abo
 test("install.sh installs exactly one trap, so nothing can silently replace the sweep", () => {
   const traps = CODE_LINES.filter((l) => /\btrap\b/.test(l)).map((l) => l.trim());
   expect(traps).toEqual(["trap cleanup_tmp_files EXIT"]);
+});
+
+// ---------------------------------------------------------------------------
+// validate_stack_env (issue #169) — the "render validates and fails loudly naming the exact
+// field" half of the personal one-answer-file rule, applied to the generated stack .env.
+// ---------------------------------------------------------------------------
+const VALIDATE_STACK_ENV = extractFunction("validate_stack_env");
+
+// validate_stack_env's absolute-path check is deliberately POSIX-only (`[[ == /* ]]`) — the real
+// script only ever runs on a Linux host (install.sh's own header: git/curl/docker, no Windows
+// target). On this Windows dev box, `mkdtempSync` returns a Windows-style `C:\Users\...` path,
+// which correctly does NOT start with `/` and would wrongly fail the "valid file" test case too.
+// Git Bash's own runtime (msys-2.0.dll) transparently resolves the MSYS form `/c/Users/...` for
+// real filesystem syscalls, including `[ -d ]`, so that form is both POSIX-absolute (passes the
+// check) and a real, `stat`-able path (works for the existence check) under the same BASH this
+// harness already resolved via resolveBash(). A no-op on a real POSIX path (CI/Linux).
+function toMsysPath(p: string): string {
+  const m = p.match(/^([A-Za-z]):[\\/](.*)$/);
+  if (!m) return p.replaceAll("\\", "/");
+  return `/${m[1]!.toLowerCase()}/${m[2]!.replaceAll("\\", "/")}`;
+}
+
+async function runValidate(fileLines: string[]): Promise<Run> {
+  const dir = mkdtempSync(join(tmpdir(), "install-validate-"));
+  try {
+    const file = join(dir, "stack.env");
+    writeFileSync(file, fileLines.join("\n") + "\n");
+    const script = ['set -euo pipefail', 'die() { echo "install: $*" >&2; exit 1; }', VALIDATE_STACK_ENV, 'validate_stack_env "$1"', 'echo VALID'].join(
+      "\n",
+    );
+    const proc = Bun.spawn([BASH!, "-c", script, "_", file], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { exitCode, stdout, stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// A shape matching what install.sh's own STACKENV heredoc actually writes (install.sh:220-226),
+// with BOT_OPS_CONFIG_DIR pointed at a REAL directory (validDir) so the base case is genuinely
+// valid end to end, not just absolute-looking.
+function validStackEnv(validDir: string): string[] {
+  const dir = toMsysPath(validDir);
+  return [
+    `BOT_ENV_FILE=${dir}/.env`,
+    "BOT_OPS_CONTAINER=probe",
+    "BOT_OPS_PROJECT=probe",
+    `BOT_OPS_CONFIG_DIR=${dir}`,
+    `BOT_OPS_COMPOSE_FILE=${dir}/docker-compose.yml`,
+    "BOT_BUILD_CONTEXT=https://example.invalid/repo.git#main",
+    "GIT_SHA=deadbeef",
+  ];
+}
+
+describe.skipIf(!runnable)("install.sh's validate_stack_env catches a bad render, naming the field (#169)", () => {
+  test("a well-formed generated file (matching the real STACKENV shape) passes", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const r = await runValidate(validStackEnv(validDir));
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("VALID");
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a relative BOT_ENV_FILE is rejected, naming BOT_ENV_FILE and the bad value", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const lines = validStackEnv(validDir).map((l) => (l.startsWith("BOT_ENV_FILE=") ? "BOT_ENV_FILE=relative/secrets.env" : l));
+      const r = await runValidate(lines);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain('install: BOT_ENV_FILE must be an absolute path, got "relative/secrets.env"');
+      expect(r.stdout).not.toContain("VALID");
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a relative BOT_OPS_COMPOSE_FILE is rejected, naming BOT_OPS_COMPOSE_FILE", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const lines = validStackEnv(validDir).map((l) =>
+        l.startsWith("BOT_OPS_COMPOSE_FILE=") ? "BOT_OPS_COMPOSE_FILE=relative/docker-compose.yml" : l,
+      );
+      const r = await runValidate(lines);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain('install: BOT_OPS_COMPOSE_FILE must be an absolute path, got "relative/docker-compose.yml"');
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a relative BOT_OPS_CONFIG_DIR is rejected as non-absolute BEFORE the existence check ever runs", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const lines = validStackEnv(validDir).map((l) => (l.startsWith("BOT_OPS_CONFIG_DIR=") ? "BOT_OPS_CONFIG_DIR=relative/dir" : l));
+      const r = await runValidate(lines);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain('install: BOT_OPS_CONFIG_DIR must be an absolute path, got "relative/dir"');
+      expect(r.stderr).not.toContain("does not exist"); // died on the absolute-path check, never reached the existence one
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an absolute but missing BOT_OPS_CONFIG_DIR is rejected as not existing", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const missing = toMsysPath(join(validDir, "does-not-exist-really"));
+      const lines = validStackEnv(validDir).map((l) => (l.startsWith("BOT_OPS_CONFIG_DIR=") ? `BOT_OPS_CONFIG_DIR=${missing}` : l));
+      const r = await runValidate(lines);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain("install: BOT_OPS_CONFIG_DIR does not exist");
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The CALL SITE (issue #169) — every test above only proves validate_stack_env works correctly in
+// isolation; none of them would notice if main() stopped calling it at all. Extracted as a
+// CONTIGUOUS SOURCE SLICE (not a function pulled by name) spanning from the STACKENV mktemp
+// through the "wrote $STACK_DIR/.env" echo, so a future edit that removes the call — while leaving
+// the function definition intact — shrinks THIS extraction too and is caught here, unlike a
+// by-name function extraction which would keep passing against an orphaned, never-called function.
+// ---------------------------------------------------------------------------
+const STACK_ENV_WRITE_SEQUENCE = extractLine(
+  /^ {2}STACK_ENV_TMP="\$\(mktemp -p "\$STACK_DIR"\)"[\s\S]*?\n {2}echo "install: wrote \$STACK_DIR\/\.env \(Dockge's own interpolation source — see ops\/README\.md\)"$/m,
+  "the stack .env write-then-validate sequence (STACK_ENV_TMP mktemp through the wrote-echo)",
+);
+
+async function runWriteSequence(configDir: string | null): Promise<Run> {
+  const stackDir = mkdtempSync(join(tmpdir(), "install-callsite-stack-"));
+  try {
+    const script = [
+      "set -euo pipefail",
+      `STACK_DIR="${toMsysPath(stackDir)}"`,
+      `CONFIG_DIR="${configDir ?? "relative-config-dir-not-absolute"}"`,
+      "PROJECT=probe",
+      'REPO_URL="https://example.invalid/repo.git"',
+      "BRANCH=main",
+      "GIT_SHA=deadbeef",
+      "DEPLOY_UID=1000",
+      "DEPLOY_GID=1000",
+      "TMP_FILES=()",
+      'chown() { :; }', // real chown needs privileges/semantics this harness doesn't have or need
+      'die() { echo "install: $*" >&2; exit 1; }',
+      VALIDATE_STACK_ENV,
+      STACK_ENV_WRITE_SEQUENCE,
+      'echo POST_VALIDATE_OK', // proves execution actually reached past the extracted slice
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { exitCode, stdout, stderr };
+  } finally {
+    rmSync(stackDir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("validate_stack_env is actually wired into the real write sequence, not just callable in isolation (#169)", () => {
+  test("a real CONFIG_DIR: the sequence writes the file, validates it, and execution continues past it", async () => {
+    const configDir = mkdtempSync(join(tmpdir(), "install-callsite-config-"));
+    try {
+      const r = await runWriteSequence(toMsysPath(configDir));
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("install: wrote");
+      expect(r.stdout).toContain("POST_VALIDATE_OK");
+    } finally {
+      rmSync(configDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a non-absolute CONFIG_DIR (so BOT_ENV_FILE is non-absolute): the real sequence dies naming BOT_ENV_FILE before its own wrote-echo or anything after it", async () => {
+    const r = await runWriteSequence(null); // relative CONFIG_DIR, not mkdtempSync'd — deliberately bad
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("install: BOT_ENV_FILE must be an absolute path");
+    // Neither this slice's own success echo NOR anything after the extracted slice ran — proves
+    // validate_stack_env's real call site position, not an assumption about it.
+    expect(r.stdout).not.toContain("install: wrote");
+    expect(r.stdout).not.toContain("POST_VALIDATE_OK");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The printed "next steps" block (issue #169) — proves the RENDERED output, not just the source
+// text, since a probe grepping install.sh's literal lines could pass while the actual printed
+// output still carried the old prefixes via some other path (a second, unnoticed copy). Extracted
+// as a heredoc block (not a function — main()'s final `cat <<EOF ... EOF`), fed the same variable
+// names install.sh's own main() resolves before reaching it, and run standalone.
+// ---------------------------------------------------------------------------
+const NEXT_STEPS_BLOCK = extractLine(/^  cat <<EOF[\s\S]*?\n^EOF$/m, "the printed next-steps heredoc block");
+
+async function renderNextSteps(): Promise<string> {
+  const script = [
+    "set -euo pipefail",
+    "INSTANCE=debug",
+    "CONFIG_DIR=/opt/rackbops-discord-bot/debug",
+    "BIN_DIR=/opt/rackbops-discord-bot/bin",
+    "STACK_DIR=/opt/stacks/rackbops-discord-bot-debug",
+    "PROJECT=rackbops-discord-bot-debug",
+    "BRANCH=main",
+    "GIT_SHA=deadbeefcafefeed",
+    'REPO_URL="https://github.com/Rackbops/rackbops-discord-bot.git"',
+    NEXT_STEPS_BLOCK,
+  ].join("\n");
+  const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  expect(exitCode).toBe(0);
+  return stdout;
+}
+
+describe.skipIf(!runnable)("install.sh's printed step 2 no longer carries the four now-redundant prefix vars (#169)", () => {
+  test("step 2's own block has no GIT_SHA=/BOT_ENV_FILE=/BOT_BUILD_CONTEXT=/BOT_OPS_CONTAINER= prefix lines, but step 3's block still does", async () => {
+    const out = await renderNextSteps();
+    const step2 = out.slice(out.indexOf("2. Bring it up"), out.indexOf("3. Day-2 ops"));
+    for (const prefix of ["GIT_SHA=", "BOT_ENV_FILE=", "BOT_BUILD_CONTEXT=", "BOT_OPS_CONTAINER="]) {
+      expect(step2).not.toContain(prefix);
+    }
+    expect(step2).toContain("docker compose -f /opt/stacks/rackbops-discord-bot-debug/docker-compose.yml -p rackbops-discord-bot-debug up -d --build");
+    // Not vacuous: step 3 (bot-ops.sh — a plain script, not Compose, so it has no auto-.env-load
+    // to lean on) is untouched by #169 and must still carry its own prefix vars. NOTE (found while
+    // writing this test, out of #169's scope, unrelated to this change): bash's unquoted `<<EOF`
+    // heredoc splices every `\<newline>` in its body per the manual ("the character sequence
+    // \newline is ignored"), confirmed with a two-line repro — so steps 3/4/5's own backslash
+    // continuations, unchanged here, already collapse onto one run-on line with the source's
+    // indentation left behind as inline whitespace, not the multi-line block the source layout
+    // visually suggests. Still a valid single command to copy-paste (word-splitting doesn't care
+    // whether words are separated by a newline+indent or a run of spaces), so not asserted as
+    // multi-line here — just that step 3's prefix vars are still present, unlike step 2's.
+    const step3 = out.slice(out.indexOf("3. Day-2 ops"), out.indexOf("4. Optional"));
+    expect(step3).toContain("BOT_OPS_CONTAINER=rackbops-discord-bot-debug");
+  });
 });
