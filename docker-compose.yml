@@ -126,7 +126,7 @@ services:
   cloudflared:
     # Pinned, not :latest — a floating tag pulls whatever cloudflared shipped that day on every
     # `up --build`, with no reproducibility and no chance to vet a release. Bump deliberately.
-    image: cloudflare/cloudflared:2026.8.3
+    image: cloudflare/cloudflared:2026.9.0
     container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}-tunnel
     command: tunnel --no-autoupdate run
     environment:
