@@ -122,3 +122,6 @@ plugin to an instance is a `PLUGINS=` edit and a restart; adding one to the worl
 plugins repo. The shipped identifiers listed in #95 — the connector's env var, command names and
 options, reply strings, data paths, HTTP routes — are preserved through the whole migration; only
 startup log lines may be reworded.
+
+Extended by [ADR-0005](0005-plugins-ship-their-own-admin-ui.md) for the panel side: a plugin may
+also ship its own admin-panel tab, delivered through the same Plugin Index this ADR defines.
