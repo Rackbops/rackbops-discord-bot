@@ -215,6 +215,46 @@ describe("handleCommand — /plugins", () => {
   });
 });
 
+// The three editReply failure paths below share the same shape as the ordering guards above
+// (real network/state I/O behind them, impractical to drive a genuine upstream failure through
+// in a unit test), so they're pinned the same way: source-scan the catch block for the guard
+// rather than exercise it end-to-end. `clampReply`'s own behaviour (truncation, boundary, custom
+// max) is unit-tested directly in github.test.ts; report.test.ts drives the equivalent /report
+// failure path end-to-end since createIssue's fetch is easy to stub. Mutation: removing
+// `clampReply(` from any of these three catch blocks must fail its test.
+describe("commands.ts — clampReply guards every editReply failure path (#55, #186)", () => {
+  test("/update's failure edit is wrapped in clampReply", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    const block = src.slice(src.indexOf('case "update"'), src.indexOf('case "report"'));
+    const catchIdx = block.indexOf("} catch (err) {");
+    expect(catchIdx).toBeGreaterThan(-1);
+    const editIdx = block.indexOf("await interaction.editReply(clampReply(", catchIdx);
+    expect(editIdx).toBeGreaterThan(catchIdx);
+  });
+
+  test("/plugins list's failure edit is wrapped in clampReply", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    const listIdx = src.indexOf('if (sub === "list")');
+    const block = src.slice(listIdx, src.indexOf('if (!isPluginStateReady())'));
+    const catchIdx = block.indexOf("} catch (err) {");
+    expect(catchIdx).toBeGreaterThan(-1);
+    const editIdx = block.indexOf("await interaction.editReply(clampReply(", catchIdx);
+    expect(editIdx).toBeGreaterThan(catchIdx);
+  });
+
+  test("/plugins <action>'s failure edit is wrapped in clampReply", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    // The action (update/remind/skip/cancel) catch is the last one in the file — after it there
+    // is only the default-case plugin dispatch, which has no editReply of its own.
+    const actionCatchIdx = src.lastIndexOf("} catch (err) {");
+    const editIdx = src.indexOf("await interaction.editReply(clampReply(", actionCatchIdx);
+    expect(editIdx).toBeGreaterThan(actionCatchIdx);
+  });
+});
+
 describe("buildCommandBody — core-only identity", () => {
   // The framework must not change the core registration body, AND the plugin-migration removals are
   // pinned here: with no plugins the built body must equal the captured full JSON MINUS every command

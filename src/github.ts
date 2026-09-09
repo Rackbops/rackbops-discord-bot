@@ -125,6 +125,41 @@ export interface CreatedIssue {
   url: string;
 }
 
+/**
+ * `text.slice(0, max)` bounds UTF-16 code units — the same unit Discord's content-length limit
+ * counts in — but can cut a surrogate pair (e.g. an emoji) in half, leaving a lone high surrogate
+ * at the end that mangles on the way out. Dropping that one trailing unit keeps the true
+ * ≤`max`-unit bound (round 2 of #189's review: an earlier fix switched to counting *code points*
+ * instead, which silently let an emoji-heavy body through roughly 2x over Discord's real cap).
+ */
+function sliceUtf16(text: string, max: number): string {
+  const cut = text.slice(0, max);
+  const lastUnit = cut.charCodeAt(cut.length - 1);
+  return lastUnit >= 0xd800 && lastUnit <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/**
+ * Clamp raw upstream text before it's embedded in a thrown message: first line only (a GitHub
+ * 5xx can answer with several KB of HTML), trimmed and capped to `max` chars with a `…` suffix on
+ * truncation. Applied at every `res.text()` embed under `src/` that can end up in an `Error`
+ * message — without it, a long body blows Discord's 2000-char reply cap and `editReply` throws,
+ * leaving the interaction "thinking" until the token expires (#55, #186).
+ */
+export function clampUpstreamBody(text: string, max = 300): string {
+  const line = (text.split("\n")[0] ?? "").trim();
+  return line.length > max ? `${sliceUtf16(line, max)}…` : line;
+}
+
+/**
+ * Defensive clamp for anything about to go into an `editReply` failure path. `clampUpstreamBody`
+ * already bounds what an upstream body contributes to an `Error.message`, but a failure message
+ * can carry other text too (a thrown validation error, a stack-free JS error) — this is the last
+ * line of defense so *any* long message can't strand the interaction, not just an upstream one.
+ */
+export function clampReply(text: string, max = 1900): string {
+  return text.length > max ? `${sliceUtf16(text, max)}…` : text;
+}
+
 function writeHeaders(): Record<string, string> {
   if (!config.githubToken) throw new Error("GITHUB_TOKEN is not set — cannot write to GitHub");
   return {
@@ -152,7 +187,7 @@ export async function createIssue(
     body: JSON.stringify({ title, body, labels }),
     signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!res.ok) throw new Error(`GitHub create-issue failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) throw new Error(`GitHub create-issue failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
   const data = (await res.json()) as { number: number; html_url: string };
   return { number: data.number, url: data.html_url };
 }
