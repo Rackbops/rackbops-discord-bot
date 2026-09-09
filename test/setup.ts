@@ -54,7 +54,8 @@ function snapshotTree(dir: string): void {
 snapshotTree(repoDataDir);
 (globalThis as { __repoDataSnapshots?: Record<string, string | null> }).__repoDataSnapshots = snapshots;
 
-// The two vars `config.ts` requires at import time. Kept here so the nine test files that each
-// repeated them don't have to — they resolve the same singleton either way.
+// The two vars `config.ts` requires at import time. The one place this is set (#136) -- every
+// test file that transitively imports config/state used to repeat these two lines itself; all of
+// them now rely on this preload instead.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";

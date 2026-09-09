@@ -1,9 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-// github.ts imports the `config` singleton (resolved from process.env at import time), so
-// prime the required vars before pulling the module in — see config.test.ts.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// github.ts imports the `config` singleton (resolved from process.env at import time) --
+// the required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
   clampReply,
   clampUpstreamBody,

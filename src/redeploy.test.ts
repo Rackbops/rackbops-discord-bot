@@ -2,9 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ContainerInspect, ImageSummary } from "./docker";
 import type { HandoffMarker } from "./handoff";
 
-// redeploy.ts pulls in the `config` singleton (env resolved at import time) — see config.test.ts.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// redeploy.ts pulls in the `config` singleton (env resolved at import time) -- the required vars
+// are primed once by test/setup.ts's bunfig preload (#136).
 const {
   buildCreateSpec,
   buildRemote,

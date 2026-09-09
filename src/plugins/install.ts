@@ -14,7 +14,7 @@ const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const REGISTRY_BASE = (process.env.PLUGIN_REGISTRY_URL ?? DEFAULT_REGISTRY).replace(/\/$/, "");
 const FETCH_TIMEOUT_MS = 30_000;
 
-export interface InstallLog {
+interface InstallLog {
   info(message: string): void;
   warn(message: string): void;
   error(message: string, err?: unknown): void;
@@ -47,7 +47,7 @@ export interface InstallResult {
 
 /** The pins a plugin resolves its install version against — the last-good `installedVersion` and,
  *  after a `/plugins update`, the transient `targetVersion` the next boot should try first (#104). */
-export interface PluginPins {
+interface PluginPins {
   installedVersion?: string;
   targetVersion?: string;
 }

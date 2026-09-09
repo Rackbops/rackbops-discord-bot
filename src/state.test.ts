@@ -4,10 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BotState } from "./state";
 
-// state.ts imports the `config` singleton (resolved from process.env at import time), so
-// prime the required vars before pulling the module in — see config.test.ts.
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// state.ts imports the `config` singleton (resolved from process.env at import time) -- the
+// required vars are primed once by test/setup.ts's bunfig preload (#136).
 const { createStateWriter, loadStateFrom, normalizeSeenReleaseIds, saveStateTo } = await import("./state");
 
 describe("normalizeSeenReleaseIds", () => {

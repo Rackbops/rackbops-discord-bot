@@ -4,7 +4,6 @@
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
 import {
   MessageFlags,
-  SlashCommandBuilder,
   type MessageComponentInteraction,
   type ModalSubmitInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,

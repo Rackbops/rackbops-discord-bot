@@ -7,10 +7,8 @@ import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndexEntry, Plu
 import type { InstalledPlugin } from "./install";
 import type { LoadedPlugin } from "./host";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
-// Prime the env some transitive imports read at load time (harmless if unused after the #104 cycle
-// break moved commandNamer to ../commandNaming, so host.ts no longer imports ../commands/config).
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
+// once, for every test file, by test/setup.ts's bunfig preload (#136).
 const {
   createHostApi,
   loadPlugins,

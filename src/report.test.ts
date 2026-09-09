@@ -1,10 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ModalSubmitInteraction } from "discord.js";
 
-// report.ts pulls in the `config` singleton, which resolves process.env at import time —
-// satisfy the required vars before importing so this file runs standalone (see config.test.ts).
-process.env.DISCORD_TOKEN ??= "test-token";
-process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// report.ts pulls in the `config` singleton, which resolves process.env at import time -- the
+// required vars are primed once by test/setup.ts's bunfig preload (#136).
 const { handleReportModal } = await import("./report");
 const { config } = await import("./config");
 
