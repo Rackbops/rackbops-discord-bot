@@ -1166,3 +1166,24 @@ describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they a
     expect(run.stderr).not.toContain("bot-ops: env file");
   });
 });
+
+// #173: the panel's runBotOps reads a subcommand's STDOUT as JSON — a stray line anywhere else
+// on stdout (or the JSON landing on stderr instead) would break the same way env-get/status's own
+// stdout-is-JSON contract breaks (#101's lesson, reused here for a fourth subcommand).
+describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
+  test("prints {\"schema\": N} on stdout, nothing on stderr", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"]);
+    expect(run.exitCode).toBe(0);
+    // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
+    expect(run.json).toEqual({ schema: 1 });
+    expect(run.stderr).toBe("");
+  });
+
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 1)", () => {
+    // A source-level pin distinct from the subprocess test above: this is the number the drift
+    // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=1\b/);
+  });
+});

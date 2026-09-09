@@ -77,6 +77,10 @@
   }
   label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
   .field-hint { font-size: 11px; color: var(--muted); margin: 0 0 4px; }
+  /* #173: a hard-to-miss warning — bot-ops.sh drifted behind the panel image it's paired with.
+     Distinct from .field-hint/.msg (both quiet, per-field/per-action notices): this is instance-
+     wide, so it renders once at the very top of the page rather than beside any one section. */
+  .banner-warn { background: var(--danger); color: #fff; font-size: 13px; font-weight: 600; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
   /* Tag/chip editor for comma-separated list fields (ADMIN_USER_IDS, WATCHED_REPOS). Looks like an
      input box with each entry as a removable chip, plus an inline field to type the next one. */
   .tag-field { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: var(--inset); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
@@ -191,6 +195,11 @@
 </div>
 
 <main id="app" hidden>
+  <!-- #173: bot-ops.sh version-drift warning — populated from /api/status's botOpsOutdated, hidden
+       whenever that field is absent (up to date). See loadStatus() below. -->
+  <div id="bot-ops-outdated-banner" class="banner-warn" hidden>
+    bot-ops.sh is out of date on this instance — re-run ops/install.sh; panel features may fail.
+  </div>
   <div class="panel-header">
     <h1>Bot Admin</h1>
     <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
@@ -1156,9 +1165,13 @@
 
   async function loadStatus() {
     const grid = document.getElementById("status-grid");
+    const banner = document.getElementById("bot-ops-outdated-banner");
     try {
       const res = await api("/api/status");
       const s = await res.json();
+      // #173: present exactly when true (server convention, see mergeStatusOutdated) — absent or
+      // false both mean up to date.
+      if (banner) banner.hidden = !s.botOpsOutdated;
       const dot = s.realmStatus === "UP" ? "up" : s.realmStatus === "DOWN" ? "down" : "";
       grid.innerHTML =
         "<dt>Running</dt><dd>" + (s.running ? "yes" : "no") + "</dd>" +

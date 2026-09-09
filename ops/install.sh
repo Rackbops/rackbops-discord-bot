@@ -191,7 +191,12 @@ main() {
   # whatever BRANCH ships, same as .env is never touched. This is the "scripts/descriptors are
   # deployment artifacts, not instance config" split from app-config-deployment-foundation.md.
   fetch "ops/bot-ops.sh" 755 "$BIN_DIR/bot-ops.sh"
-  echo "install: wrote $BIN_DIR/bot-ops.sh from $BRANCH"
+  # #173: name the schema this fetch just installed, so an operator can see it side by side with
+  # the admin panel's own "bot-ops.sh schema <got> (panel needs <want>)" startup log line. Read
+  # from the file just written (not a hardcoded number here) so this can never itself drift from
+  # what actually landed on disk.
+  bot_ops_schema="$(grep -m1 '^readonly BOT_OPS_SCHEMA=' "$BIN_DIR/bot-ops.sh" | cut -d= -f2)"
+  echo "install: wrote $BIN_DIR/bot-ops.sh from $BRANCH (bot-ops schema ${bot_ops_schema:-unknown})"
   fetch "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
   echo "install: wrote $STACK_DIR/docker-compose.yml from $BRANCH (Dockge will list this as a managed stack)"
 

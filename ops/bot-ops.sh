@@ -17,6 +17,8 @@
 #   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
 #                 remaining one against the effective value, validate the FORMAT of only the ones
 #                 that change, back up .env, apply those changes, then `up -d --force-recreate`.
+#   version       Print JSON: {"schema": N} — this script's BOT_OPS_SCHEMA, so a caller (the admin
+#                 panel) can tell an outdated deployed copy from the one it was built against (#173).
 #
 # Design notes:
 #   - The compose project + container come from BOT_OPS_PROJECT / BOT_OPS_CONTAINER (the caller
@@ -43,6 +45,18 @@
 #     validating every submitted line first meant one stored value the bot accepts but a regex
 #     here rejects failed every save that echoed it back, naming a key the operator never touched.
 set -euo pipefail
+
+# #173: bumped in the SAME PR whenever a subcommand or ALLOWED/ALLOWED_ORDER row is added or
+# changed — the admin panel (ops/admin/server.ts's REQUIRED_BOT_OPS_SCHEMA, hand-mirrored and
+# drift-pinned by a test) compares this against its own copy at startup, so a deployed instance
+# whose bin/bot-ops.sh has drifted behind the panel image it's paired with shows up as a loud,
+# visible warning instead of a generic "bot-ops: usage: ..." failure the next time someone clicks
+# a button the old script doesn't have (the #173 incident: Update now failed on debug because
+# install.sh hadn't been re-run since #121 added plugin-request). `version` (below) is a subcommand
+# like any other — it still needs BOT_OPS_PROJECT/CONTAINER/CONFIG_DIR/COMPOSE_FILE set, since the
+# panel always has those set for its own instance by the time it runs a startup check; nothing
+# special-cases it past main()'s usual preconditions.
+readonly BOT_OPS_SCHEMA=1
 
 # Target bot: no fallback to the monorepo-era name — a panel (or you, by hand) must always pass
 # both per the selected target (debug/prod), the same "no repo-relative fallback" rule as
@@ -395,6 +409,14 @@ cmd_logs() {
   docker logs "$CONTAINER" --tail "$n" 2>&1
 }
 
+cmd_version() {
+  need jq
+  # #173: stdout JSON only, same convention as status/env-get — the panel's runBotOps reads this
+  # subcommand's stdout as JSON, so a stray non-JSON line here would break the same way a stray
+  # stdout line already breaks env-get/status (#101).
+  jq -n --argjson schema "$BOT_OPS_SCHEMA" '{schema: $schema}'
+}
+
 cmd_restart() {
   need docker
   guard_no_handoff_in_progress
@@ -688,7 +710,8 @@ main() {
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
     plugin-request) cmd_plugin_request ;;
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request}" ;;
+    version) cmd_version ;;
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request|version}" ;;
   esac
 }
 

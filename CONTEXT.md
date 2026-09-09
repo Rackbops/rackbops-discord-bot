@@ -643,3 +643,21 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   and is not built. A plugin's admin tab therefore configures the running code's UI, but a config
   key that changed shape between versions is validated against the CURRENT manifest, not the
   installed one.
+- **`ops/bot-ops.sh` on a deployed instance can silently drift behind the panel image it's paired
+  with, and the panel now stamps + checks a schema for it (#173).** `install.sh` fetches
+  `bot-ops.sh` once and nothing re-fetches it after a later merge changes it — a real incident:
+  `debug`'s admin panel was rebuilt from `main` after #121 added the `plugin-request` subcommand,
+  but its deployed `bin/bot-ops.sh` was still the pre-#121 copy, so `Update now` failed with a bare
+  `bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}` and nothing named the real
+  cause. `bot-ops.sh` gained `readonly BOT_OPS_SCHEMA=<n>` (bumped in the same PR as any subcommand
+  or `ALLOWED`/`ALLOWED_ORDER` change) and a `version` subcommand printing `{"schema": <n>}`;
+  `ops/admin/server.ts`'s `REQUIRED_BOT_OPS_SCHEMA` is a hand-mirror, drift-pinned by a test that
+  regexes the script (the `DEFAULT_PLUGIN_INDEX_URL`/`HOST_API_VERSION` pattern). The panel runs
+  `version` once at startup (`checkBotOpsSchemaStartup`), logging either an info line or a loud
+  `OUT OF DATE` one — a pre-#173 script's usage error on an unrecognized `version` subcommand
+  counts as outdated too, same as a real number mismatch (`decideBotOpsSchema`). Never refuses to
+  start on a mismatch: `status`/`logs`/`restart` still work against an outdated script, this only
+  makes the drift visible instead of silent — `/api/status` gains `botOpsOutdated: true` (present
+  only when true — `mergeStatusOutdated`) and the panel renders it as a banner at the top of the
+  page. `install.sh`'s own summary line for `bot-ops.sh` prints the schema it just installed, read
+  back from the file it just wrote, so the two numbers are easy to compare after a deploy.
