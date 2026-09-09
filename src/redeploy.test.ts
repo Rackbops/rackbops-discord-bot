@@ -18,7 +18,7 @@ const {
   shaTag,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker, writeMarker, HANDOFF_FROM_ENV } = await import("./handoff");
+const { clearMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV } = await import("./handoff");
 const { handoffActive, restartPending, resetForTest } = await import("./restart");
 
 const SELF_ID = "a".repeat(64);
@@ -227,13 +227,43 @@ describe("buildCreateSpec", () => {
     expect(spec.User).toBe("0:0");
   });
 
-  test("keeps the restart policy, so the replacement survives a host reboot", () => {
-    expect(spec.HostConfig.RestartPolicy).toEqual({ Name: "unless-stopped" });
+  // #160: the standby must never be resurrected by Docker's own restart policy while it's still
+  // unverified — a policy restore that only ran AFTER retireOriginal's stop, combined with #130's
+  // 60s bound on that stop, would be a permanent zero-bots outage if the transport dropped in that
+  // exact window (see redeploy.ts's takeOver docstring). The original's REAL policy still rides
+  // along, just in the env now — see the next test — for takeOver to restore before it stops it.
+  test("the standby is non-resurrecting, regardless of the original's own policy", () => {
+    expect(spec.HostConfig.RestartPolicy).toEqual({ Name: "no" });
+    const originalOnNoPolicy = buildCreateSpec(
+      { ...SELF, HostConfig: { ...SELF.HostConfig, RestartPolicy: { Name: "always" } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(originalOnNoPolicy.HostConfig.RestartPolicy).toEqual({ Name: "no" });
   });
 
-  test("defaults the restart policy when the original somehow has none", () => {
+  test("the original's policy name rides in the env for takeOver to restore, defaulting when absent", () => {
+    expect(spec.Env).toContain(`${HANDOFF_RESTART_POLICY_ENV}=unless-stopped`);
     const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
-    expect(bare.HostConfig.RestartPolicy).toEqual({ Name: "unless-stopped" });
+    expect(bare.Env).toContain(`${HANDOFF_RESTART_POLICY_ENV}=unless-stopped`);
+    const always = buildCreateSpec(
+      { ...SELF, HostConfig: { ...SELF.HostConfig, RestartPolicy: { Name: "always" } } },
+      { image: "i", handoffFrom: "x", oldImageEnv: [] },
+    );
+    expect(always.Env).toContain(`${HANDOFF_RESTART_POLICY_ENV}=always`);
+  });
+
+  // Mirrors the existing "never stacks a second HANDOFF_FROM" test — a container that has already
+  // been through one handoff (a standby that never finished, restarted, and is now redeploying
+  // again) must not accumulate a second HANDOFF_RESTART_POLICY= line, which would make grep-style
+  // extraction (takeOver's real effect) ambiguous about which one is current.
+  test("never stacks a second HANDOFF_RESTART_POLICY when one is already set", () => {
+    const chained = buildCreateSpec(
+      { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, `${HANDOFF_RESTART_POLICY_ENV}=stale`] } },
+      { image: "img:abc1234", handoffFrom: "newer", oldImageEnv: [] },
+    );
+    expect(chained.Env.filter((e) => e.startsWith(`${HANDOFF_RESTART_POLICY_ENV}=`))).toEqual([
+      `${HANDOFF_RESTART_POLICY_ENV}=unless-stopped`,
+    ]);
   });
 
   // Found on the debug box: the swapped-in bot ran with bun as PID 1 because compose's
@@ -303,23 +333,27 @@ describe("buildCreateSpec", () => {
 describe("takeOver", () => {
   const ID = "b".repeat(64);
 
-  test("announces ready, tags :latest, retires the original, clears the marker — and never exits", async () => {
+  test("announces ready, tags :latest, restores the policy, retires the original, clears the marker — and never exits", async () => {
     const order: string[] = [];
     const exits: number[] = [];
     let retired: string | undefined;
     await takeOver(ID, {
       write: async (m) => void order.push(`write:${m.status}`),
       tagLatest: async () => void order.push("tag"),
+      restorePolicy: async () => void order.push("restore"),
       retire: async (id) => void (order.push("retire"), (retired = id)),
       clear: async () => void order.push("clear"),
       exit: (code) => void exits.push(code),
     });
     // Order is load-bearing: `ready` must be written *before* the retire — that write is what
     // stops the original counting toward its deadline and removing a replacement that has in fact
-    // verified — and the :latest tag lands before the retire too, since it tags this (still-live)
-    // container's own image, no different in kind from the write. Assert the exact sequence, so a
-    // reorder can't slip through green.
-    expect(order).toEqual(["write:ready", "tag", "retire", "clear"]);
+    // verified — the :latest tag and the restart-policy restore both land before the retire too,
+    // since they both act on this (still-live) container's own state, no different in kind from
+    // the write. #160: restore must come after tag and before retire specifically — a restore
+    // that ran only after the original's stop would be a permanent zero-bots outage if the
+    // transport dropped in that window (see takeOver's own docstring). Assert the exact sequence,
+    // so a reorder — the guard for that whole hazard — can't slip through green.
+    expect(order).toEqual(["write:ready", "tag", "restore", "retire", "clear"]);
     expect(retired).toBe(ID);
     expect(exits).toEqual([]);
   });
@@ -336,6 +370,7 @@ describe("takeOver", () => {
       tagLatest: async () => {
         throw new Error("daemon: tag conflict");
       },
+      restorePolicy: async () => {},
       retire: async (id) => void (retired = id),
       clear: async () => void (cleared = true),
       exit: (code) => void exits.push(code),
@@ -344,6 +379,34 @@ describe("takeOver", () => {
     expect(cleared).toBe(true);
     expect(exits).toEqual([]);
     expect(writes.some((m) => m.status === "failed")).toBe(false);
+  });
+
+  // #160: unlike tagLatest, a restorePolicy failure is NOT best-effort — a swallowed failure would
+  // leave the SURVIVING bot on RestartPolicy:"no" forever, silently, until a host reboot doesn't
+  // bring it back and someone notices weeks later. So this must behave exactly like a retire
+  // failure: failed marker, exit(1), and — critically — retire/clear never run at all, since the
+  // original must stay alive to reclaim rather than being torn down by a replacement that isn't
+  // actually safe to leave running unsupervised yet.
+  test("a restorePolicy failure writes a failed marker and exits 1 — retire and clear never run", async () => {
+    const writes: HandoffMarker[] = [];
+    const exits: number[] = [];
+    let retireCalled = false;
+    let cleared = false;
+    await takeOver(ID, {
+      write: async (m) => void writes.push(m),
+      tagLatest: async () => {},
+      restorePolicy: async () => {
+        throw new Error("daemon: update rejected");
+      },
+      retire: async () => void (retireCalled = true),
+      clear: async () => void (cleared = true),
+      exit: (code) => void exits.push(code),
+    });
+    expect(exits).toEqual([1]);
+    expect(retireCalled).toBe(false); // never reached — the original must stay alive to reclaim
+    expect(cleared).toBe(false);
+    const failed = writes.find((m) => m.status === "failed");
+    expect(failed?.error).toContain("daemon: update rejected");
   });
 
   // The crux of the fix: a retire that throws must not become an unhandled rejection. The
@@ -357,6 +420,7 @@ describe("takeOver", () => {
     await takeOver(ID, {
       write: async (m) => void writes.push(m),
       tagLatest: async () => {},
+      restorePolicy: async () => {},
       retire: async () => {
         throw new Error("daemon unreachable");
       },
@@ -378,6 +442,7 @@ describe("takeOver", () => {
         throw new Error("disk full");
       },
       tagLatest: async () => {},
+      restorePolicy: async () => {},
       retire: async () => void 0,
       exit: (code) => void exits.push(code),
     });
@@ -392,12 +457,126 @@ describe("takeOver", () => {
     await takeOver(ID, {
       write: async () => void 0,
       tagLatest: async () => {},
+      restorePolicy: async () => {},
       retire: async () => {
         throw null;
       },
       exit: (code) => void exits.push(code),
     });
     expect(exits).toEqual([1]);
+  });
+});
+
+// #160's actual guard against the permanent-outage hazard: the effects-injection tests above only
+// prove the CALLING order of whichever functions were passed in — they say nothing about the real
+// HTTP verbs the DEFAULT effects (restoreOriginalRestartPolicy, retireOriginal) issue against the
+// daemon. This drives takeOver with real defaults for restorePolicy/retire (only write/clear/
+// tagLatest are stubbed, to keep this hermetic and avoid touching the real marker file) through a
+// stubbed globalThis.fetch, recording call order — the same harness shape as the retireOriginal
+// describe below.
+describe("takeOver — real daemon calls (the ordering guard for the whole hazard, #160)", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = "self-container-id";
+  const ORIGINAL_ID = "e".repeat(64);
+  let calls: { path: string; method: string; body?: string }[] = [];
+
+  const runningOriginal: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: true, Status: "running", ExitCode: 0 },
+  };
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    process.env[HANDOFF_RESTART_POLICY_ENV] = "unless-stopped";
+    calls = [];
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+    delete process.env[HANDOFF_RESTART_POLICY_ENV];
+  });
+
+  function stubDaemon() {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method, body: init?.body ? String(init.body) : undefined });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname === `/containers/${SELF_ID}/update`) return new Response("", { status: 200 });
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) return new Response(JSON.stringify(runningOriginal), { status: 200 });
+      if (pathname === `/containers/${ORIGINAL_ID}/stop`) return new Response("", { status: 204 });
+      if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return new Response("", { status: 204 });
+      if (pathname.endsWith("/rename")) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  // THE guard for the whole hazard the ⚠️ section describes: a reorder that moved the restore back
+  // to after the stop would pass every effects-injection test above (which only checks the ORDER
+  // OF WHATEVER'S PASSED IN) but would be exactly the permanent-outage bug — this is what actually
+  // pins the real HTTP call order.
+  test("POST .../update (restore policy) precedes POST .../stop (retire the original)", async () => {
+    stubDaemon();
+    await takeOver(ORIGINAL_ID, {
+      write: async () => {},
+      clear: async () => {},
+      tagLatest: async () => {},
+      exit: () => {
+        throw new Error("must not exit on the happy path");
+      },
+    });
+    const updateIdx = calls.findIndex((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
+    const stopIdx = calls.findIndex((c) => c.method === "POST" && c.path === `/containers/${ORIGINAL_ID}/stop`);
+    expect(updateIdx).toBeGreaterThanOrEqual(0);
+    expect(stopIdx).toBeGreaterThan(updateIdx);
+  });
+
+  // A distinct value from the "unless-stopped" fallback on purpose — using the same value as the
+  // fallback here would let a hardcoded fallback masquerade as a genuine env pass-through.
+  test("restores the env-carried policy name onto self, distinct from the fallback value", async () => {
+    process.env[HANDOFF_RESTART_POLICY_ENV] = "always";
+    stubDaemon();
+    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {}, tagLatest: async () => {} });
+    const updateCall = calls.find((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
+    expect(updateCall?.body).toBeDefined();
+    expect(JSON.parse(updateCall!.body!)).toEqual({ RestartPolicy: { Name: "always" } });
+  });
+
+  test("falls back to unless-stopped when HANDOFF_RESTART_POLICY is absent from the env", async () => {
+    delete process.env[HANDOFF_RESTART_POLICY_ENV];
+    stubDaemon();
+    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {}, tagLatest: async () => {} });
+    const updateCall = calls.find((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
+    expect(JSON.parse(updateCall!.body!)).toEqual({ RestartPolicy: { Name: "unless-stopped" } });
+  });
+
+  // A restore that fails at the DAEMON level (not just an injected-effect throw) must still block
+  // the stop — proves the real default restorePolicy effect propagates a real HTTP failure rather
+  // than swallowing it the way tagLatest's real effect is allowed to.
+  test("a real daemon failure on the update call blocks the stop from ever being attempted", async () => {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname === `/containers/${SELF_ID}/update`) return new Response("daemon blip", { status: 500 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+    const writes: HandoffMarker[] = [];
+    const exits: number[] = [];
+    let cleared = false;
+    await takeOver(ORIGINAL_ID, {
+      write: async (m) => void writes.push(m),
+      clear: async () => void (cleared = true),
+      tagLatest: async () => {},
+      exit: (code) => void exits.push(code),
+    });
+    expect(exits).toEqual([1]);
+    expect(cleared).toBe(false);
+    expect(writes.find((m) => m.status === "failed")?.error).toContain("500");
+    expect(calls.some((c) => c.path === `/containers/${ORIGINAL_ID}/stop`)).toBe(false);
   });
 });
 
@@ -503,6 +682,51 @@ describe("retireOriginal", () => {
       stopOriginal: () => new Response("not found", { status: 404 }),
     });
     await retireOriginal(ORIGINAL_ID); // must not throw
+  });
+
+  // #160: with the replacement's own RestartPolicy now "no" until takeOver restores it, a stop
+  // that THROWS on the live branch is no longer necessarily a failed stop — #130's 60s bound means
+  // a stop the daemon actually performed but answered slowly now looks identical to one that never
+  // ran. These two tests are the mutation guard for the re-inspect that tells them apart; the
+  // first-inspect result must stay "running" (that's what makes this the LIVE branch to begin
+  // with) while the RE-inspect after the stop throws differs per test.
+  test("a stop that answers late (throws) re-inspects and proceeds once the original is confirmed down", async () => {
+    let inspectCallCount = 0;
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) {
+        inspectCallCount++;
+        const state =
+          inspectCallCount === 1
+            ? { Running: true, Status: "running", ExitCode: 0 }
+            : { Running: false, Status: "exited", ExitCode: 0 };
+        return new Response(JSON.stringify({ ...runningOriginal, State: state }), { status: 200 });
+      }
+      if (pathname === `/containers/${ORIGINAL_ID}/stop`) return new Response("stop timed out", { status: 500 });
+      if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return new Response("", { status: 204 });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname.endsWith("/rename")) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+    await retireOriginal(ORIGINAL_ID); // must NOT throw — the late-stop re-inspect confirms it's down
+    expect(inspectCallCount).toBeGreaterThanOrEqual(2); // proves the re-inspect actually ran, not a fluke
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+  });
+
+  test("a stop that throws while the original is STILL confirmed running rethrows — a genuine failure, not a slow one", async () => {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method });
+      // Every inspect — the first AND the re-inspect after the stop throws — says still running.
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) return new Response(JSON.stringify(runningOriginal), { status: 200 });
+      if (pathname === `/containers/${ORIGINAL_ID}/stop`) return new Response("daemon blip", { status: 500 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+    await expect(retireOriginal(ORIGINAL_ID)).rejects.toThrow(/500/);
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false); // never reached the remove step
   });
 });
 
@@ -864,6 +1088,95 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(handoffActive()).toBe(false);
+    // #161's keeper: a stalled replacement is still genuinely reclaimed (removed), not just
+    // reported as stalled — a guard keyed on outcome === "ready" alone would wrongly skip removal
+    // once the outcome demotes to "stalled" here.
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // #160 change 5, defence in depth (Docker itself can no longer produce this once the standby's
+  // own RestartPolicy is "no" — this covers a manual `docker start`, or a pre-#160 standby mid-
+  // rollout). The FIRST poll decides "failed" (exited); the SECOND — the pre-removal re-inspect —
+  // finds it back up with a StartedAt strictly after that decision: a different life of the same
+  // container than the one just judged.
+  test("a replacement that restarted after we decided its outcome is left alone, not removed", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        pollCount++;
+        if (pollCount === 1) {
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        }
+        // +5ms guarantees this strictly postdates observedAt regardless of clock resolution —
+        // observedAt was sampled synchronously before the first poll's Promise.all, microseconds
+        // before this closure runs on the SECOND (pre-removal) call.
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(Date.now() + 5).toISOString() },
+        });
+      },
+      removeReplacement: () => {
+        throw new Error("must not attempt removal — the replacement restarted since the decision");
+      },
+    });
+    const result = await redeploy("9".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(wasRemovalAttempted()).toBe(false);
+  });
+
+  // The boundary the mutation table calls out explicitly: Running + a StartedAt that is AT OR
+  // BEFORE the decision (the ordinary "stalled" case — the replacement never restarted, it's the
+  // SAME life we just judged) must still be removed, not false-positive skipped.
+  test("a replacement whose StartedAt is at-or-before the decision is still removed, not a false-positive skip", async () => {
+    const stableStartedAt = new Date(Date.now() - 60_000).toISOString(); // well before observedAt
+    stubDaemon({
+      pollReplacement: () =>
+        jsonRes({ ...SELF, State: { Running: true, Status: "running", ExitCode: 0, StartedAt: stableStartedAt } }),
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "0000000", at: Date.now() }),
+    });
+    const result = await redeploy("0".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled");
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // Found in review: observedAt used to be captured ONLY at the moment "ready" was first observed
+  // (inside awaitHandoff) and never refreshed when that outcome is later demoted to stalled/failed
+  // — up to RETIREMENT_DEADLINE_MS (3 real minutes) afterward. A replacement whose restorePolicy
+  // update genuinely landed at the daemon but whose response was lost (the same transport-drop
+  // class retireOriginal's own re-inspect already treats as realistic) restarts under its
+  // now-correctly-restored policy SOMETIME during that wait — strictly after the stale "ready"
+  // timestamp, but before the decision the guard is actually supposed to be judged against. Against
+  // the stale baseline that reads as "restarted later than our decision," wrongly skipping a
+  // removal the old, unconditional code always made. Fixed by re-sampling observedAt right where
+  // the outcome is actually decided (after the retirement wait concludes), not where "ready" first
+  // arrived. This StartedAt sits deliberately in that exact gap — between the two timestamps — so a
+  // regression back to the stale baseline fails this test while the boundary test above (a
+  // StartedAt from well BEFORE "ready" was ever seen) would not have caught it.
+  test("a StartedAt between 'ready' and the LATE stalled decision is still removed — the baseline must be the decision, not the stale 'ready' moment", async () => {
+    let pollCount = 0;
+    let readyObservedAt = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        pollCount++;
+        if (pollCount === 1) {
+          readyObservedAt = Date.now();
+          return jsonRes(SELF); // the "ready" observation itself — no StartedAt needed here
+        }
+        // The pre-removal re-inspect, well after the retirement wait has concluded: restarted
+        // strictly after "ready" was first seen, but the wait's own elapsed deadline (not this
+        // restart) is what actually decided "stalled" — this StartedAt predates that decision.
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(readyObservedAt + 30).toISOString() },
+        });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "8080808", at: Date.now() }),
+    });
+    const result = await redeploy("8".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled");
+    expect(wasRemovalAttempted()).toBe(true);
   });
 });
 

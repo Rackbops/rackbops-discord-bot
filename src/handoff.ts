@@ -15,6 +15,13 @@ import { DATA_DIR } from "./storage";
 /** Set on the replacement only. Its presence *is* the instruction to boot in standby. */
 export const HANDOFF_FROM_ENV = "HANDOFF_FROM";
 
+/** Set on the replacement only, alongside {@link HANDOFF_FROM_ENV}: the ORIGINAL's restart-policy
+ *  name at create time (`buildCreateSpec`), so `takeOver` can restore it onto the now-verified
+ *  replacement before the original is stopped (#160) — a `tryInspectContainer` inside `takeOver`
+ *  would work too, but this needs no extra daemon call and no assumption that the original is
+ *  still inspectable by the time the replacement gets around to reading it. */
+export const HANDOFF_RESTART_POLICY_ENV = "HANDOFF_RESTART_POLICY";
+
 /** How long the original waits for the replacement to prove itself before writing it off. */
 export const HANDOFF_DEADLINE_MS = 120_000;
 

@@ -202,17 +202,19 @@ need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 # resolving overlap rather than a stale-code split-brain — the same class of accepted residual risk
 # as issue #51's own item 1.
 #
-# Known, DECLINED-for-now residual risk (found in review, tracked on #85 rather than fixed here):
-# retireOriginal's own stopContainer call is unguarded on a genuine first attempt (redeploy.ts)
-# — if the daemon actually stops the original but the HTTP response is lost in transit (the exact
-# scenario takeOver's own comment already names), that throw crashes the REPLACEMENT process
-# rather than completing the swap. `docker ps` (no -a) then correctly reports the original as not
-# running — this guard reads that as safe — while the crashed replacement is mid-reboot (a real
-# Bun process + gateway reconnect, low seconds, not "two more daemon calls") retrying the whole
-# handoff. An env-set landing in THAT window can still produce a genuine two-live-bots outcome.
-# This is the same restart-policy/crash-proofing family of race as #85's `unless-stopped`
-# resurrection issue, not a gap specific to this guard's own signal — fixing it here without also
-# fixing #85 would be treating one symptom of a shared root cause.
+# Formerly a known, DECLINED residual risk (tracked on #85, now HANDLED by #160, not by this
+# guard): retireOriginal's own stopContainer call on a genuine first attempt used to be unguarded
+# — if the daemon actually stopped the original but the HTTP response was lost in transit (the
+# exact scenario takeOver's own comment names), that throw crashed the REPLACEMENT process rather
+# than completing the swap, which could leave the crashed replacement mid-reboot (a real Bun
+# process + gateway reconnect, low seconds) while `docker ps` already read the original as safely
+# gone — a window where an env-set landing here could still produce a genuine two-live-bots
+# outcome. #160 closed it at the source: retireOriginal now re-inspects the original on any stop
+# throw and proceeds (rather than crashing) once it's confirmed down, so a lost-in-transit response
+# no longer crashes the replacement at all — see CONTEXT.md's matching gotcha. #160 also stops
+# Docker's OWN restart policy from resurrecting an unverified standby (the other half of #85), so
+# this guard's own signal (`-next` exists + the canonical name still running) is no longer racing
+# either failure mode it used to.
 guard_no_handoff_in_progress() {
   docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
   if docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then

@@ -19,6 +19,7 @@ const {
   stopContainer,
   tagImage,
   tryInspectContainer,
+  updateContainer,
 } = await import("./docker");
 
 describe("parseContainerId", () => {
@@ -82,12 +83,17 @@ describe("parseBuildOutput", () => {
 
 describe("daemon calls", () => {
   const realFetch = globalThis.fetch;
-  let calls: { url: string; method: string; signal?: AbortSignal }[] = [];
+  let calls: { url: string; method: string; signal?: AbortSignal; body?: string }[] = [];
 
   const stub = (impl: (url: string, init?: RequestInit) => Response) => {
     calls = [];
     globalThis.fetch = ((url: string, init?: RequestInit & { unix?: string }) => {
-      calls.push({ url: String(url), method: init?.method ?? "GET", signal: init?.signal ?? undefined });
+      calls.push({
+        url: String(url),
+        method: init?.method ?? "GET",
+        signal: init?.signal ?? undefined,
+        body: init?.body ? String(init.body) : undefined,
+      });
       return Promise.resolve(impl(String(url), init));
     }) as unknown as typeof fetch;
   };
@@ -227,6 +233,7 @@ describe("daemon calls", () => {
     ["stopContainer", (t) => stopContainer("abc", 10, t)],
     ["removeContainer", (t) => removeContainer("abc", false, t)],
     ["renameContainer", (t) => renameContainer("abc", "n", t)],
+    ["updateContainer", (t) => updateContainer("abc", { RestartPolicy: { Name: "no" } }, t)],
     ["listImages", (t) => listImages(t)],
     ["inspectImage", (t) => inspectImage("abc", t)],
     ["removeImage", (t) => removeImage("i:abc1234", t)],
@@ -340,6 +347,18 @@ describe("daemon calls", () => {
     expect(url).toContain("/images/myrepo:abc1234/tag?");
     expect(url).toContain("repo=myrepo");
     expect(url).toContain("tag=latest");
+  });
+
+  // #160: the only field this bot ever changes on a running container — posts to the right path
+  // with the RestartPolicy body verbatim, no query-string encoding of it (it's a JSON body, unlike
+  // every other write here).
+  test("updateContainer posts the RestartPolicy body to /containers/<id>/update", async () => {
+    stub(() => new Response("", { status: 200 }));
+    await updateContainer("abc123", { RestartPolicy: { Name: "no" } });
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url).toContain("/containers/abc123/update");
+    expect(calls[0]!.body).toBeDefined();
+    expect(JSON.parse(calls[0]!.body!)).toEqual({ RestartPolicy: { Name: "no" } });
   });
 
   // Both are "the state we wanted" — treating them as errors would abort a handoff over a
