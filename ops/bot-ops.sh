@@ -17,6 +17,8 @@
 #   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
 #                 remaining one against the effective value, validate the FORMAT of only the ones
 #                 that change, back up .env, apply those changes, then `up -d --force-recreate`.
+#   version       Print JSON: {"schema": N} — this script's BOT_OPS_SCHEMA, so a caller (the admin
+#                 panel) can tell an outdated deployed copy from the one it was built against (#173).
 #
 # Design notes:
 #   - The compose project + container come from BOT_OPS_PROJECT / BOT_OPS_CONTAINER (the caller
@@ -43,6 +45,43 @@
 #     validating every submitted line first meant one stored value the bot accepts but a regex
 #     here rejects failed every save that echoed it back, naming a key the operator never touched.
 set -euo pipefail
+
+# #173: bumped in the SAME PR whenever a subcommand or ALLOWED/ALLOWED_ORDER row is added or
+# changed — the admin panel (ops/admin/server.ts's REQUIRED_BOT_OPS_SCHEMA, hand-mirrored and
+# drift-pinned by a test) compares this against its own copy at startup, so a deployed instance
+# whose bin/bot-ops.sh has drifted behind the panel image it's paired with shows up as a loud,
+# visible warning instead of a generic "bot-ops: usage: ..." failure the next time someone clicks
+# a button the old script doesn't have (the #173 incident: Update now failed on debug because
+# install.sh hadn't been re-run since #121 added plugin-request).
+readonly BOT_OPS_SCHEMA=1
+
+die() { echo "bot-ops: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
+
+cmd_version() {
+  need jq
+  # #173: stdout JSON only, same convention as status/env-get — the panel's runBotOps reads this
+  # subcommand's stdout as JSON, so a stray non-JSON line here would break the same way a stray
+  # stdout line already breaks env-get/status (#101).
+  jq -n --argjson schema "$BOT_OPS_SCHEMA" '{schema: $schema}'
+}
+
+# #173 round 3: `version` is dispatched HERE — before ANY of the BOT_OPS_PROJECT/CONTAINER/
+# CONFIG_DIR/COMPOSE_FILE/.env preconditions below — deliberately reversing the original design
+# ("version is a subcommand like any other, it still needs those set"), which review caught live:
+# with that ordering, a genuinely CURRENT script pointed at a bad instance config (an unset or
+# wrong BOT_OPS_CONFIG_DIR, a missing .env) failed `version` with an instance-config error, and the
+# panel's decideBotOpsSchema classified that identically to a real pre-#173 script's drift — an
+# operator was told to re-run install.sh for a problem that had nothing to do with the script being
+# out of date. `version` needs only `jq` — no docker, no config dir, no compose file — so checking
+# it first is what actually decouples "is this script current" from "is this instance configured
+# right": now only a genuine schema mismatch or a pre-stamp script's usage error (main()'s `*)`
+# fallback below, reached only because an old script has no `version` case at all) is ever reported
+# as out of date. See CONTEXT.md's #173 gotcha for the full incident.
+if [ "${1:-}" = "version" ]; then
+  cmd_version
+  exit 0
+fi
 
 # Target bot: no fallback to the monorepo-era name — a panel (or you, by hand) must always pass
 # both per the selected target (debug/prod), the same "no repo-relative fallback" rule as
@@ -161,10 +200,6 @@ ALLOWED_ORDER=(
   PLUGINS
   PLUGIN_INDEX_URL
 )
-
-die() { echo "bot-ops: $*" >&2; exit 1; }
-
-need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
 # "<container>-next" before it takes the canonical name over. Recreating or restarting the
@@ -690,7 +725,11 @@ main() {
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
     plugin-request) cmd_plugin_request ;;
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request}" ;;
+    # #173 round 3: version is dispatched near the very top of the script, before this function
+    # (and its .env/compose-file preconditions) is ever reached — see the comment above readonly
+    # BOT_OPS_SCHEMA. No case arm needed here; kept in the usage string below since it's still a
+    # real, documented subcommand.
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|plugin-request|version}" ;;
   esac
 }
 

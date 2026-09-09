@@ -1166,3 +1166,55 @@ describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they a
     expect(run.stderr).not.toContain("bot-ops: env file");
   });
 });
+
+// #173: the panel's runBotOps reads a subcommand's STDOUT as JSON — a stray line anywhere else
+// on stdout (or the JSON landing on stderr instead) would break the same way env-get/status's own
+// stdout-is-JSON contract breaks (#101's lesson, reused here for a fourth subcommand).
+describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
+  test("prints {\"schema\": N} on stdout, nothing on stderr", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"]);
+    expect(run.exitCode).toBe(0);
+    // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
+    expect(run.json).toEqual({ schema: 1 });
+    expect(run.stderr).toBe("");
+  });
+
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 1)", () => {
+    // A source-level pin distinct from the subprocess test above: this is the number the drift
+    // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=1\b/);
+  });
+
+  // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
+  // dispatched AFTER main()'s BOT_OPS_PROJECT/CONTAINER/CONFIG_DIR/COMPOSE_FILE/.env preconditions,
+  // so a genuinely CURRENT script pointed at a bad instance config failed `version` the same way an
+  // OLD script would, and the panel reported "OUT OF DATE — re-run install.sh" for a problem that
+  // had nothing to do with script drift. `version` is dispatched before ALL of that now.
+  test("succeeds with NO BOT_OPS_* env set at all (not even PROJECT/CONTAINER)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    // Mutation: moving the version dispatch back below main()'s preconditions turns this red —
+    // the run would instead die naming BOT_OPS_PROJECT/CONTAINER/CONFIG_DIR/COMPOSE_FILE not set.
+    const run = await botOps(fx, ["version"], undefined, {
+      BOT_OPS_PROJECT: undefined,
+      BOT_OPS_CONTAINER: undefined,
+      BOT_OPS_CONFIG_DIR: undefined,
+      BOT_OPS_COMPOSE_FILE: undefined,
+    });
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1 });
+  });
+
+  test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"], undefined, {
+      BOT_OPS_CONFIG_DIR: "/opt/does-not-exist",
+      BOT_OPS_COMPOSE_FILE: "/opt/does-not-exist/compose.yml",
+    });
+    // Mutation: dispatching version after the .env/compose-file existence checks in main() turns
+    // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ schema: 1 });
+  });
+});

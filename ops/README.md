@@ -30,13 +30,16 @@ time, not silently written.
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 | `plugin-request` | Read one plugin-update **request JSON** from stdin (`{action, plugin, version?, at?, days?, requestedBy}` — `action` ∈ `update-now`/`schedule`/`remind`/`skip`/`cancel`), validate it, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
+| `version` | JSON `{"schema": N}` — this script's `BOT_OPS_SCHEMA`. The admin panel runs this once at startup to check the deployed script isn't behind the panel image; see "Keeping `bot-ops.sh` current" below |
 
 Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
 `BOT_OPS_COMPOSE_FILE` (the deployed `docker-compose.yml`, under `/opt/stacks/` for Dockge — see
 [Bootstrapping a fresh instance](#bootstrapping-a-fresh-instance-no-checkout)), `BOT_OPS_PROJECT`
 (the compose project, e.g. `rackbops-discord-bot-debug`), and `BOT_OPS_CONTAINER` (the container
-name — same value as `BOT_OPS_PROJECT` under the current layout) are all **required**, with no
-fallback to the script's own location or to any monorepo-era default:
+name — same value as `BOT_OPS_PROJECT` under the current layout) are all **required** for every
+subcommand except `version` (deliberately checkable with none of them set — see "Keeping
+`bot-ops.sh` current"), with no fallback to the script's own location or to any monorepo-era
+default:
 
 ```sh
 export BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/debug
@@ -63,6 +66,28 @@ The mailbox can only ever run the five actions on an **already-installed** plugi
 new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
 (`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
+
+## Keeping `bot-ops.sh` current
+
+`bin/bot-ops.sh` on an instance is a **deployment artifact** — fetched by `install.sh`, never
+touched by hand, never precious the way `.env` is — but nothing re-fetches it on its own. **After a merge
+that adds a subcommand or changes the `ALLOWED`/`ALLOWED_ORDER` whitelist, re-run `install.sh` on
+each instance** (it always refreshes `bot-ops.sh`, same as `docker-compose.yml`) — otherwise the
+admin panel image (rebuilt from the same merge) ships a feature the deployed script doesn't have
+yet, and the panel's only symptom is a generic "failed" on that button.
+
+You don't have to remember to check: `bot-ops.sh` stamps a `BOT_OPS_SCHEMA` integer, and the admin
+panel checks it once at startup against the schema it was built for, logging either
+`bot-ops.sh schema <N> (panel needs <N>)` or a loud `bot-ops.sh is OUT OF DATE` line — the same
+sentence appears as a banner at the top of the panel page. The panel still starts and serves
+`status`/`logs`/`restart` against an outdated script; it just tells you rather than staying silent
+about it. `install.sh`'s own summary line for `bot-ops.sh` prints the schema it just installed, so
+the two numbers (panel log vs. install output) are easy to compare side by side.
+
+`version` is checked deliberately WITHOUT any of the `BOT_OPS_*` config or a real `.env`/compose
+file — it needs only `jq`. That's on purpose: a check that required valid instance config first
+couldn't tell "this script is old" apart from "this instance is misconfigured," and would report
+the identical `OUT OF DATE` warning for both.
 
 ## Bootstrapping a fresh instance (no checkout)
 

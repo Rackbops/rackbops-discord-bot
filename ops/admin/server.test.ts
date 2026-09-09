@@ -23,6 +23,10 @@ import {
   handleAdmins,
   handleRequest,
   HOST_API_VERSION,
+  REQUIRED_BOT_OPS_SCHEMA,
+  decideBotOpsSchema,
+  checkBotOpsSchemaStartup,
+  mergeStatusOutdated,
   IDLE_TIMEOUT_SECONDS,
   isAuthorized,
   isCrossSiteWrite,
@@ -1474,6 +1478,37 @@ describe("handleRequest", () => {
     expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer"]);
   });
 
+  // #173: GET /api/status merges botOpsOutdated into cmd_status's own JSON — the one route this
+  // panel augments server-side. Also proves the whole point of the design: an outdated script never
+  // stops the panel from serving day-2 ops (status here, restart below), only makes the drift visible.
+  test("GET /api/status merges botOpsOutdated:true when the startup check found drift", async () => {
+    const res = await handleRequest(
+      authed("/api/status"),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true,"realmStatus":"UP"}', stderr: "" }), botOpsOutdated: true }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true });
+  });
+
+  test("GET /api/status carries no botOpsOutdated field when the script is up to date", async () => {
+    const res = await handleRequest(
+      authed("/api/status"),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }), botOpsOutdated: false }),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ running: true });
+  });
+
+  test("POST /api/restart still succeeds with an outdated script — the panel degrades, never refuses to start or serve (#173)", async () => {
+    const res = await handleRequest(
+      new Request("http://x/api/restart", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } }),
+      branchCfg({ runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "restarted probe\n", stderr: "" }), botOpsOutdated: true }),
+    );
+    // Mutation: a stray "refuse when outdated" guard anywhere on the request path turns this red.
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("restarted probe\n");
+  });
+
   test("/api/plugins tolerates a malformed status/env payload (non-array plugins, non-string PLUGINS)", async () => {
     const res = await handleRequest(
       authed("/api/plugins"),
@@ -2228,6 +2263,128 @@ describe("HOST_API_VERSION mirrors src/plugins/contract.ts (#105, can't drift)",
     const botVersion = contractSrc.match(/export const HOST_API_VERSION = (\d+)/)?.[1];
     expect(botVersion).toBeTruthy();
     expect(HOST_API_VERSION).toBe(Number(botVersion));
+  });
+});
+
+// #173: REQUIRED_BOT_OPS_SCHEMA is a hand copy of ops/bot-ops.sh's own BOT_OPS_SCHEMA — the same
+// drift class as HOST_API_VERSION above, but NOT cosmetic here: an outdated deployed script is
+// missing real subcommands/whitelist rows the panel image already assumes exist.
+describe("REQUIRED_BOT_OPS_SCHEMA mirrors ops/bot-ops.sh's BOT_OPS_SCHEMA (#173, can't drift)", () => {
+  test("matches the script's readonly BOT_OPS_SCHEMA", () => {
+    const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+    const scriptSchema = botOpsSrc.match(/readonly BOT_OPS_SCHEMA=(\d+)/)?.[1];
+    // Mutation: bumping either side without the other turns this red.
+    expect(scriptSchema).toBeTruthy();
+    expect(REQUIRED_BOT_OPS_SCHEMA).toBe(Number(scriptSchema));
+  });
+});
+
+describe("decideBotOpsSchema (#173)", () => {
+  test("matching schema -> not outdated, got the real number", () => {
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":1}' }, 1)).toEqual({ outdated: false, got: 1 });
+  });
+  test("a real mismatch -> outdated, got the wrong number (not the required one)", () => {
+    // Mutation: dropping the !== comparison (always false) would call a genuine mismatch up to date.
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":2}' }, 1)).toEqual({ outdated: true, got: 2 });
+  });
+  test("a pre-#173 script's usage error (nonzero exit, no JSON) -> outdated, got null", () => {
+    // The issue's own design: "a usage error from a pre-stamp script counts as outdated" — not a
+    // separate/unknown state. Mutation: only checking stdout shape (ignoring exitCode) would treat
+    // a coincidentally-JSON-shaped stderr-adjacent stdout as a real schema.
+    expect(decideBotOpsSchema({ exitCode: 1, stdout: "" }, 1)).toEqual({ outdated: true, got: null });
+  });
+  test("exit 0 but an unexpected shape (no numeric schema field) -> outdated, got null", () => {
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: "{}" }, 1)).toEqual({ outdated: true, got: null });
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: "not json" }, 1)).toEqual({ outdated: true, got: null });
+    expect(decideBotOpsSchema({ exitCode: 0, stdout: '{"schema":"one"}' }, 1)).toEqual({ outdated: true, got: null });
+  });
+});
+
+describe("checkBotOpsSchemaStartup (#173)", () => {
+  function capture() {
+    const logs: string[] = [];
+    const errors: string[] = [];
+    return { logs, errors, log: (m: string) => logs.push(m), logError: (m: string) => errors.push(m) };
+  }
+
+  test("matching schema -> info line via log, no logError, returns false (not outdated)", async () => {
+    const { logs, errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":1}', stderr: "" });
+    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    expect(outdated).toBe(false);
+    expect(errors.length).toBe(0);
+    expect(logs[0]).toContain("bot-ops.sh schema 1");
+    expect(logs[0]).toContain("panel needs 1");
+  });
+
+  test("mismatch -> loud OUT OF DATE line via logError, not log, returns true", async () => {
+    const { logs, errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 0, stdout: '{"schema":2}', stderr: "" });
+    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    expect(outdated).toBe(true);
+    expect(logs.length).toBe(0);
+    // Mutation: treating a mismatch as ok (dropping the outdated branch) would silently pass here.
+    expect(errors[0]).toContain("OUT OF DATE");
+    expect(errors[0]).toContain("re-run ops/install.sh");
+    // A real, numbered mismatch is unambiguous — no extra "; <detail>" clause needed or wanted.
+    expect(errors[0]).toBe("[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema 2, panel needs 1)");
+  });
+
+  test("a pre-#173 script's usage error -> also OUT OF DATE, names 'unknown' AND the real stderr detail", async () => {
+    // Round-1 review fix: `got === null` is ambiguous (a real usage error vs. an unrelated
+    // precondition failure), so the actual stderr must be surfaced too, not just "unknown".
+    const { errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}" });
+    const outdated = await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    expect(outdated).toBe(true);
+    expect(errors[0]).toContain("OUT OF DATE");
+    expect(errors[0]).toContain("schema unknown");
+    // Mutation: discarding result.stderr here would make this the SAME message as any other
+    // unrelated failure, sending an operator to re-run install.sh for the wrong reason.
+    expect(errors[0]).toContain("bot-ops: usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set}");
+  });
+
+  test("an UNRELATED precondition failure (e.g. missing jq, no stderr text) -> distinguishable from a real usage error", async () => {
+    const { errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "" });
+    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    expect(errors[0]).toContain("no schema reported");
+  });
+
+  test("a timed-out version call is named as a timeout, not conflated with a schema mismatch", async () => {
+    const { errors, log, logError } = capture();
+    const runBotOps = async () => ({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
+    await checkBotOpsSchemaStartup(runBotOps, 1, log, logError);
+    // Mutation: ignoring result.timedOut (the MINOR gap the round-1 correctness reviewer named)
+    // would fall through to "no schema reported" instead of naming the real cause.
+    expect(errors[0]).toContain("bot-ops.sh version timed out");
+    expect(errors[0]).not.toContain("no schema reported");
+  });
+
+  test("passes args:['version'] to runBotOps, contentType application/json", async () => {
+    let seen: unknown;
+    const runBotOps = async (invocation: unknown) => {
+      seen = invocation;
+      return { exitCode: 0, stdout: '{"schema":1}', stderr: "" };
+    };
+    await checkBotOpsSchemaStartup(runBotOps, 1);
+    expect(seen).toEqual({ args: ["version"], contentType: "application/json" });
+  });
+});
+
+describe("mergeStatusOutdated (#173)", () => {
+  test("not outdated -> stdout passed through byte-for-byte, unchanged", () => {
+    const stdout = '{"running":true,"realmStatus":"UP"}';
+    // Mutation: always merging (dropping the outdated check) would add the field even when fine.
+    expect(mergeStatusOutdated(stdout, false)).toBe(stdout);
+  });
+  test("outdated -> botOpsOutdated:true merged into the existing status fields", () => {
+    const merged = JSON.parse(mergeStatusOutdated('{"running":true,"realmStatus":"UP"}', true));
+    expect(merged).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true });
+  });
+  test("a genuinely broken stdout stays as-is rather than throwing", () => {
+    expect(mergeStatusOutdated("not json", true)).toBe("not json");
+    expect(mergeStatusOutdated("[]", true)).toBe("[]"); // an array, not an object — left alone
   });
 });
 

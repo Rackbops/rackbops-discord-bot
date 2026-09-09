@@ -278,6 +278,58 @@ export function describeBotOpsStartup(botOpsSh: string, composeFile: string | un
   return lines;
 }
 
+/** #173: decides whether the deployed bot-ops.sh is out of date, from the result of running its
+ *  `version` subcommand. Pure over the result shape (no I/O), so the decision itself is unit-tested
+ *  without a real subprocess. A pre-#173 script has no `version` subcommand at all and dies with a
+ *  usage error — nonzero exit, nothing parseable on stdout — which this treats exactly like a real
+ *  schema mismatch (the issue's own design: "a usage error from a pre-stamp script counts as
+ *  outdated"), not as a separate "unknown" state. `got` is `null` whenever it couldn't be read at
+ *  all (the exit-nonzero case, or a 0-exit with an unexpected shape), so the startup log can still
+ *  name what it saw. */
+export function decideBotOpsSchema(
+  result: { exitCode: number; stdout: string },
+  required: number,
+): { outdated: boolean; got: number | null } {
+  const raw = result.exitCode === 0 ? safeJsonField(result.stdout, "schema") : undefined;
+  const got = typeof raw === "number" ? raw : null;
+  return { outdated: got !== required, got };
+}
+
+/**
+ * #173: runs `bot-ops.sh version` once at startup and logs the result — an info line on a match,
+ * a loud warning on drift (or a pre-stamp script's usage error, per `decideBotOpsSchema`). Returns
+ * whether the panel should surface an out-of-date warning, so `import.meta.main` can bake it into
+ * `HandlerConfig.botOpsOutdated` for `/api/status` to report. Never refuses to start either way —
+ * day-2 ops (status/logs/restart) still work against an outdated script; this only makes the drift
+ * visible instead of silent. `runBotOps`/`log`/`logError` injected so this is tested without a real
+ * subprocess or eyeballing console output, the same shape as `logDynamicAdminsStartup` above.
+ */
+export async function checkBotOpsSchemaStartup(
+  runBotOps: (invocation: BotOpsInvocation) => Promise<BotOpsResult>,
+  required: number,
+  log: (msg: string) => void = console.log,
+  logError: (msg: string) => void = console.error,
+): Promise<boolean> {
+  const result = await runBotOps({ args: ["version"], contentType: "application/json" });
+  const { outdated, got } = decideBotOpsSchema(result, required);
+  if (outdated) {
+    // Round-1 review fix: when `got` is null, the version call itself never produced a real schema
+    // — decideBotOpsSchema can't tell a genuine pre-#173 usage error apart from an UNRELATED
+    // precondition failure (a missing jq, a wrong BOT_OPS_CONFIG_DIR, a timed-out subprocess), and
+    // silently discarding the real reason sent an operator to re-run install.sh for a problem that
+    // wasn't schema drift at all. Surface it — never blocks startup either way, this is diagnostic
+    // detail only.
+    const detail = got !== null ? undefined : result.timedOut ? "bot-ops.sh version timed out" : result.stderr.trim() || "no schema reported";
+    logError(
+      `[admin] bot-ops.sh is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail ` +
+        `(schema ${got ?? "unknown"}, panel needs ${required}${detail ? `; ${detail}` : ""})`,
+    );
+  } else {
+    log(`[admin] bot-ops.sh schema ${got} (panel needs ${required})`);
+  }
+  return outdated;
+}
+
 /**
  * Trims and lowercases a raw `CLOUDFLARE_ACCESS_TEAM_DOMAIN` value, then rejects anything that
  * isn't a bare hostname — throws on a value carrying a scheme, port, or path (e.g. pasted with an
@@ -556,6 +608,15 @@ export const DEFAULT_PLUGIN_INDEX_URL = "https://raw.githubusercontent.com/Rackb
  *  flag an update whose version needs a newer bot (#105 compat warning). Drift here is cosmetic
  *  (the bot itself enforces compatibility); a test pins it against contract.ts. */
 export const HOST_API_VERSION = 1;
+
+/** #173: the ops/bot-ops.sh schema this panel build was written against — hand-mirrored (the
+ *  DEFAULT_PLUGIN_INDEX_URL pattern above), pinned by a drift test that regexes ops/bot-ops.sh's own
+ *  `readonly BOT_OPS_SCHEMA=` constant. Bump this in the SAME PR that bumps the script's. Unlike
+ *  HOST_API_VERSION's drift, this one is NOT cosmetic — an outdated deployed script is missing real
+ *  subcommands/whitelist rows the panel image already assumes exist (the incident this issue is
+ *  named for: `Update now` failing with a generic error because `plugin-request` didn't exist yet
+ *  on the deployed copy). */
+export const REQUIRED_BOT_OPS_SCHEMA = 1;
 
 // ADMIN_API_VERSION (+ the AdminApi/SaveResult types) is vendored in ./admin-contract — a copy of the
 // plugins repo's packages/api/admin.ts. Re-exported so the routes, the merge, and the tests all read
@@ -1110,6 +1171,12 @@ export interface HandlerConfig {
    * the backing store for the add/remove-admins endpoints. Absent means no extra narrowing and no
    * management endpoints. Never applied to the bearer-token fallback. */
   adminStore?: AdminStore;
+  /** #173: whether the startup `bot-ops.sh version` check found a schema mismatch (or a pre-#173
+   *  script's usage error) — computed ONCE at startup via `checkBotOpsSchemaStartup`, not per
+   *  request. Absent/false means up to date; `/api/status`'s route merges `botOpsOutdated: true`
+   *  into its response only when this is true, so the field is present exactly when there's
+   *  something to report, the same convention `/api/plugins`'s `indexError`/`stateError` use. */
+  botOpsOutdated?: boolean;
 }
 
 /** How a request authorized, carried through so mutating actions can be attributed. `email` is
@@ -1260,6 +1327,22 @@ function safeJsonField(text: string, field: string): unknown {
     return typeof obj === "object" && obj !== null ? (obj as Record<string, unknown>)[field] : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** #173: merges `botOpsOutdated: true` into `cmd_status`'s own JSON stdout — ONLY when `outdated`
+ *  is true, so the field is present exactly when there's something to report (the panel checks
+ *  `s.botOpsOutdated` truthy, never distinguishes false from absent). Returns `stdout` unchanged on
+ *  a parse failure rather than throwing: a degraded/unparseable status response is a pre-existing,
+ *  separate problem this merge shouldn't mask by crashing the route instead of returning it as-is. */
+export function mergeStatusOutdated(stdout: string, outdated: boolean): string {
+  if (!outdated) return stdout;
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return stdout;
+    return JSON.stringify({ ...(parsed as Record<string, unknown>), botOpsOutdated: true });
+  } catch {
+    return stdout;
   }
 }
 
@@ -1517,7 +1600,11 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   // incidents needed. Reads aren't logged (auditLogLine returns null): they're low-value here.
   const audit = auditLogLine(invocation, result, auth);
   if (audit) console.log(audit);
-  return new Response(result.stdout, { headers: { "Content-Type": invocation.contentType } });
+  // #173: /api/status is the one route that gets a server-side augmentation on top of bot-ops.sh's
+  // own stdout — everything else here still passes it straight through unmodified.
+  const stdout =
+    invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.botOpsOutdated ?? false) : result.stdout;
+  return new Response(stdout, { headers: { "Content-Type": invocation.contentType } });
 }
 
 // Everything below only runs when this file is the actual entry point (`bun run server.ts`),
@@ -1607,6 +1694,9 @@ if (import.meta.main) {
   }
   await logDynamicAdminsStartup(adminsFile);
   for (const line of describeBotOpsStartup(BOT_OPS_SH, process.env.BOT_OPS_COMPOSE_FILE)) console.log(line);
+  // #173: never refuses to start on a mismatch — only makes the drift visible (a loud log line +
+  // /api/status's botOpsOutdated banner). Day-2 ops still work against an outdated script.
+  const botOpsOutdated = await checkBotOpsSchemaStartup(runBotOps, REQUIRED_BOT_OPS_SCHEMA);
 
   // The BOT_BRANCH chooser's data source: the configured repo's branches from the GitHub API.
   // GITHUB_REPO/GITHUB_TOKEN are read on demand from the mounted .env (never this process's env, so
@@ -1680,7 +1770,10 @@ if (import.meta.main) {
   // resolveAdminBundleUrl / resolvePluginProxyUrl already constrained the host + path.
   const fetchAdminAsset = makeAdminAssetFetcher(fetch);
 
-  const config: HandlerConfig = { adminToken, indexHtml, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore };
+  const config: HandlerConfig = {
+    adminToken, indexHtml, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt, adminStore,
+    botOpsOutdated,
+  };
   // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
   // restart/env-set request out from under the client while bot-ops.sh is still legitimately
   // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.
