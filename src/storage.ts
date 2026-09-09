@@ -52,23 +52,38 @@ export function resolveDataDir(env: Record<string, string | undefined> = process
  */
 export const DATA_DIR = resolveDataDir();
 
+// #154: gives every temp file this process creates here a unique name — see writeJsonAtomic's own
+// comment for why. A plain per-call Date.now()/Math.random() would still theoretically collide
+// under heavy concurrency; a monotonically increasing counter cannot, by construction.
+let tmpCounter = 0;
+
 /**
  * Atomically writes `data` as JSON to `path`: a temp file in the same directory, then a rename —
  * never a bare write, which a crash mid-write could leave unparseable for the next read. Mirrors
  * `state.ts`'s `saveStateTo`, generalized so `links.ts` and `characters.ts` both call this instead
  * of each reimplementing the same three lines.
  *
- * **Not safe to call directly from two places that might race on the same `path`** — the temp
- * filename is fixed (`${path}.tmp`), so two overlapping calls for the same path can have one
- * rename fail with `ENOENT` out from under the other (verified: this is exactly what happens if
- * `createJsonWriter`/`createKeyedJsonMutator` are bypassed). Every current caller reaches this
- * only through one of those two serializing wrappers, which is what actually makes it safe — this
- * function's own atomicity is solely "never leaves a half-written file," not "safe under
- * concurrent callers."
+ * **Not safe to call twice concurrently for the same `path` from the SAME process** — two
+ * overlapping calls both write, then both rename, the winner is whichever rename lands last, and
+ * the loser's write is silently discarded (a lost update, not a corrupt file). Every in-process
+ * caller reaches this only through `createJsonWriter`/`createKeyedJsonMutator`, which serialize
+ * that.
+ *
+ * The temp NAME itself, though, is per-process-unique (`${path}.${pid}.${counter}.tmp`, #154) —
+ * unlike the writes it's safe across DIFFERENT processes racing the same `path`, which the
+ * in-process serializers above can't help with at all: two containers sharing the state volume
+ * during a handoff (the replacement's boot-time `loadPluginIndex` cache write, the original's
+ * still-running `pluginUpdates` tick re-fetching the same manifest) used to share one fixed
+ * `${path}.tmp`, so either process's rename could fail with `ENOENT` out from under the other, or
+ * — worse — one process's in-flight write could be clobbered mid-write by the other reusing the
+ * same temp path. A unique name per (process, call) makes that structurally impossible: the two
+ * writes now always go to two different temp files, so the only remaining question is which
+ * RENAME lands last (last-write-wins on the real path, the same "lost update" the in-process
+ * comment above already accepts — never a torn or missing file).
  */
 export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.${++tmpCounter}.tmp`;
   await Bun.write(tmp, JSON.stringify(data, null, 2));
   renameSync(tmp, path);
 }
