@@ -442,7 +442,7 @@ export interface BotOpsResult {
  * Pure: maps a request's method/path/query/body onto a bot-ops.sh invocation, or `undefined`
  * for a route this panel doesn't recognise. No new bot-ops.sh capability is introduced here —
  * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`env-get`/
- * `env-set`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
+ * `env-set`/`env-schema`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
  * server-native route (`POST /api/plugins/request`) so `requestedBy` can be set from the verified
  * identity, so it never reaches buildInvocation.
  */

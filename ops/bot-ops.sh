@@ -525,10 +525,12 @@ cmd_env_schema() {
   for key in "${ENV_KEY_ORDER[@]}"; do
     args+=("$key" "${ALLOWED[$key]}" "$([[ -n "${REQUIRED[$key]+x}" ]] && echo true || echo false)" core)
   done
-  for key in "${PLUGIN_KEY_ORDER[@]}"; do
-    [[ -n "${ALLOWED[$key]+x}" ]] && continue   # a plugin key colliding with a static one: static wins, exactly as env-get
-    args+=("$key" "${PLUGIN_FORMAT[$key]}" "${PLUGIN_REQUIRED[$key]:-false}" plugin)
-  done
+  if [ "${#PLUGIN_KEY_ORDER[@]}" -gt 0 ]; then
+    for key in "${PLUGIN_KEY_ORDER[@]}"; do
+      [[ -n "${ALLOWED[$key]+x}" ]] && continue   # a plugin key colliding with a static one: static wins, exactly as env-get
+      args+=("$key" "${PLUGIN_FORMAT[$key]}" "${PLUGIN_REQUIRED[$key]:-false}" plugin)
+    done
+  fi
   if [ "$PLUGIN_KEYS_STATUS" = "index unavailable" ]; then
     echo "bot-ops: plugins: index unavailable — showing static keys only (the bot isn't running or hasn't cached the Plugin Index yet)" >&2
   fi
