@@ -23,18 +23,18 @@ span children, and the exit demo.
 | 3 | The panel translates POSIX bracket classes (`[:space:]` and friends) to JS and treats any pattern that still won't compile as "no client-side check". | bash ERE and JS `RegExp` differ; `PLUGIN_INDEX_URL` uses `[[:space:]]`. The server stays the authority either way, so a translation gap degrades to the pre-epic behaviour, never to a wrong refusal. |
 | 4 | When `/api/env-schema` is unavailable the panel renders and saves with no client-side validation. | An old deployed script or a 5xx must not brick the config form; the banner already explains the outdated script. |
 | 5 | Core commands adopt the plugin `PluginCommand` shape (`name`, `build`, `handle`) as `CoreCommand`, and dispatch is `core ?? plugin`. | One shape for both means the host's collision rule and the prefix application are stated once; the refactor is byte-identical in registration JSON (acceptance pins it). |
-| 6 | Config/state dependency injection is **not** scheduled. | Eleven importers of `config`, three of the top-level-awaited `state`, every test module graph — an L refactor whose only payoff is test hygiene the #136 preload already delivers. Kept as a note on #137. |
+| 6 | Config/state dependency injection is **not** scheduled. | Nine `src/` modules import `config`, three import the top-level-awaited `state`, every test module graph changes — an L refactor whose only payoff is test hygiene the #136 preload already delivers. Kept as a note on #137. |
 
 ## 2. Verified starting state (2026-09-09, `main` @ `d344cec`)
 
 | Item | State |
 |---|---|
-| `ops/bot-ops.sh` | `BOT_OPS_SCHEMA=1` (`:55`); `ALLOWED_SPEC` (`:171-195`); `REQUIRED` = `ANNOUNCE_CHANNEL_ID` only (`:223-225`); `load_plugin_keys` fills `PLUGIN_FORMAT`/`PLUGIN_REQUIRED` (`:358-413`); `cmd_env_get` (`:473-508`); usage string (`:750`) |
+| `ops/bot-ops.sh` | `BOT_OPS_SCHEMA=1` (`:55`); `ALLOWED_SPEC` (`:171-195`); `REQUIRED` = `ANNOUNCE_CHANNEL_ID` only (`:223-225`); `load_plugin_keys` fills `PLUGIN_FORMAT`/`PLUGIN_REQUIRED` (`:358-413`); `cmd_env_get` (`:473-507`); usage string (`:750`) |
 | `ops/admin/server.ts` | `GET /api/env → env-get` route (`:465-467`); `REQUIRED_BOT_OPS_SCHEMA = 1` (`:660`) |
 | `ops/admin/public/index.html` | `REQUIRED_KEYS` (`:1311`), `BRANCH_NAME_RE` (`:1339`), `saveEnv`'s blank check (`:1537-1544`), `loadEnv` (`:1471-1500`) |
 | `ops/admin/server.test.ts` | REQUIRED-keys mirror test (`:2214-2231`), BRANCH_NAME_RE mirror (`:2241-2251`), schema mirror (`:2311-2319`), saveEnv harness lifting marker blocks (`:1856-1923`) |
 | `src/commands.ts` | `commandData` array literal (`:53-101`), `CORE_COMMAND_NAMES` derived (`:104`), `handleCommand` switch with duplicated admin refusal (`:112-121`, `:150-158`) and plugin fall-through in `default` (`:266-273`) |
-| deployed instances | debug and prod both refreshed to `main` @ `10780b4` + cloudflared 2026.9.0 today; shared `bin/bot-ops.sh` at main's sha, both panels report `schema 1 (panel needs 1)` |
+| deployed instances | debug and prod refreshed today: bot and admin images built from `10780b4`, stack compose and shared `bin/bot-ops.sh` from `d344cec` (the cloudflared 2026.9.0 bump, the only commit between the two); both panels report `schema 1 (panel needs 1)` |
 
 ## 3. Build order
 
@@ -64,7 +64,16 @@ span children, and the exit demo.
 4. Merge #207, rebuild debug's admin again: blank `ANNOUNCE_CHANNEL_ID` and `BOT_BRANCH = bad branch!` are refused before the confirm dialog with the plan's exact messages; `grep -c 'REQUIRED_KEYS\|BRANCH_NAME_RE' ops/admin/public/index.html` is 0 on `main`.
 5. Prod: refresh script + rebuild admin the same way (no banner step needed a second time).
 
-## 6. Escalations
+## 6. Corrections to the plan (running log)
+
+- **#205 (2026-09-09):** the jq grouping in the child plan used `_nwise(4)`, which is a manual
+  example, not a builtin, and fails on every real jq. Subordinate #1 caught it and replaced it with
+  `range(0; ($a|length)/4) | $a[.*4:.*4+4]`. Verified on nucbox's jq 1.8.1: the grouping emits the
+  nested object with `[[:space:]]` and `\.` intact, and `--args` works before or after the filter, so
+  the ordering caveat in the child plan is moot there. Lesson: run every snippet a plan hands a
+  subordinate, even a one-liner.
+
+## 7. Escalations
 
 None expected: no shipped identifier changes (the `env-get` shape and every command name are unchanged), no data migration. A cloudflared or bot recreate is not part of this epic's deploys — only the admin service and the bind-mounted script move.
 
