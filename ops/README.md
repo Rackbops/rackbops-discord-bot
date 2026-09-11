@@ -172,7 +172,7 @@ re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved v
 ## Editable keys (whitelist)
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
-`ADMIN_USER_IDS`, `WOW_REALM`, `WOW_REGION`, `WATCHED_REPOS`, `DMF_TIMEZONE`, `AUTO_UPDATE`,
+`ADMIN_USER_IDS`, `WATCHED_REPOS`, `AUTO_UPDATE`,
 `BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
@@ -422,23 +422,14 @@ page is rendered from whatever `GET /api/env` returns, so it can never drift fro
 dialog previews — never the untouched ones echoed back (issue #44): a stored value the whitelist
 would reject can't block an unrelated save, and a tab loaded before another operator's save can't
 silently revert their unrelated edit. A few fields render as constrained controls instead of free text:
-`WOW_REGION`/`AUTO_UPDATE` as selects, `DMF_TIMEZONE` as an IANA-zone datalist, `WOW_REALM` as a
-region-filtered realm chooser and `BOT_BRANCH` as a live branch chooser (both below), and
-`ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors.
-
-**The `WOW_REALM` chooser** reads a static, bundled `public/realms.json` (served at `GET
-/realms.json` — non-secret data, public at that layer like the page itself) and filters it to the
-region `WOW_REGION` is currently set to. The panel never calls Blizzard at request time. That file
-is regenerated locally, by hand, about once a year (WoW realm lists change that rarely) with
-`bun run ops/tools/gen-realms.ts` — a script that lives outside `ops/admin/` (so it's never in the
-deployed image and adds no dependency to it), reads Blizzard client creds from
-`R:\repos\secrets\BattleNetAPI-secrets.json` (`ID`/`SECRET`), and calls the realm-index endpoint
-via the `roshne/battlenet-api-research` client, writing every slug it returns (accented EU slugs
-included). The chooser then offers only slugs `bot-ops.sh`'s `WOW_REALM` regex accepts — lowercase
-ASCII plus accented Latin letters, so EU realms like `chants-éternels` and `aggra-português` are
-offered — never suggesting a realm the server would reject. (`REALM_SLUG_RE` in `index.html` is a
-hand-duplicated mirror of that regex; `ops/admin/server.test.ts` guards the two against drift.) If
-`realms.json` is absent, `WOW_REALM` gracefully falls back to a plain text input.
+`AUTO_UPDATE` as a select, `BOT_BRANCH` as a live branch chooser (below), and
+`ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors. Every other key — the static ones and each
+installed plugin's manifest keys alike — is a plain text input whose required-ness and format come
+from `GET /api/env-schema` (`bot-ops.sh env-schema`, #205/#207), so a blank required key or a value
+`env-set` would reject is refused before the confirm dialog rather than after a failed,
+restart-triggering save. A plugin that needs a richer control (the wow plugin's region-filtered
+realm chooser) ships it in its own admin tab — see ADR-0005 — not in this page. (`realms.json` and
+its `gen-realms.ts` generator moved to the plugins repo with the wow plugin, under `plugins/wow/`.)
 
 **The `BOT_BRANCH` chooser** lists the configured repo's live branches (branches change far too
 often for a static list) via `GET /api/branches`, which calls the GitHub API server-side.
