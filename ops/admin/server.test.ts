@@ -2339,6 +2339,18 @@ describe("env schema drives client-side validation (#207)", () => {
     expect(validateEnvChanges({ K: { pattern: "(", required: false } }, [{ key: "K", before: "", now: "x" }])).toBeNull();
   });
 
+  // A POSIX class outside the six POSIX_CLASSES maps (blank/punct/cntrl/print/graph/xdigit, or any
+  // future one no current ALLOWED_SPEC/plugin manifest happens to use yet) must fail SAFE, not
+  // silently compile a wrong-but-valid JS RegExp. `[^[:blank:]]` is syntactically fine JS: the class
+  // closes at its first literal "]", so the compiled pattern ends up requiring the value to
+  // literally END in "]" — rejecting almost everything (including values bash's real ERE would
+  // accept), the opposite of "no check". Caught in review (correctness lens) before this shipped.
+  test("an unmapped POSIX class means no client check, not a silently-wrong regex", () => {
+    const re = compilePattern("^[^[:blank:]]+$");
+    expect(re).toBeNull();
+    expect(validateEnvChanges({ K: { pattern: "^[^[:blank:]]+$", required: false } }, [{ key: "K", before: "", now: "no-blank-here" }])).toBeNull();
+  });
+
   test.each([
     ["blank + required -> names the key", { K: { required: true } }, [{ key: "K", before: "1", now: "" }], { key: "K", message: "K is required and cannot be blank." }],
     ["blank + optional -> null", { K: { required: false } }, [{ key: "K", before: "1", now: "" }], null],

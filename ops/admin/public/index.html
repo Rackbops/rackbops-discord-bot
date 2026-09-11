@@ -1524,7 +1524,15 @@
   const POSIX_CLASSES = { "[:space:]": "\\s", "[:alnum:]": "A-Za-z0-9", "[:alpha:]": "A-Za-z", "[:digit:]": "0-9", "[:upper:]": "A-Z", "[:lower:]": "a-z" };
   function compilePattern(ere) {
     if (typeof ere !== "string" || ere === "") return null;
-    const js = ere.replace(/\[:(space|alnum|alpha|digit|upper|lower):\]/g, (m) => POSIX_CLASSES[m]);
+    const js = ere.replace(/\[:\w+:\]/g, (m) => POSIX_CLASSES[m] ?? m);
+    // A POSIX class this map doesn't cover (blank/punct/cntrl/print/graph/xdigit, or any future
+    // one) is NOT a compile error — `[^[:blank:]]` is syntactically valid JS RegExp, just wrong:
+    // the class closes at its first literal "]", leaving the trailing "]" as a literal character
+    // the value must now end with, so it silently rejects almost everything instead of doing no
+    // check at all. Fail safe explicitly: if any "[:...:]" token survives the translation, don't
+    // compile it — that's the same "no client-side check for this key" outcome an actual throw
+    // would give, without the false-positive validation a wrong-but-valid regex would produce.
+    if (/\[:\w+:\]/.test(js)) return null;
     try { return new RegExp(js); } catch { return null; }
   }
   // First violation among the planned changes, or null. `schema` is GET /api/env-schema's object
