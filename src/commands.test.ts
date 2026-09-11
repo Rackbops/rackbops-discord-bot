@@ -4,7 +4,8 @@ import type { PluginCommand } from "./plugins/contract";
 
 // `commands.ts` pulls in the `config` singleton, which resolves process.env at import time --
 // the required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { isAdmin, bareName, updateReply, commandData, handleCommand } = await import("./commands");
+const { isAdmin, bareName, updateReply, commandData, handleCommand, CORE_COMMANDS, CORE_COMMAND_NAMES, refuseUnlessAdmin } =
+  await import("./commands");
 const { buildCommandBody } = await import("./plugins/host");
 const { config } = await import("./config");
 const { shortSha } = await import("./storage");
@@ -27,6 +28,61 @@ describe("isAdmin", () => {
   test("matches the whole id, not a prefix or substring", () => {
     expect(isAdmin("11", ["111"])).toBe(false);
     expect(isAdmin("1111", ["111"])).toBe(false);
+  });
+});
+
+describe("refuseUnlessAdmin (#206)", () => {
+  // config.adminUserIds is empty in this test process (ADMIN_USER_IDS unset — see the file's own
+  // top comment), so this exercises the no-admins-configured branch directly. The
+  // configured-but-not-this-user branch below mutates the array IN PLACE (never reassigns the
+  // `config` binding itself) and restores it in a `finally`, so it can't leak into another test.
+  test("refuses with the no-admins-configured message, naming the command, when none are set", async () => {
+    let replied: { content?: string } | undefined;
+    const interaction = {
+      user: { id: "999" },
+      reply: async (o: { content?: string }) => {
+        replied = o;
+      },
+    } as unknown as ChatInputCommandInteraction;
+    const refused = await refuseUnlessAdmin(interaction, "/update");
+    expect(refused).toBe(true);
+    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+  });
+
+  test("refuses with the not-allowed message when admins ARE configured but this user isn't one", async () => {
+    config.adminUserIds.push("111");
+    try {
+      let replied: { content?: string } | undefined;
+      const interaction = {
+        user: { id: "999" },
+        reply: async (o: { content?: string }) => {
+          replied = o;
+        },
+      } as unknown as ChatInputCommandInteraction;
+      const refused = await refuseUnlessAdmin(interaction, "/plugins");
+      expect(refused).toBe(true);
+      expect(replied?.content).toBe("⛔ You're not allowed to run this.");
+    } finally {
+      config.adminUserIds.length = 0;
+    }
+  });
+
+  test("returns false and does not reply for an admin", async () => {
+    config.adminUserIds.push("111");
+    try {
+      let replyCalled = false;
+      const interaction = {
+        user: { id: "111" },
+        reply: async () => {
+          replyCalled = true;
+        },
+      } as unknown as ChatInputCommandInteraction;
+      const refused = await refuseUnlessAdmin(interaction, "/update");
+      expect(refused).toBe(false);
+      expect(replyCalled).toBe(false);
+    } finally {
+      config.adminUserIds.length = 0;
+    }
   });
 });
 
@@ -132,6 +188,78 @@ describe("commandData", () => {
   });
 });
 
+describe("CORE_COMMANDS table (#206)", () => {
+  test("registers exactly the three core commands, prefixed once", () => {
+    expect(commandData.map((c) => c.name)).toEqual(["report", "update", "plugins"]);
+    // COMMAND_PREFIX is empty in this test process, so bareName is a round-trip identity — proves
+    // the prefix was applied exactly once (build(cmd(c.name))), not zero or twice.
+    for (const c of commandData) expect(bareName(c.name)).toBe(c.name);
+  });
+
+  test("CORE_COMMAND_NAMES is derived from the table, not hand-listed", () => {
+    expect(CORE_COMMAND_NAMES).toEqual(CORE_COMMANDS.map((c) => c.name));
+  });
+
+  // Found in review: COMMAND_PREFIX is empty in this test process (config resolves it once, at
+  // import, from this process's actual env — see the file's own top comment), so nothing here can
+  // exercise `commandData`'s own `cmd(c.name)` call site under a NON-empty prefix without a fresh
+  // module import under different env, which this codebase's config-singleton architecture doesn't
+  // support without a broader change out of scope for this issue. `bun run check`'s
+  // `noUnusedLocals` is the real backstop for that specific call site today — `cmd` has exactly one
+  // use (`commandData`'s own line), so bypassing it with a raw, unprefixed
+  // `new SlashCommandBuilder()` leaves `cmd` unused and fails the typecheck (verified directly: TS6133
+  // on `cmd`). This test covers the other, independently-testable half of the same property — that
+  // each row's `build` genuinely HONORS whatever already-namespaced builder it's handed, rather than
+  // hardcoding a bare one internally — using the real `commandNamer` with a non-empty prefix.
+  test("each row's build() honors an externally-namespaced builder (non-empty prefix)", async () => {
+    const { commandNamer } = await import("./commandNaming");
+    const prefixed = commandNamer("r_");
+    const built = CORE_COMMANDS.map((c) => c.build(prefixed(c.name)).toJSON());
+    expect(built.map((c) => c.name)).toEqual(["r_report", "r_update", "r_plugins"]);
+  });
+
+  test("dispatch reaches the table row's handle for each core name", async () => {
+    for (const row of CORE_COMMANDS) {
+      const spy = spyOn(row, "handle").mockImplementation(async () => {});
+      let lookupCalled = false;
+      const interaction = { commandName: row.name, user: { id: "x" } } as unknown as ChatInputCommandInteraction;
+      try {
+        await handleCommand(interaction, () => {
+          lookupCalled = true;
+          return undefined;
+        });
+        expect(spy).toHaveBeenCalledTimes(1);
+        expect(spy.mock.calls[0]?.[0]).toBe(interaction);
+        expect(lookupCalled).toBe(false); // a core row is found first — lookup is never consulted
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  });
+
+  // Mirrors pluginCommandMap's own collision rule (host.ts): a core command wins over a
+  // same-named plugin one, never the other way around.
+  test("a core name shadows a plugin command of the same bare name", async () => {
+    const reportRow = CORE_COMMANDS.find((c) => c.name === "report")!;
+    const spy = spyOn(reportRow, "handle").mockImplementation(async () => {});
+    let pluginHandleCalled = false;
+    try {
+      const pluginCommand = {
+        name: "report",
+        handle: async () => {
+          pluginHandleCalled = true;
+        },
+      } as unknown as PluginCommand;
+      const interaction = { commandName: "report" } as unknown as ChatInputCommandInteraction;
+      await handleCommand(interaction, (bare) => (bare === "report" ? pluginCommand : undefined));
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(pluginHandleCalled).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 describe("handleCommand — plugin dispatch (default case)", () => {
   test("dispatches a non-core command to the looked-up plugin handler", async () => {
     let handledName: string | undefined;
@@ -149,6 +277,31 @@ describe("handleCommand — plugin dispatch (default case)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// Found in review: nothing dispatched "/update" through the real handleCommand at all before this
+// — only "/plugins" had a non-admin dispatch test. Paired with that one (same shape, same exact-
+// message assertion, different command name), the two together catch a table row swap either way:
+// swapping the two rows' handle bodies makes dispatching by ONE name produce the OTHER's embedded
+// command name in the refusal text, which either exact assertion below would then fail.
+describe("handleCommand — /update", () => {
+  test("refuses a non-admin before any deferReply / update check", async () => {
+    let replied: { content?: string } | undefined;
+    let deferred = false;
+    const interaction = {
+      commandName: "update",
+      user: { id: "999" },
+      reply: async (o: { content?: string }) => {
+        replied = o;
+      },
+      deferReply: async () => {
+        deferred = true;
+      },
+    } as unknown as ChatInputCommandInteraction;
+    await handleCommand(interaction);
+    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+    expect(deferred).toBe(false);
   });
 });
 
@@ -172,7 +325,11 @@ describe("handleCommand — /plugins", () => {
       },
     } as unknown as ChatInputCommandInteraction;
     await handleCommand(interaction);
-    expect(replied?.content).toContain("set `ADMIN_USER_IDS`");
+    // Full equality, not a substring: the message embeds the SPECIFIC command name
+    // (refuseUnlessAdmin(interaction, "/plugins")) — found in review that a looser substring check
+    // (just "set `ADMIN_USER_IDS`") can't tell this apart from /update's own refusal, which shares
+    // that same fragment and would still match if the two rows' handle bodies were swapped.
+    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.");
     expect(deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
   });
 
@@ -222,10 +379,14 @@ describe("handleCommand — /plugins", () => {
 // failure path end-to-end since createIssue's fetch is easy to stub. Mutation: removing
 // `clampReply(` from any of these three catch blocks must fail its test.
 describe("commands.ts — clampReply guards every editReply failure path (#55, #186)", () => {
+  // #206: anchors moved from the old switch's `case "update"`/`case "report"` labels to
+  // CORE_COMMANDS' own row markers — the table's order is report/update/plugins (matching
+  // commandData's own pinned order), so the update row runs from its own `name:` to the next
+  // row's (`plugins`), not to `name: "report"`, which now comes BEFORE it.
   test("/update's failure edit is wrapped in clampReply", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
-    const block = src.slice(src.indexOf('case "update"'), src.indexOf('case "report"'));
+    const block = src.slice(src.indexOf('name: "update"'), src.indexOf('name: "plugins"'));
     const catchIdx = block.indexOf("} catch (err) {");
     expect(catchIdx).toBeGreaterThan(-1);
     const editIdx = block.indexOf("await interaction.editReply(clampReply(", catchIdx);
@@ -247,7 +408,7 @@ describe("commands.ts — clampReply guards every editReply failure path (#55, #
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
     // The action (update/remind/skip/cancel) catch is the last one in the file — after it there
-    // is only the default-case plugin dispatch, which has no editReply of its own.
+    // is only handleCommand's own dispatch, which has no editReply of its own (#206).
     const actionCatchIdx = src.lastIndexOf("} catch (err) {");
     const editIdx = src.indexOf("await interaction.editReply(clampReply(", actionCatchIdx);
     expect(editIdx).toBeGreaterThan(actionCatchIdx);
