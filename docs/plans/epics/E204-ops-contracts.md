@@ -1,6 +1,14 @@
 # E204 — env-schema contract and core command table — implementation plan
 
-Status: **in progress (picked up 2026-09-09).** Epic issue:
+Status: **CLOSED — epic complete 2026-09-10.** All three children merged (#205 PR #209 `47252c2`,
+#206 PR #210 `9bd0d7c`, #207 PR #211 `441795a`); exit demo executed on debug and pasted on the epic
+(the schema-2 banner fired against the un-refreshed script and cleared after the refresh plus an
+admin restart; `/api/env-schema` serves 15 keys with `WARBANDEER_INGEST_PORT` as `source: plugin`;
+the rebuilt bot registered 9 slash commands and `/r_report` + `/r_plugins list` answered live;
+both panels rebuilt from `441795a` with no `REQUIRED_KEYS`/`BRANCH_NAME_RE` and the `ENV_SCHEMA`
+block served). Left unverified live: `/r_update` as a non-admin (covered by exact-message tests)
+and the in-browser refusal messages (covered by the page's own `saveEnv` run in the test harness;
+see the running log for roshne's click check). Was: in progress (picked up 2026-09-09). Epic issue:
 [#204](https://github.com/Rackbops/rackbops-discord-bot/issues/204). Children (in order):
 [#205](https://github.com/Rackbops/rackbops-discord-bot/issues/205) env-schema subcommand + route,
 [#206](https://github.com/Rackbops/rackbops-discord-bot/issues/206) core command table,
@@ -59,7 +67,7 @@ span children, and the exit demo.
 ## 5. Exit demo (debug, orchestrator-driven)
 
 1. Merge #205 and #206. Rebuild debug's admin image from `main` **before** refreshing the shared script: the panel logs `bot-ops.sh schema 1 (panel needs 2)` and shows the OUT OF DATE banner naming `bot-ops.sh`. Paste both.
-2. Refresh `bin/bot-ops.sh` per the narrow procedure; the banner clears without a container restart (bind mount). `GET /api/env-schema` returns the object; paste it with `ANNOUNCE_CHANNEL_ID.required = true` and `WARBANDEER_INGEST_PORT` present with `source: "plugin"`.
+2. Refresh `bin/bot-ops.sh` per the narrow procedure, then `docker restart` the admin: the schema check runs once at startup (`checkBotOpsSchemaStartup`, baked into `/api/status`), so the banner does **not** clear live — an earlier draft of this step said it would. `GET /api/env-schema` returns the object; paste it with `ANNOUNCE_CHANNEL_ID.required = true` and `WARBANDEER_INGEST_PORT` present with `source: "plugin"`. Because the script is one shared file and the check is strict equality, rebuild the other instance's admin too before it next restarts.
 3. Rebuild the debug bot from `main` (scoped `bot` service); `/report`, `/update` as a non-admin, `/plugins list` answer. Paste the replies.
 4. Merge #207, rebuild debug's admin again: blank `ANNOUNCE_CHANNEL_ID` and `BOT_BRANCH = bad branch!` are refused before the confirm dialog with the plan's exact messages; `grep -c 'REQUIRED_KEYS\|BRANCH_NAME_RE' ops/admin/public/index.html` is 0 on `main`.
 5. Prod: refresh script + rebuild admin the same way (no banner step needed a second time).
@@ -72,6 +80,20 @@ span children, and the exit demo.
   nested object with `[[:space:]]` and `\.` intact, and `--args` works before or after the filter, so
   the ordering caveat in the child plan is moot there. Lesson: run every snippet a plan hands a
   subordinate, even a one-liner.
+- **#206 (2026-09-10):** two mutation-table rows named tests that did not catch their mutation —
+  the handle swap (the dispatch test mocked `handle` away; the non-admin test asserted a substring
+  both refusals share) and the `cmd()` bypass (the suite runs with an empty `COMMAND_PREFIX`, and
+  the `config` singleton can't be re-resolved per test). Subordinate #2's reviewers caught both;
+  fixed with exact-message assertions plus a matching `/update` dispatch test, and `noUnusedLocals`
+  named as the real backstop for the bypass (`cmd` has exactly one use). The orchestrator
+  reproduced the byte-identical registration under `COMMAND_PREFIX=r_` directly, outside the suite.
+- **#207 (2026-09-10):** the "remove the `[:space:]` mapping" row claimed the every-pattern-compiles
+  test would fail; it does not — an untranslated `[^[:space:]]` still compiles as a wrong-but-valid
+  JS class. Only the bash-parity test on `PLUGIN_INDEX_URL` catches it. The reviewers generalised
+  that into a real gap in decision 3: any *unmapped* POSIX class (`[:blank:]`, `[:punct:]`, …)
+  compiled to a regex that rejects almost everything instead of "no check". Fixed in review: a
+  surviving `[:…:]` token after translation now yields `null`, with a regression test.
+- **Deploy (2026-09-10):** a schema bump moves both panels at once — see §5 step 2.
 
 ## 7. Escalations
 
