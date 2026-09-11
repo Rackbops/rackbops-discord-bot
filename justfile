@@ -1,5 +1,11 @@
 # rackbops-discord-bot — Discord bot with a plugin architecture (Bun + TypeScript)
 # Requires: just, bun, docker compose
+#
+# This file deliberately combines the two recipe sets docs/non-addon-repo-scaffold.md
+# normally keeps separate: compose-lifecycle (build/up/down/reup/logs) and the
+# dev-workflow set (install/check/lint/typecheck/test/clean/fresh) other non-addon
+# repos put in a Justfile alone. Kept together here rather than split across a
+# Justfile + justfile pair, since both target the same single service.
 
 default:
     @just --list
@@ -21,8 +27,12 @@ dev:
 build:
     GIT_SHA=$(git rev-parse HEAD) docker compose build
 
-# Run all checks (typecheck + test) — no linter configured in this repo, so no lint step
-check: typecheck test
+# Lint -- no linter is configured in this repo yet; nothing to run
+lint:
+    @echo "no linter configured in this repo yet"
+
+# Run all checks (lint + typecheck + test)
+check: lint typecheck test
 
 # Type-check (root, plus ops/ and ops/admin/ separately — see CLAUDE.md)
 typecheck:
