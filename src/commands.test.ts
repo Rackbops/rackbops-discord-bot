@@ -200,6 +200,24 @@ describe("CORE_COMMANDS table (#206)", () => {
     expect(CORE_COMMAND_NAMES).toEqual(CORE_COMMANDS.map((c) => c.name));
   });
 
+  // Found in review: COMMAND_PREFIX is empty in this test process (config resolves it once, at
+  // import, from this process's actual env — see the file's own top comment), so nothing here can
+  // exercise `commandData`'s own `cmd(c.name)` call site under a NON-empty prefix without a fresh
+  // module import under different env, which this codebase's config-singleton architecture doesn't
+  // support without a broader change out of scope for this issue. `bun run check`'s
+  // `noUnusedLocals` is the real backstop for that specific call site today — `cmd` has exactly one
+  // use (`commandData`'s own line), so bypassing it with a raw, unprefixed
+  // `new SlashCommandBuilder()` leaves `cmd` unused and fails the typecheck (verified directly: TS6133
+  // on `cmd`). This test covers the other, independently-testable half of the same property — that
+  // each row's `build` genuinely HONORS whatever already-namespaced builder it's handed, rather than
+  // hardcoding a bare one internally — using the real `commandNamer` with a non-empty prefix.
+  test("each row's build() honors an externally-namespaced builder (non-empty prefix)", async () => {
+    const { commandNamer } = await import("./commandNaming");
+    const prefixed = commandNamer("r_");
+    const built = CORE_COMMANDS.map((c) => c.build(prefixed(c.name)).toJSON());
+    expect(built.map((c) => c.name)).toEqual(["r_report", "r_update", "r_plugins"]);
+  });
+
   test("dispatch reaches the table row's handle for each core name", async () => {
     for (const row of CORE_COMMANDS) {
       const spy = spyOn(row, "handle").mockImplementation(async () => {});
@@ -262,6 +280,31 @@ describe("handleCommand — plugin dispatch (default case)", () => {
   });
 });
 
+// Found in review: nothing dispatched "/update" through the real handleCommand at all before this
+// — only "/plugins" had a non-admin dispatch test. Paired with that one (same shape, same exact-
+// message assertion, different command name), the two together catch a table row swap either way:
+// swapping the two rows' handle bodies makes dispatching by ONE name produce the OTHER's embedded
+// command name in the refusal text, which either exact assertion below would then fail.
+describe("handleCommand — /update", () => {
+  test("refuses a non-admin before any deferReply / update check", async () => {
+    let replied: { content?: string } | undefined;
+    let deferred = false;
+    const interaction = {
+      commandName: "update",
+      user: { id: "999" },
+      reply: async (o: { content?: string }) => {
+        replied = o;
+      },
+      deferReply: async () => {
+        deferred = true;
+      },
+    } as unknown as ChatInputCommandInteraction;
+    await handleCommand(interaction);
+    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+    expect(deferred).toBe(false);
+  });
+});
+
 describe("handleCommand — /plugins", () => {
   // config.adminUserIds is empty in this test process (ADMIN_USER_IDS unset), so this exercises the
   // no-admins-configured refusal — which is exactly the isAdmin gate: drop it and the handler would
@@ -282,7 +325,11 @@ describe("handleCommand — /plugins", () => {
       },
     } as unknown as ChatInputCommandInteraction;
     await handleCommand(interaction);
-    expect(replied?.content).toContain("set `ADMIN_USER_IDS`");
+    // Full equality, not a substring: the message embeds the SPECIFIC command name
+    // (refuseUnlessAdmin(interaction, "/plugins")) — found in review that a looser substring check
+    // (just "set `ADMIN_USER_IDS`") can't tell this apart from /update's own refusal, which shares
+    // that same fragment and would still match if the two rows' handle bodies were swapped.
+    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.");
     expect(deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
   });
 
