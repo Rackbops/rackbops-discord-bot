@@ -823,8 +823,14 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
   a key). `env-get`'s output shape (a flat `{KEY: value}` object) is unchanged — this was an
   internal refactor only. Carved out of the same issue, needing a design decision first: emitting
   each key's `pattern`/`required` to the panel so `ops/admin/public/index.html`'s hard-coded
-  `BRANCH_NAME_RE` could go away — that's a contract change across `bot-ops.sh`/`server.ts`/the
-  panel, done by #205 (`env-schema`) and #207 (the panel consumes it).
+  `REQUIRED_KEYS`/`BRANCH_NAME_RE` mirrors could go away — a contract change across
+  `bot-ops.sh`/`server.ts`/the panel, landed by #205 (the `env-schema` subcommand and
+  `GET /api/env-schema`) and #207 (the panel fetches it alongside `GET /api/env` on load, drives
+  required-marking/blank-check/format-check/the `BOT_BRANCH` chooser filter from it, and drops both
+  hardcoded mirrors and their drift tests). Degrades gracefully: an old deployed `bot-ops.sh`
+  (pre-#205) or a transient `GET /api/env-schema` failure leaves the panel with no client-side
+  validation at all — `env-set` stays the authority either way, same as the #173 schema-gate banner
+  already covers for a missing subcommand.
 - **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178
   extends #173's mechanism to cover it rather than inventing a second one.** `install.sh` fetches
   the compose file once too and nothing refreshes it — a real incident: `debug`'s stack compose was
