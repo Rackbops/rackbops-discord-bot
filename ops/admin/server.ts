@@ -442,7 +442,7 @@ export interface BotOpsResult {
  * Pure: maps a request's method/path/query/body onto a bot-ops.sh invocation, or `undefined`
  * for a route this panel doesn't recognise. No new bot-ops.sh capability is introduced here —
  * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`env-get`/
- * `env-set`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
+ * `env-set`/`env-schema`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
  * server-native route (`POST /api/plugins/request`) so `requestedBy` can be set from the verified
  * identity, so it never reaches buildInvocation.
  */
@@ -467,6 +467,9 @@ export function buildInvocation(
   }
   if (method === "POST" && pathname === "/api/env") {
     return { args: ["env-set"], stdin: body ?? "", contentType: "application/json" };
+  }
+  if (method === "GET" && pathname === "/api/env-schema") {
+    return { args: ["env-schema"], contentType: "application/json" };
   }
   return undefined;
 }
@@ -656,8 +659,9 @@ export const HOST_API_VERSION = 1;
  *  HOST_API_VERSION's drift, this one is NOT cosmetic — an outdated deployed script is missing real
  *  subcommands/whitelist rows the panel image already assumes exist (the incident this issue is
  *  named for: `Update now` failing with a generic error because `plugin-request` didn't exist yet
- *  on the deployed copy). */
-export const REQUIRED_BOT_OPS_SCHEMA = 1;
+ *  on the deployed copy).
+ *  2 = env-schema (#205). */
+export const REQUIRED_BOT_OPS_SCHEMA = 2;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed

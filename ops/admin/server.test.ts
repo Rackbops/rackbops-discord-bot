@@ -1275,6 +1275,17 @@ describe("buildInvocation", () => {
     });
   });
 
+  test("GET /api/env-schema -> env-schema, json (#205)", () => {
+    expect(buildInvocation("GET", "/api/env-schema", new URLSearchParams(), noBody)).toEqual({
+      args: ["env-schema"],
+      contentType: "application/json",
+    });
+  });
+
+  test("POST /api/env-schema is not routed (read-only) (#205)", () => {
+    expect(buildInvocation("POST", "/api/env-schema", new URLSearchParams(), noBody)).toBeUndefined();
+  });
+
   test("wrong method on a known path is unrecognised", () => {
     expect(buildInvocation("POST", "/api/status", new URLSearchParams(), noBody)).toBeUndefined();
     expect(buildInvocation("DELETE", "/api/env", new URLSearchParams(), noBody)).toBeUndefined();
