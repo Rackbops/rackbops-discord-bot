@@ -1,11 +1,11 @@
 # rackbops-discord-bot — Discord bot with a plugin architecture (Bun + TypeScript)
 # Requires: just, bun, docker compose
 #
-# This file deliberately combines the two recipe sets docs/non-addon-repo-scaffold.md
-# normally keeps separate: compose-lifecycle (build/up/down/reup/logs) and the
-# dev-workflow set (install/check/lint/typecheck/test/clean/fresh) other non-addon
-# repos put in a Justfile alone. Kept together here rather than split across a
-# Justfile + justfile pair, since both target the same single service.
+# This file combines two recipe groups: compose-lifecycle (build/up/down/reup/logs),
+# for running the deployed stack, and the dev-workflow set
+# (install/check/lint/typecheck/test/clean/fresh) docs/non-addon-repo-scaffold.md
+# specifies for every non-addon repo. Kept together in this one file since both
+# target this single service.
 
 default:
     @just --list
