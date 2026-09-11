@@ -1868,11 +1868,10 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const planSrc = indexSrc.match(/\/\/ ENV_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE_PLAN:end/)?.[1];
   const saveSrc = indexSrc.match(/\/\/ ENV_SAVE:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE:end/)?.[1];
-  // REQUIRED_KEYS lives outside the ENV_SAVE markers (the real page's saveEnv reaches it via
-  // closure, in the single IIFE scope it shares with FIELD_META) — so the isolated eval below must
-  // have it injected explicitly, extracted from source like planSrc/saveSrc are.
-  const requiredKeysSrc = indexSrc.match(/REQUIRED_KEYS\s*=\s*(\[[^\]]*\])/)?.[1];
-  const REQUIRED_KEYS = JSON.parse(requiredKeysSrc ?? "[]") as string[];
+  // compilePattern/validateEnvChanges live between their own markers, same reason as planSrc/saveSrc
+  // — saveEnv reaches validateEnvChanges via closure in the real page's single IIFE scope, so the
+  // isolated eval below must lift and inject it explicitly, not just the two ENV_SAVE functions.
+  const schemaSrc = indexSrc.match(/\/\/ ENV_SCHEMA:begin\n([\s\S]*?)\n\s*\/\/ ENV_SCHEMA:end/)?.[1];
   type Plan = { changes: { key: string; before: string; now: string }[]; body: string };
   // "use strict" up front, matching the page's own IIFE (index.html:226): without it, a `Function`
   // body silently creates a global on an assignment to an un-injected or misspelled identifier
@@ -1893,10 +1892,14 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     msg: { textContent: string; className: string };
     reloads: number;
   }
+  // Matches the shape GET /api/env-schema actually returns (#205) for the one key these tests
+  // exercise required-ness on; a test that needs a different schema (a format check, or the
+  // degraded {} path) overrides it via opts.loadedSchema.
+  const DEFAULT_SCHEMA = { ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: true, source: "core" } };
   async function runSaveEnv(
     loaded: Record<string, string>,
     controls: Record<string, string>,
-    opts: { confirm?: boolean; response?: { ok: boolean; text: string } } = {},
+    opts: { confirm?: boolean; response?: { ok: boolean; text: string }; loadedSchema?: Record<string, unknown> } = {},
   ): Promise<FakePage> {
     const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, reloads: 0 };
     const document = {
@@ -1924,11 +1927,21 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
       "loadEnv",
       "loadStatus",
       "loadedEnv",
-      "REQUIRED_KEYS",
+      "loadedSchema",
       "MUTATION_TIMEOUT_MS",
       "timeoutSignal",
-      `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
-    )(document, confirm, api, () => page.reloads++, () => {}, loaded, REQUIRED_KEYS, 110000, timeoutSignal) as () => Promise<void>;
+      `${schemaSrc ?? ""}\n${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
+    )(
+      document,
+      confirm,
+      api,
+      () => page.reloads++,
+      () => {},
+      loaded,
+      opts.loadedSchema ?? DEFAULT_SCHEMA,
+      110000,
+      timeoutSignal,
+    ) as () => Promise<void>;
     await saveEnv();
     return page;
   }
@@ -1940,17 +1953,20 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
 
   test("saveEnv POSTs only the changed fields, diffed against the LOADED env, and previews the same", async () => {
     // The issue's exact setup: two stored values the whitelist would reject, both untouched.
-    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage" };
-    const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "222" });
+    // ANNOUNCE_CHANNEL_ID values are 5 digits (not the old placeholder "111"/"222") so they satisfy
+    // DEFAULT_SCHEMA's real ^[0-9]{5,25}$ pattern (#207) — this test predates client-side format
+    // validation and isn't testing that pattern itself, so the values just need to pass it.
+    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "11111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage" };
+    const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "22222" });
     expect(page.posts).toHaveLength(1);
     const [post] = page.posts;
     expect(post?.path).toBe("/api/env");
     expect(post?.opts.method).toBe("POST");
-    expect(post?.opts.body).toBe("ANNOUNCE_CHANNEL_ID=222");
+    expect(post?.opts.body).toBe("ANNOUNCE_CHANNEL_ID=22222");
     // issue #53 item 2: the POST now carries a real AbortSignal, not none at all.
     expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
     expect(page.confirms).toHaveLength(1);
-    expect(page.confirms[0]).toContain('ANNOUNCE_CHANNEL_ID: "111" → "222"');
+    expect(page.confirms[0]).toContain('ANNOUNCE_CHANNEL_ID: "11111" → "22222"');
     expect(page.confirms[0]).not.toContain("ADMIN_USER_IDS");
     expect(page.msg).toEqual({ textContent: "Saved: ANNOUNCE_CHANNEL_ID", className: "msg ok" });
     expect(page.reloads).toBe(1); // re-baselined, so a second save diffs against the new state
@@ -2056,6 +2072,33 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
     const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" }, { ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" });
     expect(page.posts).toEqual([]); // the WATCHED_REPOS change is not posted either
     expect(page.msg.className).toBe("msg error");
+  });
+
+  // #207: a bad-format (not just blank) value is now blocked client-side too, reading BOT_BRANCH's
+  // pattern from the schema exactly the way the deleted BRANCH_NAME_RE mirror used to hardcode it.
+  test("a bad-format value (BOT_BRANCH) is refused before the confirm dialog, with the format message (#207)", async () => {
+    const page = await runSaveEnv(
+      { BOT_BRANCH: "main" },
+      { BOT_BRANCH: "bad branch!" },
+      { loadedSchema: { BOT_BRANCH: { pattern: "^[A-Za-z0-9._/-]{1,100}$", required: false, source: "core" } } },
+    );
+    expect(page.confirms).toEqual([]);
+    expect(page.posts).toEqual([]);
+    expect(page.msg).toEqual({
+      textContent: 'BOT_BRANCH: "bad branch!" doesn\'t match the expected format (^[A-Za-z0-9._/-]{1,100}$).',
+      className: "msg error",
+    });
+    expect(page.reloads).toBe(0);
+  });
+
+  // #207's degraded path: an old deployed bot-ops.sh (pre-#205) or a transient GET /api/env-schema
+  // failure leaves loadedSchema at {} (loadEnv's own fallback) — the panel must NOT block the save
+  // client-side in that case (env-set, server-side, stays the authority either way).
+  test("with no schema loaded ({}), a value that WOULD be refused is submitted anyway — the degraded path (#207)", async () => {
+    const page = await runSaveEnv({ BOT_BRANCH: "main" }, { BOT_BRANCH: "bad branch!" }, { loadedSchema: {} });
+    expect(page.confirms).toHaveLength(1);
+    expect(page.posts).toHaveLength(1);
+    expect(page.posts[0]?.opts.body).toBe("BOT_BRANCH=bad branch!");
   });
 });
 
@@ -2218,48 +2261,12 @@ describe("admin panel hasAccessSession (issue #53 item 6: probes via /api/whoami
   });
 });
 
-// Which keys may never be blanked is a bot-ops.sh ↔ panel mirror like the others above: the
-// authority is bot-ops.sh's REQUIRED set (env-set refuses an empty value for them, since they have
-// no documented default — issue #45), mirrored by REQUIRED_KEYS in the panel so a blank submit is
-// refused client-side instead of surfacing only after a failed, restart-triggering save.
-describe("REQUIRED keys (bot-ops.sh ↔ panel REQUIRED_KEYS stay in sync)", () => {
+// AUTO_UPDATE is a UI-shape mirror only (select options), not validation — REQUIRED/BOT_BRANCH's
+// format validation moved to GET /api/env-schema (#207), read live by the panel instead of a
+// hardcoded copy, so there's nothing left here for those two to drift out of sync on.
+describe("AUTO_UPDATE (panel ↔ bot-ops.sh UI-shape mirror)", () => {
   const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const requiredBlock = botOpsSrc.match(/declare -A REQUIRED=\(([\s\S]*?)\)/)?.[1] ?? "";
-  const botOpsRequired = [...requiredBlock.matchAll(/\[(\w+)\]=1/g)].map((m) => m[1]!).sort();
-  const panelRequired = (JSON.parse(indexSrc.match(/REQUIRED_KEYS\s*=\s*(\[[^\]]*\])/)?.[1] ?? "[]") as string[]).sort();
-
-  test("both source lists are present and identical (mirror can't drift)", () => {
-    expect(botOpsRequired.length).toBeGreaterThan(0);
-    expect(panelRequired).toEqual(botOpsRequired);
-  });
-
-  test("every REQUIRED key is itself a whitelisted ALLOWED key", () => {
-    // #133: ALLOWED is derived from ALLOWED_SPEC's "KEY|regex" entries, not a hand-declared
-    // `[KEY]='regex'` associative-array literal — the source pattern this scrapes moved with it.
-    for (const key of botOpsRequired) expect(botOpsSrc).toMatch(new RegExp(`'${key}\\|`));
-  });
-});
-
-// BOT_BRANCH and AUTO_UPDATE are two more bot-ops.sh ↔ panel mirrors like REQUIRED_KEYS above:
-// bot-ops.sh's ALLOWED regex is the authority (env-set's format check), and the panel hardcodes
-// its own copy for client-side validation/options — nothing pins the two together, so either side
-// can drift silently.
-describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
-  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
-  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-
-  test("BOT_BRANCH: panel's BRANCH_NAME_RE matches bot-ops.sh's ALLOWED regex", () => {
-    // #133: scraped from ALLOWED_SPEC's "KEY|regex" entry now, not a `[KEY]='regex'` associative-
-    // array literal — the entry itself (and the regex it carries) is unchanged, only its source
-    // shape moved.
-    const botOpsBranchRe = botOpsSrc.match(/'BOT_BRANCH\|([^']*)'/)?.[1];
-    // Greedy: defensive against a future BRANCH_NAME_RE whose character class embeds a literal
-    // "/;" — today's `/` is followed by `-`, so lazy would happen to land here too.
-    const panelBranchRe = indexSrc.match(/const BRANCH_NAME_RE = \/(.+)\/;/)?.[1];
-    expect(botOpsBranchRe).toBeTruthy();
-    expect(panelBranchRe).toBe(botOpsBranchRe);
-  });
 
   test("AUTO_UPDATE: panel's select options match bot-ops.sh's ALLOWED alternation", () => {
     const botOpsAlternation = botOpsSrc.match(/'AUTO_UPDATE\|\^\(([^)]+)\)\$'/)?.[1];
@@ -2268,6 +2275,104 @@ describe("BOT_BRANCH / AUTO_UPDATE (panel ↔ bot-ops.sh mirrors)", () => {
     const panelOptions = (JSON.parse(panelOptionsSrc ?? "[]") as string[]).sort();
     expect(botOpsOptions.length).toBeGreaterThan(0);
     expect(panelOptions).toEqual(botOpsOptions);
+  });
+});
+
+// #207: the panel's client-side env validation (required-ness, format) reads GET /api/env-schema
+// live instead of hardcoding a copy of bot-ops.sh's ALLOWED_SPEC regexes — compilePattern/
+// validateEnvChanges are pinned against the page's OWN source (lifted from index.html between
+// their ENV_SCHEMA markers), same discipline as planEnvSave/saveEnv above.
+describe("env schema drives client-side validation (#207)", () => {
+  const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const schemaSrc = indexSrc.match(/\/\/ ENV_SCHEMA:begin\n([\s\S]*?)\n\s*\/\/ ENV_SCHEMA:end/)?.[1];
+  const lifted = new Function(`"use strict";\n${schemaSrc ?? ""}\nreturn { compilePattern, validateEnvChanges };`)() as {
+    compilePattern: (ere: unknown) => RegExp | null;
+    validateEnvChanges: (
+      schema: Record<string, { pattern?: string; required?: boolean }>,
+      changes: { key: string; before: string; now: string }[],
+    ) => { key: string; message: string } | null;
+  };
+  const { compilePattern, validateEnvChanges } = lifted;
+  // Every 'KEY|regex' row in ALLOWED_SPEC — scraped the same way the deleted BOT_BRANCH mirror test
+  // did, generalized to all of them. Split on the FIRST "|" only, matching build_allowed_from_spec's
+  // own `${spec%%|*}` / `${spec#*|}` split (AUTO_UPDATE's and PLUGIN_INDEX_URL's regex values both
+  // contain a later "|" as alternation).
+  const allowedSpec = [...botOpsSrc.matchAll(/^\s*'([A-Z_][A-Z0-9_]*)\|(.*)'$/gm)].map((m) => ({ key: m[1]!, regex: m[2]! }));
+
+  test("both marked functions are present in the served page", () => {
+    expect(schemaSrc).toContain("function compilePattern(");
+    expect(schemaSrc).toContain("function validateEnvChanges(");
+  });
+
+  test("compilePattern translates every ALLOWED_SPEC pattern into a RegExp", () => {
+    expect(allowedSpec.length).toBeGreaterThan(0);
+    for (const { key, regex } of allowedSpec) expect(compilePattern(regex), key).not.toBeNull();
+  });
+
+  test('the compiled PLUGIN_INDEX_URL pattern agrees with bash on a space (proves the "[:space:]" translation, not just that it compiles)', async () => {
+    const ere = allowedSpec.find((e) => e.key === "PLUGIN_INDEX_URL")?.regex;
+    expect(ere).toBeTruthy();
+    const re = compilePattern(ere);
+    const cases: [string, boolean][] = [
+      ["https://a b", false],
+      ["https://a/b", true],
+      ["/abs/path", true],
+    ];
+    for (const [value, expected] of cases) expect(re!.test(value), value).toBe(expected);
+    // Parity with the real bash ERE these values will actually be checked against by env-set
+    // (ops/bot-ops.sh) — only runs where a real POSIX bash is available (CI's Linux runner).
+    if (process.platform !== "win32" && BASH) {
+      for (const [value, expected] of cases) {
+        const proc = Bun.spawn([BASH, "-c", '[[ "$1" =~ $2 ]] && echo true || echo false', "_", value, ere!], {
+          stdout: "pipe",
+        });
+        const out = (await new Response(proc.stdout).text()).trim();
+        await proc.exited;
+        expect(out, value).toBe(String(expected));
+      }
+    }
+  });
+
+  test("an uncompilable pattern means no client check, not a thrown error", () => {
+    expect(compilePattern("(")).toBeNull();
+    expect(validateEnvChanges({ K: { pattern: "(", required: false } }, [{ key: "K", before: "", now: "x" }])).toBeNull();
+  });
+
+  // A POSIX class outside the six POSIX_CLASSES maps (blank/punct/cntrl/print/graph/xdigit, or any
+  // future one no current ALLOWED_SPEC/plugin manifest happens to use yet) must fail SAFE, not
+  // silently compile a wrong-but-valid JS RegExp. `[^[:blank:]]` is syntactically fine JS: the class
+  // closes at its first literal "]", so the compiled pattern ends up requiring the value to
+  // literally END in "]" — rejecting almost everything (including values bash's real ERE would
+  // accept), the opposite of "no check". Caught in review (correctness lens) before this shipped.
+  test("an unmapped POSIX class means no client check, not a silently-wrong regex", () => {
+    const re = compilePattern("^[^[:blank:]]+$");
+    expect(re).toBeNull();
+    expect(validateEnvChanges({ K: { pattern: "^[^[:blank:]]+$", required: false } }, [{ key: "K", before: "", now: "no-blank-here" }])).toBeNull();
+  });
+
+  test.each([
+    ["blank + required -> names the key", { K: { required: true } }, [{ key: "K", before: "1", now: "" }], { key: "K", message: "K is required and cannot be blank." }],
+    ["blank + optional -> null", { K: { required: false } }, [{ key: "K", before: "1", now: "" }], null],
+    [
+      "bad format -> message carries the value and the pattern",
+      { K: { pattern: "^[0-9]+$", required: false } },
+      [{ key: "K", before: "1", now: "abc" }],
+      { key: "K", message: 'K: "abc" doesn\'t match the expected format (^[0-9]+$).' },
+    ],
+    ["good format -> null", { K: { pattern: "^[0-9]+$", required: false } }, [{ key: "K", before: "1", now: "42" }], null],
+    ["a key absent from the schema -> null (unchecked, not refused)", {}, [{ key: "K", before: "1", now: "anything" }], null],
+    [
+      "the FIRST violation in change order wins",
+      { A: { required: true }, B: { required: true } },
+      [
+        { key: "A", before: "1", now: "" },
+        { key: "B", before: "1", now: "" },
+      ],
+      { key: "A", message: "A is required and cannot be blank." },
+    ],
+  ])("validateEnvChanges: %s", (_name, schema, changes, expected) => {
+    expect(validateEnvChanges(schema as Record<string, { pattern?: string; required?: boolean }>, changes)).toEqual(expected);
   });
 });
 
