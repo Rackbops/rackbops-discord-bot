@@ -128,9 +128,10 @@ written to a temp file first and moved into place atomically, so a dropped conne
 interrupted write) never leaves a truncated file a later run's existence-check could mistake for
 something real. Each temp file is registered with a script-level `EXIT` trap as it is created
 (issue #60), so an abort *between* the `mktemp` and the `mv` sweeps its `tmp.XXXXXX` instead of
-stranding it beside the real files. The reachable case is a typo'd `BRANCH`: it is only checked
-against the remote *after* the three downloads, so the first one 404s and `set -e` aborts inside
-`fetch()` before the branch check ever runs. Immediately after the stack `.env` is written,
+stranding it beside the real files. The reachable case is a typo'd `BRANCH`: its syntax is validated
+up front (#232), but its *existence* is only checked against the remote *after* the three downloads,
+so a syntactically valid but nonexistent branch 404s and `set -e` aborts inside `fetch()`.
+Immediately after the stack `.env` is written,
 `validate_stack_env` re-reads it and fails loudly, before anything below it prints or starts
 (issue #169): `install: <FIELD> must be an absolute path, got "…"` for a non-absolute
 `BOT_ENV_FILE`, `BOT_OPS_CONFIG_DIR`, or `BOT_OPS_COMPOSE_FILE` (all three), or

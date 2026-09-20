@@ -44,13 +44,14 @@
 set -euo pipefail
 
 # Every temp file this script creates is registered here and swept however we leave — including
-# the `set -e` abort that is the realistic case. `BRANCH` isn't validated until after all three
-# fetches, so a typo'd branch 404s inside `fetch()` and aborts mid-run, stranding a `tmp.XXXXXX`
-# in the install tree. Nothing sensitive leaks (curl -f writes no body on a 404, all three sources
-# are public, and the stack .env holds no secrets by design) — but the litter lands one directory
-# from the real ones. A script-level EXIT trap rather than a per-function one: a RETURN trap does
-# not fire when `set -e` unwinds, and a second EXIT trap set inside a function would silently
-# replace the first.
+# the `set -e` abort that is the realistic case. `BRANCH`'s *syntax* is validated up front (#232),
+# but its *existence* on the remote isn't confirmed until the `git ls-remote` check after all three
+# fetches, so a syntactically valid but typo'd branch still 404s inside `fetch()` and aborts mid-run,
+# stranding a `tmp.XXXXXX` in the install tree. Nothing sensitive leaks (curl -f writes no body on a
+# 404, all three sources are public, and the stack .env holds no secrets by design) — but the litter
+# lands one directory from the real ones. A script-level EXIT trap rather than a per-function one: a
+# RETURN trap does not fire when `set -e` unwinds, and a second EXIT trap set inside a function would
+# silently replace the first.
 TMP_FILES=()
 cleanup_tmp_files() {
   # The -gt 0 test is deliberately unpinned by any test, and cannot be pinned on a modern box: on
@@ -155,6 +156,16 @@ main() {
   BRANCH="${2:-main}"
   [[ "$INSTANCE" =~ ^[a-z0-9-]+$ ]] || die "usage: install.sh <instance> [branch] (instance: lowercase letters/digits/hyphens only)"
   [ "$INSTANCE" != "bin" ] || die "'bin' is reserved (it's the shared /opt/rackbops-discord-bot/bin/ scripts dir) — pick a different instance name"
+
+  # #232: BRANCH is interpolated into fetch()'s raw.githubusercontent.com URL, and curl collapses
+  # `../` per RFC 3986 before sending — so a `../`-bearing branch climbs out of this repo's path
+  # prefix and fetches a foreign bot-ops.sh/compose file (host-root) before the ls-remote check
+  # below ever runs. Validate up front so a crafted branch writes nothing. Same char class the rest
+  # of the repo gates branch names with (bot-ops.sh's BOT_BRANCH ALLOWED regex), plus an explicit
+  # `..` reject — the class permits `.` and `/`, so it alone does NOT stop `../`; git forbids `..`
+  # in a ref, so nothing legitimate is lost.
+  [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]{1,100}$ ]] || die "bad branch name '$BRANCH' (letters, digits, . _ / - only, max 100)"
+  [[ "$BRANCH" != *..* ]] || die "bad branch name '$BRANCH' (must not contain '..')"
 
   need git
   need curl
