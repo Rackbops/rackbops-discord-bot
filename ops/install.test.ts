@@ -132,9 +132,10 @@ describe.skipIf(!runnable)(
 // Same extraction discipline as above: the trap, the cleanup function and fetch() are all pulled
 // from the live install.sh, so deleting any of them there fails these tests rather than silently
 // leaving them unguarded. The abort is driven by a fake `curl` that exits 22 — curl -f's own code
-// for an HTTP 4xx, which is exactly what a typo'd BRANCH produces: BRANCH is only checked against
-// the remote by the `no branch '$BRANCH' found` guard, which sits *after* all three `fetch` calls,
-// so the very first one 404s and set -e aborts there — the validation never runs. (Cited by the
+// for an HTTP 4xx, which is exactly what a syntactically valid but typo'd BRANCH produces: its
+// *existence* is only checked by the `no branch '$BRANCH' found` guard, which sits *after* all three
+// `fetch` calls, so the first one 404s and set -e aborts there. The #232 syntax guard runs earlier
+// but passes a value like "typo", so it doesn't change what this fake models. (Cited by the
 // landmark rather than a line number on purpose: an earlier revision of this comment named
 // :156/:169/:171 and went stale five lines out the moment install.sh grew a comment.) Hermetic: no
 // network, no /opt, no sudo.
@@ -527,5 +528,154 @@ describe.skipIf(!runnable)("install.sh's printed step 2 no longer carries the fo
     // multi-line here — just that step 3's prefix vars are still present, unlike step 2's.
     const step3 = out.slice(out.indexOf("3. Day-2 ops"), out.indexOf("4. Optional"));
     expect(step3).toContain("BOT_OPS_CONTAINER=rackbops-discord-bot-debug");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The branch-argument guard (issue #232)
+// ---------------------------------------------------------------------------
+// install.sh interpolates BRANCH straight into fetch()'s raw.githubusercontent.com URL, and curl
+// collapses `../` path segments per RFC 3986 before sending — so an unvalidated `../`-bearing branch
+// climbs out of this repo's path prefix and fetches a FOREIGN bot-ops.sh (host-root, mode 755) and
+// compose file before the `git ls-remote` existence check ever runs. The fix validates BRANCH up
+// front, before the first fetch. Two guards, two tests: the predicate itself, and its POSITION
+// (that a bad branch reaches no fetch at all — the issue's literal ask, "bot-ops.sh untouched").
+
+// ---- The predicate, extracted as the two live lines (removing either fails the extract loudly) ---
+const BRANCH_GUARD_LINES = extractLine(
+  /^ {2}\[\[ "\$BRANCH" =~ [^\n]*\]\] \|\| die [^\n]*\n {2}\[\[ "\$BRANCH" != \*\.\.\* \]\] \|\| die [^\n]*$/m,
+  "the two BRANCH validation lines",
+);
+
+async function runBranchPredicate(branch: string): Promise<Run> {
+  // BRANCH is passed as $1 (never interpolated into the script text), so a hostile value like
+  // "a;rm" is data under test, not something the harness itself could execute.
+  const script = ["set -euo pipefail", 'die() { echo "install: $*" >&2; exit 1; }', 'BRANCH="$1"', BRANCH_GUARD_LINES, "echo OK"].join(
+    "\n",
+  );
+  const proc = Bun.spawn([BASH!, "-c", script, "_", branch], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+describe.skipIf(!runnable)("install.sh's BRANCH guard accepts real branch names and rejects malformed ones (issue #232)", () => {
+  // Legit git refs the fix must NOT break — dots, slashes, hyphens, underscores are all valid.
+  for (const good of ["main", "claude/fix-232", "release/1.2.3", "a.b.c/d-e_f"]) {
+    test(`accepts ${JSON.stringify(good)}`, async () => {
+      const r = await runBranchPredicate(good);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toContain("OK");
+    });
+  }
+  // The traversal payload plus its two failure classes: a bare `..` (caught only by the *..* line,
+  // not the char class, which permits both `.` and `/`) and a non-`..` bad char (caught only by the
+  // char class). Deleting either guard line lets its case through — that is the mutation coverage.
+  for (const bad of ["../../torvalds/linux/master", "foo..bar", "foo bar", "a;rm -rf x"]) {
+    test(`rejects ${JSON.stringify(bad)}`, async () => {
+      const r = await runBranchPredicate(bad);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain("bad branch name");
+      expect(r.stdout).not.toContain("OK");
+    });
+  }
+  // The `{1,100}` upper bound (matched byte-for-byte to bot-ops.sh's BOT_BRANCH regex) pinned on
+  // both edges, so narrowing the bound reddens the accept case and removing it (e.g. `+`) reddens
+  // the reject case — otherwise the length is asserted but unguarded (found in the #232 review).
+  test("accepts a 100-char all-valid branch (the bound's upper edge)", async () => {
+    const r = await runBranchPredicate("a".repeat(100));
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("OK");
+  });
+  test("rejects a 101-char branch (one past the bound), even though every char is allowed", async () => {
+    const r = await runBranchPredicate("a".repeat(101));
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("bad branch name");
+    expect(r.stdout).not.toContain("OK");
+  });
+});
+
+// ---- The POSITION: a bad branch must die before ANY fetch (nothing lands on disk) ----------------
+// Extracted as a CONTIGUOUS SLICE from arg-parsing through the bot-ops.sh fetch — the same
+// discipline as STACK_ENV_WRITE_SEQUENCE above. A regression that MOVED the guard below the fetches
+// (leaving the predicate itself intact, so the tests above would still pass) shrinks nothing here
+// but makes a `..` branch reach the recording fetch — caught. Every side-effecting call the slice
+// makes is stubbed; the recording `fetch` reports the `src` of each download it was asked to do.
+const BRANCH_GUARD_TO_FETCH = extractLine(
+  /^ {2}INSTANCE="\$\{1:-\}"[\s\S]*?^ {2}fetch "ops\/bot-ops\.sh" 755 "\$BIN_DIR\/bot-ops\.sh"$/m,
+  "the arg-parse-through-bot-ops-fetch slice",
+);
+
+interface FetchProbe {
+  exitCode: number;
+  /** The `src` argument of every fetch() the slice actually reached, in order. */
+  fetches: string[];
+  reachedEnd: boolean;
+  stderr: string;
+}
+
+async function runBranchGate(branch: string): Promise<FetchProbe> {
+  const script = [
+    "set -euo pipefail",
+    'die() { echo "install: $*" >&2; exit 1; }',
+    "need() { :; }",
+    "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
+    "bootstrap_dir() { :; }",
+    "mkdir() { :; }", // stubbed: the real one would try to mkdir /opt/... without privileges
+    "chown() { :; }",
+    "sed() { :; }", // stubbed: the real ADMIN_TOKEN rewrite targets a file that doesn't exist here
+    "random_token() { echo faketoken; }",
+    'fetch() { echo "FETCH:$1"; }', // the probe: records each download's src instead of doing it
+    BRANCH_GUARD_TO_FETCH,
+    'echo "REACHED_END"',
+  ].join("\n");
+  // $1 = INSTANCE (a valid name so its own guard passes), $2 = the BRANCH under test.
+  const proc = Bun.spawn([BASH!, "-c", script, "_", "probe", branch], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return {
+    exitCode,
+    fetches: stdout.split("\n").filter((l) => l.startsWith("FETCH:")).map((l) => l.slice("FETCH:".length)),
+    reachedEnd: stdout.includes("REACHED_END"),
+    stderr,
+  };
+}
+
+describe.skipIf(!runnable)("install.sh's BRANCH guard runs before the fetches, so a crafted branch writes nothing (issue #232)", () => {
+  test("the traversal payload dies before any fetch — bot-ops.sh is never fetched", async () => {
+    const r = await runBranchGate("../../torvalds/linux/master");
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("bad branch name");
+    expect(r.fetches).toEqual([]); // nothing downloaded — the foreign bot-ops.sh never lands
+    expect(r.reachedEnd).toBe(false);
+  });
+
+  test("a non-`..` malformed branch (a space) also dies before any fetch", async () => {
+    const r = await runBranchGate("foo bar");
+    expect(r.exitCode).not.toBe(0);
+    expect(r.fetches).toEqual([]);
+  });
+
+  // Non-vacuous control: a valid branch runs RIGHT THROUGH the guard to the bot-ops.sh fetch. Proven
+  // against the pre-fix source too — there, the traversal payload reached this same fetch identically
+  // to `main`, which is exactly the vulnerability this test now pins shut.
+  test("a valid branch passes the guard and reaches the bot-ops.sh fetch", async () => {
+    const r = await runBranchGate("main");
+    expect(r.exitCode).toBe(0);
+    expect(r.fetches).toContain(".env.example");
+    expect(r.fetches).toContain("ops/bot-ops.sh");
+    expect(r.reachedEnd).toBe(true);
+  });
+
+  test("a valid non-trivial branch (slashes, digits, hyphens) is accepted too", async () => {
+    const r = await runBranchGate("claude/fix-232");
+    expect(r.exitCode).toBe(0);
+    expect(r.fetches).toContain("ops/bot-ops.sh");
   });
 });
