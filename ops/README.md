@@ -397,9 +397,11 @@ state and current `PLUGINS`; see below), and (**#105**) `POST /api/plugins/reque
 button → a request file the bot consumes), and (**#123/#165**) `GET /plugin-admin/<name>.js?v=` +
 `GET /api/plugin-proxy/<name>?path=&v=` (a plugin's own admin-tab bundle and its data assets,
 proxied same-origin from that plugin's own published package on the allowlisted CDN host — see
-"Plugin admin tabs" below). The
-`/api/whoami`, `/api/admins`, `/api/branches`, `/plugin-admin/<name>.js`, and
-`/api/plugin-proxy/<name>` routes never shell out to `bot-ops.sh`;
+"Plugin admin tabs" below), and (**#238**) `GET /rb-theme.css` + `GET /admin.css` (the page's two
+stylesheets, read once at startup from `ops/admin/public/` and served by exact path, public at this
+layer like the page itself). The
+`/api/whoami`, `/api/admins`, `/api/branches`, `/plugin-admin/<name>.js`,
+`/api/plugin-proxy/<name>`, `/rb-theme.css` and `/admin.css` routes never shell out to `bot-ops.sh`;
 `/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and
 `/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does), while
 saving a plugin's *enabled* state still goes through the ordinary `POST /api/env` (only `PLUGINS`).

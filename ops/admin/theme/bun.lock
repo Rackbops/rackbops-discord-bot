@@ -1,0 +1,15 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "rackbops-bot-admin-theme",
+      "devDependencies": {
+        "@rackbops/styles": "0.2.39",
+      },
+    },
+  },
+  "packages": {
+    "@rackbops/styles": ["@rackbops/styles@0.2.39", "", {}, "sha512-JgIMsi+APXgq3I9oQSyuSeCAzRxtoq4VI4TF1FpYNiHefVRZhUZp8xBEJzQvd/70jNYB68In3rw+PjvIqtMeMg=="],
+  }
+}
