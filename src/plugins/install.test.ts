@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installPlugins, tarExtract, type InstallDeps } from "./install";
-import type { PluginIndexEntry } from "./contract";
+import { installPlugins, reconcileManifest, tarExtract, type InstallDeps } from "./install";
+import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
 const noopLog: InstallDeps["log"] = { info() {}, warn() {}, error() {} };
@@ -48,6 +48,32 @@ const fakeExtract: InstallDeps["extract"] = async (_tarPath, destDir) => {
 function withDataDir<T>(fn: (dataDir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "install-test-"));
   return fn(dir).finally(() => rmSync(dir, { recursive: true, force: true }));
+}
+
+function withTempDir<T>(fn: (dir: string) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "reconcile-test-"));
+  try {
+    return fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Extract stub that also writes a `package.json` with the given `botPlugin` block (or none, when
+ * `botPlugin` is undefined), mirroring what `tar` pulls out of a real bundle alongside `plugin.js`. */
+function extractWithManifest(botPlugin: unknown): InstallDeps["extract"] {
+  return async (_tarPath, destDir) => {
+    mkdirSync(join(destDir, "dist"), { recursive: true });
+    writeFileSync(join(destDir, "dist", "plugin.js"), "extracted");
+    if (botPlugin !== undefined) {
+      writeFileSync(join(destDir, "package.json"), JSON.stringify({ name: "@rackbops/plugin-demo", botPlugin }));
+    }
+  };
+}
+
+function capturingLog(): { log: InstallDeps["log"]; warns: string[] } {
+  const warns: string[] = [];
+  return { log: { info() {}, warn: (m) => warns.push(m), error() {} }, warns };
 }
 
 describe("installPlugins", () => {
@@ -251,6 +277,242 @@ describe("installPlugins", () => {
     });
   });
 
+  test("a broken target whose bundle fails host-API reconciliation falls back to the recorded previous version (#104, #223)", async () => {
+    await withDataDir(async (dataDir) => {
+      seedCached(dataDir, "1.0.0"); // the last-good bundle is on disk, no package.json (never refused)
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const mismatched = HOST_API_VERSION + 1;
+      const result = await installPlugins(
+        [{ name: "demo", entry: entry({ version: "1.1.0" }) }],
+        dataDir,
+        { demo: { installedVersion: "1.0.0", targetVersion: "1.1.0" } },
+        {
+          fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+          extract: extractWithManifest({ hostApiVersion: mismatched }),
+          now: () => 1,
+          log: noopLog,
+        },
+      );
+      expect(result.installed.map((i) => i.version)).toEqual(["1.0.0"]);
+      expect(result.fallbacks.demo).toMatchObject({ attempted: "1.1.0" });
+      expect(result.fallbacks.demo?.reason).toContain(`v${mismatched}`);
+      expect(result.fallbacks.demo?.reason).toContain(`v${HOST_API_VERSION}`);
+      expect(result.skips).toEqual({});
+    });
+  });
+
+  // #224: extract-then-rename, never straight into the final versionDir.
+  test("a part-way extract failure leaves no bundle behind, and the next attempt re-fetches", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const partialExtract: InstallDeps["extract"] = async (_tarPath, destDir) => {
+        mkdirSync(join(destDir, "dist"), { recursive: true });
+        writeFileSync(join(destDir, "dist", "plugin.js"), "partial");
+        throw new Error("tar exited 137: killed");
+      };
+      const calls: string[] = [];
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: partialExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.skips.demo).toContain("tar exited 137");
+      expect(existsSync(join(dataDir, "plugins", "demo", "1.0.0", "dist", "plugin.js"))).toBe(false);
+      const pluginDir = join(dataDir, "plugins", "demo");
+      const leftovers = existsSync(pluginDir) ? readdirSync(pluginDir) : [];
+      expect(leftovers.some((n) => n.startsWith(".staging-"))).toBe(false);
+
+      // a second attempt re-fetches — nothing partial was ever committed to the cache
+      const calls2: string[] = [];
+      await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls: calls2 }),
+        extract: fakeExtract,
+        now: () => 2,
+        log: noopLog,
+      });
+      expect(calls2.length).toBeGreaterThan(0);
+    });
+  });
+
+  test("a staging directory left behind is never treated as a cached version", async () => {
+    await withDataDir(async (dataDir) => {
+      const stagingDir = join(dataDir, "plugins", "demo", ".staging-9.9.9-1");
+      mkdirSync(join(stagingDir, "dist"), { recursive: true });
+      writeFileSync(join(stagingDir, "dist", "plugin.js"), "stale");
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: fakeExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.installed[0]?.version).toBe("1.0.0");
+      expect(calls.length).toBeGreaterThan(0); // fetched — the staging leftover was not reused
+    });
+  });
+
+  test("the bundle is extracted to a staging dir and moved into place, not written there directly", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const destDirs: string[] = [];
+      const capturingExtract: InstallDeps["extract"] = async (tarPath, destDir) => {
+        destDirs.push(destDir);
+        await fakeExtract(tarPath, destDir);
+      };
+      await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: capturingExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      const versionDir = join(dataDir, "plugins", "demo", "1.0.0");
+      expect(destDirs).toHaveLength(1);
+      expect(destDirs[0]).not.toBe(versionDir);
+      expect(existsSync(join(versionDir, "dist", "plugin.js"))).toBe(true);
+    });
+  });
+
+  test("a previous partial version directory is replaced, not merged", async () => {
+    await withDataDir(async (dataDir) => {
+      const versionDir = join(dataDir, "plugins", "demo", "1.0.0");
+      mkdirSync(versionDir, { recursive: true });
+      writeFileSync(join(versionDir, "leftover.txt"), "stale");
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: fakeExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.installed).toHaveLength(1);
+      expect(existsSync(join(versionDir, "leftover.txt"))).toBe(false);
+      expect(existsSync(join(versionDir, "dist", "plugin.js"))).toBe(true);
+    });
+  });
+
+  // #223: the bundle's own package.json botPlugin block, reconciled against the host.
+  test("a bundle whose package.json declares a different hostApiVersion is refused and never lands", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const mismatched = HOST_API_VERSION + 1;
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: extractWithManifest({ hostApiVersion: mismatched }),
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.skips.demo).toContain(`v${mismatched}`);
+      expect(result.skips.demo).toContain(`v${HOST_API_VERSION}`);
+      expect(existsSync(join(dataDir, "plugins", "demo", "1.0.0"))).toBe(false);
+    });
+  });
+
+  test("a cached bundle whose package.json declares a different hostApiVersion is refused with no fetch", async () => {
+    await withDataDir(async (dataDir) => {
+      const versionDir = join(dataDir, "plugins", "demo", "1.0.0");
+      mkdirSync(join(versionDir, "dist"), { recursive: true });
+      writeFileSync(join(versionDir, "dist", "plugin.js"), "cached");
+      const mismatched = HOST_API_VERSION + 1;
+      writeFileSync(join(versionDir, "package.json"), JSON.stringify({ botPlugin: { hostApiVersion: mismatched } }));
+      const calls: string[] = [];
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, { demo: { installedVersion: "1.0.0" } }, {
+        fetch: makeFetch({ bytes: new Uint8Array(), integrity: "x", calls }),
+        extract: fakeExtract,
+        now: () => 1,
+        log: noopLog,
+      });
+      expect(result.skips.demo).toContain(`v${mismatched}`);
+      expect(result.skips.demo).toContain(`v${HOST_API_VERSION}`);
+      expect(calls).toEqual([]);
+    });
+  });
+
+  test("divergent commands or env keys warn but still install", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const { log, warns } = capturingLog();
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: extractWithManifest({ hostApiVersion: HOST_API_VERSION, commands: ["other"], env: [{ key: "X" }] }),
+        now: () => 1,
+        log,
+      });
+      expect(result.installed).toHaveLength(1);
+      expect(result.skips).toEqual({});
+      expect(warns.some((w) => w.includes("commands"))).toBe(true);
+      expect(warns.some((w) => w.includes("env keys"))).toBe(true);
+    });
+  });
+
+  test("a bundle with no package.json installs with a warning and is never refused", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const { log, warns } = capturingLog();
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: fakeExtract,
+        now: () => 1,
+        log,
+      });
+      expect(result.installed).toHaveLength(1);
+      expect(result.skips).toEqual({});
+      expect(warns.some((w) => w.includes("no readable package.json"))).toBe(true);
+    });
+  });
+
+  test("an unparseable package.json installs with a warning and is never refused", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("x");
+      const calls: string[] = [];
+      const { log, warns } = capturingLog();
+      const badJsonExtract: InstallDeps["extract"] = async (_tarPath, destDir) => {
+        mkdirSync(join(destDir, "dist"), { recursive: true });
+        writeFileSync(join(destDir, "dist", "plugin.js"), "extracted");
+        writeFileSync(join(destDir, "package.json"), "{");
+      };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, {
+        fetch: makeFetch({ bytes, integrity: sri(bytes), calls }),
+        extract: badJsonExtract,
+        now: () => 1,
+        log,
+      });
+      expect(result.installed).toHaveLength(1);
+      expect(result.skips).toEqual({});
+      expect(warns.some((w) => w.includes("not valid JSON"))).toBe(true);
+    });
+  });
+
+  // AMENDMENT to the #223 plan: reconciliation compares against the HOST's HOST_API_VERSION, never
+  // entry.hostApiVersion — the index's hostApiVersion describes entry.version alone, so comparing
+  // against it would wrongly refuse a #222 keepOlder bundle whose manifest still says the OLDER host
+  // API it was actually built against.
+  test("a kept older bundle is not refused when the index entry needs a newer host (#222)", async () => {
+    await withDataDir(async (dataDir) => {
+      const versionDir = join(dataDir, "plugins", "demo", "1.0.0");
+      mkdirSync(join(versionDir, "dist"), { recursive: true });
+      writeFileSync(join(versionDir, "dist", "plugin.js"), "cached");
+      writeFileSync(join(versionDir, "package.json"), JSON.stringify({ botPlugin: { hostApiVersion: HOST_API_VERSION } }));
+      const calls: string[] = [];
+      const result = await installPlugins(
+        [{ name: "demo", entry: entry({ version: "2.0.0", hostApiVersion: HOST_API_VERSION + 1, intents: [] }) }],
+        dataDir,
+        { demo: { installedVersion: "1.0.0" } },
+        { fetch: makeFetch({ bytes: new Uint8Array(), integrity: "x", calls }), extract: fakeExtract, now: () => 1, log: noopLog },
+      );
+      expect(result.installed.map((i) => i.version)).toEqual(["1.0.0"]);
+      expect(result.skips).toEqual({});
+      expect(calls).toEqual([]); // cached, no fetch — and reconciliation still ran (matches the host)
+    });
+  });
+
   // Real tar, Linux/CI only: Windows tar reads a C:\ path as a remote host and fails. In the image
   // (oven/bun:1-slim, Linux) this is the actual production path.
   test.skipIf(process.platform === "win32")("tarExtract flattens package/ and extracts plugin.js (real tar)", async () => {
@@ -267,6 +529,75 @@ describe("installPlugins", () => {
       // --strip-components=1 drops `package/`, leaving dist/plugin.js + package.json
       expect(readFileSync(join(dest, "dist", "plugin.js"), "utf8")).toContain("createPlugin");
       expect(existsSync(join(dest, "package.json"))).toBe(true);
+    });
+  });
+});
+
+// reconcileManifest is exported and total (never throws) — its cache-path call in tryInstallVersion
+// sits outside that function's own try, so a throw here would take installPlugins down for every
+// plugin, not just this one. Direct unit tests for the odd shapes a real or crafted package.json
+// could hold.
+describe("reconcileManifest", () => {
+  test("a package.json that is a directory (unreadable) warns and returns ok", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      mkdirSync(pkgPath); // a directory at this path makes readFileSync throw
+      const { log, warns } = capturingLog();
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, log);
+      expect(result.ok).toBe(true);
+      expect(warns).toHaveLength(1);
+    });
+  });
+
+  test("package.json containing the JSON value null warns and returns ok", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      writeFileSync(pkgPath, "null");
+      const { log, warns } = capturingLog();
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, log);
+      expect(result.ok).toBe(true);
+      expect(warns).toHaveLength(1);
+    });
+  });
+
+  test("a botPlugin block that isn't an object warns and returns ok", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      writeFileSync(pkgPath, JSON.stringify({ botPlugin: "not-an-object" }));
+      const { log, warns } = capturingLog();
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, log);
+      expect(result.ok).toBe(true);
+      expect(warns).toHaveLength(1);
+    });
+  });
+
+  test("commands that aren't an array is tolerated without throwing or refusing", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      writeFileSync(pkgPath, JSON.stringify({ botPlugin: { hostApiVersion: HOST_API_VERSION, commands: "demo" } }));
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, noopLog);
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  test("an env entry without a string key is tolerated without throwing or refusing", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      writeFileSync(
+        pkgPath,
+        JSON.stringify({ botPlugin: { hostApiVersion: HOST_API_VERSION, env: [{ notKey: 1 }, "not-an-object", null] } }),
+      );
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, noopLog);
+      expect(result.ok).toBe(true);
+    });
+  });
+
+  test("a hostApiVersion that is a string is tolerated without throwing or refusing", () => {
+    withTempDir((dir) => {
+      const pkgPath = join(dir, "package.json");
+      writeFileSync(pkgPath, JSON.stringify({ botPlugin: { hostApiVersion: "not-a-number" } }));
+      const result = reconcileManifest(entry(), "1.0.0", pkgPath, noopLog);
+      expect(result.ok).toBe(true);
     });
   });
 });
