@@ -40,8 +40,27 @@ describe("refusalMessage", () => {
 });
 
 describe("gateCommand", () => {
-  const run = (plugin: string | undefined, where: Where, file: RoutingFile = listed) =>
-    gateCommand(plugin, "rsetlist", where, async () => file, logCapture().log);
+  /** What `where` is, as whereOf would work it out; every call to routing and to the lookup is counted. */
+  function gate(plugin: string | undefined, where: Where, file: RoutingFile = listed) {
+    const counts = { routing: 0, lookups: 0 };
+    const { log, lines } = logCapture();
+    const result = gateCommand(
+      plugin,
+      "rsetlist",
+      where,
+      async () => {
+        counts.lookups += 1;
+        return where;
+      },
+      async () => {
+        counts.routing += 1;
+        return file;
+      },
+      log,
+    );
+    return { result, counts, lines };
+  }
+  const run = async (plugin: string | undefined, where: Where, file?: RoutingFile) => (await gate(plugin, where, file).result);
 
   test("a command in a listed channel is allowed", async () => {
     expect(await run("music", here({ channelId: CHAN_1 }))).toBeUndefined();
@@ -71,27 +90,75 @@ describe("gateCommand", () => {
     expect(await run("music", here({ channelId: ELSEWHERE }), freshRouting())).toBeUndefined();
   });
 
-  test("a DM is allowed", async () => {
-    expect(await run("music", { guildId: null, channelId: ELSEWHERE })).toBeUndefined();
+  test("a DM is allowed, and routing is not even read", async () => {
+    const { result, counts } = gate("music", { guildId: null, channelId: ELSEWHERE });
+    expect(await result).toBeUndefined();
+    expect(counts).toEqual({ routing: 0, lookups: 0 });
   });
 
-  test("no plugin (a core command) is allowed", async () => {
-    expect(await run(undefined, here({ channelId: ELSEWHERE }))).toBeUndefined();
+  test("no plugin (a core command) is allowed, and routing is not even read", async () => {
+    const { result, counts } = gate(undefined, here({ channelId: ELSEWHERE }));
+    expect(await result).toBeUndefined();
+    expect(counts).toEqual({ routing: 0, lookups: 0 });
+  });
+
+  test("nothing is looked up unless the channel is not listed: no routing, no entry, all, and a listed channel never fetch", async () => {
+    const cases: [string, Where, RoutingFile][] = [
+      ["a listed channel", here({ channelId: CHAN_1 }), listed],
+      ["no routing at all", here({ channelId: ELSEWHERE }), freshRouting()],
+      ["no entry for the server", here({ guildId: HOME, channelId: ELSEWHERE }), listed],
+      ["all", here({ channelId: ELSEWHERE }), routing({ music: { servers: { [OTHER]: { commands: "all" } } } })],
+    ];
+    for (const [name, where, file] of cases) {
+      const { result, counts } = gate("music", where, file);
+      expect(await result, name).toBeUndefined();
+      expect(counts, name).toEqual({ routing: 1, lookups: 0 });
+    }
+  });
+
+  test("the channel is looked up, once, when it is not listed and its parent could decide", async () => {
+    const { result, counts } = gate("music", here({ channelId: THREAD, parentChannelId: CHAN_2 }));
+    expect(await result).toBeUndefined();
+    expect(counts).toEqual({ routing: 1, lookups: 1 });
+    const refused = gate("music", here({ channelId: ELSEWHERE }));
+    expect(await refused.result).not.toBeUndefined();
+    expect(refused.counts).toEqual({ routing: 1, lookups: 1 });
   });
 
   test("a routing read that throws is logged and allowed", async () => {
     const { log, lines } = logCapture();
     const boom = new Error("EIO");
-    const result = await gateCommand("music", "rsetlist", here({ channelId: ELSEWHERE }), async () => Promise.reject(boom), log);
+    const result = await gateCommand("music", "rsetlist", here({ channelId: ELSEWHERE }), async () => here({ channelId: ELSEWHERE }), async () => Promise.reject(boom), log);
     expect(result).toBeUndefined();
     expect(lines).toEqual([["[gate] could not decide whether /rsetlist may run here; letting it run", boom]]);
   });
 
-  test("a channel whose parent could not be determined is allowed", async () => {
-    // Not on the list, and not known to be anything else: the gate does not refuse what it cannot judge.
-    expect(await run("music", here({ channelId: THREAD, parentUnknown: true }))).toBeUndefined();
-    // ... but a channel that IS on the list is allowed either way, and one that is known is judged.
+  test("a lookup that throws is logged and allowed", async () => {
+    const { log, lines } = logCapture();
+    const boom = new Error("Unknown Channel");
+    const result = await gateCommand("music", "rsetlist", here({ channelId: ELSEWHERE }), async () => Promise.reject(boom), async () => listed, log);
+    expect(result).toBeUndefined();
+    expect(lines).toEqual([["[gate] could not decide whether /rsetlist may run here; letting it run", boom]]);
+  });
+
+  test("a channel whose parent could not be determined is allowed, and says so", async () => {
+    // Not on the list, and not known to be anything else: the gate does not refuse what it cannot judge,
+    // and leaves a line so that a command that ran where it should not have can be explained.
+    const unknown = gate("music", here({ channelId: THREAD, parentUnknown: true }));
+    expect(await unknown.result).toBeUndefined();
+    expect(unknown.lines).toEqual([["[gate] could not tell where /rsetlist was typed, so it is not refused"]]);
+    // A channel that IS listed needs no lookup, so it says nothing; and one that is known is judged.
+    const listedOne = gate("music", here({ channelId: CHAN_1, parentUnknown: true }));
+    expect(await listedOne.result).toBeUndefined();
+    expect(listedOne.lines).toEqual([]);
     expect(await run("music", here({ channelId: ELSEWHERE }))).not.toBeUndefined();
+  });
+
+  test("an unknown parent that would have been allowed anyway says nothing", async () => {
+    // The parent turns out to be listed even though `parentUnknown` is also set: allowed, no line.
+    const both = gate("music", here({ channelId: THREAD, parentChannelId: CHAN_1, parentUnknown: true }));
+    expect(await both.result).toBeUndefined();
+    expect(both.lines).toEqual([]);
   });
 });
 

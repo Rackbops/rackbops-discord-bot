@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { freshRouting, freshSecrets, type RoutingFile, type RoutingSecretsFile, type WebhookMeta } from "./model";
-import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps, type WebhookPostResult } from "./post";
+import { liveExecuteWebhook, markWebhookBroken, postForPlugin, withWebhookBroken, type PostDeps, type WebhookPostResult } from "./post";
 import { mutateRouting, readRouting, routingPath } from "./store";
 
 const G1 = "111111111111111111";
@@ -42,10 +42,11 @@ function harness(
     secrets?: RoutingSecretsFile | (() => never);
     webhook?: (url: string, message: string) => Promise<WebhookPostResult>;
     bot?: (channelId: string, message: string) => Promise<void>;
-    markBroken?: (channelId: string, reason: string) => Promise<void>;
+    markBroken?: (channelId: string, reason: string, seen: WebhookMeta) => Promise<void>;
   } = {},
 ) {
   const events: string[] = [];
+  const seenByMark: WebhookMeta[] = [];
   const logs: Log[] = [];
   let secretReads = 0;
   const deps: PostDeps = {
@@ -67,9 +68,10 @@ function harness(
       events.push(`hook:${url}:${message}`);
       return opts.webhook ? opts.webhook(url, message) : { ok: true };
     },
-    markBroken: async (channelId, reason) => {
+    markBroken: async (channelId, reason, seen) => {
       events.push(`broken:${channelId}:${reason}`);
-      await opts.markBroken?.(channelId, reason);
+      seenByMark.push(seen);
+      await opts.markBroken?.(channelId, reason, seen);
     },
     log: {
       log: (...a: unknown[]) => void logs.push(["log", ...a]),
@@ -77,7 +79,7 @@ function harness(
       error: (...a: unknown[]) => void logs.push(["error", ...a]),
     },
   };
-  return { deps, events, logs, get secretReads() { return secretReads; } };
+  return { deps, events, logs, seenByMark, get secretReads() { return secretReads; } };
 }
 
 describe("postForPlugin", () => {
@@ -193,6 +195,8 @@ describe("postForPlugin", () => {
     // The post still arrives, through the bot, after the flag is written.
     expect(h.events).toEqual([`hook:${URL_A}:hello`, `broken:${CHAN_A}:${reason}`, `bot:${CHAN_A}:hello`]);
     expect(h.logs).toEqual([["warn", `[announce] music: the webhook for ${CHAN_A} failed: ${reason}`]]);
+    // The flag is asked for on the webhook that was posted through: the metadata as it was read.
+    expect(h.seenByMark).toEqual([meta()]);
   });
 
   test("a 401 does the same", async () => {
@@ -320,8 +324,16 @@ describe("postForPlugin", () => {
       },
     });
     await expect(postForPlugin("music", "hello", h.deps)).rejects.toBe(errA);
-    // Both were tried.
+    // Both were tried, and the one that is not thrown is not lost: it is logged.
     expect(h.events).toEqual([`bot:${CHAN_A}:hello`, `bot:${CHAN_B}:hello`]);
+    expect(h.logs).toEqual([["error", `[announce] music: could not post to ${CHAN_B}`, errB]]);
+  });
+
+  test("a single target failing logs nothing more than today: the plugin gets the error", async () => {
+    const boom = new Error("Missing Access");
+    const h = harness({ routing: routingFor(), bot: async () => Promise.reject(boom) });
+    await expect(postForPlugin("music", "hello", h.deps)).rejects.toBe(boom);
+    expect(h.logs).toEqual([]);
   });
 
   test("the webhook success prints the same [announce] line the bot path does", async () => {
@@ -422,7 +434,7 @@ describe("markWebhookBroken", () => {
 
   test("sets broken on an existing entry, leaves updatedAt and updatedBy alone", async () => {
     await seed({ [CHAN_A]: meta(), [CHAN_B]: meta({ id: "555555555555555002", guildId: G2 }) });
-    await markWebhookBroken(dir)(CHAN_A, "Discord says that webhook is gone (404)");
+    await markWebhookBroken(dir)(CHAN_A, "Discord says that webhook is gone (404)", meta());
     const after = await readRouting(dir);
     expect(after.webhooks[CHAN_A]).toEqual({ ...meta(), broken: "Discord says that webhook is gone (404)" });
     // The other webhook, the placements and the edit stamp are untouched: nobody edited anything.
@@ -434,13 +446,55 @@ describe("markWebhookBroken", () => {
 
   test("does nothing for a channel with no entry", async () => {
     await seed({ [CHAN_A]: meta() });
-    await markWebhookBroken(dir)(CHAN_B, "Discord says that webhook is gone (404)");
+    await markWebhookBroken(dir)(CHAN_B, "Discord says that webhook is gone (404)", meta());
     const after = await readRouting(dir);
     expect(Object.keys(after.webhooks)).toEqual([CHAN_A]);
     expect(after.webhooks[CHAN_A]?.broken).toBeUndefined();
     // Not even an inherited name creates an entry.
-    await markWebhookBroken(dir)("constructor", "Discord says that webhook is gone (404)");
+    await markWebhookBroken(dir)("constructor", "Discord says that webhook is gone (404)", meta());
     expect(Object.keys((await readRouting(dir)).webhooks)).toEqual([CHAN_A]);
+  });
+
+  test("a webhook replaced while the post was in flight is not marked broken by the old one's 404", async () => {
+    // The post went through W1 (this is what it saw); the operator then replaced it with W2; W1's 404 lands.
+    const w1 = meta({ id: "555555555555555001", addedAt: "2026-09-21T00:00:00.000Z" });
+    const w2 = meta({ id: "555555555555555002", addedAt: "2026-09-21T00:00:05.000Z", addedBy: "op" });
+    await seed({ [CHAN_A]: w2 });
+    await markWebhookBroken(dir)(CHAN_A, "Discord says that webhook is gone (404)", w1);
+    expect((await readRouting(dir)).webhooks[CHAN_A]).toEqual(w2);
+    // The same webhook added again under the same id is a different add: it is left alone too.
+    const again = meta({ id: w1.id, addedAt: "2026-09-21T00:00:09.000Z" });
+    await seed({ [CHAN_A]: again });
+    await markWebhookBroken(dir)(CHAN_A, "Discord says that webhook is gone (404)", w1);
+    expect((await readRouting(dir)).webhooks[CHAN_A]).toEqual(again);
+    // ... while the entry that WAS posted through is marked.
+    await markWebhookBroken(dir)(CHAN_A, "Discord says that webhook is gone (404)", again);
+    expect((await readRouting(dir)).webhooks[CHAN_A]?.broken).toBe("Discord says that webhook is gone (404)");
+  });
+});
+
+describe("withWebhookBroken", () => {
+  const REASON = "Discord says that webhook is gone (404)";
+  const file = (webhooks: Record<string, WebhookMeta>): RoutingFile => ({ ...freshRouting(), updatedAt: "T", updatedBy: "who", webhooks });
+
+  test("sets broken on the entry that was seen, and touches nothing else", () => {
+    const before = file({ [CHAN_A]: meta(), [CHAN_B]: meta({ id: "555555555555555002", guildId: G2 }) });
+    const after = withWebhookBroken(before, CHAN_A, REASON, meta());
+    expect(after.webhooks[CHAN_A]).toEqual({ ...meta(), broken: REASON });
+    expect(after.webhooks[CHAN_B]).toEqual(meta({ id: "555555555555555002", guildId: G2 }));
+    expect(after.updatedAt).toBe("T");
+    expect(after.updatedBy).toBe("who");
+    // The input is not changed.
+    expect(before.webhooks[CHAN_A]).toEqual(meta());
+  });
+
+  test("returns the routing itself when there is nothing to mark", () => {
+    const before = file({ [CHAN_A]: meta() });
+    // No entry for the channel; an inherited name; a different webhook; the same webhook added again.
+    expect(withWebhookBroken(before, CHAN_B, REASON, meta())).toBe(before);
+    expect(withWebhookBroken(before, "constructor", REASON, meta())).toBe(before);
+    expect(withWebhookBroken(before, CHAN_A, REASON, meta({ id: "555555555555555009" }))).toBe(before);
+    expect(withWebhookBroken(before, CHAN_A, REASON, meta({ addedAt: "2026-09-22T00:00:00.000Z" }))).toBe(before);
   });
 });
 
@@ -494,8 +548,8 @@ describe("the webhook url never appears", () => {
           if (channelId === CHAN_B) throw new Error("Missing Access");
         },
       });
-      h.deps.markBroken = async (channelId, reason) => {
-        await markWebhookBroken(dir)(channelId, reason);
+      h.deps.markBroken = async (channelId, reason, seen) => {
+        await markWebhookBroken(dir)(channelId, reason, seen);
         throw new Error("could not record it");
       };
       const thrown: unknown[] = [];

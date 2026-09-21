@@ -214,10 +214,13 @@ describe("index.ts wiring", () => {
       expect(source.lastIndexOf("interaction.isChatInputCommand()", handleCall)).toBeGreaterThan(interactionStart);
       const handleBlock = source.slice(handleCall, source.indexOf("} else if", handleCall));
       expect(handleBlock).toMatch(/\(bare\)\s*=>\s*commandMap\.get\(bare\)\?\.command,/);
-      expect(handleBlock).toMatch(/whereOf\(chatInput,\s*\(id\)\s*=>\s*client\.channels\.fetch\(id\)\)/);
+      // whereOf is handed over as a thunk, never awaited here: the gate calls it only when the channel's own
+      // id cannot decide, so a plugin with no routing (or a listed channel, or a DM) costs no Discord fetch.
+      expect(handleBlock).toMatch(/\(\)\s*=>\s*whereOf\(chatInput,\s*\(id\)\s*=>\s*client\.channels\.fetch\(id\)\)/);
+      expect(handleBlock).not.toMatch(/await\s+whereOf\(/);
       // The plugin that owns the command is the one whose routing decides, and the command name shown is the registered one.
       expect(handleBlock).toMatch(
-        /gateCommand\(commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*where,\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console\)/,
+        /gateCommand\(\s*commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*chatInput,\s*\(\)\s*=>\s*whereOf\([^]*?\),\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console,?\s*\)/,
       );
     });
 

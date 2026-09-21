@@ -190,8 +190,13 @@ async function activate(c: Client<true>): Promise<void> {
           interaction,
           (bare) => commandMap.get(bare)?.command,
           (bare, chatInput) =>
-            whereOf(chatInput, (id) => client.channels.fetch(id)).then((where) =>
-              gateCommand(commandMap.get(bare)?.entry.name, chatInput.commandName, where, () => readRouting(DATA_DIR), console),
+            gateCommand(
+              commandMap.get(bare)?.entry.name,
+              chatInput.commandName,
+              chatInput,
+              () => whereOf(chatInput, (id) => client.channels.fetch(id)),
+              () => readRouting(DATA_DIR),
+              console,
             ),
         );
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {

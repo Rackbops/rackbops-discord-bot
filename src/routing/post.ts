@@ -9,11 +9,14 @@
 // A webhook URL is a secret (it is a bearer credential for the channel). It comes out of
 // `routing.secrets.json` only to be handed to `executeWebhook`, and it is never put in a log line, an
 // error, or `routing.json`: every reason in this file is a fixed string, and a fetch error is dropped
-// rather than interpolated. There is nothing to redact because nothing ever holds the URL and text.
+// rather than interpolated. There is no redaction step because no string in this file is ever built from
+// the URL and other text.
 //
-// Pure over injected deps (`fetch` included), so it is tested with no Discord, no network and no disk.
+// `postForPlugin` and `liveExecuteWebhook` are pure over injected deps (`fetch` included), so they are
+// tested with no Discord, no network and no disk; `markWebhookBroken` writes `routing.json` and its tests
+// use a temp directory.
 
-import { freshRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
+import { freshRouting, type RoutingFile, type RoutingSecretsFile, type WebhookMeta } from "./model";
 import { announceTargets } from "./resolve";
 import { mutateRouting } from "./store";
 
@@ -27,13 +30,15 @@ export interface PostDeps {
   /** `announceTo` -- the bot's own send path; it prints the `[announce]` line itself. */
   sendAsBot: (channelId: string, message: string) => Promise<void>;
   executeWebhook: (url: string, message: string) => Promise<WebhookPostResult>;
-  markBroken: (channelId: string, reason: string) => Promise<void>;
+  /** `seen` is the webhook's metadata as it was when the post was made: see `withWebhookBroken`. */
+  markBroken: (channelId: string, reason: string, seen: WebhookMeta) => Promise<void>;
   log: Pick<Console, "log" | "warn" | "error">;
 }
 
-/** A webhook that exists in `routing.json` and has not been found dead. */
-function hasUsableWebhook(routing: RoutingFile, channelId: string): boolean {
-  return Object.hasOwn(routing.webhooks, channelId) && routing.webhooks[channelId]?.broken === undefined;
+/** The channel's webhook, when `routing.json` has one that has not been found dead. */
+function usableWebhook(routing: RoutingFile, channelId: string): WebhookMeta | undefined {
+  const meta = Object.hasOwn(routing.webhooks, channelId) ? routing.webhooks[channelId] : undefined;
+  return meta !== undefined && meta.broken === undefined ? meta : undefined;
 }
 
 /**
@@ -43,10 +48,14 @@ function hasUsableWebhook(routing: RoutingFile, channelId: string): boolean {
  * broken, so the panel can say so and the next post skips it. A rate limit, a 5xx, a timeout or a
  * message that is too long is a bad moment, not a dead webhook.
  *
- * It rejects only when EVERY target failed, with the first error unchanged. A plugin that sees a
- * rejection typically posts again on its next tick, and that would post again to the channels that DID
- * get the message -- every minute, for as long as one channel stays unreachable. With one target (the
- * case with no routing) this is exactly today's behaviour: the failure propagates.
+ * A webhook that timed out or answered 5xx may still have delivered the message, so the fallback can put
+ * a second copy in the channel: a message that must arrive is worth more here than one that arrives
+ * exactly once.
+ *
+ * It rejects only when EVERY target failed, with the first error unchanged (the others are logged). A
+ * plugin that sees a rejection typically posts again on its next tick, and that would post again to the
+ * channels that DID get the message -- every minute, for as long as one channel stays unreachable. With
+ * one target (the case with no routing) this is exactly today's behaviour: the failure propagates.
  */
 export async function postForPlugin(plugin: string, message: string, deps: PostDeps): Promise<void> {
   // Routing is read per use (one small file; no cache, so no invalidation bug). A read that fails must
@@ -62,7 +71,7 @@ export async function postForPlugin(plugin: string, message: string, deps: PostD
 
   // The secrets file is only opened when some target could use it.
   let secrets: RoutingSecretsFile | undefined;
-  if (targets.some((channelId) => hasUsableWebhook(routing, channelId))) {
+  if (targets.some((channelId) => usableWebhook(routing, channelId) !== undefined)) {
     try {
       secrets = await deps.readSecrets();
     } catch {
@@ -72,7 +81,8 @@ export async function postForPlugin(plugin: string, message: string, deps: PostD
 
   /** True once the post has been made through the channel's webhook. */
   const viaWebhook = async (channelId: string): Promise<boolean> => {
-    if (!hasUsableWebhook(routing, channelId)) return false;
+    const meta = usableWebhook(routing, channelId);
+    if (meta === undefined) return false;
     const url = secrets !== undefined && Object.hasOwn(secrets.webhooks, channelId) ? secrets.webhooks[channelId] : undefined;
     if (url === undefined || url.length === 0) return false;
     let result: WebhookPostResult;
@@ -89,7 +99,7 @@ export async function postForPlugin(plugin: string, message: string, deps: PostD
     deps.log.warn(`[announce] ${plugin}: the webhook for ${channelId} failed: ${result.reason}`);
     if (result.gone) {
       try {
-        await deps.markBroken(channelId, result.reason);
+        await deps.markBroken(channelId, result.reason, meta);
       } catch (err) {
         deps.log.error(`[announce] ${plugin}: could not mark the webhook for ${channelId} broken`, err);
       }
@@ -107,10 +117,12 @@ export async function postForPlugin(plugin: string, message: string, deps: PostD
       failures.push({ channelId, err });
     }
   }
-  if (posted === 0) throw failures[0]?.err;
-  for (const { channelId, err } of failures) {
+  // Every one that was not thrown is logged: the first failure is the plugin's to see, the rest would be lost.
+  const unreported = posted === 0 ? failures.slice(1) : failures;
+  for (const { channelId, err } of unreported) {
     deps.log.error(`[announce] ${plugin}: could not post to ${channelId}`, err);
   }
+  if (posted === 0) throw failures[0]?.err;
 }
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
@@ -146,17 +158,24 @@ export function liveExecuteWebhook(fetchFn: typeof fetch = fetch): PostDeps["exe
 }
 
 /**
- * Records, in `routing.json`, that Discord says the webhook for `channelId` is gone: `webhooks[channel].broken`
- * holds the reason, where the model (#237) keeps it and the panel reads it. Only an entry that exists is
- * touched, and `updatedAt` / `updatedBy` are left alone -- nobody edited anything. Serialized with every
- * other routing write by `mutateRouting`.
+ * `routing` with the webhook for `channelId` marked broken: `webhooks[channel].broken` holds the reason,
+ * where the model (#237) keeps it and the panel reads it. Only an entry that exists is touched, and
+ * `updatedAt` / `updatedBy` are left alone -- nobody edited anything.
+ *
+ * And only the entry that was posted through. A post can be in flight for ten seconds; if the operator
+ * replaced the webhook in that time, the old one's 404 must not mark the new one broken. `seen` is the
+ * metadata the post was made with: a different `id`, or the same webhook added again (`addedAt`), is
+ * a different webhook and is left alone.
  */
+export function withWebhookBroken(routing: RoutingFile, channelId: string, reason: string, seen: WebhookMeta): RoutingFile {
+  const meta = Object.hasOwn(routing.webhooks, channelId) ? routing.webhooks[channelId] : undefined;
+  if (meta === undefined || meta.id !== seen.id || meta.addedAt !== seen.addedAt) return routing;
+  return { ...routing, webhooks: { ...routing.webhooks, [channelId]: { ...meta, broken: reason } } };
+}
+
+/** `withWebhookBroken`, written to `routing.json`; serialized with every other routing write by `mutateRouting`. */
 export function markWebhookBroken(dataDir: string): PostDeps["markBroken"] {
-  return async (channelId, reason) => {
-    await mutateRouting(dataDir, (current) => {
-      const meta = Object.hasOwn(current.webhooks, channelId) ? current.webhooks[channelId] : undefined;
-      if (meta === undefined) return current;
-      return { ...current, webhooks: { ...current.webhooks, [channelId]: { ...meta, broken: reason } } };
-    });
+  return async (channelId, reason, seen) => {
+    await mutateRouting(dataDir, (current) => withWebhookBroken(current, channelId, reason, seen));
   };
 }
