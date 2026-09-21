@@ -366,6 +366,38 @@ describe("validatePluginRouting", () => {
     expect(bigServer.reason.length).toBeLessThan(150);
   });
 
+  test("an echoed value of 40 characters is kept whole and one of 41 is clipped to 37 and an ellipsis", () => {
+    const reason = (value: string) => {
+      const result = validatePluginRouting({ servers: { [OTHER]: { commands: [value] } } }, discovery());
+      if (result.ok) throw new Error("expected rejection");
+      return result.reason;
+    };
+    expect(reason("x".repeat(40))).toBe(`channel ${"x".repeat(40)} is not in server ${OTHER}`);
+    expect(reason("x".repeat(41))).toBe(`channel ${"x".repeat(37)}... is not in server ${OTHER}`);
+    expect(reason("x".repeat(1_000_000))).toBe(`channel ${"x".repeat(37)}... is not in server ${OTHER}`);
+  });
+
+  test("a clipped reason never splits an emoji, and a lone surrogate is replaced, so it can always be URL-encoded", () => {
+    const reason = (value: string) => {
+      const result = validatePluginRouting({ servers: { [OTHER]: { commands: [value] } } }, discovery());
+      if (result.ok) throw new Error("expected rejection");
+      return result.reason;
+    };
+    // 50 emoji is 100 UTF-16 units: a clip by units lands in the middle of one.
+    const clipped = reason("\u{1F600}".repeat(50));
+    expect(clipped).toBe(`channel ${"\u{1F600}".repeat(37)}... is not in server ${OTHER}`);
+    expect(() => encodeURIComponent(clipped)).not.toThrow();
+    // A lone surrogate straight from JSON (`"\ud83d"`), on its own and inside longer text.
+    for (const lone of ["\ud83d", "a\udc00b", "\ude00\ud83d", `${"y".repeat(60)}\ud83d`]) {
+      const echoed = reason(lone);
+      expect(() => encodeURIComponent(echoed)).not.toThrow();
+      expect(echoed).not.toMatch(/[\ud800-\udfff]/);
+    }
+    expect(reason("\ud83d")).toBe(`channel ${String.fromCharCode(0xfffd)} is not in server ${OTHER}`);
+    // A well-formed pair is left alone.
+    expect(reason("a\u{1F600}b")).toBe(`channel a\u{1F600}b is not in server ${OTHER}`);
+  });
+
   test("an unserialisable value is reported rather than thrown on", () => {
     const circular: Record<string, unknown> = {};
     circular.self = circular;

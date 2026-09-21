@@ -10,6 +10,7 @@
 // The bot is the ONLY writer of these files (ADR-0006). The panel asks for a change through the
 // request mailbox; it never touches them.
 
+import { randomUUID } from "node:crypto";
 import { chmod as fsChmod, mkdir, rename as fsRename, unlink, writeFile as fsWriteFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createKeyedJsonMutator, readJsonOrFresh } from "../storage";
@@ -50,17 +51,31 @@ export async function readRouting(dataDir: string): Promise<RoutingFile> {
 }
 
 /**
+ * `mutate` must hand back the whole file. Anything that is not an object -- a callback that forgot its
+ * `return`, say -- is refused BEFORE anything is written: repairing `undefined` would give a fresh
+ * file, and writing that would erase every placement without a word.
+ */
+function requireFile<T>(value: T, caller: string): T {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    const got = value === null ? "null" : Array.isArray(value) ? "a list" : typeof value;
+    throw new TypeError(`${caller}: mutate must return the whole file, not ${got}; nothing was written`);
+  }
+  return value;
+}
+
+/**
  * Serialized read-modify-write of `routing.json`. `mutate` always receives a REPAIRED value (never
- * whatever the file happened to contain) and returns the file to write -- which is repaired again
- * before it is written, so a value that does not fit the shape can never land in the file. Above
- * all that keeps a webhook URL out of `routing.json` whatever a caller builds: a `url` key on a
- * webhook is not part of `WebhookMeta` and is dropped.
+ * whatever the file happened to contain) and returns the file to write, which must be an object and
+ * is repaired again before it is written -- so a value that does not fit the shape cannot land in
+ * the file. That drops every key outside the shape, a `url` or `token` on a webhook above all. It
+ * does NOT inspect the text of the fields the shape does allow (`updatedBy`, a webhook's `addedBy`
+ * and `broken`): a caller must not put a webhook URL in those.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
   await routingMutator.update(
     routingPath(dataDir),
     freshRouting,
-    (current) => repairRouting(mutate(repairRouting(current))),
+    (current) => repairRouting(requireFile(mutate(repairRouting(current)), "mutateRouting")),
     "routing",
   );
 }
@@ -78,13 +93,12 @@ const SECRETS_MODE = 0o600;
  */
 export interface SecretsIo {
   rename?: (from: string, to: string) => Promise<void>;
-  writeFile?: (path: string, data: string, options: { mode: number }) => Promise<void>;
+  writeFile?: (path: string, data: string, options: { mode: number; flag: string }) => Promise<void>;
 }
 
 // One queue per secrets file: each write chains behind the one before it, whether that one
 // succeeded or failed (a failed write must not wedge every later one -- see `mutateSecrets`).
 const secretsQueues = new Map<string, Promise<void>>();
-let secretsTmpCounter = 0;
 
 /**
  * As `mutateRouting` (repaired in, repaired out), for the file that holds webhook URLs -- which is
@@ -99,10 +113,20 @@ let secretsTmpCounter = 0;
  * `readJsonOrFresh` moves an unparseable file to (a rename again). A write that fails part-way removes
  * its temp file, best effort.
  *
- * `chmod` is then called on the final file as a last belt-and-braces step. A `chmod` that fails is
- * logged and swallowed: the write itself succeeded and the file was created owner-only, and refusing
- * to report that would leave the caller retrying a change that already landed. `chmod` and `io` are
- * parameters only so a test can observe or fail them.
+ * The temp file is named with a random UUID and created exclusively (`flag: "wx"`), so two writers --
+ * two containers on one volume during a handoff, where a process id and a counter would repeat --
+ * cannot pick the same name, and a stale file or a symlink already at that name is refused rather than
+ * written through.
+ *
+ * "Owner-only from creation" is about files this function writes. A secrets file put there by hand
+ * (a deployment seeding it, a restore) keeps whatever mode it was given until the first write here
+ * replaces it, and if it will not parse it is moved aside at that mode.
+ *
+ * `mutate` must return the whole file (an object), as for `mutateRouting`; it is repaired before it
+ * is written. `chmod` is then called on the final file as a last belt-and-braces step. A `chmod` that
+ * fails is logged and swallowed: the write itself succeeded and the file was created owner-only, and
+ * refusing to report that would leave the caller retrying a change that already landed. `chmod` and
+ * `io` are parameters only so a test can observe or fail them.
  *
  * The mode is enforced by the kernel on Linux, where the bot runs; on Windows a mode is not meaningful
  * and the tests that observe it are skipped.
@@ -119,11 +143,11 @@ export function mutateSecrets(
 
   const run = async (): Promise<void> => {
     const current = repairSecrets(await readJsonOrFresh<unknown>(path, freshSecrets, "routing-secrets"));
-    const next = repairSecrets(mutate(current));
+    const next = repairSecrets(requireFile(mutate(current), "mutateSecrets"));
     await mkdir(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.${++secretsTmpCounter}.tmp`;
+    const tmp = `${path}.${randomUUID()}.tmp`;
     try {
-      await write(tmp, JSON.stringify(next, null, 2), { mode: SECRETS_MODE });
+      await write(tmp, JSON.stringify(next, null, 2), { mode: SECRETS_MODE, flag: "wx" });
       await rename(tmp, path);
     } catch (err) {
       await unlink(tmp).catch(() => {});

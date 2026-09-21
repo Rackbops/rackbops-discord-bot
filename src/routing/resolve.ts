@@ -1,8 +1,9 @@
 // Pure routing decisions (ADR-0006): which plugins live in a server, where a plugin posts, whether a
 // command may run in a channel, and whether one plugin's routing, as the panel sent it, is
-// acceptable. No I/O and no discord.js -- every function takes a `RoutingFile` (and, where it
-// needs to know what the bot can see, a `DiscoveryFile`) and returns data, so all of it is tested
-// as data. Nothing calls this yet: with #237 merged the bot behaves exactly as before.
+// acceptable. No I/O and no discord.js -- every function takes plain data (a `RoutingFile`, or for
+// `validatePluginRouting` the routing a panel sent plus the `DiscoveryFile` of what the bot can see)
+// and returns data, so all of it is tested as data. Nothing calls this yet: with #237 merged the bot
+// behaves exactly as before.
 //
 // Placed vs unplaced is the one distinction to hold on to. A plugin with NO entry in
 // `routing.json` is *unplaced* and lives in the home server; a plugin WITH an entry is *placed* and
@@ -98,6 +99,9 @@ export function commandAllowed(
   return { allowed: false, channels: [...scope] };
 }
 
+/** U+FFFD, built by code so no editor or tool can quietly turn the escape into a lookalike glyph. */
+const REPLACEMENT_CHARACTER = String.fromCharCode(0xfffd);
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -108,6 +112,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * kilobytes deep overflows the stack in `JSON.stringify` and again in any fallback), and everything
  * else is a primitive. Ids are at most 25 characters, so the clip changes nothing for a real request
  * and only stops a hostile one from echoing itself back at length.
+ *
+ * The result is always well-formed text. A lone surrogate -- a `"\ud83d"` escape in the JSON, or an
+ * emoji cut in half by a clip -- makes a string that `encodeURIComponent` refuses, so whatever shows
+ * the reason would throw; a lone one is replaced with U+FFFD, and the clip counts code points.
  */
 function shown(value: unknown): string {
   let text: string;
@@ -115,7 +123,11 @@ function shown(value: unknown): string {
   else if (typeof value === "object" && value !== null) text = Array.isArray(value) ? "[list]" : "[object]";
   else if (typeof value === "function") text = "[function]";
   else text = String(value);
-  return text.length > 40 ? `${text.slice(0, 37)}...` : text;
+  text = text.replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, REPLACEMENT_CHARACTER);
+  if (text.length <= 40) return text;
+  // 80 UTF-16 units hold at least 40 code points, so this still yields the 37 it wants, and a
+  // megabyte of hostile text is never spread into an array.
+  return `${Array.from(text.slice(0, 80)).slice(0, 37).join("")}...`;
 }
 
 type Validation = { ok: true; value: PluginRouting } | { ok: false; reason: string };

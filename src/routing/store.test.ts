@@ -185,9 +185,19 @@ describe("mutateRouting", () => {
       plugins: { music: { servers: { [GUILD]: { commands: "all" } } } },
       webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u" } },
     });
-    // And a mutate that returns something that is not a routing file at all writes a valid one.
-    await mutateRouting(dir, () => "not a routing file" as unknown as RoutingFile);
-    expect(JSON.parse(readFileSync(routingPath(dir), "utf8"))).toEqual(freshRouting());
+  });
+
+  test("the guard is on keys, not on text: a URL inside a free-text field is copied as given", async () => {
+    // Pinned so nobody reads "a url never reaches routing.json" as more than it is. `updatedBy` and a
+    // webhook's `addedBy` / `broken` are text the shape allows, and the store does not read them.
+    await mutateRouting(dir, (current) => ({
+      ...current,
+      updatedBy: "https://example.invalid/hook/1",
+      webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u", broken: "HTTP 404 from https://example.invalid/hook/1" } },
+    }));
+    const written = JSON.parse(readFileSync(routingPath(dir), "utf8"));
+    expect(written.updatedBy).toBe("https://example.invalid/hook/1");
+    expect(written.webhooks[CHAN].broken).toContain("https://example.invalid/hook/1");
   });
 
   test("it only ever writes under the directory it is given, never the bot's own data dir", async () => {
@@ -277,24 +287,61 @@ describe("secrets", () => {
   test("the secrets temp file is written owner-only, and nothing else is left in the directory", async () => {
     // Runs on every platform: what it pins is the MODE ARGUMENT of the write that creates the temp
     // file, so the URLs are never in a wider-mode file. The CI-only tests below observe the real mode.
-    const writes: { path: string; mode: number | undefined }[] = [];
-    await mutateSecrets(
-      dir,
-      (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }),
-      async () => {},
-      {
-        writeFile: async (path, data, options) => {
-          writes.push({ path, mode: options.mode });
-          await writeFile(path, data, options);
-        },
+    const writes: { path: string; mode: number | undefined; flag: string | undefined }[] = [];
+    const io = {
+      writeFile: async (path: string, data: string, options: { mode: number; flag: string }) => {
+        writes.push({ path, mode: options.mode, flag: options.flag });
+        await writeFile(path, data, options);
       },
-    );
-    expect(writes).toHaveLength(1);
-    expect(writes[0]!.mode).toBe(0o600);
-    // The write went to a temp file beside the target, not to the target itself.
-    expect(writes[0]!.path).not.toBe(secretsPath(dir));
-    expect(writes[0]!.path).toMatch(/routing\.secrets\.json\.\d+\.\d+\.tmp$/);
+    };
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {}, io);
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }), async () => {}, io);
+    expect(writes).toHaveLength(2);
+    for (const write of writes) {
+      expect(write.mode).toBe(0o600);
+      // Created exclusively: a stale file or a symlink already at the temp name is refused, not written through.
+      expect(write.flag).toBe("wx");
+      // The write went to a temp file beside the target, not to the target itself.
+      expect(write.path).not.toBe(secretsPath(dir));
+      expect(write.path).toMatch(/routing\.secrets\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/);
+    }
+    // A random name per write -- a process id and a counter would repeat across containers on one
+    // volume, and two writers would then share a temp file.
+    expect(writes[0]!.path).not.toBe(writes[1]!.path);
     expect(readdirSync(dir)).toEqual(["routing.secrets.json"]);
+  });
+
+  test("a write that fails before its temp file exists reports the write's own error", async () => {
+    // The clean-up must not turn the real failure into an ENOENT from unlinking a file that was never made.
+    await expect(
+      mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {}, {
+        writeFile: async () => {
+          throw new Error("EACCES: permission denied, open");
+        },
+      }),
+    ).rejects.toThrow("EACCES");
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("a mutate that returns nothing fails its own call and writes nothing, for both files", async () => {
+    // Repairing `undefined` gives a fresh file, and writing that would erase every placement silently.
+    await mutateRouting(dir, withPlugin("music"));
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+    const routingBefore = readFileSync(routingPath(dir), "utf8");
+    const secretsBefore = readFileSync(secretsPath(dir), "utf8");
+    for (const bad of [undefined, null, "a routing file", 7, ["v"], true]) {
+      await expect(mutateRouting(dir, () => bad as unknown as RoutingFile)).rejects.toThrow(/mutateRouting: mutate must return the whole file/);
+      await expect(mutateSecrets(dir, () => bad as unknown as RoutingSecretsFile, async () => {})).rejects.toThrow(
+        /mutateSecrets: mutate must return the whole file/,
+      );
+    }
+    expect(readFileSync(routingPath(dir), "utf8")).toBe(routingBefore);
+    expect(readFileSync(secretsPath(dir), "utf8")).toBe(secretsBefore);
+    // Neither refusal wedged its queue.
+    await mutateRouting(dir, withPlugin("wow"));
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }), async () => {});
+    expect(Object.keys((await readRouting(dir)).plugins).sort()).toEqual(["music", "wow"]);
+    expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([CHAN, "333333333333333332"]);
   });
 
   test("a failed rename leaves the previous secrets file intact and no temp file behind", async () => {
