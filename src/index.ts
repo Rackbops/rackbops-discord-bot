@@ -40,6 +40,9 @@ import {
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { describePlugins } from "./routing/discovery";
 import { applyRouting, initRouting } from "./routing/live";
+import { gateCommand, whereOf } from "./routing/gate";
+import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
+import { readRouting, readSecrets } from "./routing/store";
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -139,6 +142,17 @@ async function activate(c: Client<true>): Promise<void> {
       now: Date.now,
       log: console,
     });
+    // #243: where a plugin's announcements go -- the channels its routing names, through a channel's
+    // webhook when it has one, and the default channel (ANNOUNCE_CHANNEL_ID) when routing names none.
+    const postDeps: PostDeps = {
+      readRouting: () => readRouting(DATA_DIR),
+      readSecrets: () => readSecrets(DATA_DIR),
+      defaultChannelId: config.announceChannelId,
+      sendAsBot: (channelId, message) => announceTo(client, channelId, message),
+      executeWebhook: liveExecuteWebhook(),
+      markBroken: markWebhookBroken(DATA_DIR),
+      log: console,
+    };
     const makeHost = (entry: PluginIndexEntry): HostApi =>
       createHostApi({
         entry,
@@ -146,7 +160,7 @@ async function activate(c: Client<true>): Promise<void> {
         dataDir: DATA_DIR,
         baseLog: console,
         storage,
-        announce: (message) => announceTo(client, config.announceChannelId, message),
+        announce: (message) => postForPlugin(entry.name, message, postDeps),
       });
     loadResult = await loadPlugins(
       installResult.installed,
@@ -171,7 +185,15 @@ async function activate(c: Client<true>): Promise<void> {
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
       if (interaction.isChatInputCommand()) {
-        await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
+        // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
+        await handleCommand(
+          interaction,
+          (bare) => commandMap.get(bare)?.command,
+          (bare, chatInput) =>
+            whereOf(chatInput, (id) => client.channels.fetch(id)).then((where) =>
+              gateCommand(commandMap.get(bare)?.entry.name, chatInput.commandName, where, () => readRouting(DATA_DIR), console),
+            ),
+        );
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
         await handleReportModal(interaction);
       } else if (interaction.isMessageComponent() || interaction.isModalSubmit()) {

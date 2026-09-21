@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import type { ChatInputCommandInteraction } from "discord.js";
+import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { PluginCommand } from "./plugins/contract";
 
 // `commands.ts` pulls in the `config` singleton, which resolves process.env at import time --
@@ -274,6 +274,103 @@ describe("handleCommand — plugin dispatch (default case)", () => {
       await handleCommand({ commandName: "nope" } as unknown as ChatInputCommandInteraction, () => undefined);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0]?.[0])).toContain("no handler for /nope");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+// #243: a plugin's commands run only in the channels its routing lists. The decision is the gate's
+// (routing/gate.ts); what is pinned here is what handleCommand does with its answer.
+describe("handleCommand — the channel gate (#243)", () => {
+  const plugin = () => {
+    const state = { handled: 0 };
+    const command = { name: "hello", handle: async () => void (state.handled += 1) } as unknown as PluginCommand;
+    return { state, lookup: (bare: string) => (bare === "hello" ? command : undefined) };
+  };
+  const chatInput = () => {
+    const replies: unknown[] = [];
+    const interaction = {
+      commandName: "hello",
+      reply: async (options: unknown) => void replies.push(options),
+    } as unknown as ChatInputCommandInteraction;
+    return { interaction, replies };
+  };
+
+  test("a core command never consults the gate", async () => {
+    const reportRow = CORE_COMMANDS.find((c) => c.name === "report")!;
+    const handle = spyOn(reportRow, "handle").mockImplementation(async () => {});
+    try {
+      let consulted = 0;
+      const gate = async () => {
+        consulted += 1;
+        return "refused";
+      };
+      const { interaction, replies } = chatInput();
+      (interaction as unknown as { commandName: string }).commandName = "report";
+      // Even a plugin that claims the same name (the core row wins) is never put to the gate.
+      await handleCommand(interaction, () => ({ name: "report", handle: async () => {} }) as unknown as PluginCommand, gate);
+      expect(handle).toHaveBeenCalledTimes(1);
+      expect(consulted).toBe(0);
+      expect(replies).toEqual([]);
+    } finally {
+      handle.mockRestore();
+    }
+  });
+
+  test("a refused plugin command gets a private reply and its handler is not called", async () => {
+    const { state, lookup } = plugin();
+    const { interaction, replies } = chatInput();
+    await handleCommand(interaction, lookup, async () => "`/hello` works in <#1> here.");
+    expect(replies).toEqual([{ content: "`/hello` works in <#1> here.", flags: MessageFlags.Ephemeral }]);
+    expect(state.handled).toBe(0);
+  });
+
+  test("an allowed plugin command runs, and the gate is asked with the bare name and the interaction", async () => {
+    const { state, lookup } = plugin();
+    const { interaction, replies } = chatInput();
+    const asked: unknown[][] = [];
+    await handleCommand(interaction, lookup, async (...args) => {
+      asked.push(args);
+      return undefined;
+    });
+    expect(state.handled).toBe(1);
+    expect(replies).toEqual([]);
+    expect(asked).toEqual([["hello", interaction]]);
+  });
+
+  test("with no gate argument a plugin command runs", async () => {
+    const { state, lookup } = plugin();
+    const { interaction, replies } = chatInput();
+    await handleCommand(interaction, lookup);
+    expect(state.handled).toBe(1);
+    expect(replies).toEqual([]);
+  });
+
+  test("a gate that throws lets the command run, and says so", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { state, lookup } = plugin();
+      const { interaction, replies } = chatInput();
+      await handleCommand(interaction, lookup, async () => Promise.reject(new Error("EIO")));
+      expect(state.handled).toBe(1);
+      expect(replies).toEqual([]);
+      expect(String(error.mock.calls[0]?.[0])).toContain("[gate] could not decide whether /hello may run here");
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("a command no plugin owns is not put to the gate", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      let consulted = 0;
+      const { interaction } = chatInput();
+      await handleCommand(interaction, () => undefined, async () => {
+        consulted += 1;
+        return undefined;
+      });
+      expect(consulted).toBe(0);
     } finally {
       warn.mockRestore();
     }

@@ -169,6 +169,66 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #243: where a plugin posts, and which channels its commands run in. index.ts can't run under test, so
+  // the wiring is pinned in the source, in the same idiom as the block above.
+  describe("plugin announcements and the channel gate are routed (#243)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const depsStart = source.indexOf("const postDeps: PostDeps = {", activateFn);
+    const makeHostStart = source.indexOf("const makeHost = ", activateFn);
+    // The text of the postDeps object alone: `log:` and `dataDir:` appear all over this file.
+    const depsBlock = source.slice(depsStart, makeHostStart);
+    const interactionStart = source.indexOf("client.on(Events.InteractionCreate", activateFn);
+    const handleCall = source.indexOf("await handleCommand(", interactionStart);
+
+    test("a plugin's announce goes through postForPlugin with its own name and the default channel", () => {
+      expect(source).toMatch(/announce:\s*\(message\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps\),/);
+      // The old wiring -- every plugin posting straight to the one channel -- is gone.
+      expect(source).not.toMatch(/announce:\s*\(message\)\s*=>\s*announceTo\(/);
+      expect(depsBlock).toMatch(/defaultChannelId:\s*config\.announceChannelId,/);
+    });
+
+    test("postDeps is built once, in activate(), before the hosts are made", () => {
+      expect(activateFn).toBeGreaterThan(-1);
+      expect(depsStart).toBeGreaterThan(activateFn);
+      expect(makeHostStart).toBeGreaterThan(depsStart);
+      expect((source.match(/const postDeps: PostDeps = \{/g) ?? []).length).toBe(1);
+    });
+
+    test("announceTo is still the bot's send path", () => {
+      expect(depsBlock).toMatch(/sendAsBot:\s*\(channelId,\s*message\)\s*=>\s*announceTo\(client,\s*channelId,\s*message\),/);
+      expect(source).toMatch(/import \{[^}]*\bannounceTo\b[^}]*\} from "\.\/announce";/);
+    });
+
+    test("routing and secrets are read from the data dir, the webhook goes out over the real fetch, and a dead one is marked in the data dir", () => {
+      expect(depsBlock).toMatch(/readRouting:\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/readSecrets:\s*\(\)\s*=>\s*readSecrets\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/executeWebhook:\s*liveExecuteWebhook\(\),/);
+      expect(depsBlock).toMatch(/markBroken:\s*markWebhookBroken\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/log:\s*console,/);
+    });
+
+    test("the interaction handler passes a gate built from whereOf and gateCommand", () => {
+      // Only a chat-input command is gated: the call is inside the isChatInputCommand branch.
+      expect(interactionStart).toBeGreaterThan(activateFn);
+      expect(handleCall).toBeGreaterThan(interactionStart);
+      expect(source.lastIndexOf("interaction.isChatInputCommand()", handleCall)).toBeGreaterThan(interactionStart);
+      const handleBlock = source.slice(handleCall, source.indexOf("} else if", handleCall));
+      expect(handleBlock).toMatch(/\(bare\)\s*=>\s*commandMap\.get\(bare\)\?\.command,/);
+      expect(handleBlock).toMatch(/whereOf\(chatInput,\s*\(id\)\s*=>\s*client\.channels\.fetch\(id\)\)/);
+      // The plugin that owns the command is the one whose routing decides, and the command name shown is the registered one.
+      expect(handleBlock).toMatch(
+        /gateCommand\(commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*where,\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console\)/,
+      );
+    });
+
+    test("only plugin commands reach the gate: it is an argument to handleCommand, not a check in front of it", () => {
+      // Core commands are resolved inside handleCommand before it consults the gate (commands.ts), so no
+      // gateCommand call may sit outside the handleCommand call.
+      expect((source.match(/gateCommand\(/g) ?? []).length).toBe(1);
+      expect(source.slice(0, handleCall)).not.toMatch(/gateCommand\(/);
+    });
+  });
+
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });
