@@ -990,8 +990,8 @@ _Avoid_: server list, guild cache
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file is secret-bearing from its NAME (the writer
-  names a file for its action, so `webhook-add`), from its TEXT (a webhook URL, with JSON's `\/` and
-  `/` read as the slash they are) and from what it PARSES as, and for such a file a rejection
+  names a file for its action, so `webhook-add`), from its TEXT (a webhook URL, with the two JSON
+  spellings of a slash -- backslash-slash and backslash-u-0-0-2-f -- read as the slash they are) and from what it PARSES as, and for such a file a rejection
   deletes it and its reason carries no parser text (`unreadable JSON` alone -- a parser's message
   quotes what it choked on). If the delete fails the error names the file and nothing else. The file
   that carries an accepted URL exists in the mailbox for at most one drain interval (about five

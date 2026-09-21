@@ -98,8 +98,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Whether the text of a request file holds a webhook URL. JSON may spell a slash `\/` or `/`, so
-// those are read as the slash they are before looking.
+// Whether the text of a request file holds a webhook URL. JSON may spell a slash with a backslash and a
+// slash, or with the six characters backslash-u-0-0-2-f, so both are read as the slash they are before
+// looking.
 const WEBHOOK_URL_IN_TEXT = /discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i;
 function carriesWebhookUrl(text: string): boolean {
   return WEBHOOK_URL_IN_TEXT.test(text.replace(/\\\//g, "/").replace(/\\u002f/gi, "/"));

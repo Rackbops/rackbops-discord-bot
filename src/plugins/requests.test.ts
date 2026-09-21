@@ -538,10 +538,12 @@ describe("consumePluginRequests drain", () => {
 
     test("a url whose slashes are spelled \\u002f is still recognised, wherever the file is named", async () => {
       const h = harness({});
-      h.fs.set(
-        "100-x.json",
-        String.raw`{"action":"skip","plugin":"ghost","version":"1.1.0","requestedBy":"https://discord.com/api/webhooks/123456/TOKENTOKENTOKENTOKENTOKEN"}`,
-      );
+      // Built from character codes: a `backslash u 0 0 2 f` typed into an editor or a tool can be turned
+      // into the character it stands for, and then this would only be testing a plain slash.
+      const slash = `${String.fromCharCode(92)}u002f`;
+      const escaped = `https:${slash}${slash}discord.com${slash}api${slash}webhooks${slash}123456${slash}TOKENTOKENTOKENTOKENTOKEN`;
+      expect(escaped).not.toContain("/");
+      h.fs.set("100-x.json", `{"action":"skip","plugin":"ghost","version":"1.1.0","requestedBy":"${escaped}"}`);
       await consumePluginRequests(h.deps);
       expect(h.rejected).toEqual([]);
       expect(h.fs.size).toBe(0);
@@ -556,6 +558,52 @@ describe("consumePluginRequests drain", () => {
       expect(h.warns).toEqual(["[plugins] rejecting request 100-skip-1.json: apply failed — state write failed"]);
       expect(h.rejected).toEqual([]);
       expect(h.fs.size).toBe(0);
+    });
+
+    test("an error message that holds a url is redacted in the rejection log, for an update request too", async () => {
+      // Not a reason the code would produce; the point is that no path to a log line trusts the message.
+      const throwingGetter = {
+        name: "trap",
+        enabled: true,
+        configured: true,
+        missingEnv: [],
+        active: true,
+        get installedVersion(): string {
+          throw new Error(`boom near ${URL_OK}`);
+        },
+      } as unknown as PluginStateEntry;
+      const state: PluginStateFile = {
+        hostApiVersion: 1,
+        writtenAt: "",
+        plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0.0" }, throwingGetter],
+      };
+      const h = harness(
+        {
+          "100-skip-1.json": wb({ plugin: "trap", action: "skip", version: "1.1.0" }),
+          "200-skip-1.json": wb({ action: "skip", version: "1.1.0" }),
+        },
+        { state },
+      );
+      h.deps.mutateState = async () => {
+        throw new Error(`write failed near ${URL_OK}`);
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([
+        "[plugins] rejecting request 100-skip-1.json: validation threw — boom near [webhook url]",
+        "[plugins] rejecting request 200-skip-1.json: apply failed — write failed near [webhook url]",
+      ]);
+      expect(JSON.stringify([h.warns, h.errors])).not.toContain(TOKEN);
+    });
+
+    test("a failing result write's message is redacted before it is logged", async () => {
+      const r = routingFake({
+        mutateRouting: async () => {
+          throw new Error(`disk error near ${URL_OK}`);
+        },
+      });
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] couldn't record the result of request 100-discovery-refresh-1.json: disk error near [webhook url]"]);
     });
 
     test("a secret-bearing file whose delete fails is reported by name only", async () => {

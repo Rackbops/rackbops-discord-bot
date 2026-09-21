@@ -359,7 +359,9 @@ describe("request results (#241)", () => {
     // Junk between the valid entries, so a drop that shifts the order or the count would show.
     const raw = valid.flatMap((entry, i) => [entry, junk[i % junk.length]]);
     const repaired = repairRouting({ ...good(), results: raw }).results;
-    expect(repaired).toHaveLength(MAX_RESULTS);
+    // The number itself, not the constant: the plan and the panel's own expectation are both "20".
+    expect(MAX_RESULTS).toBe(20);
+    expect(repaired).toHaveLength(20);
     // The newest 20 of the 30 valid ones, oldest first.
     expect(repaired.map((r) => r.id)).toEqual(valid.slice(-MAX_RESULTS).map((r) => r.id));
   });
