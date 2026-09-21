@@ -2065,17 +2065,28 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     ["a value printed without its opening quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `bad value ${OLD_SECRET}`],
   ];
 
-  test("what compose says ABOUT the env file is withheld whole, however the line is written: only the line number survives", async () => {
-    for (const [name, line, said] of HAND_EDITED) {
-      const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, {
-        composeUp: { output: `failed to load env file {ENV_FILE}: line 2: ${said}`, exitCode: 1 },
-      });
-      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
-      expect(run.exitCode, name).toBe(1);
-      expect(String((run.json as { log: string }).log), name).toBe(withheld(fx, "line 2"));
-      expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
-    }
-  });
+  // Each table is walked in two tests of four rows: one env-set spawn per row is several seconds on a loaded
+  // Windows box, and all eight in one test ran past the file's 60 s per-test cap (a timeout that a
+  // mutation-check would then mistake for a kill).
+  const HAND_EDITED_HALVES: [string, [string, string, string][]][] = [
+    ["part 1 of 2", HAND_EDITED.slice(0, 4)],
+    ["part 2 of 2", HAND_EDITED.slice(4)],
+  ];
+
+  for (const [part, rows] of HAND_EDITED_HALVES) {
+    test(`what compose says ABOUT the env file is withheld whole, however the line is written: only the line number survives (${part})`, async () => {
+      expect(rows.length).toBe(4);
+      for (const [name, line, said] of rows) {
+        const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, {
+          composeUp: { output: `failed to load env file {ENV_FILE}: line 2: ${said}`, exitCode: 1 },
+        });
+        const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+        expect(run.exitCode, name).toBe(1);
+        expect(String((run.json as { log: string }).log), name).toBe(withheld(fx, "line 2"));
+        expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+      }
+    });
+  }
 
   test("a message is about the env file when it names the file OR says 'env file'; every line number is kept, and none is fine", async () => {
     const cases: [string, string, string | undefined][] = [
@@ -2097,16 +2108,19 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
   });
 
   // Layer 2, for every message that is NOT about the env file: the same hand-edited lines, scrubbed.
-  test("the value scrub reads a line the way compose does: export, a colon, spaces round the equals sign, U+0085 and a no-break space", async () => {
-    for (const [name, line, said] of HAND_EDITED) {
-      const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, { composeUp: { output: `compose: line 2: ${said}`, exitCode: 1 } });
-      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
-      const log = String((run.json as { log: string }).log);
-      expect(log, name).not.toContain(OLD_SECRET);
-      expect(log, name).toContain("[redacted]");
-      expect(log.startsWith("compose: line 2: "), name).toBe(true);
-    }
-  });
+  for (const [part, rows] of HAND_EDITED_HALVES) {
+    test(`the value scrub reads a line the way compose does: export, a colon, spaces round the equals sign, U+0085 and a no-break space (${part})`, async () => {
+      expect(rows.length).toBe(4);
+      for (const [name, line, said] of rows) {
+        const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, { composeUp: { output: `compose: line 2: ${said}`, exitCode: 1 } });
+        const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+        const log = String((run.json as { log: string }).log);
+        expect(log, name).not.toContain(OLD_SECRET);
+        expect(log, name).toContain("[redacted]");
+        expect(log.startsWith("compose: line 2: "), name).toBe(true);
+      }
+    });
+  }
 
   test("a core credential compose echoes is scrubbed too: whatever env-get would not print", async () => {
     const token = "core-token-7Hq2Lm9Xw4Zt";
