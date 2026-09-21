@@ -2,7 +2,7 @@
 // things that touch Discord and the disk -- registering commands and writing `discovery.json` --
 // through ONE serialized chain.
 //
-// Why serialized: the next child (#241) calls `applyRouting` from the request mailbox, while a boot
+// Why serialized: the request mailbox (#241) calls `applyRouting` and `refreshDiscovery`, while a boot
 // registration or a periodic discovery refresh may be in flight. Two interleaved runs would each read
 // the routing file, each PUT to the same servers, and race on discovery.json. Everything that
 // re-registers or rewrites discovery therefore goes through `enqueue`, and a second call waits behind

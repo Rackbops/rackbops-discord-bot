@@ -73,8 +73,9 @@ function requireFile<T>(value: T, caller: string): T {
  * whatever the file happened to contain) and returns the file to write, which must be an object and
  * is repaired again before it is written -- so a value that does not fit the shape cannot land in
  * the file. That drops every key outside the shape, a `url` or `token` on a webhook above all. It
- * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, and a
- * webhook's `addedAt`, `addedBy` and `broken`): a caller must not put a webhook URL in any of them.
+ * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, a
+ * webhook's `addedAt`, `addedBy` and `broken`, and a request result's `action`, `at` and `reason`): a
+ * caller must not put a webhook URL in any of them.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
   await routingMutator.update(

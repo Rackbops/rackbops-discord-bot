@@ -59,12 +59,17 @@ bot is the sole writer). So a panel action becomes a **request file** the bot co
 validates the JSON and writes it into `data/plugins/requests/` via `docker exec -u bun` (the bot runs
 as `bun`, so `-u bun` makes the file bot-owned — a root-created file would be un-deletable by the bot).
 
-The bot **drains** the mailbox at the start of its update tick (every ~60s) and once at boot, applying
-each request through the same state builders `/plugins` uses, then deleting the file. A malformed or
-invalid file (unknown action, bad `plugin`/`version`, a `version` with a slash, a not-installed
-plugin) is moved to `requests/rejected/` with a log line — never applied, never crashing the drain.
-The mailbox can only ever run the five actions on an **already-installed** plugin; it can't enable a
-new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
+The bot **drains** the mailbox every few seconds on its own timer, at the start of its update tick
+(every ~60s, the backstop) and once at boot, applying each request through the same state builders
+`/plugins` uses, then deleting the file. A malformed or invalid file (unknown action, bad
+`plugin`/`version`, a `version` with a slash, a not-installed plugin) is moved to `requests/rejected/`
+with a log line — never applied, never crashing the drain. Since #241 the bot's drain also handles four
+**routing** actions — `routing-set`, `webhook-add`, `webhook-remove`, `discovery-refresh` — validated
+by the bot against the servers and channels it can see; each may carry an optional `id` the panel
+chooses, under which the bot records the outcome in `routing.json`'s `results`. A request file that may
+carry a webhook URL is deleted, not moved to `rejected/`, if it is refused. The mailbox can only ever
+run the five update actions on an **already-installed** plugin and those four routing ones; it can't
+enable a new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
 (`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
 
@@ -485,7 +490,7 @@ Origin-guards and schema-validates it (the same anchored `plugin`/`version` rule
 the bot enforce, so a bad or hostile body is a `400` here), then sets `requestedBy` from the
 **Cloudflare Access identity that made the request, never anything in the body** (`email:<addr>`, or
 `token` on the bearer path), and shells `bot-ops.sh plugin-request` to drop the file in the mailbox.
-The bot applies it on its next tick (within a minute) exactly as it does a `/plugins` command — an
+The bot applies it within seconds (its mailbox timer; the 60s tick is the backstop) exactly as it does a `/plugins` command — an
 **Update now** or a due **Schedule** restarts the bot to install; the identity is recorded in
 `state.json` and shown in `/plugins list`, but because it isn't a Discord user id the bot **logs** the
 outcome rather than trying to DM it. An update whose latest version needs a newer bot than this one

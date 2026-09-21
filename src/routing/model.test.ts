@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import {
+  clip,
   freshRouting,
   freshSecrets,
+  MAX_RESULTS,
   PLUGIN_NAME_RE,
+  REQUEST_ID_RE,
   repairRouting,
   repairSecrets,
   ROUTING_VERSION,
   SNOWFLAKE_RE,
+  withResult,
+  type RequestResult,
   type RoutingFile,
 } from "./model";
 
@@ -29,6 +34,7 @@ function good(): RoutingFile {
     webhooks: {
       [CHAN_1]: { id: HOOK, guildId: GUILD_A, addedAt: "2026-09-21T00:00:00.000Z", addedBy: "admin@example.com" },
     },
+    results: [],
   };
 }
 
@@ -59,7 +65,7 @@ describe("the constants", () => {
 
 describe("freshRouting / freshSecrets", () => {
   test("a fresh file is empty and versioned", () => {
-    expect(freshRouting()).toEqual({ v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {} });
+    expect(freshRouting()).toEqual({ v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] });
     expect(freshSecrets()).toEqual({ v: 1, webhooks: {} });
   });
 
@@ -233,6 +239,7 @@ describe("repairRouting", () => {
       updatedBy: "admin@example.com",
       plugins: { music: { servers: { [GUILD_A]: { commands: "all" } } } },
       webhooks: good().webhooks,
+      results: [],
     });
   });
 
@@ -303,6 +310,148 @@ describe("repairRouting", () => {
       expect(() => repairRouting(raw)).not.toThrow();
     }
     expect(Object.keys(repairRouting({ v: 1, plugins: many }).plugins)).toHaveLength(5000);
+  });
+});
+
+/** A result a panel could have caused. `n` makes the id (and so the position) recognisable. */
+function result(n: number, over: Partial<RequestResult> = {}): RequestResult {
+  return { id: `request-${n}`, action: "routing-set", plugin: "music", ok: true, at: "2026-09-21T12:00:00.000Z", ...over };
+}
+
+describe("request results (#241)", () => {
+  test("a request id is 8 to 64 characters of letters, digits, underscore and hyphen", () => {
+    for (const id of ["12345678", "a-b_C9Zz", "x".repeat(64)]) expect(REQUEST_ID_RE.test(id), id).toBe(true);
+    for (const id of ["", "1234567", "x".repeat(65), "has space", "a/b/c/d/e/f", "quo\"te-id", "line\nbreak", "id.with.dots"]) {
+      expect(REQUEST_ID_RE.test(id), JSON.stringify(id)).toBe(false);
+    }
+  });
+
+  test("a file without results repairs to an empty list", () => {
+    expect(repairRouting({ v: 1, plugins: {}, webhooks: {} }).results).toEqual([]);
+    expect(repairRouting(good()).results).toEqual([]);
+    // A `results` that is not a list is no results, and costs the rest of the file nothing.
+    for (const bad of [null, "x", 5, true, {}, { 0: result(1) }]) {
+      const repaired = repairRouting({ ...good(), results: bad });
+      expect(repaired.results, JSON.stringify(bad)).toEqual([]);
+      expect(repaired.updatedBy).toBe("admin@example.com");
+    }
+  });
+
+  test("a valid result comes back as it was", () => {
+    const full = result(1, { channelId: CHAN_1, reason: "no webhook is registered for that channel", ok: false });
+    expect(repairRouting({ ...good(), results: [full] }).results).toEqual([full]);
+    expect(repairRouting({ ...good(), results: [result(2)] }).results).toEqual([result(2)]);
+  });
+
+  test("malformed results are dropped and the list is trimmed to the newest 20", () => {
+    const valid = Array.from({ length: 30 }, (_, i) => result(i));
+    const junk: unknown[] = [
+      null,
+      "text",
+      [],
+      result(50, { id: "short" }),
+      result(51, { id: "has space in it" }),
+      result(52, { id: "x".repeat(65) }),
+      { ...result(53), ok: "yes" },
+      { ...result(54), action: 7 },
+      { ...result(55), at: undefined },
+      { ...result(56), id: undefined },
+    ];
+    // Junk between the valid entries, so a drop that shifts the order or the count would show.
+    const raw = valid.flatMap((entry, i) => [entry, junk[i % junk.length]]);
+    const repaired = repairRouting({ ...good(), results: raw }).results;
+    // The number itself, not the constant: the plan and the panel's own expectation are both "20".
+    expect(MAX_RESULTS).toBe(20);
+    expect(repaired).toHaveLength(20);
+    // The newest 20 of the 30 valid ones, oldest first.
+    expect(repaired.map((r) => r.id)).toEqual(valid.slice(-MAX_RESULTS).map((r) => r.id));
+  });
+
+  test("a result's reason is clipped and unknown keys are not carried", () => {
+    const repaired = repairRouting({
+      ...good(),
+      results: [
+        {
+          ...result(1),
+          reason: "x".repeat(1000),
+          url: "https://discord.com/api/webhooks/123456/SECRET-TOKEN-VALUE-0123456789",
+          token: "SECRET-TOKEN-VALUE-0123456789",
+          extra: { nested: true },
+        },
+      ],
+    }).results;
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]!.reason).toHaveLength(300);
+    expect(Object.keys(repaired[0]!).sort()).toEqual(["action", "at", "id", "ok", "plugin", "reason"]);
+    expect(JSON.stringify(repaired)).not.toContain("SECRET-TOKEN-VALUE");
+  });
+
+  test("a result keeps its plugin and channel only when they have the right shape", () => {
+    const repaired = repairRouting({
+      ...good(),
+      results: [
+        result(1, { plugin: "Not A Plugin", channelId: "12ab", reason: 42 as unknown as string }),
+        result(2, { plugin: "wow-2", channelId: CHAN_2 }),
+      ],
+    }).results;
+    expect(repaired[0]).toEqual({ id: "request-1", action: "routing-set", ok: true, at: "2026-09-21T12:00:00.000Z" });
+    expect(repaired[1]).toMatchObject({ plugin: "wow-2", channelId: CHAN_2 });
+  });
+
+  test("withResult appends and trims", () => {
+    const start: RoutingFile = { ...good(), results: Array.from({ length: MAX_RESULTS }, (_, i) => result(i)) };
+    const next = withResult(start, result(99));
+    // Appended last, and the oldest went to make room.
+    expect(next.results).toHaveLength(MAX_RESULTS);
+    expect(next.results.at(-1)!.id).toBe("request-99");
+    expect(next.results[0]!.id).toBe("request-1");
+    // Everything else in the file is untouched, and the input is not mutated.
+    expect(next.plugins).toEqual(start.plugins);
+    expect(next.webhooks).toEqual(start.webhooks);
+    expect(next.updatedBy).toBe(start.updatedBy);
+    expect(start.results).toHaveLength(MAX_RESULTS);
+    expect(start.results[0]!.id).toBe("request-0");
+    // Below the cap it just appends.
+    expect(withResult(freshRouting(), result(1)).results).toEqual([result(1)]);
+  });
+
+  test("withResult replaces an earlier result under the same id, so a replayed request cannot flood the list", () => {
+    let file = { ...freshRouting(), results: [result(1), result(2), result(3)] };
+    const replay = result(2, { ok: false, reason: "second time" });
+    file = withResult(file, replay);
+    // One entry for id 2, moved to the end with its newest outcome; the others are untouched and in order.
+    expect(file.results.map((r) => r.id)).toEqual(["request-1", "request-3", "request-2"]);
+    expect(file.results.at(-1)).toEqual(replay);
+    // Twenty-five replays of one id leave one entry.
+    for (let i = 0; i < 25; i += 1) file = withResult(file, result(2, { reason: `try ${i}` }));
+    expect(file.results.filter((r) => r.id === "request-2")).toHaveLength(1);
+    expect(file.results).toHaveLength(3);
+  });
+
+  test("clip never ends on half a surrogate pair and always returns well-formed text", () => {
+    const pair = String.fromCodePoint(0x1f600); // two UTF-16 units
+    const lone = String.fromCharCode(0xd83d);
+    // Cut in the middle of the pair: the half is dropped.
+    expect(clip("x".repeat(199) + pair, 200)).toBe("x".repeat(199));
+    // Cut just after the pair: kept whole.
+    expect(clip("x".repeat(198) + pair, 200)).toBe("x".repeat(198) + pair);
+    // A lone surrogate in the middle becomes U+FFFD rather than surviving to break encodeURIComponent.
+    const cleaned = clip(`a${lone}b`, 10);
+    expect(cleaned).toBe(`a${String.fromCharCode(0xfffd)}b`);
+    expect(() => encodeURIComponent(cleaned)).not.toThrow();
+    // The edges of the surrogate range: the first and last HIGH surrogate at the cut are dropped, the unit
+    // just below the range is kept, and a lone LOW one is replaced.
+    expect(clip("x".repeat(9) + String.fromCharCode(0xd800), 10)).toBe("x".repeat(9));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xdbff), 10)).toBe("x".repeat(9));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xd7ff), 10)).toBe("x".repeat(9) + String.fromCharCode(0xd7ff));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xdc00), 10)).toBe("x".repeat(9) + String.fromCharCode(0xfffd));
+    // Short text and the empty string come back as they were.
+    expect(clip("short", 200)).toBe("short");
+    expect(clip("", 5)).toBe("");
+    // And a stored reason is clipped this way.
+    const stored = repairRouting({ ...good(), results: [{ ...result(1), reason: "y".repeat(299) + pair }] }).results[0]!.reason!;
+    expect(stored).toBe("y".repeat(299));
+    expect(() => encodeURIComponent(stored)).not.toThrow();
   });
 });
 
