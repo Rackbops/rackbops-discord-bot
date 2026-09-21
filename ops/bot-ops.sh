@@ -346,12 +346,13 @@ readonly ENV_LINE_RE='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)
 #     honest reading, and saving that key rewrites it unquoted — which repairs the file.
 # Deliberately NOT modelled, though compose does these too: an inline ` # comment`, `${VAR}`
 # interpolation, whitespace around the `=`, a `KEY: value` colon separator, and backslash escapes
-# inside double quotes. No STATIC ALLOWED regex admits `#`, `$`, `:`, `\`, or whitespace, so nothing
-# env-set writes for a static key can produce them; a hand-edit that does shows raw in the panel and
-# normalises on the next save of that key, as before. A PLUGIN key's own manifest `format` can admit
-# them (the shipped wow client keys use `^\S+$`, which allows `#`, `$`, `\` and quotes), and env-set
-# writes such a value verbatim — what compose then makes of it is the plugin author's format to get
-# right, and this script's stored/compared reading of it stays the raw text.
+# inside double quotes. Apart from PLUGIN_INDEX_URL (a URL, so it admits `:`, `#` and `$`), no STATIC
+# ALLOWED regex admits `#`, `$`, `:`, `\`, or whitespace, so nothing env-set writes for those keys can
+# produce them; a hand-edit that does shows raw in the panel and normalises on the next save of that
+# key, as before. A PLUGIN key's own manifest `format` can admit them (the shipped wow client keys use
+# `^\S+$`, which allows `#`, `$`, `\` and quotes) — but env-set refuses a `$` or a quote in ANY key's
+# value, because compose acts on those (see the guard in cmd_env_set), and writes a `#` or `\`
+# verbatim; this script's own stored/compared reading of a value stays the raw text.
 # A bash `read` loop rather than grep on purpose: Git Bash's grep drops "\r" silently, which
 # would let the CR handling pass its test on a Windows dev box even with the trim deleted.
 declare -A ENV_VALUES=()
@@ -783,19 +784,17 @@ cmd_env_set() {
       # key the format regex may be permissive, so this is checked here, for every key, before the
       # format. The message names the key, never the value.
       [[ "$val" != *$'\r'* ]] || die "env-set: value for '$key' is invalid"
-      # compose reads a .env value as SYNTAX, and a plugin key's own manifest `format` may admit it (the
-      # shipped `^\S+$` does): a `$` starts an interpolation, so `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}`
-      # would hand the plugin — and whoever it displays the value to — a core secret; a leading quote
-      # opens a multi-line or unterminated value, which stops compose loading the file at all. Refused
-      # for every plugin key, secret or plain, and never quoting the value. (A static key's regex
-      # already excludes both.)
-      if [[ -z "${ALLOWED[$key]+x}" ]]; then
-        # compose trims whitespace after the `=` before it looks for a quote, so `KEY= "open` is as bad
-        # as `KEY="open`: judge the value with its leading whitespace stripped.
-        local unspaced="${val#"${val%%[![:space:]]*}"}"
-        [[ "$val" != *'$'* && "$unspaced" != '"'* && "$unspaced" != "'"* ]] \
-          || die "env-set: value for '$key' may not contain a dollar sign or start with a quote"
-      fi
+      # compose reads a .env value as SYNTAX, and a manifest `format` may admit it (the shipped `^\S+$`
+      # does), as does the static PLUGIN_INDEX_URL regex: a `$` starts an interpolation, so
+      # `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would hand the plugin — and whoever it displays the value
+      # to — a core secret, and `PLUGIN_INDEX_URL=https://host/?t=${DISCORD_TOKEN}` would send it to
+      # that host; a quote can open a multi-line or unterminated value, which swallows the lines after
+      # it and stops compose loading the file at all. So a value may not contain `$` or a quote
+      # ANYWHERE (not just leading: compose trims a wider set of whitespace than bash's `[[:space:]]`,
+      # U+0085 and U+00A0 among it, before it looks for a quote). Refused for every key, secret or
+      # plain, static or plugin, and never quoting the value. No shipped key needs either character.
+      [[ "$val" != *'$'* && "$val" != *'"'* && "$val" != *"'"* ]] \
+        || die "env-set: value for '$key' may not contain a dollar sign or a quote"
       # Format + required-ness come from the static ALLOWED set, or from the installed plugin's
       # manifest entry for a plugin-owned key (a static key wins if somehow both name it).
       if [[ -n "${ALLOWED[$key]+x}" ]]; then
@@ -999,11 +998,16 @@ cmd_plugin_request() {
   printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || die "plugin-request: payload is not valid JSON"
   # An object, or nothing below can index it (and a jq indexing error is not ours to control).
   printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1 || die "plugin-request: payload is not a JSON object"
-  action="$(printf '%s' "$payload" | jq -r '.action // ""')"
-  plugin="$(printf '%s' "$payload" | jq -r '.plugin // ""')"
-  version="$(printf '%s' "$payload" | jq -r '.version // ""')"
-  at="$(printf '%s' "$payload" | jq -r '.at // ""')"
-  days="$(printf '%s' "$payload" | jq -r 'if .days == null then "" else (.days|tostring) end')"
+  # The string fields go through json_string_field: `$(…)` drops a trailing newline and a value holding
+  # any control character could pass a check here and still be written to the request file with the
+  # character in it, so such a field reads as "" and fails its check ("music\n" is refused, not queued
+  # and then rejected by the bot). `days` may be a number or a string; a string with a control
+  # character reads as a value that fails the day-count check.
+  action="$(printf '%s' "$payload" | json_string_field action)"
+  plugin="$(printf '%s' "$payload" | json_string_field plugin)"
+  version="$(printf '%s' "$payload" | json_string_field version)"
+  at="$(printf '%s' "$payload" | json_string_field at)"
+  days="$(printf '%s' "$payload" | jq -r 'if .days == null then "" elif (.days | type) == "string" and (.days | test("[\\x00-\\x1f]")) then "?" else (.days | tostring) end')"
 
   local snowflake_re='^[0-9]{5,25}$'
   local webhook_re='^https://(canary\.|ptb\.)?discord(app)?\.com/api(/v[0-9]+)?/webhooks/[0-9]{5,25}/[A-Za-z0-9_-]{20,}$'
@@ -1025,12 +1029,8 @@ cmd_plugin_request() {
     routing-set)
       # Where a plugin lives: `servers` maps a guild id to {commands: "all" | [channel ids, non-empty],
       # postTo?: channel id}. An empty `servers` object is valid (the plugin is placed nowhere).
-      # Every message below names the field, never the offending value. `plugin` is read through
-      # json_string_field, not the `$(…)` above: that drops a trailing newline, so "music\n" would pass
-      # the name check while the request file kept the newline.
-      local routing_plugin
-      routing_plugin="$(printf '%s' "$payload" | json_string_field plugin)"
-      [[ "$routing_plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
+      # Every message below names the field, never the offending value.
+      [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
       # \A…\z, not ^…$: in jq's regex flavour `$` also matches before a trailing newline, so "12345\n"
       # would pass as a snowflake (JavaScript's `$`, which the bot uses, does not).
       printf '%s' "$payload" | jq -e '
@@ -1061,7 +1061,9 @@ cmd_plugin_request() {
   esac
 
   local file req_dir='/app/data/plugins/requests'
-  file="$(date +%s%3N)-${action}-${RANDOM}.json"
+  # Two RANDOMs, not one: two requests of the same action in the same millisecond must not share a name
+  # (they would share the temp file too, and one would overwrite the other).
+  file="$(date +%s%3N)-${action}-${RANDOM}${RANDOM}.json"
   # The write is ATOMIC and OWNER-ONLY (found by #241's review gate). `cat > <final>` creates the file
   # and only then fills it, so for a moment it exists empty or partial — and the bot's drain lists
   # `*.json`, reads, and REJECTS a file that does not parse, after this script has already told the

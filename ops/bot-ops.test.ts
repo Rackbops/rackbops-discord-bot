@@ -14,7 +14,9 @@ import { repairRouting } from "../src/routing/model";
 // Every test here spawns real bash + jq, ~0.3-0.5 s a call on Windows; a test that loops over a
 // table of cases (the #240 request-validation ones do) can pass Bun's 5 s default on a loaded box, so
 // each test gets a minute instead. Same test bodies, same names; only the ceiling moves.
-const test = (name: string, fn: () => void | Promise<void>) => bunTest(name, fn, 60_000);
+const test = (name: string, fn: () => void | Promise<void>, ms = 60_000) => bunTest(name, fn, ms);
+/** For the table-driven tests that spawn bash + jq dozens of times: three minutes, not one. */
+const LONG = 180_000;
 
 const BOT_OPS_SH = fileURLToPath(new URL("./bot-ops.sh", import.meta.url));
 
@@ -1655,32 +1657,42 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     for (const key of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET"]) expect(Object.keys(schema), key).not.toContain(key);
   });
 
-  test("a plugin key's value may not contain a dollar sign or start with a quote (compose reads it as syntax)", async () => {
+  test("a value may not contain a dollar sign or a quote anywhere (compose reads it as syntax)", async () => {
     const index = wrapIndex([pluginEntry("p", [envKey("P_SECRET", "^\\S+$", { secret: true }), envKey("P_PLAIN", "^.+$")])]);
     const base = "PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\n";
+    // compose trims a wider set of whitespace than bash's [[:space:]] (U+0085 and U+00A0 among it) before it
+    // looks for a quote, so a quote is refused wherever it sits, not only at the start.
+    const NEL = String.fromCharCode(0x85);
+    const NBSP = String.fromCharCode(0xa0);
+    const refused = ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"', ' "open', "\t'open", '  "x"', `${NEL}"open`, `${NBSP}"open`, 'a"b', "a'b", 'closing"'];
     for (const key of ["P_SECRET", "P_PLAIN"]) {
-      // (compose trims whitespace after the `=` before it looks for a quote, so a leading space or tab does not help)
-      for (const val of ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"', ' "open', "\t'open", '  "x"']) {
+      for (const val of refused) {
         const fx = setup(base, { pluginIndex: index });
         const run = await botOps(fx, ["env-set"], `${key}=${val}\n`);
-        const why = `${key}=${val}`;
+        const why = `${key}=${JSON.stringify(val)}`;
         expect(run.exitCode, why).toBe(1);
-        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or start with a quote`);
+        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or a quote`);
         expect(everythingObservable(fx, run), why).not.toContain(val);
         expect(envText(fx), why).toBe(base);
         expect(existsSync(join(fx.cfg, "backups")), why).toBe(false);
         expect(recreateCalls(fx).some((c) => c.includes("up -d")), why).toBe(false);
       }
-      // only `$` and a LEADING quote are refused: the rest of `^\S+$` / `^.+$` still passes
-      for (const ok of ["abc-DEF_123", "a#b", "a\\b", 'a"b', "a'b"]) {
+      // nothing else is refused: `#` and a backslash still pass `^\S+$` / `^.+$`
+      for (const ok of ["abc-DEF_123", "a#b", "a\\b"]) {
         const fx = setup(base, { pluginIndex: index });
         expect((await botOps(fx, ["env-set"], `${key}=${ok}\n`)).exitCode, `${key}=${ok}`).toBe(0);
       }
     }
-    // a static key is checked by its own regex, not this guard
+    // the guard covers static keys too: PLUGIN_INDEX_URL's regex admits `$` and compose would interpolate a
+    // core secret into the URL the bot then fetches its index from
+    const url = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "PLUGIN_INDEX_URL=https://evil.example/x?t=${DISCORD_TOKEN}\n");
+    expect(url.exitCode).toBe(1);
+    expect(url.stderr).toContain("value for 'PLUGIN_INDEX_URL' may not contain a dollar sign or a quote");
+    expect((await botOps(setup(base, { pluginIndex: index }), ["env-set"], "PLUGIN_INDEX_URL=https://index.example/plugins.json\n")).exitCode).toBe(0);
+    // a static key whose own regex also rejects it is stopped by the guard first
     const stat = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "ANNOUNCE_CHANNEL_ID=1$2\n");
-    expect(stat.stderr).toContain("value for 'ANNOUNCE_CHANNEL_ID' is invalid");
-  });
+    expect(stat.stderr).toContain("value for 'ANNOUNCE_CHANNEL_ID' may not contain a dollar sign or a quote");
+  }, LONG);
 
   test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
     const index = wrapIndex([
@@ -2441,14 +2453,42 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     expect(wrote(fx)).toBe(false);
   });
 
-  test("a routing-set plugin name with a trailing newline or another control character is rejected, not queued with it", async () => {
+  test("a string field with a trailing newline or another control character is refused for every action, not queued with it", async () => {
+    // `$(…)` drops a trailing newline, so such a value used to pass its check and be written with the
+    // character in it, for the bot to reject after the panel had been told `queued`.
     const fx = setup(ENV);
-    for (const plugin of ["music\n", "music\r", "music\t", `mu${String.fromCharCode(0)}sic`]) {
-      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin, servers: {}, requestedBy: "t" }));
-      expect(run.exitCode, JSON.stringify(plugin)).not.toBe(0);
-      expect(run.stderr, JSON.stringify(plugin)).toContain("plugin-request: bad plugin");
+    for (const bad of ["\n", "\r", "\t", String.fromCharCode(0)]) {
+      const cases: [string, object][] = [
+        ["update-now plugin", { action: "update-now", plugin: `music${bad}`, version: "1.1.0" }],
+        ["skip version", { action: "skip", plugin: "music", version: `1.1.0${bad}` }],
+        ["schedule at", { action: "schedule", plugin: "music", version: "1.1.0", at: `2026-09-06T18:30-07:00${bad}` }],
+        ["remind days", { action: "remind", plugin: "music", version: "1.1.0", days: `3${bad}` }],
+        ["the action itself", { action: `skip${bad}`, plugin: "music", version: "1.1.0" }],
+        ["cancel plugin", { action: "cancel", plugin: `music${bad}` }],
+        ["routing-set plugin", { action: "routing-set", plugin: `music${bad}`, servers: {} }],
+        ["webhook-add url", { action: "webhook-add", url: `${WEBHOOK_URL}${bad}` }],
+        ["webhook-remove channelId", { action: "webhook-remove", channelId: `${CHANNEL}${bad}` }],
+      ];
+      for (const [why, payload] of cases) {
+        const run = await botOps(fx, ["plugin-request"], req({ ...payload, requestedBy: "t" }));
+        expect(run.exitCode, `${why} ${JSON.stringify(bad)}`).not.toBe(0);
+        expect(run.stderr, `${why} ${JSON.stringify(bad)}`).toContain("plugin-request: bad");
+        expect(run.stderr, `${why} ${JSON.stringify(bad)}`).not.toContain(WEBHOOK_TOKEN);
+      }
     }
     expect(wrote(fx)).toBe(false);
+  }, LONG);
+
+  test("the request name ends in two random numbers, so two same-millisecond requests do not share a name", async () => {
+    // RANDOM is seeded through BASH_ENV so the nonce is predictable: it must be two consecutive draws.
+    const fx = setup(ENV);
+    const seed = join(fx.root, "seed.sh");
+    writeFileSync(seed, "RANDOM=7\n");
+    const expected = Bun.spawnSync([BASH!, "-c", "RANDOM=7; printf '%s%s' $RANDOM $RANDOM"]).stdout.toString();
+    expect(expected.length).toBeGreaterThan(1);
+    const run = await botOps(fx, ["plugin-request"], req(REQUESTS[3]!), { BASH_ENV: bashPath(seed) });
+    expect(run.exitCode).toBe(0);
+    expect(String(run.json?.queued)).toMatch(new RegExp(`^\\d{10,}-skip-${expected}\\.json$`));
   });
 
   test("a webhook token needs at least 20 characters (Discord's are far longer)", async () => {

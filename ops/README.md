@@ -243,13 +243,15 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   ours and can quote a `.env` line it refuses to parse. That is best effort, not a proof: a compose
   that echoed caller-controlled text could still tell a caller whether a guess equals a stored secret
   (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
-  refused for every key (it could start a new `.env` line), naming the key only, and a **plugin** key's
-  value may not contain `$` or start with a quote (after any leading whitespace — compose trims it
-  first): compose reads a `.env` value as syntax, so
-  `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key and a leading
-  quote opens an unterminated value that stops compose loading the file, yet a manifest `format` such as
-  the shipped `^\S+$` admits both (static keys' regexes already exclude them; plain plugin keys are
-  covered too, which older versions of this script did not check). (4) A key the
+  refused for every key (it could start a new `.env` line), naming the key only, and so is a value
+  containing `$` or a quote **anywhere**, for every key, secret or plain, static or plugin: compose
+  reads a `.env` value as syntax, so `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core
+  secret into a plugin's key (and `PLUGIN_INDEX_URL=https://host/?t=${DISCORD_TOKEN}` would send it to
+  that host), and a quote can open a value that swallows the lines after it and stops compose loading
+  the file — yet a manifest `format` such as the shipped `^\S+$`, and the static `PLUGIN_INDEX_URL`
+  regex, admit both. (The guard is not limited to a leading quote because compose trims a wider set of
+  whitespace than bash does, U+0085 and U+00A0 among it, before it looks for one; no shipped key needs
+  either character. Older versions of this script checked neither.) (4) A key the
   deployment owns — the core credentials, the access and admin settings, and every variable
   `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
   (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
