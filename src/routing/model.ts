@@ -114,6 +114,19 @@ export function freshSecrets(): RoutingSecretsFile {
   return { v: ROUTING_VERSION, webhooks: {} };
 }
 
+/**
+ * `text` cut to at most `max` UTF-16 units, as well-formed text: a cut never ends on half of a surrogate
+ * pair, and a lone surrogate (a `"\ud83d"` escape in some JSON, say) becomes U+FFFD. A value that is
+ * about to go into `routing.json` for the panel to read needs this: a lone surrogate makes text that
+ * `encodeURIComponent` throws on.
+ */
+export function clip(text: string, max: number): string {
+  let cut = text.slice(0, max);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return cut.toWellFormed();
+}
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -175,13 +188,18 @@ function repairResult(value: unknown): RequestResult | undefined {
   const repaired: RequestResult = { id, action, ok, at };
   if (typeof plugin === "string" && PLUGIN_NAME_RE.test(plugin)) repaired.plugin = plugin;
   if (isSnowflake(channelId)) repaired.channelId = channelId;
-  if (typeof reason === "string") repaired.reason = reason.slice(0, MAX_REASON_LENGTH);
+  if (typeof reason === "string") repaired.reason = clip(reason, MAX_REASON_LENGTH);
   return repaired;
 }
 
-/** `file` with `result` appended, keeping the newest `MAX_RESULTS`. Pure. */
+/**
+ * `file` with `result` appended, keeping the newest `MAX_RESULTS`. Pure. An earlier result under the same
+ * `id` is replaced rather than kept beside it: an id names one request, so a request that is handled
+ * twice (replayed after a crash, or sent again by the panel) leaves one entry, and cannot push the
+ * other requests' outcomes out of the list.
+ */
 export function withResult(file: RoutingFile, result: RequestResult): RoutingFile {
-  return { ...file, results: [...file.results, result].slice(-MAX_RESULTS) };
+  return { ...file, results: [...file.results.filter((r) => r.id !== result.id), result].slice(-MAX_RESULTS) };
 }
 
 /**

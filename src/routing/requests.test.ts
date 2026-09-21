@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   freshRouting,
   freshSecrets,
@@ -69,6 +69,10 @@ function harness(
     applyFails?: unknown;
     routing?: RoutingFile;
     secrets?: RoutingSecretsFile;
+    /** mutateRouting throws this (after being asked, before anything is written). */
+    routingFails?: unknown;
+    /** the Nth mutateSecrets call (1-based) throws this. */
+    secretsFailOnCall?: { call: number; error: unknown };
   } = {},
 ) {
   let discovery = opts.discovery === undefined ? bothServers() : opts.discovery;
@@ -76,20 +80,25 @@ function harness(
   let secrets = opts.secrets ?? freshSecrets();
   const events: string[] = [];
   const warns: string[] = [];
+  let secretsCalls = 0;
   const routingWrites: RoutingFile[] = [];
   const secretsWrites: RoutingSecretsFile[] = [];
   const lookups: { id: string; token: string }[] = [];
   const deps: RoutingRequestDeps = {
     readDiscovery: async () => discovery,
     readRouting: async () => structuredClone(routing),
+    readSecrets: async () => structuredClone(secrets),
     mutateRouting: async (mutate) => {
       events.push("mutateRouting");
+      if (opts.routingFails !== undefined) throw opts.routingFails;
       const written = mutate(repairRouting(routing));
       routingWrites.push(written);
       routing = repairRouting(written);
     },
     mutateSecrets: async (mutate) => {
       events.push("mutateSecrets");
+      secretsCalls += 1;
+      if (opts.secretsFailOnCall?.call === secretsCalls) throw opts.secretsFailOnCall.error;
       const written = mutate(repairSecrets(secrets));
       secretsWrites.push(written);
       secrets = repairSecrets(written);
@@ -186,6 +195,18 @@ describe("the constants", () => {
   });
 });
 
+describe("the id and token in a webhook url", () => {
+  test("an id is 5 to 25 digits and a token 20 or more of letters, digits, underscore and hyphen", () => {
+    const url = (id: string, token: string) => `https://discord.com/api/webhooks/${id}/${token}`;
+    for (const id of ["12345", "1".repeat(25)]) expect(WEBHOOK_URL_RE.test(url(id, TOKEN)), id).toBe(true);
+    for (const id of ["1234", "1".repeat(26), ""]) expect(WEBHOOK_URL_RE.test(url(id, TOKEN)), id).toBe(false);
+    for (const token of ["a".repeat(20), "a".repeat(200), "A-b_C".repeat(8)]) expect(WEBHOOK_URL_RE.test(url(WH_ID, token)), token).toBe(true);
+    for (const token of ["a".repeat(19), "a".repeat(20) + ".", "a".repeat(20) + "?x=1", "a b".repeat(10)]) {
+      expect(WEBHOOK_URL_RE.test(url(WH_ID, token)), token).toBe(false);
+    }
+  });
+});
+
 describe("parseRoutingRequest", () => {
   const reasonOf = (raw: unknown): string | undefined => {
     const parsed = parseRoutingRequest(raw);
@@ -223,6 +244,48 @@ describe("parseRoutingRequest", () => {
     const clipped = parseRoutingRequest({ action: "discovery-refresh", requestedBy: `${"x".repeat(180)} ${URL_OK}` });
     expect(clipped.ok && clipped.request.requestedBy).not.toContain("TOKEN_");
     expect(clipped.ok && clipped.request.requestedBy).toBe(`${"x".repeat(180)} [webhook url]`);
+  });
+
+  test("for a webhook-add the token is scrubbed from requestedBy and id, in whatever shape it sits", () => {
+    // Not a url at all, just the token where a name should be; and a shape no url pattern knows.
+    const parsed = parseRoutingRequest({
+      action: "webhook-add",
+      url: URL_OK,
+      requestedBy: `admin ${TOKEN} via https://discord.com:443/api/webhooks/${WH_ID}/${TOKEN}?x=1`,
+      id: TOKEN,
+    });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    // (The request itself carries the url it is about to be applied with; what is stored is requestedBy
+    // and the id.)
+    expect(parsed.request.requestedBy).not.toContain(TOKEN);
+    // The id was the token: it is dropped, not fatal, and the request carries none.
+    expect("id" in parsed.request).toBe(false);
+    expect(parsed.request.requestedBy).toContain("admin ");
+    // An id that merely resembles one is kept.
+    const kept = parseRoutingRequest({ action: "webhook-add", url: URL_OK, requestedBy: ME, id: "req_12345678" });
+    expect(kept.ok && kept.request.id).toBe("req_12345678");
+  });
+
+  test("requestedBy is only scanned so far, and a url cut short by that is still redacted", () => {
+    const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: "x".repeat(4060) + URL_OK });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    // Clipped to 200; nothing of the url survives in what is stored.
+    expect(parsed.request.requestedBy).toBe("x".repeat(200));
+    // And when the cut falls inside the url, what is left of it is still removed.
+    const inside = parseRoutingRequest({ action: "discovery-refresh", requestedBy: "y".repeat(4070) + URL_OK });
+    expect(inside.ok && inside.request.requestedBy).toBe("y".repeat(200));
+    const short = parseRoutingRequest({ action: "discovery-refresh", requestedBy: `${"z".repeat(100)} ${URL_OK}` });
+    expect(short.ok && short.request.requestedBy).toBe(`${"z".repeat(100)} [webhook url]`);
+  });
+
+  test("requestedBy is well-formed text: a clip never ends on half a surrogate pair", () => {
+    const pair = String.fromCodePoint(0x1f600);
+    const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: "a".repeat(199) + pair });
+    expect(parsed.ok && parsed.request.requestedBy).toBe("a".repeat(199));
+    const lone = parseRoutingRequest({ action: "discovery-refresh", requestedBy: `a${String.fromCharCode(0xd83d)}b` });
+    expect(lone.ok && lone.request.requestedBy).toBe(`a${String.fromCharCode(0xfffd)}b`);
   });
 
   test("routing-set: a bad plugin name is refused: bad plugin name", () => {
@@ -418,6 +481,28 @@ describe("applyRoutingRequest: routing-set", () => {
     expect(h.routingWrites).toEqual([]);
   });
 
+  test("a discovery.json damaged where readDiscovery cannot see is looked at again after a refresh", async () => {
+    // A guild that is not an object: `readDiscovery` only checks that there is a list. Validating against
+    // it throws, which is the same as a stale file -- refresh, then look again.
+    const damaged = { ...bothServers(), guilds: [null as never] };
+    const h = harness({ discovery: damaged, afterRefresh: bothServers() });
+    await applyRoutingRequest(setRequest(), h.deps);
+    expect(h.events).toEqual(["refreshDiscovery", "mutateRouting", "applyRouting routing-set music"]);
+    expect(h.routing.plugins.music).toBeDefined();
+  });
+
+  test("a discovery.json that is still damaged after the refresh is a fault, not a refusal", async () => {
+    const damaged = { ...bothServers(), guilds: [null as never] };
+    const h = harness({ discovery: damaged, afterRefresh: damaged });
+    const failure = await applyRoutingRequest(setRequest(), h.deps).then(
+      () => undefined,
+      (err: unknown) => err,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure).not.toBeInstanceOf(RoutingRefusal);
+    expect(h.routingWrites).toEqual([]);
+  });
+
   test("a re-registration that fails does not fail the request", async () => {
     const h = harness({ applyFails: new Error("Missing Access") });
     await expect(applyRoutingRequest(setRequest(), h.deps)).resolves.toEqual({});
@@ -481,6 +566,44 @@ describe("applyRoutingRequest: webhook-add", () => {
     await applyRoutingRequest(addRequest(), h.deps);
     expect(Object.keys(h.routing.webhooks).sort()).toEqual([CH_HOME, CH_OTHER]);
     expect(Object.keys(h.secrets.webhooks).sort()).toEqual([CH_HOME, CH_OTHER]);
+  });
+
+  test("webhook-add stamps routing.json's updatedAt as well as updatedBy", async () => {
+    const h = harness();
+    await applyRoutingRequest(addRequest(), h.deps);
+    expect(h.routing.updatedAt).toBe(NOW.toISOString());
+    expect(h.routing.webhooks[CH_HOME]!.addedAt).toBe(NOW.toISOString());
+  });
+
+  test("a failed metadata write puts the secret back as it was: a first add leaves no secret behind", async () => {
+    const h = harness({ routingFails: new Error("EIO: write failed") });
+    await expect(applyRoutingRequest(addRequest(), h.deps)).rejects.toThrow("EIO: write failed");
+    // The secret was written, then taken out again; nothing names the webhook anywhere.
+    expect(h.events).toEqual(["fetchWebhook", "mutateSecrets", "mutateRouting", "mutateSecrets"]);
+    expect(h.secrets.webhooks).toEqual({});
+    expect(h.routing.webhooks).toEqual({});
+  });
+
+  test("a failed metadata write on a replacement restores the previous url, so the two files still agree", async () => {
+    const before = "https://discord.com/api/webhooks/666666666666666666/PREVIOUSTOKEN_0123456789abc";
+    const h = harness({
+      routingFails: new Error("EIO: write failed"),
+      routing: routingWithWebhook(),
+      secrets: { ...freshSecrets(), webhooks: { [CH_HOME]: before } },
+    });
+    await expect(applyRoutingRequest(addRequest(), h.deps)).rejects.toThrow("EIO: write failed");
+    expect(h.secrets.webhooks[CH_HOME]).toBe(before);
+    expect(h.routing.webhooks[CH_HOME]!.id).toBe("666666666666666666");
+  });
+
+  test("if the secret cannot be put back either, the original error still surfaces and the log carries no url", async () => {
+    const h = harness({
+      routingFails: new Error("EIO: write failed"),
+      secretsFailOnCall: { call: 2, error: new Error(`EACCES writing ${URL_OK}`) },
+    });
+    await expect(applyRoutingRequest(addRequest(), h.deps)).rejects.toThrow("EIO: write failed");
+    expect(h.warns).toEqual([`[routing] could not put back the webhook secret for channel ${CH_HOME} after a failed write`]);
+    expect(JSON.stringify(h.warns)).not.toContain(TOKEN);
   });
 
   test("a webhook in a server the bot is not in is refused", async () => {
@@ -567,6 +690,46 @@ describe("applyRoutingRequest: webhook-remove and discovery-refresh", () => {
     expect(Object.keys(h.routing.webhooks)).toEqual([CH_OTHER]);
   });
 
+  test("webhook-remove stamps routing.json's updatedAt as well as updatedBy", async () => {
+    const h = harness({ routing: routingWithWebhook() });
+    await applyRoutingRequest(removeRequest(), h.deps);
+    expect(h.routing.updatedAt).toBe(NOW.toISOString());
+  });
+
+  test("webhook-remove clears a secret that routing.json no longer names", async () => {
+    // A write that failed halfway, or a hand edit: the url is stored but nothing names it, and the
+    // request must still be able to remove it.
+    const h = harness({ secrets: { ...freshSecrets(), webhooks: { [CH_HOME]: URL_OK, [CH_OTHER]: URL_OK.replace(WH_ID, "666666666666666666") } } });
+    await expect(applyRoutingRequest(removeRequest(), h.deps)).resolves.toEqual({ channelId: CH_HOME });
+    expect(h.events).toEqual(["mutateSecrets"]);
+    expect(Object.keys(h.secrets.webhooks)).toEqual([CH_OTHER]);
+    // routing.json had nothing to remove and was not rewritten.
+    expect(h.routingWrites).toEqual([]);
+  });
+
+  test("webhook-remove clears metadata that has no secret behind it", async () => {
+    const h = harness({ routing: routingWithWebhook() });
+    await expect(applyRoutingRequest(removeRequest(), h.deps)).resolves.toEqual({ channelId: CH_HOME });
+    expect(h.events).toEqual(["mutateRouting"]);
+    expect(h.routing.webhooks).toEqual({});
+  });
+
+  test("a webhook-remove that failed halfway can be sent again", async () => {
+    const first = harness({
+      routing: routingWithWebhook(),
+      secrets: { ...freshSecrets(), webhooks: { [CH_HOME]: URL_OK } },
+      secretsFailOnCall: { call: 1, error: new Error("EIO: write failed") },
+    });
+    await expect(applyRoutingRequest(removeRequest(), first.deps)).rejects.toThrow("EIO");
+    // The metadata went and the secret stayed...
+    expect(first.routing.webhooks).toEqual({});
+    expect(first.secrets.webhooks[CH_HOME]).toBe(URL_OK);
+    // ...and a second request finishes the job instead of being refused for having nothing to remove.
+    const second = harness({ routing: first.routing, secrets: first.secrets });
+    await expect(applyRoutingRequest(removeRequest(), second.deps)).resolves.toEqual({ channelId: CH_HOME });
+    expect(second.secrets.webhooks).toEqual({});
+  });
+
   test("webhook-remove for a channel with none is refused", async () => {
     const h = harness();
     expect(await refusalOf(applyRoutingRequest(removeRequest(), h.deps))).toBe("no webhook is registered for that channel");
@@ -619,6 +782,17 @@ describe("liveFetchWebhook", () => {
     expect(calls[0]!.init?.method).toBeUndefined();
     expect(calls[0]!.init?.redirect).toBe("error");
     expect(calls[0]!.init?.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  test("the lookup is bounded to ten seconds", async () => {
+    const timeout = spyOn(AbortSignal, "timeout");
+    try {
+      await liveFetchWebhook(respond(200, good))(WH_ID, TOKEN);
+      expect(timeout).toHaveBeenCalledTimes(1);
+      expect(timeout).toHaveBeenCalledWith(10_000);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   test("a good answer returns the three ids and nothing else -- the token in the body goes nowhere", async () => {
@@ -685,6 +859,22 @@ describe("redactWebhookUrls", () => {
     expect(redacted).toBe('first [webhook url], then "[webhook url]" and {"url":"[webhook url]"}');
     expect(redacted).not.toContain(TOKEN);
     expect(redacted).not.toContain(WH_ID);
+  });
+
+  test("redacts the path of a url whose host it does not recognise: a port, a doubled slash, no host at all", () => {
+    for (const url of [
+      `https://discord.com:443/api/webhooks/${WH_ID}/${TOKEN}`,
+      `https://discord.com//api/webhooks/${WH_ID}/${TOKEN}`,
+      `/api/webhooks/${WH_ID}/${TOKEN}`,
+      `webhooks/${WH_ID}/${TOKEN}`,
+      `https:%2F%2Fdiscord.com%2Fapi%2Fwebhooks%2F${WH_ID}%2F${TOKEN}`,
+    ]) {
+      const redacted = redactWebhookUrls(`could not use ${url} today`);
+      expect(redacted, url).not.toContain(TOKEN);
+      expect(redacted, url).not.toContain(WH_ID);
+      expect(redacted, url).toContain("[webhook url]");
+      expect(redacted, url).toContain(" today");
+    }
   });
 
   test("leaves other text alone", () => {

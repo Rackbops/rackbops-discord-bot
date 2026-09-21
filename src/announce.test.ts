@@ -46,7 +46,8 @@ describe("livePluginRequestDeps (#241)", () => {
       expect(routing!.applyRouting).toBe(applyRouting);
       expect(routing!.refreshDiscovery).toBe(refreshDiscovery);
       expect(routing!.log).toBe(console);
-      expect(routing!.now()).toBeInstanceOf(Date);
+      // The real clock, not a fixed date.
+      expect(Math.abs(routing!.now().getTime() - Date.now())).toBeLessThan(5_000);
 
       // ...and the store ones are bound to THIS data dir, not to some other path.
       await routing!.mutateRouting((current) => ({ ...current, updatedBy: "wiring-probe" }));
@@ -55,6 +56,8 @@ describe("livePluginRequestDeps (#241)", () => {
       const url = "https://discord.com/api/webhooks/1234567/WIRINGPROBE_0123456789abcd";
       await routing!.mutateSecrets((current) => ({ ...current, webhooks: { "333333333333333331": url } }));
       expect(JSON.parse(readFileSync(join(DATA_DIR, "routing.secrets.json"), "utf8")).webhooks["333333333333333331"]).toBe(url);
+      // readSecrets reads that same file back (a webhook-remove needs it to find a stored url).
+      expect((await routing!.readSecrets()).webhooks["333333333333333331"]).toBe(url);
 
       // readDiscovery reads this data dir's discovery.json: none yet, then the file that was written.
       expect(await routing!.readDiscovery()).toBeNull();
@@ -78,6 +81,18 @@ describe("livePluginRequestDeps (#241)", () => {
       stub.mockRestore();
       cleanUp();
     }
+  });
+});
+
+describe("the pluginRequests tick check (#241)", () => {
+  test("is gated on the plugin state being ready, so no drain can run before initRouting", () => {
+    // The flag is set only after the boot registration and boot drain (index.ts), and both this check
+    // and the five-second timer are gated on it. announce.ts holds the flag in module state, so the
+    // gate is pinned in the source, as index.ts's wiring is.
+    const source = readFileSync(join(import.meta.dir, "announce.ts"), "utf8");
+    expect(source).toMatch(
+      /name: "pluginRequests",\s*run: async \(\) => \{\s*if \(pluginStateReady\) await consumePluginRequests\(livePluginRequestDeps\(\)\);/,
+    );
   });
 });
 

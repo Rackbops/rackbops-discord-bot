@@ -113,6 +113,8 @@ describe("consumePluginRequests drain", () => {
         warn: (message) => void warns.push(message),
         error: (message, err) => void errors.push(err === undefined ? message : `${message} ${String(err)}`),
       },
+      // No pause before a second look at a file that will not parse: the tests are not waiting for a writer.
+      tornReadRetryMs: 0,
       ...(opts.routing === undefined ? {} : { routing: opts.routing }),
     };
     return {
@@ -235,6 +237,7 @@ describe("consumePluginRequests drain", () => {
       const deps: RoutingRequestDeps = {
         readDiscovery: async () => discovery(),
         readRouting: async () => structuredClone(routing),
+        readSecrets: async () => structuredClone(secrets),
         mutateRouting: async (mutate) => {
           calls.push("mutateRouting");
           routing = repairRouting(mutate(repairRouting(routing)));
@@ -311,10 +314,10 @@ describe("consumePluginRequests drain", () => {
       const r = routingFake();
       const h = harness(
         {
-          "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }),
-          "200-routing-set-1.json": setPlugin({ servers: "nope" }),
-          "300-webhook-remove-1.json": removeWebhook({ channelId: "abc" }),
-          "400-x.json": req({ action: "discovery-refresh", requestedBy: "" }),
+          "100-routing-set-1.json": setPlugin({ plugin: "Bad Name", id: "req_00000001" }),
+          "200-routing-set-1.json": setPlugin({ servers: "nope", id: "req_00000002" }),
+          "300-webhook-remove-1.json": removeWebhook({ channelId: "abc", id: "req_00000003" }),
+          "400-x.json": req({ action: "discovery-refresh", requestedBy: "", id: "req_00000004" }),
         },
         { routing: r.deps },
       );
@@ -549,15 +552,200 @@ describe("consumePluginRequests drain", () => {
       expect(h.fs.size).toBe(0);
     });
 
-    test("an update request that carries a url and then fails to apply is deleted, not moved", async () => {
-      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", note: URL_OK }) });
-      h.deps.mutateState = async () => {
-        throw new Error("state write failed");
+    test("an update request that carries a url is refused and deleted, never applied", async () => {
+      // Its `requestedBy` would land in state.json and a log line, and no update request has a reason to
+      // hold a webhook url.
+      const h = harness({
+        "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy: URL_OK }),
+        "200-skip-1.json": wb({ action: "skip", version: "1.1.0", note: URL_OK }),
+        "300-skip-1.json": wb({ action: "skip", version: "1.1.0" }),
+      });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([
+        "[plugins] rejecting request 100-skip-1.json: a webhook url does not belong in this request",
+        "[plugins] rejecting request 200-skip-1.json: a webhook url does not belong in this request",
+      ]);
+      expect(h.rejected).toEqual([]);
+      // Only the clean one was applied, and the url never reached the state.
+      expect(h.mutations).toHaveLength(1);
+      expect(JSON.stringify(h.state)).not.toContain(TOKEN);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a file named for webhook-add that is not a routing request is refused and deleted", async () => {
+      const h = harness({ "100-webhook-add-1.json": wb({ action: "skip", version: "1.1.0" }) });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: not a routing action"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.mutations).toHaveLength(0);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("every spelling of a webhook url is recognised in a file that is not named for one", async () => {
+      const bs = String.fromCharCode(92);
+      const u = (hex: string) => `${bs}u${hex}`;
+      const forms: Record<string, string> = {
+        plain: `https://discord.com/api/webhooks/${WH_ID}/${TOKEN}`,
+        "upper case": `HTTPS://DISCORD.COM/API/WEBHOOKS/${WH_ID}/${TOKEN}`,
+        versioned: `https://discord.com/api/v10/webhooks/${WH_ID}/${TOKEN}`,
+        discordapp: `https://discordapp.com/api/webhooks/${WH_ID}/${TOKEN}`,
+        canary: `https://canary.discord.com/api/webhooks/${WH_ID}/${TOKEN}`,
+        "a port": `https://discord.com:443/api/webhooks/${WH_ID}/${TOKEN}`,
+        "a doubled slash": `https://discord.com//api/webhooks/${WH_ID}/${TOKEN}`,
+        "a trailing dot": `https://discord.com./api/webhooks/${WH_ID}/${TOKEN}`,
+        "no host": `/api/webhooks/${WH_ID}/${TOKEN}`,
+        "just the path": `webhooks/${WH_ID}/${TOKEN}`,
+        "percent-encoded slashes": `https:%2F%2Fdiscord.com%2Fapi%2Fwebhooks%2F${WH_ID}%2F${TOKEN}`,
+        "json-escaped slashes": `https:${bs}/${bs}/discord.com${bs}/api${bs}/webhooks${bs}/${WH_ID}${bs}/${TOKEN}`,
+        "a unicode-escaped letter in the host": `https://${u("0064")}iscord.com/api/webhooks/${WH_ID}/${TOKEN}`,
+        "a unicode-escaped dot": `https://discord${u("002e")}com/api/webhooks/${WH_ID}/${TOKEN}`,
+        "unicode-escaped slashes": `https:${u("002f")}${u("002f")}discord.com${u("002f")}api${u("002f")}webhooks${u("002f")}${WH_ID}${u("002f")}${TOKEN}`,
+        "a unicode-escaped letter in webhooks": `https://discord.com/api/${u("0077")}ebhooks/${WH_ID}/${TOKEN}`,
+      };
+      for (const [name, url] of Object.entries(forms)) {
+        const h = harness({});
+        h.fs.set("100-x.json", `{"action":"skip","plugin":"ghost","version":"1.1.0","requestedBy":"${url}"}`);
+        await consumePluginRequests(h.deps);
+        expect(h.rejected, name).toEqual([]);
+        expect(h.fs.size, name).toBe(0);
+        expect(h.mutations, name).toHaveLength(0);
+        expect(h.warns, name).toEqual(["[plugins] rejecting request 100-x.json: a webhook url does not belong in this request"]);
+      }
+    });
+
+    test("text that only talks about webhooks is not mistaken for one", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy: "https://example.com/api/webhooks-are-nice" }) });
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(1);
+      expect(h.warns).toEqual([]);
+    });
+
+    test("a request read while it is still being written is looked at again, not rejected", async () => {
+      const good = JSON.stringify(wb({ action: "skip", version: "1.1.0" }));
+      for (const firstRead of ["", '{"plugin":"warbandeer","requestedBy":"email:me@x.com","act']) {
+        const h = harness({});
+        h.fs.set("100-skip-1.json", good);
+        const real = h.deps.readFile;
+        let reads = 0;
+        h.deps.readFile = async (path) => {
+          reads += 1;
+          return reads === 1 ? firstRead : real(path);
+        };
+        await consumePluginRequests(h.deps);
+        expect(reads).toBe(2);
+        expect(h.rejected).toEqual([]);
+        expect(h.warns).toEqual([]);
+        expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0");
+      }
+    });
+
+    test("a file that is still unparseable the second time is rejected, and one that has gone is not a crash", async () => {
+      const still = harness({});
+      still.fs.set("100-skip-1.json", "{ not json");
+      await consumePluginRequests(still.deps);
+      expect(still.rejected).toEqual(["100-skip-1.json"]);
+
+      const gone = harness({});
+      gone.fs.set("100-skip-1.json", "{ not json");
+      const real = gone.deps.readFile;
+      let reads = 0;
+      gone.deps.readFile = async (path) => {
+        reads += 1;
+        if (reads > 1) throw new Error("ENOENT");
+        return real(path);
+      };
+      await consumePluginRequests(gone.deps);
+      expect(reads).toBe(2);
+      expect(gone.warns).toHaveLength(1);
+      expect(gone.warns[0]).toContain("unreadable JSON");
+    });
+
+    test("the parser's quoted text is taken out of an unparseable file's reason", async () => {
+      const h = harness({});
+      // Bun's parser quotes a bare identifier: `Unexpected identifier "<text>"`.
+      h.fs.set("100-x.json", `{"note":${TOKEN}}`);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(1);
+      expect(h.warns[0]).toContain("100-x.json: unreadable JSON — ");
+      expect(h.warns[0]).not.toContain(TOKEN);
+      expect(h.warns[0]).toContain('"..."');
+    });
+
+    test("a Plugin Index that is down does not hold up the routing requests behind an update request", async () => {
+      const r = routingFake();
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0" }), "200-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      h.deps.loadIndex = async () => {
+        throw new Error("index down");
+      };
+      await expect(consumePluginRequests(h.deps)).rejects.toThrow("index down");
+      // The routing request behind it was applied and removed; the update request stays queued.
+      expect(r.calls).toContain("refreshDiscovery");
+      expect([...h.fs.keys()]).toEqual(["100-skip-1.json"]);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("a routing request whose file cannot be deleted is not applied again on the next drain", async () => {
+      const r = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook(), "200-routing-set-1.json": setPlugin({ servers: { [OTHER]: { commands: "all" } }, id: "req_00000002" }) }, { routing: r.deps });
+      h.deps.unlink = async () => {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
       };
       await consumePluginRequests(h.deps);
-      expect(h.warns).toEqual(["[plugins] rejecting request 100-skip-1.json: apply failed — state write failed"]);
-      expect(h.rejected).toEqual([]);
-      expect(h.fs.size).toBe(0);
+      // The applied one is reported by name, and the refused one (whose secret-bearing file cannot go either)
+      // by name too...
+      expect(h.errors).toEqual(["[plugins] couldn't delete applied request 100-webhook-add-1.json; it will not be applied again"]);
+      const callsAfterFirst = r.calls.length;
+      const resultsAfterFirst = r.routing.results.length;
+      // ...and neither is done again by the next drains.
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(r.calls).toHaveLength(callsAfterFirst);
+      expect(r.routing.results).toHaveLength(resultsAfterFirst);
+      expect(h.errors).toHaveLength(1);
+    });
+
+    test("a refused file that cannot be moved or deleted is also skipped from then on", async () => {
+      const r = routingFake();
+      const h = harness({ "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }) }, { routing: r.deps });
+      h.deps.rename = async () => {
+        throw new Error("EXDEV");
+      };
+      h.deps.unlink = async () => {
+        throw new Error("EACCES");
+      };
+      await consumePluginRequests(h.deps);
+      const warnsAfterFirst = h.warns.length;
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(warnsAfterFirst);
+      expect(r.routing.results).toHaveLength(1);
+    });
+
+    test("a file that is already gone when it is deleted is fine, not a stuck request", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      h.deps.unlink = async () => {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.errors).toEqual([]);
+    });
+
+    test("an entry for a file that has gone is forgotten, so a new request under that name is handled", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      const realUnlink = h.deps.unlink;
+      h.deps.unlink = async () => {
+        throw new Error("EACCES");
+      };
+      await consumePluginRequests(h.deps);
+      const first = r.calls.filter((c) => c === "refreshDiscovery").length;
+      // The operator removes the file by hand; the panel later sends another under the same name.
+      h.fs.delete("100-discovery-refresh-1.json");
+      await consumePluginRequests(h.deps);
+      h.deps.unlink = realUnlink;
+      h.fs.set("100-discovery-refresh-1.json", JSON.stringify(refresh()));
+      await consumePluginRequests(h.deps);
+      expect(r.calls.filter((c) => c === "refreshDiscovery").length).toBe(first + 1);
     });
 
     test("an error message that holds a url is redacted in the rejection log, for an update request too", async () => {

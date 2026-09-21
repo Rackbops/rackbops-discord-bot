@@ -1,6 +1,7 @@
 // The plugin request MAILBOX (#105, extended by #241). The admin panel can't write the bot's data (the
 // bot is the sole writer), so each panel action becomes a request file in data/plugins/requests/
-// (written by `ops/bot-ops.sh plugin-request` via `docker exec -u bun`). The bot drains them --
+// (written for the update actions by `ops/bot-ops.sh plugin-request` via `docker exec -u bun`; the
+// routing actions get the same treatment in #240). The bot drains them --
 // validating each, applying the surviving ones, then deleting the file (a malformed/invalid one is moved
 // aside to requests/rejected/). Two families share the directory:
 //
@@ -68,16 +69,32 @@ export interface PluginRequestDeps {
   log: PluginUpdateLog;
   /** What the four routing actions run against (#241). Absent: a routing action is rejected. */
   routing?: RoutingRequestDeps;
+  /**
+   * How long to wait before looking a second time at a file that will not parse (default 200 ms). The
+   * writer is not atomic (`cat > file`), so a request can be read while it is still being written -- empty,
+   * or cut off -- and rejecting it then would lose a good request. Now that the mailbox is drained every
+   * few seconds that is a real window, so a file that fails to parse gets one more look before it is
+   * rejected.
+   */
+  tornReadRetryMs?: number;
 }
+
+const TORN_READ_RETRY_MS = 200;
 
 // Single-flight: the boot drain and a tick drain (both call consumePluginRequests) must not overlap —
 // two readdir passes could each see, apply, and unlink the same file. A module-level promise chain
 // (the shape host.ts's stateMutator uses) serializes them; a restart between conversations is fine.
 let draining: Promise<void> = Promise.resolve();
 
+// Routing requests that were applied (or refused) but whose file could not be deleted. Left alone they
+// would be applied again on every drain -- a webhook-add asks Discord again each time -- so they are
+// skipped until the file goes. Only routing requests: the update actions behave as they always did.
+const undeletable = new Set<string>();
+
 /** Test seam: reset the single-flight chain between cases. */
 export function resetPluginRequestsForTest(): void {
   draining = Promise.resolve();
+  undeletable.clear();
 }
 
 /** Drain the request mailbox once, serialized against any concurrent drain. Never throws. */
@@ -98,13 +115,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-// Whether the text of a request file holds a webhook URL. JSON may spell a slash with a backslash and a
-// slash, or with the six characters backslash-u-0-0-2-f, so both are read as the slash they are before
-// looking.
-const WEBHOOK_URL_IN_TEXT = /discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i;
+// Whether the text of a request file holds a webhook URL, or enough of one to be its secret: the path
+// `webhooks/<id>/<token>` with or without a host (so a port, a doubled slash or a trailing dot cannot hide
+// it), or the discord API host followed by `webhooks/`. JSON can spell any character as an escape and a
+// URL can percent-encode a slash, so those are read as what they stand for before looking.
+const WEBHOOK_PATH_IN_TEXT = /webhooks\/\d{5,25}\/[\w-]{20,}/i;
+const WEBHOOK_HOST_IN_TEXT = /discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i;
 function carriesWebhookUrl(text: string): boolean {
-  return WEBHOOK_URL_IN_TEXT.test(text.replace(/\\\//g, "/").replace(/\\u002f/gi, "/"));
+  const plain = text
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/%2f/gi, "/");
+  return WEBHOOK_PATH_IN_TEXT.test(plain) || WEBHOOK_HOST_IN_TEXT.test(plain);
 }
+
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type Parsed = { ok: true; raw: unknown } | { ok: false; message: string };
+function tryParse(text: string): Parsed {
+  try {
+    return { ok: true, raw: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, message: errorText(err) };
+  }
+}
+
+// A parser's message quotes what it choked on -- Bun's says `Unexpected identifier "<text>"` -- which may
+// be a token. The shape of the message is what an operator needs, so the quoted text is taken out.
+const withoutQuotedText = (message: string): string => message.replace(/"[^"]*"/g, '"..."');
+
+const isNotFound = (err: unknown): boolean => typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ENOENT";
 
 interface PluginContext {
   installed: Map<string, PluginStateEntry>;
@@ -118,6 +158,8 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   } catch {
     return; // no requests dir yet (or unreadable) — nothing to drain
   }
+  // Forget a stuck file once it is gone, so a request that arrives later under the same name is handled.
+  for (const name of undeletable) if (!files.includes(name)) undeletable.delete(name);
   if (files.length === 0) return;
 
   // The Plugin Index is a network fetch (five-second timeout) and only the five update actions need it,
@@ -131,8 +173,10 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       entryByName: new Map(index.plugins.map((e) => [e.name, e])),
     })));
   let restartReason: string | undefined;
+  let loadFailure: unknown;
 
   for (const file of files) {
+    if (undeletable.has(file)) continue;
     const path = join(deps.requestsDir, file);
     // The writer names a webhook request for its action, so the name alone says it may hold a URL --
     // even when the file cannot be read or parsed.
@@ -144,15 +188,32 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       await reject(deps, path, file, namedForSecret ? "unreadable JSON" : `unreadable JSON — ${errorText(err)}`, namedForSecret);
       continue;
     }
-    const secretBearing = namedForSecret || carriesWebhookUrl(text);
-    let raw: unknown;
-    try {
-      raw = JSON.parse(text);
-    } catch (err) {
-      // A parser's message quotes what it choked on, which for such a file may be the URL.
-      await reject(deps, path, file, secretBearing ? "unreadable JSON" : `unreadable JSON — ${errorText(err)}`, secretBearing);
+    let parsed = tryParse(text);
+    if (!parsed.ok) {
+      // The writer is not atomic, so this may be a request still being written: look once more before
+      // rejecting it (see `tornReadRetryMs`). If the file has gone or cannot be read now, the first
+      // failure stands.
+      await pause(deps.tornReadRetryMs ?? TORN_READ_RETRY_MS);
+      try {
+        const again = await deps.readFile(path);
+        if (again !== text) {
+          text = again;
+          parsed = tryParse(again);
+        }
+      } catch {
+        /* keep the first failure */
+      }
+    }
+    const holdsUrl = carriesWebhookUrl(text);
+    const secretBearing = namedForSecret || holdsUrl;
+    if (!parsed.ok) {
+      // For a file that may hold a URL the parser's message is not quoted at all, and for any other its
+      // quoted text is taken out.
+      const why = secretBearing ? "unreadable JSON" : `unreadable JSON — ${withoutQuotedText(parsed.message)}`;
+      await reject(deps, path, file, why, secretBearing);
       continue;
     }
+    const raw = parsed.raw;
 
     const action = isRecord(raw) ? raw.action : undefined;
     if (typeof action === "string" && ROUTING_ACTIONS.has(action)) {
@@ -160,7 +221,22 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       continue;
     }
 
-    const { installed, entryByName } = await loadPluginContext();
+    // Not a routing request. An update request has no reason to hold a webhook url, and one that does
+    // would be stored (its `requestedBy` lands in state.json and a log line): refuse it, and delete it.
+    if (secretBearing) {
+      await reject(deps, path, file, holdsUrl ? "a webhook url does not belong in this request" : "not a routing action", true);
+      continue;
+    }
+
+    let context: PluginContext;
+    try {
+      context = await loadPluginContext();
+    } catch (err) {
+      // This file stays queued, as it always has; the routing requests behind it are not held up by it.
+      loadFailure ??= err;
+      continue;
+    }
+    const { installed, entryByName } = context;
     // #249: validation must not be able to wedge the mailbox. A throw here used to escape the drain with
     // this file still queued, so every later drain threw on it again.
     let v: Valid;
@@ -170,7 +246,7 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       v = { ok: false, reason: `validation threw — ${errorText(err)}` };
     }
     if (!v.ok) {
-      await reject(deps, path, file, v.reason, secretBearing);
+      await reject(deps, path, file, v.reason);
       continue;
     }
     try {
@@ -179,9 +255,13 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       await unlinkTolerant(deps, path);
     } catch (err) {
       // An apply failure is unexpected (the mutator write failed) — move it aside so it doesn't loop.
-      await reject(deps, path, file, `apply failed — ${errorText(err)}`, secretBearing);
+      await reject(deps, path, file, `apply failed — ${errorText(err)}`);
     }
   }
+
+  // A failed load of the Plugin Index still fails the drain, as it always has -- once the routing
+  // requests that did not need it have been dealt with.
+  if (loadFailure !== undefined) throw loadFailure;
 
   // ONE restart after the full drain, so an update-now doesn't strand later co-dropped files (two
   // update-nows share it — buildPluginStateFile consumes each targetVersion independently).
@@ -244,8 +324,16 @@ async function handleRoutingRequest(
     }
   }
 
-  if (outcome.ok) await unlinkTolerant(deps, path);
-  else await reject(deps, path, file, reason ?? "rejected", secretBearing);
+  // A request whose file cannot be removed is remembered and skipped from now on: applying it again on
+  // every drain would ask Discord about the same webhook every few seconds, and record a result each time.
+  let removed: boolean;
+  if (outcome.ok) {
+    removed = await removeFile(deps, path);
+    if (!removed) deps.log.error(`[plugins] couldn't delete applied request ${file}; it will not be applied again`);
+  } else {
+    removed = await reject(deps, path, file, reason ?? "rejected", secretBearing);
+  }
+  if (!removed) undeletable.add(file);
 }
 
 type Valid = { ok: true; request: PluginRequest } | { ok: false; reason: string };
@@ -338,32 +426,46 @@ async function unlinkTolerant(deps: PluginRequestDeps, path: string): Promise<vo
   }
 }
 
+/** Delete a request file. True once it is gone (already gone counts); false if it could not be removed. */
+async function removeFile(deps: PluginRequestDeps, path: string): Promise<boolean> {
+  try {
+    await deps.unlink(path);
+    return true;
+  } catch (err) {
+    return isNotFound(err);
+  }
+}
+
 /**
  * Refuse a request file. Logged, then moved aside to rejected/ so an operator can look at it -- except a
  * `secretBearing` file, which may hold a webhook URL and is DELETED instead: rejected/ would keep the
  * secret on disk indefinitely, in a folder nobody treats as secret. If that delete fails the error names
- * the file and nothing else.
+ * the file and nothing else. Resolves true when the file is gone (moved or deleted), false when it is not.
  */
-async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string, secretBearing = false): Promise<void> {
+async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string, secretBearing = false): Promise<boolean> {
   deps.log.warn(`[plugins] rejecting request ${file}: ${redactWebhookUrls(reason)}`);
   if (secretBearing) {
     try {
       await deps.unlink(path);
+      return true;
     } catch {
       deps.log.error(`[plugins] couldn't delete rejected request ${file}`);
+      return false;
     }
-    return;
   }
   const rejectedDir = join(deps.requestsDir, "rejected");
   try {
     await deps.mkdir(rejectedDir);
     await deps.rename(path, join(rejectedDir, file));
+    return true;
   } catch (err) {
     // Couldn't move it aside — unlink so it doesn't re-reject every drain; if that fails too, log.
     try {
       await deps.unlink(path);
+      return true;
     } catch {
       deps.log.error(`[plugins] couldn't quarantine or delete rejected request ${file}`, err);
+      return false;
     }
   }
 }

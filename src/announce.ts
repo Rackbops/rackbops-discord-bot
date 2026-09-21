@@ -16,7 +16,7 @@ import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 import { readDiscovery } from "./routing/discovery";
 import { applyRouting, refreshDiscovery } from "./routing/live";
 import { liveFetchWebhook } from "./routing/requests";
-import { mutateRouting, mutateSecrets, readRouting } from "./routing/store";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets } from "./routing/store";
 
 // Exported so plugins/host.test.ts can pin PLUGIN_TICK_TIMEOUT_MS under it (#217).
 export const TICK_MS = 60 * 1000;
@@ -348,6 +348,7 @@ export function livePluginRequestDeps(): PluginRequestDeps {
     routing: {
       readDiscovery: () => readDiscovery(DATA_DIR),
       readRouting: () => readRouting(DATA_DIR),
+      readSecrets: () => readSecrets(DATA_DIR),
       mutateRouting: (mutate) => mutateRouting(DATA_DIR, mutate),
       mutateSecrets: (mutate) => mutateSecrets(DATA_DIR, mutate),
       fetchWebhook: liveFetchWebhook(),

@@ -20,15 +20,16 @@
 //
 // Pure over injected deps (`RoutingRequestDeps`) so it tests in a temp dir with no Discord.
 
-import { PLUGIN_NAME_RE, REQUEST_ID_RE, SNOWFLAKE_RE, type DiscoveryFile, type RoutingFile, type RoutingSecretsFile } from "./model";
+import { PLUGIN_NAME_RE, REQUEST_ID_RE, SNOWFLAKE_RE, clip, type DiscoveryFile, type RoutingFile, type RoutingSecretsFile } from "./model";
 import { validatePluginRouting } from "./resolve";
 
 export const ROUTING_ACTIONS: ReadonlySet<string> = new Set(["routing-set", "webhook-add", "webhook-remove", "discovery-refresh"]);
 
 /**
- * The webhook URLs the bot accepts: the same set `ops/bot-ops.sh` accepts. Group 1 is the webhook id,
- * group 2 its token. Anything the bot does with a URL is built from these two groups, never from the
- * string that was pasted.
+ * The webhook URLs the bot accepts: https, discord.com or discordapp.com (canary and ptb too), with or
+ * without an API version. The panel's writer (#240) is meant to accept the same set; the bot checks it
+ * again either way. Group 1 is the webhook id, group 2 its token. Anything the bot does with a URL is
+ * built from these two groups, never from the string that was pasted.
  */
 export const WEBHOOK_URL_RE = /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/(\d{5,25})\/([A-Za-z0-9_-]{20,})$/;
 
@@ -39,9 +40,14 @@ const REDACTED = "[webhook url]";
 const WEBHOOK_TEXT_RE =
   /(?:[a-z][a-z0-9+.-]{0,15}:\\?\/\\?\/)?(?:[a-z0-9-]{1,63}\.){0,5}discord(?:app)?\.com\\?\/api\\?\/(?:v\d+\\?\/)?webhooks\\?\/[\w\-.~%+=?&#:@/\\]*/gi;
 
+// The same without a host: `webhooks/<id>/<token>`, however the slashes are spelled, so a URL with a port,
+// a doubled slash or a trailing dot in its host (which the pattern above does not know) is still cut
+// down to the part that matters.
+const WEBHOOK_PATH_RE = /webhooks(?:\\?\/|%2f)\d{5,25}(?:\\?\/|%2f)[\w-]{20,}/gi;
+
 /** `text` with anything that looks like a webhook URL replaced by `[webhook url]`. */
 export function redactWebhookUrls(text: string): string {
-  return text.replace(WEBHOOK_TEXT_RE, REDACTED);
+  return text.replace(WEBHOOK_TEXT_RE, REDACTED).replace(WEBHOOK_PATH_RE, REDACTED);
 }
 
 export type RoutingRequest =
@@ -53,6 +59,10 @@ export type RoutingRequest =
 export type ParsedRoutingRequest = { ok: true; request: RoutingRequest } | { ok: false; reason: string };
 
 const MAX_REQUESTED_BY = 200;
+// How much of `requestedBy` is looked at for a url before it is clipped to `MAX_REQUESTED_BY`. Redaction
+// is linear but not free (about a second per megabyte of hostile text), so a value is cut to this first;
+// a url cut short by it is still redacted, because the pattern matches from `webhooks/` on.
+const MAX_REQUESTED_BY_SCAN = 4096;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -82,28 +92,37 @@ export function parseRoutingRequest(raw: unknown): ParsedRoutingRequest {
   const action = raw.action;
   if (typeof action !== "string" || !ROUTING_ACTIONS.has(action)) return refuse("not a routing action");
   if (typeof raw.requestedBy !== "string" || raw.requestedBy.length === 0) return refuse("missing requestedBy");
-  // Redacted BEFORE it is clipped (a clip could leave half a URL that the redaction no longer sees), and
-  // because it ends up in routing.json's `updatedBy` / `addedBy`, which the panel reads.
-  const requestedBy = redactWebhookUrls(raw.requestedBy).slice(0, MAX_REQUESTED_BY);
-  const id = requestIdOf(raw);
-  const base = id === undefined ? { requestedBy } : { id, requestedBy };
+  const submitted = raw.requestedBy;
+  const submittedId = requestIdOf(raw);
+  // `requestedBy` ends up in routing.json's `updatedBy` / `addedBy`, which the panel reads, and `id` in a
+  // result, so neither may carry a webhook url. `requestedBy` is redacted BEFORE it is clipped (a clip
+  // could leave half a url that the redaction no longer sees); and for a webhook-add the token itself is
+  // taken out of both wherever it sits, in whatever shape, since it is the one thing that must not leak.
+  const base = (token?: string) => {
+    const scrubbed = token === undefined ? submitted : submitted.split(token).join(REDACTED);
+    const requestedBy = clip(redactWebhookUrls(scrubbed.slice(0, MAX_REQUESTED_BY_SCAN)), MAX_REQUESTED_BY);
+    const id = token !== undefined && submittedId?.includes(token) ? undefined : submittedId;
+    return id === undefined ? { requestedBy } : { id, requestedBy };
+  };
 
   switch (action) {
     case "routing-set": {
       if (typeof raw.plugin !== "string" || !PLUGIN_NAME_RE.test(raw.plugin)) return refuse("bad plugin name");
       if (!isRecord(raw.servers)) return refuse("routing must be an object with a servers object");
-      return { ok: true, request: { ...base, action, plugin: raw.plugin, servers: raw.servers } };
+      return { ok: true, request: { ...base(), action, plugin: raw.plugin, servers: raw.servers } };
     }
     case "webhook-add": {
-      if (typeof raw.url !== "string" || !WEBHOOK_URL_RE.test(raw.url)) return refuse("bad webhook url");
-      return { ok: true, request: { ...base, action, url: raw.url } };
+      const url = raw.url;
+      const match = typeof url === "string" ? WEBHOOK_URL_RE.exec(url) : null;
+      if (typeof url !== "string" || match === null) return refuse("bad webhook url");
+      return { ok: true, request: { ...base(match[2]), action, url } };
     }
     case "webhook-remove": {
       if (typeof raw.channelId !== "string" || !SNOWFLAKE_RE.test(raw.channelId)) return refuse("bad channel id");
-      return { ok: true, request: { ...base, action, channelId: raw.channelId } };
+      return { ok: true, request: { ...base(), action, channelId: raw.channelId } };
     }
     default:
-      return { ok: true, request: { ...base, action: "discovery-refresh" } };
+      return { ok: true, request: { ...base(), action: "discovery-refresh" } };
   }
 }
 
@@ -117,6 +136,8 @@ export interface RoutingRequestDeps {
   /** `null` when the bot has not published discovery.json yet (or it is damaged). */
   readDiscovery: () => Promise<DiscoveryFile | null>;
   readRouting: () => Promise<RoutingFile>;
+  /** For a webhook-remove: the secrets file may hold a URL that routing.json no longer names. */
+  readSecrets: () => Promise<RoutingSecretsFile>;
   mutateRouting: (mutate: (current: RoutingFile) => RoutingFile) => Promise<void>;
   mutateSecrets: (mutate: (current: RoutingSecretsFile) => RoutingSecretsFile) => Promise<void>;
   fetchWebhook: (id: string, token: string) => Promise<WebhookLookup>;
@@ -139,8 +160,13 @@ type Check<T> = { ok: true; value: T } | { ok: false; reason: string };
 async function checkAgainstDiscovery<T>(deps: RoutingRequestDeps, check: (discovery: DiscoveryFile) => Check<T>): Promise<T> {
   const before = await deps.readDiscovery();
   if (before !== null) {
-    const first = check(before);
-    if (first.ok) return first.value;
+    try {
+      const first = check(before);
+      if (first.ok) return first.value;
+    } catch {
+      // A file damaged in a way `readDiscovery` cannot see (a guild with no channels list, say) is the
+      // same as a stale one: look again after a refresh, which rewrites it.
+    }
   }
   await deps.refreshDiscovery();
   const after = await deps.readDiscovery();
@@ -198,34 +224,63 @@ export async function applyRoutingRequest(request: RoutingRequest, deps: Routing
       });
       // The secret first, the metadata second: routing.json never names a webhook whose URL is missing.
       const canonical = `https://discord.com/api/webhooks/${id}/${token}`;
-      await deps.mutateSecrets((current) => ({ ...current, webhooks: { ...current.webhooks, [channelId]: canonical } }));
+      let previous: string | undefined;
+      await deps.mutateSecrets((current) => {
+        previous = Object.hasOwn(current.webhooks, channelId) ? current.webhooks[channelId] : undefined;
+        return { ...current, webhooks: { ...current.webhooks, [channelId]: canonical } };
+      });
       const at = stamp();
-      await deps.mutateRouting((current) => ({
-        ...current,
-        // One webhook per channel: a second replaces the first, and with it any `broken`.
-        webhooks: { ...current.webhooks, [channelId]: { id, guildId, addedAt: at, addedBy: request.requestedBy } },
-        updatedAt: at,
-        updatedBy: request.requestedBy,
-      }));
+      try {
+        await deps.mutateRouting((current) => ({
+          ...current,
+          // One webhook per channel: a second replaces the first, and with it any `broken`.
+          webhooks: { ...current.webhooks, [channelId]: { id, guildId, addedAt: at, addedBy: request.requestedBy } },
+          updatedAt: at,
+          updatedBy: request.requestedBy,
+        }));
+      } catch (err) {
+        // routing.json still describes the webhook that was there before, so put its URL back rather than
+        // leave the two files naming different webhooks (or, for a first add, a secret nobody names).
+        try {
+          await deps.mutateSecrets((current) => ({
+            ...current,
+            webhooks:
+              previous === undefined
+                ? Object.fromEntries(Object.entries(current.webhooks).filter(([channel]) => channel !== channelId))
+                : { ...current.webhooks, [channelId]: previous },
+          }));
+        } catch {
+          deps.log.warn(`[routing] could not put back the webhook secret for channel ${channelId} after a failed write`);
+        }
+        throw err;
+      }
       return { channelId };
     }
 
     case "webhook-remove": {
       const { channelId } = request;
-      const routing = await deps.readRouting();
-      if (!Object.hasOwn(routing.webhooks, channelId)) throw new RoutingRefusal("no webhook is registered for that channel");
+      // Either file may hold the channel without the other: a write that failed halfway, or a hand edit.
+      // Whichever does is cleared, so a half-removed webhook can still be removed.
+      const [routing, secrets] = await Promise.all([deps.readRouting(), deps.readSecrets()]);
+      const named = Object.hasOwn(routing.webhooks, channelId);
+      const stored = Object.hasOwn(secrets.webhooks, channelId);
+      if (!named && !stored) throw new RoutingRefusal("no webhook is registered for that channel");
       // The reverse order of an add: the metadata goes first, so routing.json never names a webhook
       // whose URL is gone.
-      await deps.mutateRouting((current) => ({
-        ...current,
-        webhooks: Object.fromEntries(Object.entries(current.webhooks).filter(([channel]) => channel !== channelId)),
-        updatedAt: stamp(),
-        updatedBy: request.requestedBy,
-      }));
-      await deps.mutateSecrets((current) => ({
-        ...current,
-        webhooks: Object.fromEntries(Object.entries(current.webhooks).filter(([channel]) => channel !== channelId)),
-      }));
+      if (named) {
+        await deps.mutateRouting((current) => ({
+          ...current,
+          webhooks: Object.fromEntries(Object.entries(current.webhooks).filter(([channel]) => channel !== channelId)),
+          updatedAt: stamp(),
+          updatedBy: request.requestedBy,
+        }));
+      }
+      if (stored) {
+        await deps.mutateSecrets((current) => ({
+          ...current,
+          webhooks: Object.fromEntries(Object.entries(current.webhooks).filter(([channel]) => channel !== channelId)),
+        }));
+      }
       return { channelId };
     }
 

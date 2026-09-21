@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  clip,
   freshRouting,
   freshSecrets,
   MAX_RESULTS,
@@ -412,6 +413,39 @@ describe("request results (#241)", () => {
     expect(start.results[0]!.id).toBe("request-0");
     // Below the cap it just appends.
     expect(withResult(freshRouting(), result(1)).results).toEqual([result(1)]);
+  });
+
+  test("withResult replaces an earlier result under the same id, so a replayed request cannot flood the list", () => {
+    let file = { ...freshRouting(), results: [result(1), result(2), result(3)] };
+    const replay = result(2, { ok: false, reason: "second time" });
+    file = withResult(file, replay);
+    // One entry for id 2, moved to the end with its newest outcome; the others are untouched and in order.
+    expect(file.results.map((r) => r.id)).toEqual(["request-1", "request-3", "request-2"]);
+    expect(file.results.at(-1)).toEqual(replay);
+    // Twenty-five replays of one id leave one entry.
+    for (let i = 0; i < 25; i += 1) file = withResult(file, result(2, { reason: `try ${i}` }));
+    expect(file.results.filter((r) => r.id === "request-2")).toHaveLength(1);
+    expect(file.results).toHaveLength(3);
+  });
+
+  test("clip never ends on half a surrogate pair and always returns well-formed text", () => {
+    const pair = String.fromCodePoint(0x1f600); // two UTF-16 units
+    const lone = String.fromCharCode(0xd83d);
+    // Cut in the middle of the pair: the half is dropped.
+    expect(clip("x".repeat(199) + pair, 200)).toBe("x".repeat(199));
+    // Cut just after the pair: kept whole.
+    expect(clip("x".repeat(198) + pair, 200)).toBe("x".repeat(198) + pair);
+    // A lone surrogate in the middle becomes U+FFFD rather than surviving to break encodeURIComponent.
+    const cleaned = clip(`a${lone}b`, 10);
+    expect(cleaned).toBe(`a${String.fromCharCode(0xfffd)}b`);
+    expect(() => encodeURIComponent(cleaned)).not.toThrow();
+    // Short text and the empty string come back as they were.
+    expect(clip("short", 200)).toBe("short");
+    expect(clip("", 5)).toBe("");
+    // And a stored reason is clipped this way.
+    const stored = repairRouting({ ...good(), results: [{ ...result(1), reason: "y".repeat(299) + pair }] }).results[0]!.reason!;
+    expect(stored).toBe("y".repeat(299));
+    expect(() => encodeURIComponent(stored)).not.toThrow();
   });
 });
 
