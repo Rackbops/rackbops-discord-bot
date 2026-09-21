@@ -702,9 +702,14 @@ echo_key() {
 # includes U+0085 and U+00A0 -- so any guess made with bash's rules misses wherever the two disagree.
 #
 #   1. relay_tool_output WITHHOLDS, whole, any output that is ABOUT the env file: it names the file
-#      ($ENV_FILE) or says "env file". Every error compose's .env reader raises names the file it was
-#      reading, and those are exactly the messages that quote its contents. What is relayed instead is
-#      this script's own sentence, carrying nothing from compose's but the line numbers (digits only).
+#      ($ENV_FILE) or says "env file". The premise: compose-go's dotenv reader wraps every parse error
+#      as `failed to read <path>: ...` (compose-spec/compose-go `main`, dotenv/format.go, read on
+#      2026-09-21 -- upstream main, NOT the compose installed on any host, which was never run here), so
+#      the messages most likely to quote the file's contents name it. Anything that does not name it
+#      goes to layer 2, because any message can quote a value. What is relayed instead of a withheld
+#      message is this script's own sentence: it names no path, claims no cause and no remedy (it is
+#      the same for a failed run and a successful one, and the script never checked which it saw), and
+#      carries nothing from compose's output but the line numbers (digits only).
 #   2. Everything else goes through redact_secret_values, best effort, as before.
 mentions_env_file() {
   local text="$1" lower="${1,,}"
@@ -719,7 +724,7 @@ relay_tool_output() {
     # the script under pipefail.
     lines="$(printf '%s\n' "$text" | grep -oE 'line [0-9]+' | LC_ALL=C sort -t ' ' -k2,2n -u | tr '\n' ',' || true)"
     lines="${lines%,}"
-    printf '%s' "docker compose could not read the env file ($ENV_FILE)${lines:+ -- ${lines//,/, }}. Its own message is withheld because it quotes the file; fix that line on the host."
+    printf '%s' "docker compose's output mentioned an env file, so it is withheld: such a message can quote the file's contents.${lines:+ It named ${lines//,/, }.} Run the same command on the host to see it."
     return 0
   fi
   redact_secret_values "$text"
@@ -727,7 +732,8 @@ relay_tool_output() {
 
 # Trim, from both ends of $1, what COMPOSE's .env reader treats as whitespace: ASCII blanks plus U+0085
 # and U+00A0 (matched as their UTF-8 bytes, whatever the locale). Result in REPLY -- no subshell, since
-# this runs several times per line of .env.
+# this runs several times per line of .env, so the return channel cannot be `local`; the script has no
+# bare `read`, so nothing else touches REPLY.
 compose_trim() {
   local s="$1" before
   local nbsp=$'\xc2\xa0' nel=$'\xc2\x85'
@@ -742,7 +748,8 @@ compose_trim() {
   REPLY="$s"
 }
 
-# Replace, in the text given, every .env value that env-get would NOT print with "[redacted]".
+# Replace, in the text given, each text that looks like a .env value env-get would NOT print with
+# "[redacted]" (a best-effort guess, see the end of this comment).
 #
 # What is scrubbed is decided from .env and the static ALLOWED table ALONE, never from the Plugin Index.
 # The index is unavailable exactly when the bot is down, which is when compose is most likely to be

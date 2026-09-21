@@ -1321,7 +1321,7 @@ describe.skipIf(!runnable)("plugin-request (#105)", () => {
 
 // #240, review rounds 4 and 5: restart relays `docker compose restart`'s output to the panel, and compose
 // quotes a .env line it cannot parse -- so it goes through relay_tool_output, as env-set's `log` does.
-describe.skipIf(!runnable)("bot-ops.sh restart relays compose's output scrubbed (#240)", () => {
+describe.skipIf(!runnable)("bot-ops.sh restart relays compose's output withheld or scrubbed (#240)", () => {
   test("a secret compose quotes while restarting is scrubbed, the exit status is compose's, and no restart is claimed", async () => {
     const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET="${OLD_SECRET}\n`, {
       composeRestart: { output: `compose: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
@@ -1335,11 +1335,11 @@ describe.skipIf(!runnable)("bot-ops.sh restart relays compose's output scrubbed 
 
   test("what compose says ABOUT the env file is withheld whole while restarting too, and the restart still fails", async () => {
     const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET: "${OLD_SECRET}\n`, {
-      composeRestart: { output: `failed to load env file {ENV_FILE}: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
+      composeRestart: { output: `failed to read {ENV_FILE}: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
     });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).toBe(1);
-    expect(run.stdout).toBe(`${withheld(fx, "line 2")}\n`);
+    expect(run.stdout).toBe(`${withheld("line 2")}\n`);
     expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
   });
 
@@ -1516,10 +1516,11 @@ const MUSIC_ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_MUST_KEY=abcd
 /** Every place a value could surface after a run: both output streams, docker's logged argv, the
  *  config dir's file names and the backups listing. (A backup's CONTENT legitimately holds the
  *  previous .env, values included — it is 0600 and asserted separately.) */
-/** The sentence relay_tool_output prints in place of a message that is about the env file. */
-function withheld(fx: Fixture, lines?: string): string {
-  const where = lines === undefined ? "" : ` -- ${lines}`;
-  return `docker compose could not read the env file (${bashPath(fx.envFile)})${where}. Its own message is withheld because it quotes the file; fix that line on the host.`;
+/** The sentence relay_tool_output prints in place of a message that is about the env file: it names no
+ *  path, claims no cause and no remedy, and is the same whether the command failed or succeeded. */
+function withheld(lines?: string): string {
+  const named = lines === undefined ? "" : ` It named ${lines}.`;
+  return `docker compose's output mentioned an env file, so it is withheld: such a message can quote the file's contents.${named} Run the same command on the host to see it.`;
 }
 
 function everythingObservable(fx: Fixture, run: Run): string {
@@ -1838,7 +1839,11 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(refused.stderr).toContain("'SHARED_KEY' is not an editable key");
 
     const on = setup(stored.replace("PLUGINS=music", "PLUGINS=music,spotify"), { pluginIndex: index });
-    expect((await botOps(on, ["env-schema"])).json).toMatchObject({ SHARED_KEY: { secret: true, isSet: true } });
+    // Both declarers are enabled: the key is gone from env-get, STAYS in env-schema as a secret row (the
+    // secret declaration's format, not the plain one's), and stays editable, write-only.
+    expect((await botOps(on, ["env-schema"])).json).toMatchObject({
+      SHARED_KEY: { pattern: "^[A-Za-z0-9_]{8,}$", required: false, source: "plugin", secret: true, isSet: true },
+    });
     expect((await botOps(on, ["env-get"])).stdout).not.toContain("SHARED_KEY");
     expect((await botOps(on, ["env-set"], "SHARED_KEY=another_value_9\n")).exitCode).toBe(0);
   });
@@ -2065,12 +2070,13 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
       expect(String((run.json as { log: string }).log), name).toBe("compose: bad line 4: unterminated quoted value [redacted]");
       expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
     }
-  });
+  }, LONG);
 
   // Review round 5: the value scrub has to guess which part of a line a tool prints, and compose reads .env
   // by its own rules (a key ends at `=` OR `:`, `export ` is dropped, U+0085 / U+00A0 are whitespace), so a
   // guess made with bash's rules missed wherever the two disagree. Two layers now. Layer 1: what compose
-  // says ABOUT the env file is not scrubbed but withheld whole -- those are the messages that quote it.
+  // says ABOUT the env file is not scrubbed but withheld whole -- those are the messages most likely to
+  // quote it (compose-go's dotenv reader words them `failed to read <path>: line N: ...`).
   // written as char codes, never as the characters themselves: both are invisible in a diff, and an editor
   // that normalised them away would turn those two rows into copies of the plain one with no test failing
   const HAND_NBSP = String.fromCharCode(0xa0);
@@ -2086,29 +2092,36 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     ["whitespace around the equals sign", `BLIZZARD_CLIENT_SECRET = "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
     ["a plain unterminated quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
     ["a value printed without its opening quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `bad value ${OLD_SECRET}`],
+    // compose lstrips a RUN of its whitespace, so two blanks in a row must both go (a single pass leaks)
+    ["two no-break spaces before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NBSP}${HAND_NBSP}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
   ];
 
-  // Each table is walked in two tests of four rows: one env-set spawn per row is several seconds on a loaded
-  // Windows box, and all eight in one test ran past the file's 60 s per-test cap (a timeout that a
-  // mutation-check would then mistake for a kill).
+  // Each table is walked in two tests: one env-set spawn per row is several seconds on a loaded Windows
+  // box, and all the rows in one test ran past the file's 60 s per-test cap (a timeout that a
+  // mutation-check would then mistake for a kill). The rows are the same whatever the split.
   const HAND_EDITED_HALVES: [string, [string, string, string][]][] = [
     ["part 1 of 2", HAND_EDITED.slice(0, 4)],
     ["part 2 of 2", HAND_EDITED.slice(4)],
   ];
 
   for (const [part, rows] of HAND_EDITED_HALVES) {
-    test(`what compose says ABOUT the env file is withheld whole, however the line is written: only the line number survives (${part})`, async () => {
-      expect(rows.length).toBe(4);
-      for (const [name, line, said] of rows) {
-        const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, {
-          composeUp: { output: `failed to load env file {ENV_FILE}: line 2: ${said}`, exitCode: 1 },
-        });
-        const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
-        expect(run.exitCode, name).toBe(1);
-        expect(String((run.json as { log: string }).log), name).toBe(withheld(fx, "line 2"));
-        expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
-      }
-    });
+    test(
+      `what compose says ABOUT the env file is withheld whole, however the line is written: only the line number survives (${part})`,
+      async () => {
+        expect(HAND_EDITED.length).toBe(9); // the halves between them cover every row
+        for (const [name, line, said] of rows) {
+          // compose-go's dotenv reader wraps every parse error as `failed to read <path>: <error>`
+          const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, {
+            composeUp: { output: `failed to read {ENV_FILE}: line 2: ${said}`, exitCode: 1 },
+          });
+          const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+          expect(run.exitCode, name).toBe(1);
+          expect(String((run.json as { log: string }).log), name).toBe(withheld("line 2"));
+          expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+        }
+      },
+      LONG,
+    );
   }
 
   test("a message is about the env file when it names the file OR says 'env file'; every line number is kept, and none is fine", async () => {
@@ -2126,24 +2139,70 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     for (const [name, output, lines] of cases) {
       const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nHAND_KEY=${OLD_SECRET}\n`, { composeUp: { output, exitCode: 1 } });
       const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
-      expect(String((run.json as { log: string }).log), name).toBe(withheld(fx, lines));
+      expect(String((run.json as { log: string }).log), name).toBe(withheld(lines));
+      expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
     }
-  });
+  }, LONG);
+
+  // Review round 6 (reviewer A's F1): compose also says "env file" about the STACK's .env, which is a
+  // different file from $ENV_FILE, and a message that named the right one used to be replaced by a sentence
+  // that named the wrong one, claimed compose "could not read" the file and told the operator to fix a line.
+  // The withheld sentence now names no path and claims no cause, and it is the same whatever compose's status.
+  test("a message about the stack's own .env is withheld by the same neutral sentence, naming neither path, whatever compose's status", async () => {
+    const stackEnv = "/opt/stacks/x/.env";
+    const said = `couldn't find env file: ${stackEnv}`;
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { composeUp: { output: said, exitCode: 1 }, composeRestart: { output: said, exitCode: 1 } });
+    const neutral = (text: string, label: string) => {
+      expect(text, label).toBe(withheld());
+      for (const path of [stackEnv, bashPath(fx.envFile)]) expect(text, `${label}: ${path}`).not.toContain(path);
+      expect(text, label).not.toContain("could not read");
+      expect(text, label).not.toContain("fix that line");
+    };
+    const set = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(set.exitCode).toBe(1); // the recreate failed, and env-set says so
+    expect(set.json).toMatchObject({ ok: false });
+    neutral(String((set.json as { log: string }).log), "env-set");
+    // restart: compose's status is the script's, the sentence is the same one, and no restart is claimed
+    const restart = await botOps(fx, ["restart"]);
+    expect(restart.exitCode).toBe(1);
+    neutral(restart.stdout.replace(/\n$/, ""), "restart, failed");
+    expect(restart.stdout).not.toContain("restarted");
+    // and when compose SUCCEEDS with output that mentions the env file: the same sentence, then `restarted`
+    const ok = setup("ANNOUNCE_CHANNEL_ID=11111\n", { composeRestart: { output: `WARN ${said}` } });
+    const success = await botOps(ok, ["restart"]);
+    expect(success.exitCode).toBe(0);
+    expect(success.stdout).toBe(`${withheld()}\nrestarted probe-container\n`);
+  }, LONG);
 
   // Layer 2, for every message that is NOT about the env file: the same hand-edited lines, scrubbed.
   for (const [part, rows] of HAND_EDITED_HALVES) {
-    test(`the value scrub reads a line the way compose does: export, a colon, spaces round the equals sign, U+0085 and a no-break space (${part})`, async () => {
-      expect(rows.length).toBe(4);
-      for (const [name, line, said] of rows) {
-        const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, { composeUp: { output: `compose: line 2: ${said}`, exitCode: 1 } });
-        const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
-        const log = String((run.json as { log: string }).log);
-        expect(log, name).not.toContain(OLD_SECRET);
-        expect(log, name).toContain("[redacted]");
-        expect(log.startsWith("compose: line 2: "), name).toBe(true);
-      }
-    });
+    test(
+      `the value scrub reads a line the way compose does: export, a colon, spaces round the equals sign, U+0085 and a no-break space, two of them, a value printed without its opening quote (${part})`,
+      async () => {
+        expect(HAND_EDITED.length).toBe(9); // the halves between them cover every row
+        for (const [name, line, said] of rows) {
+          const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, { composeUp: { output: `compose: line 2: ${said}`, exitCode: 1 } });
+          const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+          const log = String((run.json as { log: string }).log);
+          expect(log, name).not.toContain(OLD_SECRET);
+          expect(log, name).toContain("[redacted]");
+          expect(log.startsWith("compose: line 2: "), name).toBe(true);
+        }
+      },
+      LONG,
+    );
   }
+
+  // Review round 6 (reviewer A's F3): the trailing-blank strips in compose_trim. A tool that prints a stored
+  // value with no blank after it must still match a value stored with one.
+  test("a stored value with a no-break space after it is scrubbed as a tool prints it, without the space", async () => {
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET=${OLD_SECRET}${HAND_NBSP}\n`, {
+      composeUp: { output: `compose: bad value ${OLD_SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("compose: bad value [redacted]");
+    expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
+  });
 
   test("a core credential compose echoes is scrubbed too: whatever env-get would not print", async () => {
     const token = "core-token-7Hq2Lm9Xw4Zt";
@@ -2172,7 +2231,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
       const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
       expect(String((run.json as { log: string }).log), `KEY_ONE=${one}`).toBe("compose: bad line [redacted] end, and [redacted] alone");
     }
-  });
+  }, LONG);
 
   test("every definition of a key is scrubbed, not only the last, and so is a line that is not a definition", async () => {
     const earlier = "earlier-definition-5Tg8";
