@@ -999,8 +999,9 @@ _Avoid_: server list, guild cache
   decision 8) — its VALUE never leaves the script.** `env-set` accepts one; `env-get`
   never emits the key (let alone its value); `env-schema` lists it with `secret: true` and a boolean
   `isSet`, never the value; `env-set`'s result, every `die` message this script writes, stderr and
-  `docker.log` (argv) are value-free too — the one text it relays but does not write, `docker compose`'s
-  output in `log`, is scrubbed on a best-effort basis (item 5 below). What holds that together: (1) secret keys live in their own
+  `docker.log` (argv) are value-free too — the text it relays but does not write, `docker compose`'s
+  output (`env-set`'s `log`, and everything `restart` prints), is scrubbed on a best-effort basis (item 5
+  below). What holds that together: (1) secret keys live in their own
   `PLUGIN_SECRET_ORDER`/`PLUGIN_SECRET_FORMAT`/`PLUGIN_SECRET_REQUIRED`, deliberately NOT in
   `PLUGIN_KEY_ORDER`, so nothing that lists keys can reach one; (2) **`RESERVED_KEYS`** — the
   deployment's own keys (core credentials, access control, every `${VAR}` `docker-compose.yml`
@@ -1019,10 +1020,22 @@ _Avoid_: server list, guild cache
   `secret` still marks its key secret (never editable), so it cannot be forgotten into a listing; (4) **env-set's own decision reveals nothing about a
   stored secret** — a submitted secret is always treated as a change and written, because a "no
   changes" answer would tell a caller its guess equals the stored value (the one skip is a blank for
-  an already-unset key, which `isSet` already reveals); (5) the recreate's own output is scrubbed of
-  every plugin-secret value before it becomes `log` — best effort against text `docker compose`
-  might echo, not a proof (a compose that echoed caller-controlled text into `log` could still act as
-  a guess oracle for a stored secret; not seen, and not testable without a real compose); (6) a value
+  an already-unset key, which `isSet` already reveals); (5) **compose's relayed output is scrubbed of
+  every `.env` value that `env-get` would not print** (`redact_secret_values`) — in `env-set`'s `log`
+  and in `restart`'s output alike, since compose quotes a `.env` line it refuses to parse. What is
+  scrubbed is decided from `.env` and the static `ALLOWED` table ALONE, never from the Plugin Index: the
+  index is unavailable exactly when the bot is down, which is when compose complains, and a scrub that
+  leaned on it scrubbed nothing then (review round 4). So a core credential, a plugin's secret, a
+  plugin's plain setting and a key nobody knows are all scrubbed; only a static `ALLOWED` key's value is
+  left. Every definition of a key counts (not only the last), quoted and unquoted; a line that is not a
+  definition (the tail of a pasted multi-line secret) is scrubbed whole; the values read before the
+  rewrite and the ones being written count too; and values are replaced LONGEST FIRST — a short value
+  replaced first cuts a longer one that contains it in two, which then no longer matches, so whoever
+  could set one secret could unmask another. A value under six characters is left alone (scrubbing
+  `us` or a port out of compose's message would make it unreadable, and no credential is that short).
+  Best effort, not a proof: a tool that prints a value transformed is not caught, and a compose that
+  echoed caller-controlled text into `log` could still act as a guess oracle for a stored secret (not
+  seen, and not testable without a real compose); (6) a value
   holding a CR is refused (message names the key only) before its format regex runs, since a
   permissive secret pattern must not let one start a new `.env` line, and no key's value may contain
   `$` or a quote ANYWHERE, static or plugin, secret or plain (compose reads a `.env` value as syntax:

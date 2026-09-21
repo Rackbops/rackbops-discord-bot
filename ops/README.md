@@ -26,7 +26,7 @@ time, not silently written.
 |---|---|
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
-| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload |
+| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed scrubbed of every `.env` value `env-get` would not print (#240); a failed restart prints it, exits with compose's status, and does not say `restarted` |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 | `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or the installed plugin's manifest); then one row per installed plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
@@ -243,11 +243,17 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   and not in `docker`'s argv. These keep that true. (1) A submitted secret is **always written** and
   reported as changed, even with the value it already has: otherwise "no changes" would tell a caller
   its guess was the stored value. The one exception is a blank for a key that is already unset, which
-  reveals only what `isSet` already does. (2) The recreate's own output is scrubbed of every
-  plugin-secret value (new and old) before it is returned in `log`, since `docker compose` is not
-  ours and can quote a `.env` line it refuses to parse. That is best effort, not a proof: a compose
-  that echoed caller-controlled text could still tell a caller whether a guess equals a stored secret
-  (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
+  reveals only what `isSet` already does. (2) What `docker compose` prints is relayed — as `log` by
+  `env-set`, as its output by `restart` — and compose is not ours: it quotes a `.env` line it refuses
+  to parse. So both are scrubbed of **every `.env` value that `env-get` would not print** — core
+  credentials, plugin secrets and plain plugin settings alike; only a static key's value is left —
+  worked out from `.env` itself and never from the Plugin Index, which is unavailable exactly when the
+  bot is down and compose is complaining. Every definition of a key counts, a stray line that is not a
+  definition is scrubbed whole, values are replaced longest first (so a short secret can never unmask
+  a longer one that contains it), and a value under six characters is left alone so the message stays
+  readable. That is best effort, not a proof: a tool that printed a value transformed would not be
+  caught, and a compose that echoed caller-controlled text could still tell a caller whether a guess
+  equals a stored secret (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
   refused for every key (it could start a new `.env` line), naming the key only, and so is a value
   containing `$` or a quote **anywhere**, for every key, secret or plain, static or plugin: compose
   reads a `.env` value as syntax, so `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core

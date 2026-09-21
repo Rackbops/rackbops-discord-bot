@@ -97,6 +97,8 @@ function setup(
     /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
      *  stdout) and exits with — for the tests that check a recreate message can't carry a secret. */
     composeUp?: { output: string; exitCode?: number };
+    /** The same for the fake `docker compose … restart` — restart relays compose's output too. */
+    composeRestart?: { output: string; exitCode?: number };
     /** Inject a failure into the plugin-request write (see the exec handler in setup()). */
     requestWrite?: "mv-fails" | "exec-fails";
   } = {},
@@ -132,6 +134,8 @@ function setup(
   if (opts.routing !== undefined) writeFileSync(routingFile, opts.routing);
   if (opts.discovery !== undefined) writeFileSync(discoveryFile, opts.discovery);
   if (opts.composeUp !== undefined) writeFileSync(composeOutFile, opts.composeUp.output);
+  const composeRestartFile = join(root, "compose-restart-output.txt");
+  if (opts.composeRestart !== undefined) writeFileSync(composeRestartFile, opts.composeRestart.output);
   const execHandler = [
     // An absent routing / discovery file exits 1, as a real `docker exec … cat <missing>` does (unlike the
     // older index / state handlers below, which stay silent with status 0) — routing-get must survive it.
@@ -143,6 +147,9 @@ function setup(
       : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then echo "cat: can't open '/app/data/discovery.json': No such file or directory" >&2; exit 1; fi`,
     opts.composeUp !== undefined
       ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
+      : "",
+    opts.composeRestart !== undefined
+      ? `if [[ "$1" == "compose" ]] && [[ "\${@: -1}" == "restart" ]]; then cat ${JSON.stringify(bashPath(composeRestartFile))}; exit ${opts.composeRestart.exitCode ?? 0}; fi`
       : "",
     opts.pluginIndex !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/index.json"* ]]; then cat ${JSON.stringify(bashPath(pluginIndexFile))}; fi`
@@ -1309,6 +1316,30 @@ describe.skipIf(!runnable)("plugin-request (#105)", () => {
   });
 });
 
+// #240, review round 4: restart relays `docker compose restart`'s output to the panel, and compose quotes
+// a .env line it cannot parse -- so it goes through the same scrub as env-set's `log`.
+describe.skipIf(!runnable)("bot-ops.sh restart relays compose's output scrubbed (#240)", () => {
+  test("a secret compose quotes while restarting is scrubbed, the exit status is compose's, and no restart is claimed", async () => {
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET="${OLD_SECRET}\n`, {
+      composeRestart: { output: `failed to load env file: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stdout).toBe("failed to load env file: line 2: unterminated quoted value [redacted]\n");
+    expect(run.stdout).not.toContain("restarted");
+    expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
+  });
+
+  test("a successful restart still prints what compose said, then says restarted", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      composeRestart: { output: " Container probe-container  Restarting\n Container probe-container  Started" },
+    });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout).toBe(" Container probe-container  Restarting\n Container probe-container  Started\nrestarted probe-container\n");
+  });
+});
+
 // #60 item 2 / #168: name which .env this command is acting on, on stderr — env-get/status's
 // stdout is JSON the panel parses (#101's lesson), so the new line must never land on stdout.
 describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they act on (issue #60 item 2 / #168)", () => {
@@ -1971,6 +2002,80 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(log).toContain("[redacted]");
     // an unquoted pattern would glob-match this text and redact it too
     expect(log).toContain("unrelated preXfixaZtail stays");
+  });
+
+  // Review round 4: the scrub took its list of secrets from the cached Plugin Index, so it scrubbed
+  // NOTHING when the index was unavailable -- which is when the bot is down and compose is most likely to
+  // be complaining. What is scrubbed is decided from .env and the static ALLOWED table alone now.
+  test("a stored secret compose echoes is scrubbed when the Plugin Index is unavailable, and when PLUGINS is empty", async () => {
+    const cases: [string, string, { pluginIndex?: string }][] = [
+      ["index unavailable", `${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {}],
+      ["PLUGINS empty", `PLUGINS=\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_API_KEY=${OLD_SECRET}\n`, { pluginIndex: SECRET_INDEX }],
+    ];
+    for (const [name, env, extra] of cases) {
+      const fx = setup(env, {
+        ...extra,
+        composeUp: { output: `failed to load env file: line 4: unterminated quoted value ${OLD_SECRET}`, exitCode: 1 },
+      });
+      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+      expect(run.exitCode, name).toBe(1);
+      expect(String((run.json as { log: string }).log), name).toBe("failed to load env file: line 4: unterminated quoted value [redacted]");
+      expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+    }
+  });
+
+  test("a core credential compose echoes is scrubbed too: whatever env-get would not print", async () => {
+    const token = "core-token-7Hq2Lm9Xw4Zt";
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nDISCORD_TOKEN=${token}\n`, {
+      composeUp: { output: `bad line DISCORD_TOKEN=${token}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("bad line DISCORD_TOKEN=[redacted]");
+    expect(everythingObservable(fx, run)).not.toContain(token);
+  });
+
+  // Review round 4: replacing a short value first cut a longer one that contains it in two, and the longer
+  // one then no longer matched -- whoever can set one secret could unmask another. Longest first.
+  test("a short secret never unmasks a longer one that contains it, whichever key holds which", async () => {
+    const long = "CANARYAAAAAABBBB";
+    const short = "AAAAAA";
+    const index = wrapIndex([pluginEntry("two", [envKey("KEY_ONE", "^\\S+$", { secret: true }), envKey("KEY_TWO", "^\\S+$", { secret: true })])]);
+    for (const [one, two] of [
+      [long, short],
+      [short, long],
+    ]) {
+      const fx = setup(`PLUGINS=two\nANNOUNCE_CHANNEL_ID=11111\nKEY_ONE=${one}\nKEY_TWO=${two}\n`, {
+        pluginIndex: index,
+        composeUp: { output: `compose: bad line ${long} end, and ${short} alone`, exitCode: 1 },
+      });
+      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+      expect(String((run.json as { log: string }).log), `KEY_ONE=${one}`).toBe("compose: bad line [redacted] end, and [redacted] alone");
+    }
+  });
+
+  test("every definition of a key is scrubbed, not only the last, and so is a line that is not a definition", async () => {
+    const earlier = "earlier-definition-5Tg8";
+    const tail = "tail-of-a-pasted-multi-line-secret";
+    // The QUOTED definition is the earlier one, so only the scan of the file itself can know it (the values
+    // read for env-get hold the last definition only); it is scrubbed as it stands in the file AND as
+    // compose reads it, without its quotes.
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nHAND_KEY="${OLD_SECRET}"\nHAND_KEY=${earlier}\n${tail}\n# a comment stays a comment\n`, {
+      composeUp: { output: `line 2: "${OLD_SECRET}" read as ${OLD_SECRET}; line 3: ${earlier}; line 4: ${tail}; # a comment stays a comment`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe(
+      "line 2: [redacted] read as [redacted]; line 3: [redacted]; line 4: [redacted]; # a comment stays a comment",
+    );
+  });
+
+  test("a value under six characters is left alone, and so is the value of a key env-get prints", async () => {
+    // Scrubbing "us" or a port number out of compose's message would make it unreadable for nothing, and a
+    // static ALLOWED key's value is one the panel is shown anyway.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=1234567890\nWOW_REGION=us\nSHORT_KEY=abcde\n", {
+      composeUp: { output: "status: us-east abcde 1234567890", exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("status: us-east abcde 1234567890");
   });
 
   test("a manifest entry with an empty key is skipped, secret or plain, and never crashes the reads", async () => {
