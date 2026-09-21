@@ -4,8 +4,8 @@ import { rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
-import { freshRouting, freshSecrets, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, routingPath, secretsPath } from "./store";
+import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, sayWhatWasIgnored, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -32,7 +32,21 @@ describe("paths", () => {
   });
 });
 
+/** Runs `body` with console.warn recorded (and kept off the test output), and gives back what it said. */
+async function captureWarnings(body: () => Promise<void>): Promise<string[]> {
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    await body();
+    return warn.mock.calls.map((call) => String(call[0]));
+  } finally {
+    warn.mockRestore();
+  }
+}
+
 describe("readRouting", () => {
+  // #260: a damaged file now says what it ignored, once per process; start each test from nothing said.
+  beforeEach(resetRoutingWarningsForTest);
+
   test("a missing file reads as fresh", async () => {
     expect(await readRouting(dir)).toEqual(freshRouting());
     // Reading never creates the file.
@@ -59,10 +73,12 @@ describe("readRouting", () => {
   });
 
   test("a wrong-shaped file reads as fresh", async () => {
-    for (const shaped of [[], "text", 5, null, true, { v: 1, plugins: [] }, { v: 1, plugins: "x", webhooks: 7 }, {}]) {
-      writeFileSync(routingPath(dir), JSON.stringify(shaped));
-      expect(await readRouting(dir)).toEqual(freshRouting());
-    }
+    await captureWarnings(async () => {
+      for (const shaped of [[], "text", 5, null, true, { v: 1, plugins: [] }, { v: 1, plugins: "x", webhooks: 7 }, {}]) {
+        writeFileSync(routingPath(dir), JSON.stringify(shaped));
+        expect(await readRouting(dir)).toEqual(freshRouting());
+      }
+    });
   });
 
   test("a hand-written file without v keeps its entries and is written back as v 1", async () => {
@@ -93,7 +109,9 @@ describe("readRouting", () => {
         },
       }),
     );
-    expect((await readRouting(dir)).plugins).toEqual({ music: { servers: { [GUILD]: { commands: [CHAN], postTo: CHAN } } } });
+    await captureWarnings(async () => {
+      expect((await readRouting(dir)).plugins).toEqual({ music: { servers: { [GUILD]: { commands: [CHAN], postTo: CHAN } } } });
+    });
   });
 });
 
@@ -504,5 +522,205 @@ describe("secrets", () => {
     } finally {
       error.mockRestore();
     }
+  });
+});
+
+// #260: what a damaged routing.json's repair left out is said, once. `readRouting` is on the path of every
+// plugin command used in a server, every announcement and every join, so a file with one bad entry must not
+// write a line per read.
+describe("readRouting says what it ignored (#260)", () => {
+  beforeEach(resetRoutingWarningsForTest);
+
+  const OTHER = "222222222222222222";
+  const write = (raw: unknown) => writeFileSync(routingPath(dir), JSON.stringify(raw));
+  const music = (servers: Record<string, unknown>) => ({ v: 1, plugins: { music: { servers } } });
+  const NO_COMMANDS = `[routing] routing.json: plugin music: server ${GUILD} has no valid commands ("all" or a list of channel ids); it is ignored`;
+  const BAD_HOOK = `[routing] routing.json: webhook for ${CHAN} is missing its ids; it is ignored`;
+  const said = captureWarnings;
+
+  test("a malformed server entry is warned about once, naming the plugin and the server, and a second read says nothing more", async () => {
+    write(music({ [GUILD]: { commands: "none" }, [OTHER]: { commands: "all" } }));
+    let first: RoutingFile | undefined;
+    const lines = await said(async () => {
+      first = await readRouting(dir);
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    // The good server is kept and the malformed one is dropped, exactly as before ...
+    expect(first!.plugins.music).toEqual({ servers: { [OTHER]: { commands: "all" } } });
+    // ... and one line, on the first read only, names what was dropped and why.
+    expect(lines).toEqual([NO_COMMANDS]);
+  });
+
+  test("a different problem is warned about separately, and each only once", async () => {
+    const lines = await said(async () => {
+      write(music({ [GUILD]: { commands: "none" } }));
+      await readRouting(dir);
+      write({ ...music({ [GUILD]: { commands: "none" } }), webhooks: { [CHAN]: {} } });
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([NO_COMMANDS, BAD_HOOK]);
+  });
+
+  test("a file with several problems says each of them, once", async () => {
+    write({ plugins: { Bad: {}, music: { servers: { [GUILD]: { commands: [] }, x: { commands: "all" } } } }, webhooks: { [CHAN]: 7 } });
+    const lines = await said(async () => {
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    expect(lines).toHaveLength(4);
+    expect(new Set(lines).size).toBe(4);
+    for (const line of lines) expect(line.startsWith("[routing] routing.json: ")).toBe(true);
+    for (const line of lines) expect(line.endsWith("; it is ignored")).toBe(true);
+  });
+
+  test("a good file, a fresh one and a missing one warn about nothing", async () => {
+    const lines = await said(async () => {
+      await readRouting(dir); // no file at all
+      write(freshRouting());
+      await readRouting(dir);
+      write(music({ [GUILD]: { commands: "all", postTo: CHAN } }));
+      await readRouting(dir);
+      await mutateRouting(dir, (c) => c);
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([]);
+  });
+
+  test("the same problem is said again once the record is cleared (the test seam works)", async () => {
+    write(music({ [GUILD]: { commands: "none" } }));
+    const lines = await said(async () => {
+      await readRouting(dir);
+      resetRoutingWarningsForTest();
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([NO_COMMANDS, NO_COMMANDS]);
+  });
+
+  test("a webhook entry with a stray url key warns about nothing, and no warning contains the url", async () => {
+    write({ v: 1, webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "x", url: HOOK_URL, token: "SECRET-TOKEN" } } });
+    const lines = await said(async () => {
+      const file = await readRouting(dir);
+      // The entry is kept, and the url is not carried into what the bot acts on.
+      expect(JSON.stringify(file)).not.toContain("SECRET-TOKEN");
+    });
+    expect(lines).toEqual([]);
+    // A DROPPED entry that carried one says which webhook and nothing it held.
+    write({ v: 1, webhooks: { [CHAN]: { url: HOOK_URL, token: "SECRET-TOKEN" } } });
+    const dropped = await said(async () => void (await readRouting(dir)));
+    expect(dropped).toEqual([BAD_HOOK]);
+    for (const line of dropped) expect(line).not.toContain("SECRET-TOKEN");
+  });
+
+  test("a file that is not an object at all, or a plugins or webhooks that is not, is said so", async () => {
+    const lines = await said(async () => {
+      for (const raw of [[], null, "x", 5]) {
+        write(raw);
+        expect(await readRouting(dir)).toEqual(freshRouting());
+      }
+      write({ v: 1, plugins: "music", webhooks: [] });
+      expect(await readRouting(dir)).toEqual(freshRouting());
+      await readRouting(dir);
+    });
+    // Each distinct message once, however many files said it.
+    expect(lines).toEqual([
+      "[routing] routing.json: the file is not an object; it is ignored",
+      "[routing] routing.json: plugins is not an object; it is ignored",
+      "[routing] routing.json: webhooks is not an object; it is ignored",
+    ]);
+  });
+
+  test("a logger that throws does not change what is read", async () => {
+    write(music({ [GUILD]: { commands: "none" }, [OTHER]: { commands: "all" } }));
+    const warn = spyOn(console, "warn").mockImplementation(() => {
+      throw new Error("the log is closed");
+    });
+    try {
+      // Reading must still resolve, with the repaired value: gateCommand fails OPEN when a read throws, so a
+      // throw out of a log line would let a restricted command run.
+      const file = await readRouting(dir);
+      expect(file.plugins.music).toEqual({ servers: { [OTHER]: { commands: "all" } } });
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("a line the logger failed to write is tried again on the next read, not lost", async () => {
+    write(music({ [GUILD]: { commands: "none" } }));
+    let calls = 0;
+    const written: string[] = [];
+    const warn = spyOn(console, "warn").mockImplementation((line: unknown) => {
+      calls += 1;
+      if (calls === 1) throw new Error("the log is closed");
+      written.push(String(line));
+    });
+    try {
+      await readRouting(dir); // the logger throws: swallowed, and not recorded as said
+      await readRouting(dir); // so it is tried again, and written
+      await readRouting(dir); // and now it is said, so nothing more
+    } finally {
+      warn.mockRestore();
+    }
+    expect(written).toEqual([NO_COMMANDS]);
+    expect(calls).toBe(2);
+  });
+
+  test("a report that throws is said once, in place of the report, and never escapes", async () => {
+    // No file can hold this (JSON has no getters); it stands for a bug in the report on some input.
+    const hostile = {
+      plugins: {
+        get music(): never {
+          throw new Error("boom");
+        },
+      },
+    };
+    const lines = await said(async () => {
+      expect(() => sayWhatWasIgnored(hostile)).not.toThrow();
+      sayWhatWasIgnored(hostile);
+    });
+    expect(lines).toEqual(["[routing] routing.json: could not work out what the repair ignored (boom)"]);
+  });
+
+  test("a report that throws says why only in clipped text, and describing the failure cannot throw either", async () => {
+    const failing = (thrown: unknown) => ({
+      plugins: {
+        get music(): never {
+          throw thrown;
+        },
+      },
+    });
+    // An engine message can echo a hostile key: it is clipped like any other key.
+    const long = await said(async () => sayWhatWasIgnored(failing(new Error("z".repeat(1000)))));
+    expect(long).toEqual([`[routing] routing.json: could not work out what the repair ignored (${"z".repeat(37)}...)`]);
+    resetRoutingWarningsForTest();
+    // An Error whose message cannot even be read, and a thrown value that is not an Error at all.
+    const unreadable = Object.defineProperty(new Error("x"), "message", {
+      get(): never {
+        throw new Error("nested");
+      },
+    });
+    const odd = await said(async () => {
+      expect(() => sayWhatWasIgnored(failing(unreadable))).not.toThrow();
+      resetRoutingWarningsForTest();
+      expect(() => sayWhatWasIgnored(failing("just a string"))).not.toThrow();
+    });
+    expect(odd).toEqual([
+      "[routing] routing.json: could not work out what the repair ignored (unreadable error)",
+      "[routing] routing.json: could not work out what the repair ignored (not an Error)",
+    ]);
+  });
+
+  test("what the bot acts on is exactly what repairRouting gives: this is log output only", async () => {
+    const raw = { plugins: { Bad: {}, music: { servers: { [GUILD]: { commands: "none" }, [OTHER]: { commands: "all", postTo: 7 } } } }, webhooks: { [CHAN]: {} } };
+    write(raw);
+    let read: RoutingFile | undefined;
+    await said(async () => {
+      read = await readRouting(dir);
+    });
+    expect(read).toEqual(repairRouting(raw));
+    // Nothing was written: reading and warning leave the file as it was.
+    expect(JSON.parse(readFileSync(routingPath(dir), "utf8"))).toEqual(raw);
   });
 });

@@ -843,3 +843,206 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(errors.some((line) => line.includes(`[routing] handling the departure from Other (${OTHER}) failed`))).toBe(true);
   });
 });
+
+// #260: a plugin nobody has placed lives in the home server, so when that server is not one the bot is in
+// (kicked, or a typo in DISCORD_SERVER_ID) those plugins are registered nowhere. It is said, once.
+describe("a home server the bot is not in (#260)", () => {
+  const home = (h: ReturnType<typeof harness>) => h.world.guilds.delete(HOME);
+  const NOWHERE = (ids: string, names: string) =>
+    `[routing] the home server ${ids} is not one the bot is in, so these plugins, which nobody has placed, are registered nowhere: ${names}`;
+
+  test("routed mode with a home server the bot is not in warns once, naming the unplaced plugins", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    home(h);
+    initRouting(h.ctx);
+    const first = await applyRouting("boot");
+    await applyRouting("routing changed");
+    await refreshDiscovery();
+
+    // `music` is placed, `wow` is not: only `wow` is named, and only once across every registration.
+    expect(first.mode).toBe("routed");
+    expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow")]);
+    // It is only a log line: what was registered is what the plan said, and nothing else changed.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER), guildRoute(OTHER)]);
+    // ... and the warning is true: no server was told about `wow`'s command, the one server there is has music's.
+    expect(names(h.puts[0]!.body)).toEqual([...CORE, ...MUSIC]);
+  });
+
+  test("it names every unplaced plugin, in the order they were loaded, and not the placed one", async () => {
+    await placeMusicInOther();
+    const h = harness({ plugins: [...commandWorld().plugins, { name: "extra", commands: ["extra"], posts: false }] });
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow, extra")]);
+  });
+
+  test("a plugin with no commands has nothing to register, so it is not named", async () => {
+    await placeMusicInOther();
+    // `ticker` only posts (its announcements go to the default channel by id): it loses nothing.
+    const h = harness({ plugins: [...commandWorld().plugins, { name: "ticker", commands: [], posts: true }] });
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow")]);
+  });
+
+  test("no warning when the only unplaced plugin has no commands", async () => {
+    await placeMusicInOther();
+    const h = harness({ plugins: [commandWorld().plugins[0]!, { name: "ticker", commands: [], posts: true }] });
+    home(h);
+    initRouting(h.ctx);
+    expect((await applyRouting("boot")).mode).toBe("routed");
+    expect(h.logs.warn).toEqual([]);
+  });
+
+  test("a different home server is a different message, and is said once in its own right", async () => {
+    await placeMusicInOther();
+    const a = harness();
+    home(a);
+    initRouting(a.ctx);
+    await applyRouting("boot");
+    expect(a.logs.warn).toEqual([NOWHERE(HOME, "wow")]);
+
+    // A second start-up in the same process (nothing resets what has been said): same problem, said no more.
+    const b = harness();
+    home(b);
+    initRouting(b.ctx);
+    await applyRouting("boot");
+    expect(b.logs.warn).toEqual([]);
+
+    // A different home server id is a different problem.
+    const c = harness({ homeGuildId: "999999999999999999" });
+    home(c);
+    initRouting(c.ctx);
+    await applyRouting("boot");
+    expect(c.logs.warn).toEqual([NOWHERE("999999999999999999", "wow")]);
+  });
+
+  test("what has been said is forgotten on reset, so a test can see it again", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    resetRoutingForTest();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow"), NOWHERE(HOME, "wow")]);
+  });
+
+  test("a hostile DISCORD_SERVER_ID is clipped, not quoted whole", async () => {
+    await placeMusicInOther();
+    const huge = "9".repeat(5000);
+    const h = harness({ homeGuildId: huge });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.warn).toHaveLength(1);
+    expect(h.logs.warn[0]).toContain(`the home server ${"9".repeat(37)}... is not one the bot is in`);
+    expect(h.logs.warn[0]!.length).toBeLessThan(300);
+  });
+
+  test("a logger that throws on the warning does not turn a finished registration into a failure", async () => {
+    await placeMusicInOther();
+    const h = harness({
+      log: {
+        log: () => {},
+        warn: () => {
+          throw new Error("the log is closed");
+        },
+        error: () => {},
+      },
+    });
+    home(h);
+    initRouting(h.ctx);
+    // Routed mode never throws: the registration and the discovery write were already done.
+    const result = await applyRouting("boot");
+    expect(result.mode).toBe("routed");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([OTHER]);
+  });
+
+  test("a warning the logger failed to write is tried again at the next registration, not lost", async () => {
+    await placeMusicInOther();
+    let calls = 0;
+    const written: string[] = [];
+    const h = harness({
+      log: {
+        log: () => {},
+        warn: (line: unknown) => {
+          calls += 1;
+          if (calls === 1) throw new Error("the log is closed");
+          written.push(String(line));
+        },
+        error: () => {},
+      },
+    });
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot"); // the logger throws: swallowed, not recorded as said
+    await applyRouting("routing changed"); // tried again, written
+    await applyRouting("routing changed"); // said: nothing more
+    expect(written).toEqual([NOWHERE(HOME, "wow")]);
+    expect(calls).toBe(2);
+  });
+
+  test("no warning when every loaded plugin is placed", async () => {
+    await mutateRouting(dir, (c) => ({
+      ...c,
+      plugins: { music: { servers: { [OTHER]: { commands: "all" } } }, wow: { servers: { [OTHER]: { commands: "all" } } } },
+    }));
+    const h = harness();
+    home(h);
+    initRouting(h.ctx);
+    const result = await applyRouting("boot");
+    expect(result.mode).toBe("routed");
+    expect(h.logs.warn).toEqual([]);
+  });
+
+  test("no warning when the home server is one the bot is in", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    initRouting(h.ctx);
+    const result = await applyRouting("boot");
+    expect(result.mode).toBe("routed");
+    // `wow` is unplaced and lives in the home server, which is there: nothing is lost.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect(h.logs.warn).toEqual([]);
+  });
+
+  test("no warning when there is no home server to be missing", async () => {
+    await placeMusicInOther();
+    const h = harness({ homeGuildId: undefined });
+    initRouting(h.ctx);
+    expect((await applyRouting("boot")).mode).toBe("routed");
+    expect(h.logs.warn).toEqual([]);
+  });
+
+  test("no warning in single mode", async () => {
+    // Nothing is placed: today's one call, whatever the home server is.
+    const h = harness();
+    home(h);
+    initRouting(h.ctx);
+    expect((await applyRouting("boot")).mode).toBe("single");
+    expect(h.logs.warn).toEqual([]);
+  });
+
+  test("no warning when the server list could not be read", async () => {
+    await placeMusicInOther();
+    const world = fakeWorld();
+    const h = harness({
+      client: {
+        user: world.client.user,
+        get guilds(): never {
+          throw new Error("cache exploded");
+        },
+      } as unknown as Client<true>,
+    });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    // The read failure is what is reported: a home server the bot "is not in" would be a guess.
+    expect(h.logs.error.some((line) => line.includes("could not read the bot's servers"))).toBe(true);
+    expect(h.logs.warn).toEqual([]);
+  });
+});

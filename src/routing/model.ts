@@ -14,6 +14,8 @@
 // through nor be assigned onto a prototype (see `repoForProject` in `src/config.ts` for the failure
 // this style exists to prevent).
 
+import { shown } from "./resolve";
+
 export const ROUTING_VERSION = 1 as const;
 /** Same rule as `PluginIndexEntry.name` (`src/plugins/requests.ts` and `src/plugins/index.ts`). */
 export const PLUGIN_NAME_RE = /^[a-z][a-z0-9-]*$/;
@@ -247,6 +249,82 @@ export function repairRouting(raw: unknown): RoutingFile {
     repaired.results = repaired.results.slice(-MAX_RESULTS);
   }
   return repaired;
+}
+
+/**
+ * What `repairRouting` would drop from `raw`, as short messages that NAME each dropped thing (#260). Pure,
+ * silent, and, like `repairRouting`, not going to throw on anything `JSON.parse` can produce: `repairRouting`
+ * stays tolerant and quiet, and `readRouting` says these once.
+ *
+ * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and, with one
+ * exception, never a value: a value can be anything a person typed. `shown` shows at most 40 characters
+ * (a longer text is cut to its first 37 and `...`). A token starts at character 39 of a Discord webhook URL
+ * at the earliest (51 or later with a real id), so a URL used as a key is cut before its token. The
+ * exception is a bad `postTo`, whose value is shown (through `shown` too) so the operator can see what was
+ * wrong with it. A webhook entry that carried a stray `url` or `token` key is not a dropped entry -- the
+ * repair keeps the entry and drops the key, by design -- so it reports nothing.
+ *
+ * The primitives are the repair's own (`repairScope`, `repairWebhook`, `isSnowflake` and the two regexes are
+ * shared, not copied, and the reason a webhook is refused is asked of `repairWebhook` itself); how they are
+ * combined is mirrored from `repairPlugin` and `repairRouting`, so a table-driven test in `model.test.ts`
+ * pins that this says something exactly when the repair drops one of these kinds of thing. Also said: a
+ * `raw` that is not an object at all (the file holds `[]` or `"x"`: a missing file is not that,
+ * `readJsonOrFresh` reads it as a fresh object), and a `plugins` or `webhooks` that is not an object. NOT
+ * reported: a `results` entry (the bot's own bookkeeping, not configuration), and an `undefined` `raw`
+ * (nothing was read, which `readRouting` never hands over).
+ */
+export function droppedByRepair(raw: unknown): string[] {
+  const dropped: string[] = [];
+  if (raw === undefined) return dropped;
+  if (!isPlainObject(raw)) {
+    dropped.push("the file is not an object");
+    return dropped;
+  }
+
+  if (raw.plugins !== undefined && !isPlainObject(raw.plugins)) dropped.push("plugins is not an object");
+  if (isPlainObject(raw.plugins)) {
+    for (const [name, entry] of Object.entries(raw.plugins)) {
+      const plugin = `plugin ${shown(name)}`;
+      if (!PLUGIN_NAME_RE.test(name)) {
+        dropped.push(`${plugin} is not a valid plugin name`);
+        continue;
+      }
+      if (!isPlainObject(entry) || !isPlainObject(entry.servers)) {
+        dropped.push(`${plugin} is not an object with a servers object`);
+        continue;
+      }
+      for (const [guildId, server] of Object.entries(entry.servers)) {
+        const where = `${plugin}: server ${shown(guildId)}`;
+        if (!SNOWFLAKE_RE.test(guildId)) {
+          dropped.push(`${where} is not a server id`);
+        } else if (!isPlainObject(server) || repairScope(server.commands) === undefined) {
+          dropped.push(`${where} has no valid commands ("all" or a list of channel ids)`);
+        } else if (server.postTo !== undefined && !isSnowflake(server.postTo)) {
+          // The server entry is kept, as the repair keeps it; only its posting channel is lost.
+          dropped.push(`${where}: postTo ${shown(server.postTo)} is not a channel id`);
+        }
+      }
+    }
+  }
+
+  if (raw.webhooks !== undefined && !isPlainObject(raw.webhooks)) dropped.push("webhooks is not an object");
+  if (isPlainObject(raw.webhooks)) {
+    for (const [channelId, entry] of Object.entries(raw.webhooks)) {
+      const webhook = `webhook for ${shown(channelId)}`;
+      if (!SNOWFLAKE_RE.test(channelId)) {
+        dropped.push(`${webhook} is not a channel id`);
+      } else if (repairWebhook(entry) === undefined) {
+        // `repairWebhook` refuses for two reasons and the message says which: naming the wrong one would
+        // send whoever is reading the log to the wrong field. The repair is asked, not second-guessed: would
+        // it keep this entry if it had an addedAt and an addedBy? If so, those were what was missing. (Any
+        // string will do for them today; a stricter rule for those two fields would have to change this.)
+        const withDates = isPlainObject(entry) ? { ...entry, addedAt: "-", addedBy: "-" } : entry;
+        if (repairWebhook(withDates) === undefined) dropped.push(`${webhook} is missing its ids`);
+        else dropped.push(`${webhook} is missing its addedAt or addedBy`);
+      }
+    }
+  }
+  return dropped;
 }
 
 /**
