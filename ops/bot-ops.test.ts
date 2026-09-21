@@ -2148,7 +2148,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
   // different file from $ENV_FILE, and a message that named the right one used to be replaced by a sentence
   // that named the wrong one, claimed compose "could not read" the file and told the operator to fix a line.
   // The withheld sentence now names no path and claims no cause, and it is the same whatever compose's status.
-  test("a message about the stack's own .env is withheld by the same neutral sentence, naming neither path, whatever compose's status", async () => {
+  // What this pins is the WORDS: the fixture says "env file", which is what triggers layer 1. A message that
+  // names the stack's .env by path alone, without those words, goes to layer 2 (by design: the stack .env
+  // holds no secrets, see ops/install.sh), so it is not what this test is about.
+  test("a message that SAYS 'env file' about another file (the stack's own .env) is withheld by the same neutral sentence, naming neither path, whatever compose's status", async () => {
     const stackEnv = "/opt/stacks/x/.env";
     const said = `couldn't find env file: ${stackEnv}`;
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { composeUp: { output: said, exitCode: 1 }, composeRestart: { output: said, exitCode: 1 } });
