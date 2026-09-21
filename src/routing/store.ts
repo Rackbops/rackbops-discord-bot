@@ -82,7 +82,7 @@ export interface SecretsIo {
 }
 
 // One queue per secrets file: each write chains behind the one before it, whether that one
-// succeeded or failed (a failed write must not wedge every later one).
+// succeeded or failed (a failed write must not wedge every later one -- see `mutateSecrets`).
 const secretsQueues = new Map<string, Promise<void>>();
 let secretsTmpCounter = 0;
 
@@ -136,7 +136,9 @@ export function mutateSecrets(
     }
   };
 
-  const queued = (secretsQueues.get(path) ?? Promise.resolve()).then(run, run);
+  // The stored chain never rejects (the `.catch`), so a failed write cannot wedge the ones behind it
+  // and `run` needs only its fulfilled branch.
+  const queued = (secretsQueues.get(path) ?? Promise.resolve()).then(run);
   secretsQueues.set(path, queued.catch(() => {}));
   return queued;
 }
