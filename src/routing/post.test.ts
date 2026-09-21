@@ -157,6 +157,31 @@ describe("postForPlugin", () => {
     expect(h.secretReads).toBe(0);
   });
 
+  test("a broken webhook is skipped even when another channel's webhook makes the secrets get read", async () => {
+    // A: broken, with its url still stored. B: fine. B makes the secrets get read, and A's url is right there.
+    const h = harness({
+      routing: routingFor({
+        both: true,
+        webhooks: { [CHAN_A]: meta({ broken: "Discord says that webhook is gone (404)" }), [CHAN_B]: meta({ id: "555555555555555002", guildId: G2 }) },
+      }),
+      secrets: secretsOf({ [CHAN_A]: URL_A, [CHAN_B]: URL_B }),
+    });
+    await postForPlugin("music", "hello", h.deps);
+    expect(h.events).toEqual([`bot:${CHAN_A}:hello`, `hook:${URL_B}:hello`]);
+  });
+
+  test("an inherited property is not a stored url", async () => {
+    // The channel really has webhook metadata, under a name every object has; the secrets file has no
+    // entry for it. `secrets.webhooks["constructor"]` is a function, and must not be handed to fetch.
+    const h = harness({
+      routing: { ...freshRouting(), webhooks: { constructor: meta() } },
+      secrets: secretsOf({}),
+    });
+    h.deps.defaultChannelId = "constructor";
+    await postForPlugin("music", "hello", h.deps);
+    expect(h.events).toEqual(["bot:constructor:hello"]);
+  });
+
   test("a 404 falls back to the bot and marks the webhook broken", async () => {
     const reason = "Discord says that webhook is gone (404)";
     const h = harness({
@@ -347,7 +372,8 @@ describe("liveExecuteWebhook", () => {
       [200, { ok: true }],
       [204, { ok: true }],
       [299, { ok: true }],
-      [404, { ok: false, gone: true, reason: "Discord says that webhook is gone (404)" }],
+      [300, { ok: false, gone: false, reason: "webhook post failed (300)" }],
+      [404,{ ok: false, gone: true, reason: "Discord says that webhook is gone (404)" }],
       [401, { ok: false, gone: true, reason: "Discord says that webhook is gone (401)" }],
       [400, { ok: false, gone: false, reason: "webhook post failed (400)" }],
       [403, { ok: false, gone: false, reason: "webhook post failed (403)" }],

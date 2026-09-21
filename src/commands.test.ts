@@ -361,6 +361,15 @@ describe("handleCommand — the channel gate (#243)", () => {
     }
   });
 
+  test("the gate is asked with the BARE name: the plugin is found by it, and a prefixed name would find none", async () => {
+    // COMMAND_PREFIX is empty under test, so the two names are equal here and a behavioural test cannot
+    // tell them apart; the source can. `index.ts` looks the owning plugin up by this name.
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    expect(source).toContain("await gate(bare, interaction)");
+    expect(source).not.toMatch(/gate\(interaction\.commandName/);
+  });
+
   test("a command no plugin owns is not put to the gate", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
