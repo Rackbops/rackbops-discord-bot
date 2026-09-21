@@ -54,6 +54,11 @@ export async function readRouting(dataDir: string): Promise<RoutingFile> {
  * `mutate` must hand back the whole file. Anything that is not an object -- a callback that forgot its
  * `return`, say -- is refused BEFORE anything is written: repairing `undefined` would give a fresh
  * file, and writing that would erase every placement without a word.
+ *
+ * That is all this checks. An object of the wrong shape (an empty `{}`, a `Map`, a `Promise` from an
+ * `async` callback) is still repaired down and written, so it still empties the file: the type
+ * checker is what stops those, since none of them is assignable to the callback's return type. Only a
+ * cast or an untyped caller gets past it.
  */
 function requireFile<T>(value: T, caller: string): T {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -68,8 +73,8 @@ function requireFile<T>(value: T, caller: string): T {
  * whatever the file happened to contain) and returns the file to write, which must be an object and
  * is repaired again before it is written -- so a value that does not fit the shape cannot land in
  * the file. That drops every key outside the shape, a `url` or `token` on a webhook above all. It
- * does NOT inspect the text of the fields the shape does allow (`updatedBy`, a webhook's `addedBy`
- * and `broken`): a caller must not put a webhook URL in those.
+ * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, and a
+ * webhook's `addedAt`, `addedBy` and `broken`): a caller must not put a webhook URL in any of them.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
   await routingMutator.update(
@@ -108,15 +113,15 @@ const secretsQueues = new Map<string, Promise<void>>();
  * mode. Instead it serializes its own read-modify-write on a per-path promise chain, writes a temp
  * file created with mode `0o600`, and renames it into place (a rename keeps the mode). So the URLs
  * are never in a file anyone but the owner can read -- not the temp file, not the final one -- and
- * the two other places the same bytes can end up stay owner-only too: a leftover temp file from a
- * write that died between the write and the rename, and the `.corrupt-<timestamp>` copy
- * `readJsonOrFresh` moves an unparseable file to (a rename again). A write that fails part-way removes
- * its temp file, best effort.
+ * the two other places the same bytes can end up stay owner-only too (for a file this function
+ * created, see below): a leftover temp file from a write that died between the write and the rename,
+ * and the `.corrupt-<timestamp>` copy `readJsonOrFresh` moves an unparseable file to (a rename
+ * again). A write that fails part-way removes its temp file, best effort.
  *
  * The temp file is named with a random UUID and created exclusively (`flag: "wx"`), so two writers --
- * two containers on one volume during a handoff, where a process id and a counter would repeat --
- * cannot pick the same name, and a stale file or a symlink already at that name is refused rather than
- * written through.
+ * two containers on one volume during a handoff, where a process id and a counter can repeat, each
+ * container having its own process-id namespace -- cannot pick the same name, and a stale file or a
+ * symlink already at that name is refused rather than written through.
  *
  * "Owner-only from creation" is about files this function writes. A secrets file put there by hand
  * (a deployment seeding it, a restore) keeps whatever mode it was given until the first write here
@@ -139,7 +144,7 @@ export function mutateSecrets(
 ): Promise<void> {
   const path = secretsPath(dataDir);
   const rename = io.rename ?? fsRename;
-  const write = io.writeFile ?? ((file, data, options) => fsWriteFile(file, data, options));
+  const write = io.writeFile ?? fsWriteFile;
 
   const run = async (): Promise<void> => {
     const current = repairSecrets(await readJsonOrFresh<unknown>(path, freshSecrets, "routing-secrets"));

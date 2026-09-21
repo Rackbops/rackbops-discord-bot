@@ -377,7 +377,7 @@ describe("validatePluginRouting", () => {
     expect(reason("x".repeat(1_000_000))).toBe(`channel ${"x".repeat(37)}... is not in server ${OTHER}`);
   });
 
-  test("a clipped reason never splits an emoji, and a lone surrogate is replaced, so it can always be URL-encoded", () => {
+  test("a clipped reason never cuts a surrogate pair in half, and a lone surrogate is replaced, so it can always be URL-encoded", () => {
     const reason = (value: string) => {
       const result = validatePluginRouting({ servers: { [OTHER]: { commands: [value] } } }, discovery());
       if (result.ok) throw new Error("expected rejection");
@@ -394,8 +394,22 @@ describe("validatePluginRouting", () => {
       expect(echoed).not.toMatch(/[\ud800-\udfff]/);
     }
     expect(reason("\ud83d")).toBe(`channel ${String.fromCharCode(0xfffd)} is not in server ${OTHER}`);
+    // A lone surrogate INSIDE the part that is kept (position 10 of a long text) is replaced too --
+    // replacing only in short texts would leave it there, because the clip only removes the tail.
+    const inside = reason(`${"y".repeat(10)}\ud83d${"z".repeat(60)}`);
+    expect(inside).toBe(`channel ${"y".repeat(10)}${String.fromCharCode(0xfffd)}${"z".repeat(26)}... is not in server ${OTHER}`);
+    expect(() => encodeURIComponent(inside)).not.toThrow();
     // A well-formed pair is left alone.
     expect(reason("a\u{1F600}b")).toBe(`channel a\u{1F600}b is not in server ${OTHER}`);
+  });
+
+  test("whether to clip is decided on UTF-16 length, the cut on code points: a short emoji run still gets the ellipsis", () => {
+    // Documents the two measures in `shown()`'s comment. 30 emoji are 60 UTF-16 units (over the 40
+    // that trigger a clip) but only 30 code points (under the 37 that are kept): nothing is cut, and
+    // the ellipsis is appended anyway. Only a hostile value ever looks like this.
+    const result = validatePluginRouting({ servers: { [OTHER]: { commands: ["\u{1F600}".repeat(30)] } } }, discovery());
+    if (result.ok) throw new Error("expected rejection");
+    expect(result.reason).toBe(`channel ${"\u{1F600}".repeat(30)}... is not in server ${OTHER}`);
   });
 
   test("an unserialisable value is reported rather than thrown on", () => {

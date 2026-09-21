@@ -106,11 +106,12 @@ which channels its commands work in (`"all"`, or a list) and which channel it po
 `data/routing.json`, written only by the bot; a webhook URL, being a secret, lives in
 `data/routing.secrets.json`, which is created owner-only, and in no other file the bot writes (a
 corrupt copy moved aside by `readJsonOrFresh`, or the temp file of a failed write, is that same file
-under another name, and is owner-only too). Per
-plugin, never per command. #237 added only the model — the shapes, the pure decisions in
-`src/routing/resolve.ts` and the store; the later children of the epic wire it into command
-registration, posting and dispatch, and until then the bot still registers its commands to
-`DISCORD_SERVER_ID` (globally when that is unset) and posts to `ANNOUNCE_CHANNEL_ID`.
+under another name, and is owner-only too -- for a file the bot wrote: one put there by hand keeps
+its own mode until the bot's first write replaces it). Per plugin, never per command. #237 added
+only the model — the shapes, the pure decisions in `src/routing/resolve.ts` and the store; the later
+children of the epic wire it into command registration, posting and dispatch, and until then the
+bot still registers its commands to `DISCORD_SERVER_ID` (globally when that is unset) and posts to
+`ANNOUNCE_CHANNEL_ID`.
 _Avoid_: channel config, command permissions (Discord's own per-channel command permissions are a
 different thing, which the bot cannot edit — ADR-0006 decision 7)
 

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -188,16 +188,22 @@ describe("mutateRouting", () => {
   });
 
   test("the guard is on keys, not on text: a URL inside a free-text field is copied as given", async () => {
-    // Pinned so nobody reads "a url never reaches routing.json" as more than it is. `updatedBy` and a
-    // webhook's `addedBy` / `broken` are text the shape allows, and the store does not read them.
+    // Pinned so nobody reads "a url never reaches routing.json" as more than it is. All five string
+    // fields the shape allows -- `updatedAt`, `updatedBy`, and a webhook's `addedAt`, `addedBy` and
+    // `broken` -- are text the store copies without reading.
+    const url = "https://example.invalid/hook/1";
     await mutateRouting(dir, (current) => ({
       ...current,
-      updatedBy: "https://example.invalid/hook/1",
-      webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u", broken: "HTTP 404 from https://example.invalid/hook/1" } },
+      updatedAt: url,
+      updatedBy: url,
+      webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: url, addedBy: url, broken: `HTTP 404 from ${url}` } },
     }));
     const written = JSON.parse(readFileSync(routingPath(dir), "utf8"));
-    expect(written.updatedBy).toBe("https://example.invalid/hook/1");
-    expect(written.webhooks[CHAN].broken).toContain("https://example.invalid/hook/1");
+    expect(written.updatedAt).toBe(url);
+    expect(written.updatedBy).toBe(url);
+    expect(written.webhooks[CHAN].addedAt).toBe(url);
+    expect(written.webhooks[CHAN].addedBy).toBe(url);
+    expect(written.webhooks[CHAN].broken).toContain(url);
   });
 
   test("it only ever writes under the directory it is given, never the bot's own data dir", async () => {
@@ -329,7 +335,7 @@ describe("secrets", () => {
     await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
     const routingBefore = readFileSync(routingPath(dir), "utf8");
     const secretsBefore = readFileSync(secretsPath(dir), "utf8");
-    for (const bad of [undefined, null, "a routing file", 7, ["v"], true]) {
+    for (const bad of [undefined, null, "a routing file", 7, ["v"], true, () => ({ v: 1 })]) {
       await expect(mutateRouting(dir, () => bad as unknown as RoutingFile)).rejects.toThrow(/mutateRouting: mutate must return the whole file/);
       await expect(mutateSecrets(dir, () => bad as unknown as RoutingSecretsFile, async () => {})).rejects.toThrow(
         /mutateSecrets: mutate must return the whole file/,
@@ -367,7 +373,7 @@ describe("secrets", () => {
     expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([CHAN, "333333333333333332"]);
   });
 
-  // The three tests below read real file modes, which only mean something on Linux -- so they are
+  // The tests below (and `the secrets file is owner-only after a write`) read real file modes, which only mean something on Linux -- so they are
   // CI-ONLY: `skipIf(win32)`, and a green run on a Windows box says nothing about them.
   test.skipIf(process.platform === "win32")("the secrets temp file is owner-only when it is renamed into place (CI-only)", async () => {
     const old = process.umask(0o022); // the usual default, so a dropped mode would show as 0644
@@ -405,6 +411,40 @@ describe("secrets", () => {
       ).rejects.toThrow("EXDEV");
       for (const name of readdirSync(dir)) expect(statSync(join(dir, name)).mode & 0o077).toBe(0);
     } finally {
+      process.umask(old);
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("a hand-seeded wide-mode secrets file keeps its mode until the first write replaces it at 0600 (CI-only)", async () => {
+    // The limit `mutateSecrets` documents: "owner-only from creation" is about files IT writes. A
+    // deployment that seeds the file by hand (#247) gets whatever mode it chose, until the bot's
+    // first write renames a fresh 0600 file over it.
+    const old = process.umask(0o022);
+    try {
+      writeFileSync(secretsPath(dir), JSON.stringify({ v: 1, webhooks: { [CHAN]: HOOK_URL } }));
+      chmodSync(secretsPath(dir), 0o644);
+      expect((await readSecrets(dir)).webhooks).toEqual({ [CHAN]: HOOK_URL });
+      expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o644); // reading never tightens it
+      await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }), async () => {});
+      expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o600);
+      expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([CHAN, "333333333333333332"]);
+    } finally {
+      process.umask(old);
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("a hand-seeded wide-mode secrets file that will not parse is moved aside at that same mode (CI-only)", async () => {
+    const old = process.umask(0o022);
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      writeFileSync(secretsPath(dir), '{"v":1,"webhooks":{"333333333333333331":');
+      chmodSync(secretsPath(dir), 0o644);
+      expect(await readSecrets(dir)).toEqual(freshSecrets());
+      const aside = readdirSync(dir).filter((f) => f.startsWith("routing.secrets.json.corrupt-"));
+      expect(aside).toHaveLength(1);
+      expect(statSync(join(dir, aside[0]!)).mode & 0o777).toBe(0o644);
+    } finally {
+      error.mockRestore();
       process.umask(old);
     }
   });

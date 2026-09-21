@@ -54,7 +54,9 @@ export interface RoutingFile {
  * channel id -> webhook URL. The only FILE the bot stores a webhook URL in -- though the same bytes
  * can sit beside it under another name: a corrupt copy moved aside by `readJsonOrFresh`
  * (`routing.secrets.json.corrupt-<timestamp>`), and the temp file of a write that died before its
- * rename. `store.ts` creates the file and its temp files owner-only, so every one of them is.
+ * rename. `store.ts` creates the file and its temp files owner-only, so every one of them is -- for a
+ * file the bot wrote. One a deployment put there by hand keeps its own mode until the bot's first
+ * write replaces it (and is moved aside at that mode if it will not parse).
  */
 export interface RoutingSecretsFile {
   v: 1;
