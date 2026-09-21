@@ -6908,6 +6908,8 @@ describe("the bar while the page re-reads (#275)", () => {
     await nextTask();
     expect(page.log.posts).toHaveLength(1);
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    // applyPending has not returned: the page wraps it in withBusy, which re-enables Apply when it does
+    expect(await settlesSoon(applying)).toBe(false);
     // The failure is shown at once, beside the edits the re-read is about to drop -- and nothing can act on them.
     expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1", ok: true, discard: true, go: true, disabled: true });
     try {
@@ -6926,6 +6928,7 @@ describe("the bar while the page re-reads (#275)", () => {
     const applying = page.run.applyPending();
     await nextTask();
     expect(page.view()).toMatchObject({ tone: "ok", title: "Applied. The bot restarted with your changes.", ok: true, discard: false, go: false });
+    expect(await settlesSoon(applying)).toBe(false); // still waiting for the re-read (see the failed-recreate test)
     try {
       // the controls still hold the applied values, so without the flag this would POST them again
       expect(await settlesSoon(page.run.applyPending())).toBe(true);
@@ -6936,6 +6939,30 @@ describe("the bar while the page re-reads (#275)", () => {
       release();
     }
     await applying;
+  });
+
+  test("focus: a Discard pressed from the bar leaves it on the bar during the re-read and on the open tab after; focus elsewhere is not pulled", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, resetOnReload: true, loadersRefresh: true });
+    page.activate(page.els.discard); // the button just pressed (the bar disables it, and a browser drops its focus)
+    const discard = page.run.discardPending();
+    await nextTask();
+    expect(page.log.focused).toEqual(["apply-bar"]); // rests on the bar, not lost to <body>
+    release();
+    await discard;
+    expect(page.log.focused.at(-1)).toBe("tab-settings"); // the bar hid: the existing recovery
+
+    let releaseElsewhere!: () => void;
+    const held = new Promise<void>((resolve) => (releaseElsewhere = resolve));
+    const elsewhere = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold: held, resetOnReload: true, loadersRefresh: true });
+    elsewhere.activate(elsewhere.control("WATCHED_REPOS")); // the user is typing in a field
+    const second = elsewhere.run.discardPending();
+    await nextTask();
+    expect(elsewhere.log.focused).toEqual([]); // nothing pulled onto the bar
+    releaseElsewhere();
+    await second;
+    expect(elsewhere.log.focused).toEqual([]);
   });
 
   test("when the re-read lands the bar is consistent: hidden when nothing is pending, and Apply works again", async () => {
