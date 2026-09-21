@@ -59,6 +59,13 @@ remind, skip, cancel. The panel is a **separate service that can't write the bot
 bot is the sole writer). So a panel action becomes a **request file** the bot consumes: `plugin-request`
 validates the JSON and writes it into `data/plugins/requests/` via `docker exec -u bun` (the bot runs
 as `bun`, so `-u bun` makes the file bot-owned — a root-created file would be un-deletable by the bot).
+The file is written **atomically and owner-only**: the body goes to `<file>.tmp` in the same directory
+and is `mv`ed to `<file>`, because `cat > <file>` creates the file before filling it and the bot's
+drain (which reads only `*.json` and moves one it cannot parse to `rejected/`) could otherwise read it
+half-written — after the panel had already been told `queued`. The temp name must never end in `.json`.
+If any step fails the temp file is removed and `plugin-request` exits non-zero instead of reporting
+`queued`; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
+`bun`, like the write) can still read and delete.
 
 The bot **drains** the mailbox at the start of its update tick (every ~60s) and once at boot, applying
 each request through the same state builders `/plugins` uses, then deleting the file. A malformed or
@@ -77,7 +84,7 @@ the plugin nowhere), `webhook-add` (`{url}` — a Discord webhook URL, on the `d
 `discordapp.com` hosts, with its numeric id and token), `webhook-remove` (`{channelId}`) and
 `discovery-refresh`. `plugin-request` validates each per action before it writes the file and names the
 offending *field* when it refuses — never the value: a webhook URL is a credential, so it travels on
-stdin only, no message echoes any part of it, and its request file is written owner-only. This script
+stdin only and no message echoes any part of it. This script
 only validates and queues; **applying** the requests is the bot's job (Epic #236's routing work), and a
 bot without it moves such a file to `requests/rejected/` like any unknown action (for a `webhook-add`
 that file still holds the URL, owner-only, until someone clears it — so roll the bot forward before the
@@ -252,7 +259,7 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   `0600`. A **webhook URL** in a `plugin-request` is treated the same way: it travels on stdin only,
   no message echoes any part of it (the new actions' messages name the field only; an update
   action's rejected field is echoed only when it is at most 40 printable characters, else `(not
-  shown)`), and a `webhook-add` request file is written owner-only.
+  shown)`), and every request file is written owner-only (`umask 077`).
 
 - **Compose project + container come from `BOT_OPS_PROJECT` / `BOT_OPS_CONTAINER`** (a panel passes
   them per selected bot) — required, with no default (issue #41: a monorepo-era fallback once

@@ -90,6 +90,8 @@ function setup(
     /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
      *  stdout) and exits with — for the tests that check a recreate message can't carry a secret. */
     composeUp?: { output: string; exitCode?: number };
+    /** Inject a failure into the plugin-request write (see the exec handler in setup()). */
+    requestWrite?: "mv-fails" | "exec-fails";
   } = {},
 ): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
@@ -141,9 +143,22 @@ function setup(
     opts.pluginState !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/state.json"* ]]; then cat ${JSON.stringify(bashPath(pluginStateFile))}; fi`
       : "",
-    // #105 plugin-request write: capture the piped payload so a test can assert the round-trip (the
-    // real docker would run the container's `cat > …/requests/<file>`; the fake records stdin here).
-    `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests/"* ]]; then cat > "$(dirname "$0")/request-stdin.json"; fi`,
+    // #105 plugin-request write. The fake records the piped payload (request-stdin.json) so a test can
+    // assert the round-trip, AND runs the `sh -c` the script sent for real, with `/app/data` pointed at
+    // <bin>/data, so the temp-then-rename write and its cleanup are exercised, not just string-matched.
+    // opts.requestWrite injects a failure: "mv-fails" makes the rename fail after the body is written,
+    // "exec-fails" makes the whole `docker exec` fail (container not running).
+    opts.requestWrite === "exec-fails"
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests"* ]]; then cat > /dev/null; echo "Error response from daemon: container is not running" >&2; exit 1; fi`
+      : [
+          `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests"* ]]; then`,
+          `  cmd="\${@: -1}"; data="$(dirname "$0")/data"; cmd="\${cmd//\\/app\\/data/$data}"`,
+          opts.requestWrite === "mv-fails" ? `  cmd="\${cmd// mv / false }"` : "",
+          `  tee "$(dirname "$0")/request-stdin.json" | sh -c "$cmd"; exit "\${PIPESTATUS[1]}"`,
+          `fi`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
   ]
     .filter(Boolean)
     .join("\n");
@@ -2095,22 +2110,79 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     expect(seen).not.toContain("webhooks/");
   });
 
-  test("a webhook-add request file is written owner-only; the other actions are written exactly as before", async () => {
-    const fx = setup(ENV);
-    await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
-    expect(dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/"))).toContain("sh -c mkdir -p /app/data/plugins/requests && umask 077 && cat > ");
-    for (const payload of [
-      { action: "update-now", plugin: "music", version: "1.1.0", requestedBy: "t" },
-      { action: "routing-set", plugin: "music", servers: {}, requestedBy: "t" },
-      { action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" },
-      { action: "discovery-refresh", requestedBy: "t" },
-    ]) {
-      const other = setup(ENV);
-      expect((await botOps(other, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
-      const call = dockerCalls(other).find((c) => c.includes("/app/data/plugins/requests/"));
-      expect(call, payload.action).toContain("sh -c mkdir -p /app/data/plugins/requests && cat > ");
-      expect(call, payload.action).not.toContain("umask");
+  // A request file is never visible half-written, and is owner-only (#241's gate found the race: `cat >
+  // <final>` creates the file before filling it, and the bot's drain rejects a `.json` it cannot parse).
+  // The fake docker runs the `sh -c` for real against <bin>/data (see setup()), so these check what the
+  // write LEAVES in the directory as well as the command string.
+  const REQUESTS: { action: string; [k: string]: unknown }[] = [
+    { action: "update-now", plugin: "music", version: "1.1.0", requestedBy: "t" },
+    { action: "schedule", plugin: "music", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" },
+    { action: "remind", plugin: "music", version: "1.1.0", days: 3, requestedBy: "t" },
+    { action: "skip", plugin: "music", version: "1.1.0", requestedBy: "t" },
+    { action: "cancel", plugin: "music", requestedBy: "t" },
+    { action: "routing-set", plugin: "music", servers: {}, requestedBy: "t" },
+    { action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" },
+    { action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" },
+    { action: "discovery-refresh", requestedBy: "t" },
+  ];
+  const writeCall = (fx: Fixture): string => dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/")) ?? "";
+  const mailbox = (fx: Fixture): string => join(fx.bin, "data", "plugins", "requests");
+
+  test("the request is written to a .tmp name and renamed into place", async () => {
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, payload.action).toBe(0);
+      const queued = String(run.json?.queued);
+      // `cat > <dir>/<file>.tmp && mv <dir>/<file>.tmp <dir>/<file>`, in that order, the same <file>
+      const m = writeCall(fx).match(/cat > (\/app\/data\/plugins\/requests\/\S+\.json)\.tmp && mv \1\.tmp \1 \|\|/);
+      expect(m, `${payload.action}: ${writeCall(fx)}`).not.toBeNull();
+      expect(m![1], payload.action).toBe(`/app/data/plugins/requests/${queued}`);
+      // and for real: the directory holds exactly the final file, with the whole body, and no temp file
+      expect(readdirSync(mailbox(fx)), payload.action).toEqual([queued]);
+      expect(readFileSync(join(mailbox(fx), queued), "utf8"), payload.action).toBe(stdinOf(fx));
     }
+  });
+
+  test("the temp name does not end in .json, so the bot's drain never lists it", async () => {
+    // The assumption this rests on: the drain lists only names ending .json.
+    const consumer = readFileSync(new URL("../src/plugins/requests.ts", import.meta.url), "utf8");
+    expect(consumer).toMatch(/endsWith\("\.json"\)/);
+    const fx = setup(ENV);
+    expect((await botOps(fx, ["plugin-request"], req(REQUESTS[3]!))).exitCode).toBe(0);
+    const tmp = writeCall(fx).match(/cat > (\S+)/)?.[1] ?? "";
+    expect(tmp).toMatch(/\.json\.tmp$/);
+    expect(tmp.endsWith(".json")).toBe(false);
+  });
+
+  test("the write is owner-only: umask 077 comes after mkdir -p and before the write", async () => {
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      expect((await botOps(fx, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
+      const call = writeCall(fx);
+      const [mkdir, umask, write] = [call.indexOf("mkdir -p"), call.indexOf("umask 077"), call.indexOf("cat >")];
+      expect(mkdir, payload.action).toBeGreaterThan(-1);
+      expect(umask, payload.action).toBeGreaterThan(mkdir); // a not-yet-existing requests/ keeps the ordinary mode
+      expect(write, payload.action).toBeGreaterThan(umask);
+    }
+  });
+
+  test("a failed write removes the temp file and exits non-zero, never reporting queued", async () => {
+    // The rename fails after the body is on disk: the temp file must not be left behind.
+    const fx = setup(ENV, { requestWrite: "mv-fails" });
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stdout).not.toContain("queued");
+    expect(run.stderr).toContain("plugin-request: could not write the request");
+    expect(everythingObservable(fx, run)).not.toContain(WEBHOOK_TOKEN);
+    expect(JSON.parse(stdinOf(fx)).url).toBe(WEBHOOK_URL); // the body did reach the shell...
+    expect(existsSync(mailbox(fx)) ? readdirSync(mailbox(fx)) : []).toEqual([]); // ...and nothing is left behind
+    // The whole `docker exec` failing (container not running) is the same story.
+    const dead = setup(ENV, { requestWrite: "exec-fails" });
+    const run2 = await botOps(dead, ["plugin-request"], req(REQUESTS[3]!));
+    expect(run2.exitCode).not.toBe(0);
+    expect(run2.stdout).not.toContain("queued");
+    expect(run2.stderr).toContain("plugin-request: could not write the request");
   });
 
   test("a bad webhook url is rejected without echoing it", async () => {

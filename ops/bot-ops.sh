@@ -961,12 +961,13 @@ json_string_field() {
 # the socket, so a root-created requests/ dir would be un-writable by the bun bot — it could then
 # neither delete a consumed file nor create rejected/). The filename is script-controlled (epoch-ms +
 # validated action + a nonce, so two same-ms same-action requests don't collide); the untrusted JSON is
-# only ever the `cat >` body (a redirect, not eval), never the command or the path.
+# only ever the `cat >` body (a redirect, not eval), never the command or the path. The file is written
+# under a temp name and renamed into place, so the bot never sees it half-written (see the write below).
 #
 # THE PAYLOAD MAY NOW HOLD A SECRET: a webhook-add request carries a Discord webhook URL, which is a
 # credential. So it travels on STDIN only — never as an argument (argv is world-readable in `ps` and
 # lands in docker's own command line) — the fields it holds are matched in bash rather than handed to
-# jq as --arg, no `die` below echoes any part of it, and a webhook-add file is written owner-only.
+# jq as --arg, no `die` below echoes any part of it, and every request file is written owner-only.
 cmd_plugin_request() {
   need docker; need jq
   local payload action plugin version at days
@@ -1035,15 +1036,23 @@ cmd_plugin_request() {
     *) die "plugin-request: bad action '$(echo_safe "$action")'" ;;
   esac
 
-  local file write_prefix=""
+  local file req_dir='/app/data/plugins/requests'
   file="$(date +%s%3N)-${action}-${RANDOM}.json"
-  # A webhook-add file holds the URL until the bot consumes it: owner-only (umask 077 in the container
-  # shell that creates it — set AFTER `mkdir -p`, so a requests/ that does not exist yet is created with
-  # the ordinary mode and only the file is narrowed). The other actions are written exactly as before.
-  [ "$action" != "webhook-add" ] || write_prefix="umask 077 && "
-  # -i to pipe the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
+  # The write is ATOMIC and OWNER-ONLY (found by #241's review gate). `cat > <final>` creates the file
+  # and only then fills it, so for a moment it exists empty or partial — and the bot's drain lists
+  # `*.json`, reads, and REJECTS a file that does not parse, after this script has already told the
+  # panel {ok: true, queued}: a good request lost silently. So the body goes to `<final>.tmp` in the
+  # SAME directory (the drain's filter is `f.endsWith(".json")`, src/plugins/requests.ts, so a name
+  # ending `.json.tmp` is never picked up — never give the temp file a `.json` ending) and is then
+  # `mv`ed into place, which is atomic within a directory. If any step fails the temp file is removed
+  # and the shell exits 1, so nothing half-written is left behind and this script dies below rather
+  # than reporting `queued`. `umask 077` comes AFTER `mkdir -p` (a requests/ that does not exist yet
+  # keeps the ordinary mode; only the file is narrowed): a request may carry a webhook URL, and the bot
+  # — which runs as bun, as does this write — can still read and delete an owner-only file.
+  # -i pipes the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
   printf '%s' "$payload" \
-    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p /app/data/plugins/requests && ${write_prefix}cat > /app/data/plugins/requests/${file}"
+    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p ${req_dir} && umask 077 && cat > ${req_dir}/${file}.tmp && mv ${req_dir}/${file}.tmp ${req_dir}/${file} || { rm -f ${req_dir}/${file}.tmp; exit 1; }" \
+    || die "plugin-request: could not write the request into the bot's mailbox"
   jq -n --arg queued "$file" '{ok: true, queued: $queued}'
 }
 
