@@ -260,8 +260,9 @@ _Avoid_: server list, guild cache
   again, which also rewrites `discovery.json` (the file the panel reads), so it lists the server within
   seconds — and, in single mode, only a discovery refresh: single mode registers to one place (the home
   server, or globally when there is none), which a join does not change, except that a join **of the home
-  server** runs the registration again (a bot re-invited to it, say with the `applications.commands` scope a
-  50001 said it lacked, has nothing there until it does). A joined server that is not the home server gets
+  server** runs the registration again (a bot re-invited to it with the `applications.commands` scope a
+  50001 said it lacked has nothing there until it does, and so, it is understood, may one that was kicked:
+  Discord drops a server's commands when the bot leaves it, which is not verified against a live server). A joined server that is not the home server gets
   no commands in single mode, as before. A server it **leaves** (`guildDelete`) refreshes discovery and
   nothing else: `routing.json` is not touched, so being kicked and re-invited loses no placement (a server
   that is in routing but not in discovery is what #246, the panel's Servers tab, is to show as

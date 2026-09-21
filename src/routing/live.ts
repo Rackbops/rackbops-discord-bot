@@ -208,11 +208,12 @@ function reportFailure(c: RoutingContext, message: string, err: unknown): void {
  *
  * In single mode registration goes to ONE place, the home server's guild (or everywhere, when there is no
  * home server), and a join does not change where; only discovery is refreshed. The exception is a join OF
- * the home server: a bot that is added back to it (after being kicked, or with the applications.commands
- * scope it lacked when a 50001 refused the boot registration, which is what `index.ts`'s start-up message
- * asks for) has nothing registered there until that is done again, and single mode's one call is exactly
- * that, so this runs it. A joined server that is not the home server gets no commands in single mode, as
- * before.
+ * the home server: a bot that is added back to it with the applications.commands scope it lacked when a
+ * 50001 refused the boot registration (which is what `index.ts`'s start-up message asks for) has nothing
+ * registered there until that is done again, and so, it is understood, may one that was kicked (Discord
+ * drops a server's commands when the bot leaves it; not verified against a live server). Single mode's
+ * one call is exactly that registration, so this runs it. A joined server that is not the home server
+ * gets no commands in single mode, as before.
  *
  * The mode is decided HERE, from a fresh read of routing.json, and NOT inside the chain: `applyRouting`
  * and `refreshDiscovery` each queue themselves on it, so calling either from inside a queued job would
