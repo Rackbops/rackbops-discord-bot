@@ -231,7 +231,8 @@ let checkInFlight = false;
  * admin, recorded so the next boot can report back what build it landed on.
  *
  * The restart is only *requested*. On the exit-75 fallback path (`requestRestart`) that request
- * is held until any in-flight announcement and state write finish; the socket-mounted redeploy path
+ * is held until any in-flight announcement and state write finish (a plugin tick that `pluginTicks`
+ * abandoned after its timeout, #217, excepted — see `restart.ts`'s header); the socket-mounted redeploy path
  * instead quiesces via `beginHandoff` — now only for the create→verify window, after the build (#130) —
  * which stops new ticks but does not await a tick already running.
  */

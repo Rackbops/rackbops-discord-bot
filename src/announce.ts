@@ -14,7 +14,8 @@ import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 
-const TICK_MS = 60 * 1000;
+// Exported so plugins/host.test.ts can pin PLUGIN_TICK_TIMEOUT_MS under it (#217).
+export const TICK_MS = 60 * 1000;
 
 // A watched repo's releases can be published at any hour (config.watchedRepos is an arbitrary
 // operator list — there is no release cron in this fork), so poll on a flat cadence like the
@@ -122,10 +123,11 @@ let tickGeneration = 0;
 
 // The bot's own network is bounded now — the GitHub calls in github.ts/update.ts since #88, the
 // docker-daemon calls under the redeploy path since #130, the plugin index and bundle fetches by
-// their own signals. What remains unbounded is what this watchdog is still for: discord.js's REST
-// calls (they carry internal timeouts and retries of their own, so they are bounded in practice
-// but not by us) and — the one the host genuinely cannot bound — arbitrary third-party plugin
-// ticks, which are `...extra` below and can do anything.
+// their own signals, and the WAIT on each plugin tick (the `...extra` checks below) by `pluginTicks`
+// since #217 — the hung call itself can't be cancelled, so it is left running, and that tick isn't
+// started again until it settles. What remains unbounded is what this watchdog is still for:
+// discord.js's REST calls (they carry internal timeouts and retries of their own, so they are
+// bounded in practice but not by us).
 //
 // A genuinely hung call there (connected, but the far end never responds and never closes) leaves
 // `run()` below never settling, which without this bound would leave tickInFlight stuck true
@@ -138,7 +140,11 @@ const TICK_WATCHDOG_MS = 5 * 60 * 1000;
  * without this, a stalled send (discord.js retries 3x with a 15s timeout each and waits out a
  * 429's `retry_after`, so a single `announce()` can exceed the 60s tick interval) lets a second
  * tick pass the same dedup-key check (the release `seenReleaseIds`, or a plugin's own dedup state)
- * before the first tick has written it — producing a duplicate announcement.
+ * before the first tick has written it — producing a duplicate announcement. (A plugin tick over
+ * PLUGIN_TICK_TIMEOUT_MS no longer holds this guard — `pluginTicks` stops waiting on it, #217 — so
+ * `pluginTicks` itself skips that tick's next run until the call settles: within this process its
+ * dedup-key check is still never re-entered. A restart during that call is the exception — see
+ * restart.ts's header.)
  *
  * Skips outright rather than queuing, so a merely-slow tick never piles up work — the next tick
  * to actually run re-reads whatever state the (by-then-finished) previous one left behind. Warns
@@ -241,7 +247,10 @@ async function onTick(client: Client, extraChecks: TickCheck[]): Promise<void> {
   await guardedTick(() =>
     // The whole tick is one critical section: a restart requested during it — by the self-update
     // check or by a due plugin-update schedule (#104) — lands only once every announcement and state
-    // write has settled.
+    // write has settled. The one exception is a plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS:
+    // `pluginTicks` stops waiting on it (#217), so this section closes while that call is still
+    // running, and until it settles neither a restart nor a SIGTERM drain waits for it — see
+    // restart.ts's header.
     withCritical(() => runTick(tickChecks(client, extraChecks))),
   );
 }

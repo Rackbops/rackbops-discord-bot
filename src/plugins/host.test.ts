@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ const {
   pluginCommandMap,
   buildCommandBody,
   pluginTicks,
+  PLUGIN_TICK_TIMEOUT_MS,
   activatePlugins,
   disposePlugins,
   buildPluginStateFile,
@@ -23,6 +24,10 @@ const {
   routeInteractionByPrefix,
   dispatchPluginInteraction,
 } = await import("./host");
+// The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
+// relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
+const { runTick, TICK_MS } = await import("../announce");
+const { withCritical, requestRestart, setExitFn, resetForTest: resetRestartState } = await import("../restart");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 
@@ -216,6 +221,242 @@ describe("pluginTicks", () => {
     }).not.toThrow();
     expect(checks.map((c) => c.name)).toEqual(["good:t"]); // bad skipped, good kept
     expect(calls.some((l) => l.level === "error" && l.message.includes("malformed ticks"))).toBe(true);
+  });
+
+  // #217: `timeoutMs` (pluginTicks' third parameter) is the test seam, the same shape as
+  // guardedTick's `watchdogMs`. The 2s `Bun.sleep` sentinel is what a regression that drops the
+  // bound looks like -- a check that never settles -- surfaced as a plain "hung" assertion failure
+  // rather than a bun-level test timeout.
+  const HUNG = (): Promise<void> => new Promise<void>(() => {});
+  const settleOrHang = (run: () => Promise<void>) =>
+    Promise.race([
+      run().then(() => "resolved" as const, (err: unknown) => err),
+      Bun.sleep(2_000).then(() => "hung" as const),
+    ]);
+  const checkFor = (lp: LoadedPlugin, timeoutMs: number, log = makeLog().log) => {
+    const checks = pluginTicks([lp], log, timeoutMs);
+    expect(checks).toHaveLength(1);
+    return checks[0]!;
+  };
+  // pluginTicks' checks run on every 60s scheduler tick, so a timer left armed after its tick settled
+  // would sit dead for up to `ms`, holding the event loop open: spy setTimeout/clearTimeout around
+  // `body` and assert every timer armed for `ms` was cleared.
+  const expectTimerCleared = async (ms: number, body: () => Promise<void>) => {
+    const setSpy = spyOn(globalThis, "setTimeout");
+    const clearSpy = spyOn(globalThis, "clearTimeout");
+    try {
+      await body();
+      await Bun.sleep(0); // let the settle's .finally() run
+      const armed = setSpy.mock.calls.flatMap((call, i) => (call[1] === ms ? [setSpy.mock.results[i]?.value] : []));
+      expect(armed.length).toBeGreaterThanOrEqual(1); // a timer WAS armed for this bound...
+      // ...and every one of them was cleared. Identity, not toHaveBeenCalledWith: bun compares timer
+      // objects structurally, so that would pass for a clearTimeout of ANY timer.
+      for (const handle of armed) expect(clearSpy.mock.calls.some((call) => call[0] === handle)).toBe(true);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  };
+
+  test("a plugin tick that never settles is abandoned after timeoutMs, as a rejection (#217)", async () => {
+    const lp = loaded(entry({ name: "wedged" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+    const outcome = await settleOrHang(() => checkFor(lp, 20).run());
+    expect(outcome).not.toBe("hung"); // the never-settling tick no longer holds its check open
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toBe("plugin tick wedged:t exceeded 20ms");
+  });
+
+  test("the running gate still holds -- a not-running plugin's tick is never called, and the flag is read per call (#217)", async () => {
+    let started = 0;
+    const lp = loaded(entry({ name: "gated" }), { ticks: [{ name: "t", run: () => { started += 1; return HUNG(); } }] }, false);
+    const check = checkFor(lp, 20);
+    // Gate closed: resolves without calling the tick, which would otherwise never settle and reject.
+    expect(await settleOrHang(() => check.run())).toBe("resolved");
+    expect(started).toBe(0);
+    // Gate open: the same check now calls the tick, and bounds it.
+    lp.running = true;
+    expect(await settleOrHang(() => check.run())).toBeInstanceOf(Error);
+    expect(started).toBe(1);
+  });
+
+  // Through runTick, the real consumer (announce.ts): it awaits checks one after another, so without
+  // the bound the later plugin's tick sits behind the wedged one for as long as that one hangs.
+  test("a hung plugin tick doesn't starve the plugins behind it, and is logged under its own name (#217)", async () => {
+    let laterRan = false;
+    const wedged = loaded(entry({ name: "wedged" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+    const later = loaded(entry({ name: "later" }), { ticks: [{ name: "t", run: async () => { laterRan = true; } }] }, true);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const settled = await Promise.race([
+        runTick(pluginTicks([wedged, later], makeLog().log, 20)).then(() => "settled" as const),
+        Bun.sleep(2_000).then(() => "hung" as const),
+      ]);
+      expect(settled).toBe("settled");
+      expect(laterRan).toBe(true);
+      expect(errorSpy.mock.calls[0]?.[0]).toBe("[tick:wedged:t]");
+      expect((errorSpy.mock.calls[0]?.[1] as Error).message).toContain("exceeded");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a tick that settles in time clears its timer, and the default bound is PLUGIN_TICK_TIMEOUT_MS (#217)", async () => {
+    const lp = loaded(entry({ name: "fast" }), { ticks: [{ name: "t", run: async () => {} }] }, true);
+    await expectTimerCleared(PLUGIN_TICK_TIMEOUT_MS, async () => {
+      const [check] = pluginTicks([lp], makeLog().log); // no third argument: the real default
+      await check?.run();
+    });
+  });
+
+  test("a tick that rejects surfaces its own error at once, not a timeout, and clears its timer (#217)", async () => {
+    const boom = new Error("tick blew up");
+    const lp = loaded(entry({ name: "boom" }), { ticks: [{ name: "t", run: async () => { throw boom; } }] }, true);
+    await expectTimerCleared(60_000, async () => {
+      // 60s bound against a 2s sentinel: only the tick's own rejection can settle this in time.
+      expect(await settleOrHang(() => checkFor(lp, 60_000).run())).toBe(boom);
+    });
+  });
+
+  // `TickCheck.run` is typed Promise<void>, but plugin code is only type-asserted (see above) and a
+  // plain `await` used to tolerate a bundle that returns nothing.
+  test("a tick whose run() returns a plain value still runs, as it did under a bare await (#217)", async () => {
+    let started = 0;
+    const plain = (() => { started += 1; }) as unknown as () => Promise<void>;
+    const lp = loaded(entry({ name: "plain" }), { ticks: [{ name: "t", run: plain }] }, true);
+    expect(await settleOrHang(() => checkFor(lp, 20).run())).toBe("resolved");
+    expect(started).toBe(1);
+  });
+
+  // withTickTimeout's doc comment promises the abandoned call's late settle is dropped, never an
+  // unhandled rejection -- this is the test that reads that claim.
+  test("an abandoned tick that rejects after its timeout is dropped quietly -- no unhandled rejection (#217)", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const late = new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error("too late")), 60));
+      const lp = loaded(entry({ name: "late" }), { ticks: [{ name: "t", run: () => late }] }, true);
+      expect(await settleOrHang(() => checkFor(lp, 20).run())).toBeInstanceOf(Error); // times out first...
+      await Bun.sleep(150); // ...then `late` rejects, with nothing listening to it but the helper
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  // The in-flight guard (#217). The timeout abandons the WAIT, not the call (cancelling needs an
+  // AbortSignal in TickCheck.run -- a contract change), so without the guard the next tick would start a
+  // second call on top of the first, still-pending one. A plugin author reading TickCheck's doc
+  // reasonably assumes their tick never overlaps itself.
+  test("a plugin whose previous tick is still in flight is skipped, not re-entered (#217)", async () => {
+    let started = 0;
+    const { log, calls } = makeLog();
+    const lp = loaded(entry({ name: "stuck" }), { ticks: [{ name: "t", run: () => { started += 1; return HUNG(); } }] }, true);
+    const check = checkFor(lp, 20, log);
+    expect(await settleOrHang(() => check.run())).toBeInstanceOf(Error); // first call hangs, abandoned at 20ms
+    expect(started).toBe(1);
+    // Every later tick finds the abandoned call still pending: skipped with a warning, never re-entered.
+    expect(await settleOrHang(() => check.run())).toBe("resolved");
+    expect(await settleOrHang(() => check.run())).toBe("resolved");
+    expect(started).toBe(1); // tick.run() was not called again
+    expect(calls.filter((c) => c.level === "warn" && c.message.includes("stuck:t"))).toHaveLength(2);
+  });
+
+  test("a plugin that stopped running is skipped silently even while its previous call is still pending (#217)", async () => {
+    const { log, calls } = makeLog();
+    const lp = loaded(entry({ name: "gone" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+    const check = checkFor(lp, 20, log);
+    expect(await settleOrHang(() => check.run())).toBeInstanceOf(Error); // the call hangs and is abandoned
+    lp.running = false; // e.g. disposePlugins flipped it on the way out
+    expect(await settleOrHang(() => check.run())).toBe("resolved");
+    expect(calls.filter((c) => c.level === "warn")).toHaveLength(0); // the running gate answers first: no skip warning
+  });
+
+  test("a slow tick that eventually settles releases the guard, so the plugin ticks again (#217)", async () => {
+    let started = 0;
+    // Slow only the first time: 60ms against a 20ms bound, then instant.
+    const run = () => (++started === 1 ? Bun.sleep(60).then(() => {}) : Promise.resolve());
+    const check = checkFor(loaded(entry({ name: "slow" }), { ticks: [{ name: "t", run }] }, true), 20);
+    expect(await settleOrHang(() => check.run())).toBeInstanceOf(Error); // abandoned at 20ms...
+    await Bun.sleep(100); // ...the call itself finishes at ~60ms, releasing the guard
+    expect(await settleOrHang(() => check.run())).toBe("resolved"); // ticks again, this time in time
+    expect(started).toBe(2);
+  });
+
+  test("a tick that rejects releases the guard -- it is retried next tick, not skipped for good (#217)", async () => {
+    let started = 0;
+    const boom = new Error("tick blew up");
+    const lp = loaded(entry({ name: "flaky" }), { ticks: [{ name: "t", run: async () => { started += 1; throw boom; } }] }, true);
+    const check = checkFor(lp, 60_000);
+    expect(await settleOrHang(() => check.run())).toBe(boom);
+    expect(await settleOrHang(() => check.run())).toBe(boom); // ran (and failed) again: not skipped
+    expect(started).toBe(2);
+  });
+
+  test("a tick that throws synchronously releases the guard too (#217)", async () => {
+    let started = 0;
+    const lp = loaded(entry({ name: "sync" }), { ticks: [{ name: "t", run: () => { started += 1; throw new Error("sync boom"); } }] }, true);
+    const check = checkFor(lp, 60_000);
+    expect(((await settleOrHang(() => check.run())) as Error).message).toBe("sync boom");
+    expect(await settleOrHang(() => check.run())).toBeInstanceOf(Error); // called again, not skipped
+    expect(started).toBe(2);
+  });
+
+  test("the in-flight guard is per check: a stuck tick doesn't block its siblings, even one with the same name (#217)", async () => {
+    let siblingRuns = 0;
+    const stuck = loaded(
+      entry({ name: "stuck" }),
+      { ticks: [{ name: "t", run: HUNG }, { name: "t", run: async () => { siblingRuns += 1; } }] },
+      true,
+    );
+    const other = loaded(entry({ name: "other" }), { ticks: [{ name: "t", run: async () => { siblingRuns += 10; } }] }, true);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const checks = pluginTicks([stuck, other], makeLog().log, 20);
+      await runTick(checks); // pass 1: the first stuck:t hangs and is abandoned; its same-named sibling and the other plugin still run
+      await runTick(checks); // pass 2: the first stuck:t is skipped; the rest run again
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(siblingRuns).toBe(22); // (1 + 10) x 2
+  });
+
+  // The documented exception to restart.ts's "no announcement is half-posted" (#217): the host stops
+  // waiting on a plugin tick that overruns its bound rather than let one hung plugin hold every
+  // restart forever, so the tick's critical section closes -- and a pending restart lands -- while
+  // the abandoned call is still running. Composes what announce.ts's onTick does (one withCritical
+  // around the whole runTick), so this pins pluginTicks' side of the trade-off, not onTick itself.
+  test("a plugin tick that overruns the bound lets a pending restart land while its call is still running (#217)", async () => {
+    resetRestartState();
+    let exited = false;
+    let callSettled = false;
+    const restoreExit = setExitFn(() => { exited = true; });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const run = async () => {
+        requestRestart("update"); // deferred: this tick's critical section is still open
+        await Bun.sleep(80);
+        callSettled = true;
+      };
+      const lp = loaded(entry({ name: "slow" }), { ticks: [{ name: "t", run }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20)));
+      expect(exited).toBe(true); // the section closed on the abandoned wait, so the deferred restart landed...
+      expect(callSettled).toBe(false); // ...while the call was still running
+      await Bun.sleep(120);
+      expect(callSettled).toBe(true); // (and it does finish on its own afterwards)
+    } finally {
+      restoreExit();
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      resetRestartState();
+    }
+  });
+
+  test("PLUGIN_TICK_TIMEOUT_MS stays under the 60s scheduler tick (#217)", () => {
+    expect(TICK_MS).toBe(60_000); // the "60s TICK_MS" host.ts's doc comments name -- change both together
+    expect(PLUGIN_TICK_TIMEOUT_MS).toBe(30_000);
+    expect(PLUGIN_TICK_TIMEOUT_MS).toBeLessThan(TICK_MS);
   });
 });
 
