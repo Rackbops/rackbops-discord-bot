@@ -1038,9 +1038,24 @@ _Avoid_: server list, guild cache
   below). What holds that together: (1) secret keys live in their own
   `PLUGIN_SECRET_ORDER`/`PLUGIN_SECRET_FORMAT`/`PLUGIN_SECRET_REQUIRED`, deliberately NOT in
   `PLUGIN_KEY_ORDER`, so nothing that lists keys can reach one; (2) **`RESERVED_KEYS`** — the
-  deployment's own keys (core credentials, access control, every `${VAR}` `docker-compose.yml`
-  interpolates) — are dropped from a manifest whether it declares them secret or not, so a manifest
-  can't make `DISCORD_TOKEN` editable (a credential a first-party plugin owns is deliberately NOT
+  deployment's and the core's own keys, in three groups: core credentials and access control, every
+  `${VAR}` `docker-compose.yml` interpolates, and (#278) the settings the bot core reads that the panel
+  does not edit (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`; three the redeploy
+  machinery or docker sets but the core reads from the environment: `HANDOFF_FROM`,
+  `HANDOFF_RESTART_POLICY`, `HOSTNAME`; and four the discord.js `Client` the core builds reads:
+  `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`) — are dropped from a manifest
+  whether it declares them secret or not, so a manifest can't make `DISCORD_TOKEN`, or the bot's data
+  directory, editable or listable, with or without its plugin enabled. Pinned by tests: against
+  `.env.example` (every credential-shaped key; and every documented key is editable, reserved, or one of a
+  named list of plugin-owned settings), the compose file, and a regex scan of the core's source (each
+  variable it reads through `env.X`, `env["X"]`, `required`/`optional`/`list("X")` or a `*_ENV` constant is
+  editable or reserved — a net, not a proof: it misses destructuring and dynamic names, and what a
+  dependency reads, which is why the four shard variables are pinned by the behaviour table instead), so a
+  new core key fails a test until it is decided. Runtime-level variables (`NODE_OPTIONS`, `PATH`, the
+  proxy variables, `TAR_OPTIONS`) are read by the runtime or a spawned tool, not by the core's code, and
+  stay claimable (#240's item 22; #280 tracks reserving the proxy variables and `TAR_OPTIONS`). (A
+  credential a first-party plugin owns is
+  deliberately NOT
   reserved: the wow plugin's `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` are declared `secret: true`
   in its Plugin Index entry and nothing in `src/` reads them, so the panel can set them — the test pin
   names them in an explicit exemption list and checks each sits under `.env.example`'s "Used by the
@@ -1119,11 +1134,9 @@ _Avoid_: server list, guild cache
   index can disagree for up to the bot's ~15-minute index refresh: a plugin the panel already lists may
   have no keys here yet); (iv) which declaration of a key governs it is the FIRST in index order, on or
   off — so a plugin that is off and listed before an enabled one that declares the same key decides that
-  key's format and required-ness (the shipped index has no key declared by two plugins). `RESERVED_KEYS`
-  is a credential and interpolation denylist (#240's plan copy, deviation 22): keys the bot core reads that are not
-  credentials (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`) are not in it, so an
-  index entry that names one makes it listable and editable, where before that took its plugin being in
-  `PLUGINS`; the index is the trust boundary (a panel admin already controls it via `PLUGIN_INDEX_URL`). A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
+  key's format and required-ness (the shipped index has no key declared by two plugins). (`RESERVED_KEYS`
+  also covers the settings the core reads that the panel does not edit, since #278: an index entry that
+  names `GITHUB_REPO` or `BOT_DATA_DIR` is dropped, on or off.) A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
   from — and the plugin code the bot then installs — so write-only is a property against the panel,
   its logs and its screens, not against whoever owns the index.
   The same posture covers `plugin-request`: a `webhook-add` URL travels on stdin only, is matched in
