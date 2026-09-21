@@ -5828,12 +5828,13 @@ describe("describeApplyFailure (#257, the failText logic saveEnv had, split in t
   });
 });
 
-// #272: after a failed POST /api/env, may the page keep what the user typed? Only when the answer PROVES
-// nothing was written. server.ts answers a failed bot-ops.sh with 502 (JSON body when env-set got as far as
-// the write and the recreate failed; the plain stderr text for an early die()) or 504 (we killed it: outcome
-// unknown).
+// #272: after a failed POST /api/env, may the page keep what the user typed? Only for bot-ops.sh's own early
+// refusal. server.ts answers a failed bot-ops.sh with 502 (JSON body when env-set got as far as the write and
+// the recreate failed; the plain stderr text for an early die() -- and, rarely, for a failure after the write
+// that printed no JSON: a `set -e` abort, an external kill; those look the same to the page) or 504 (we killed
+// it: outcome unknown).
 describe("failureWroteNothing (#272)", () => {
-  test("only a plain-text 502 proves nothing was written", () => {
+  test("only a plain-text 502 (bot-ops.sh's early refusal) counts as a failure that wrote nothing", () => {
     expect(failureWroteNothing(502, null)).toBe(true);
     // a failed recreate: .env was rewritten first (#47)
     expect(failureWroteNothing(502, { ok: false, changed: ["X"], backup: "/b", log: "compose: boom" })).toBe(false);
@@ -5841,7 +5842,7 @@ describe("failureWroteNothing (#272)", () => {
     expect(failureWroteNothing(502, {})).toBe(false);
     // a timeout: the recreate may still finish
     expect(failureWroteNothing(504, null)).toBe(false);
-    // a status this page cannot reason about is not proof of anything
+    // a status this page cannot reason about says nothing
     for (const status of [200, 400, 401, 403, 404, 500, 503]) expect({ status, wroteNothing: failureWroteNothing(status, null) }).toEqual({ status, wroteNothing: false });
   });
 });
@@ -6248,9 +6249,10 @@ describe("applyPending (#257)", () => {
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
   });
 
-  // #272: THE expectation under change. A plain-text 502 is an early die() in bot-ops.sh (a refused value, a
-  // key that is not editable, a backup that could not be written): it never reached the write, so the page has
-  // nothing to re-baseline against and must not throw away what the user typed. Until #272 this test said
+  // #272: THE expectation under change. A plain-text 502 is, in every case bot-ops.sh's own checks produce, an
+  // early die() (a refused value, a key that is not editable, a backup that could not be written) that never
+  // reached the write, so the page has nothing to re-baseline against and must not throw away what the user
+  // typed (the rare plain-text 502 that follows the write is described at failureWroteNothing). Until #272 this test said
   // `reloads` was { plugins: 1, env: 1, status: 0 } "unconditionally" (#47 parity with the retired saveEnv).
   test("a plain-text failure is shown verbatim, and the user's edits are kept (#272)", async () => {
     const page = runApply({

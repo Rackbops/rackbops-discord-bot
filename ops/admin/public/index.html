@@ -1563,12 +1563,17 @@
     }
     return { error: text || "bot-ops.sh error", detail: "" };
   }
-  // Did a failed POST /api/env PROVABLY write nothing? Only then may the page keep what the user typed (#272).
+  // Did a failed POST /api/env, as far as the page can tell, write nothing? Only then may it keep what the user
+  // typed (#272).
   //   502 + JSON ({ok:false, changed, backup, log})  the recreate failed AFTER .env was rewritten (#47)  -> false
   //   504                                              bot-ops.sh timed out: the outcome is unknown        -> false
-  //   502 + a body that is not JSON                   an early die(): it never reached the write          -> true
+  //   502 + a body that is not JSON                   bot-ops.sh's own early refusal (a die() before the write) -> true
   //   anything else                                    not a status this page can reason about            -> false
   // `result` is the parsed body, or null when it did not parse as JSON (what applyPending computes).
+  // "True" is the script's early-refusal answer, NOT a proof: a plain-text 502 can also follow the write (a
+  // `set -e` abort after the mv, an external kill during the recreate, a proxy's own 502). A retry then finds
+  // the values in place, env-set answers recreated:false ("Nothing needed applying.") and nothing redoes a
+  // recreate that never finished. Accepted for #272; see the issue for the rare cases and a hardening option.
   function failureWroteNothing(status, result) {
     return status === 502 && result === null;
   }
@@ -1750,15 +1755,15 @@
         applyError = failure.error;
         applyDetail = failure.detail;
         refreshApplyBar();
-        // Re-baseline unless the answer PROVES nothing was written (issue #47: a failed recreate arrives after
-        // .env was rewritten, so the edits ARE the stored values; a timeout leaves the outcome unknown; a status
-        // this page does not know is not proof either). When it does prove it (an early die() in bot-ops.sh, a
-        // plain-text 502), the controls keep the user's values and ticks and the bar shows the failure with
-        // Discard and Apply, so one refused value can be corrected without retyping the rest. A retry that
-        // finds the values already in place (the narrow window after the write) gets recreated:false, which
-        // the bar reports as "Nothing needed applying." The catch below is unchanged: a network error or the
-        // page's own timeout leaves the controls as they are (a reload from a server that cannot be reached
-        // would replace the user's input with two error lines).
+        // Re-baseline unless the answer is bot-ops.sh's own early refusal (issue #47: a failed recreate arrives
+        // after .env was rewritten, so the edits ARE the stored values; a timeout leaves the outcome unknown; a
+        // status this page does not know says nothing). For the early refusal (a plain-text 502, see
+        // failureWroteNothing for the rare cases where one follows the write) the controls keep the user's
+        // values and ticks and the bar shows the failure with Discard and Apply, so one refused value can be
+        // corrected without retyping the rest. A retry that finds the values already in place gets
+        // recreated:false, which the bar reports as "Nothing needed applying." The catch below is unchanged: a
+        // network error or the page's own timeout leaves the controls as they are (a reload from a server that
+        // cannot be reached would replace the user's input with two error lines).
         if (!failureWroteNothing(res.status, result)) {
           loadPlugins();
           loadEnv();

@@ -1301,16 +1301,19 @@ _Avoid_: server list, guild cache
   on the reader (it is not verified here). While a request is in flight both buttons are disabled and focus
   rests on the bar itself (`tabindex="-1"`); it lands on OK when the request ends, and returns to the open
   tab (or the bar) when OK / Discard hide the focused button.
-  **After a failed apply the controls are re-read from the bot unless the answer PROVES nothing was
-  written (#272).** `failureWroteNothing(status, result)` (`APPLY_VIEW`) is true only for a plain-text 502
+  **After a failed apply the controls are re-read from the bot unless the answer is `bot-ops.sh`'s own early
+  refusal (#272).** `failureWroteNothing(status, result)` (`APPLY_VIEW`) is true only for a plain-text 502
   (`result === null`: an early `die()` in `bot-ops.sh`, before the write, the case server.ts describes as
   "an early die() that never wrote any stdout"): the controls keep the user's values and ticks, and the bar
   shows `Couldn't apply: …` with Discard and Apply. A JSON 502 (the recreate failed after `.env` was
   rewritten, #47), a 504 (we killed it: the outcome is unknown) and any status the page does not know
-  re-read both lists. The `catch` (a network error, or the page's own timeout) leaves the controls as they
-  are: a reload from a server that cannot be reached would replace the input with two error lines. A retry
-  that finds the values already in place (the narrow window after the write) gets `recreated:false`, which
-  the bar reports as "Nothing needed applying."
+  re-read both lists, after which nothing is pending and the bar keeps only OK. The `catch` (a network
+  error, or the page's own timeout) leaves the controls as they are: a reload from a server that cannot be
+  reached would replace the input with two error lines. **The plain-text 502 is not a proof that nothing was
+  written**: it can also follow the write (a `set -e` abort after the `mv`, an external SIGTERM or OOM kill
+  during the recreate, which `createRunBotOps` deliberately keeps apart from a timeout, or a proxy's own
+  502). A retry then finds the values in place, `env-set` answers `recreated:false` and the bar reports
+  "Nothing needed applying."; nothing redoes a recreate that never finished (accepted for #272).
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer
