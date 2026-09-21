@@ -4,8 +4,8 @@ import { rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
-import { freshRouting, freshSecrets, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, routingPath, secretsPath } from "./store";
+import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -504,5 +504,115 @@ describe("secrets", () => {
     } finally {
       error.mockRestore();
     }
+  });
+});
+
+// #260: what a damaged routing.json's repair left out is said, once. `readRouting` is on the path of every
+// command and every announcement since #243, so a file with one bad entry must not write a line per read.
+describe("readRouting says what it ignored (#260)", () => {
+  beforeEach(resetRoutingWarningsForTest);
+
+  const OTHER = "222222222222222222";
+  const write = (raw: unknown) => writeFileSync(routingPath(dir), JSON.stringify(raw));
+  const music = (servers: Record<string, unknown>) => ({ v: 1, plugins: { music: { servers } } });
+  const NO_COMMANDS = `[routing] routing.json: plugin music: server ${GUILD} has no valid commands ("all" or a list of channel ids); it is ignored`;
+  const BAD_HOOK = `[routing] routing.json: webhook for ${CHAN} is missing its ids; it is ignored`;
+
+  /** Runs `body` with console.warn recorded, and gives back what it said. */
+  async function said(body: () => Promise<void>): Promise<string[]> {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await body();
+      return warn.mock.calls.map((call) => String(call[0]));
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  test("a malformed server entry is warned about once, naming the plugin and the server, and a second read says nothing more", async () => {
+    write(music({ [GUILD]: { commands: "none" }, [OTHER]: { commands: "all" } }));
+    let first: RoutingFile | undefined;
+    const lines = await said(async () => {
+      first = await readRouting(dir);
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    // The good server is kept and the malformed one is dropped, exactly as before ...
+    expect(first!.plugins.music).toEqual({ servers: { [OTHER]: { commands: "all" } } });
+    // ... and one line, on the first read only, names what was dropped and why.
+    expect(lines).toEqual([NO_COMMANDS]);
+  });
+
+  test("a different problem is warned about separately, and each only once", async () => {
+    const lines = await said(async () => {
+      write(music({ [GUILD]: { commands: "none" } }));
+      await readRouting(dir);
+      write({ ...music({ [GUILD]: { commands: "none" } }), webhooks: { [CHAN]: {} } });
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([NO_COMMANDS, BAD_HOOK]);
+  });
+
+  test("a file with several problems says each of them, once", async () => {
+    write({ plugins: { Bad: {}, music: { servers: { [GUILD]: { commands: [] }, x: { commands: "all" } } } }, webhooks: { [CHAN]: 7 } });
+    const lines = await said(async () => {
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    expect(lines).toHaveLength(4);
+    expect(new Set(lines).size).toBe(4);
+    for (const line of lines) expect(line.startsWith("[routing] routing.json: ")).toBe(true);
+    for (const line of lines) expect(line.endsWith("; it is ignored")).toBe(true);
+  });
+
+  test("a good file, a fresh one and a missing one warn about nothing", async () => {
+    const lines = await said(async () => {
+      await readRouting(dir); // no file at all
+      write(freshRouting());
+      await readRouting(dir);
+      write(music({ [GUILD]: { commands: "all", postTo: CHAN } }));
+      await readRouting(dir);
+      await mutateRouting(dir, (c) => c);
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([]);
+  });
+
+  test("the same problem is said again once the record is cleared (the test seam works)", async () => {
+    write(music({ [GUILD]: { commands: "none" } }));
+    const lines = await said(async () => {
+      await readRouting(dir);
+      resetRoutingWarningsForTest();
+      await readRouting(dir);
+    });
+    expect(lines).toEqual([NO_COMMANDS, NO_COMMANDS]);
+  });
+
+  test("a webhook entry with a stray url key warns about nothing, and no warning contains the url", async () => {
+    write({ v: 1, webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "x", url: HOOK_URL, token: "SECRET-TOKEN" } } });
+    const lines = await said(async () => {
+      const file = await readRouting(dir);
+      // The entry is kept, and the url is not carried into what the bot acts on.
+      expect(JSON.stringify(file)).not.toContain("SECRET-TOKEN");
+    });
+    expect(lines).toEqual([]);
+    // A DROPPED entry that carried one says which webhook and nothing it held.
+    write({ v: 1, webhooks: { [CHAN]: { url: HOOK_URL, token: "SECRET-TOKEN" } } });
+    const dropped = await said(async () => void (await readRouting(dir)));
+    expect(dropped).toEqual([BAD_HOOK]);
+    for (const line of dropped) expect(line).not.toContain("SECRET-TOKEN");
+  });
+
+  test("what the bot acts on is exactly what repairRouting gives: this is log output only", async () => {
+    const raw = { plugins: { Bad: {}, music: { servers: { [GUILD]: { commands: "none" }, [OTHER]: { commands: "all", postTo: 7 } } } }, webhooks: { [CHAN]: {} } };
+    write(raw);
+    let read: RoutingFile | undefined;
+    await said(async () => {
+      read = await readRouting(dir);
+    });
+    expect(read).toEqual(repairRouting(raw));
+    // Nothing was written: reading and warning leave the file as it was.
+    expect(JSON.parse(readFileSync(routingPath(dir), "utf8"))).toEqual(raw);
   });
 });

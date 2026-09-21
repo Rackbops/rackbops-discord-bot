@@ -23,8 +23,9 @@
 import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as CommandJson } from "discord.js";
 import type { PluginCommandMap } from "../plugins/host";
 import { buildDiscovery, snapshotGuilds, writeDiscovery, type GuildSnapshot, type PluginSummary } from "./discovery";
+import type { RoutingFile } from "./model";
 import { describeError, planRegistration, registerPlan, type GuildRegistration } from "./register";
-import { hasPlacements } from "./resolve";
+import { hasPlacements, isPlaced, shown } from "./resolve";
 import { readRouting } from "./store";
 
 export interface RoutingContext {
@@ -48,6 +49,9 @@ export type ApplyResult = { mode: "single" | "routed"; results: GuildRegistratio
 let context: RoutingContext | undefined;
 let lastRegistrations: GuildRegistration[] = [];
 let chain: Promise<unknown> = Promise.resolve();
+// What `applyRouting` has already said about the home server (#260): every join, leave-and-return and
+// routing change registers again, so the same problem would otherwise be said each time.
+const said = new Set<string>();
 
 /** Stashes what registration needs. Called once, at boot, before the first `applyRouting`. */
 export function initRouting(ctx: RoutingContext): void {
@@ -126,6 +130,27 @@ function logRouted(c: RoutingContext, snapshots: readonly GuildSnapshot[], resul
 }
 
 /**
+ * Routed mode only: a plugin nobody has placed lives in the home server, so when `DISCORD_SERVER_ID` names
+ * a server the bot is not in (kicked, or a typo) those plugins are registered nowhere, and nothing else
+ * says so (`discovery.json` shows `homeGuildId` with no matching guild, which the panel does not read that
+ * way yet). Said once per distinct message; a log line, nothing about what is registered changes. Nothing
+ * is said when the bot's servers could not be read (`snapshots` is null), when there is no home server, or
+ * when every loaded plugin is placed.
+ */
+function warnHomeServerMissing(c: RoutingContext, routing: RoutingFile, snapshots: readonly GuildSnapshot[] | null): void {
+  if (c.homeGuildId === undefined || snapshots === null) return;
+  if (snapshots.some((s) => s.id === c.homeGuildId)) return;
+  const nowhere = c.plugins.map((p) => p.name).filter((name) => !isPlaced(routing, name));
+  if (nowhere.length === 0) return;
+  const message =
+    `[routing] the home server ${shown(c.homeGuildId)} is not one the bot is in, so these plugins, ` +
+    `which nobody has placed, are registered nowhere: ${nowhere.join(", ")}`;
+  if (said.has(message)) return;
+  said.add(message);
+  c.log.warn(message);
+}
+
+/**
  * Read routing, plan, register, write discovery. Serialized: a second call queues behind the first.
  * `reason` says why it ran (it names the trigger in a discovery write failure). Resolves with the mode
  * the plan took, so `index.ts` prints today's `Registered N slash commands` line only for `single`.
@@ -172,7 +197,10 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
     lastRegistrations = results;
     // After registering, not before: the file carries what each server was actually told.
     if (snapshots !== null) await writeView(c, snapshots, results, reason);
-    if (plan.mode === "routed") logRouted(c, snapshots ?? [], results);
+    if (plan.mode === "routed") {
+      logRouted(c, snapshots ?? [], results);
+      warnHomeServerMissing(c, routing, snapshots);
+    }
     if (failure !== undefined) throw failure.error;
     return { mode: plan.mode, results };
   });
@@ -276,4 +304,5 @@ export function resetRoutingForTest(): void {
   context = undefined;
   lastRegistrations = [];
   chain = Promise.resolve();
+  said.clear();
 }

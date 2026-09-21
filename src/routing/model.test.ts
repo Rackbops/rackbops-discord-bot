@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   clip,
+  droppedByRepair,
   freshRouting,
   freshSecrets,
   MAX_RESULTS,
@@ -452,6 +453,221 @@ describe("request results (#241)", () => {
     const stored = repairRouting({ ...good(), results: [{ ...result(1), reason: "y".repeat(299) + pair }] }).results[0]!.reason!;
     expect(stored).toBe("y".repeat(299));
     expect(() => encodeURIComponent(stored)).not.toThrow();
+  });
+});
+
+// #260: what the repair drops is said, by name -- see droppedByRepair.
+describe("droppedByRepair (#260)", () => {
+  const withPlugin = (name: string, entry: unknown) => ({ v: 1, plugins: { [name]: entry } });
+  const withServer = (server: unknown, id = GUILD_A) => ({ v: 1, plugins: { music: { servers: { [id]: server } } } });
+  const withWebhook = (entry: unknown, channel = CHAN_1) => ({ v: 1, webhooks: { [channel]: entry } });
+  const goodHook = { id: HOOK, guildId: GUILD_A, addedAt: "2026-09-21T00:00:00.000Z", addedBy: "admin@example.com" };
+  const NO_COMMANDS = `has no valid commands ("all" or a list of channel ids)`;
+  // A distinctive token in a webhook URL: found in a message, it would be a leak.
+  const TOKEN = "TOKENzq9f3k2m8v1w7p4r6t5y0uabcdefghij";
+  const URL_WITH_TOKEN = `https://discord.com/api/webhooks/${HOOK}/${TOKEN}`;
+
+  test("a plugin whose name is not valid", () => {
+    expect(droppedByRepair(withPlugin("Music", { servers: {} }))).toEqual(["plugin Music is not a valid plugin name"]);
+    expect(droppedByRepair(withPlugin("a_b", { servers: {} }))).toEqual(["plugin a_b is not a valid plugin name"]);
+  });
+
+  test("a plugin that is not an object with a servers object", () => {
+    for (const entry of ["x", 7, null, [], { servers: [] }, { servers: "all" }, {}]) {
+      expect(droppedByRepair(withPlugin("music", entry))).toEqual(["plugin music is not an object with a servers object"]);
+    }
+  });
+
+  test("a server whose id is not a snowflake", () => {
+    expect(droppedByRepair(withServer({ commands: "all" }, "main"))).toEqual(["plugin music: server main is not a server id"]);
+    expect(droppedByRepair(withServer({ commands: "all" }, "1234"))).toEqual(["plugin music: server 1234 is not a server id"]);
+  });
+
+  test("a server with no valid commands", () => {
+    for (const server of [{}, { commands: "none" }, { commands: [] }, { commands: [7] }, { commands: ["abc"] }, { commands: [CHAN_1, 7] }, { commands: null }, "all", 7, null, []]) {
+      expect(droppedByRepair(withServer(server)), JSON.stringify(server)).toEqual([`plugin music: server ${GUILD_A} ${NO_COMMANDS}`]);
+    }
+  });
+
+  test("a postTo that is not a channel id: the server entry is kept, and only that is said", () => {
+    for (const postTo of [7, "x", "1234", null, {}, [], ""]) {
+      const raw = withServer({ commands: "all", postTo });
+      expect(droppedByRepair(raw), String(postTo)).toEqual([`plugin music: server ${GUILD_A}: postTo ${postTo === null ? "null" : Array.isArray(postTo) ? "[list]" : typeof postTo === "object" ? "[object]" : String(postTo)} is not a channel id`]);
+      // The entry stays, exactly as the repair keeps it.
+      expect(repairRouting(raw).plugins.music?.servers[GUILD_A]).toEqual({ commands: "all" });
+    }
+    // An absent postTo is not a dropped one.
+    expect(droppedByRepair(withServer({ commands: "all" }))).toEqual([]);
+  });
+
+  test("a webhook whose key is not a channel id", () => {
+    expect(droppedByRepair(withWebhook(goodHook, "general"))).toEqual(["webhook for general is not a channel id"]);
+  });
+
+  test("a webhook that is missing its ids", () => {
+    for (const entry of ["x", null, [], {}, { ...goodHook, id: "abc" }, { ...goodHook, id: undefined }, { ...goodHook, guildId: 7 }, { ...goodHook, guildId: undefined }]) {
+      expect(droppedByRepair(withWebhook(entry)), JSON.stringify(entry)).toEqual([`webhook for ${CHAN_1} is missing its ids`]);
+    }
+  });
+
+  test("a webhook that is missing its addedAt or addedBy is not said to be missing its ids", () => {
+    for (const entry of [{ ...goodHook, addedAt: 5 }, { ...goodHook, addedBy: undefined }, { ...goodHook, addedAt: undefined, addedBy: undefined }]) {
+      expect(droppedByRepair(withWebhook(entry)), JSON.stringify(entry)).toEqual([`webhook for ${CHAN_1} is missing its addedAt or addedBy`]);
+    }
+  });
+
+  test("a file with nothing wrong reports nothing", () => {
+    expect(droppedByRepair(good())).toEqual([]);
+    expect(droppedByRepair(freshRouting())).toEqual([]);
+    // A missing file is the normal case, and so is a raw that is not an object at all.
+    for (const raw of [null, undefined, 42, "routing", true, [], [good()]]) expect(droppedByRepair(raw)).toEqual([]);
+    // Bookkeeping and stray keys are not configuration: none of these is reported.
+    expect(droppedByRepair({ ...good(), results: [{ id: "x" }, 5, null], extra: 1, updatedAt: 5 })).toEqual([]);
+    expect(droppedByRepair({ v: 1, plugins: {}, webhooks: {} })).toEqual([]);
+  });
+
+  test("a webhook entry with a stray url key reports nothing, and no message ever contains the url", () => {
+    // The repair keeps the entry and drops the key, by design: that is not a dropped entry.
+    const stray = { ...goodHook, url: URL_WITH_TOKEN, token: TOKEN, broken: 7 };
+    expect(droppedByRepair(withWebhook(stray))).toEqual([]);
+    expect(repairRouting(withWebhook(stray)).webhooks[CHAN_1]).toEqual(goodHook);
+    // A dropped one that carried the url says which webhook, and nothing it held.
+    const dropped = droppedByRepair(withWebhook({ url: URL_WITH_TOKEN, token: TOKEN, id: "x" }));
+    expect(dropped).toEqual([`webhook for ${CHAN_1} is missing its ids`]);
+    // The url everywhere a value or a key can be: nothing in any message.
+    const everywhere = {
+      v: 1,
+      plugins: {
+        [URL_WITH_TOKEN]: { servers: {} },
+        music: {
+          servers: {
+            [URL_WITH_TOKEN]: { commands: "all" },
+            [GUILD_A]: { commands: URL_WITH_TOKEN, postTo: URL_WITH_TOKEN },
+            [GUILD_B]: { commands: [URL_WITH_TOKEN] },
+          },
+        },
+        wow: URL_WITH_TOKEN,
+      },
+      webhooks: { [URL_WITH_TOKEN]: { url: URL_WITH_TOKEN }, [CHAN_1]: { id: URL_WITH_TOKEN, url: URL_WITH_TOKEN, guildId: URL_WITH_TOKEN } },
+    };
+    const messages = droppedByRepair(everywhere);
+    expect(messages.length).toBeGreaterThanOrEqual(7);
+    for (const message of messages) {
+      // A key that is a url shows its first 37 characters (`shown`), which is before the token starts.
+      expect(message).not.toContain(TOKEN);
+      expect(message).not.toContain(URL_WITH_TOKEN);
+    }
+  });
+
+  test("a hostile key is clipped", () => {
+    const key = "x".repeat(100_000);
+    // (Upper case, because a run of lower-case letters is a valid plugin name.)
+    expect(droppedByRepair(withPlugin(key.toUpperCase(), { servers: {} }))).toEqual([`plugin ${"X".repeat(37)}... is not a valid plugin name`]);
+    expect(droppedByRepair(withServer({ commands: "all" }, key))).toEqual([`plugin music: server ${"x".repeat(37)}... is not a server id`]);
+    expect(droppedByRepair(withWebhook(goodHook, key))).toEqual([`webhook for ${"x".repeat(37)}... is not a channel id`]);
+    // A postTo value is clipped the same way, and a lone surrogate comes out well-formed.
+    const [postTo] = droppedByRepair(withServer({ commands: "all", postTo: "y".repeat(100_000) }));
+    expect(postTo).toBe(`plugin music: server ${GUILD_A}: postTo ${"y".repeat(37)}... is not a channel id`);
+    const [lone] = droppedByRepair(withPlugin("Bad\ud83dName", { servers: {} }));
+    expect(lone).toBe(`plugin Bad�Name is not a valid plugin name`);
+    // Keys that are inherited property names are just keys: `__proto__` is not a valid plugin name and is
+    // said; `constructor` is one (lower-case letters), the repair keeps it, and there is nothing to say.
+    const inherited = JSON.parse('{"plugins":{"__proto__":{"servers":{}},"constructor":{"servers":{}}}}');
+    expect(droppedByRepair(inherited)).toEqual(["plugin __proto__ is not a valid plugin name"]);
+    expect(Object.keys(repairRouting(inherited).plugins)).toEqual(["constructor"]);
+  });
+
+  test("it never throws, whatever it is given", () => {
+    for (const raw of [{ plugins: { music: { servers: { [GUILD_A]: { commands: { get x() { throw new Error("no"); } } } } } } }, { plugins: null, webhooks: 5 }, JSON.parse('{"plugins":{"music":{"servers":{"1":null}}}}')]) {
+      expect(() => droppedByRepair(raw)).not.toThrow();
+    }
+  });
+
+  describe("droppedByRepair and repairRouting agree on every fixture", () => {
+    /**
+     * An oracle that does not look at droppedByRepair: what `repairRouting` LEFT OUT, worked out by comparing
+     * its output with the raw file. A plugin that is gone; a server that is gone from a plugin that is kept; a
+     * postTo lost from a server that is kept; a webhook that is gone. (A dropped plugin's servers are not
+     * counted separately: the plugin is the thing dropped.)
+     */
+    function leftOut(raw: unknown): string[] {
+      const out: string[] = [];
+      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
+      const file = raw as { plugins?: unknown; webhooks?: unknown };
+      const repaired = repairRouting(raw);
+      const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+      if (isObject(file.plugins)) {
+        for (const [name, entry] of Object.entries(file.plugins)) {
+          const kept = Object.hasOwn(repaired.plugins, name) ? repaired.plugins[name] : undefined;
+          if (kept === undefined) {
+            out.push(name);
+            continue;
+          }
+          for (const [id, server] of Object.entries((entry as { servers: Record<string, unknown> }).servers)) {
+            const keptServer = Object.hasOwn(kept.servers, id) ? kept.servers[id] : undefined;
+            if (keptServer === undefined) out.push(id);
+            else if (isObject(server) && server.postTo !== undefined && keptServer.postTo === undefined) out.push(id);
+          }
+        }
+      }
+      if (isObject(file.webhooks)) {
+        for (const channel of Object.keys(file.webhooks)) if (!Object.hasOwn(repaired.webhooks, channel)) out.push(channel);
+      }
+      return out;
+    }
+
+    const A = GUILD_A;
+    const fixtures: [string, unknown][] = [
+      ["a valid file", good()],
+      ["an empty file", {}],
+      ["a fresh file", freshRouting()],
+      ["a bad plugin name", { plugins: { Music: { servers: {} }, wow: { servers: {} } } }],
+      ["an underscore plugin name", { plugins: { a_b: { servers: {} } } }],
+      ["plugins that are not objects", { plugins: { music: "x", wow: 7, x1: null, x2: [], x3: { servers: [] } } }],
+      ["a server id that is not a snowflake", { plugins: { music: { servers: { main: { commands: "all" }, [A]: { commands: "all" } } } } }],
+      ["a 4-digit server id", { plugins: { music: { servers: { "1234": { commands: "all" } } } } }],
+      ["a 26-digit server id", { plugins: { music: { servers: { ["1".repeat(26)]: { commands: "all" } } } } }],
+      ["a 5-digit server id", { plugins: { music: { servers: { "12345": { commands: "all" } } } } }],
+      ["a 25-digit server id", { plugins: { music: { servers: { ["1".repeat(25)]: { commands: "all" } } } } }],
+      ["commands: every bad shape at once", { plugins: { music: { servers: { [A]: { commands: "none" }, [GUILD_B]: { commands: [] }, "333333333333333333": { commands: [7] }, "444444444444444444": { commands: ["abc"] }, "555555555555555555": {} } } } }],
+      ["commands: a mixed list", { plugins: { music: { servers: { [A]: { commands: [CHAN_1, 7] } } } } }],
+      ["commands: a 4-digit channel", { plugins: { music: { servers: { [A]: { commands: ["1234"] } } } } }],
+      ["a server entry that is not an object", { plugins: { music: { servers: { [A]: "all", [GUILD_B]: null, "333333333333333333": [] } } } }],
+      ["a bad postTo beside good commands", { plugins: { music: { servers: { [A]: { commands: "all", postTo: 7 } } } } }],
+      ["a 4-digit postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "1234" } } } } }],
+      ["a null postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: null } } } } }],
+      ["a good postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: CHAN_1 } } } } }],
+      ["a webhook with a bad key", { webhooks: { general: goodHook, [CHAN_1]: goodHook } }],
+      ["a webhook keyed by a 4-digit channel id", { webhooks: { "1234": goodHook } }],
+      ["a webhook keyed by a 5-digit channel id", { webhooks: { "12345": goodHook } }],
+      ["a webhook keyed by a 19-digit channel id", { webhooks: { ["1".repeat(19)]: goodHook } }],
+      ["a webhook keyed by a 25-digit channel id", { webhooks: { ["1".repeat(25)]: goodHook } }],
+      ["a webhook keyed by a 26-digit channel id", { webhooks: { ["1".repeat(26)]: goodHook } }],
+      ["a webhook that is not an object", { webhooks: { [CHAN_1]: "x", [CHAN_2]: null, "333333333333333333": [] } }],
+      ["a webhook with a bad id", { webhooks: { [CHAN_1]: { ...goodHook, id: "abc" } } }],
+      ["a webhook with a 4-digit id", { webhooks: { [CHAN_1]: { ...goodHook, id: "1234" } } }],
+      ["a webhook with a bad guildId", { webhooks: { [CHAN_1]: { ...goodHook, guildId: 7 } } }],
+      ["a webhook with no addedAt", { webhooks: { [CHAN_1]: { ...goodHook, addedAt: undefined } } }],
+      ["a webhook with a numeric addedBy", { webhooks: { [CHAN_1]: { ...goodHook, addedBy: 7 } } }],
+      ["a webhook with stray keys and a non-string broken", { webhooks: { [CHAN_1]: { ...goodHook, url: URL_WITH_TOKEN, token: TOKEN, broken: 7 } } }],
+      ["a webhook with a string broken", { webhooks: { [CHAN_1]: { ...goodHook, broken: "gone" } } }],
+      ["everything wrong at once", { plugins: { Bad: {}, music: { servers: { x: {}, [A]: { commands: [], postTo: 1 } } } }, webhooks: { y: {}, [CHAN_1]: {} }, results: [null] }],
+      ["plugins and webhooks that are not objects (outside the kinds it reports)", { plugins: [], webhooks: "x" }],
+    ];
+
+    for (const [label, raw] of fixtures) {
+      test(label, () => {
+        const said = droppedByRepair(raw);
+        const gone = leftOut(raw);
+        // Something is said exactly when the repair left something out, and once for each.
+        expect(said.length).toBe(gone.length);
+        for (const key of gone) expect(said.some((message) => message.includes(shownKey(key))), key).toBe(true);
+      });
+    }
+    /** How a key appears in a message: as `shown` writes it. */
+    function shownKey(key: string): string {
+      return key.length <= 40 ? key : `${key.slice(0, 37)}...`;
+    }
   });
 });
 

@@ -15,6 +15,7 @@ import { chmod as fsChmod, mkdir, rename as fsRename, unlink, writeFile as fsWri
 import { dirname } from "node:path";
 import { createKeyedJsonMutator, readJsonOrFresh } from "../storage";
 import {
+  droppedByRepair,
   freshRouting,
   freshSecrets,
   repairRouting,
@@ -40,14 +41,36 @@ export function secretsPath(dataDir: string): string {
 // queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason.
 const routingMutator = createKeyedJsonMutator<RoutingFile>();
 
+// What `readRouting` has already said about a damaged file (#260). It is on the path of every command and
+// every announcement since #243, so a file with one bad entry must not write a line per command: each
+// distinct message is said once per process.
+const said = new Set<string>();
+
+/** Forget what has been said, so a test can see the same problem reported again. */
+export function resetRoutingWarningsForTest(): void {
+  said.clear();
+}
+
 /**
  * The routing file as the bot should act on it. A missing file is fresh; an unparseable one is
  * moved aside (`routing.json.corrupt-<timestamp>`) and read as fresh, as `readJsonOrFresh` does for
  * every data file; a parseable file of the wrong shape is repaired down to whatever in it is valid.
  * Never throws.
+ *
+ * The repair is tolerant and silent (`repairRouting` is pure); what it dropped is worked out beside it
+ * (`droppedByRepair`) and said HERE, at the I/O edge, once per distinct message: a plugin placed in a
+ * server whose entry is malformed would otherwise live nowhere with nothing in the log, and `#247` seeds
+ * this file by hand. Log output only -- what is registered, posted or refused is decided by the repaired
+ * value, exactly as before.
  */
 export async function readRouting(dataDir: string): Promise<RoutingFile> {
-  return repairRouting(await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing"));
+  const raw = await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing");
+  for (const message of droppedByRepair(raw)) {
+    if (said.has(message)) continue;
+    said.add(message);
+    console.warn(`[routing] routing.json: ${message}; it is ignored`);
+  }
+  return repairRouting(raw);
 }
 
 /**
