@@ -715,8 +715,9 @@ relay_tool_output() {
   local text="$1"
   if mentions_env_file "$text"; then
     local lines
-    # `|| true`: no "line N" in the text is fine, and must not abort the script under pipefail.
-    lines="$(printf '%s\n' "$text" | grep -oE 'line [0-9]+' | LC_ALL=C sort -u | tr '\n' ',' || true)"
+    # Each "line N" once, in numeric order. `|| true`: no "line N" in the text is fine, and must not abort
+    # the script under pipefail.
+    lines="$(printf '%s\n' "$text" | grep -oE 'line [0-9]+' | LC_ALL=C sort -t ' ' -k2,2n -u | tr '\n' ',' || true)"
     lines="${lines%,}"
     printf '%s' "docker compose could not read the env file ($ENV_FILE)${lines:+ -- ${lines//,/, }}. Its own message is withheld because it quotes the file; fix that line on the host."
     return 0

@@ -2048,11 +2048,17 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
   // by its own rules (a key ends at `=` OR `:`, `export ` is dropped, U+0085 / U+00A0 are whitespace), so a
   // guess made with bash's rules missed wherever the two disagree. Two layers now. Layer 1: what compose
   // says ABOUT the env file is not scrubbed but withheld whole -- those are the messages that quote it.
+  // written as char codes, never as the characters themselves: both are invisible in a diff, and an editor
+  // that normalised them away would turn those two rows into copies of the plain one with no test failing
+  const HAND_NBSP = String.fromCharCode(0xa0);
+  const HAND_NEL = String.fromCharCode(0x85);
   const HAND_EDITED: [string, string, string][] = [
     // [what is odd about the line, the line, what compose prints of it]
     ["export and a key compose rejects", `export MY!KEY=${OLD_SECRET}`, `unexpected character '!' in variable name 'MY!KEY=${OLD_SECRET}'`],
-    ["a no-break space before an unterminated quote", `BLIZZARD_CLIENT_SECRET= "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
-    ["U+0085 before an unterminated quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    // no `=` and no `:` either, so only "the line without export" matches what compose quotes
+    ["export, a key compose rejects, and no separator", `export MY!KEY ${OLD_SECRET}`, `unexpected character '!' in variable name 'MY!KEY ${OLD_SECRET}'`],
+    ["a no-break space before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NBSP}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["U+0085 before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NEL}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
     ["compose's colon separator", `BLIZZARD_CLIENT_SECRET: "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
     ["whitespace around the equals sign", `BLIZZARD_CLIENT_SECRET = "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
     ["a plain unterminated quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
@@ -2076,6 +2082,11 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
       ["names the file only", `failed to read {ENV_FILE}: line 3: bad ${OLD_SECRET}`, "line 3"],
       ["says env file only", `Failed to load ENV FILE: line 3: bad ${OLD_SECRET}`, "line 3"],
       ["two line numbers", `env file {ENV_FILE}: line 9: x ${OLD_SECRET}\nenv file {ENV_FILE}: line 3: y`, "line 3, line 9"],
+      [
+        "numeric order, and a line said twice is named once",
+        `env file {ENV_FILE}: line 10: x\nenv file {ENV_FILE}: line 3: y ${OLD_SECRET}\nenv file {ENV_FILE}: line 10: z`,
+        "line 3, line 10",
+      ],
       ["no line number", `env file {ENV_FILE} not found: ${OLD_SECRET}`, undefined],
     ];
     for (const [name, output, lines] of cases) {
