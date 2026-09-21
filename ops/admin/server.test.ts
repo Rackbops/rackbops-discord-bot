@@ -6325,6 +6325,26 @@ describe("applyPending (#257)", () => {
     expect(page.log.cancels).toBe(1);
   });
 
+  // #272 leaves this branch as it was: a network error or the page's own timeout is not an answer from the
+  // server, so nothing is re-read (a reload from a server that cannot be reached would replace the user's
+  // input with two error lines) and the controls keep what the user typed.
+  test("a request that throws (a network error, the page's own timeout) leaves the controls as they are", async () => {
+    for (const error of [new TypeError("Failed to fetch"), Object.assign(new Error("The operation was aborted."), { name: "AbortError" })]) {
+      const page = runApply({
+        loadedEnv: APPLY_ENV,
+        fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+        checked: ["warbandeer", "raidhelper"],
+        response: error,
+        resetOnReload: true,
+      });
+      await page.run.applyPending();
+      expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+      expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe("eu");
+      expect(page.boxes.find((b) => b.dataset.plugin === "raidhelper")!.checked).toBe(true);
+      expect(page.view()).toMatchObject({ tone: "danger", ok: true, discard: true, go: true });
+    }
+  });
+
   test("unauthorized is swallowed: the bar does not stay on Restarting the bot...", async () => {
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: new Error("unauthorized") });
     await page.run.applyPending();
