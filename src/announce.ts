@@ -13,7 +13,10 @@ import { readPluginState, mutatePluginState } from "./plugins/host";
 import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
-import { refreshDiscovery } from "./routing/live";
+import { readDiscovery } from "./routing/discovery";
+import { applyRouting, refreshDiscovery } from "./routing/live";
+import { liveFetchWebhook } from "./routing/requests";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets } from "./routing/store";
 
 // Exported so plugins/host.test.ts can pin PLUGIN_TICK_TIMEOUT_MS under it (#217).
 export const TICK_MS = 60 * 1000;
@@ -222,10 +225,12 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       },
     },
     {
-      // Drain the plugin request MAILBOX (#105) — panel-dropped update/schedule/remind/skip/cancel
-      // requests — every tick, and BEFORE the pluginUpdates pass so a just-queued request is applied
-      // this tick (the panel promises "≤1 min"). Gated on pluginStateReady like pluginUpdates; the
-      // consumer is single-flight vs the boot drain.
+      // Drain the plugin request MAILBOX (#105) — panel-dropped update and routing requests. Since #241
+      // the mailbox is also drained every few seconds on its own timer (src/plugins/drain.ts, started
+      // from index.ts), so a panel change lands in seconds; this tick check is the backstop, and still
+      // runs BEFORE the pluginUpdates pass so a request queued in the last seconds is applied this
+      // tick. Gated on pluginStateReady like pluginUpdates; the consumer is single-flight vs the boot
+      // drain and the timer's.
       name: "pluginRequests",
       run: async () => {
         if (pluginStateReady) await consumePluginRequests(livePluginRequestDeps());
@@ -321,9 +326,10 @@ function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
   };
 }
 
-/** Live deps for the #105 request-mailbox consumer (real fs + the shared index/state/mutator). No
- *  Discord client — a panel request has no DM target; the report-back logs the outcome. Reused by the
- *  boot drain in index.ts. */
+/** Live deps for the #105 request-mailbox consumer (real fs + the shared index/state/mutator), and since
+ *  #241 for the routing requests too (the routing store, `applyRouting` / `refreshDiscovery`, and the
+ *  webhook lookup). No Discord client — a panel request has no DM target; the report-back logs the
+ *  outcome. Reused by the boot drain and the every-few-seconds timer in index.ts. */
 export function livePluginRequestDeps(): PluginRequestDeps {
   return {
     requestsDir: join(DATA_DIR, "plugins", "requests"),
@@ -339,6 +345,18 @@ export function livePluginRequestDeps(): PluginRequestDeps {
     hostApiVersion: HOST_API_VERSION,
     now: () => new Date(),
     log: console,
+    routing: {
+      readDiscovery: () => readDiscovery(DATA_DIR),
+      readRouting: () => readRouting(DATA_DIR),
+      readSecrets: () => readSecrets(DATA_DIR),
+      mutateRouting: (mutate) => mutateRouting(DATA_DIR, mutate),
+      mutateSecrets: (mutate) => mutateSecrets(DATA_DIR, mutate),
+      fetchWebhook: liveFetchWebhook(),
+      applyRouting,
+      refreshDiscovery,
+      now: () => new Date(),
+      log: console,
+    },
   };
 }
 

@@ -160,6 +160,7 @@ describe("mutateRouting", () => {
       updatedBy: "someone",
       plugins: { music: { servers: { [GUILD]: { commands: [CHAN] } } } },
       webhooks: {},
+      results: [],
     });
     // And what was written back is the repaired file, not the damage.
     expect(JSON.parse(readFileSync(routingPath(dir), "utf8")).junk).toBeUndefined();
@@ -184,6 +185,7 @@ describe("mutateRouting", () => {
       updatedBy: "",
       plugins: { music: { servers: { [GUILD]: { commands: "all" } } } },
       webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u" } },
+      results: [],
     });
   });
 
