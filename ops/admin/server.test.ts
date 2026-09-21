@@ -5651,6 +5651,7 @@ interface BarView {
   showGo: boolean;
   showOk: boolean;
   busy: boolean;
+  ariaBusy: boolean;
 }
 // "use strict" up front, like the page's own IIFE: without it a lifted `Function` body silently creates
 // a global on an assignment to an un-injected identifier instead of throwing.
@@ -5660,7 +5661,7 @@ const planApply = new Function(
 const { applyBarView, describeApplyFailure, failureWroteNothing } = new Function(
   `"use strict";\n${applyBlock("APPLY_VIEW")}\nreturn { applyBarView, describeApplyFailure, failureWroteNothing };`,
 )() as {
-  applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean }) => BarView;
+  applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean; rereading?: boolean }) => BarView;
   describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
   failureWroteNothing: (status: number, result: unknown, text: string) => boolean;
 };
@@ -5744,7 +5745,7 @@ describe("planApply (#257)", () => {
 });
 
 describe("applyBarView (#257)", () => {
-  const hiddenView: BarView = { hidden: true, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false };
+  const hiddenView: BarView = { hidden: true, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false, ariaBusy: false };
   const HINT = "The bot goes offline for about 20 seconds while it restarts.";
 
   test("idle with nothing pending: the bar is hidden", () => {
@@ -5753,7 +5754,7 @@ describe("applyBarView (#257)", () => {
 
   test("idle with changes pending: the count, the consequence, Discard and Apply and restart", () => {
     expect(applyBarView({ count: 3, phase: "idle" })).toEqual({
-      hidden: false, tone: "", title: "3 changes need a restart", hint: HINT, showDiscard: true, showGo: true, showOk: false, busy: false,
+      hidden: false, tone: "", title: "3 changes need a restart", hint: HINT, showDiscard: true, showGo: true, showOk: false, busy: false, ariaBusy: false,
     });
   });
 
@@ -5765,13 +5766,13 @@ describe("applyBarView (#257)", () => {
   test("idle with a validation error: the same title, the error as the hint, danger, both buttons", () => {
     expect(applyBarView({ count: 2, phase: "idle", error: "ANNOUNCE_CHANNEL_ID is required and cannot be blank." })).toEqual({
       hidden: false, tone: "danger", title: "2 changes need a restart", hint: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.",
-      showDiscard: true, showGo: true, showOk: false, busy: false,
+      showDiscard: true, showGo: true, showOk: false, busy: false, ariaBusy: false,
     });
   });
 
   test("applying: Restarting the bot..., both buttons shown and busy", () => {
     expect(applyBarView({ count: 3, phase: "applying" })).toEqual({
-      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", showDiscard: true, showGo: true, showOk: false, busy: true,
+      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", showDiscard: true, showGo: true, showOk: false, busy: true, ariaBusy: false,
     });
     // ... whatever else is in the state: an in-flight request has one message.
     expect(applyBarView({ count: 0, phase: "applying", error: "x", detail: "y" }).title).toBe("Restarting the bot…");
@@ -5779,7 +5780,7 @@ describe("applyBarView (#257)", () => {
 
   test("done: it says the change is running, ok tone, only OK", () => {
     expect(applyBarView({ count: 3, phase: "done" })).toEqual({
-      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", showDiscard: false, showGo: false, showOk: true, busy: false,
+      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", showDiscard: false, showGo: false, showOk: true, busy: false, ariaBusy: false,
     });
     expect(applyBarView({ count: 0, phase: "done" }).hidden).toBe(false); // shown even though nothing is pending any more
   });
@@ -5791,7 +5792,7 @@ describe("applyBarView (#257)", () => {
     // It now says what the answer proves, that the SAVED settings hold them.
     expect(view).toEqual({
       hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The saved settings already held these values, so the bot was not restarted.",
-      showDiscard: false, showGo: false, showOk: true, busy: false,
+      showDiscard: false, showGo: false, showOk: true, busy: false, ariaBusy: false,
     });
     expect(`${view.title} ${view.hint}`).not.toMatch(/restarted with|The bot already had/);
     // noop only means something once an apply has finished: pending changes never read as "nothing needed".
@@ -5803,7 +5804,7 @@ describe("applyBarView (#257)", () => {
   test("failed: the error in the title, the detail as the hint, danger, OK -- plus Discard and Apply while changes are pending", () => {
     expect(applyBarView({ count: 0, phase: "failed", error: "compose: image not found", detail: "Backup: /opt/x/.env.bak.1" })).toEqual({
       hidden: false, tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1",
-      showDiscard: false, showGo: false, showOk: true, busy: false,
+      showDiscard: false, showGo: false, showOk: true, busy: false, ariaBusy: false,
     });
     const again = applyBarView({ count: 2, phase: "failed", error: "boom" });
     expect([again.showOk, again.showDiscard, again.showGo]).toEqual([true, true, true]);
@@ -6001,6 +6002,20 @@ interface ApplySpec {
   hold?: Promise<void>;
   /** The loaders put the controls back to `loadedEnv` and the server's ticks (a re-render from the baseline). */
   resetOnReload?: boolean;
+  /** #275: the loaders wait for this before they finish: a re-read in flight (the controls are replaced, if at all,
+   *  only when it lands). Resolve it yourself and never await anything that depends on it without a deadline. */
+  reloadHold?: Promise<void>;
+  /** #275: the loaders reject after `reloadHold` (a loader that throws). */
+  reloadFails?: boolean;
+  /** #275: the real loaders end in refreshApplyBar() (a `finally`); with this the stubs do too. */
+  loadersRefresh?: boolean;
+  /** #275: only THIS loader rejects, at once, while the other still waits for `reloadHold`: one list has failed and
+   *  the other is still in flight. */
+  reloadFailsAlone?: "plugins" | "env";
+  /** #275: this loader THROWS synchronously (after counting itself): a plain function, not an async one. */
+  reloadThrows?: "plugins" | "env";
+  /** #275: the first focus() of the bar throws (the bar's own DOM work failing as a re-read starts). */
+  focusThrowsOnce?: boolean;
   /** The plugin list is not rendered (a failed /api/plugins reload swaps the boxes for an error line) while
    *  `pluginsData` still holds the previous answer. */
   noBoxes?: boolean;
@@ -6010,6 +6025,10 @@ type ApplyPost = { path: string; opts: { method?: string; body?: string; signal?
 const APPLY_SCHEMA = { ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: true, source: "core" } };
 const APPLY_PLUGINS = { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" };
 const APPLY_ENV = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "11111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage", WATCHED_REPOS: "us" };
+// What `view()` reports for the bar's two buttons. Every assertion names BOTH: a single combined flag would pass
+// with one of them still locked (or still enabled).
+const BUTTONS_LOCKED = { discardDisabled: true, goDisabled: true };
+const BUTTONS_FREE = { discardDisabled: false, goDisabled: false };
 
 function runApply(spec: ApplySpec) {
   const log = {
@@ -6058,6 +6077,17 @@ function runApply(spec: ApplySpec) {
   };
 
   const bar = makeEl("apply-bar", { hidden: true });
+  if (spec.focusThrowsOnce) {
+    const realFocus = bar.focus;
+    let thrown = false;
+    bar.focus = (options) => {
+      if (!thrown) {
+        thrown = true;
+        throw new Error("focus() threw");
+      }
+      realFocus(options);
+    };
+  }
   const title = makeEl("apply-title");
   const hint = makeEl("apply-hint");
   const ok = makeEl("apply-ok", { hidden: true });
@@ -6108,13 +6138,30 @@ function runApply(spec: ApplySpec) {
   // The real loaders re-render every control from the persisted state. With `resetOnReload` the stubs do
   // the same to the stub controls (back to the baseline they started from), so Discard is observable end
   // to end; without it they only count (after a real apply the new baseline IS what was typed).
-  const loadEnv = async () => {
-    log.reloads.env++;
-    if (spec.resetOnReload) controls.forEach((c) => { c.value = baseline[c.dataset.key!] ?? ""; });
+  // A loader "lands" after `reloadHold` (if any), replaces the controls (resetOnReload) and, like the real loaders'
+  // `finally`, refreshes the bar (loadersRefresh); with `reloadFails` it rejects instead, with `reloadFailsAlone`
+  // only the named one rejects and it does so at once, and with `reloadThrows` the named one throws synchronously
+  // (after counting itself). With none of those set it is synchronous up to its return, as before.
+  let refreshAfterLoad: () => void = () => {};
+  const land = async (which: "plugins" | "env", replaceControls: () => void) => {
+    try {
+      if (spec.reloadFailsAlone === which) throw new Error(`loading ${which} failed`);
+      if (spec.reloadHold) await spec.reloadHold;
+      if (spec.reloadFails) throw new Error("the reload failed");
+      if (spec.resetOnReload) replaceControls();
+    } finally {
+      if (spec.loadersRefresh) refreshAfterLoad();
+    }
   };
-  const loadPlugins = async () => {
+  const loadEnv = (): Promise<void> => {
+    log.reloads.env++;
+    if (spec.reloadThrows === "env") throw new Error("loadEnv threw synchronously");
+    return land("env", () => controls.forEach((c) => { c.value = baseline[c.dataset.key!] ?? ""; }));
+  };
+  const loadPlugins = (): Promise<void> => {
     log.reloads.plugins++;
-    if (spec.resetOnReload) boxes.forEach((b, i) => { b.checked = boxBaseline[i]!; });
+    if (spec.reloadThrows === "plugins") throw new Error("loadPlugins threw synchronously");
+    return land("plugins", () => boxes.forEach((b, i) => { b.checked = boxBaseline[i]!; }));
   };
   const loadStatus = async () => void log.reloads.status++;
   const api = async (path: string, opts: ApplyPost["opts"]) => {
@@ -6145,6 +6192,7 @@ function runApply(spec: ApplySpec) {
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
   };
+  refreshAfterLoad = () => run.refreshApplyBar();
 
   return {
     run,
@@ -6175,7 +6223,8 @@ function runApply(spec: ApplySpec) {
         ok: !ok.hidden,
         discard: !discard.hidden,
         go: !go.hidden,
-        disabled: go.disabled && discard.disabled,
+        discardDisabled: discard.disabled,
+        goDisabled: go.disabled,
       };
     },
   };
@@ -6325,7 +6374,7 @@ describe("applyPending (#257)", () => {
     await page.run.applyPending();
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 });
     expect(page.view()).toEqual({
-      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", ok: true, discard: false, go: false, disabled: false,
+      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", ok: true, discard: false, go: false, ...BUTTONS_FREE,
     });
   });
 
@@ -6337,7 +6386,7 @@ describe("applyPending (#257)", () => {
     await page.run.applyPending();
     expect(page.view()).toEqual({
       hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The saved settings already held these values, so the bot was not restarted.",
-      ok: true, discard: false, go: false, disabled: false,
+      ok: true, discard: false, go: false, ...BUTTONS_FREE,
     });
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 }); // still re-baselined
     // Only an explicit recreated:false counts; a real restart (recreated:true), or any other success body, still says applied.
@@ -6381,7 +6430,7 @@ describe("applyPending (#257)", () => {
     await page.run.applyPending();
     expect(page.view()).toEqual({
       hidden: false, tone: "danger", title: "Couldn't apply: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", hint: "",
-      ok: true, discard: true, go: true, disabled: false,
+      ok: true, discard: true, go: true, ...BUTTONS_FREE,
     });
     expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
     expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe("eu");
@@ -6561,7 +6610,7 @@ describe("applyPending (#257)", () => {
     const first = page.run.applyPending();
     await Promise.resolve();
     expect(page.view()).toEqual({
-      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", ok: false, discard: true, go: true, disabled: true,
+      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", ok: false, discard: true, go: true, ...BUTTONS_LOCKED,
     });
     try {
       // A second click while one is in flight, and a Discard: each must return at once. Raced against a
@@ -6576,7 +6625,7 @@ describe("applyPending (#257)", () => {
     }
     await first;
     expect(page.view().title).toBe("Applied. The bot restarted with your changes.");
-    expect(page.view().disabled).toBe(false);
+    expect(page.view()).toMatchObject(BUTTONS_FREE);
   });
 
   test("focus rests on the bar while a request is in flight and lands on OK when it ends", async () => {
@@ -6749,7 +6798,15 @@ describe("discardPending (#257)", () => {
   });
 
   test("Discard on a failed apply also clears the failure, and focus returns to the open tab when the bar goes", async () => {
-    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: false, text: "nope" }, resetOnReload: true });
+    // (#275: a refusal, so the edits are KEPT and Discard is still on offer. This used to use a body that
+    // re-baselines, and its stub showed Discard beside a bar whose re-read had already replaced the edits -- the
+    // very window #275 closes: once the re-read lands, nothing is pending and only OK is left.)
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+      resetOnReload: true,
+    });
     page.activate(page.els.go);
     await page.run.applyPending();
     expect(page.view()).toMatchObject({ tone: "danger", ok: true, discard: true, go: true }); // changes are still pending
@@ -6794,6 +6851,370 @@ describe("dismissApplyResult (#257)", () => {
     expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
     expect(page.log.focused.at(-1)).toBe("apply-bar"); // an Enter pressed twice must not restart the bot
     expect(page.log.preventScroll).toEqual(["apply-bar"]);
+  });
+});
+
+// #275: while the page re-reads the plugins and the config from the server, the controls still hold what the user
+// typed, so the bar must not be interactive: an Apply pressed then sent the edits the page was about to drop -- after
+// a Discard (the very edits just discarded) and after a re-baselining failure (the bar offered Apply for the length
+// of the re-read). One flag (`applyRereading`), one helper (`rereadFromServer`) used by Discard, a re-baselining
+// failure and a success. A held re-read is a promise the test resolves itself; anything that could wait on it is
+// raced against a deadline, so a regression fails an assertion instead of hanging (Bun neither times such a test out
+// nor exits).
+describe("applyBarView while the page re-reads (#275)", () => {
+  test("marks Discard and Apply busy in the pending view and in the failed view; OK stays usable; the rest is unchanged", () => {
+    expect(applyBarView({ count: 2, phase: "idle", rereading: true })).toMatchObject({ hidden: false, showDiscard: true, showGo: true, busy: true });
+    expect(applyBarView({ count: 1, phase: "failed", error: "boom", rereading: true })).toMatchObject({ showOk: true, showDiscard: true, showGo: true, busy: true });
+    // not re-reading: interactive, as before
+    expect(applyBarView({ count: 2, phase: "idle" }).busy).toBe(false);
+    expect(applyBarView({ count: 2, phase: "idle", rereading: false }).busy).toBe(false);
+    expect(applyBarView({ count: 1, phase: "failed", error: "boom" }).busy).toBe(false);
+    // the "applying" view is already busy and the "done" view offers only OK: neither changes
+    expect(applyBarView({ count: 1, phase: "applying", rereading: true })).toEqual(applyBarView({ count: 1, phase: "applying" }));
+    expect(applyBarView({ count: 1, phase: "done", rereading: true })).toEqual(applyBarView({ count: 1, phase: "done" }));
+    // nothing pending: a failed view offers only OK, and an idle one is hidden, re-reading or not
+    expect(applyBarView({ count: 0, phase: "failed", error: "boom", rereading: true })).toMatchObject({ showOk: true, showDiscard: false, showGo: false });
+    expect(applyBarView({ count: 0, phase: "idle", rereading: true }).hidden).toBe(true);
+  });
+
+  // The bar is marked aria-busy in the PENDING view only. The failed and done views have just had their message
+  // written to the live region in the same task the re-read starts, and a screen reader may hold a live region's
+  // announcements while a container above it is busy: marking them could leave the failure or the success unheard.
+  test("marks the bar aria-busy in the pending view only, and only while re-reading", () => {
+    expect(applyBarView({ count: 2, phase: "idle", rereading: true }).ariaBusy).toBe(true);
+    expect(applyBarView({ count: 2, phase: "idle", rereading: false }).ariaBusy).toBe(false);
+    expect(applyBarView({ count: 2, phase: "idle" }).ariaBusy).toBe(false);
+    for (const rereading of [true, false]) {
+      expect(applyBarView({ count: 1, phase: "failed", error: "boom", rereading }).ariaBusy).toBe(false);
+      expect(applyBarView({ count: 0, phase: "failed", error: "boom", rereading }).ariaBusy).toBe(false);
+      expect(applyBarView({ count: 1, phase: "done", rereading }).ariaBusy).toBe(false);
+      expect(applyBarView({ count: 1, phase: "done", noop: true, rereading }).ariaBusy).toBe(false);
+      expect(applyBarView({ count: 1, phase: "applying", rereading }).ariaBusy).toBe(false);
+    }
+    expect(applyBarView({ count: 0, phase: "idle", rereading: true }).ariaBusy).toBe(false); // hidden: nothing to mark
+  });
+});
+
+describe("the bar while the page re-reads (#275)", () => {
+  const settlesSoon = (call: Promise<unknown>) => Promise.race([call.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100))]);
+  const nextTask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const JSON_FAILURE = '{"ok":false,"changed":["WATCHED_REPOS"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+  const REFUSAL = "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid";
+  const edited = { ...APPLY_ENV, WATCHED_REPOS: "eu" };
+
+  test("while a Discard is re-reading, Apply posts nothing and both buttons are busy", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, checked: ["warbandeer", "raidhelper"], reloadHold, resetOnReload: true, loadersRefresh: true });
+    page.run.refreshApplyBar();
+    expect(page.view()).toMatchObject({ hidden: false, go: true, discard: true, ...BUTTONS_FREE });
+    const discard = page.run.discardPending();
+    await nextTask();
+    // The controls still hold the edits, so the bar still shows them pending -- but neither button can act.
+    expect(page.view()).toMatchObject({ hidden: false, title: "2 changes need a restart", go: true, discard: true, ...BUTTONS_LOCKED });
+    try {
+      expect(await settlesSoon(page.run.applyPending())).toBe(true); // returns at once ...
+      expect(page.log.posts).toEqual([]); // ... having sent nothing
+    } finally {
+      release();
+    }
+    await discard;
+  });
+
+  test("a second Discard while one is re-reading does nothing", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, resetOnReload: true, loadersRefresh: true });
+    const first = page.run.discardPending();
+    await nextTask();
+    try {
+      expect(await settlesSoon(page.run.discardPending())).toBe(true);
+      expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 }); // one re-read, not two
+    } finally {
+      release();
+    }
+    await first;
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+  });
+
+  test("while the re-read after a failed recreate is in flight, Apply posts nothing and both buttons are busy", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: edited,
+      checked: ["warbandeer", "raidhelper"],
+      response: { ok: false, text: JSON_FAILURE },
+      reloadHold,
+      resetOnReload: true,
+      loadersRefresh: true,
+    });
+    const applying = page.run.applyPending(); // a JSON 502 (#47): the page re-reads, and applyPending waits for it
+    await nextTask();
+    expect(page.log.posts).toHaveLength(1);
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    // applyPending has not returned: the page wraps it in withBusy, which re-enables Apply when it does
+    expect(await settlesSoon(applying)).toBe(false);
+    // The failure is shown at once, beside the edits the re-read is about to drop -- and nothing can act on them.
+    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1", ok: true, discard: true, go: true, ...BUTTONS_LOCKED });
+    try {
+      expect(await settlesSoon(page.run.applyPending())).toBe(true);
+      expect(page.log.posts).toHaveLength(1); // the same POST is not sent a second time
+    } finally {
+      release();
+    }
+    await applying;
+  });
+
+  test("while the re-read after a successful apply is in flight, a second Apply and a Discard do nothing", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, resetOnReload: true, loadersRefresh: true });
+    const applying = page.run.applyPending();
+    await nextTask();
+    expect(page.view()).toMatchObject({ tone: "ok", title: "Applied. The bot restarted with your changes.", ok: true, discard: false, go: false });
+    expect(await settlesSoon(applying)).toBe(false); // still waiting for the re-read (see the failed-recreate test)
+    try {
+      // the controls still hold the applied values, so without the flag this would POST them again
+      expect(await settlesSoon(page.run.applyPending())).toBe(true);
+      expect(await settlesSoon(page.run.discardPending())).toBe(true);
+      expect(page.log.posts).toHaveLength(1);
+      expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 });
+    } finally {
+      release();
+    }
+    await applying;
+  });
+
+  test("focus: a Discard pressed from the bar leaves it on the bar during the re-read and on the open tab after; focus elsewhere is not pulled", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, resetOnReload: true, loadersRefresh: true });
+    page.activate(page.els.discard); // the button just pressed (the bar disables it, and a browser drops its focus)
+    const discard = page.run.discardPending();
+    await nextTask();
+    expect(page.log.focused).toEqual(["apply-bar"]); // rests on the bar, not lost to <body>
+    release();
+    await discard;
+    expect(page.log.focused.at(-1)).toBe("tab-settings"); // the bar hid: the existing recovery
+
+    let releaseElsewhere!: () => void;
+    const held = new Promise<void>((resolve) => (releaseElsewhere = resolve));
+    const elsewhere = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold: held, resetOnReload: true, loadersRefresh: true });
+    elsewhere.activate(elsewhere.control("WATCHED_REPOS")); // the user is typing in a field
+    const second = elsewhere.run.discardPending();
+    await nextTask();
+    expect(elsewhere.log.focused).toEqual([]); // nothing pulled onto the bar
+    releaseElsewhere();
+    await second;
+    expect(elsewhere.log.focused).toEqual([]);
+  });
+
+  test("when the re-read lands the bar is consistent: hidden when nothing is pending, and Apply works again", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, checked: ["warbandeer", "raidhelper"], reloadHold, resetOnReload: true, loadersRefresh: true });
+    const discard = page.run.discardPending();
+    await nextTask();
+    expect(page.view()).toMatchObject(BUTTONS_LOCKED);
+    release();
+    await discard;
+    // the controls are back at the baseline: nothing is pending, the bar is gone, the buttons are enabled again
+    expect(page.run.collectPending().fields).toEqual(APPLY_ENV);
+    expect(page.view()).toMatchObject({ hidden: true, ...BUTTONS_FREE });
+    // ... and a new edit is applied normally
+    page.edit("WATCHED_REPOS", "ap");
+    page.run.onControlEdited({ target: { closest: () => ({}) } });
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, ...BUTTONS_FREE });
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=ap"]);
+    // and after the failure that re-baselines, once the re-read landed only OK is left
+    const failed = runApply({ loadedEnv: APPLY_ENV, fields: edited, response: { ok: false, text: JSON_FAILURE }, resetOnReload: true, loadersRefresh: true });
+    await failed.run.applyPending();
+    expect(failed.view()).toMatchObject({ tone: "danger", ok: true, discard: false, go: false, ...BUTTONS_FREE });
+  });
+
+  test("a re-read that fails still unlocks the bar", async () => {
+    const logged = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      // a loader that rejects, after Discard ...
+      const discarded = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadFails: true, loadersRefresh: true });
+      expect(await settlesSoon(discarded.run.discardPending())).toBe(true);
+      // (nothing was replaced, so the edits are still pending and the buttons are enabled again)
+      expect(discarded.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, discard: true, ...BUTTONS_FREE });
+      await discarded.run.applyPending();
+      expect(discarded.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+      // ... and after a failed recreate
+      const failed = runApply({ loadedEnv: APPLY_ENV, fields: edited, response: { ok: false, text: JSON_FAILURE }, reloadFails: true, loadersRefresh: true });
+      expect(await settlesSoon(failed.run.applyPending())).toBe(true);
+      expect(failed.view()).toMatchObject({ tone: "danger", ok: true, discard: true, go: true, ...BUTTONS_FREE });
+    } finally {
+      console.error = logged;
+    }
+    expect(errors.length).toBeGreaterThanOrEqual(1); // reported, not swallowed silently
+  });
+
+  // The flag must stay up until BOTH lists have settled. A loader that fails at once must not end the wait while
+  // the other list is still in flight (Promise.all would: it rejects on the first rejection, and the finally then
+  // unlocks the bar with the controls about to be replaced under an Apply).
+  test("a loader that fails at once does not unlock the bar while the other list is still loading", async () => {
+    const logged = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      for (const failing of ["plugins", "env"] as const) {
+        let release!: () => void;
+        const reloadHold = new Promise<void>((resolve) => (release = resolve));
+        const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, reloadFailsAlone: failing, resetOnReload: true, loadersRefresh: true });
+        const discard = page.run.discardPending();
+        await nextTask(); // the failing loader has rejected; the other one is held
+        expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+        expect(page.view()).toMatchObject({ hidden: false, go: true, discard: true, ...BUTTONS_LOCKED });
+        try {
+          expect(await settlesSoon(page.run.applyPending())).toBe(true);
+          expect(page.log.posts).toEqual([]);
+          expect(await settlesSoon(discard)).toBe(false); // still waiting for the loader that is in flight
+        } finally {
+          release();
+        }
+        await discard;
+        expect(page.view()).toMatchObject(BUTTONS_FREE); // both lists have settled: the bar is free again
+      }
+    } finally {
+      console.error = logged;
+    }
+    expect(errors).toHaveLength(2); // each rejection reported, once
+  });
+
+  // Same rule for a loader that THROWS instead of returning a promise (the real ones are async and cannot, but a
+  // synchronous one must not skip the other loader, nor let the finally run while the other one is in flight).
+  test("a loader that throws synchronously is reported, does not skip the other one, and does not unlock the bar early", async () => {
+    const logged = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      for (const throwing of ["plugins", "env"] as const) {
+        let release!: () => void;
+        const reloadHold = new Promise<void>((resolve) => (release = resolve));
+        const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, reloadThrows: throwing, resetOnReload: true, loadersRefresh: true });
+        const discard = page.run.discardPending();
+        await nextTask();
+        expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 }); // both were started ...
+        expect(page.view()).toMatchObject({ hidden: false, go: true, discard: true, ...BUTTONS_LOCKED }); // ... and the bar waits for the one still loading
+        try {
+          expect(await settlesSoon(page.run.applyPending())).toBe(true);
+          expect(page.log.posts).toEqual([]);
+          expect(await settlesSoon(discard)).toBe(false);
+        } finally {
+          release();
+        }
+        await discard;
+        expect(page.view()).toMatchObject(BUTTONS_FREE);
+      }
+    } finally {
+      console.error = logged;
+    }
+    expect(errors).toHaveLength(2);
+  });
+
+  // The bar's own DOM work at the start of a re-read (refreshing it, moving focus) sits inside the try too: a throw
+  // there must neither leave the flag set nor reach the caller.
+  test("a throw as the re-read starts (moving focus onto the bar) is reported, and the bar still ends unlocked", async () => {
+    const logged = console.error;
+    const errors: unknown[][] = [];
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, focusThrowsOnce: true, resetOnReload: true, loadersRefresh: true });
+      page.activate(page.els.discard); // focus is inside the bar, so the re-read moves it onto the bar itself
+      expect(await settlesSoon(page.run.discardPending())).toBe(true); // it neither rejects nor hangs
+      // the throw came before the loaders started, so nothing was replaced: the edit is still pending, and the bar is free
+      expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+      expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, discard: true, ...BUTTONS_FREE });
+      await page.run.applyPending();
+      expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+    } finally {
+      console.error = logged;
+    }
+    expect(errors).toHaveLength(1);
+  });
+
+  // Discard and Apply are disabled while the bar shows its pending view and the page re-reads, and nothing on the bar
+  // says why, so the bar itself is aria-busy for exactly that long (applyBarView.ariaBusy). It is NOT marked when
+  // the bar has just had a message written (the failure, the success), while a request is in flight ("Restarting
+  // the bot…" says it), or after a refusal that re-reads nothing.
+  test("the bar is aria-busy while its pending view re-reads, and never for a message just written, a request in flight or a refusal", async () => {
+    type ApplyPage = ReturnType<typeof runApply>;
+    const busy = (page: ApplyPage) => page.els.bar.getAttribute("aria-busy");
+    const held = (over: Partial<ApplySpec> = {}) => {
+      let release!: () => void;
+      const reloadHold = new Promise<void>((resolve) => (release = resolve));
+      return { release, page: runApply({ loadedEnv: APPLY_ENV, fields: edited, reloadHold, resetOnReload: true, loadersRefresh: true, ...over }) };
+    };
+    // a Discard's re-read: marked while it is in flight, and only then
+    const discarded = held();
+    discarded.page.run.refreshApplyBar();
+    expect(busy(discarded.page)).toBeNull();
+    const discard = discarded.page.run.discardPending();
+    await nextTask();
+    expect(discarded.page.view()).toMatchObject({ title: "1 change needs a restart", ...BUTTONS_LOCKED });
+    expect(busy(discarded.page)).toBe("true");
+    discarded.release();
+    await discard;
+    expect(busy(discarded.page)).toBeNull();
+    // the failure and the success: their re-read is in flight (the loaders were started) and the bar is not marked
+    for (const [name, over] of [["a failed recreate", { response: { ok: false, text: JSON_FAILURE } }], ["a success", {}]] as [string, Partial<ApplySpec>][]) {
+      const { page, release } = held(over);
+      const applying = page.run.applyPending();
+      await nextTask();
+      expect([name, page.log.reloads]).toEqual([name, { plugins: 1, env: 1, status: name === "a success" ? 1 : 0 }]);
+      expect([name, busy(page)]).toEqual([name, null]);
+      release();
+      await applying;
+      expect([name, busy(page)]).toEqual([name, null]);
+    }
+    // OK pressed while the failure's re-read is in flight dismisses the message, and the bar is the pending view again:
+    // busy, so marked, until the reads land
+    const failed = held({ response: { ok: false, text: JSON_FAILURE } });
+    const applying = failed.page.run.applyPending();
+    await nextTask();
+    failed.page.run.dismissApplyResult();
+    expect(failed.page.view()).toMatchObject({ title: "1 change needs a restart", ...BUTTONS_LOCKED });
+    expect(busy(failed.page)).toBe("true");
+    failed.release();
+    await applying;
+    expect(busy(failed.page)).toBeNull();
+    // a request in flight is not a re-read
+    let releasePost!: () => void;
+    const hold = new Promise<void>((resolve) => (releasePost = resolve));
+    const posting = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold });
+    const posted = posting.run.applyPending();
+    await nextTask();
+    expect(posting.view().title).toBe("Restarting the bot…");
+    expect(busy(posting)).toBeNull();
+    releasePost();
+    await posted;
+    // a kept-edits refusal re-reads nothing
+    const refused = runApply({ loadedEnv: APPLY_ENV, fields: edited, response: { ok: false, text: REFUSAL } });
+    await refused.run.applyPending();
+    expect(busy(refused)).toBeNull();
+  });
+
+  test("after a kept-edits refusal (#272) nothing is re-read and the bar is never locked", async () => {
+    let release!: () => void;
+    const reloadHold = new Promise<void>((resolve) => (release = resolve)); // would hang the call if anything re-read
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, response: { ok: false, text: REFUSAL }, reloadHold, resetOnReload: true, loadersRefresh: true });
+    try {
+      expect(await settlesSoon(page.run.applyPending())).toBe(true);
+      expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+      expect(page.view()).toMatchObject({ tone: "danger", ok: true, discard: true, go: true, ...BUTTONS_FREE });
+      // the user can retry at once: a second POST goes out
+      expect(await settlesSoon(page.run.applyPending())).toBe(true);
+      expect(page.log.posts).toHaveLength(2);
+    } finally {
+      release();
+    }
   });
 });
 
