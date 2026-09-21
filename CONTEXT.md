@@ -261,7 +261,7 @@ _Avoid_: server list, guild cache
   (a request with no valid id records nothing). The Plugin Index is fetched only when a drain holds an
   update request; if it cannot be loaded those files stay queued and the drain fails, as it always has,
   but the routing requests behind them are still handled. A file that will not parse is looked at a
-  second time (`tornReadRetryMs`, 200 ms) before it is rejected, because the writer's `cat > file` is
+  second time (once, after `tornReadRetryMs`, 250 ms) before it is rejected, because the writer's `cat > file` is
   not atomic and the timer makes reading a half-written request likely enough to matter. A routing
   request whose file cannot be deleted is remembered and not applied again until the file is gone.
 - **Self-update** asks whether the baked-in `GIT_SHA` **contains** the newest `BOT_BRANCH` (default

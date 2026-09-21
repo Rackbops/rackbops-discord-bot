@@ -620,7 +620,7 @@ describe("consumePluginRequests drain", () => {
       expect(h.warns).toEqual([]);
     });
 
-    test("a request read while it is still being written is looked at again, not rejected", async () => {
+    test("a file that parses on the second read is applied, not rejected", async () => {
       const good = JSON.stringify(wb({ action: "skip", version: "1.1.0" }));
       for (const firstRead of ["", '{"plugin":"warbandeer","requestedBy":"email:me@x.com","act']) {
         const h = harness({});
@@ -639,7 +639,7 @@ describe("consumePluginRequests drain", () => {
       }
     });
 
-    test("the second look waits 200 ms by default, and tornReadRetryMs overrides it", async () => {
+    test("the second look waits 250 ms by default, and tornReadRetryMs overrides it", async () => {
       const delays: number[] = [];
       const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
         delays.push(ms ?? -1);
@@ -651,7 +651,7 @@ describe("consumePluginRequests drain", () => {
         delete byDefault.deps.tornReadRetryMs;
         byDefault.fs.set("100-skip-1.json", "{ not json");
         await consumePluginRequests(byDefault.deps);
-        expect(delays).toEqual([200]);
+        expect(delays).toEqual([250]);
 
         delays.length = 0;
         const custom = harness({});
@@ -700,12 +700,55 @@ describe("consumePluginRequests drain", () => {
       expect(h.fs.size).toBe(0);
     });
 
-    test("a file that is still unparseable the second time is rejected, and one that has gone is not a crash", async () => {
-      const still = harness({});
-      still.fs.set("100-skip-1.json", "{ not json");
-      await consumePluginRequests(still.deps);
-      expect(still.rejected).toEqual(["100-skip-1.json"]);
+    test("a file that still does not parse is rejected once, after exactly one retry", async () => {
+      const h = harness({});
+      h.fs.set("100-skip-1.json", "{ not json");
+      const real = h.deps.readFile;
+      let reads = 0;
+      h.deps.readFile = async (path) => {
+        reads += 1;
+        return real(path);
+      };
+      await consumePluginRequests(h.deps);
+      // Read twice -- the file and its one retry -- and rejected once, not looked at again and again.
+      expect(reads).toBe(2);
+      expect(h.warns).toHaveLength(1);
+      expect(h.rejected).toEqual(["100-skip-1.json"]);
+      // The next drain finds it gone: it is not read at all.
+      await consumePluginRequests(h.deps);
+      expect(reads).toBe(2);
+    });
 
+    test("a secret-bearing file that still does not parse is deleted after its one retry, never quarantined", async () => {
+      const h = harness({});
+      h.fs.set("100-webhook-add-1.json", `{"url":"${URL_OK}", oops`);
+      const real = h.deps.readFile;
+      let reads = 0;
+      h.deps.readFile = async (path) => {
+        reads += 1;
+        return real(path);
+      };
+      await consumePluginRequests(h.deps);
+      expect(reads).toBe(2);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: unreadable JSON"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a request that parses but fails validation is not read a second time", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "not-a-version" }) });
+      const real = h.deps.readFile;
+      let reads = 0;
+      h.deps.readFile = async (path) => {
+        reads += 1;
+        return real(path);
+      };
+      await consumePluginRequests(h.deps);
+      expect(reads).toBe(1);
+      expect(h.rejected).toEqual(["100-skip-1.json"]);
+    });
+
+    test("a file that has gone by the second look keeps its first failure, and is not a crash", async () => {
       const gone = harness({});
       gone.fs.set("100-skip-1.json", "{ not json");
       const real = gone.deps.readFile;

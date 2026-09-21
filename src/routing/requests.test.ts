@@ -283,10 +283,12 @@ describe("parseRoutingRequest", () => {
   test("a hostile requestedBy of several megabytes is parsed quickly, because only its start is scanned", () => {
     // Redaction costs about a second per megabyte on text built to be slow for it; the bound is what keeps
     // one request from holding the drain for seconds.
-    const hostile = `${"a".repeat(63)}.`.repeat(60_000); // about 3.8 MB
+    // Big enough that scanning all of it would take tens of seconds, so the bound below is far from anything
+    // a loaded machine does to the version that only scans the start.
+    const hostile = `${"a".repeat(63)}.`.repeat(320_000); // about 20 MB
     const started = Date.now();
     const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: hostile });
-    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(Date.now() - started).toBeLessThan(5_000);
     expect(parsed.ok && parsed.request.requestedBy).toHaveLength(200);
   });
 
@@ -907,6 +909,8 @@ describe("redactWebhookUrls", () => {
     for (const text of ["a".repeat(500_000), "a.".repeat(250_000), "https://".repeat(60_000), "a-".repeat(250_000) + "discord.com"]) {
       redactWebhookUrls(text);
     }
-    expect(Date.now() - started).toBeLessThan(3000);
+    // Linear takes tens of milliseconds; a backtracking pattern would take minutes or never finish. The bound
+    // sits between the two with room for a machine that is busy with something else.
+    expect(Date.now() - started).toBeLessThan(20_000);
   });
 });

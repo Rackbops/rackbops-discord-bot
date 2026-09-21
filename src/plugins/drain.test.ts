@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { REQUEST_DRAIN_MS, startRequestDrain, type RequestDrainOptions } from "./drain";
 
 /** A drain whose timer the test turns by hand: `beat()` is one tick of the interval. */
@@ -131,22 +131,42 @@ describe("startRequestDrain", () => {
     expect(harness({ intervalMs: 250 }).state.ms).toBe(250);
   });
 
-  test("with no seam it really is an interval, and stopping it stops the beats", async () => {
-    let drains = 0;
-    const stop = startRequestDrain({
-      ready: () => true,
-      restartPending: () => false,
-      drain: async () => {
-        drains += 1;
-      },
-      log: { error() {} },
-      intervalMs: 5,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    stop();
-    expect(drains).toBeGreaterThan(1);
-    const seen = drains;
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    expect(drains).toBe(seen);
+  test("with no seam it schedules a real interval at REQUEST_DRAIN_MS, and stopping it clears that interval", async () => {
+    // Through spies on setInterval / clearInterval, not a real timer: nothing here waits on a wall clock.
+    const handle = { id: "the timer" } as unknown as ReturnType<typeof setInterval>;
+    let beat: () => void = () => {
+      throw new Error("no interval was scheduled");
+    };
+    let scheduledMs: number | undefined;
+    const set = spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms?: number) => {
+      beat = fn;
+      scheduledMs = ms;
+      return handle;
+    }) as never);
+    const cleared: unknown[] = [];
+    const clear = spyOn(globalThis, "clearInterval").mockImplementation(((timer: unknown) => {
+      cleared.push(timer);
+    }) as never);
+    try {
+      let drains = 0;
+      const stop = startRequestDrain({
+        ready: () => true,
+        restartPending: () => false,
+        drain: async () => {
+          drains += 1;
+        },
+        log: { error() {} },
+      });
+      expect(scheduledMs).toBe(REQUEST_DRAIN_MS);
+      beat();
+      await Promise.resolve();
+      expect(drains).toBe(1);
+      expect(cleared).toEqual([]);
+      stop();
+      expect(cleared).toEqual([handle]);
+    } finally {
+      set.mockRestore();
+      clear.mockRestore();
+    }
   });
 });

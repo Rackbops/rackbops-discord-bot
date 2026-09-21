@@ -70,16 +70,17 @@ export interface PluginRequestDeps {
   /** What the four routing actions run against (#241). Absent: a routing action is rejected. */
   routing?: RoutingRequestDeps;
   /**
-   * How long to wait before looking a second time at a file that will not parse (default 200 ms). The
-   * writer is not atomic (`cat > file`), so a request can be read while it is still being written -- empty,
-   * or cut off -- and rejecting it then would lose a good request. Now that the mailbox is drained every
-   * few seconds that is a real window, so a file that fails to parse gets one more look before it is
-   * rejected.
+   * How long to wait before looking a second time at a file that will not parse (default 250 ms). The
+   * writer is not atomic (`cat > file`; #240 makes it write-then-rename, but an instance can run this bot
+   * with the old script), so a request can be read while it is still being written -- empty, or cut off --
+   * and rejecting it then would lose a good request. Now that the mailbox is drained every few seconds
+   * that is a real window, so a file that fails to PARSE gets exactly one more look before it is rejected
+   * (a file that parses but fails validation gets none). Injected so no test waits on a wall clock.
    */
   tornReadRetryMs?: number;
 }
 
-const TORN_READ_RETRY_MS = 200;
+const TORN_READ_RETRY_MS = 250;
 
 // Single-flight: the boot drain and a tick drain (both call consumePluginRequests) must not overlap —
 // two readdir passes could each see, apply, and unlink the same file. A module-level promise chain

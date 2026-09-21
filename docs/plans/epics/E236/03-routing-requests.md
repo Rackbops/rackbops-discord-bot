@@ -19,7 +19,7 @@ Read first: ADR-0006 (decisions 1 and 5), `src/plugins/requests.ts` in full with
 
 ### Known and accepted — so nobody spends a review round on it
 
-The request file that carries a webhook URL exists in `data/plugins/requests/` at the container's default mode for at most one drain interval (about five seconds) before the bot deletes it. That is accepted: the volume is the bot's own, and shortening it further belongs to the writer (`bot-ops.sh`), not this child.
+The request file that carries a webhook URL exists in `data/plugins/requests/` at the container's default mode for at most one drain interval (about five seconds) before the bot deletes it. That is accepted: the volume is the bot's own. The writer-side half of this -- a write-then-rename so a reader never sees a half-written file, and `umask 077` so the file is owner-only from creation -- is being fixed in #240 (`bot-ops.sh`), not in this child. Until an instance re-runs `install.sh` it can run this bot with the old script, so the bot side keeps a small mitigation: a file that fails to PARSE is read once more, after a fixed short delay (250 ms, injected), before it is rejected, and a secret-bearing file is still deleted (never quarantined) after that. *(Edited by the implementer after the plan was posted, on the orchestrator's instruction; everything else in this file is the plan as written.)*
 
 ### Step 1 — the model gains `results` (`src/routing/model.ts`, `src/routing/resolve.ts`)
 

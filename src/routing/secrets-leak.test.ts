@@ -112,6 +112,8 @@ describe("a webhook url is only ever in routing.secrets.json", () => {
         hostApiVersion: 1,
         now: () => new Date(AT),
         log: { info: capture, warn: capture, error: capture },
+        // The second look at a file that will not parse waits no wall-clock time here.
+        tornReadRetryMs: 0,
         routing: {
           readDiscovery: () => readDiscovery(dataDir),
           readRouting: () => readRouting(dataDir),
@@ -293,6 +295,7 @@ function liveDeps() {
     hostApiVersion: 1,
     now: () => new Date(AT),
     log: { info() {}, warn() {}, error() {} },
+    tornReadRetryMs: 0,
     routing: {
       readDiscovery: () => readDiscovery(dataDir),
       readRouting: () => readRouting(dataDir),
