@@ -187,8 +187,8 @@ async function activate(c: Client<true>): Promise<void> {
     // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or
     // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
     // same route with the same body, and its result is `single` -- so the line below is unchanged.
-    // A `single` failure is rethrown after discovery.json is written (see live.ts for what it records),
-    // into the catch below.
+    // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
+    // and when it is skipped), into the catch below.
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),

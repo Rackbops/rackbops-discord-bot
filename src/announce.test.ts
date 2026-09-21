@@ -111,7 +111,18 @@ describe("tickChecks", () => {
     try {
       initRouting({
         client: { user: { id: APP }, guilds: { cache: guilds } } as unknown as Client<true>,
-        put: () => gate,
+        // A channel appears in Discord while the registration is in flight: the registration takes its
+        // snapshot BEFORE it puts, so its own discovery write cannot contain this channel.
+        put: () => {
+          channels.set("1001", {
+            id: "1001",
+            name: "general",
+            type: ChannelType.GuildText,
+            rawPosition: 1,
+            permissionsFor: () => ({ has: () => true }),
+          });
+          return gate;
+        },
         appId: APP,
         botUsername: "Setlist Bot",
         dataDir: dir,
@@ -133,16 +144,9 @@ describe("tickChecks", () => {
       ]);
       expect(outcome).toBe("returned");
 
-      // ...and its refresh was not lost: a channel that appears while the registration is in flight is
-      // in discovery.json once both have run. The registration's own write (taken before the channel
-      // existed) cannot have put it there; only a refresh queued behind it can.
-      channels.set("1001", {
-        id: "1001",
-        name: "general",
-        type: ChannelType.GuildText,
-        rawPosition: 1,
-        permissionsFor: () => ({ has: () => true }),
-      });
+      // ...and its refresh was not lost: the channel is in discovery.json once both have run. The
+      // registration's own write used the snapshot it took before the put, so only a refresh queued
+      // behind the registration can have put the channel there.
       release();
       await boot;
       await routingIdleForTest();

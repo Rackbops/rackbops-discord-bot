@@ -107,6 +107,8 @@ describe("index.ts wiring", () => {
 
     test("initRouting is given the bot's own id and name, the command map, and the loaded plugins' summaries", () => {
       // appId is the route's first argument in every PUT, so a wrong one is a wrong route.
+      // The Client the servers are read from.
+      expect(initBlock).toMatch(/client:\s*c,/);
       expect(initBlock).toMatch(/appId:\s*c\.user\.id,/);
       expect(initBlock).toMatch(/botUsername:\s*c\.user\.username,/);
       // The command map is how the planner finds each command's owner: an empty one would read every

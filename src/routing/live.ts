@@ -9,11 +9,12 @@
 // the first.
 //
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
-// `single` mode (today's behaviour) the error is rethrown AFTER `discovery.json` has been written, so
-// `index.ts` reaches its own long `catch`; in `routed` mode nothing here ever throws. The failure is
-// written against the home server's entry -- when the bot can see that server. A failure of the
-// global scope (no home server) has no entry to go on, and `DiscoveryFile` has no other slot for it,
-// so that one reaches the operator through `index.ts`'s message only.
+// `single` mode (today's behaviour) the error is rethrown once `discovery.json` has been written (it
+// is not written when the bot's servers could not be read), so `index.ts` reaches its own long
+// `catch`; in `routed` mode nothing here ever throws. The failure is written against the home
+// server's entry -- when the bot can see that server. A failure of the global scope (no home server)
+// has no entry to go on, and `DiscoveryFile` has no other slot for it, so that one reaches the
+// operator through `index.ts`'s message only.
 
 import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as CommandJson } from "discord.js";
 import type { PluginCommandMap } from "../plugins/host";
@@ -124,8 +125,9 @@ function logRouted(c: RoutingContext, snapshots: readonly GuildSnapshot[], resul
  * `reason` says why it ran (it names the trigger in a discovery write failure). Resolves with the mode
  * the plan took, so `index.ts` prints today's `Registered N slash commands` line only for `single`.
  *
- * `single` mode registers exactly as before routing existed and rethrows a failure after recording it
- * in discovery; `routed` mode never throws.
+ * `single` mode registers exactly as before routing existed and rethrows a failure once discovery has
+ * been written (against the home server's entry when the bot can see it -- see the header for what it
+ * cannot record); `routed` mode never throws.
  */
 export function applyRouting(reason: string): Promise<ApplyResult> {
   return enqueue(async () => {
