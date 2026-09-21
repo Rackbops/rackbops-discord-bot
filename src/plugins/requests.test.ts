@@ -937,6 +937,27 @@ describe("consumePluginRequests drain", () => {
       expect(h.errors).toHaveLength(errors);
     });
 
+    test("a file that cannot be read, is refused, and cannot be removed is skipped from then on", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0" }) });
+      h.deps.readFile = async () => {
+        throw new Error("EIO: i/o error");
+      };
+      h.deps.rename = async () => {
+        throw new Error("EXDEV");
+      };
+      h.deps.unlink = async () => {
+        throw new Error("EACCES");
+      };
+      await consumePluginRequests(h.deps);
+      const warns = h.warns.length;
+      const errors = h.errors.length;
+      expect(warns).toBe(1);
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(warns);
+      expect(h.errors).toHaveLength(errors);
+    });
+
     test("two files that will not parse cost one pause between them, not one each", async () => {
       const delays: number[] = [];
       const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
