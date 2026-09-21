@@ -124,12 +124,14 @@ function setup(
   if (opts.discovery !== undefined) writeFileSync(discoveryFile, opts.discovery);
   if (opts.composeUp !== undefined) writeFileSync(composeOutFile, opts.composeUp.output);
   const execHandler = [
+    // An absent routing / discovery file exits 1, as a real `docker exec … cat <missing>` does (unlike the
+    // older index / state handlers below, which stay silent with status 0) — routing-get must survive it.
     opts.routing !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then cat ${JSON.stringify(bashPath(routingFile))}; fi`
-      : "",
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then exit 1; fi`,
     opts.discovery !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then cat ${JSON.stringify(bashPath(discoveryFile))}; fi`
-      : "",
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then exit 1; fi`,
     opts.composeUp !== undefined
       ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
       : "",

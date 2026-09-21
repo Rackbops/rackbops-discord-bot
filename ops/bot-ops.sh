@@ -880,17 +880,22 @@ readonly ROUTING_SCRUB_JQ='
         | gsub("webhooks/[0-9]+/[A-Za-z0-9_.~%-]+"; "webhooks/[redacted]"; "i")
         | fromjson)
   else null end'
+# Reads one file from the container into SCRUBBED (a global, so it runs in the CURRENT shell like
+# load_plugin_keys: called through a command substitution, `set -e` would not apply inside it and the
+# `|| true` below — which a real `docker exec … cat` of a file that isn't there needs, since it exits 1
+# and pipefail is on — could be dropped without anyone noticing).
+SCRUBBED="null"
 read_scrubbed_json() {
-  local out
-  out="$(docker exec "$CONTAINER" cat "$1" 2>/dev/null | jq -c -s "$ROUTING_SCRUB_JQ" 2>/dev/null || true)"
-  [ -n "$out" ] || out="null"
-  printf '%s' "$out"
+  SCRUBBED="$(docker exec "$CONTAINER" cat "$1" 2>/dev/null | jq -c -s "$ROUTING_SCRUB_JQ" 2>/dev/null || true)"
+  [ -n "$SCRUBBED" ] || SCRUBBED="null"
 }
 cmd_routing_get() {
   need docker; need jq
   local routing discovery
-  routing="$(read_scrubbed_json "$ROUTING_PATH")"
-  discovery="$(read_scrubbed_json "$DISCOVERY_PATH")"
+  read_scrubbed_json "$ROUTING_PATH"
+  routing="$SCRUBBED"
+  read_scrubbed_json "$DISCOVERY_PATH"
+  discovery="$SCRUBBED"
   { printf '%s\n' "$routing"; printf '%s\n' "$discovery"; } | jq -s '{routing: .[0], discovery: .[1]}'
 }
 
