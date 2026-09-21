@@ -40,9 +40,10 @@
 #     Dockge manages it), while .env lives under /opt/rackbops-discord-bot/<instance>/ (config dir
 #     stays outside any git checkout — see ops/README.md). Neither is set here — a caller (a panel,
 #     or you by hand) must always pass both; there is no repo-relative fallback.
-#   - CORE secrets (DISCORD_TOKEN, BLIZZARD_CLIENT_SECRET, GITHUB_TOKEN, ...) are deliberately absent
-#     from ALLOWED. env-get never reads them out; env-set never writes them. Edit those by hand
-#     with nano on the box. A PLUGIN-declared secret key (the Plugin Index marks it `secret: true`) is
+#   - CORE secrets (DISCORD_TOKEN, GITHUB_TOKEN, ADMIN_TOKEN, the Cloudflare tunnel / Access keys, ...)
+#     are deliberately absent from ALLOWED. env-get never reads them out; env-set never writes them.
+#     Edit those by hand with nano on the box. A PLUGIN-declared secret key (the Plugin Index marks
+#     it `secret: true` — e.g. the wow plugin's BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET) is
 #     different, on purpose (ADR-0006 decision 8): env-set may WRITE it, and nothing ever reads it
 #     back — env-get never lists it, env-schema says only that it exists and whether it is set, and
 #     no output, error or log line this script emits carries its value.
@@ -244,12 +245,16 @@ declare -A REQUIRED=(
 # load_plugin_keys drops these on the way in. Pinned against .env.example's credential-shaped keys
 # and every ${VAR} docker-compose.yml interpolates by ops/bot-ops.test.ts, so a new core secret that
 # is not added here fails a test rather than staying editable by manifest.
+#
+# A credential a first-party PLUGIN owns is deliberately NOT here: the wow plugin's
+# BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET are read by that plugin alone (nothing in the bot core
+# does), its Plugin Index entry declares both `secret: true`, and being panel-settable and write-only
+# is exactly what ADR-0006 decision 8 is for. The test pin names them in an explicit exemption list
+# and checks each sits under .env.example's "Used by the <plugin> plugin" block.
 declare -A RESERVED_KEYS=(
   [DISCORD_TOKEN]=1
   [GITHUB_TOKEN]=1
   [ADMIN_TOKEN]=1
-  [BLIZZARD_CLIENT_ID]=1
-  [BLIZZARD_CLIENT_SECRET]=1
   [CLOUDFLARE_TUNNEL_TOKEN]=1
   [CLOUDFLARE_ACCESS_TEAM_DOMAIN]=1
   [CLOUDFLARE_ACCESS_AUD]=1

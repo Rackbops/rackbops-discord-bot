@@ -212,10 +212,12 @@ an error (the JSON stays a flat map of editable keys, so the panel round-trips i
 edit a plugin's keys while the bot is up. A valid-JSON-but-wrong-shape cached index is treated the
 same way (degraded, never a crash).
 
-**Core secrets are intentionally absent** — `DISCORD_TOKEN`, `BLIZZARD_CLIENT_ID`,
-`BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`. `env-get` never reads them
-out and `env-set` refuses to write them. Edit those by hand with `nano` on the box. (A plugin's own
-`secret` keys are the one exception, and only for writing — see below.)
+**Core secrets are intentionally absent** — `DISCORD_TOKEN`, `GITHUB_TOKEN`, `ADMIN_TOKEN`,
+`CLOUDFLARE_TUNNEL_TOKEN` and the other credentials the bot core itself reads. `env-get` never reads
+them out and `env-set` refuses to write them. Edit those by hand with `nano` on the box. (A plugin's
+own `secret` keys are the one exception, and only for writing — see below. The wow plugin's
+`BLIZZARD_CLIENT_ID` / `BLIZZARD_CLIENT_SECRET` are such keys, not core: nothing in the bot core reads
+them, so with `wow` in `PLUGINS=` the panel can set them.)
 
 ## Safety notes
 

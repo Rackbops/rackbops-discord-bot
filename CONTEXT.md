@@ -947,7 +947,11 @@ _Avoid_: server list, guild cache
   `PLUGIN_KEY_ORDER`, so nothing that lists keys can reach one; (2) **`RESERVED_KEYS`** — the
   deployment's own keys (core credentials, access control, every `${VAR}` `docker-compose.yml`
   interpolates) — are dropped from a manifest whether it declares them secret or not, so a manifest
-  can't make `DISCORD_TOKEN` editable, and a key one plugin declares secret is secret for every
+  can't make `DISCORD_TOKEN` editable (a credential a first-party plugin owns is deliberately NOT
+  reserved: the wow plugin's `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` are declared `secret: true`
+  in its Plugin Index entry and nothing in `src/` reads them, so the panel can set them — the test pin
+  names them in an explicit exemption list and checks each sits under `.env.example`'s "Used by the
+  <plugin> plugin" block), and a key one plugin declares secret is secret for every
   plugin (secret wins; a secret declared twice is first-wins); (3) **no equality oracle** — a
   submitted secret is always treated as a change and written, because a "no changes" answer would
   tell a caller its guess equals the stored value (the one skip is a blank for an already-unset key,

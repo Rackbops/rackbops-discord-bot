@@ -1508,7 +1508,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
 
   test("a core secret is still refused", async () => {
     const fx = setup(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`, { pluginIndex: SECRET_INDEX });
-    for (const key of ["DISCORD_TOKEN", "GITHUB_TOKEN", "ADMIN_TOKEN", "BLIZZARD_CLIENT_SECRET", "CLOUDFLARE_TUNNEL_TOKEN"]) {
+    for (const key of ["DISCORD_TOKEN", "GITHUB_TOKEN", "ADMIN_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN", "CLOUDFLARE_ACCESS_AUD"]) {
       const run = await botOps(fx, ["env-set"], `${key}=${SECRET}\n`);
       expect(run.exitCode, key).toBe(1);
       expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
@@ -1516,6 +1516,44 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     }
     expect(envText(fx)).toBe(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`);
     expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("the wow plugin's Blizzard client is not core: settable, write-only, listed nowhere but env-schema", async () => {
+    // Shaped like the real wow entry in the published Plugin Index: both keys `secret: true`, format
+    // ^\S+$. BLIZZARD_CLIENT_* belong to that plugin, so the panel must be able to set them.
+    const index = wrapIndex([
+      pluginEntry("wow", [
+        envKey("WOW_REGION", "^(us|eu)$"),
+        envKey("BLIZZARD_CLIENT_ID", "^\\S+$", { secret: true }),
+        envKey("BLIZZARD_CLIENT_SECRET", "^\\S+$", { secret: true }),
+      ]),
+    ]);
+    const base = "PLUGINS=wow\nANNOUNCE_CHANNEL_ID=11111\n";
+    const fx = setup(base, { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], `BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["BLIZZARD_CLIENT_SECRET"], recreated: true });
+    expect(envText(fx)).toBe(`${base}BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).not.toContain("BLIZZARD");
+    expect(get.stdout).not.toContain(SECRET);
+
+    const schema = await botOps(fx, ["env-schema"]);
+    expect(schema.json).toMatchObject({
+      WOW_REGION: { source: "plugin", required: false },
+      BLIZZARD_CLIENT_ID: { source: "plugin", secret: true, isSet: false },
+      BLIZZARD_CLIENT_SECRET: { source: "plugin", secret: true, isSet: true },
+    });
+    expect(schema.stdout).not.toContain(SECRET);
+
+    // The manifest, not the key's name, is the authority: with wow not enabled the same key is refused.
+    const off = setup("ANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const refused = await botOps(off, ["env-set"], `BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("'BLIZZARD_CLIENT_SECRET' is not an editable key");
   });
 
   test("a manifest that declares a core credential cannot make it editable, listable or schema-visible", async () => {
@@ -2068,16 +2106,38 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
   const reserved = new Set([...block.matchAll(/\[([A-Z][A-Z0-9_]*)\]=1/g)].map((m) => m[1]!));
 
   test("the block is found and non-empty (can't pass vacuously)", () => {
-    expect(reserved.size).toBeGreaterThanOrEqual(15);
-    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
+    expect(reserved.size).toBeGreaterThanOrEqual(15);    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
   });
 
-  test("every credential-shaped key in .env.example is reserved", () => {
-    const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  // Credentials a first-party plugin owns are NOT reserved, on purpose (ADR-0006 decision 8): the panel
+  // sets them write-only. Add a key here only when a plugin's Plugin Index entry declares it and nothing
+  // in the bot core (src/) reads it. Each entry is checked below against .env.example's "Used by the
+  // <plugin> plugin" block, so this list cannot be used to un-reserve a core key by accident.
+  const PLUGIN_OWNED: Record<string, string> = { BLIZZARD_CLIENT_ID: "wow", BLIZZARD_CLIENT_SECRET: "wow" };
+  const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  /** .env.example's blank-line-separated blocks: the plugin a "# Used by the <name> plugin" header names
+   *  (or null) and the keys the block sets. */
+  const blocks = example.split(/\r?\n[ \t]*\r?\n/).map((b) => ({
+    plugin: b.match(/^# Used by the ([a-z][a-z0-9-]*) plugin/m)?.[1] ?? null,
+    keys: [...b.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!),
+  }));
+
+  test("every credential-shaped key in .env.example is reserved, bar the plugin-owned exemptions", () => {
     const keys = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!);
     const credentialShaped = keys.filter((k) => /TOKEN|SECRET|CLIENT_ID|PASSWORD|_KEY$|ALLOWED_EMAILS|ACCESS_/.test(k));
     expect(credentialShaped.length).toBeGreaterThanOrEqual(6);
-    expect(credentialShaped.filter((k) => !reserved.has(k))).toEqual([]);
+    expect(credentialShaped.filter((k) => !reserved.has(k) && !(k in PLUGIN_OWNED))).toEqual([]);
+  });
+
+  test("each plugin-owned exemption is unreserved and really sits under its plugin's block in .env.example", () => {
+    expect(Object.keys(PLUGIN_OWNED)).toEqual(["BLIZZARD_CLIENT_ID", "BLIZZARD_CLIENT_SECRET"]);
+    for (const [key, plugin] of Object.entries(PLUGIN_OWNED)) {
+      expect(reserved.has(key), `${key} is plugin-owned, so it must not be reserved`).toBe(false);
+      const block = blocks.find((b) => b.keys.includes(key));
+      expect(block?.plugin, `${key} must sit under a "# Used by the <plugin> plugin" block`).toBe(plugin);
+    }
+    // ...and a core key is in no such block, so listing it as an exemption would fail the check above.
+    expect(blocks.find((b) => b.keys.includes("DISCORD_TOKEN"))?.plugin ?? null).toBeNull();
   });
 
   test("every variable docker-compose.yml interpolates is reserved", () => {
