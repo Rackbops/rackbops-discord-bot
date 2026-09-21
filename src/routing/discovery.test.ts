@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelType, PermissionFlagsBits, type Client } from "discord.js";
 import type { LoadedPlugin, PluginCommandMap } from "../plugins/host";
 import type { Plugin, PluginCommand, PluginIndexEntry, TickCheck } from "../plugins/contract";
-import { buildDiscovery, describePlugins, discoveryPath, inviteUrl, snapshotGuilds, writeDiscovery } from "./discovery";
+import { buildDiscovery, describePlugins, discoveryPath, inviteUrl, readDiscovery, snapshotGuilds, writeDiscovery } from "./discovery";
 import type { GuildSnapshot } from "./discovery";
 import type { GuildRegistration } from "./register";
 
@@ -341,5 +341,43 @@ describe("writeDiscovery", () => {
     const nested = join(dir, "a", "b");
     await writeDiscovery(nested, build());
     expect(JSON.parse(readFileSync(discoveryPath(nested), "utf8")).v).toBe(1);
+  });
+});
+
+describe("readDiscovery (#241)", () => {
+  test("a missing file reads as not published yet", async () => {
+    expect(await readDiscovery(dir)).toBeNull();
+    // And reading it created nothing.
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("a malformed file reads as not published yet", async () => {
+    const quiet = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Not JSON at all -- moved aside by readJsonOrFresh, as every data file is.
+      writeFileSync(discoveryPath(dir), "{ not json");
+      expect(await readDiscovery(dir)).toBeNull();
+      expect(readdirSync(dir).some((f) => f.startsWith("discovery.json.corrupt-"))).toBe(true);
+      // JSON, but not a file the bot wrote: no guilds list.
+      for (const damaged of ["null", "[]", "5", '"text"', "{}", '{"v":1}', '{"guilds":null}', '{"guilds":{}}', '{"guilds":"x"}']) {
+        writeFileSync(discoveryPath(dir), damaged);
+        expect(await readDiscovery(dir), damaged).toBeNull();
+      }
+    } finally {
+      quiet.mockRestore();
+    }
+  });
+
+  test("a good file is read back as it was written", async () => {
+    const file = build({ registrations: [{ guildId: HOME, registered: 7, at: AT }] });
+    await writeDiscovery(dir, file);
+    expect(await readDiscovery(dir)).toEqual(file);
+  });
+
+  test("a file with an empty guilds list is a file: the bot published that it is in no server", async () => {
+    await writeDiscovery(dir, build({ snapshots: [] }));
+    const read = await readDiscovery(dir);
+    expect(read).not.toBeNull();
+    expect(read!.guilds).toEqual([]);
   });
 });

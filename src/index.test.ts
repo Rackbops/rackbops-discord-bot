@@ -151,6 +151,42 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #241: the request mailbox is also drained every few seconds on its own timer. index.ts can't run under
+  // test, so the shape of the wiring is pinned in the source: that the timer is started at all, and how.
+  describe("the request-mailbox timer is wired (#241)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const scheduler = source.indexOf("startScheduler(client", activateFn);
+    const start = source.indexOf("startRequestDrain({", activateFn);
+    // The text of the call alone, so a property name that appears elsewhere cannot satisfy a pin.
+    const call = source.slice(start, source.indexOf("});", start));
+
+    test("the request drain starts after the scheduler, gated on plugin state and restarts, inside a critical section", () => {
+      expect(scheduler).toBeGreaterThan(activateFn);
+      expect(start).toBeGreaterThan(scheduler);
+      expect((source.match(/startRequestDrain\(/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/import \{ startRequestDrain \} from "\.\/plugins\/drain";/);
+      // Nothing is drained until the boot state write and boot drain have landed...
+      expect(call).toMatch(/ready:\s*isPluginStateReady,/);
+      // ...none starts on the way out...
+      expect(call).toMatch(/\n\s*restartPending,\n/);
+      // ...and a drain is a critical section, so a restart an update-now asks for waits for it.
+      expect(call).toMatch(/drain:\s*\(\)\s*=>\s*withCritical\(\(\)\s*=>\s*consumePluginRequests\(livePluginRequestDeps\(\)\)\),/);
+      expect(call).toMatch(/log:\s*console,/);
+    });
+
+    test("every drain runs after initRouting: the boot drain follows registration and precedes the ready flag", () => {
+      const init = source.indexOf("initRouting({", activateFn);
+      const applied = source.indexOf('applyRouting("boot")', activateFn);
+      const bootDrain = source.indexOf("await consumePluginRequests(livePluginRequestDeps())", activateFn);
+      const ready = source.indexOf("markPluginStateReady();", activateFn);
+      for (const pos of [init, applied, bootDrain, ready]) expect(pos).toBeGreaterThan(-1);
+      expect(init).toBeLessThan(applied);
+      expect(applied).toBeLessThan(bootDrain);
+      // The timer's beats (and the tick's) are gated on this flag, so they cannot run before initRouting.
+      expect(bootDrain).toBeLessThan(ready);
+    });
+  });
+
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });

@@ -26,7 +26,9 @@ request mailbox and applied without a restart.
    where its commands work (`"all"`, or a list of channels) and the channel it posts to. The panel
    asks for a change by dropping a request in the mailbox (`src/plugins/requests.ts`), exactly as it
    already does for plugin updates; the bot validates it against what it can actually see, writes
-   the file, re-registers commands and carries on. Nothing restarts.
+   the file, re-registers commands and carries on. Nothing restarts. The bot records each request's
+   outcome in the same file, under the id the panel chose, so the panel learns it by reading
+   `routing.json` (#241).
 2. **Routing is per plugin, not per command.** A plugin's whole command set goes where the plugin
    lives. Core commands (`report`, `update`, `plugins`) go to every server the bot is in; the two
    admin ones are already hidden from non-admins by `setDefaultMemberPermissions(0)`.

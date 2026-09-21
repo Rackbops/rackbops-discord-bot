@@ -9,12 +9,13 @@ import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, wr
 import { createClient, CORE_INTENTS } from "./client";
 import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler, announceTo, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
+import { startScheduler, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
+import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
-import { awaitCriticalIdle, beginShutdown } from "./restart";
+import { awaitCriticalIdle, beginShutdown, restartPending, withCritical } from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
@@ -182,6 +183,19 @@ async function activate(c: Client<true>): Promise<void> {
   await activatePlugins(loadResult.loaded, console);
 
   startScheduler(client, pluginTicks(loadResult.loaded, console));
+
+  // #241: the request mailbox is also drained every few seconds on its own timer, so a routing change
+  // made in the panel shows up while the operator is still looking; the `pluginRequests` tick check
+  // stays as the backstop. It is deliberately not part of the tick machinery. Beats do nothing until
+  // the boot state write and the boot drain below have landed (`isPluginStateReady`), which is also
+  // after `initRouting`, and none starts on the way out. The drain is a critical section, so a restart an
+  // update-now asks for waits for it, as it does for a tick.
+  startRequestDrain({
+    ready: isPluginStateReady,
+    restartPending,
+    drain: () => withCritical(() => consumePluginRequests(livePluginRequestDeps())),
+    log: console,
+  });
 
   try {
     // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or
