@@ -226,19 +226,27 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   true` — for a plugin named in `PLUGINS=` — and nothing ever reads it back. The value appears in no
   output this script emits: not in `env-get` (a secret key is never listed), not in `env-schema`
   (`secret: true` and `isSet` only), not in `env-set`'s result (it names changed *keys*), not in a
-  refusal message (those name the key), not on stderr, and not in `docker`'s argv. Four properties
-  keep that true. (1) A submitted secret is **always written** and reported as changed, even with
-  the value it already has: otherwise "no changes" would tell a caller its guess was the stored
-  value. The one exception is a blank for a key that is already unset, which reveals only what
-  `isSet` already does. (2) The recreate's own output is scrubbed of every plugin-secret value (new
-  and old) before it is returned in `log`, since `docker compose` is not ours and can quote a `.env`
-  line it refuses to parse. (3) A value containing a CR is refused for every key (it could start a new
-  `.env` line), naming the key only. (4) A key the deployment owns — the core credentials, the access
-  and admin settings, and every variable `docker-compose.yml` interpolates — is dropped from every
-  plugin path whatever the manifest says (`RESERVED_KEYS` in the script, pinned by a test against
-  `.env.example` and the compose file), so a manifest that names `DISCORD_TOKEN` cannot make the
-  panel able to overwrite it. A key one plugin declares secret is secret even if another declares it
-  plain, and a secret key that collides with a static key is ignored (the static key wins). The
+  refusal message (those name a key, and only one that looks like a variable name), not on stderr,
+  and not in `docker`'s argv. These keep that true. (1) A submitted secret is **always written** and
+  reported as changed, even with the value it already has: otherwise "no changes" would tell a caller
+  its guess was the stored value. The one exception is a blank for a key that is already unset, which
+  reveals only what `isSet` already does. (2) The recreate's own output is scrubbed of every
+  plugin-secret value (new and old) before it is returned in `log`, since `docker compose` is not
+  ours and can quote a `.env` line it refuses to parse. That is best effort, not a proof: a compose
+  that echoed caller-controlled text could still tell a caller whether a guess equals a stored secret
+  (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
+  refused for every key (it could start a new `.env` line), naming the key only. (4) A key the
+  deployment owns — the core credentials, the access and admin settings, and every variable
+  `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
+  (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
+  manifest that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails
+  closed on the manifest: a key that *any* plugin in the index declares secret — enabled or not — is
+  never listed as a plain key, a `secret` that is not exactly `false` or absent counts as secret, an
+  entry whose `key`, `format` or `required` holds a line break is dropped whole (it could re-frame the
+  rows the script reads and forge a plain row for another plugin's secret), and a secret key that
+  collides with a static key is ignored (the static key wins). A panel admin who can set
+  `PLUGIN_INDEX_URL` controls that index — and the plugin code the bot installs from it — so this
+  protects against the panel, its logs and screens, not against whoever owns the index. The
   backup `env-set` writes still holds the previous `.env` — secrets included — which is why it is
   `0600`. A **webhook URL** in a `plugin-request` is treated the same way: it travels on stdin only,
   no message echoes any part of it (the new actions' messages name the field only; an update

@@ -1558,6 +1558,99 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(refused.stderr).toContain("'BLIZZARD_CLIENT_SECRET' is not an editable key");
   });
 
+  test("a manifest field holding a line break cannot re-frame the rows and unmask another plugin's secret", async () => {
+    // load_plugin_keys reads five raw lines per key, so a `format` / `required` with embedded newlines
+    // used to shift every later row: the hostile plugin (listed FIRST) forged a plain row for
+    // A_SECRET and env-get listed its stored value. Each payload is framed for one row width.
+    const forged4 = "F1\nF2\nF3\nA_SECRET\n.*\nfalse\nfalse";
+    const forged5 = "^x$\nfalse\nfalse\ntrue\nA_SECRET\n.*\nfalse\nfalse\ntrue\nJUNK";
+    const variants: [string, Record<string, unknown>][] = [
+      ["format, 4-line framing", { format: forged4 }],
+      ["format, 5-line framing", { format: forged5 }],
+      ["required", { required: "false\nfalse\ntrue\nA_SECRET\n.*\nfalse\nfalse\ntrue" }],
+      ["carriage return in the key", { key: "X1\rA_SECRET" }],
+    ];
+    for (const [why, override] of variants) {
+      const evil = { ...envKey("X1", "^x$"), ...override };
+      const index = wrapIndex([
+        pluginEntry("evil", [evil]),
+        pluginEntry("goodplug", [envKey("A_SECRET", "^[A-Za-z0-9_]{8,}$", { secret: true })]),
+      ]);
+      const fx = setup("PLUGINS=evil,goodplug\nANNOUNCE_CHANNEL_ID=11111\nA_SECRET=STOREDVALUE_zzz9\n", { pluginIndex: index });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.exitCode, why).toBe(0);
+      expect(get.stdout, why).not.toContain("A_SECRET");
+      expect(get.stdout, why).not.toContain("STOREDVALUE_zzz9");
+      const schema = await botOps(fx, ["env-schema"]);
+      expect(schema.json, why).toMatchObject({ A_SECRET: { secret: true, isSet: true } });
+      expect(schema.stdout, why).not.toContain("STOREDVALUE_zzz9");
+      expect(Object.keys(schema.json ?? {}), why).not.toContain("X1"); // the hostile entry is dropped whole
+    }
+  });
+
+  test("a `secret` that is not exactly false or absent counts as secret (fail closed)", async () => {
+    const asSecret: unknown[] = ["yes", 1, "TRUE", "true ", "false", [], {}, "true"];
+    for (const secret of asSecret) {
+      const index = wrapIndex([pluginEntry("p", [envKey("K_SECRET", "^.+$", { secret })])]);
+      const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nK_SECRET=VALUE_OF_K_SECRET\n", { pluginIndex: index });
+      const why = JSON.stringify(secret);
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.stdout, why).not.toContain("K_SECRET");
+      expect(get.stdout, why).not.toContain("VALUE_OF_K_SECRET");
+      const schema = await botOps(fx, ["env-schema"]);
+      expect(schema.json, why).toMatchObject({ K_SECRET: { secret: true, isSet: true } });
+    }
+    for (const plain of [false, null, undefined]) {
+      const extra = plain === undefined ? {} : { secret: plain };
+      const index = wrapIndex([pluginEntry("p", [envKey("K_PLAIN", "^.+$", extra)])]);
+      const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nK_PLAIN=plainvalue\n", { pluginIndex: index });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.json, String(plain)).toMatchObject({ K_PLAIN: "plainvalue" });
+    }
+  });
+
+  test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
+    const index = wrapIndex([
+      pluginEntry("spotify", [envKey("SHARED_KEY", "^[A-Za-z0-9_]{8,}$", { secret: true })]),
+      pluginEntry("music", [envKey("SHARED_KEY", "^.+$"), envKey("MUSIC_PORT", PORT_RE)]),
+    ]);
+    const stored = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nSHARED_KEY=LEFTOVER_VALUE_1\nMUSIC_PORT=8080\n";
+    const off = setup(stored, { pluginIndex: index });
+    const get = await botOps(off, ["env-get"]);
+    expect(get.json).toMatchObject({ MUSIC_PORT: "8080" });
+    expect(get.stdout).not.toContain("SHARED_KEY");
+    expect(get.stdout).not.toContain("LEFTOVER_VALUE_1");
+    expect(Object.keys((await botOps(off, ["env-schema"])).json ?? {})).not.toContain("SHARED_KEY");
+    const refused = await botOps(off, ["env-set"], "SHARED_KEY=another_value_9\n");
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("'SHARED_KEY' is not an editable key");
+
+    const on = setup(stored.replace("PLUGINS=music", "PLUGINS=music,spotify"), { pluginIndex: index });
+    expect((await botOps(on, ["env-schema"])).json).toMatchObject({ SHARED_KEY: { secret: true, isSet: true } });
+    expect((await botOps(on, ["env-get"])).stdout).not.toContain("SHARED_KEY");
+    expect((await botOps(on, ["env-set"], "SHARED_KEY=another_value_9\n")).exitCode).toBe(0);
+  });
+
+  test("a refusal never echoes a line of a multi-line value as if it were a key name", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    // A PEM-like value read line by line: its later lines look like `KEY=`. None may be echoed.
+    const body = "MUSIC_API_KEY=-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj=\nAAAAB3NzaC1yc2E=\n-----END KEY-----\n";
+    const run = await botOps(fx, ["env-set"], body);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("'(not shown)' is not an editable key");
+    expect(everythingObservable(fx, run)).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj");
+    expect(everythingObservable(fx, run)).not.toContain("AAAAB3NzaC1yc2E");
+    expect(envText(fx)).toBe(MUSIC_ENV);
+    // A mistyped variable name is still named (upper-case, at most 40 characters)...
+    const typo = await botOps(fx, ["env-set"], "MUSIC_API_KAY=x\n");
+    expect(typo.stderr).toContain("'MUSIC_API_KAY' is not an editable key");
+    // ...and one over that length is not.
+    const long = `A${"B".repeat(40)}`;
+    const over = await botOps(fx, ["env-set"], `${long}=x\n`);
+    expect(over.stderr).toContain("'(not shown)' is not an editable key");
+    expect(over.stderr).not.toContain(long);
+  });
+
   test("a manifest that declares a core credential cannot make it editable, listable or schema-visible", async () => {
     // Secret or plain, by mistake or through a bad index entry: a key the deployment owns stays out.
     const index = wrapIndex([

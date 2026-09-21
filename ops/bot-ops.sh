@@ -400,6 +400,9 @@ declare -A PLUGIN_REQUIRED=()
 PLUGIN_SECRET_ORDER=()
 declare -A PLUGIN_SECRET_FORMAT=()
 declare -A PLUGIN_SECRET_REQUIRED=()
+# Every key ANY plugin in the index declares secret, enabled or not: such a key is never listed as a
+# plain one, whichever plugin declares it plain. (PLUGIN_SECRET_FORMAT is the editable subset.)
+declare -A PLUGIN_SECRET_ANY=()
 # "none" (no plugins enabled — no docker read attempted), "ok", or "index unavailable" (the bot
 # isn't running or hasn't cached the index yet — env-get then shows static keys only, never errors).
 PLUGIN_KEYS_STATUS="none"
@@ -418,8 +421,9 @@ load_plugin_keys() {
   PLUGIN_SECRET_ORDER=()
   PLUGIN_SECRET_FORMAT=()
   PLUGIN_SECRET_REQUIRED=()
+  PLUGIN_SECRET_ANY=()
   PLUGIN_KEYS_STATUS="none"
-  local plugins_val names_json raw rows key format required secret
+  local plugins_val names_json raw rows key format required secret enabled
   plugins_val="$(env_value PLUGINS)"
   [ -n "$plugins_val" ] || return 0
   PLUGIN_KEYS_STATUS="ok"
@@ -431,10 +435,19 @@ load_plugin_keys() {
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
   fi
-  # Each env key as four RAW lines (key, format, required, secret), NOT @tsv: jq's TSV encoder
-  # escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash reader
-  # would then see it doubled; raw lines pass the regex through verbatim (a `format` never spans
-  # lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
+  # Each env key as five RAW lines (key, format, required, secret, enabled), NOT @tsv: jq's TSV
+  # encoder escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash
+  # reader would then see it doubled; raw lines pass the regex through verbatim (a `format` never
+  # spans lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
+  #
+  # The reader takes exactly five lines per row, so a field that itself held a line break would
+  # re-frame every later row — a hostile manifest could then forge a plain row for another plugin's
+  # secret key and have env-get list its stored value (#240). So a key holding a CR or LF, or a
+  # `format` or `required` doing so, drops the whole entry inside the program, and `secret` is
+  # normalised there too: only an absent / null / false `secret` means "not secret", ANY other value
+  # (a string, a number, an array) counts as secret — fail closed, never fail open. The `enabled`
+  # column carries whether the plugin is in PLUGINS: a key ANY plugin in the index declares secret is
+  # secret for every plugin, but only an enabled plugin's keys are ever editable.
   #
   # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
   # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
@@ -446,46 +459,56 @@ load_plugin_keys() {
   # state.json; without it a valid-JSON-but-wrong-shape cached index crashes ops (a D3 violation).
   if ! rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
     (.index.plugins // [])
-    | map(select((type == "object") and (.name as $n | $names | index($n))))
-    | .[].env[]?
+    | map(select(type == "object"))
+    | .[]
+    | (.name as $n | (($names | index($n)) != null)) as $on
+    | .env[]?
     | select((type == "object") and (.key | type == "string") and (.format | type == "string"))
-    | (.key, .format, (.required // false | tostring), (.secret // false | tostring))
+    | (.required // false | tostring) as $req
+    | (if (.secret // false) == false then "false" else "true" end) as $sec
+    | select([.key, .format, $req] | all(test("[\\r\\n]") | not))
+    | (.key, .format, $req, $sec, ($on | tostring))
   ' 2>/dev/null)"; then
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
   fi
   # Two passes over the same rows (#240). Pass 1 collects the SECRET keys, pass 2 the plain ones, so a
-  # key that ANY enabled plugin declares secret is secret everywhere: a second plugin declaring the
-  # same key non-secret must not get it listed, or env-get would emit a value one manifest called
-  # secret. In both passes a key the deployment owns (RESERVED_KEYS) is dropped whatever the manifest
-  # says, and a secret key that collides with a static ALLOWED key is ignored (static wins, exactly
-  # as for a plain plugin key).
+  # key that ANY plugin in the index declares secret — enabled or not — is secret everywhere: another
+  # plugin declaring the same key non-secret must not get it listed, or env-get would emit a value one
+  # manifest called secret. In both passes a key the deployment owns (RESERVED_KEYS) is dropped
+  # whatever the manifest says, and a secret key that collides with a static ALLOWED key is ignored
+  # (static wins, exactly as for a plain plugin key).
   # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
   # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a
   # CRLF-saved .env — else the key names and the `secret`/`required` flags are all "…\r".
-  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret; do
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
     key="${key%$'\r'}"
     format="${format%$'\r'}"
     required="${required%$'\r'}"
     secret="${secret%$'\r'}"
+    enabled="${enabled%$'\r'}"
     [ "$secret" = "true" ] || continue
     [ -n "$key" ] || continue
     [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-editable
     [[ -n "${ALLOWED[$key]+x}" ]] && continue                # a static key: static wins
+    PLUGIN_SECRET_ANY["$key"]=1                              # secret for every plugin, enabled or not
+    [ "$enabled" = "true" ] || continue                      # only an ENABLED plugin's secret key is editable
     [[ -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] && continue   # a key declared twice: first wins
     PLUGIN_SECRET_ORDER+=("$key")
     PLUGIN_SECRET_FORMAT["$key"]="$format"
     PLUGIN_SECRET_REQUIRED["$key"]="$required"
   done <<< "$rows"
-  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret; do
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
     key="${key%$'\r'}"
     format="${format%$'\r'}"
     required="${required%$'\r'}"
     secret="${secret%$'\r'}"
+    enabled="${enabled%$'\r'}"
     [ -n "$key" ] || continue
+    [ "$enabled" = "true" ] || continue                      # a plain key of a plugin that is not enabled is never listed
     [ "$secret" = "true" ] && continue                       # a secret key: tracked in PLUGIN_SECRET_*, never here
     [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-listable or editable
-    [[ -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] && continue   # another plugin declares it secret: secret wins
+    [[ -n "${PLUGIN_SECRET_ANY[$key]+x}" ]] && continue      # another plugin declares it secret: secret wins
     [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue          # a key declared twice: first wins
     PLUGIN_KEY_ORDER+=("$key")
     PLUGIN_FORMAT["$key"]="$format"
@@ -638,6 +661,15 @@ cmd_env_schema() {
     -- "${args[@]}"
 }
 
+# What may be echoed of a submitted key name that is not editable: only something shaped like an
+# environment variable's name — upper-case, at most 40 characters, which every real key here is.
+# A multi-line value (a PEM block, say) is read one line at a time, so a later line's text before its
+# first `=` arrives here as a "key"; naming it would echo a fragment of a secret into an error that the
+# panel's server logs. Anything else is not shown.
+echo_key() {
+  if [[ "$1" =~ ^[A-Z][A-Z0-9_]{0,39}$ ]]; then printf '%s' "$1"; else printf '%s' "(not shown)"; fi
+}
+
 # Replace every plugin-secret value this invocation knows of — each secret key's stored (pre-change)
 # value AND the value being written — with "[redacted]" in the text given. The one way a value could
 # still reach an output is a message from a tool this script does not own: `docker compose up` echoing
@@ -701,9 +733,10 @@ cmd_env_set() {
     # editable if it is a static ALLOWED key, an installed plugin's own key, OR (#240) an installed
     # plugin's `secret` key — write-only, see PLUGIN_SECRET_* above. A CORE secret is in none of
     # those sets (and load_plugin_keys never lets a manifest add a reserved key), so it is refused
-    # here exactly as before. The message names the key only, never the value.
+    # here exactly as before. The message names the key (when it looks like a variable name — see
+    # echo_key), never a value.
     [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" || -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] \
-      || die "env-set: '$key' is not an editable key"
+      || die "env-set: '$(echo_key "$key")' is not an editable key"
     [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
     SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
   done

@@ -951,20 +951,37 @@ _Avoid_: server list, guild cache
   reserved: the wow plugin's `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` are declared `secret: true`
   in its Plugin Index entry and nothing in `src/` reads them, so the panel can set them — the test pin
   names them in an explicit exemption list and checks each sits under `.env.example`'s "Used by the
-  <plugin> plugin" block), and a key one plugin declares secret is secret for every
-  plugin (secret wins; a secret declared twice is first-wins); (3) **no equality oracle** — a
-  submitted secret is always treated as a change and written, because a "no changes" answer would
-  tell a caller its guess equals the stored value (the one skip is a blank for an already-unset key,
-  which `isSet` already reveals); (4) the recreate's own output is scrubbed of every plugin-secret
-  value before it becomes `log`; (5) a value holding a CR is refused (message names the key only)
-  before its format regex runs, since a permissive secret pattern must not let one start a new
-  `.env` line. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical.
+  <plugin> plugin" block); (3) **fail closed on what a manifest says** — a key that ANY plugin in the
+  index declares secret (enabled or not) is never listed as a plain key, whichever plugin declares it
+  plain (only an enabled plugin's secret key is editable); a secret declared twice is first-wins; a
+  `secret` that is not exactly `false`/absent (`"yes"`, `1`, `[]`) counts as secret; and an entry whose
+  `key`/`format`/`required` holds a CR or LF is dropped whole, because the row reader takes five raw
+  lines per key and a stray newline would re-frame every later row and let a hostile entry forge a
+  plain row for another plugin's secret key; (4) **env-set's own decision reveals nothing about a
+  stored secret** — a submitted secret is always treated as a change and written, because a "no
+  changes" answer would tell a caller its guess equals the stored value (the one skip is a blank for
+  an already-unset key, which `isSet` already reveals); (5) the recreate's own output is scrubbed of
+  every plugin-secret value before it becomes `log` — best effort against text `docker compose`
+  might echo, not a proof (a compose that echoed caller-controlled text into `log` could still act as
+  a guess oracle for a stored secret; not seen, and not testable without a real compose); (6) a value
+  holding a CR is refused (message names the key only) before its format regex runs, since a
+  permissive secret pattern must not let one start a new `.env` line; (7) a refusal names a submitted
+  key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
+  multi-line value is read line by line and a later line's text before its `=` would otherwise be
+  echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical for a
+  well-formed index. A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
+  from — and the plugin code the bot then installs — so write-only is a property against the panel,
+  its logs and its screens, not against whoever owns the index.
   The same posture covers `plugin-request`: a `webhook-add` URL travels on stdin only, is matched in
   bash (never `jq --arg`, never argv), is never echoed by a `die` (`echo_safe` shows a short
   printable field or `(not shown)`; the rest name the field, not the value), and its request file is
   written under `umask 077`; the `routing-set` snowflake check uses `\A…\z` because jq's `$` also
   matches before a trailing newline. `routing-get` reads only `routing.json` and `discovery.json`
-  (the bot's webhook store is never named or opened) and scrubs on the way out. **Treat any new path
+  (the bot's webhook store is never named or opened) and scrubs on the way out — best effort, since
+  neither file is meant to hold a URL: it drops members named exactly `url`/`token`/`secret`/`password`
+  and redacts webhook-URL-shaped strings, and does NOT catch a bare token under another name, an id and
+  token split across fields, or a percent-encoded URL (`webhooks` and `inviteUrl` are legitimate
+  members of these files, so broader name matching would delete real data). **Treat any new path
   that could print a secret value as a blocker** — `everythingObservable` in `ops/bot-ops.test.ts`
   is the check that walks every output channel for the secret's value.
 - **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178
