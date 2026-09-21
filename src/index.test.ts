@@ -40,6 +40,24 @@ describe("index.ts wiring", () => {
     expect(describeCall).toBeLessThan(createCall);
   });
 
+  // #222: without the previous boot's version pins, a plugin that is last-good (rather than explicitly
+  // pinned) on an older version is disabled the moment the index moves to a version declaring a different
+  // host API. registry.test.ts pins the logic; this pins the one thing it cannot see — that the top-level
+  // boot block actually reads the pins BEFORE selecting (not inside activate(), which runs after the
+  // Client is built) and hands them to selectPlugins as its 5th argument.
+  test("reads state.json's version pins before selectPlugins and passes them in (#222)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const pinsRead = source.indexOf("pinsFromState(await readPluginState(");
+    const selectCall = source.indexOf("selectPlugins(");
+    expect(pinsRead).toBeGreaterThan(-1);
+    expect(pinsRead).toBeLessThan(selectCall);
+    expect(selectCall).toBeLessThan(activateFn);
+    // the variable handed to selectPlugins is the one built from that read
+    expect(source).toMatch(/const installedPins = pinsFromState\(await readPluginState\(DATA_DIR, bootStorage\)\);/);
+    const selectArgs = source.slice(selectCall, source.indexOf(");", selectCall));
+    expect(selectArgs).toMatch(/CORE_COMMAND_NAMES,\s*installedPins,?\s*$/);
+  });
+
   test("no plugin code loads at module-eval — the bundle import() is inside activate(), after takeOver", () => {
     const activateFn = source.indexOf("async function activate(");
     const dynImport = source.indexOf("import(pathToFileURL");
