@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
@@ -64,7 +65,7 @@ describe("readRouting", () => {
     }
   });
 
-  test("a file with no version, or another one, is read by shape and its placements survive the next write", async () => {
+  test("a hand-written file without v keeps its entries and is written back as v 1", async () => {
     // The data-loss case: a hand-seeded file that forgot `v`, or one a newer bot wrote. Reading it as
     // fresh would let the very next mutate overwrite it, with no copy kept (only an UNPARSEABLE file
     // is moved aside).
@@ -164,7 +165,7 @@ describe("mutateRouting", () => {
     expect(JSON.parse(readFileSync(routingPath(dir), "utf8")).junk).toBeUndefined();
   });
 
-  test("mutateRouting repairs what mutate returns before it writes", async () => {
+  test("a url returned by mutate never reaches routing.json", async () => {
     // A caller that builds a value off the shape -- here a webhook carrying its URL -- cannot put it in
     // routing.json: that file is the one the panel reads, and the URL belongs in the secrets file only.
     await mutateRouting(dir, (current) => ({
@@ -263,6 +264,118 @@ describe("secrets", () => {
     // Every later write replaces the file, so it has to be set again each time.
     await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }));
     expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o600);
+  });
+
+  test("a data directory that does not exist yet is created by the first secrets write", async () => {
+    // A fresh install: `writeJsonAtomic` made the directory for every other data file, and this write
+    // no longer goes through it.
+    const nested = join(dir, "not", "there", "yet");
+    await mutateSecrets(nested, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+    expect((await readSecrets(nested)).webhooks).toEqual({ [CHAN]: HOOK_URL });
+  });
+
+  test("the secrets temp file is written owner-only, and nothing else is left in the directory", async () => {
+    // Runs on every platform: what it pins is the MODE ARGUMENT of the write that creates the temp
+    // file, so the URLs are never in a wider-mode file. The CI-only tests below observe the real mode.
+    const writes: { path: string; mode: number | undefined }[] = [];
+    await mutateSecrets(
+      dir,
+      (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }),
+      async () => {},
+      {
+        writeFile: async (path, data, options) => {
+          writes.push({ path, mode: options.mode });
+          await writeFile(path, data, options);
+        },
+      },
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.mode).toBe(0o600);
+    // The write went to a temp file beside the target, not to the target itself.
+    expect(writes[0]!.path).not.toBe(secretsPath(dir));
+    expect(writes[0]!.path).toMatch(/routing\.secrets\.json\.\d+\.\d+\.tmp$/);
+    expect(readdirSync(dir)).toEqual(["routing.secrets.json"]);
+  });
+
+  test("a failed rename leaves the previous secrets file intact and no temp file behind", async () => {
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+    const before = readFileSync(secretsPath(dir), "utf8");
+    await expect(
+      mutateSecrets(
+        dir,
+        (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }),
+        async () => {},
+        {
+          rename: async () => {
+            throw new Error("EXDEV: cross-device link not permitted");
+          },
+        },
+      ),
+    ).rejects.toThrow("EXDEV");
+    // The failed write neither damaged the file nor left the URLs lying beside it.
+    expect(readFileSync(secretsPath(dir), "utf8")).toBe(before);
+    expect(readdirSync(dir)).toEqual(["routing.secrets.json"]);
+    // And it did not wedge the queue.
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }), async () => {});
+    expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([CHAN, "333333333333333332"]);
+  });
+
+  // The three tests below read real file modes, which only mean something on Linux -- so they are
+  // CI-ONLY: `skipIf(win32)`, and a green run on a Windows box says nothing about them.
+  test.skipIf(process.platform === "win32")("the secrets temp file is owner-only when it is renamed into place (CI-only)", async () => {
+    const old = process.umask(0o022); // the usual default, so a dropped mode would show as 0644
+    try {
+      const modes: number[] = [];
+      await mutateSecrets(
+        dir,
+        (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }),
+        async () => {},
+        {
+          rename: async (from, to) => {
+            modes.push(statSync(from).mode & 0o777);
+            await rename(from, to);
+          },
+        },
+      );
+      expect(modes).toEqual([0o600]);
+      // The file that landed is owner-only without any chmod having run (it was passed a no-op).
+      expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(old);
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("a failed write leaves no copy of the secrets that anyone but the owner could read (CI-only)", async () => {
+    const old = process.umask(0o022);
+    try {
+      await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+      await expect(
+        mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "x" } }), async () => {}, {
+          rename: async () => {
+            throw new Error("EXDEV");
+          },
+        }),
+      ).rejects.toThrow("EXDEV");
+      for (const name of readdirSync(dir)) expect(statSync(join(dir, name)).mode & 0o077).toBe(0);
+    } finally {
+      process.umask(old);
+    }
+  });
+
+  test.skipIf(process.platform === "win32")("a secrets file that will not parse is moved aside still owner-only (CI-only)", async () => {
+    const old = process.umask(0o022);
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+      writeFileSync(secretsPath(dir), '{"v":1,"webhooks":{"333333333333333331":'); // truncated in place: same inode, same mode
+      expect(await readSecrets(dir)).toEqual(freshSecrets());
+      const aside = readdirSync(dir).filter((f) => f.startsWith("routing.secrets.json.corrupt-"));
+      expect(aside).toHaveLength(1);
+      expect(statSync(join(dir, aside[0]!)).mode & 0o777).toBe(0o600);
+    } finally {
+      error.mockRestore();
+      process.umask(old);
+    }
   });
 
   test("mutateSecrets asks for owner-only on the secrets file, after the write", async () => {

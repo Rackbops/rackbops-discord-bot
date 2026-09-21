@@ -1,18 +1,23 @@
 # Where a plugin lives is bot-owned data, applied live
 
-Until Epic #236 every slash command was registered to one guild (`DISCORD_SERVER_ID`, one
-`rest.put` in `src/index.ts`) and every plugin's `announce` posted to one channel
-(`ANNOUNCE_CHANNEL_ID`). Neither was a per-plugin setting, and neither could be reached from the
-admin panel. Going live with the `music` plugin on 2026-09-20 made the cost concrete: its commands
-were wanted in a second server the bot was already in, and the only way to get them there was a
-hand-made call to the Discord API.
+Until Epic #236 every slash command was registered in one place — the guild `DISCORD_SERVER_ID`
+names, or globally when it is unset (one `rest.put` in `src/index.ts`) — and every plugin's
+`announce` posted to one channel (`ANNOUNCE_CHANNEL_ID`). Neither was a per-plugin setting, and the
+admin panel could change each only as one instance-wide `.env` value, by pasting a Discord id. Going
+live with the `music` plugin on 2026-09-20 made the cost concrete: its commands were wanted in a
+second server the bot was already in, and the only way to get them there was a hand-made call to the
+Discord API.
 
-Three constraints shape the answer. The panel is a separate container that **never holds the Discord
-token** (`docker-compose.yml`'s `admin` service is deliberately not given the instance `.env`), so it
-cannot ask Discord which servers or channels exist. Configuration today is **flat `.env` scalars that
-only take effect on a container recreate** (`ops/bot-ops.sh env-set`), which is the wrong shape and
-the wrong latency for "this plugin, these servers, these channels". And `src/plugins/contract.ts` is
-a **shipped contract**: changing `HostApi` affects every published plugin.
+Three constraints shape the answer. The panel is a separate container that is **deliberately not
+configured with the Discord token**: `docker-compose.yml`'s `admin` service has no `env_file:` for
+the instance `.env`, so the token is not in its environment. That is a choice rather than a barrier —
+the same service mounts the instance's config dir, which holds that `.env`, and `ops/admin/server.ts`
+already reads a few non-Discord values out of it (the GitHub repo and token for the branch chooser,
+the Plugin Index URL). This design keeps the choice: the panel never talks to Discord, so it cannot
+ask which servers or channels exist. Configuration today is **flat `.env` scalars that only take
+effect on a container recreate** (`ops/bot-ops.sh env-set`), which is the wrong shape and the wrong
+latency for "this plugin, these servers, these channels". And `src/plugins/contract.ts` is a
+**shipped contract**: changing `HostApi` affects every published plugin.
 
 **Decision:** where a plugin lives is data the bot owns, in its data dir, changed through the
 request mailbox and applied without a restart.
@@ -28,15 +33,18 @@ request mailbox and applied without a restart.
 3. **A plugin nobody has placed lives in the home server.** `DISCORD_SERVER_ID` stops meaning "the
    only server" and becomes "the home server": a plugin with no entry in `routing.json` registers
    there and posts to `ANNOUNCE_CHANNEL_ID`, exactly as before. With no `routing.json` at all the
-   bot makes byte-for-byte the registration call it makes today.
+   bot makes byte-for-byte the registration call it makes today — to the home server when
+   `DISCORD_SERVER_ID` is set, globally when it is not.
 4. **The bot publishes what it can see, as `data/discovery.json`.** Its servers, their text
    channels and whether it can post in each, the outcome of the last command registration per
    server, and an invite URL carrying the `applications.commands` scope. The panel reads that file
    and offers names to pick from; nobody types a Discord id.
 5. **Posting goes through the channel's webhook when one is registered, and as the bot when none
    is.** A webhook is an upgrade — its own name and avatar — never a requirement. A webhook URL is
-   a secret: it is stored only in `data/routing.secrets.json`, never in `routing.json`,
-   `discovery.json`, a log line or a rejected request.
+   a secret: it is kept in `data/routing.secrets.json`, which is created owner-only, and never in
+   `routing.json`, `discovery.json`, a log line or a rejected request. Two copies can exist under
+   other names — a secrets file that will not parse is moved aside beside it, and a write that fails
+   can leave its temp file — and both stay owner-only.
 6. **`HostApi.announce(message)` does not change.** The host resolves a plugin's channels where it
    builds that plugin's `announce`; `HOST_API_VERSION` does not move and no published plugin is
    affected.
@@ -56,9 +64,11 @@ request mailbox and applied without a restart.
 - **Encode routing in `.env`** (a JSON value, or compound keys). Fits `env-set` with the least new
   plumbing, but every change costs a recreate — about twenty seconds offline to move a plugin into a
   channel — and a map of maps in an env var is unreviewable. Rejected.
-- **Give the panel the Discord token** so it can list servers and register commands itself.
-  Rejected: it would hand the root-equivalent panel container the one secret it is deliberately
-  kept from, and create a second writer of Discord state racing the bot.
+- **Let the panel talk to Discord itself** — it could read the token from the mounted config dir,
+  list servers and register commands. Rejected: it would put the one Discord credential to work in a
+  second, root-equivalent process that has never needed it, and create a second writer of Discord
+  state racing the bot. The bot already holds the gateway's view of its servers, channels and
+  permissions; the panel would have to rebuild that over REST.
 - **`announce(message, channelId?)`**, the plugin sourcing the id from its own env key (#219 as
   filed). Rejected for this case: it moves the pasted snowflake from one env key to many, makes every
   plugin re-implement "where do I post", and changes a shipped contract. Named destinations

@@ -190,3 +190,39 @@ git grep -n "routing/" src/index.ts src/commands.ts src/announce.ts
 ```
 
 Mutation checks: scratch worktree (`git worktree add --detach <path> <sha>`), one mutation at a time, `bun test src/routing`, paste the failing test's name, `git worktree remove <path>`.
+
+---
+
+## Amendment to the plan above — ADR-0006 corrections (orchestrator, after round 1 of the gate)
+
+The executing session stopped, as instructed, on three sentences of the ADR text in this plan that today's code contradicts. I re-verified each against source; all three stand, and they were my errors. The decisions themselves are unchanged. The replacements below supersede the corresponding text in Step 1.
+
+**1. Registration was one place, not necessarily one guild.** `src/index.ts:185-188` registers to the guild when `DISCORD_SERVER_ID` is set and **globally** when it is not (`config.ts:121` makes it optional).
+
+> Until Epic #236 every slash command was registered in one place — the guild `DISCORD_SERVER_ID` names, or globally when it is unset (one `rest.put` in `src/index.ts`) — and every plugin's `announce` posted to one channel (`ANNOUNCE_CHANNEL_ID`).
+
+and decision 3's last sentence becomes:
+
+> With no `routing.json` at all the bot makes byte-for-byte the registration call it makes today — to the home server when `DISCORD_SERVER_ID` is set, globally when it is not.
+
+**2. Both settings *were* reachable from the panel — as instance-wide scalars.** `DISCORD_SERVER_ID` and `ANNOUNCE_CHANNEL_ID` are on `ops/bot-ops.sh`'s `ALLOWED_SPEC` (`:173-174`).
+
+> Neither was a per-plugin setting, and the admin panel could change each only as one instance-wide `.env` value, by pasting a Discord id.
+
+**3. The panel is *not configured with* the Discord token; it is not *unable to reach* it.** `docker-compose.yml`'s `admin` service has no `env_file:` (`:74-82`), so the token is not in its environment — but the same service mounts the instance's config dir read-write (`:110`), that dir holds the `.env`, and `ops/admin/server.ts` already reads values out of it (`:1774-1780`, `:1811`). Keeping Discord out of the panel is a choice this design makes, not a constraint it inherits. The first constraint becomes:
+
+> The panel is a separate container that is **deliberately not configured with the Discord token**: `docker-compose.yml`'s `admin` service has no `env_file:` for the instance `.env`, so the token is not in its environment. That is a choice rather than a barrier — the same service mounts the instance's config dir, which holds that `.env`, and `ops/admin/server.ts` already reads a few non-Discord values out of it (the GitHub repo and token for the branch chooser, the Plugin Index URL). This design keeps the choice: the panel never talks to Discord, so it cannot ask which servers or channels exist.
+
+and the matching Considered Option becomes:
+
+> - **Let the panel talk to Discord itself** — it could read the token from the mounted config dir, list servers and register commands. Rejected: it would put the one Discord credential to work in a second, root-equivalent process that has never needed it, and create a second writer of Discord state racing the bot. The bot already holds the gateway's view of its servers, channels and permissions; the panel would have to rebuild that over REST.
+
+**4. "Stored only in `routing.secrets.json`" was too strong.** `readJsonOrFresh` moves an unparseable file aside under `<path>.corrupt-<ts>`, and a failed rename can leave a temp file. Decision 5's last sentence becomes:
+
+> A webhook URL is a secret: it is kept in `data/routing.secrets.json`, which is created owner-only, and never in `routing.json`, `discovery.json`, a log line or a rejected request. Two copies can exist under other names — a secrets file that will not parse is moved aside beside it, and a write that fails can leave its temp file — and both stay owner-only.
+
+That last clause is only true if the file is owner-only **from creation**, not `chmod`ed after the rename. So Step 4 changes: `mutateSecrets` does not write through `writeJsonAtomic` (which creates its temp file with the default mode). It serializes its own read-modify-write on a module-level promise chain, writes the temp file with `mode: 0o600`, renames it into place, and keeps the `chmod` as a belt-and-braces last step. `readSecrets` still uses `readJsonOrFresh`. The mode tests stay `skipIf(win32)` and are named CI-only.
+
+**5. The acceptance bullet on a malformed plugin name was mine to fix, not the code's.** `validatePluginRouting` checks one plugin's routing and takes no name; the name's shape belongs to the request layer (#241), which reuses the exported `PLUGIN_NAME_RE`. #237's bullet is corrected; `repairRouting` dropping a malformed name stays, and stays tested.
+
+Epic #236's body carried sentences 1–3 too and is corrected to match.

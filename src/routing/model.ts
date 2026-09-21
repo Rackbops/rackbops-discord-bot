@@ -52,8 +52,9 @@ export interface RoutingFile {
 }
 /**
  * channel id -> webhook URL. The only FILE the bot stores a webhook URL in -- though the same bytes
- * can sit beside it under another name: a corrupt copy is moved aside by `readJsonOrFresh`
- * (`routing.secrets.json.corrupt-<timestamp>`), and a write whose rename fails leaves its temp file.
+ * can sit beside it under another name: a corrupt copy moved aside by `readJsonOrFresh`
+ * (`routing.secrets.json.corrupt-<timestamp>`), and the temp file of a write that died before its
+ * rename. `store.ts` creates the file and its temp files owner-only, so every one of them is.
  */
 export interface RoutingSecretsFile {
   v: 1;
