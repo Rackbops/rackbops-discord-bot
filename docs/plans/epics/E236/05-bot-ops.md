@@ -1,4 +1,4 @@
-<!-- Plan for Rackbops/rackbops-discord-bot#240 (Epic #236). Verbatim copy of the approved plan comment: https://github.com/Rackbops/rackbops-discord-bot/issues/240#issuecomment-5754929160 -->
+<!-- Plan for Rackbops/rackbops-discord-bot#240 (Epic #236). Copy of the approved plan comment, https://github.com/Rackbops/rackbops-discord-bot/issues/240#issuecomment-5754929160, as of when it was approved — with the orchestrator's later corrections applied where the text says so (Step 5's "the write is unchanged" is superseded; a coverage-table row was added) and the implementer's "Deviations from the plan" appended at the end. -->
 
 ## Implementation plan — written by the orchestrating session, to be executed as written
 

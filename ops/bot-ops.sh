@@ -683,16 +683,19 @@ echo_key() {
   if [[ "$1" =~ ^[A-Z][A-Z0-9_]{0,39}$ ]]; then printf '%s' "$1"; else printf '%s' "(not shown)"; fi
 }
 
-# Replace every plugin-secret value this invocation knows of — each secret key's stored (pre-change)
-# value AND the value being written — with "[redacted]" in the text given. The one way a value could
+# Replace every plugin-secret value this invocation knows of — the stored (pre-change) value of every
+# key ANY plugin in the index declares secret, enabled or not, AND the value being written — with
+# "[redacted]" in the text given. The one way a value could
 # still reach an output is a message from a tool this script does not own: `docker compose up` echoing
 # part of a .env line it refused to parse. Values are matched as literals (quoted inside ${…//…/…}, so
 # a `*` or `[` in a secret is not a glob), an empty value is skipped (an empty pattern would match
 # nothing anyway), and DIFF is the caller's (bash scoping is dynamic: cmd_env_set's own array).
 redact_secret_values() {
   local text="$1" k v
-  if [ "${#PLUGIN_SECRET_ORDER[@]}" -gt 0 ]; then
-    for k in "${PLUGIN_SECRET_ORDER[@]}"; do
+  # PLUGIN_SECRET_ANY is a superset of the editable PLUGIN_SECRET_ORDER: a disabled plugin's stored
+  # secret is still a secret, and still sits in the .env compose is reading.
+  if [ "${#PLUGIN_SECRET_ANY[@]}" -gt 0 ]; then
+    for k in "${!PLUGIN_SECRET_ANY[@]}"; do
       for v in "$(env_value "$k")" "${DIFF[$k]-}"; do
         [ -z "$v" ] || text="${text//"$v"/[redacted]}"
       done
@@ -1072,7 +1075,8 @@ cmd_plugin_request() {
   # ending `.json.tmp` is never picked up — never give the temp file a `.json` ending) and is then
   # `mv`ed into place, which is atomic within a directory. If any step fails the temp file is removed
   # and the shell exits 1, so nothing half-written is left behind and this script dies below rather
-  # than reporting `queued`. `umask 077` comes AFTER `mkdir -p` (a requests/ that does not exist yet
+  # than reporting `queued`. (A shell that is KILLED mid-write cannot clean up: it leaves a
+  # `<file>.json.tmp`, owner-only and invisible to the drain, that nothing sweeps.) `umask 077` comes AFTER `mkdir -p` (a requests/ that does not exist yet
   # keeps the ordinary mode; only the file is narrowed): a request may carry a webhook URL, and the bot
   # — which runs as bun, as does this write — can still read and delete an owner-only file.
   # -i pipes the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.

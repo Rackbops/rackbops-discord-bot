@@ -1,6 +1,8 @@
 // Real-bash tests for ops/bot-ops.sh's env-get / env-set: the script is spawned as-is against a
-// throwaway config dir, with a fake `docker` shim first on PATH (it logs its argv and exits 0, so
-// `up -d --force-recreate` never reaches a daemon) and `jq` from the host. Discovered by the root
+// throwaway config dir, with a fake `docker` shim first on PATH (it logs its argv, serves fixture files
+// for the `exec … cat` reads, and runs the plugin-request write's `sh -c` for real against <bin>/data;
+// every other call exits 0, so `up -d --force-recreate` never reaches a daemon) and `jq` from the host.
+// Discovered by the root
 // `bun test` the same way ops/admin/server.test.ts is. Needs bash + jq on PATH; on a box without
 // them the whole file skips LOUDLY rather than passing vacuously. On Windows, Git's own bash is
 // used — a WSL bash.exe earlier on PATH would run the script against a different filesystem.
@@ -86,7 +88,8 @@ function setup(
      *  discovery file (`/app/data/routing.json`, `/app/data/discovery.json` — #240), verbatim, so a
      *  test can serve corrupt or hand-edited content. Absent → the file isn't in the container. The
      *  shim matches by substring, and `/app/data/routing.json` is not a substring of the bot's
-     *  webhook store's path, so the two can never be confused (asserted in a test, not assumed). */
+     *  webhook store's path, so a read of that store would never be served by this shim (the
+     *  "never reads the secrets file" test asserts on docker.log, not on this). */
     routing?: string;
     discovery?: string;
     /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
@@ -1586,6 +1589,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
       ["format, 5-line framing", { format: forged5 }],
       ["required", { required: "false\nfalse\ntrue\nA_SECRET\n.*\nfalse\nfalse\ntrue" }],
       ["carriage return in the key", { key: "X1\rA_SECRET" }],
+      ["line feed in the key, framed to forge a plain row", { key: "A_SECRET\n.*\nfalse\nfalse\ntrue" }],
     ];
     for (const [why, override] of variants) {
       const evil = { ...envKey("X1", "^x$"), ...override };
@@ -1738,7 +1742,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(over.stderr).toContain("'(not shown)' is not an editable key");
     expect(over.stderr).not.toContain(long);
     // only an upper-case, variable-shaped name is echoed: a lower-case or underscore-led one is not
-    for (const odd of ["music_api_key", "_MUSIC_KEY", "Music_Key"]) {
+    for (const odd of ["music_api_key", "_MUSIC_KEY", "Music_Key", "mUSIC_API_KEY"]) {
       const run = await botOps(fx, ["env-set"], `${odd}=x\n`);
       expect(run.stderr, odd).toContain("'(not shown)' is not an editable key");
       expect(run.stderr, odd).not.toContain(odd);
@@ -1874,6 +1878,34 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     });
     const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
     expect(String((run.json as { log: string }).log)).toBe("first [redacted] then [redacted] and [redacted] and again [redacted] end");
+  });
+
+  test("redaction also covers the stored secret of a plugin that is not enabled", async () => {
+    // `music` is not in PLUGINS, but MUSIC_API_KEY is still a secret sitting in the .env compose reads.
+    const index = wrapIndex([
+      pluginEntry("music", [envKey("MUSIC_API_KEY", "^\\S+$", { secret: true })]),
+      pluginEntry("wb", [envKey("WB_KEY", "^\\S+$", { secret: true })]),
+    ]);
+    const fx = setup(`PLUGINS=wb\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_API_KEY=${OLD_SECRET}\nWB_KEY=old-wb-key-1234\n`, {
+      pluginIndex: index,
+      composeUp: { output: `bad env line MUSIC_API_KEY=${OLD_SECRET} and WB_KEY=${SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `WB_KEY=${SECRET}\n`);
+    const log = String((run.json as { log: string }).log);
+    expect(log).toBe("bad env line MUSIC_API_KEY=[redacted] and WB_KEY=[redacted]");
+  });
+
+  test("an unchanged value is never judged by the compose guard, only what changes is", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("LAX", "^.+$"), envKey("PORT_X", PORT_RE)])]);
+    const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nLAX=stored$value\nPORT_X=80\n", { pluginIndex: index });
+    // the panel echoes the whole form back: LAX is unchanged (a hand-edited value with a dollar sign), PORT_X changes
+    const run = await botOps(fx, ["env-set"], "LAX=stored$value\nPORT_X=81\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: ["PORT_X"] });
+    // ...but changing LAX to another value with a dollar sign is refused
+    const bad = await botOps(fx, ["env-set"], "LAX=other$value\n");
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr).toContain("value for 'LAX' may not contain a dollar sign or a quote");
   });
 
   test("redaction treats a secret as a literal, whatever glob characters it holds", async () => {
@@ -2102,7 +2134,7 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
     };
     const run = await get(setup(ENV, { routing: JSON.stringify(dirtyRouting), discovery: JSON.stringify(dirtyDiscovery) }));
     expect(run.exitCode).toBe(0);
-    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b", "UpperTokenABCDEFGHIJKLMNOP", "UpperTailTokenXYZ", "HttpTokenABCDEFGHIJKLMNOPQR"]) {
+    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b", "UpperTokenABCDEFGHIJKLMNOP", "UpperTailTokenXYZ", "HttpTokenABCDEFGHIJKLMNOPQR", "HTTPS://DISCORD.COM", "http://discord.com"]) {
       expect(run.stdout, leak).not.toContain(leak);
     }
     const out = run.json as { routing: Record<string, unknown>; discovery: Record<string, unknown> };
@@ -2216,7 +2248,7 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     expect(badPlugin.exitCode).not.toBe(0);
     expect(badPlugin.stderr).toContain("plugin-request: bad plugin");
     expect(wrote(fx)).toBe(false);
-  });
+  }, LONG);
 
   test("webhook-add round-trips on stdin", async () => {
     const fx = setup(ENV);
@@ -2285,11 +2317,20 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     for (const payload of REQUESTS) {
       const fx = setup(ENV);
       expect((await botOps(fx, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
-      const call = writeCall(fx);
-      const [mkdir, umask, write] = [call.indexOf("mkdir -p"), call.indexOf("umask 077"), call.indexOf("cat >")];
-      expect(mkdir, payload.action).toBeGreaterThan(-1);
-      expect(umask, payload.action).toBeGreaterThan(mkdir); // a not-yet-existing requests/ keeps the ordinary mode
-      expect(write, payload.action).toBeGreaterThan(umask);
+      // one shell, in this order: mkdir (ordinary mode for a new requests/), THEN umask, THEN the write.
+      // `umask` must run in the SAME shell as the write: `(umask 077) && cat` narrows a subshell only.
+      expect(writeCall(fx), payload.action).toContain("mkdir -p /app/data/plugins/requests && umask 077 && cat > ");
+    }
+  });
+
+  test("the request file really is 0600 (where the platform has file modes)", async () => {
+    // Git Bash on Windows has no modes; CI on Linux runs the real `sh -c` under the fake docker.
+    if (process.platform === "win32") return;
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, payload.action).toBe(0);
+      expect(statSync(join(mailbox(fx), String(run.json?.queued))).mode & 0o777, payload.action).toBe(0o600);
     }
   });
 
@@ -2522,7 +2563,8 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
   const reserved = new Set([...block.matchAll(/\[([A-Z][A-Z0-9_]*)\]=1/g)].map((m) => m[1]!));
 
   test("the block is found and non-empty (can't pass vacuously)", () => {
-    expect(reserved.size).toBeGreaterThanOrEqual(15);    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
+    expect(reserved.size).toBeGreaterThanOrEqual(15);
+    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
   });
 
   // Credentials a first-party plugin owns are NOT reserved, on purpose (ADR-0006 decision 8): the panel
