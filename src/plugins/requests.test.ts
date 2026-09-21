@@ -56,6 +56,57 @@ describe("validate (#105 trust boundary)", () => {
     expect(ok({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 1000, requestedBy: "t" }).ok).toBe(false);
   });
 
+  test("refuses update-now and schedule for the version already installed, naming it (#263)", () => {
+    // The index's current is 1.1.0 and 1.0.0 is installed: the refusal compares with what is INSTALLED.
+    const now = ok({ action: "update-now", plugin: "warbandeer", version: "1.0.0", requestedBy: "t" });
+    expect(now).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0" });
+    const scheduled = ok({ action: "schedule", plugin: "warbandeer", version: "1.0.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" });
+    expect(scheduled).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0" });
+  });
+
+  test("an update to any other version is accepted as before, including the index's current and an older one (#263)", () => {
+    for (const version of ["1.1.0", "1.0.1", "0.9.0", "1.0.0-rc.1"]) {
+      expect(ok({ action: "update-now", plugin: "warbandeer", version, requestedBy: "t" }).ok, version).toBe(true);
+      expect(ok({ action: "schedule", plugin: "warbandeer", version, at: "2026-09-06T18:30-07:00", requestedBy: "t" }).ok, version).toBe(true);
+    }
+  });
+
+  test("the comparison is exact: a prerelease and its release are different versions (#263)", () => {
+    const rc = installedMap(["warbandeer", "1.0.0-rc.1"]);
+    const check = (version: string) => validate({ action: "update-now", plugin: "warbandeer", version, requestedBy: "t" }, rc, entries, 1);
+    expect(check("1.0.0-rc.1")).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0-rc.1" });
+    expect(check("1.0.0").ok).toBe(true); // the release of the installed prerelease is a real update
+    expect(check("1.0.0-rc.2").ok).toBe(true);
+    expect(check("1.0.0-rc").ok).toBe(true);
+  });
+
+  test("skip, remind and cancel for the installed version are still accepted (#263)", () => {
+    expect(ok({ action: "skip", plugin: "warbandeer", version: "1.0.0", requestedBy: "t" }).ok).toBe(true);
+    expect(ok({ action: "remind", plugin: "warbandeer", version: "1.0.0", days: 3, requestedBy: "t" }).ok).toBe(true);
+    expect(ok({ action: "cancel", plugin: "warbandeer", requestedBy: "t" }).ok).toBe(true);
+  });
+
+  test("a malformed version is still \"bad version\", not \"already on\" (#263)", () => {
+    // An installed version that is not itself well-formed makes the order of the two checks observable: a
+    // request naming exactly that text must be refused as malformed, not as "already on".
+    const odd = installedMap(["warbandeer", "1.0"]);
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0", requestedBy: "t" }, odd, entries, 1);
+    expect(refused.ok).toBe(false);
+    expect(refused.ok === false && refused.reason).toContain("bad version");
+    // and the refusals that come before it in `validate` keep their own reasons
+    expect(ok({ action: "update-now", plugin: "ghost", version: "1.0.0", requestedBy: "t" })).toEqual({ ok: false, reason: "ghost is not an installed plugin" });
+    const badAt = ok({ action: "schedule", plugin: "warbandeer", version: "1.0.0", at: "tomorrow", requestedBy: "t" });
+    expect(badAt.ok === false && badAt.reason).toContain("bad schedule time"); // a request `main` refused keeps its reason
+  });
+
+  test("the installed-version refusal comes before the host-API check (#263)", () => {
+    // The index's current is 1.0.0, needs host API v2 (the bot is v1), and 1.0.0 is what is installed: it is
+    // already installed, so that is the answer, not "needs host API".
+    const incompat = entryMap(entry("warbandeer", "1.0.0", 2));
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0.0", requestedBy: "t" }, installed, incompat, 1);
+    expect(refused).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0" });
+  });
+
   test("rejects an update to the index's CURRENT version when it's host-API-incompatible", () => {
     const incompatEntries = entryMap(entry("warbandeer", "1.1.0", 2)); // needs host API v2
     expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, installed, incompatEntries, 1).ok).toBe(false);
@@ -204,6 +255,191 @@ describe("consumePluginRequests drain", () => {
     await consumePluginRequests(h.deps);
     expect(h.mutations).toHaveLength(0);
     expect(h.restarts).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------------------------------
+  // #263: an applied update request whose file cannot be deleted, and an update to what is installed.
+  // -------------------------------------------------------------------------------------------------
+  describe("update requests: a file that cannot be deleted, and an update to the installed version (#263)", () => {
+    const STUCK = "[plugins] couldn't delete applied request 100-update-now-1.json; it will not be applied again";
+    const busy = () => Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+    /** Make every delete fail until `release()`; returns the number of delete attempts so far. */
+    function stickyDelete(h: { deps: PluginRequestDeps }) {
+      const realUnlink = h.deps.unlink;
+      const control = { failing: true, attempts: 0 };
+      h.deps.unlink = async (path) => {
+        control.attempts += 1;
+        if (control.failing) throw busy();
+        return realUnlink(path);
+      };
+      return control;
+    }
+
+    test("an applied update request whose file cannot be deleted is applied once: one state write, one restart, and later drains only retry the delete", async () => {
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+      const del = stickyDelete(h);
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(1);
+      expect(h.restarts).toHaveLength(1);
+      expect(h.errors).toEqual([STUCK]);
+      expect(h.fs.size).toBe(1);
+      const attempts = del.attempts;
+      // Two more drains while it is still stuck: not applied again, no restart, no new error -- and the delete IS tried again.
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(1);
+      expect(h.restarts).toHaveLength(1);
+      expect(h.errors).toEqual([STUCK]);
+      expect(del.attempts).toBe(attempts + 2);
+      expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
+    });
+
+    test("… and it goes once it can be deleted, and a new request under that name is handled", async () => {
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+      const del = stickyDelete(h);
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      del.failing = false;
+      await consumePluginRequests(h.deps);
+      expect(h.fs.size).toBe(0); // the retry removed it
+      expect(h.mutations).toHaveLength(1); // ...without applying it again
+      expect(h.restarts).toHaveLength(1);
+      // The entry is forgotten with the file: another request under the same name -- even one with the very
+      // same text -- is handled as the new request it is, not taken for the one that was already applied.
+      h.fs.set("100-update-now-1.json", JSON.stringify(wb({ action: "update-now", version: "1.1.0" })));
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(2);
+      expect(h.restarts).toHaveLength(2);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a different update request under a stuck one's name is applied, not mistaken for it", async () => {
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+      stickyDelete(h);
+      await consumePluginRequests(h.deps);
+      // Someone puts another request under the same name (different text) while the first is stuck.
+      h.fs.set("100-update-now-1.json", JSON.stringify(wb({ action: "skip", version: "1.1.0" })));
+      await consumePluginRequests(h.deps);
+      expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0");
+      expect(h.mutations).toHaveLength(2);
+      expect(h.restarts).toHaveLength(1); // the skip asks for none
+    });
+
+    test("every update action whose file cannot be deleted is applied once, not only update-now", async () => {
+      const bodies: [string, object][] = [
+        ["schedule", wb({ action: "schedule", version: "1.1.0", at: "2026-09-06T18:30-07:00" })],
+        ["remind", wb({ action: "remind", version: "1.1.0", days: 3 })],
+        ["skip", wb({ action: "skip", version: "1.1.0" })],
+        ["cancel", wb({ action: "cancel" })],
+      ];
+      for (const [name, body] of bodies) {
+        resetPluginRequestsForTest();
+        const h = harness({ [`100-${name}-1.json`]: body });
+        stickyDelete(h);
+        await consumePluginRequests(h.deps);
+        await consumePluginRequests(h.deps);
+        await consumePluginRequests(h.deps);
+        expect(h.mutations, name).toHaveLength(1);
+        expect(h.errors, name).toEqual([`[plugins] couldn't delete applied request 100-${name}-1.json; it will not be applied again`]);
+      }
+    });
+
+    test("the restart loop ends across a restart: the replayed file is refused, not applied, once the install has landed", async () => {
+      // A file that cannot be deleted or moved. First process: update-now to 1.1.0 is applied and asks for a restart.
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+      h.deps.unlink = async () => {
+        throw busy();
+      };
+      h.deps.rename = async () => {
+        throw busy();
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.restarts).toHaveLength(1);
+      // The restart: a fresh module state (nothing remembered), the same mailbox, and a state in which the
+      // install has landed, so 1.1.0 is now what is installed.
+      resetPluginRequestsForTest();
+      const landed: PluginStateFile = { hostApiVersion: 1, writtenAt: "", plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.1.0" }] };
+      h.deps.readState = async () => landed;
+      const mutationsBefore = h.mutations.length;
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(mutationsBefore); // not pinned again
+      expect(h.restarts).toHaveLength(1); // no second restart
+      expect(h.warns).toContain("[plugins] rejecting request 100-update-now-1.json: warbandeer is already on 1.1.0");
+      // ...and being refused, and still undeletable, it is remembered and not refused again every few seconds.
+      const warns = h.warns.length;
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(warns);
+      expect(h.restarts).toHaveLength(1);
+    });
+
+    test("update-now for the version already installed is refused naming it, writes no state and requests no restart", async () => {
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.0.0" }) });
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(0);
+      expect(h.restarts).toHaveLength(0);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-update-now-1.json: warbandeer is already on 1.0.0"]);
+      expect(h.rejected).toEqual(["100-update-now-1.json"]);
+      expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("schedule for the version already installed is refused the same way", async () => {
+      const h = harness({ "100-schedule-1.json": wb({ action: "schedule", version: "1.0.0", at: "2026-09-06T18:30-07:00" }) });
+      await consumePluginRequests(h.deps);
+      expect(h.mutations).toHaveLength(0);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-schedule-1.json: warbandeer is already on 1.0.0"]);
+      expect(h.rejected).toEqual(["100-schedule-1.json"]);
+      expect(h.state.plugins[0]?.scheduled).toBeUndefined();
+    });
+
+    test("skip, remind and cancel for the installed version still apply", async () => {
+      const h = harness({
+        "100-skip-1.json": wb({ action: "skip", version: "1.0.0" }),
+        "200-remind-1.json": wb({ action: "remind", version: "1.0.0", days: 3 }),
+        "300-cancel-1.json": wb({ action: "cancel" }),
+      });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([]);
+      expect(h.rejected).toEqual([]);
+      expect(h.mutations).toHaveLength(3);
+      expect(h.state.plugins[0]?.skippedVersion).toBe("1.0.0");
+      expect(h.restarts).toHaveLength(0);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("an update-now for any other version than the installed one is applied as before", async () => {
+      for (const version of ["1.0.1", "1.1.0", "0.9.0", "1.0.0-rc.1", "2.0.0"]) {
+        resetPluginRequestsForTest();
+        const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version }) });
+        await consumePluginRequests(h.deps);
+        expect(h.state.plugins[0]?.targetVersion, version).toBe(version);
+        expect(h.restarts, version).toHaveLength(1);
+        expect(h.rejected, version).toEqual([]);
+      }
+    });
+
+    test("a malformed version is still \"bad version\" in the drain, not \"already on\"", async () => {
+      // An installed version that is not itself well-formed makes the order of the two checks observable: a
+      // request naming exactly that text is malformed, and must not be answered as "already on".
+      const state: PluginStateFile = { hostApiVersion: 1, writtenAt: "", plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0" }] };
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.0" }) }, { state });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(1);
+      expect(h.warns[0]).toContain("bad version");
+      expect(h.warns[0]).not.toContain("already on");
+      expect(h.mutations).toHaveLength(0);
+    });
+
+    test("an applied update request whose file is already gone when it is deleted is fine, not a stuck request", async () => {
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+      h.deps.unlink = async () => {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.errors).toEqual([]); // no "couldn't delete", nothing remembered
+      expect(h.restarts).toHaveLength(1);
+    });
   });
 
   // -------------------------------------------------------------------------------------------------

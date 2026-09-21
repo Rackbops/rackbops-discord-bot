@@ -438,10 +438,112 @@
   cursor: not-allowed;
 }
 
+/* ---- The Apply bar (#257) --------------------------------------------------------------------
+   Every change that needs a restart collects here, whichever tab it was made on: the last child of
+   <main>, outside every tab panel, sticky at the bottom of the viewport, shown only while something is
+   pending or an apply has just finished (the [hidden] rule above does the hiding). A raised surface with
+   a border and a shadow so it reads as a bar over the page, not a card in it. Semantic colour is a bar,
+   never small text (like .msg and .rb-alert): the text stays the body colour and the tone rides on the
+   left edge -- danger for a refusal or a failure, success once it is applied. */
+.adm-apply {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rb-space-3) var(--rb-space-4);
+  padding: var(--rb-space-3) var(--rb-space-4);
+  background: var(--rb-surface-2);
+  border: 1px solid var(--rb-border-strong);
+  border-left: 3px solid var(--rb-accent);
+  border-radius: var(--rb-radius);
+  box-shadow: var(--rb-shadow-lg);
+  color: var(--rb-text);
+}
+.adm-apply--danger {
+  border-left-color: var(--rb-danger);
+}
+.adm-apply--ok {
+  border-left-color: var(--rb-success);
+}
+/* The bar takes focus while a request is in flight (tabindex="-1", see the page script); the theme's own
+   :focus-visible ring (rb-theme.css, on everything inside [data-rb-style]) is what shows it. */
+/* A sticky bar covers the bottom of the viewport, and the browser scrolls a focused control only into the
+   REST of it: without this a Tab stop can land underneath the bar. The padding is the bar's height (about
+   67px on a desktop, 143px stacked on a phone) with room to spare, while the bar is showing. A failed bar can
+   be taller -- its title can hold a compose log, bounded at 30vh below -- and a refusal can too (it echoes the
+   offending value in the hint, bounded the same way); both carry --danger, which so gets that bound plus the
+   rest of the bar. (Deliberately NOT clamped to a share of the viewport: at 400% zoom, 320x256, a 60vh clamp
+   put every Tab stop UNDER the 219px bar of a 10-line compose failure, where the full padding keeps them in
+   the strip above it.) The danger rules come after the base ones: equal specificity, source order. */
+:root:has(.adm-apply:not([hidden])) {
+  scroll-padding-bottom: 6rem;
+}
+:root:has(.adm-apply--danger:not([hidden])) {
+  scroll-padding-bottom: calc(30vh + 5rem);
+}
+.adm-apply__text {
+  flex: 1 1 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+/* A compose log can run to hundreds of lines and it is shown whole, in the TITLE: bound it, so the bar's
+   buttons stay on screen, and let it scroll inside. The hint is bounded the same way (a refusal echoes the
+   offending value there, and a pasted value can be thousands of characters), but it is a SEPARATE scroller:
+   the backup path (#47) is a one-line hint that never reaches the bound, and it is never inside the title's. */
+.adm-apply__text > strong {
+  max-height: 30vh;
+  overflow-y: auto;
+}
+.adm-apply__text .field-hint {
+  margin: 0;
+  font-size: var(--rb-text-sm);
+  color: var(--rb-text-soft);
+  max-height: 30vh;
+  overflow-y: auto;
+}
+.adm-apply__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--rb-space-2);
+}
+/* A control the bar refused (aria-invalid, set by the page script): its border says so too, not only the bar.
+   A chip field's typing input is borderless, so the field around it carries the mark. */
+.adm [aria-invalid="true"] {
+  border-color: var(--rb-danger);
+}
+.tag-field:has([aria-invalid="true"]) {
+  border-color: var(--rb-danger);
+}
+
 /* ---- Narrow screens ------------------------------------------------------------------------- */
 @media (max-width: 640px) {
   .adm {
     padding: 16px;
+  }
+  /* The bar stacks on a phone: the message on top, the buttons full width beneath it. In a column the
+     text's `flex-basis` would be a HEIGHT, so it goes back to its content's size. */
+  .adm-apply {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  :root:has(.adm-apply:not([hidden])) {
+    scroll-padding-bottom: 10rem;
+  }
+  :root:has(.adm-apply--danger:not([hidden])) {
+    scroll-padding-bottom: calc(30vh + 10rem);
+  }
+  .adm-apply__text {
+    flex: 0 0 auto;
+  }
+  .adm-apply__actions .rb-btn {
+    flex: 1 1 auto;
   }
   /* Three tabs fit a phone, but a long localized label must scroll rather than wrap the strip. */
   .rb-tabstrip {
