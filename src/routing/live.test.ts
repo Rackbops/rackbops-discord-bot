@@ -204,6 +204,17 @@ describe("applyRouting", () => {
     expect(h.logs.error).toEqual([]);
   });
 
+  test("routed mode finds each command's owner through COMMAND_PREFIX", async () => {
+    await placeMusicInOther();
+    const h = harness({ prefix: "r_" });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    // Every registered name carries the prefix; the owner is found by stripping it, so music's
+    // commands still go only to Other and wow's (unplaced) only to Home.
+    expect(names(h.puts[0]!.body)).toEqual(["r_report", "r_update", "r_plugins", "r_dmf"]);
+    expect(names(h.puts[1]!.body)).toEqual(["r_report", "r_update", "r_plugins", "r_setlist", "r_spotify"]);
+  });
+
   test("a refusal in one server is recorded against it in discovery and the others are registered", async () => {
     await placeMusicInOther();
     const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
