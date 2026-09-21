@@ -4,11 +4,17 @@
 // `bun test` the same way ops/admin/server.test.ts is. Needs bash + jq on PATH; on a box without
 // them the whole file skips LOUDLY rather than passing vacuously. On Windows, Git's own bash is
 // used — a WSL bash.exe earlier on PATH would run the script against a different filesystem.
-import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test as bunTest } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { repairRouting } from "../src/routing/model";
+
+// Every test here spawns real bash + jq, ~0.3-0.5 s a call on Windows; a test that loops over a
+// table of cases (the #240 request-validation ones do) can pass Bun's 5 s default on a loaded box, so
+// each test gets a minute instead. Same test bodies, same names; only the ceiling moves.
+const test = (name: string, fn: () => void | Promise<void>) => bunTest(name, fn, 60_000);
 
 const BOT_OPS_SH = fileURLToPath(new URL("./bot-ops.sh", import.meta.url));
 
@@ -74,6 +80,16 @@ function setup(
      *  path, i.e. the file isn't there in the container (index unavailable / no state). */
     pluginIndex?: string;
     pluginState?: string;
+    /** Fixture text the fake `docker exec … cat` returns for the bot's routing record and its
+     *  discovery file (`/app/data/routing.json`, `/app/data/discovery.json` — #240), verbatim, so a
+     *  test can serve corrupt or hand-edited content. Absent → the file isn't in the container. The
+     *  shim matches by substring, and `/app/data/routing.json` is not a substring of the bot's
+     *  webhook store's path, so the two can never be confused (asserted in a test, not assumed). */
+    routing?: string;
+    discovery?: string;
+    /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
+     *  stdout) and exits with — for the tests that check a recreate message can't carry a secret. */
+    composeUp?: { output: string; exitCode?: number };
   } = {},
 ): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
@@ -101,7 +117,22 @@ function setup(
   const pluginStateFile = join(root, "plugin-state.json");
   if (opts.pluginIndex !== undefined) writeFileSync(pluginIndexFile, opts.pluginIndex);
   if (opts.pluginState !== undefined) writeFileSync(pluginStateFile, opts.pluginState);
+  const routingFile = join(root, "routing.json");
+  const discoveryFile = join(root, "discovery.json");
+  const composeOutFile = join(root, "compose-up-output.txt");
+  if (opts.routing !== undefined) writeFileSync(routingFile, opts.routing);
+  if (opts.discovery !== undefined) writeFileSync(discoveryFile, opts.discovery);
+  if (opts.composeUp !== undefined) writeFileSync(composeOutFile, opts.composeUp.output);
   const execHandler = [
+    opts.routing !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then cat ${JSON.stringify(bashPath(routingFile))}; fi`
+      : "",
+    opts.discovery !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then cat ${JSON.stringify(bashPath(discoveryFile))}; fi`
+      : "",
+    opts.composeUp !== undefined
+      ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
+      : "",
     opts.pluginIndex !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/index.json"* ]]; then cat ${JSON.stringify(bashPath(pluginIndexFile))}; fi`
       : "",
@@ -965,11 +996,12 @@ describe.skipIf(!runnable)("bot-ops.sh env-set validates an installed plugin's k
     ]);
   });
 
-  test("a secret plugin key is refused as not editable, and never listed by env-get", async () => {
+  // #240 changed the FIRST half of this test on purpose: a plugin's secret key used to be refused
+  // here ("not an editable key"); since ADR-0006 decision 8 it is settable, write-only — see the
+  // "accepts a plugin's secret key, write-only (#240)" describe below, which owns that behaviour.
+  // What has NOT changed, and stays pinned here, is that env-get never lists it.
+  test("a secret plugin key is never listed by env-get, and its non-secret sibling is", async () => {
     const fx = setup("PLUGINS=warbandeer\n", { pluginIndex: index });
-    const set = await botOps(fx, ["env-set"], "WARBANDEER_SECRET=hunter2\n");
-    expect(set.exitCode).toBe(1);
-    expect(set.stderr).toContain("'WARBANDEER_SECRET' is not an editable key");
     const env = await envGet(fx);
     expect(env).not.toHaveProperty("WARBANDEER_SECRET");
     expect(env).toHaveProperty("WARBANDEER_INGEST_PORT"); // the non-secret sibling IS listed
@@ -1300,15 +1332,22 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
-  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 2, #205)", () => {
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 3, #240)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=2\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=3\b/);
+  });
+
+  test("reports schema 3 (#240: routing-get, the four routing/webhook request actions, write-only plugin secrets)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"]);
+    expect(run.exitCode).toBe(0);
+    expect((run.json as { schema: number }).schema).toBe(3);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
@@ -1328,7 +1367,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -1341,7 +1380,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 });
 
@@ -1354,7 +1393,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 3, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -1365,7 +1404,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -1373,7 +1412,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -1381,6 +1420,677 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 3, composeSchema: 2 });
+  });
+});
+
+// ---- #240: write-only plugin secrets, routing-get, the four routing / webhook request actions ------
+// Epic #236, ADR-0006. The property everything below rests on: a plugin secret's VALUE (and a webhook
+// URL) never leaves the script — not in env-get, env-schema, env-set's result, a die message, stderr,
+// or docker's argv (docker.log). `everythingObservable` gathers every place a value could surface.
+
+/** A recognisable plugin secret: it matches MUSIC_API_KEY's format below and cannot occur in any
+ *  fixture or output by chance, so "the value appears nowhere" is a meaningful literal search. */
+const SECRET = "sk_live_Zx91QpL7mNv3TrWq";
+const OLD_SECRET = "sk_old_Qw83RtYu12LmNbVc";
+const WEBHOOK_TOKEN = "Zk3nQ8xV1mB7cR4tY9uL2pS6wA0dF5gHjKq";
+const WEBHOOK_URL = `https://discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`;
+
+const SECRET_INDEX = wrapIndex([
+  pluginEntry("music", [
+    envKey("MUSIC_PORT", PORT_RE),
+    envKey("MUSIC_API_KEY", "^[A-Za-z0-9_-]{8,64}$", { secret: true }),
+    envKey("MUSIC_MUST_KEY", "^[a-z]{4,}$", { secret: true, required: true }),
+  ]),
+]);
+const MUSIC_ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_MUST_KEY=abcd\n";
+
+/** Every place a value could surface after a run: both output streams, docker's logged argv, the
+ *  config dir's file names and the backups listing. (A backup's CONTENT legitimately holds the
+ *  previous .env, values included — it is 0600 and asserted separately.) */
+function everythingObservable(fx: Fixture, run: Run): string {
+  return [
+    run.stdout,
+    run.stderr,
+    dockerCalls(fx).join("\n"),
+    readdirSync(fx.cfg).join("\n"),
+    existsSync(join(fx.cfg, "backups")) ? readdirSync(join(fx.cfg, "backups")).join("\n") : "",
+  ].join("\n--\n");
+}
+
+describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, write-only (#240)", () => {
+  test("a secret key is written to .env and named in changed", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["MUSIC_API_KEY"], recreated: true });
+    expect(envText(fx)).toBe(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`);
+    expect(readdirSync(join(fx.cfg, "backups"))).toHaveLength(1);
+    expect(dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"))).toBe(true);
+  });
+
+  test("env-get emits neither its name nor its value, before or after", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const before = await botOps(fx, ["env-get"]);
+    expect(before.exitCode).toBe(0);
+    expect(before.stdout).not.toContain("MUSIC_API_KEY");
+    expect(before.stdout).not.toContain("MUSIC_MUST_KEY"); // a stored secret is not listed either
+    await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    const after = await botOps(fx, ["env-get"]);
+    expect(after.stdout).not.toContain("MUSIC_API_KEY");
+    expect(after.stdout).not.toContain(SECRET);
+    expect(after.stderr).not.toContain(SECRET);
+    expect(after.json).toHaveProperty("MUSIC_PORT"); // the plugin's non-secret sibling IS listed
+    expect(Object.keys(after.json!)).toEqual(Object.keys(before.json!));
+  });
+
+  test("its format is enforced", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], "MUSIC_API_KEY=short\n"); // < 8 chars
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("env-set: value for 'MUSIC_API_KEY' is invalid");
+    expect(envText(fx)).toBe(MUSIC_ENV); // untouched
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("a required secret cannot be blanked, an optional one can be cleared", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const blank = await botOps(fx, ["env-set"], "MUSIC_MUST_KEY=\n");
+    expect(blank.exitCode).toBe(1);
+    expect(blank.stderr).toContain("env-set: 'MUSIC_MUST_KEY' is required and cannot be blank");
+    expect(envText(fx)).toBe(MUSIC_ENV);
+    expect((await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`)).exitCode).toBe(0);
+    const clear = await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect(clear.exitCode).toBe(0);
+    expect(clear.json).toMatchObject({ changed: ["MUSIC_API_KEY"] });
+    expect(envText(fx)).toContain("MUSIC_API_KEY=\n");
+  });
+
+  test("a core secret is still refused", async () => {
+    const fx = setup(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`, { pluginIndex: SECRET_INDEX });
+    for (const key of ["DISCORD_TOKEN", "GITHUB_TOKEN", "ADMIN_TOKEN", "BLIZZARD_CLIENT_SECRET", "CLOUDFLARE_TUNNEL_TOKEN"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=${SECRET}\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+      expect(everythingObservable(fx, run), key).not.toContain(SECRET);
+    }
+    expect(envText(fx)).toBe(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`);
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("a manifest that declares a core credential cannot make it editable, listable or schema-visible", async () => {
+    // Secret or plain, by mistake or through a bad index entry: a key the deployment owns stays out.
+    const index = wrapIndex([
+      pluginEntry("evil", [
+        envKey("DISCORD_TOKEN", "^.+$", { secret: true }),
+        envKey("ADMIN_TOKEN", "^.+$", { secret: true }),
+        envKey("GITHUB_TOKEN", "^.+$"), // declared PLAIN: must not be listed with its value either
+        envKey("BOT_OPS_CONFIG_DIR", "^.+$"),
+        envKey("EVIL_PORT", PORT_RE),
+      ]),
+    ]);
+    const fx = setup("PLUGINS=evil\nDISCORD_TOKEN=tok-1\nADMIN_TOKEN=tok-2\nGITHUB_TOKEN=tok-3\nBOT_OPS_CONFIG_DIR=/x\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const get = await botOps(fx, ["env-get"]);
+    for (const leak of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR", "tok-1", "tok-2", "tok-3"]) {
+      expect(get.stdout, leak).not.toContain(leak);
+    }
+    expect(get.json).toHaveProperty("EVIL_PORT"); // the legitimate key is still listed
+    const schema = await botOps(fx, ["env-schema"]);
+    for (const leak of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR"]) {
+      expect(schema.stdout, leak).not.toContain(leak);
+    }
+    for (const key of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=new-value\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+  });
+
+  test("a secret key of a plugin that is not enabled is refused", async () => {
+    const other = "PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n"; // music is in the index but not in PLUGINS
+    const fx = setup(other, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
+    expect(envText(fx)).toBe(other);
+    // ... nor when the index cannot be read at all
+    const noIndex = setup(MUSIC_ENV);
+    const run2 = await botOps(noIndex, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run2.exitCode).toBe(1);
+    expect(run2.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
+    expect(everythingObservable(noIndex, run2)).not.toContain(SECRET);
+  });
+
+  test("the value appears nowhere in stdout, stderr, docker.log or the backups listing", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\nANNOUNCE_CHANNEL_ID=22222\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: expect.arrayContaining(["MUSIC_API_KEY", "ANNOUNCE_CHANNEL_ID"]) });
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(SECRET); // the new value
+    expect(seen).not.toContain(OLD_SECRET); // nor the one it replaced
+    // The backup file legitimately holds the PREVIOUS .env — values included — so it must be owner-only.
+    const [backupName] = readdirSync(join(fx.cfg, "backups"));
+    const backup = join(fx.cfg, "backups", backupName!);
+    expect(readFileSync(backup, "utf8")).toContain(`MUSIC_API_KEY=${OLD_SECRET}`);
+    if (process.platform !== "win32") expect(statSync(backup).mode & 0o777).toBe(0o600);
+  });
+
+  test("a rejected value is never echoed either: the messages name the key only", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const bad = "bad value with spaces and the secret sk_live_Leak123456"; // fails the format
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${bad}\n`);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("value for 'MUSIC_API_KEY' is invalid");
+    expect(everythingObservable(fx, run)).not.toContain("sk_live_Leak123456");
+    const malformed = await botOps(fx, ["env-set"], `MUSIC_API_KEY ${SECRET}\n`); // no `=`
+    expect(malformed.exitCode).toBe(1);
+    expect(everythingObservable(fx, malformed)).not.toContain(SECRET);
+  });
+
+  test("a submitted secret is always written, so a guess cannot be checked against the stored value", async () => {
+    // "No change" would be a read oracle: submit a guess, and an empty `changed` means it IS the value.
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const same = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    const guess = await botOps(fx, ["env-set"], "MUSIC_API_KEY=some_other_guess_1\n");
+    for (const run of [same, guess]) {
+      expect(run.exitCode).toBe(0);
+      expect(run.json).toMatchObject({ ok: true, changed: ["MUSIC_API_KEY"], recreated: true });
+      expect(run.json).not.toHaveProperty("note");
+    }
+    // indistinguishable to a caller: same keys, same shape
+    expect(Object.keys(same.json!).sort()).toEqual(Object.keys(guess.json!).sort());
+  });
+
+  test("a blank for a secret that is already unset changes nothing (that much isSet already says)", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
+    expect(envText(fx)).toBe(MUSIC_ENV);
+  });
+
+  test("a line break inside a value is refused for every key, naming the key only", async () => {
+    // A CR could start a new line in .env (`KEY=a\rDISCORD_TOKEN=evil`); a permissive plugin format
+    // would let it through, so the script refuses it before the format is even consulted.
+    const index = wrapIndex([pluginEntry("lax", [envKey("LAX_KEY", "^.+$", { secret: true }), envKey("LAX_PLAIN", "^.+$")])]);
+    const fx = setup("PLUGINS=lax\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    for (const key of ["LAX_KEY", "LAX_PLAIN"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=abc\rDISCORD_TOKEN=evil\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`env-set: value for '${key}' is invalid`);
+      expect(run.stderr, key).not.toContain("evil");
+    }
+    expect(envText(fx)).toBe("PLUGINS=lax\nANNOUNCE_CHANNEL_ID=11111\n");
+  });
+
+  test("a recreate message that echoes a value is redacted before it reaches the result's log", async () => {
+    // Nothing this script prints carries a value — but `docker compose up` is not ours, and a .env
+    // line it refuses to parse can be quoted back in its error. Both the new and the old value go.
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {
+      pluginIndex: SECRET_INDEX,
+      composeUp: { output: `error while loading .env: line 3: bad value MUSIC_API_KEY=${SECRET} (was ${OLD_SECRET})`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(1); // the recreate failed, and env-set says so
+    expect(run.json).toMatchObject({ ok: false, changed: ["MUSIC_API_KEY"] });
+    expect(String((run.json as { log: string }).log)).toContain("[redacted]");
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(SECRET);
+    expect(seen).not.toContain(OLD_SECRET);
+  });
+
+  test("a key one plugin declares secret and another declares plain is secret: never listed, schema says so", async () => {
+    for (const order of [["plain", "secret"], ["secret", "plain"]] as const) {
+      const decl = { plain: pluginEntry("aaa", [envKey("SHARED_KEY", "^.+$")]), secret: pluginEntry("bbb", [envKey("SHARED_KEY", "^.+$", { secret: true })]) };
+      const fx = setup(`PLUGINS=aaa,bbb\nANNOUNCE_CHANNEL_ID=11111\nSHARED_KEY=${SECRET}\n`, { pluginIndex: wrapIndex(order.map((o) => decl[o])) });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.stdout, order.join()).not.toContain("SHARED_KEY");
+      expect(get.stdout, order.join()).not.toContain(SECRET);
+      const schema = (await botOps(fx, ["env-schema"])).json as unknown as Record<string, Record<string, unknown>>;
+      expect(schema.SHARED_KEY, order.join()).toMatchObject({ secret: true, isSet: true });
+    }
+  });
+
+  test("a secret key that collides with a static key is ignored: the static key stays, and stays core", async () => {
+    const index = wrapIndex([pluginEntry("sneaky", [envKey("COMMAND_PREFIX", "^.+$", { secret: true })])]);
+    const fx = setup("PLUGINS=sneaky\nCOMMAND_PREFIX=rb\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    expect((await envGet(fx)).COMMAND_PREFIX).toBe("rb");
+    const schema = await envSchema(fx);
+    expect(schema.COMMAND_PREFIX).toEqual({ pattern: "^[a-z0-9_-]{1,20}$", required: false, source: "core" });
+  });
+
+  test("a secret declared twice: the first declaration's format wins", async () => {
+    const index = wrapIndex([
+      pluginEntry("one", [envKey("TWICE_KEY", "^[0-9]+$", { secret: true })]),
+      pluginEntry("two", [envKey("TWICE_KEY", "^[a-z]+$", { secret: true })]),
+    ]);
+    const fx = setup("PLUGINS=one,two\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    expect((await botOps(fx, ["env-set"], "TWICE_KEY=abc\n")).exitCode).toBe(1);
+    expect((await botOps(fx, ["env-set"], "TWICE_KEY=123\n")).exitCode).toBe(0);
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-schema lists secret keys without their values (#240)", () => {
+  type Row = Record<string, unknown>;
+  const schemaOf = async (fx: Fixture) => (await botOps(fx, ["env-schema"])).json as unknown as Record<string, Row>;
+
+  test("a secret key carries secret:true and isSet:false when unset", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const schema = await schemaOf(fx);
+    expect(schema.MUSIC_API_KEY).toEqual({ pattern: "^[A-Za-z0-9_-]{8,64}$", required: false, source: "plugin", secret: true, isSet: false });
+    // MUSIC_MUST_KEY=abcd is in MUSIC_ENV, so it is set — and its required flag comes through
+    expect(schema.MUSIC_MUST_KEY).toEqual({ pattern: "^[a-z]{4,}$", required: true, source: "plugin", secret: true, isSet: true });
+  });
+
+  test("isSet turns true once it is set, and false again once it is cleared", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ secret: true, isSet: true });
+    await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    // a quoted-empty value is not "set" either (it reads back as the empty string)
+    const quoted = setup(`${MUSIC_ENV}MUSIC_API_KEY=""\n`, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(quoted)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    const quotedSet = setup(`${MUSIC_ENV}MUSIC_API_KEY="${SECRET}"\n`, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(quotedSet)).MUSIC_API_KEY).toMatchObject({ isSet: true });
+  });
+
+  test("a non-secret entry is exactly {pattern, required, source}", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const schema = await schemaOf(fx);
+    expect(schema.ANNOUNCE_CHANNEL_ID).toEqual({ pattern: "^[0-9]{5,25}$", required: true, source: "core" });
+    expect(schema.MUSIC_PORT).toEqual({ pattern: PORT_RE, required: false, source: "plugin" });
+    for (const [key, row] of Object.entries(schema)) {
+      if (row.secret === true) continue;
+      expect(Object.keys(row).sort(), key).toEqual(["pattern", "required", "source"]);
+    }
+  });
+
+  test("secret rows come after every other row, and env-get never lists them", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const [schema, env] = await Promise.all([schemaOf(fx), envGet(fx)]);
+    const keys = Object.keys(schema);
+    expect(keys.slice(-2)).toEqual(["MUSIC_API_KEY", "MUSIC_MUST_KEY"]); // manifest order, last
+    expect(keys.slice(0, -2)).toEqual(Object.keys(env)); // everything before them is exactly env-get's listing
+  });
+
+  test("the value appears nowhere in the output", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-schema"]);
+    expect(run.exitCode).toBe(0);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+    expect(run.stdout).not.toContain("abcd"); // nor the required secret's stored value
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
+  const GUILD = "123456789012345678";
+  const CHANNEL = "223456789012345678";
+  const ROUTING = {
+    v: 1,
+    updatedAt: "2026-09-21T00:00:00.000Z",
+    updatedBy: "email:me@x.com",
+    plugins: { music: { servers: { [GUILD]: { commands: "all", postTo: CHANNEL } } } },
+    webhooks: { [CHANNEL]: { id: "323456789012345678", guildId: GUILD, addedAt: "2026-09-21T00:00:00.000Z", addedBy: "email:me@x.com" } },
+  };
+  const DISCOVERY = {
+    v: 1,
+    generatedAt: "2026-09-21T00:00:00.000Z",
+    bot: { id: "423456789012345678", username: "rackbops" },
+    inviteUrl: "https://discord.com/oauth2/authorize?client_id=423456789012345678&scope=bot%20applications.commands",
+    homeGuildId: GUILD,
+    guilds: [{ id: GUILD, name: "Home", channels: [{ id: CHANNEL, name: "general", canSend: true }], commands: { registered: 4, at: "2026-09-21T00:00:00.000Z" } }],
+    plugins: { music: { posts: true, commands: ["play"] } },
+  };
+  const ENV = "ANNOUNCE_CHANNEL_ID=11111\n";
+  const get = async (fx: Fixture) => botOps(fx, ["routing-get"]);
+
+  test("returns both files", async () => {
+    const fx = setup(ENV, { routing: JSON.stringify(ROUTING), discovery: JSON.stringify(DISCOVERY) });
+    const run = await get(fx);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ routing: ROUTING, discovery: DISCOVERY });
+    expect(run.stderr).toBe("");
+  });
+
+  test("a missing file is null, not an error", async () => {
+    const neither = await get(setup(ENV));
+    expect(neither.exitCode).toBe(0);
+    expect(neither.json).toEqual({ routing: null, discovery: null });
+    const onlyRouting = await get(setup(ENV, { routing: JSON.stringify(ROUTING) }));
+    expect(onlyRouting.json).toEqual({ routing: ROUTING, discovery: null });
+    const onlyDiscovery = await get(setup(ENV, { discovery: JSON.stringify(DISCOVERY) }));
+    expect(onlyDiscovery.json).toEqual({ routing: null, discovery: DISCOVERY });
+  });
+
+  test("a corrupt file is null, not an error", async () => {
+    for (const bad of ['{ "v": 1, "plugins": ', "", "not json at all", "[]", "42", '"a string"', "null", '{"a":1}{"b":2}']) {
+      const fx = setup(ENV, { routing: bad, discovery: JSON.stringify(DISCOVERY) });
+      const run = await get(fx);
+      expect(run.exitCode, bad).toBe(0);
+      expect(run.json, bad).toEqual({ routing: null, discovery: DISCOVERY });
+    }
+    // and both corrupt at once: still valid JSON on stdout
+    const both = await get(setup(ENV, { routing: "{", discovery: "}" }));
+    expect(both.exitCode).toBe(0);
+    expect(both.json).toEqual({ routing: null, discovery: null });
+  });
+
+  test("never reads the secrets file", async () => {
+    const fx = setup(ENV, { routing: JSON.stringify(ROUTING), discovery: JSON.stringify(DISCOVERY) });
+    await get(fx);
+    const calls = dockerCalls(fx);
+    expect(calls.some((c) => c.includes("routing.secrets"))).toBe(false);
+    // exactly two reads, of exactly the two files
+    expect(calls).toEqual([
+      expect.stringContaining("exec probe-container cat /app/data/routing.json"),
+      expect.stringContaining("exec probe-container cat /app/data/discovery.json"),
+    ]);
+    // the fixture shim matches by substring: prove the secrets path could never satisfy the routing match
+    expect("/app/data/routing.secrets.json".includes("/app/data/routing.json")).toBe(false);
+  });
+
+  test("the script never names the secrets file", () => {
+    expect(readFileSync(BOT_OPS_SH, "utf8")).not.toContain("routing.secrets");
+  });
+
+  test("a webhook URL a hand-edit left in either file never appears in the output", async () => {
+    const dirtyRouting = {
+      ...ROUTING,
+      note: `see ${WEBHOOK_URL} for the hook`,
+      webhooks: { [CHANNEL]: { ...ROUTING.webhooks[CHANNEL], url: WEBHOOK_URL, token: WEBHOOK_TOKEN } },
+      [WEBHOOK_URL]: 1, // even as a key
+    };
+    const dirtyDiscovery = { ...DISCOVERY, hook: "https://discordapp.com/api/v10/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWx", tail: "webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz" };
+    const run = await get(setup(ENV, { routing: JSON.stringify(dirtyRouting), discovery: JSON.stringify(dirtyDiscovery) }));
+    expect(run.exitCode).toBe(0);
+    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api"]) {
+      expect(run.stdout, leak).not.toContain(leak);
+    }
+    const out = run.json as { routing: Record<string, unknown>; discovery: Record<string, unknown> };
+    expect(out.routing.plugins).toEqual(ROUTING.plugins); // everything else survives untouched
+    expect(out.routing.webhooks).toEqual(ROUTING.webhooks); // the hand-edited url / token members are dropped, the metadata stays
+    expect(out.discovery.inviteUrl).toBe(DISCOVERY.inviteUrl); // an invite URL is not a webhook URL
+    expect(JSON.stringify(out.routing.note)).toContain("[redacted]");
+  });
+
+  test("a large discovery file (tens of KB) comes through whole", async () => {
+    const channels = Array.from({ length: 900 }, (_, i) => ({ id: String(500000000000000000n + BigInt(i)), name: `channel-${i}-with-a-reasonably-long-name`, canSend: i % 2 === 0 }));
+    const big = { ...DISCOVERY, guilds: [{ ...DISCOVERY.guilds[0]!, channels }] };
+    expect(JSON.stringify(big).length).toBeGreaterThan(60_000);
+    const run = await get(setup(ENV, { discovery: JSON.stringify(big) }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ routing: null, discovery: big });
+  });
+
+  test("routing-get is a recognised subcommand and appears in usage", async () => {
+    const run = await botOps(setup(ENV), ["bogus-subcommand"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("routing-get");
+  });
+});
+
+describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
+  const ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\n";
+  const req = (o: object) => JSON.stringify(o);
+  const GUILD = "123456789012345678";
+  const CHANNEL = "223456789012345678";
+  const wrote = (fx: Fixture) => dockerCalls(fx).some((c) => c.includes("/app/data/plugins/requests/"));
+  const stdinOf = (fx: Fixture) => readFileSync(join(fx.bin, "request-stdin.json"), "utf8");
+
+  /** What the bot's own reader (src/routing/model.ts) would keep of a `servers` value for a plugin. */
+  const keptByBot = (servers: unknown): unknown => repairRouting({ plugins: { music: { servers } } }).plugins.music?.servers;
+
+  const GOOD_SERVERS: Record<string, unknown>[] = [
+    { [GUILD]: { commands: "all" } },
+    { [GUILD]: { commands: "all", postTo: CHANNEL } },
+    { [GUILD]: { commands: [CHANNEL, "323456789012345678"], postTo: CHANNEL }, "923456789012345678": { commands: "all" } },
+    {}, // an empty object is valid: the plugin is placed nowhere
+  ];
+
+  test("routing-set round-trips to the mailbox", async () => {
+    const fx = setup(ENV);
+    const servers = GOOD_SERVERS[1]!;
+    const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-routing-set-\d+\.json$/);
+    const exec = dockerCalls(fx).find((c) => c.startsWith("docker exec -i -u bun"));
+    expect(exec).toContain("/app/data/plugins/requests/");
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "routing-set", plugin: "music", servers, requestedBy: "email:me@x.com" });
+  });
+
+  test("every routing-set shape the script accepts is one the bot's own repair (src/routing/model.ts) keeps intact", async () => {
+    for (const servers of GOOD_SERVERS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "t" }));
+      expect(run.exitCode, JSON.stringify(servers)).toBe(0);
+      expect(keptByBot(servers), JSON.stringify(servers)).toEqual(servers);
+    }
+  });
+
+  const BAD_SERVERS: [string, unknown][] = [
+    ["servers missing", undefined],
+    ["servers null", null],
+    ["servers an array", []],
+    ["servers a string", "all"],
+    ["a non-snowflake server id", { abc: { commands: "all" } }],
+    ["a too-short server id", { "1234": { commands: "all" } }],
+    ["a prototype-ish server id", JSON.parse('{"__proto__": {"commands": "all"}}')],
+    ["a server entry that is not an object", { [GUILD]: "all" }],
+    ["an empty channel list", { [GUILD]: { commands: [] } }],
+    ["a non-snowflake channel in the list", { [GUILD]: { commands: [CHANNEL, "12"] } }],
+    ["a non-string channel in the list", { [GUILD]: { commands: [123456789012345678] } }],
+    ["commands neither all nor a list", { [GUILD]: { commands: "some" } }],
+    ["commands missing", { [GUILD]: { postTo: CHANNEL } }],
+    ["a non-snowflake postTo", { [GUILD]: { commands: "all", postTo: "general" } }],
+    ["a numeric postTo", { [GUILD]: { commands: "all", postTo: 223456789012345678 } }],
+    ["a null postTo", { [GUILD]: { commands: "all", postTo: null } }],
+  ];
+  test("routing-set rejects each malformed shape, naming the field, before touching docker", async () => {
+    const fx = setup(ENV);
+    for (const [why, servers] of BAD_SERVERS) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "t" }));
+      expect(run.exitCode, why).not.toBe(0);
+      expect(run.stderr, why).toContain("plugin-request: bad servers");
+      // whatever the script rejects, the bot's own repair would not have kept verbatim
+      if (typeof servers === "object" && servers !== null && !Array.isArray(servers)) {
+        expect(keptByBot(servers), why).not.toEqual(servers);
+      }
+    }
+    const badPlugin = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "Music", servers: {}, requestedBy: "t" }));
+    expect(badPlugin.exitCode).not.toBe(0);
+    expect(badPlugin.stderr).toContain("plugin-request: bad plugin");
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("webhook-add round-trips on stdin", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-webhook-add-\d+\.json$/);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "email:me@x.com" });
+    expect(run.stdout).not.toContain(WEBHOOK_TOKEN); // the result names the file, never the URL
+  });
+
+  test("a webhook url never appears in argv (docker.log), stdout or stderr", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
+    expect(run.exitCode).toBe(0);
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(WEBHOOK_TOKEN);
+    expect(seen).not.toContain("webhooks/");
+  });
+
+  test("a webhook-add request file is written owner-only; the other actions are written exactly as before", async () => {
+    const fx = setup(ENV);
+    await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
+    expect(dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/"))).toContain("sh -c umask 077 && mkdir -p /app/data/plugins/requests && cat > ");
+    for (const payload of [
+      { action: "update-now", plugin: "music", version: "1.1.0", requestedBy: "t" },
+      { action: "routing-set", plugin: "music", servers: {}, requestedBy: "t" },
+      { action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" },
+      { action: "discovery-refresh", requestedBy: "t" },
+    ]) {
+      const other = setup(ENV);
+      expect((await botOps(other, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
+      const call = dockerCalls(other).find((c) => c.includes("/app/data/plugins/requests/"));
+      expect(call, payload.action).toContain("sh -c mkdir -p /app/data/plugins/requests && cat > ");
+      expect(call, payload.action).not.toContain("umask");
+    }
+  });
+
+  test("a bad webhook url is rejected without echoing it", async () => {
+    const fx = setup(ENV);
+    const bad: [string, unknown][] = [
+      ["http, not https", `http://discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["another host", `https://example.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a look-alike host", `https://discord.com.evil.example/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a look-alike subdomain", `https://evil.discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a token that is too short", "https://discord.com/api/webhooks/123456789012345678/short"],
+      ["no webhook id", `https://discord.com/api/webhooks/${WEBHOOK_TOKEN}`],
+      ["a non-numeric id", `https://discord.com/api/webhooks/abc/${WEBHOOK_TOKEN}`],
+      ["a query string", `${WEBHOOK_URL}?wait=true`],
+      ["a trailing path", `${WEBHOOK_URL}/extra`],
+      ["a leading space", ` ${WEBHOOK_URL}`],
+      ["a trailing newline", `${WEBHOOK_URL}\n`],
+      ["userinfo", `https://user:pw@discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["not a string", 12345],
+      ["an object", { u: WEBHOOK_URL }],
+      ["missing", undefined],
+    ];
+    for (const [why, url] of bad) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url, requestedBy: "t" }));
+      expect(run.exitCode, why).not.toBe(0);
+      expect(run.stderr, why).toContain("plugin-request: bad webhook url");
+      expect(run.stderr, why).not.toContain(WEBHOOK_TOKEN);
+      expect(run.stderr, why).not.toContain("https://");
+      expect(run.stdout, why).not.toContain(WEBHOOK_TOKEN);
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("a webhook url on the canary / ptb / discordapp hosts, with or without an API version, is accepted", async () => {
+    for (const host of ["discord.com", "canary.discord.com", "ptb.discord.com", "discordapp.com"]) {
+      for (const api of ["api", "api/v10"]) {
+        const fx = setup(ENV);
+        const url = `https://${host}/${api}/webhooks/123456789012345678/${WEBHOOK_TOKEN}`;
+        const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url, requestedBy: "t" }));
+        expect(run.exitCode, url).toBe(0);
+      }
+    }
+  });
+
+  test("webhook-remove: accepted with a channel id, rejected naming the field otherwise", async () => {
+    const fx = setup(ENV);
+    const ok = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" }));
+    expect(ok.exitCode).toBe(0);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" });
+    const bad: unknown[] = ["abc", "1234", "12345678901234567890123456", 12345, CHANNEL + "x", "", undefined, null, { id: CHANNEL }];
+    for (const channelId of bad) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId, requestedBy: "t" }));
+      expect(run.exitCode, String(channelId)).not.toBe(0);
+      expect(run.stderr, String(channelId)).toContain("plugin-request: bad channelId");
+    }
+  });
+
+  test("discovery-refresh round-trips", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "discovery-refresh", requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-discovery-refresh-\d+\.json$/);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "discovery-refresh", requestedBy: "email:me@x.com" });
+  });
+
+  test("the five update actions still validate exactly as before", async () => {
+    const fx = setup(ENV);
+    // the same two rejections the #105 suite asserts, and one acceptance per family of checks
+    const cases: [object, string][] = [
+      [{ action: "rm-rf", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, "plugin-request: bad action 'rm-rf'"],
+      [{ action: "skip", plugin: "Warbandeer", version: "1.1.0", requestedBy: "t" }, "plugin-request: bad plugin 'Warbandeer'"],
+      [{ action: "update-now", plugin: "warbandeer", version: "1.0.0/../x", requestedBy: "t" }, "plugin-request: bad version '1.0.0/../x'"],
+      [{ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "tomorrow", requestedBy: "t" }, "plugin-request: bad at 'tomorrow'"],
+      [{ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 0, requestedBy: "t" }, "plugin-request: bad days '0'"],
+    ];
+    for (const [payload, msg] of cases) {
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, msg).not.toBe(0);
+      expect(run.stderr, msg).toContain(msg);
+    }
+    expect(wrote(fx)).toBe(false);
+    for (const payload of [
+      { action: "cancel", plugin: "warbandeer", requestedBy: "t" },
+      { action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" },
+      { action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7, requestedBy: "t" },
+    ]) {
+      expect((await botOps(fx, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
+    }
+    // the new actions do not leak into the old arms: a routing-only field is not required by an update action
+    expect((await botOps(fx, ["plugin-request"], req({ action: "update-now", plugin: "warbandeer", version: "1.1.0" }))).exitCode).toBe(0);
+  });
+
+  test("a rejected request never echoes a value longer than a plugin name would be, whatever field it sits in", async () => {
+    const fx = setup(ENV);
+    const cases: [object, string][] = [
+      [{ action: WEBHOOK_URL, plugin: "music", requestedBy: "t" }, "bad action '(not shown)'"],
+      [{ action: "skip", plugin: WEBHOOK_URL, version: "1.1.0", requestedBy: "t" }, "bad plugin '(not shown)'"],
+      [{ action: "update-now", plugin: "music", version: WEBHOOK_URL, requestedBy: "t" }, "bad version '(not shown)'"],
+      [{ action: "schedule", plugin: "music", version: "1.1.0", at: WEBHOOK_URL, requestedBy: "t" }, "bad at '(not shown)'"],
+      [{ action: "routing-set", plugin: WEBHOOK_URL, servers: {}, requestedBy: "t" }, "bad plugin"],
+    ];
+    for (const [payload, msg] of cases) {
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, msg).not.toBe(0);
+      expect(run.stderr, msg).toContain(msg);
+      expect(run.stderr, msg).not.toContain(WEBHOOK_TOKEN);
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("an unknown action, including a near-miss of a new one, is rejected", async () => {
+    const fx = setup(ENV);
+    for (const action of ["webhook-list", "routing-get", "Routing-Set", "webhook_add", ""]) {
+      const run = await botOps(fx, ["plugin-request"], req({ action, plugin: "music", requestedBy: "t" }));
+      expect(run.exitCode, action).not.toBe(0);
+      expect(run.stderr, action).toContain("plugin-request: bad action");
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+});
+
+// The deployment owns a set of keys (core credentials, access control, every variable compose
+// interpolates) that no Plugin Index manifest may make editable. The set is hand-maintained in the
+// script (RESERVED_KEYS), so it is pinned against the two places a new core secret would show up.
+describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
+  const script = readFileSync(BOT_OPS_SH, "utf8");
+  const block = script.match(/declare -A RESERVED_KEYS=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+  const reserved = new Set([...block.matchAll(/\[([A-Z][A-Z0-9_]*)\]=1/g)].map((m) => m[1]!));
+
+  test("the block is found and non-empty (can't pass vacuously)", () => {
+    expect(reserved.size).toBeGreaterThanOrEqual(15);
+    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
+  });
+
+  test("every credential-shaped key in .env.example is reserved", () => {
+    const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+    const keys = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!);
+    const credentialShaped = keys.filter((k) => /TOKEN|SECRET|CLIENT_ID|PASSWORD|_KEY$|ALLOWED_EMAILS|ACCESS_/.test(k));
+    expect(credentialShaped.length).toBeGreaterThanOrEqual(6);
+    expect(credentialShaped.filter((k) => !reserved.has(k))).toEqual([]);
+  });
+
+  test("every variable docker-compose.yml interpolates is reserved", () => {
+    const compose = readFileSync(new URL("../docker-compose.yml", import.meta.url), "utf8");
+    const vars = [...new Set([...compose.matchAll(/\$\{([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]!))];
+    expect(vars.length).toBeGreaterThanOrEqual(10);
+    expect(vars.filter((v) => !reserved.has(v))).toEqual([]);
+  });
+
+  test("no reserved key is also an ALLOWED_SPEC key (the two sets are disjoint by construction)", () => {
+    const allowedBlock = script.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+    const allowed = [...allowedBlock.matchAll(/^\s*'([A-Z0-9_]+)\|/gm)].map((m) => m[1]!);
+    expect(allowed.length).toBeGreaterThan(5);
+    expect(allowed.filter((k) => reserved.has(k))).toEqual([]);
   });
 });
