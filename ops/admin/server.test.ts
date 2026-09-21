@@ -68,6 +68,10 @@ import {
   type PluginsView,
   type PluginStatusEntry,
 } from "./server";
+// #238 (panel shell): kept as separate import statements so this change adds lines and removes none.
+import { existsSync } from "node:fs";
+import { loadStaticAssets, STATIC_ASSET_FILES, type StaticAsset } from "./server";
+import { composeThemeCss } from "./theme/build-theme";
 
 /** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set. */
 function makeStore(opts: { bootstrap?: string[]; dynamic?: string[] } = {}): AdminStore & { dynamic: Set<string> } {
@@ -3983,5 +3987,1039 @@ describe("Dockerfile COPY ratchet: every server.ts local import is copied into t
     for (const filename of imports) {
       expect(copied).toContain(filename);
     }
+  });
+});
+
+// ---- #238: the panel shell (Rackbops theme, static assets, three tabs) --------------------------
+
+// The page's stylesheets are served from an exact-match Map (HandlerConfig.assets), built at startup
+// from STATIC_ASSET_FILES -- the request path is only ever a key, never a filesystem path.
+describe("static assets", () => {
+  const TOKEN = "test-token";
+  const THEME: StaticAsset = { body: "/* theme */", contentType: "text/css; charset=utf-8" };
+  const ADMIN: StaticAsset = { body: "/* admin */", contentType: "text/css; charset=utf-8" };
+  const assets = new Map<string, StaticAsset>([
+    ["/rb-theme.css", THEME],
+    ["/admin.css", ADMIN],
+  ]);
+  const cfg = (overrides: Partial<HandlerConfig> = {}): HandlerConfig => ({
+    adminToken: TOKEN,
+    indexHtml: "<html>admin panel</html>",
+    assets,
+    runBotOps: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    ...overrides,
+  });
+
+  test("serves /rb-theme.css as text/css", async () => {
+    const res = await handleRequest(new Request("http://x/rb-theme.css"), cfg());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/css");
+    expect(res.headers.get("Cache-Control")).toBe("no-cache");
+    expect(await res.text()).toBe(THEME.body);
+  });
+
+  test("serves /admin.css as text/css", async () => {
+    const res = await handleRequest(new Request("http://x/admin.css"), cfg());
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/css");
+    expect(await res.text()).toBe(ADMIN.body);
+  });
+
+  test("serves them without authentication, like the page", async () => {
+    // No Authorization header anywhere: the page has to load its own stylesheets before it can even
+    // show the token gate.
+    for (const path of ["/rb-theme.css", "/admin.css"]) {
+      expect((await handleRequest(new Request("http://x" + path), cfg())).status).toBe(200);
+    }
+  });
+
+  test("answers a non-GET with 404", async () => {
+    for (const method of ["POST", "PUT", "PATCH", "DELETE"]) {
+      for (const path of ["/rb-theme.css", "/admin.css"]) {
+        const res = await handleRequest(new Request("http://x" + path, { method, body: "x" }), cfg());
+        expect(res.status).toBe(404);
+      }
+    }
+  });
+
+  test("answers a percent-encoded spelling with 404", async () => {
+    // /%72b-theme.css is /rb-theme.css to anything that decodes before it looks up. It must miss: the
+    // lookup is an exact match on url.pathname, which the URL parser leaves percent-encoded (the same
+    // reason the admin-asset routes never decode a path they then trust; see CONTEXT.md's %-encoding
+    // gotcha). A percent-encoded dot SEGMENT, /%2e%2e/admin.css, is not listed: the URL parser itself
+    // resolves that to exactly /admin.css before the handler sees it, so it is the key itself.
+    for (const path of ["/%72b-theme.css", "/rb-theme%2ecss", "/%61dmin.css", "/admin%2Ecss", "/admin.css%00", "/admin.css%2f"]) {
+      const res = await handleRequest(new Request("http://x" + path), cfg());
+      expect(res.status).toBe(404);
+    }
+  });
+
+  test("answers a near-miss spelling (case, trailing slash, ;param, double slash) with 404", async () => {
+    // Exact means exact: nothing here folds case, strips a slash or a ;parameter, or collapses `//`.
+    for (const path of ["/ADMIN.CSS", "/Admin.css", "/RB-THEME.CSS", "/admin.css/", "/admin.css;x=1", "//admin.css", "/admin.css%20", "/%20admin.css", "/admin.css.map", "/admin.cs", "/rb-theme.css/x"]) {
+      const res = await handleRequest(new Request("http://x" + path), cfg());
+      expect({ path, status: res.status }).toEqual({ path, status: 404 });
+    }
+    // ... while a query string is not part of the path, so it still names the asset.
+    expect((await handleRequest(new Request("http://x/admin.css?v=2"), cfg())).status).toBe(200);
+  });
+
+  test("answers /constructor with 404", async () => {
+    // Object.prototype names: a lookup on a plain object (with the slash stripped) would find these
+    // and answer 200 with a function as the body.
+    for (const path of ["/constructor", "/__proto__", "/toString", "/hasOwnProperty", "/valueOf"]) {
+      const res = await handleRequest(new Request("http://x" + path), cfg());
+      expect(res.status).toBe(404);
+    }
+  });
+
+  test("leaves every existing route untouched", async () => {
+    const page = await handleRequest(new Request("http://x/"), cfg());
+    expect(page.status).toBe(200);
+    expect(await page.text()).toBe("<html>admin panel</html>");
+    expect((await handleRequest(new Request("http://x/index.html"), cfg())).status).toBe(200);
+    // Auth still gates the API, and an unknown path is still a plain 404.
+    expect((await handleRequest(new Request("http://x/api/status"), cfg())).status).toBe(401);
+    expect((await handleRequest(new Request("http://x/nope.css"), cfg())).status).toBe(404);
+    // No assets configured (an older HandlerConfig) -> the routes simply don't exist.
+    expect((await handleRequest(new Request("http://x/admin.css"), cfg({ assets: undefined }))).status).toBe(404);
+  });
+});
+
+// The boot-time half of the asset route. The import.meta.main block (which no test runs) only calls
+// loadStaticAssets and puts the result in the HandlerConfig, so the route -> file mapping and the
+// content type are pinned here against the real files, and the two call sites by source.
+describe("loadStaticAssets (the boot-time wiring of the static assets)", () => {
+  const readReal = async (file: string) => readFileSync(new URL(`./public/${file}`, import.meta.url), "utf8");
+
+  test("maps each route to its own file, as text/css", async () => {
+    const assets = await loadStaticAssets(readReal);
+    expect([...assets.keys()].sort()).toEqual(Object.keys(STATIC_ASSET_FILES).sort());
+    // Each route carries ITS file's bytes: a swapped STATIC_ASSET_FILES entry would put the theme
+    // under /admin.css and the panel's own CSS under /rb-theme.css.
+    const theme = assets.get("/rb-theme.css")!.body;
+    const admin = assets.get("/admin.css")!.body;
+    expect(theme).toContain("GENERATED by ops/admin/theme/build-theme.ts");
+    expect(theme).not.toContain(".adm {");
+    expect(admin).toContain(".adm {");
+    expect(admin).not.toContain("GENERATED by ops/admin/theme/build-theme.ts");
+    for (const asset of assets.values()) expect(asset.contentType).toBe("text/css; charset=utf-8");
+  });
+
+  test("reads each STATIC_ASSET_FILES entry by its file name under public/, once", async () => {
+    const read: string[] = [];
+    await loadStaticAssets(async (file) => (read.push(file), `body of ${file}`));
+    expect(read).toEqual(Object.values(STATIC_ASSET_FILES));
+  });
+
+  test("a stylesheet that can't be read rejects, so the boot fails instead of a live 404", async () => {
+    await expect(
+      loadStaticAssets(async (file) => {
+        if (file === "admin.css") throw new Error("ENOENT: admin.css");
+        return "";
+      }),
+    ).rejects.toThrow("ENOENT: admin.css");
+  });
+
+  test("the entry point calls it and puts the result in the HandlerConfig", () => {
+    const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+    expect(serverSrc).toContain("const assets = await loadStaticAssets((file) => Bun.file(new URL(`./public/${file}`, import.meta.url)).text());");
+    const config = (/const config: HandlerConfig = \{([^}]*)\};/.exec(serverSrc)?.[1] ?? "")
+      .replace(/\/\*[\s\S]*?\*\//g, "") // a commented-out `assets,` must not satisfy the pin
+      .replace(/\/\/[^\n]*/g, "");
+    // the bare shorthand `assets`, the variable the line above built -- not `assets: new Map()` or any
+    // other value that merely mentions the word
+    expect(config).toMatch(/(^|[\s,])assets\s*(,|$)/);
+  });
+});
+
+// The page is a template (index.html) plus two stylesheets. These read the real files: the page must
+// not link anything the server won't serve, and must not carry the styling that moved out of it.
+describe("the page's stylesheets", () => {
+  const html = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("every stylesheet the page links is served", () => {
+    const hrefs = [...html.matchAll(/<link\b[^>]*>/gi)]
+      .map((m) => m[0])
+      .filter((tag) => /\brel=["']?stylesheet\b/i.test(tag))
+      .map((tag) => /\bhref=["']([^"']+)["']/i.exec(tag)?.[1]);
+    expect(hrefs.length).toBeGreaterThanOrEqual(2); // can't pass vacuously
+    for (const href of hrefs) {
+      expect(href).toBeTruthy();
+      expect(Object.hasOwn(STATIC_ASSET_FILES, href!)).toBe(true);
+      expect(existsSync(new URL(`./public/${STATIC_ASSET_FILES[href!]}`, import.meta.url))).toBe(true);
+    }
+  });
+
+  test("the page has no inline style block", () => {
+    expect(/<style[\s>]/i.test(html)).toBe(false);
+  });
+
+  test("the page carries no legacy custom property", () => {
+    // The hand-rolled token block is gone; a straggling var(--muted) would render as nothing.
+    for (const name of ["bg", "panel", "border", "text", "muted", "accent", "danger", "ok", "inset", "chip", "btn2"]) {
+      expect(new RegExp(`var\\(\\s*--${name}\\s*[,)]`).test(html)).toBe(false); // var(--x)
+      expect(new RegExp(`(^|[\\s;{"'])--${name}\\s*:`).test(html)).toBe(false); // a declaration of --x
+    }
+  });
+
+  test("every class the page uses is styled by admin.css or the theme", () => {
+    // A typo'd or renamed class (rb-btn--dnager) would silently render unstyled. Collect every class
+    // token the markup, the script's className assignments, classList.toggle calls and the rb-*
+    // string literals name, and require each to appear as a `.class` selector in one of the sheets.
+    const sheets = (readFileSync(new URL("./public/admin.css", import.meta.url), "utf8") + readFileSync(new URL("./public/rb-theme.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, ""); // a class named only in a comment is not styled
+    const styled = new Set([...sheets.matchAll(/\.([A-Za-z_][\w-]*)/g)].map((m) => m[1]!));
+    const used = new Set<string>();
+    const add = (list: string | undefined) => {
+      for (const token of (list ?? "").split(/\s+/)) if (/^[A-Za-z][\w-]*$/.test(token)) used.add(token);
+    };
+    for (const m of html.matchAll(/\bclass="([^"]*)"/g)) add(m[1]);
+    for (const m of html.matchAll(/\bclassName = "([^"]*)"/g)) add(m[1]);
+    for (const m of html.matchAll(/classList\.toggle\("([^"]+)"/g)) add(m[1]);
+    for (const m of html.matchAll(/"(rb-[\w-]+)"/g)) add(m[1]);
+    expect(used.size).toBeGreaterThan(40); // can't pass vacuously
+    expect(used.has("rb-btn--danger") && used.has("rb-badge--success") && used.has("nowrap")).toBe(true);
+    const unstyled = [...used].filter((c) => !styled.has(c));
+    expect(unstyled).toEqual([]);
+  });
+});
+
+// rb-theme.css is GENERATED by ops/admin/theme/build-theme.ts from the pinned @rackbops/styles and
+// committed. Its first line names the version it came from; this fails when the pin moves without a
+// rebuild (or the file is hand-edited), with no need for node_modules (CI does not install the theme
+// package).
+describe("rb-theme.css", () => {
+  const themePkg = JSON.parse(readFileSync(new URL("./theme/package.json", import.meta.url), "utf8")) as {
+    devDependencies?: Record<string, string>;
+  };
+  const pin = themePkg.devDependencies?.["@rackbops/styles"] ?? "";
+  const css = readFileSync(new URL("./public/rb-theme.css", import.meta.url), "utf8");
+
+  test("is stamped with the version pinned in ops/admin/theme/package.json", () => {
+    const expectedBanner = composeThemeCss(pin, "", "").split("\n")[0];
+    expect(css.split("\n")[0]).toBe(expectedBanner);
+  });
+
+  test("the pin is an exact version", () => {
+    expect(pin).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  test("carries both themes", () => {
+    expect(css).toContain('[data-rb-style="arcane-obsidian"]');
+    expect(css).toContain('[data-rb-style="arcane-parchment"]');
+  });
+});
+
+// admin.css is the panel's own CSS and the theme is the only source of colour, type and shape: it is
+// written with --rb-* tokens, so a re-theme (or a light/dark switch) can never leave a stray literal.
+describe("admin.css uses tokens only", () => {
+  const css = readFileSync(new URL("./public/admin.css", import.meta.url), "utf8");
+  const themeCss = readFileSync(new URL("./public/rb-theme.css", import.meta.url), "utf8");
+
+  // A small CSS scanner: every `prop: value` declaration at ANY nesting depth (@media, native nesting),
+  // and every selector / at-rule prelude, with comments stripped and `;` `{` `}` inside parentheses
+  // or strings ignored. Selectors are never mistaken for declarations, so `#logs-filter` is not a hex
+  // colour.
+  function parseCss(source: string): { decls: { prop: string; value: string }[]; selectors: string[] } {
+    const decls: { prop: string; value: string }[] = [];
+    const selectors: string[] = [];
+    let buf = "";
+    let parens = 0;
+    let quote = "";
+    const flush = () => {
+      const i = buf.indexOf(":");
+      if (buf.trim() !== "" && i !== -1) decls.push({ prop: buf.slice(0, i).trim().toLowerCase(), value: buf.slice(i + 1).trim() });
+      buf = "";
+    };
+    for (const ch of source.replace(/\/\*[\s\S]*?\*\//g, "")) {
+      if (quote) {
+        buf += ch;
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === "(") parens++;
+      else if (ch === ")") parens--;
+      else if (parens === 0 && ch === "{") {
+        selectors.push(buf.trim());
+        buf = "";
+        continue;
+      } else if (parens === 0 && (ch === ";" || ch === "}")) {
+        flush();
+        continue;
+      }
+      buf += ch;
+    }
+    return { decls, selectors };
+  }
+  const { decls, selectors } = parseCss(css);
+
+  // What a colour-bearing declaration may contain besides var(...) tokens and numbers: line styles,
+  // the non-colour keywords, and color-mix()'s own words. Anything else -- a named colour (red,
+  // white, Canvas ...), a colour function, a hex value -- is a literal.
+  const COLOUR_PROPS = /^(color|background(-color|-image)?|border(-[a-z]+)*|outline(-color)?|box-shadow|text-shadow|fill|stroke|[a-z-]*-color|-webkit-text-fill-color|text-decoration(-color)?|column-rule(-color)?)$/;
+  const ALLOWED_WORDS = new Set(["solid", "dashed", "dotted", "none", "transparent", "currentcolor", "inherit", "initial", "unset", "important", "in", "srgb", "color-mix(", "calc("]);
+  // Every CSS named colour, and every system colour including the deprecated CSS2 ones -- except
+  // `background`, which doubles as a property name in `transition: background ...`. Checked in EVERY
+  // value of EVERY property (custom property names are stripped first, a var() fallback is not), so
+  // `filter: drop-shadow(0 0 1px red)` and `color: var(--rb-text, red)` are caught as well as
+  // `color: red`. (`tan(` etc. are functions: the scan keeps a trailing "(" on a word, so they never
+  // match a colour name.) A backslash anywhere in a value is rejected too, since a CSS escape can
+  // spell a colour word (`r\65 d`) past the word scan.
+  const NAMED_COLOURS = new Set(
+    ("aliceblue antiquewhite aqua aquamarine azure beige bisque black blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow yellowgreen " +
+      "canvas canvastext linktext visitedtext activetext buttonface buttontext buttonborder field fieldtext highlight highlighttext selecteditem selecteditemtext mark marktext graytext accentcolor accentcolortext " +
+      "activeborder activecaption appworkspace buttonhighlight buttonshadow captiontext inactiveborder inactivecaption inactivecaptiontext infobackground infotext menu menutext scrollbar threeddarkshadow threedface threedhighlight threedlightshadow threedshadow window windowframe windowtext").split(" "),
+  );
+  function colourViolation(prop: string, value: string): string | null {
+    if (value.includes("\\")) return "escape sequence";
+    if (/#[0-9a-f]{3,8}\b/i.test(value)) return "hex colour";
+    if (/\b(rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color|light-dark)\(/i.test(value)) return "colour function";
+    for (const m of value.replace(/--[\w-]+/g, " ").toLowerCase().matchAll(/[a-z-]+\(?/g)) {
+      if (NAMED_COLOURS.has(m[0])) return `named colour "${m[0]}"`;
+    }
+    if (!COLOUR_PROPS.test(prop)) return null;
+    const rest = value.replace(/var\([^)]*\)/g, " ").replace(/-?\d*\.?\d+(px|rem|em|%)?/g, " ");
+    for (const m of rest.toLowerCase().matchAll(/[a-z-]+\(?/g)) {
+      if (!ALLOWED_WORDS.has(m[0])) return `unexpected word "${m[0]}"`;
+    }
+    return null;
+  }
+
+  test("the declaration parser finds the sheet's declarations (can't pass vacuously)", () => {
+    expect(decls.length).toBeGreaterThan(100);
+    // ... including declarations inside a nested rule and an @media block, next to a parent's own.
+    const sample = parseCss(".a { color: #f00; & b { margin: 0 } border-radius: 6px } @media (max-width: 640px) { .c { font-family: Arial } }");
+    expect(sample.decls).toEqual([
+      { prop: "color", value: "#f00" },
+      { prop: "margin", value: "0" },
+      { prop: "border-radius", value: "6px" },
+      { prop: "font-family", value: "Arial" },
+    ]);
+  });
+
+  test("the colour check accepts tokens and rejects every literal spelling", () => {
+    for (const [prop, value] of [
+      ["color", "var(--rb-text)"],
+      ["border", "1px solid var(--rb-border)"],
+      ["border-left", "3px solid var(--rb-danger)"],
+      ["box-shadow", "0 0 0 3px var(--rb-accent-wash)"],
+      ["background", "color-mix(in srgb, var(--rb-danger) 16%, transparent)"],
+      ["border-color", "color-mix(in srgb, var(--rb-accent) 40%, var(--rb-border))"],
+      ["background", "none"],
+      ["outline", "none"],
+      ["display", "flex"],
+      ["text-transform", "none"],
+      ["grid-template-columns", "auto 1fr"],
+    ] as const) {
+      expect({ prop, value, violation: colourViolation(prop, value) }).toEqual({ prop, value, violation: null });
+    }
+    for (const [prop, value] of [
+      ["color", "red"],
+      ["background", "white"],
+      ["color", "Canvas"],
+      ["border", "1px solid black"],
+      ["background", "color-mix(in srgb, red, blue)"],
+      ["color", "color(display-p3 1 0 0)"],
+      ["color", "#fff"],
+      ["fill", "rgb(0 0 0)"],
+      ["filter", "drop-shadow(0 0 1px #000)"],
+      // named colours on properties outside the usual colour set, and inside a var() fallback
+      ["background-image", "linear-gradient(red, blue)"],
+      ["filter", "drop-shadow(0 0 1px red)"],
+      ["scrollbar-color", "red blue"],
+      ["-webkit-text-fill-color", "red"],
+      ["text-emphasis-color", "red"],
+      ["stop-color", "red"],
+      ["mask-image", "linear-gradient(red, blue)"],
+      ["-webkit-tap-highlight-color", "red"],
+      ["color", "var(--rb-text, red)"],
+      ["border-top-color", "hotpink"],
+      // deprecated system colours on non-colour properties, and a colour spelled with a CSS escape
+      ["filter", "drop-shadow(0 0 1px WindowText)"],
+      ["mask-image", "linear-gradient(ThreeDFace, ThreeDShadow)"],
+      ["color", "var(--rb-text, r\\65 d)"],
+    ] as const) {
+      expect({ prop, value, rejected: colourViolation(prop, value) !== null }).toEqual({ prop, value, rejected: true });
+    }
+  });
+
+  test("has no colour literal", () => {
+    for (const { prop, value } of decls) {
+      expect({ prop, value, violation: colourViolation(prop, value) }).toEqual({ prop, value, violation: null });
+    }
+  });
+
+  test("every font-family is a token", () => {
+    const families = decls.filter((d) => d.prop === "font-family");
+    expect(families.length).toBeGreaterThan(0);
+    for (const { value } of families) {
+      expect(value).toMatch(/^(var\(--rb-font-(body|mono|display)\)|inherit)$/);
+    }
+    // The `font` shorthand can smuggle a family in past the check above.
+    expect(decls.filter((d) => d.prop === "font")).toEqual([]);
+  });
+
+  test("every border-radius is a token, 50% or 0", () => {
+    const radii = decls.filter((d) => /^border(-[a-z]+)*-radius$/.test(d.prop));
+    expect(radii.length).toBeGreaterThan(0);
+    for (const { prop, value } of radii) {
+      for (const part of value.split(/\s+/)) {
+        expect({ prop, part, ok: /^(var\(--rb-radius(-lg|-pill)?\)|50%|0)$/.test(part) }).toEqual({ prop, part, ok: true });
+      }
+    }
+  });
+
+  test("restates the [hidden] rule, which an author display rule would otherwise beat", () => {
+    // .adm / .adm-panel / .rb-alert all set `display`, and an author `display` beats the browser's own
+    // [hidden] { display: none } -- without this the hidden app (behind the token gate), the hidden
+    // tab panels and the drift banner would all show at once. (The gate itself has no display rule.)
+    const hidden = /(^|\})\s*\[hidden\]\s*\{([^{}]*)\}/.exec(css.replace(/\/\*[\s\S]*?\*\//g, ""));
+    expect(hidden?.[2]).toMatch(/display:\s*none\s*!important/);
+  });
+
+  test("the small state text and the touch targets keep the accessible choices (WCAG AA text, 24px / 44px targets)", () => {
+    const bare = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = (selector: string) => new RegExp(`(^|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^{}]*)\\}`).exec(bare)?.[2] ?? "";
+    // The light theme's success / warning / info text on their own 16% tint is 2.9 / 2.85 / 4.0 : 1, so
+    // a badge's words are body text; the semantic modifier only tints the pill.
+    expect(rule(".plugin-badge")).toMatch(/color:\s*var\(--rb-text\);/);
+    // The instance badge (the wrong-instance guard) does the same: accent text on its accent wash is 4.4 : 1.
+    expect(rule(".instance-badge")).toMatch(/color:\s*var\(--rb-text\);/);
+    // The small danger button sits in this box, and danger red on the sunken well is 4.24 : 1.
+    expect(rule(".plugin-update")).toMatch(/background:\s*var\(--rb-surface\);/);
+    // A chip's remove button is never smaller than 24 x 24 CSS px, and on a phone a plugin bundle's own
+    // buttons and the panel's are 44px tall.
+    expect(rule(".tag-field .tag button")).toMatch(/min-width:\s*1\.5rem;[\s\S]*min-height:\s*1\.5rem;/);
+    const phone = /@media \(max-width: 640px\) \{([\s\S]*)\}\s*$/.exec(bare)?.[1] ?? "";
+    expect(phone).toMatch(/:where\(\.plugin-admin-tab button\)\s*\{\s*min-height:\s*44px;/);
+    expect(phone).toMatch(/\.adm \.rb-btn[\s\S]*min-height:\s*44px;/);
+  });
+
+  test("the rules for a plugin's own bare controls sit wholly inside :where(), so a bundle's styling wins", () => {
+    // A published plugin bundle builds bare label / input / select / textarea / button elements, so
+    // admin.css styles them by tag name under .plugin-admin-tab. Every such selector must be ONE
+    // :where(...) group -- zero specificity -- or it would beat a rule the bundle brings itself.
+    const topLevelParts = (sel: string) => {
+      const parts: string[] = [];
+      let depth = 0;
+      let start = 0;
+      for (let i = 0; i < sel.length; i++) {
+        if (sel[i] === "(") depth++;
+        else if (sel[i] === ")") depth--;
+        else if (sel[i] === "," && depth === 0) {
+          parts.push(sel.slice(start, i).trim());
+          start = i + 1;
+        }
+      }
+      parts.push(sel.slice(start).trim());
+      return parts;
+    };
+    const wholly = (part: string) => {
+      if (!part.startsWith(":where(")) return false;
+      let depth = 0;
+      for (let i = 0; i < part.length; i++) {
+        if (part[i] === "(") depth++;
+        else if (part[i] === ")" && --depth === 0) return i === part.length - 1;
+      }
+      return false;
+    };
+    const bare = selectors.flatMap(topLevelParts).filter((p) => p.includes(".plugin-admin-tab") && /\b(label|input|select|textarea|button)\b/.test(p));
+    expect(bare.length).toBeGreaterThanOrEqual(5);
+    for (const part of bare) expect({ part, wholly: wholly(part) }).toEqual({ part, wholly: true });
+    // the checker itself can tell the difference
+    expect(wholly(".plugin-admin-tab :where(label)")).toBe(false);
+    expect(wholly(":where(.plugin-admin-tab label):focus-visible")).toBe(false);
+    expect(wholly(":where(.plugin-admin-tab label)")).toBe(true);
+  });
+
+  test("only references --rb-* tokens the theme defines, and defines none of its own", () => {
+    const defined = new Set([...themeCss.matchAll(/(--rb-[a-z0-9-]+)\s*:/g)].map((m) => m[1]));
+    const used = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/var\(\s*(--[a-z0-9-]+)/gi)].map((m) => m[1]!);
+    expect(used.length).toBeGreaterThan(20);
+    for (const name of used) expect({ name, defined: defined.has(name) }).toEqual({ name, defined: true });
+    expect(decls.filter((d) => d.prop.startsWith("--"))).toEqual([]);
+  });
+});
+
+// The page follows the viewer's colour scheme with no toggle: an inline script in <head>, ahead of the
+// stylesheets, sets data-rb-style on <html>. Evaluated here against a stubbed window/document.
+describe("colour scheme (the inline head script)", () => {
+  const html = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const head = html.slice(0, html.indexOf("</head>"));
+  const src = /<script>\n([\s\S]*?)\n<\/script>/.exec(head)?.[1] ?? "";
+
+  test("the page is dark by default for a viewer with no script", () => {
+    expect(html).toContain('<html lang="en" data-rb-style="arcane-obsidian">');
+  });
+
+  test("the script sits ahead of the stylesheets, so first paint is already the right scheme", () => {
+    expect(src).not.toBe("");
+    expect(head.indexOf("<script>")).toBeGreaterThan(-1);
+    expect(head.indexOf("<script>")).toBeLessThan(head.indexOf('rel="stylesheet"'));
+  });
+
+  function run(dark: boolean) {
+    const listeners: [string, () => void][] = [];
+    const queries: string[] = [];
+    const mq = { matches: dark, addEventListener: (type: string, fn: () => void) => void listeners.push([type, fn]) };
+    const root = { dataset: {} as Record<string, string> };
+    new Function("window", "document", `"use strict";\n${src}`)(
+      { matchMedia: (q: string) => (queries.push(q), mq) },
+      { documentElement: root },
+    );
+    return { root, mq, listeners, queries };
+  }
+
+  test("dark preference -> arcane-obsidian, light -> arcane-parchment", () => {
+    const d = run(true);
+    expect(d.queries).toEqual(["(prefers-color-scheme: dark)"]);
+    expect(d.root.dataset.rbStyle).toBe("arcane-obsidian");
+    expect(run(false).root.dataset.rbStyle).toBe("arcane-parchment");
+  });
+
+  test("follows a later change of the OS setting", () => {
+    const p = run(true);
+    const change = p.listeners.find(([type]) => type === "change")?.[1];
+    expect(change).toBeTruthy();
+    p.mq.matches = false;
+    change!();
+    expect(p.root.dataset.rbStyle).toBe("arcane-parchment");
+    p.mq.matches = true;
+    change!();
+    expect(p.root.dataset.rbStyle).toBe("arcane-obsidian");
+  });
+});
+
+// The tab decisions are lifted from index.html between their TABS markers (the same lift the other
+// pure page helpers use), so the page's own source is what's pinned -- not a copy of it.
+describe("tabs (lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const tabsSrc = indexSrc.match(/\/\/ TABS:begin\n([\s\S]*?)\n\s*\/\/ TABS:end/)?.[1];
+
+  test("the marked block is present", () => {
+    expect(tabsSrc).toBeTruthy();
+  });
+
+  const { tabFromHash, nextTabId } = new Function(`"use strict";\n${tabsSrc ?? ""}\nreturn { tabFromHash, nextTabId };`)() as {
+    tabFromHash: (hash: unknown) => string;
+    nextTabId: (current: string, key: string) => string;
+  };
+
+  test("an unknown or empty hash opens Overview", () => {
+    // Mutation: returning the raw hash makes "#nope" open a tab that doesn't exist.
+    for (const hash of ["", "#", "#nope", "#PLUGINS", "#constructor", "#__proto__", "#toString", undefined, null]) {
+      expect(tabFromHash(hash)).toBe("overview");
+    }
+  });
+
+  test("a known hash opens its tab", () => {
+    expect(tabFromHash("#overview")).toBe("overview");
+    expect(tabFromHash("#plugins")).toBe("plugins");
+    expect(tabFromHash("#settings")).toBe("settings");
+    expect(tabFromHash("plugins")).toBe("plugins"); // location.hash always has the '#', but the parse shouldn't need it
+  });
+
+  test("arrow keys wrap in both directions", () => {
+    expect(nextTabId("overview", "ArrowRight")).toBe("plugins");
+    expect(nextTabId("plugins", "ArrowRight")).toBe("settings");
+    expect(nextTabId("settings", "ArrowRight")).toBe("overview");
+    expect(nextTabId("settings", "ArrowLeft")).toBe("plugins");
+    expect(nextTabId("plugins", "ArrowLeft")).toBe("overview");
+    expect(nextTabId("overview", "ArrowLeft")).toBe("settings");
+  });
+
+  test("Home and End jump to the ends", () => {
+    for (const from of ["overview", "plugins", "settings"]) {
+      expect(nextTabId(from, "Home")).toBe("overview");
+      expect(nextTabId(from, "End")).toBe("settings");
+    }
+  });
+
+  test("any other key stays put", () => {
+    for (const key of ["Enter", " ", "Tab", "ArrowUp", "ArrowDown", "a", "PageDown", "Escape"]) {
+      expect(nextTabId("plugins", key)).toBe("plugins");
+    }
+  });
+});
+
+// The markup half of the tabs, and the guarantee that moving seven stacked sections under three tabs
+// lost nothing. Parsed from the real index.html (the page markup only -- not the script below it).
+describe("page skeleton", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const bodyStart = indexSrc.indexOf("<body>");
+  const markup = indexSrc
+    .slice(bodyStart, indexSrc.indexOf("<script>", bodyStart))
+    .replace(/<!--[\s\S]*?-->/g, "");
+
+  function attrs(tagSource: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const m of tagSource.matchAll(/([\w-]+)="([^"]*)"/g)) out[m[1]!] = m[2]!;
+    return out;
+  }
+  const tabs = [...markup.matchAll(/<button\b[^>]*\brole="tab"[^>]*>/g)].map((m) => attrs(m[0]));
+  const panels = [...markup.matchAll(/<div\b[^>]*\brole="tabpanel"[^>]*>/g)].map((m) => attrs(m[0]));
+
+  test("every tab controls an existing tabpanel", () => {
+    expect(tabs.length).toBe(3);
+    expect(panels.length).toBe(3);
+    for (const tab of tabs) {
+      const panel = panels.find((p) => p.id === tab["aria-controls"]);
+      expect({ tab: tab.id, panel: panel?.id }).toEqual({ tab: tab.id, panel: tab["aria-controls"] });
+      expect(panel!["aria-labelledby"]).toBe(tab.id);
+    }
+  });
+
+  // Container tags only, walked with a stack, so "inside a tabpanel" means genuinely nested in one.
+  // Maps every id found inside a tabpanel to the id of the panel that holds it.
+  function panelOfIds(): Map<string, string> {
+    const out = new Map<string, string>();
+    const stack: { tag: string; panel: string | null }[] = [];
+    for (const m of markup.matchAll(/<(\/?)(div|section|main|nav)\b([^>]*)>/g)) {
+      if (m[1] === "/") {
+        stack.pop();
+        continue;
+      }
+      const a = attrs(m[3]!);
+      const panel = a.role === "tabpanel" ? (a.id ?? null) : (stack.findLast((s) => s.panel !== null)?.panel ?? null);
+      stack.push({ tag: m[2]!, panel });
+      if (a.id && panel && !out.has(a.id)) out.set(a.id, panel);
+    }
+    return out;
+  }
+
+  test("every original section id still exists exactly once, inside a tabpanel", () => {
+    const inPanels = panelOfIds();
+    for (const id of ["status-section", "plugins-section", "plugin-admin-section", "admins-section", "identity-section"]) {
+      expect({ id, total: markup.split(`id="${id}"`).length - 1 }).toEqual({ id, total: 1 });
+      expect({ id, inPanel: Boolean(inPanels.get(id)) }).toEqual({ id, inPanel: true });
+    }
+  });
+
+  test("each section sits under the tab the issue names", () => {
+    // Overview: status, restart, logs. Plugins: the plugin list and plugin settings. Settings:
+    // config, admins, identity. (Logs and Config had no id before #238; they got one so this can say so.)
+    const inPanels = panelOfIds();
+    const expected: Record<string, string> = {
+      "status-section": "panel-overview",
+      "logs-section": "panel-overview",
+      "plugins-section": "panel-plugins",
+      "plugin-admin-section": "panel-plugins",
+      "config-section": "panel-settings",
+      "admins-section": "panel-settings",
+      "identity-section": "panel-settings",
+    };
+    for (const [id, panel] of Object.entries(expected)) {
+      expect({ id, total: markup.split(`id="${id}"`).length - 1 }).toEqual({ id, total: 1 });
+      expect({ id, panel: inPanels.get(id) }).toEqual({ id, panel });
+    }
+  });
+
+  test("the token gate and the out-of-date banner stay outside every tabpanel, and the banner above the tabs", () => {
+    const inPanels = panelOfIds();
+    expect(markup).toContain('id="gate"');
+    expect(markup).toContain('id="bot-ops-outdated-banner"');
+    expect(inPanels.has("gate")).toBe(false);
+    expect(inPanels.has("bot-ops-outdated-banner")).toBe(false);
+    expect(markup.indexOf('id="bot-ops-outdated-banner"')).toBeLessThan(markup.indexOf('role="tablist"'));
+  });
+
+  test("the decorative wordmark spark is hidden from the accessibility tree", () => {
+    // Otherwise the page's <h1> is announced as "◆bot admin".
+    const sparks = markup.split('class="rb-wordmark__spark"').length - 1;
+    expect(sparks).toBe(2); // the gate's and the app's
+    expect(markup.split('class="rb-wordmark__spark" aria-hidden="true"').length - 1).toBe(sparks);
+  });
+
+  test("the page has exactly one tablist, holding the three tabs, and the script's lookup of it matches", () => {
+    expect(markup.split('role="tablist"').length - 1).toBe(1);
+    const list = markup.slice(markup.indexOf('role="tablist"'));
+    const listEnd = list.indexOf("</nav>");
+    const inside = [...list.slice(0, listEnd).matchAll(/\brole="tab"/g)].length;
+    expect(inside).toBe(3);
+    expect(indexSrc).toContain(`document.querySelector('[role="tablist"]')`);
+  });
+
+  test("every element id the page script looks up by literal exists in the markup", () => {
+    // A control the script wires (Lock, Restart, Save ...) or a section it fills that lost its id in
+    // a re-organisation would otherwise throw at load (or silently do nothing) while every test of a
+    // lifted block stays green.
+    const script = indexSrc.slice(indexSrc.indexOf("<script>", bodyStart));
+    const looked = new Set([...script.matchAll(/getElementById\("([^"]+)"\)/g)].map((m) => m[1]!));
+    expect(looked.size).toBeGreaterThan(25); // can't pass vacuously
+    for (const id of ["lock", "restart", "unlock", "save-env", "save-plugins", "logs-out", "status-grid"]) expect(looked.has(id)).toBe(true);
+    const missing = [...looked].filter((id) => markup.split(`id="${id}"`).length - 1 !== 1);
+    expect(missing).toEqual([]);
+  });
+
+  test("the controls carry the design-system classes the restyle gave them", () => {
+    // Presentation only (no behaviour rides on these), but a control that silently loses `rb-btn` or
+    // gets the wrong variant renders unstyled or with the wrong emphasis while every other test stays
+    // green. Each entry is a fragment of the page and how many times it must appear.
+    const expected: [string, number][] = [
+      // static markup
+      ['<button id="unlock" class="rb-btn rb-btn--primary">', 1],
+      ['<input id="token-input" class="rb-input"', 1],
+      ['<button id="lock" class="rb-btn rb-btn--ghost">', 1],
+      ['<button id="restart" class="rb-btn rb-btn--danger">', 1],
+      ['<button id="refresh-status" class="rb-btn">', 1],
+      ['<button id="load-logs" class="rb-btn">', 1],
+      ['<input id="logs-n" class="rb-input"', 1],
+      ['<input id="logs-filter" class="rb-input"', 1],
+      ['id="logs-wrap" class="rb-checkbox"', 1],
+      ['<pre id="logs-out" class="rb-pre rb-log"', 1],
+      ['<button id="save-env" class="rb-btn rb-btn--primary">', 1],
+      ['<button id="save-plugins" class="rb-btn rb-btn--primary">', 1],
+      ['<button id="add-admin" class="rb-btn rb-btn--primary">', 1],
+      ['<input id="admin-email" class="rb-input"', 1],
+      ['<div id="env-fields" class="adm-fields">', 1],
+      ['class="banner-warn rb-alert rb-alert--danger"', 1],
+      ['class="rb-tabstrip" role="tablist"', 1],
+      ['class="rb-tabpanel adm-panel"', 3],
+      ['class="rb-card"', 7], // seven sections (five carry their old id, Logs and Config their new one)
+      ['class="rb-tabstrip__tab', 3], // the three tab buttons
+      ['<main id="app" class="adm" hidden>', 1],
+      ['class="adm-gate"', 1],
+      ['class="rb-wordmark"', 2], // the gate's h1 and the app's
+      ['class="instance-badge rb-badge rb-badge--md"', 2],
+      ['<label class="inline-check rb-label">', 1], // the Wrap toggle
+      ['class="status-grid"', 2], // status and identity
+      ['class="msg"', 4], // restart, config, plugins, admins
+      // built by the page script
+      ['btn.className = "rb-btn rb-btn--danger rb-btn--sm";', 1], // Remove admin
+      ['check.className = "rb-checkbox";', 1], // a plugin's tick box
+      ['now.className = "rb-btn rb-btn--primary rb-btn--sm";', 1], // Update now
+      ['when.className = "rb-input";', 1], // the schedule picker
+      ['schedBtn.className = "rb-btn rb-btn--sm";', 1],
+      ['remind.className = "rb-btn rb-btn--sm";', 1],
+      ['skip.className = "rb-btn rb-btn--sm";', 1],
+      ['cancel.className = "rb-btn rb-btn--danger rb-btn--sm";', 1],
+      ['add.className = "tag-add rb-input";', 1], // the chip editor's typing field
+      ['label.className = "rb-label";', 1], // a config field's label
+      ['control.className = "rb-select";', 2], // an enum select and the branch chooser
+      ['control.className = "rb-input";', 1], // a plain config field
+      ['notice.className = "field-hint field-hint--danger";', 1],
+      ['row.className = "plugin-row";', 1],
+      ['row.className = "admin-row";', 1],
+      ['wrapper.className = "tag-field";', 1],
+      ['sched.className = "sched";', 1],
+      ['actions.className = "plugin-actions";', 1],
+      ['wrap.className = "plugin-update";', 1],
+      ['wrap.className = "plugin-admin-tab";', 1],
+    ];
+    for (const [fragment, count] of expected) {
+      expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
+    }
+  });
+
+  test("every lifted block is still present", () => {
+    // The thirteen blocks server.test.ts lifted out of the page before #238, plus the four it added
+    // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES). A rename or a deleted marker would otherwise
+    // leave a lifted `new Function` evaluating an empty string.
+    const names = [
+      "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_BADGES", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
+      "PLUGINS_SAVE", "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
+      "ENV_SAVE", "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
+    ];
+    expect(names.length).toBe(17);
+    for (const name of names) {
+      expect({ name, begin: indexSrc.split(`// ${name}:begin\n`).length - 1 }).toEqual({ name, begin: 1 });
+      expect({ name, end: indexSrc.split(`// ${name}:end\n`).length - 1 }).toEqual({ name, end: 1 });
+    }
+  });
+});
+
+// The DOM half of the tabs (showTab + the click / keydown / hashchange wiring), lifted from index.html
+// between TABS_DOM markers together with the pure TABS block, and run against a hand-made page:
+// three tab buttons, three panels, and spies for history.replaceState and the listeners.
+describe("tabs DOM wiring (lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const tabsSrc = indexSrc.match(/\/\/ TABS:begin\n([\s\S]*?)\n\s*\/\/ TABS:end/)?.[1];
+  const domSrc = indexSrc.match(/\/\/ TABS_DOM:begin\n([\s\S]*?)\n\s*\/\/ TABS_DOM:end/)?.[1];
+
+  test("the marked blocks are present", () => {
+    expect(tabsSrc).toBeTruthy();
+    expect(domSrc).toBeTruthy();
+  });
+
+  type Tab = {
+    id: string;
+    attrs: Record<string, string>;
+    tabIndex: number;
+    classes: Set<string>;
+    focused: number;
+    setAttribute(k: string, v: string): void;
+    classList: { toggle(c: string, on: boolean): void };
+    focus(): void;
+    closest(sel: string): Tab | null;
+  };
+  type KeyEvent = { key: string; altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; target: Tab; prevented: boolean; preventDefault(): void };
+
+  function page(hash = "") {
+    const ids = ["overview", "plugins", "settings"];
+    const tabs: Tab[] = ids.map((id) => {
+      const el: Tab = {
+        id: `tab-${id}`,
+        attrs: {},
+        tabIndex: 0,
+        classes: new Set(),
+        focused: 0,
+        setAttribute(k, v) {
+          el.attrs[k] = v;
+        },
+        classList: {
+          toggle(c, on) {
+            if (on) el.classes.add(c);
+            else el.classes.delete(c);
+          },
+        },
+        focus() {
+          el.focused += 1;
+        },
+        closest: (sel) => (sel === '[role="tab"]' ? el : null),
+      };
+      return el;
+    });
+    const panels = ids.map((id) => ({ id: `panel-${id}`, hidden: id !== "overview" }));
+    const handlers: Record<string, (e?: unknown) => void> = {};
+    const tablist = { addEventListener: (type: string, fn: (e?: unknown) => void) => void (handlers[type] = fn) };
+    const win = { addEventListener: (type: string, fn: (e?: unknown) => void) => void (handlers[`window:${type}`] = fn) };
+    const loc = { hash };
+    const replaced: unknown[][] = [];
+    // showTab must find the shell's tabs and panels by their own ids: a role query would also catch
+    // ARIA tabs a plugin's settings bundle builds elsewhere in the page.
+    const doc = {
+      getElementById: (id: string) => tabs.find((t) => t.id === id) ?? panels.find((x) => x.id === id) ?? null,
+      querySelectorAll: () => {
+        throw new Error("showTab must look tabs and panels up by id, not by role");
+      },
+    };
+    const hist = {
+      replaceState: (...args: unknown[]) => {
+        replaced.push(args);
+        loc.hash = String(args[2]);
+      },
+    };
+    const shownCalls: string[] = [];
+    // Which panels were hidden at the moment afterTabShown ran: it must run AFTER the panels are
+    // updated, or a deferred scroll would still see the old (hidden) layout.
+    const hiddenAtCall: boolean[][] = [];
+    const api = new Function(
+      "document",
+      "history",
+      "window",
+      "location",
+      "afterTabShown",
+      `"use strict";\n${tabsSrc ?? ""}\n${domSrc ?? ""}\nreturn { showTab, wireTabs };`,
+    )(doc, hist, win, loc, (id: string) => {
+      shownCalls.push(id);
+      hiddenAtCall.push(panels.map((x) => x.hidden));
+    }) as { showTab: (id: string, moveFocus: boolean) => void; wireTabs: (tablist: unknown) => void };
+    api.wireTabs(tablist);
+    const key = (tab: Tab, k: string, mods: Partial<Pick<KeyEvent, "altKey" | "ctrlKey" | "metaKey" | "shiftKey">> = {}): KeyEvent => {
+      const e: KeyEvent = {
+        key: k, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false, ...mods, target: tab, prevented: false,
+        preventDefault() {
+          e.prevented = true;
+        },
+      };
+      handlers.keydown!(e);
+      return e;
+    };
+    const open = () => tabs.filter((t) => t.attrs["aria-selected"] === "true").map((t) => t.id);
+    const shown = () => panels.filter((p) => !p.hidden).map((p) => p.id);
+    return { api, tabs, panels, handlers, replaced, loc, key, open, shown, shownCalls, hiddenAtCall };
+  }
+
+  test("showTab opens exactly one tab and one panel, and writes the hash with replaceState", () => {
+    const p = page();
+    p.api.showTab("plugins", false);
+    expect(p.tabs.map((t) => t.attrs["aria-selected"])).toEqual(["false", "true", "false"]);
+    expect(p.tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1]); // roving tabindex
+    expect(p.tabs.map((t) => t.classes.has("rb-tabstrip__tab--active"))).toEqual([false, true, false]);
+    expect(p.panels.map((x) => x.hidden)).toEqual([true, false, true]);
+    // replaceState (no scroll, no history entry), with the bare hash as the URL.
+    expect(p.replaced).toEqual([[null, "", "#plugins"]]);
+  });
+
+  test("showTab tells afterTabShown which tab just opened", () => {
+    const p = page();
+    p.api.showTab("plugins", false);
+    p.api.showTab("overview", false);
+    expect(p.shownCalls).toEqual(["plugins", "overview"]);
+    // ... and only once the target panel is shown and the others hidden (overview, plugins, settings).
+    expect(p.hiddenAtCall).toEqual([
+      [true, false, true],
+      [false, true, true],
+    ]);
+  });
+
+  test("showTab moves focus only when asked", () => {
+    const p = page();
+    p.api.showTab("settings", true);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+    p.api.showTab("plugins", false);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+  });
+
+  test("a click on a tab opens it, without moving focus", () => {
+    const p = page();
+    p.handlers.click!({ target: p.tabs[1] });
+    expect(p.open()).toEqual(["tab-plugins"]);
+    expect(p.shown()).toEqual(["panel-plugins"]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0]);
+    // A click that isn't on a tab (target.closest -> null) does nothing.
+    p.handlers.click!({ target: { closest: () => null } });
+    expect(p.open()).toEqual(["tab-plugins"]);
+  });
+
+  test("arrow keys, Home and End open the target tab, focus it, and prevent the default", () => {
+    const p = page();
+    expect(p.key(p.tabs[0]!, "ArrowRight").prevented).toBe(true);
+    expect(p.open()).toEqual(["tab-plugins"]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 1, 0]);
+    p.key(p.tabs[1]!, "End");
+    expect(p.open()).toEqual(["tab-settings"]);
+    p.key(p.tabs[2]!, "ArrowRight"); // wraps
+    expect(p.open()).toEqual(["tab-overview"]);
+    p.key(p.tabs[0]!, "ArrowLeft"); // wraps back
+    expect(p.open()).toEqual(["tab-settings"]);
+    p.key(p.tabs[2]!, "Home");
+    expect(p.open()).toEqual(["tab-overview"]);
+    expect(p.replaced.map((r) => r[2])).toEqual(["#plugins", "#settings", "#overview", "#settings", "#overview"]);
+  });
+
+  test("Home on the first tab still prevents the page scroll", () => {
+    const p = page();
+    expect(p.key(p.tabs[0]!, "Home").prevented).toBe(true);
+    expect(p.open()).toEqual(["tab-overview"]);
+  });
+
+  test("other keys and modified keys do nothing and are left to the browser", () => {
+    const p = page();
+    for (const k of ["Enter", " ", "Tab", "ArrowUp", "ArrowDown", "a"]) {
+      expect(p.key(p.tabs[0]!, k).prevented).toBe(false);
+    }
+    // Alt+Left is the browser's Back; Ctrl/Meta/Shift + arrows are not ours either.
+    for (const mods of [{ altKey: true }, { ctrlKey: true }, { metaKey: true }, { shiftKey: true }]) {
+      expect(p.key(p.tabs[0]!, "ArrowRight", mods).prevented).toBe(false);
+    }
+    expect(p.open()).toEqual([]); // nothing was ever opened
+    expect(p.replaced).toEqual([]);
+  });
+
+  test("a hashchange opens the tab the hash names, or Overview for an unknown one", () => {
+    const p = page();
+    p.loc.hash = "#settings";
+    p.handlers["window:hashchange"]!();
+    expect(p.open()).toEqual(["tab-settings"]);
+    p.loc.hash = "#bogus";
+    p.handlers["window:hashchange"]!();
+    expect(p.open()).toEqual(["tab-overview"]);
+  });
+
+  test("showApp opens the tab named by the hash once the loaders have started", () => {
+    // showApp itself is not lifted (it starts every loader), so pin its source: the call is there,
+    // last, and reads location.hash -- that is what makes a reload land on the open tab.
+    const showApp = indexSrc.match(/function showApp\(\) \{\n([\s\S]*?)\n  \}\n/)?.[1] ?? "";
+    expect(showApp).toContain("loadAdmins();");
+    expect(showApp.trimEnd().endsWith("showTab(tabFromHash(location.hash), false);")).toBe(true);
+  });
+
+  test("the page script wires the tablist at load, and a missing tablist can only cost the tabs", () => {
+    // wireTabs is lifted and exercised above, but nothing there calls it the way the page does. The
+    // call runs before the boot code, so an unguarded null would blank the page including the token
+    // gate: it is guarded, and the markup is pinned to carry exactly one tablist.
+    expect(indexSrc).toContain(`const tablist = document.querySelector('[role="tablist"]');\n  if (tablist) wireTabs(tablist);`);
+  });
+});
+
+// "Load" jumps the log block to its newest line, but the block lives in the Overview tab and scrollTop
+// does nothing on an element that isn't laid out: a load that finishes while another tab is open must
+// wait for Overview to be shown again (showTab -> afterTabShown), not be silently lost.
+describe("log scroll deferral (lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.match(/\/\/ LOGS_SCROLL:begin\n([\s\S]*?)\n\s*\/\/ LOGS_SCROLL:end/)?.[1];
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+  });
+
+  function page(laidOut: boolean) {
+    // For a statically positioned element like #logs-out, offsetParent is null when the element or
+    // an ancestor is display:none (a position:fixed element also has a null offsetParent, but the log
+    // block never is one).
+    const out = { offsetParent: laidOut ? {} : null, scrollTop: 0, scrollHeight: 500 };
+    const api = new Function(
+      "document",
+      `"use strict";\n${src ?? ""}\nreturn { scrollLogsToBottom, afterTabShown };`,
+    )({ getElementById: (id: string) => (id === "logs-out" ? out : null) }) as {
+      scrollLogsToBottom: () => void;
+      afterTabShown: (id: string) => void;
+    };
+    return { out, ...api };
+  }
+
+  test("a visible log block jumps straight to the newest line", () => {
+    const p = page(true);
+    p.scrollLogsToBottom();
+    expect(p.out.scrollTop).toBe(500);
+  });
+
+  test("a load that finishes while Overview is hidden scrolls once Overview is shown", () => {
+    const p = page(false);
+    p.scrollLogsToBottom(); // the response arrived on another tab
+    expect(p.out.scrollTop).toBe(0); // nothing to scroll: the block isn't laid out
+    p.afterTabShown("plugins"); // still not Overview: keep waiting
+    p.afterTabShown("settings");
+    expect(p.out.scrollTop).toBe(0);
+    p.out.offsetParent = {}; // Overview is now visible
+    p.afterTabShown("overview");
+    expect(p.out.scrollTop).toBe(500);
+  });
+
+  test("opening Overview with nothing pending leaves the log where the admin scrolled it", () => {
+    const p = page(true);
+    p.out.scrollTop = 42;
+    p.afterTabShown("overview");
+    expect(p.out.scrollTop).toBe(42);
+    // ... and a pending jump is consumed once: a later Overview visit doesn't scroll again.
+    const q = page(false);
+    q.scrollLogsToBottom();
+    q.out.offsetParent = {};
+    q.afterTabShown("overview");
+    q.out.scrollTop = 7;
+    q.afterTabShown("overview");
+    expect(q.out.scrollTop).toBe(7);
+  });
+});
+
+// makeBadge maps a badge DECISION's kind onto the library's semantic modifier; the decisions
+// themselves (pluginStateBadge / pluginUpdateBadge) are pinned elsewhere in this file.
+describe("plugin badge classes (lifted from index.html)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.match(/\/\/ PLUGIN_BADGE_CLASSES:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_BADGE_CLASSES:end/)?.[1];
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+  });
+
+  const makeBadge = new Function(
+    "document",
+    `"use strict";\n${src ?? ""}\nreturn makeBadge;`,
+  )({ createElement: () => ({ className: "", textContent: "" }) }) as (
+    text: string,
+    kind: string | null,
+  ) => { className: string; textContent: string };
+
+  test("each kind keeps its own class and gains the matching semantic modifier", () => {
+    expect(makeBadge("active", "active")).toEqual({ className: "rb-badge plugin-badge active rb-badge--success", textContent: "active" });
+    expect(makeBadge("needs config: X", "warn")).toEqual({ className: "rb-badge plugin-badge warn rb-badge--warning", textContent: "needs config: X" });
+    expect(makeBadge("update to 1.1.0", "update")).toEqual({ className: "rb-badge plugin-badge update rb-badge--info", textContent: "update to 1.1.0" });
+  });
+
+  test("a badge with no kind (or one it doesn't know) is the plain badge", () => {
+    expect(makeBadge("disabled", null).className).toBe("rb-badge plugin-badge");
+    expect(makeBadge("x", "constructor").className).toBe("rb-badge plugin-badge constructor"); // a Map, not an object lookup
   });
 });
