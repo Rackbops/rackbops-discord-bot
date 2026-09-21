@@ -705,8 +705,9 @@ echo_key() {
 # a plain setting costs nothing; missing a secret does.
 #   - EVERY definition of a key in the file counts, not only the last (compose may be quoting the
 #     earlier one), raw and with one layer of quotes stripped, the way load_env_values reads it; and so
-#     do the values this invocation read before it rewrote the file (ENV_VALUES) and the ones it is
-#     writing (DIFF — the caller's array; bash scoping is dynamic).
+#     do the values this invocation read BEFORE it rewrote the file (ENV_VALUES — a replaced value is no
+#     longer in the file). The values being written need no list of their own: by the time compose
+#     runs, the file already holds them.
 #   - A line that is neither blank, a comment, nor a KEY=value definition — the second line of a
 #     pasted multi-line secret — is scrubbed whole.
 #   - LONGEST FIRST. Replacing a short value first cuts a longer one that contains it in two, and the
@@ -743,16 +744,10 @@ redact_secret_values() {
       fi
     done < "$ENV_FILE"
   fi
-  # What was read before the file was rewritten, and what is being written. Neither array exists in
-  # every caller (restart loads no values and has no DIFF), hence the declare -p guards under `set -u`.
-  if declare -p ENV_VALUES >/dev/null 2>&1 && [ "${#ENV_VALUES[@]}" -gt 0 ]; then
+  # What env-set read before it rewrote the file (restart loads no values, so this is empty there).
+  if [ "${#ENV_VALUES[@]}" -gt 0 ]; then
     for key in "${!ENV_VALUES[@]}"; do
       if [[ -z "${ALLOWED[$key]+x}" ]]; then found+=("${ENV_VALUES[$key]}"); fi
-    done
-  fi
-  if declare -p DIFF >/dev/null 2>&1 && [ "${#DIFF[@]}" -gt 0 ]; then
-    for key in "${!DIFF[@]}"; do
-      if [[ -z "${ALLOWED[$key]+x}" ]]; then found+=("${DIFF[$key]}"); fi
     done
   fi
   if [ "${#found[@]}" -gt 0 ]; then

@@ -1028,8 +1028,9 @@ _Avoid_: server list, guild cache
   leaned on it scrubbed nothing then (review round 4). So a core credential, a plugin's secret, a
   plugin's plain setting and a key nobody knows are all scrubbed; only a static `ALLOWED` key's value is
   left. Every definition of a key counts (not only the last), quoted and unquoted; a line that is not a
-  definition (the tail of a pasted multi-line secret) is scrubbed whole; the values read before the
-  rewrite and the ones being written count too; and values are replaced LONGEST FIRST — a short value
+  definition (the tail of a pasted multi-line secret) is scrubbed whole; the values `env-set` read
+  before it rewrote the file count too (a replaced value is no longer in it; the new ones already are);
+  and values are replaced LONGEST FIRST — a short value
   replaced first cuts a longer one that contains it in two, which then no longer matches, so whoever
   could set one secret could unmask another. A value under six characters is left alone (scrubbing
   `us` or a port out of compose's message would make it unreadable, and no credential is that short).
