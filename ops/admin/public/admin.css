@@ -438,10 +438,85 @@
   cursor: not-allowed;
 }
 
+/* ---- The Apply bar (#257) --------------------------------------------------------------------
+   Every change that needs a restart collects here, whichever tab it was made on: the last child of
+   <main>, outside every tab panel, sticky at the bottom of the viewport, shown only while something is
+   pending or an apply has just finished (the [hidden] rule above does the hiding). A raised surface with
+   a border and a shadow so it reads as a bar over the page, not a card in it. Semantic colour is a bar,
+   never small text (like .msg and .rb-alert): the text stays the body colour and the tone rides on the
+   left edge -- danger for a refusal or a failure, success once it is applied. */
+.adm-apply {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--rb-space-3) var(--rb-space-4);
+  padding: var(--rb-space-3) var(--rb-space-4);
+  background: var(--rb-surface-2);
+  border: 1px solid var(--rb-border-strong);
+  border-left: 3px solid var(--rb-accent);
+  border-radius: var(--rb-radius);
+  box-shadow: var(--rb-shadow-lg);
+  color: var(--rb-text);
+}
+.adm-apply--danger {
+  border-left-color: var(--rb-danger);
+}
+.adm-apply--ok {
+  border-left-color: var(--rb-success);
+}
+/* The bar takes focus while a request is in flight (tabindex="-1", see the page script): show it. */
+.adm-apply:focus-visible {
+  outline: 2px solid var(--rb-accent);
+  outline-offset: 2px;
+}
+.adm-apply__text {
+  flex: 1 1 260px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.adm-apply__text .field-hint {
+  margin: 0;
+  font-size: var(--rb-text-sm);
+  color: var(--rb-text-soft);
+}
+.adm-apply__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--rb-space-2);
+}
+/* A control the bar refused (aria-invalid, set by the page script): its border says so too, not only the bar.
+   A chip field's typing input is borderless, so the field around it carries the mark. */
+.adm [aria-invalid="true"] {
+  border-color: var(--rb-danger);
+}
+.tag-field:has([aria-invalid="true"]) {
+  border-color: var(--rb-danger);
+}
+
 /* ---- Narrow screens ------------------------------------------------------------------------- */
 @media (max-width: 640px) {
   .adm {
     padding: 16px;
+  }
+  /* The bar stacks on a phone: the message on top, the buttons full width beneath it. In a column the
+     text's `flex-basis` would be a HEIGHT, so it goes back to its content's size. */
+  .adm-apply {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .adm-apply__text {
+    flex: 0 0 auto;
+  }
+  .adm-apply__actions .rb-btn {
+    flex: 1 1 auto;
   }
   /* Three tabs fit a phone, but a long localized label must scroll rather than wrap the strip. */
   .rb-tabstrip {

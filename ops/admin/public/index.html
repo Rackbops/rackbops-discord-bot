@@ -86,16 +86,13 @@
     <section id="plugins-section" class="rb-card">
       <h2>Plugins</h2>
       <p class="adm-sub">
-        Choose which plugins this instance runs. Ticking or unticking a plugin sets the
-        <code>PLUGINS</code> list and recreates the bot to apply it. This never installs code from the
-        browser — only plugins offered by the Plugin Index can be enabled. A disabled plugin's stored
-        data is left untouched.
+        Choose which plugins this instance runs. Ticking or unticking a plugin is collected, with every
+        other change that needs a restart, in the bar at the bottom of the page: nothing happens until
+        you press <strong>Apply and restart</strong>. This never installs code from the browser — only
+        plugins offered by the Plugin Index can be enabled. A disabled plugin's stored data is left
+        untouched.
       </p>
       <div id="plugins-list">Loading…</div>
-      <div class="row adm-actions">
-        <button id="save-plugins" class="rb-btn rb-btn--primary">Save changes</button>
-      </div>
-      <div id="plugins-msg" class="msg"></div>
     </section>
 
     <section id="plugin-admin-section" class="rb-card" hidden>
@@ -112,10 +109,6 @@
     <section id="config-section" class="rb-card">
       <h2>Config</h2>
       <div id="env-fields" class="adm-fields">Loading…</div>
-      <div class="row adm-actions">
-        <button id="save-env" class="rb-btn rb-btn--primary">Save changes</button>
-      </div>
-      <div id="env-msg" class="msg"></div>
     </section>
 
     <section id="admins-section" class="rb-card">
@@ -140,6 +133,24 @@
       </p>
       <dl class="status-grid" id="identity-grid"><dt>Loading…</dt></dl>
     </section>
+  </div>
+
+  <!-- #257: the ONE place every change that needs a restart collects (the plugin on/off choices and
+       every edited config field), and costs ONE restart. Outside every tabpanel, last in <main>, sticky
+       at the bottom, so it is visible from any tab; shown only while something is pending or an apply
+       has just finished. The text is a polite live region (role="status"); tabindex="-1" lets focus rest
+       on the bar itself while a request is in flight, when both buttons are disabled. What is pending is
+       derived from the controls on every event and never stored (see the APPLY block in the script). -->
+  <div id="apply-bar" class="adm-apply" tabindex="-1" hidden>
+    <div class="adm-apply__text" role="status">
+      <strong id="apply-title"></strong>
+      <span id="apply-hint" class="field-hint"></span>
+    </div>
+    <div class="adm-apply__actions">
+      <button id="apply-ok" type="button" class="rb-btn rb-btn--ghost" hidden>OK</button>
+      <button id="apply-discard" type="button" class="rb-btn rb-btn--ghost">Discard</button>
+      <button id="apply-go" type="button" class="rb-btn rb-btn--primary">Apply and restart</button>
+    </div>
   </div>
 </main>
 
@@ -425,23 +436,18 @@
   }
 
   // ---- Modify Plugins (#102) ------------------------------------------------------------------
-  // The last /api/plugins response, kept so savePlugins can diff against the raw PLUGINS value and
-  // reuse the manifest order without a second fetch.
+  // The last /api/plugins response, kept so the Apply bar can diff the ticked plugins against the raw
+  // PLUGINS value and reuse the manifest order without a second fetch.
   let pluginsData = null;
 
   async function loadPlugins() {
     const container = document.getElementById("plugins-list");
-    document.getElementById("plugins-msg").textContent = "";
     try {
       const data = await (await api("/api/plugins")).json();
       pluginsData = data;
       // #124: render each installed plugin's own admin tab from the same response (independent of the
       // add/remove list below, and of a stateError — env editing still works when state is unreadable).
       renderPluginAdmin(data);
-      // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy —
-      // disable Save so a change can't be planned against a false-empty selection and wipe it.
-      const saveBtn = document.getElementById("save-plugins");
-      if (saveBtn) saveBtn.disabled = !!data.stateError;
       container.innerHTML = "";
       if (data.stateError) {
         const notice = document.createElement("div");
@@ -463,14 +469,20 @@
         return;
       }
       const indexAvailable = !data.indexError;
-      for (const p of data.plugins) container.appendChild(buildPluginRow(p, indexAvailable));
+      // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every box
+      // is disabled, so a change can't be made against a false-empty selection (the plan for it is also
+      // refused, in collectPending / planApply, as the belt to this brace).
+      for (const p of data.plugins) container.appendChild(buildPluginRow(p, indexAvailable, !!data.stateError));
       const note = document.createElement("div");
       note.className = "field-hint";
       note.style.marginTop = "8px";
-      note.textContent = "Changes apply when the bot restarts (saving recreates it).";
+      note.textContent = "Changes apply when the bot restarts: they are collected in the bar below until you apply them.";
       container.appendChild(note);
     } catch (e) {
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    } finally {
+      // The baseline moved (or the list failed to load): what is pending is read from the controls again.
+      refreshApplyBar();
     }
   }
 
@@ -726,7 +738,7 @@
 
   // One card per plugin. All server-sourced text goes through textContent / createElement — never
   // innerHTML — so a plugin name or description can't inject markup.
-  function buildPluginRow(p, indexAvailable) {
+  function buildPluginRow(p, indexAvailable, stateError) {
     const row = document.createElement("div");
     row.className = "plugin-row";
 
@@ -738,8 +750,8 @@
     check.id = "plugin-" + p.name;
     // Only index-listed plugins can be enabled; one the index doesn't offer and that isn't already
     // on stays unticked and locked. An already-enabled one the index dropped stays editable so it
-    // can still be removed.
-    if (!p.inIndex && !p.enabled) check.disabled = true;
+    // can still be removed. While the bot's state is unreadable every box is locked (see loadPlugins).
+    if (stateError || (!p.inIndex && !p.enabled)) check.disabled = true;
     row.appendChild(check);
 
     const info = document.createElement("div");
@@ -973,63 +985,11 @@
   }
   // PLUGINS_SAVE_PLAN:end
 
-  // PLUGINS_SAVE:begin
-  async function savePlugins() {
-    const msg = document.getElementById("plugins-msg");
-    // Never plan a save against an untrusted baseline: a failed state read (empty pluginsValue) could
-    // otherwise diff a ticked subset against "" and wipe the real selection. The button is disabled
-    // in this case too; this is the belt-and-braces guard.
-    if (!pluginsData || pluginsData.stateError) return;
-    const checkedNames = [...document.querySelectorAll("#plugins-list input[type=checkbox]")]
-      .filter((c) => c.checked)
-      .map((c) => c.dataset.plugin);
-    const manifestOrder = (pluginsData.plugins || []).map((p) => p.name);
-    const plan = planPluginsSave(checkedNames, pluginsData.pluginsValue || "", manifestOrder);
-    if (!plan.changed) {
-      msg.textContent = "No changes.";
-      msg.className = "msg";
-      return;
-    }
-    if (!confirm('Set PLUGINS to "' + plan.value + '"? The bot will restart to load the change.')) return;
-    msg.textContent = "Saving…";
-    msg.className = "msg";
-    // Reuse the config Save path — a POST /api/env carrying ONLY PLUGINS — so the Origin guard, the
-    // auth check, and bot-ops.sh's own validation/recreate all apply unchanged; no new mutating route.
-    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
-    try {
-      const res = await api("/api/env", { method: "POST", body: "PLUGINS=" + plan.value, signal });
-      const text = await res.text();
-      let result = null;
-      try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
-      if (res.ok) {
-        msg.textContent = "Saved. PLUGINS = " + plan.value;
-        msg.className = "msg ok";
-        loadPlugins();
-        loadEnv(); // re-baseline the Config form's PLUGINS field from the persisted value
-        loadStatus();
-      } else {
-        let failText = text || "bot-ops.sh error";
-        if (result && (result.log || result.backup)) {
-          failText = [result.log, result.backup ? "Backup: " + result.backup : ""].filter(Boolean).join("\n");
-        }
-        msg.textContent = "Failed: " + failText;
-        msg.className = "msg error";
-        loadPlugins();
-        loadEnv();
-      }
-    } catch (e) {
-      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
-    } finally {
-      cancel();
-    }
-  }
-  // PLUGINS_SAVE:end
-
   // PLUGIN_REQUEST_SEND:begin
   // Consumer boundary for the #105 action buttons: POST /api/plugins/request with the pure payload,
-  // then re-load so the new schedule/skip/remind state shows. Mirrors savePlugins' timeout + error
-  // handling. Lifted + tested (ops/admin/server.test.ts) so "POSTs to /api/plugins/request, never
-  // sets requestedBy client-side, re-loads on success" is pinned at the boundary, not just the payload.
+  // then re-load so the new schedule/skip/remind state shows. Times out and reports errors the way
+  // applyPending does. Lifted + tested (ops/admin/server.test.ts) so "POSTs to /api/plugins/request,
+  // never sets requestedBy client-side, re-loads on success" is pinned at the boundary, not just the payload.
   async function sendPluginRequest(payload, msg) {
     msg.textContent = "Queuing…";
     msg.className = "plugin-actions-msg";
@@ -1061,8 +1021,6 @@
     }
   }
   // PLUGIN_REQUEST_SEND:end
-
-  document.getElementById("save-plugins").addEventListener("click", (e) => withBusy(e.currentTarget, savePlugins));
 
   document.getElementById("add-admin").addEventListener("click", (e) => withBusy(e.currentTarget, addAdmin));
   document.getElementById("admin-email").addEventListener("keydown", (e) => {
@@ -1302,11 +1260,21 @@
     select.value = currentValue;
   }
 
-  let loadedEnv = {}; // last-loaded values, for the save-time diff/confirmation
+  let loadedEnv = {}; // last-loaded values, the baseline the Apply bar diffs the controls against
   let loadedSchema = {}; // last-loaded GET /api/env-schema ({} when unavailable — degrades to no client-side validation, #207)
 
+  // TAG_SYNC:begin
+  // Setting an input's value from code fires NO event, and the Apply bar learns of an edit only from an
+  // `input` event bubbling up to #app -- so a chip added or removed must say so itself. This is the one
+  // place a chip editor writes its value carrier.
+  function syncTagValue(hidden, tokens) {
+    hidden.value = tokens.join(",");
+    hidden.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  // TAG_SYNC:end
+
   // A chip editor for a comma-separated list field (ADMIN_USER_IDS, WATCHED_REPOS). The value
-  // carrier saveEnv reads is a nested hidden <input data-key> holding the canonical comma-joined
+  // carrier the Apply bar reads is a nested hidden <input data-key> holding the canonical comma-joined
   // list — seeded with the RAW loaded value so an untouched field records no diff, and recomputed
   // (normalized, no spaces) only once the user actually edits. Per-token validation is left to
   // bot-ops.sh (the enforcing backstop); this just splits on commas, trims, and de-dupes.
@@ -1329,7 +1297,7 @@
     // De-duped so removing a chip (filter-by-value) can't drop two identical entries; the hidden
     // carrier still holds the raw value until an edit, so a de-duped display alone records no diff.
     let tokens = [...new Set(value.split(",").map((t) => t.trim()).filter(Boolean))];
-    const sync = () => { hidden.value = tokens.join(","); };
+    const sync = () => syncTagValue(hidden, tokens);
     function render() {
       wrapper.querySelectorAll(".tag").forEach((el) => el.remove());
       const frag = document.createDocumentFragment();
@@ -1363,7 +1331,7 @@
       // Backspace on an empty field removes the last chip — familiar tag-input behavior.
       else if (e.key === "Backspace" && add.value === "" && tokens.length) { tokens.pop(); sync(); render(); }
     });
-    add.addEventListener("blur", commit); // capture typed-but-not-entered text before a Save
+    add.addEventListener("blur", commit); // capture typed-but-not-entered text before an Apply
 
     wrapper.appendChild(add);
     wrapper.appendChild(hidden);
@@ -1435,6 +1403,9 @@
       loadedSchema = schema && typeof schema === "object" ? schema : {};
       container.innerHTML = "";
       for (const key of Object.keys(env)) {
+        // #257: PLUGINS is chosen on the Plugins tab (the ticks), and two controls for one key in one
+        // form is a conflict with no good answer. A name@version pin is set in .env.
+        if (key === "PLUGINS") continue;
         const value = env[key] ?? "";
         const control = buildEnvControl(key, value);
         const label = document.createElement("label");
@@ -1455,21 +1426,12 @@
       }
     } catch (e) {
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
+    } finally {
+      // The baseline moved (or the form failed to load): what is pending is read from the controls again.
+      refreshApplyBar();
     }
   }
 
-  document.getElementById("save-env").addEventListener("click", (e) => withBusy(e.currentTarget, saveEnv));
-
-  // The save-time diff — pure, and lifted out of saveEnv so ops/admin/server.test.ts can pin it
-  // against this very source (the test lifts this function and saveEnv, between their
-  // ENV_SAVE_PLAN / ENV_SAVE markers, evaluates them, and runs saveEnv against a stubbed page, so
-  // the POST body is asserted end-to-end). `loaded` is what GET /api/env returned; `current` is {KEY: control value}
-  // for every rendered field, in field order. The POST body carries ONLY the keys whose value
-  // differs — never an untouched field echoed back (issue #44): posting every field meant a stored
-  // value the bot accepts but bot-ops.sh's regex rejects (a hand-quoted realm, a CRLF-saved .env)
-  // failed every save from this panel, naming a field the operator never touched — and a tab
-  // loaded before another operator's save silently reverted their change on its own next save.
-  // The confirm preview and the body come from the same list, so what's shown is what's sent.
   // ENV_SCHEMA:begin
   // bot-ops.sh validates with bash ERE; JS RegExp has no POSIX bracket classes, so translate the
   // ones the whitelist and plugin manifests use. Anything that still won't compile means "no
@@ -1505,6 +1467,13 @@
   }
   // ENV_SCHEMA:end
 
+  // The config diff — pure, lifted so ops/admin/server.test.ts can pin it against this very source.
+  // `loaded` is what GET /api/env returned; `current` is {KEY: control value} for every rendered field, in
+  // field order. The body carries ONLY the keys whose value differs — never an untouched field echoed back
+  // (issue #44): posting every field meant a stored value the bot accepts but bot-ops.sh's regex rejects
+  // (a hand-quoted realm, a CRLF-saved .env) failed every save from this panel, naming a field the
+  // operator never touched — and a tab loaded before another operator's save silently reverted their
+  // change on its own next save. planApply (below) composes this with planPluginsSave.
   // ENV_SAVE_PLAN:begin
   function planEnvSave(loaded, current) {
     const changes = [];
@@ -1517,34 +1486,217 @@
   }
   // ENV_SAVE_PLAN:end
 
-  // ENV_SAVE:begin
-  async function saveEnv() {
-    const msg = document.getElementById("env-msg");
-    const current = {};
-    for (const c of document.querySelectorAll("#env-fields [data-key]")) current[c.dataset.key] = c.value;
-    const plan = planEnvSave(loadedEnv, current);
-    if (plan.changes.length === 0) {
-      msg.textContent = "No changes.";
-      msg.className = "msg";
+  // APPLY_PLAN:begin
+  // #257: everything that needs a restart, as ONE plan -- the plugin on/off choices (planPluginsSave) and
+  // every edited config field (planEnvSave), composed; one POST /api/env, one restart. Pure.
+  //   input: { loadedEnv, fields: {KEY: value}, plugins: { checkedNames, currentValue, manifestOrder } | null }
+  //   `plugins` is null when the bot's state could not be read: nothing may be planned against an
+  //   untrusted baseline (a ticked subset diffed against a false-empty PLUGINS would wipe the real selection).
+  //   -> { changes: [{ key, before, now }], body, count, error? }
+  // PLUGINS comes first (only when planPluginsSave says it changed; `before` is the raw current value), then
+  // the changed fields in field order -- minus any PLUGINS key among them (the Config editor no longer
+  // renders one; this is the belt to that brace). A value with a line break is refused: bot-ops.sh reads
+  // stdin line by line, so "8080\nANNOUNCE_CHANNEL_ID=1" would smuggle a second assignment.
+  function planApply(input) {
+    const changes = [];
+    if (input.plugins) {
+      const p = planPluginsSave(input.plugins.checkedNames, input.plugins.currentValue, input.plugins.manifestOrder);
+      if (p.changed) changes.push({ key: "PLUGINS", before: String(input.plugins.currentValue || ""), now: p.value });
+    }
+    for (const c of planEnvSave(input.loadedEnv, input.fields).changes) {
+      if (c.key !== "PLUGINS") changes.push(c);
+    }
+    const plan = { changes, body: changes.map((c) => c.key + "=" + c.now).join("\n"), count: changes.length };
+    const smuggling = changes.find((c) => /[\r\n]/.test(c.now));
+    if (smuggling) return { ...plan, body: "", error: smuggling.key + " must not contain a line break." };
+    return plan;
+  }
+  // APPLY_PLAN:end
+
+  // APPLY_VIEW:begin
+  // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
+  // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail? }
+  //   -> { hidden, tone: ""|"danger"|"ok", title, hint, showDiscard, showGo, showOk, busy }
+  function applyBarView(state) {
+    const view = (over) => ({ hidden: false, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false, ...over });
+    if (state.phase === "applying") {
+      return view({ title: "Restarting the bot…", hint: "This takes about 20 seconds.", showDiscard: true, showGo: true, busy: true });
+    }
+    if (state.phase === "done") {
+      return view({ tone: "ok", title: "Applied. The bot restarted with your changes.", showOk: true });
+    }
+    if (state.phase === "failed") {
+      return view({
+        tone: "danger",
+        title: "Couldn't apply: " + (state.error || "bot-ops.sh error"),
+        hint: state.detail || "",
+        showOk: true,
+        showDiscard: state.count > 0,
+        showGo: state.count > 0,
+      });
+    }
+    if (state.count === 0) return view({ hidden: true });
+    return view({
+      tone: state.error ? "danger" : "",
+      title: state.count === 1 ? "1 change needs a restart" : state.count + " changes need a restart",
+      hint: state.error || "The bot goes offline for about 20 seconds while it restarts.",
+      showDiscard: true,
+      showGo: true,
+    });
+  }
+  // A failed POST /api/env, as the bar's two lines (issue #47). A failed RECREATE arrives as JSON
+  // ({ok:false, changed, backup, log}) after .env was already rewritten: the error is the compose log and
+  // the detail the backup path, never the raw JSON blob. Anything else is shown verbatim.
+  function describeApplyFailure(text, result) {
+    if (result && (result.log || result.backup)) {
+      return { error: result.log || "bot-ops.sh error", detail: result.backup ? "Backup: " + result.backup : "" };
+    }
+    return { error: text || "bot-ops.sh error", detail: "" };
+  }
+  // APPLY_VIEW:end
+
+  // APPLY:begin
+  // #257: the DOM half of the Apply bar. The ONLY state kept here is the bar's phase and the message it is
+  // showing. WHAT IS PENDING IS NEVER STORED: it is read from the controls on every event (the way the old
+  // Save buttons read them at click time), so Discard is "re-render from the baseline" and there is no second
+  // copy of the truth to drift. Consequence for anyone touching this page: anything that changes a control's
+  // value from code must dispatch an `input` event (see TAG_SYNC), or the bar will not see it.
+  let applyPhase = "idle"; // "idle" | "applying" | "done" | "failed"
+  let applyError = ""; // the failure being shown (phase "failed") ...
+  let applyDetail = ""; // ... and its second line, the backup path
+  let applyViolation = ""; // a validation refusal being shown, until the next edit
+  let applyInvalid = null; // the control that refusal marked aria-invalid
+
+  // The planner's input, read from EXACTLY two places: the config controls (a chip field's hidden carrier
+  // included) and the plugin tick boxes. Never a page-wide [data-key]: a plugin's own settings bundle
+  // renders arbitrary DOM inside this page.
+  function collectPending() {
+    const fields = {};
+    for (const c of document.querySelectorAll("#env-fields [data-key]")) fields[c.dataset.key] = c.value;
+    let plugins = null;
+    // Never plan against an untrusted baseline: a failed state read (an empty PLUGINS) could otherwise be
+    // diffed against a ticked subset and wipe the real selection.
+    if (pluginsData && !pluginsData.stateError) {
+      plugins = {
+        checkedNames: [...document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")]
+          .filter((c) => c.checked)
+          .map((c) => c.dataset.plugin),
+        currentValue: pluginsData.pluginsValue || "",
+        manifestOrder: (pluginsData.plugins || []).map((p) => p.name),
+      };
+    }
+    return { loadedEnv, fields, plugins };
+  }
+
+  function writeApplyBar(plan) {
+    const view = applyBarView({
+      count: plan.count,
+      phase: applyPhase,
+      error: applyPhase === "failed" ? applyError : plan.error || applyViolation,
+      detail: applyDetail,
+    });
+    const bar = document.getElementById("apply-bar");
+    bar.hidden = view.hidden;
+    bar.classList.toggle("adm-apply--danger", view.tone === "danger");
+    bar.classList.toggle("adm-apply--ok", view.tone === "ok");
+    document.getElementById("apply-title").textContent = view.title;
+    document.getElementById("apply-hint").textContent = view.hint;
+    const ok = document.getElementById("apply-ok");
+    const discard = document.getElementById("apply-discard");
+    const go = document.getElementById("apply-go");
+    ok.hidden = !view.showOk;
+    discard.hidden = !view.showDiscard;
+    go.hidden = !view.showGo;
+    discard.disabled = view.busy;
+    go.disabled = view.busy;
+  }
+
+  function refreshApplyBar() {
+    writeApplyBar(planApply(collectPending()));
+  }
+
+  function clearApplyInvalid() {
+    if (applyInvalid) applyInvalid.removeAttribute("aria-invalid");
+    applyInvalid = null;
+  }
+
+  // The one delegated handler behind #app's `input` and `change` listeners. Only an edit INSIDE the config
+  // fields or the plugin list counts: the logs filter, the admin e-mail box and a plugin's own settings
+  // bundle also bubble events to #app. An edit clears a finished (done / failed) message and a refusal,
+  // and re-reads what is pending.
+  function onControlEdited(e) {
+    const target = e && e.target;
+    if (!target || typeof target.closest !== "function" || !target.closest("#env-fields, #plugins-list")) return;
+    if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
+    applyViolation = "";
+    clearApplyInvalid();
+    refreshApplyBar();
+  }
+
+  // Keyboard focus. Both buttons are disabled while a request is in flight, and the one pressed is hidden
+  // when it ends: focus would fall to <body>. So it rests on the bar itself meanwhile (tabindex="-1") and
+  // lands on OK at the end -- but only while it is still in the bar (or nowhere), so a user who has tabbed
+  // elsewhere is not pulled back.
+  function focusIfInBar(target) {
+    const bar = document.getElementById("apply-bar");
+    const active = document.activeElement;
+    if (active && active !== document.body && !bar.contains(active)) return;
+    target.focus();
+  }
+  // After OK or Discard, the button that had focus is hidden and focus would fall to <body>. Put it back:
+  // on the open tab when the bar is gone, on the bar itself when it is still there (not on Apply: an Enter
+  // pressed twice must not restart the bot). Focus that is somewhere real is left alone.
+  function settleFocus() {
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const bar = document.getElementById("apply-bar");
+    if (!bar.hidden) {
+      bar.focus();
       return;
     }
-    // Block a blank required field or a bad-format value before the confirm dialog, not after a
-    // failed save (issue #45) — one bad key blocks the WHOLE save, same as bot-ops.sh itself does
-    // server-side. loadedSchema is {} when GET /api/env-schema was unavailable, so this degrades to
-    // no client-side check rather than blocking on stale/missing rules — env-set is still the authority.
+    const tab = document.querySelector('[role="tab"][aria-selected="true"]');
+    if (tab) tab.focus();
+  }
+
+  // A refusal: the bar says why, the offending control is marked and focused on its own tab, and nothing
+  // is sent. A tag field's control is its typing input (id env-KEY, the one its label points at).
+  function refuseApply(bad) {
+    applyViolation = bad.message;
+    const plugins = bad.key === "PLUGINS";
+    showTab(plugins ? "plugins" : "settings", false);
+    const control = plugins ? null : document.getElementById("env-" + bad.key);
+    if (control) {
+      control.setAttribute("aria-invalid", "true");
+      applyInvalid = control;
+      control.focus();
+    }
+    refreshApplyBar();
+  }
+
+  async function applyPending() {
+    if (applyPhase === "applying") return;
+    const plan = planApply(collectPending());
+    if (plan.count === 0) return;
+    if (plan.error) {
+      refreshApplyBar(); // shows it
+      return;
+    }
+    // Block a blank required field or a bad-format value BEFORE anything is sent, not after a failed save
+    // (issue #45): one bad key blocks the WHOLE apply, same as bot-ops.sh itself does server-side.
+    // loadedSchema is {} when GET /api/env-schema was unavailable, so this degrades to no client-side check
+    // rather than blocking on stale or missing rules -- env-set is still the authority.
     const bad = validateEnvChanges(loadedSchema, plan.changes);
     if (bad) {
-      msg.textContent = bad.message;
-      msg.className = "msg error";
+      refuseApply(bad);
       return;
     }
-    const preview = plan.changes
-      .map((c) => `${c.key}: "${c.before}" → "${c.now}"`)
-      .join("\n");
-    if (!confirm("Save these config changes? The bot will restart to load them.\n\n" + preview)) return;
-
-    msg.textContent = "Saving…";
-    msg.className = "msg";
+    applyPhase = "applying";
+    applyViolation = "";
+    writeApplyBar(plan);
+    focusIfInBar(document.getElementById("apply-bar"));
+    // ONE POST /api/env carrying only what changed: the Origin guard, the auth check and bot-ops.sh's own
+    // validation and recreate all apply unchanged, and no new mutating route exists. env-set returns only
+    // after the recreate, so the bar says "Restarting the bot…" for exactly as long as this is in flight.
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     try {
       const res = await api("/api/env", { method: "POST", body: plan.body, signal });
@@ -1552,29 +1704,63 @@
       let result = null;
       try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
       if (res.ok) {
-        const changed = result && result.changed ? result.changed.join(", ") : "";
-        msg.textContent = changed ? "Saved: " + changed : "No changes.";
-        msg.className = "msg ok";
-        loadEnv(); // re-baseline so a second save diffs against the new state
+        applyPhase = "done";
+        refreshApplyBar();
+        loadPlugins();
+        loadEnv();
         loadStatus();
       } else {
-        let failText = text || "bot-ops.sh error";
-        if (result && (result.log || result.backup)) {
-          // The recreate itself failed after .env was already rewritten — show the compose error
-          // and backup path instead of the raw JSON blob (issue #47).
-          failText = [result.log, result.backup ? "Backup: " + result.backup : ""].filter(Boolean).join("\n");
-        }
-        msg.textContent = "Failed: " + failText;
-        msg.className = "msg error";
-        loadEnv(); // .env may already have been rewritten even though the recreate failed — re-baseline
+        const failure = describeApplyFailure(text, result);
+        applyPhase = "failed";
+        applyError = failure.error;
+        applyDetail = failure.detail;
+        refreshApplyBar();
+        // .env may already have been rewritten even though the recreate failed (issue #47): re-baseline.
+        loadPlugins();
+        loadEnv();
       }
+      focusIfInBar(document.getElementById("apply-ok"));
     } catch (e) {
-      if (e.message !== "unauthorized") { msg.textContent = e.message; msg.className = "msg error"; }
+      const message = e && e.message ? e.message : String(e);
+      if (message === "unauthorized") {
+        applyPhase = "idle"; // the gate is showing; do not leave "Restarting the bot…" behind it
+        refreshApplyBar();
+      } else {
+        applyPhase = "failed";
+        applyError = message;
+        applyDetail = "";
+        refreshApplyBar();
+        focusIfInBar(document.getElementById("apply-ok"));
+      }
     } finally {
       cancel();
     }
   }
-  // ENV_SAVE:end
+
+  // Sends nothing: the controls are re-rendered from what the server holds, which IS the baseline.
+  async function discardPending() {
+    if (applyPhase === "applying") return;
+    applyPhase = "idle";
+    applyViolation = "";
+    clearApplyInvalid();
+    await Promise.all([loadPlugins(), loadEnv()]);
+    refreshApplyBar();
+    settleFocus();
+  }
+
+  // OK on a finished (done / failed) message.
+  function dismissApplyResult() {
+    applyPhase = "idle";
+    refreshApplyBar();
+    settleFocus();
+  }
+  // APPLY:end
+
+  document.getElementById("apply-go").addEventListener("click", (e) => withBusy(e.currentTarget, applyPending));
+  document.getElementById("apply-discard").addEventListener("click", (e) => withBusy(e.currentTarget, discardPending));
+  document.getElementById("apply-ok").addEventListener("click", dismissApplyResult);
+  app.addEventListener("input", onControlEdited);
+  app.addEventListener("change", onControlEdited);
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
