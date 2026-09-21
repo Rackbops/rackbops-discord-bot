@@ -601,6 +601,14 @@ describe("consumePluginRequests drain", () => {
         "a unicode-escaped dot": `https://discord${u("002e")}com/api/webhooks/${WH_ID}/${TOKEN}`,
         "unicode-escaped slashes": `https:${u("002f")}${u("002f")}discord.com${u("002f")}api${u("002f")}webhooks${u("002f")}${WH_ID}${u("002f")}${TOKEN}`,
         "a unicode-escaped letter in webhooks": `https://discord.com/api/${u("0077")}ebhooks/${WH_ID}/${TOKEN}`,
+        // Forms only the HOST half of the detector can catch: the token has a character no token has, so the
+        // path pattern (id, then 20+ token characters) does not match, but the host and `webhooks/` do.
+        "the host, with an odd token": `https://discord.com/api/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
+        "the host in upper case, with an odd token": `HTTPS://DISCORD.COM/API/WEBHOOKS/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
+        "the host with a version, with an odd token": `https://discord.com/api/v10/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
+        "the host as discordapp.com, with an odd token": `https://discordapp.com/api/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
+        // A form only the PATH half can catch, in upper case: there is no host to fall back on.
+        "upper case, no host": `/API/WEBHOOKS/${WH_ID}/${TOKEN}`,
       };
       for (const [name, url] of Object.entries(forms)) {
         const h = harness({});
@@ -610,6 +618,28 @@ describe("consumePluginRequests drain", () => {
         expect(h.fs.size, name).toBe(0);
         expect(h.mutations, name).toHaveLength(0);
         expect(h.warns, name).toEqual(["[plugins] rejecting request 100-x.json: a webhook url does not belong in this request"]);
+      }
+    });
+
+    test("the path form has bounds: an id of 5 to 25 digits and a token of 20 or more, with no host to help", async () => {
+      // No host, so only the path half of the detector can flag these. A snowflake is 5 to 25 digits, and no
+      // token is shorter than 20 characters; text that is not shaped like either is not a url.
+      const cases: [string, boolean][] = [
+        [`webhooks/12345/${"a".repeat(20)}`, true],
+        [`webhooks/${"1".repeat(25)}/${"a".repeat(20)}`, true],
+        [`webhooks/1234/${"a".repeat(20)}`, false],
+        [`webhooks/${"1".repeat(26)}/${"a".repeat(20)}`, false],
+        [`webhooks/${WH_ID}/${"a".repeat(19)}`, false],
+        [`webhooks/${WH_ID}/${"a".repeat(20)}`, true],
+        [`webhooks/abcde/${"a".repeat(20)}`, false],
+      ];
+      for (const [text, flagged] of cases) {
+        const h = harness({ "100-x.json": wb({ action: "skip", version: "1.1.0", requestedBy: text }) });
+        await consumePluginRequests(h.deps);
+        // Flagged: refused and deleted, never applied. Not flagged: an ordinary update request, applied.
+        expect(h.mutations.length, text).toBe(flagged ? 0 : 1);
+        expect(h.warns.length, text).toBe(flagged ? 1 : 0);
+        expect(h.rejected, text).toEqual([]);
       }
     });
 
