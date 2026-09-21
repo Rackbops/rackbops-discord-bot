@@ -3285,11 +3285,18 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
     "SHARDING_MANAGER",
     "SHARDING_MANAGER_MODE",
   ];
-  // Two plugins claim every one of them, one plain and one `secret: true`. Each also declares a benign key,
-  // so a dropped claim is told apart from a dropped entry.
+  // Two plugins claim every one of them, one plain and one `secret: true` -- except HOSTNAME, which only
+  // `plain-claim` claims. Claiming every key both ways would let the secret-wins rule in load_plugin_keys
+  // (ops/bot-ops.sh) mask a forgotten RESERVED_KEYS entry from env-get on every key (env-get never lists a
+  // secret row, so it would only ever fail via env-schema); one plain-only key gives env-get its own
+  // first-failing case for that same regression. Each plugin also declares a benign key, so a dropped claim
+  // is told apart from a dropped entry.
   const CLAIMS = wrapIndex([
     pluginEntry("plain-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$")), envKey("PLAIN_CLAIM_PORT", PORT_RE)]),
-    pluginEntry("secret-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$", { secret: true })), envKey("SECRET_CLAIM_PORT", PORT_RE)]),
+    pluginEntry("secret-claim", [
+      ...CORE_SETTINGS.filter((k) => k !== "HOSTNAME").map((k) => envKey(k, "^.+$", { secret: true })),
+      envKey("SECRET_CLAIM_PORT", PORT_RE),
+    ]),
   ]);
   const STORED = "GITHUB_REPO=Rackbops/rackbops-discord-bot\nBOT_DATA_DIR=/srv/data\nNODE_ENV=production\n";
 

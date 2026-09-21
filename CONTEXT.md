@@ -1032,7 +1032,8 @@ _Avoid_: server list, guild cache
   dependency reads, which is why the four shard variables are pinned by the behaviour table instead), so a
   new core key fails a test until it is decided. Runtime-level variables (`NODE_OPTIONS`, `PATH`, the
   proxy variables, `TAR_OPTIONS`) are read by the runtime or a spawned tool, not by the core's code, and
-  stay claimable (#240's item 22; a possible follow-up). (A credential a first-party plugin owns is
+  stay claimable (#240's item 22; #280 tracks reserving the proxy variables and `TAR_OPTIONS`). (A
+  credential a first-party plugin owns is
   deliberately NOT
   reserved: the wow plugin's `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` are declared `secret: true`
   in its Plugin Index entry and nothing in `src/` reads them, so the panel can set them — the test pin
