@@ -1232,6 +1232,11 @@ export function parseRoutingSetInput(raw: unknown): { ok: true; input: RoutingSe
   return { ok: true, input: { plugin: raw.plugin, servers } };
 }
 
+/** No real webhook URL is near this (a canary, versioned URL with a 25-digit id and a 68-character token is
+ *  about 150 characters); the cap keeps a multi-megabyte "token" from ever being piped into bot-ops.sh,
+ *  whose bash pattern match over it would tie the script up. */
+const ROUTING_WEBHOOK_URL_MAX_LENGTH = 512;
+
 /**
  * Validates `POST /api/webhooks`'s body: `{ url }`, trimmed (a pasted URL often carries a newline), and
  * the trimmed string is what is returned. The reason for a bad URL is `bad webhook url` and nothing more:
@@ -1240,7 +1245,9 @@ export function parseRoutingSetInput(raw: unknown): { ok: true; input: RoutingSe
 export function parseWebhookAddInput(raw: unknown): { ok: true; url: string } | { ok: false; reason: string } {
   if (!isPlainRecord(raw)) return { ok: false, reason: "body is not a JSON object" };
   const url = typeof raw.url === "string" ? raw.url.trim() : undefined;
-  if (url === undefined || !ROUTING_WEBHOOK_URL_RE.test(url)) return { ok: false, reason: "bad webhook url" };
+  if (url === undefined || url.length > ROUTING_WEBHOOK_URL_MAX_LENGTH || !ROUTING_WEBHOOK_URL_RE.test(url)) {
+    return { ok: false, reason: "bad webhook url" };
+  }
   return { ok: true, url };
 }
 
@@ -1257,10 +1264,12 @@ const ROUTING_WEBHOOK_PATH_RE = /webhooks(?:\\?\/|%2f)\d{5,25}(?:\\?\/|%2f)[\w-]
 /**
  * `text` with anything that looks like a webhook URL replaced by `[webhook url]`; text with none is
  * returned as it was. JSON can spell any character as an escape (`/`, `\/`) and a URL can
- * percent-encode any character (`%77ebhooks`), so those are read as what they stand for BEFORE looking --
- * each decoded once: a doubly-encoded spelling is not chased, since nothing in this path produces one.
- * When something is found the DECODED text is what comes back, redacted; text that only looked escaped
- * but holds no URL is not touched.
+ * percent-encode any character (`%77ebhooks`), so those are read as what they stand for BEFORE looking.
+ * The three reads run once each, in that order (so a `%` that produces a `%` is percent-decoded too);
+ * a spelling encoded more deeply than that is not chased, since nothing in this path produces one. (`\/`
+ * is also tolerated by the two patterns themselves, as it is in the bot's: the decode is belt to that
+ * brace.) When something is found the DECODED text is what comes back, redacted; text that only looked
+ * escaped but holds no URL is not touched.
  */
 export function redactWebhookUrls(text: string): string {
   const plain = text
@@ -1646,14 +1655,16 @@ type RoutingRequestBody =
 /**
  * Queues one routing request through `bot-ops.sh plugin-request` (#242) and answers `{ ok, id, queued }`.
  * `request` is built by the caller from VALIDATED fields, never from the client's body; `requestedBy` and
- * `id` are added here, after it, from the verified identity and the server's own counter, so nothing the
- * client sent can override them. The payload goes to bot-ops.sh on STDIN as JSON and nowhere else -- a
- * `webhook-add` carries a secret, so it is never in `argv`, a log line, a response or an error.
- * `describe` is for the audit line and must NEVER be built from a webhook url.
+ * `id` are added here, after it, from the verified identity and a server-minted id (a UUID unless a test
+ * seam supplies one), so nothing the client sent can override them. The payload goes to bot-ops.sh on STDIN
+ * as JSON and nowhere else -- a `webhook-add` carries a secret, so it is never in `argv`, a log line, a
+ * response or an error. `describe` is for the audit line and must NEVER be built from a webhook url.
  *
  * Anything bot-ops.sh wrote (its stderr in a failure, its `queued` in a success) passes through
  * `redactWebhookUrls` before it is logged or answered: a `die "... '$url'"` in the script would otherwise
- * carry the secret straight back to the page and into `docker logs`.
+ * carry the secret straight back to the page and into `docker logs`. So does the message of an error
+ * `runBotOps` itself throws (it is caught here: an unhandled rejection would reach Bun's own error output,
+ * which is outside this file's control and could carry the payload).
  */
 async function queueRoutingRequest(
   config: HandlerConfig,
@@ -1664,7 +1675,21 @@ async function queueRoutingRequest(
   const requestedBy = auth.email ? `email:${auth.email}` : "token";
   const id = config.newRequestId?.() ?? crypto.randomUUID();
   const payload = JSON.stringify({ ...request, requestedBy, id });
-  const result = await config.runBotOps({ args: ["plugin-request"], stdin: payload, contentType: "application/json" });
+  let result: BotOpsResult;
+  try {
+    result = await config.runBotOps({ args: ["plugin-request"], stdin: payload, contentType: "application/json" });
+  } catch (err) {
+    // runBotOps failed to run at all (a missing script, a spawn error). Its message is redacted like any
+    // other text that came from outside this function, and clipped; the answer is a fixed one.
+    let why = "not an Error";
+    try {
+      if (err instanceof Error) why = redactWebhookUrls(String(err.message)).slice(0, 300);
+    } catch {
+      why = "unreadable error";
+    }
+    console.error(`[admin] plugin-request could not run bot-ops.sh — requested by ${describeActor(auth)}: ${why}`);
+    return new Response("bot-ops.sh could not be run", { status: 502 });
+  }
   if (result.exitCode !== 0) {
     const stderr = redactWebhookUrls(result.stderr.trim());
     console.error(`[admin] plugin-request failed (exit ${result.exitCode}) — requested by ${describeActor(auth)}: ${stderr}`);
