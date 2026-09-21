@@ -65,7 +65,9 @@ drain (which reads only `*.json`, and refuses one it cannot parse — moved to `
 it may carry a webhook URL) could otherwise read it
 half-written — after the panel had already been told `queued`. The temp name must never end in `.json`.
 If any step fails the temp file is removed and `plugin-request` exits non-zero instead of reporting
-`queued`; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
+`queued` — status 1 and a line of its own (`plugin-request: could not write the request into the bot's
+mailbox`) after docker's stderr; older versions of this script exited with docker's own status and
+printed only docker's stderr, and the panel checks only for non-zero; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
 `bun`, like the write) can still read and delete.
 
 The bot **drains** the mailbox every few seconds on its own timer, at the start of its update tick
@@ -268,7 +270,10 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   the file — yet a manifest `format` such as the shipped `^\S+$`, and the static `PLUGIN_INDEX_URL`
   regex, admit both. (The guard is not limited to a leading quote because compose trims a wider set of
   whitespace than bash does, U+0085 and U+00A0 among it, before it looks for one; no shipped key needs
-  either character. Older versions of this script checked neither.) (4) A key the
+  either character. Older versions of this script checked neither.) Only a value that would change is
+  judged: a plain key resubmitted with the value it already holds is skipped before this check (#44's
+  rule), so a stored value that holds one never blocks an unrelated save; a submitted secret always
+  counts as a change, so it is always judged. (4) A key the
   deployment owns — the core credentials, the access and admin settings, and every variable
   `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
   (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a

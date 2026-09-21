@@ -1661,6 +1661,29 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     }
   });
 
+  test("a carriage return alone in a manifest format or required makes the entry unusable too", async () => {
+    // A CR cannot re-frame the rows the way an LF can, but the entry is still dropped whole, the same way.
+    for (const [why, override] of [
+      ["format", { format: "^x$\r" }],
+      ["required", { required: "true\r" }],
+    ] as [string, Record<string, unknown>][]) {
+      const index = wrapIndex([pluginEntry("evil", [{ ...envKey("X1", "^x$"), ...override }, envKey("X2", "^y$")])]);
+      const fx = setup("PLUGINS=evil\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+      const keys = Object.keys((await botOps(fx, ["env-schema"])).json ?? {});
+      expect(keys, why).not.toContain("X1");
+      expect(keys, why).toContain("X2"); // the well-formed entry beside it still lists
+    }
+  });
+
+  test("a plain key two plugins both declare is listed once, and the FIRST declaration's format is the one enforced", async () => {
+    const index = wrapIndex([pluginEntry("aaa", [envKey("KEY_X", "^a+$")]), pluginEntry("bbb", [envKey("KEY_X", "^b+$")])]);
+    const fx = setup("PLUGINS=aaa,bbb\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const schema = (await botOps(fx, ["env-schema"])).json as unknown as Record<string, { pattern: string }>;
+    expect(schema.KEY_X?.pattern).toBe("^a+$");
+    expect((await botOps(fx, ["env-set"], "KEY_X=bbb\n")).exitCode).toBe(1); // the second plugin's format does not apply
+    expect((await botOps(fx, ["env-set"], "KEY_X=aaa\n")).exitCode).toBe(0);
+  });
+
   test("a `secret` that is not exactly false or absent counts as secret (fail closed)", async () => {
     const asSecret: unknown[] = ["yes", 1, "TRUE", "true ", "false", [], {}, "true"];
     for (const secret of asSecret) {
@@ -2552,8 +2575,10 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
       // and for real: the directory holds exactly the final file, with the whole body, and no temp file
       expect(readdirSync(mailbox(fx)), payload.action).toEqual([queued]);
       expect(readFileSync(join(mailbox(fx), queued), "utf8"), payload.action).toBe(stdinOf(fx));
+      // and the body is exactly what was sent: no trailing newline, nothing re-encoded
+      expect(stdinOf(fx), payload.action).toBe(req(payload));
     }
-  });
+  }, LONG);
 
   test("the temp name does not end in .json, so the bot's drain never lists it", async () => {
     // The assumption this rests on: the drain lists only names ending .json.
@@ -2673,13 +2698,37 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     const ok = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" }));
     expect(ok.exitCode).toBe(0);
     expect(JSON.parse(stdinOf(fx))).toEqual({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" });
-    const bad: unknown[] = ["abc", "1234", "12345678901234567890123456", 12345, CHANNEL + "x", "", undefined, null, { id: CHANNEL }];
+    const bad: unknown[] = ["abc", "1234", "12345678901234567890123456", 12345, CHANNEL + "x", "", undefined, null, { id: CHANNEL }, WEBHOOK_URL];
     for (const channelId of bad) {
       const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId, requestedBy: "t" }));
       expect(run.exitCode, String(channelId)).not.toBe(0);
-      expect(run.stderr, String(channelId)).toContain("plugin-request: bad channelId");
+      // names the field and nothing else: a webhook URL put in the wrong field is not echoed back
+      expect(run.stderr.trim(), String(channelId)).toBe("bot-ops: plugin-request: bad channelId");
+    }
+  }, LONG);
+
+  test("webhook-remove: a channel id of 5 and of 25 digits is a snowflake (4 and 26 are refused above)", async () => {
+    for (const id of ["12345", "1".repeat(25)]) {
+      const run = await botOps(setup(ENV), ["plugin-request"], req({ action: "webhook-remove", channelId: id, requestedBy: "t" }));
+      expect(run.exitCode, id).toBe(0);
     }
   });
+
+  test("days is checked only for remind, and only when it is there", async () => {
+    // These lines moved into a `case` arm with #240; the behaviour is main's.
+    const fx = setup(ENV);
+    const ok = (payload: object) => botOps(fx, ["plugin-request"], req({ plugin: "music", version: "1.1.0", requestedBy: "t", ...payload }));
+    expect((await ok({ action: "remind" })).exitCode, "remind without days: the bot's default").toBe(0);
+    expect((await ok({ action: "remind", days: 3 })).exitCode, "remind 3").toBe(0);
+    for (const days of [0, 1000]) {
+      const run = await ok({ action: "remind", days });
+      expect(run.exitCode, `remind ${days}`).not.toBe(0);
+      expect(run.stderr, `remind ${days}`).toContain(`plugin-request: bad days '${days}'`);
+    }
+    // an action that has no days never has it judged
+    expect((await ok({ action: "skip", days: 0 })).exitCode, "skip 0").toBe(0);
+    expect((await ok({ action: "update-now", days: 1000 })).exitCode, "update-now 1000").toBe(0);
+  }, LONG);
 
   test("discovery-refresh round-trips", async () => {
     const fx = setup(ENV);
@@ -2782,7 +2831,8 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     expect(expected.length).toBeGreaterThan(1);
     const run = await botOps(fx, ["plugin-request"], req(REQUESTS[3]!), { BASH_ENV: bashPath(seed) });
     expect(run.exitCode).toBe(0);
-    expect(String(run.json?.queued)).toMatch(new RegExp(`^\\d{10,}-skip-${expected}\\.json$`));
+    // the first part is the epoch in MILLISECONDS: thirteen digits (`date +%s` would give ten)
+    expect(String(run.json?.queued)).toMatch(new RegExp(`^\\d{13}-skip-${expected}\\.json$`));
   });
 
   test("a webhook token needs at least 20 characters (Discord's are far longer)", async () => {
