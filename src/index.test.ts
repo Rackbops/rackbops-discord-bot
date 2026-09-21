@@ -268,6 +268,48 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #259: joining and leaving a server. index.ts can't run under test, so the wiring is pinned in the source.
+  describe("a server joined or left after boot is wired to guildJoined / guildLeft (#259)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const createListener = source.indexOf("client.on(Events.GuildCreate", activateFn);
+    const deleteListener = source.indexOf("client.on(Events.GuildDelete", activateFn);
+    const initCall = source.indexOf("initRouting({", activateFn);
+    const bootCall = source.indexOf('applyRouting("boot")', activateFn);
+
+    test("joining and leaving a server are wired to guildJoined / guildLeft, inside activate(), before the boot registration", () => {
+      expect(activateFn).toBeGreaterThan(-1);
+      expect(createListener).toBeGreaterThan(activateFn);
+      expect(deleteListener).toBeGreaterThan(activateFn);
+      // Attached before initRouting and the boot registration, so a server joined while that runs is not missed.
+      expect(createListener).toBeLessThan(initCall);
+      expect(deleteListener).toBeLessThan(initCall);
+      expect(initCall).toBeLessThan(bootCall);
+      expect(source).toMatch(/client\.on\(Events\.GuildCreate,\s*\(guild\)\s*=>\s*void guildJoined\(guild\)\);/);
+      expect(source).toMatch(/client\.on\(Events\.GuildDelete,\s*\(guild\)\s*=>\s*void guildLeft\(guild\)\);/);
+      for (const name of ["guildJoined", "guildLeft"]) {
+        expect(source).toMatch(new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from "\\./routing/live";`));
+      }
+      // One of each: a second listener would register twice.
+      expect((source.match(/Events\.GuildCreate/g) ?? []).length).toBe(1);
+      expect((source.match(/Events\.GuildDelete/g) ?? []).length).toBe(1);
+    });
+
+    test("neither listener can reject into the emitter", () => {
+      // `void`, and the functions are the never-rejecting ones -- not applyRouting, which can reject in single mode.
+      expect((source.match(/void guildJoined\(guild\)/g) ?? []).length).toBe(1);
+      expect((source.match(/void guildLeft\(guild\)/g) ?? []).length).toBe(1);
+      expect(source).not.toMatch(/Events\.Guild(?:Create|Delete),\s*async/);
+      expect(source).not.toMatch(/Events\.Guild(?:Create|Delete),[^\n]*(?:applyRouting|refreshDiscovery)/);
+      expect(source).not.toMatch(/await guild(?:Joined|Left)\(/);
+    });
+
+    test("availability events are not wired: a server going into or coming back from an outage is neither a join nor a leave", () => {
+      expect(source).not.toMatch(/Events\.GuildAvailable/);
+      expect(source).not.toMatch(/Events\.GuildUnavailable/);
+      expect(source).not.toMatch(/["']guildAvailable["']|["']guildUnavailable["']/);
+    });
+  });
+
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });

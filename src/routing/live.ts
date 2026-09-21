@@ -8,6 +8,9 @@
 // re-registers or rewrites discovery therefore goes through `enqueue`, and a second call waits behind
 // the first.
 //
+// A server the bot joins or leaves after boot (#259) goes through the same chain: `guildJoined`
+// registers again (routed mode) or only refreshes discovery (single mode), `guildLeft` refreshes discovery.
+//
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
 // `single` mode (today's behaviour) the error is rethrown once `discovery.json` has been written (it
 // is not written when the bot's servers could not be read), so `index.ts` reaches its own long
@@ -20,6 +23,7 @@ import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as Command
 import type { PluginCommandMap } from "../plugins/host";
 import { buildDiscovery, snapshotGuilds, writeDiscovery, type GuildSnapshot, type PluginSummary } from "./discovery";
 import { describeError, planRegistration, registerPlan, type GuildRegistration } from "./register";
+import { hasPlacements } from "./resolve";
 import { readRouting } from "./store";
 
 export interface RoutingContext {
@@ -181,6 +185,53 @@ export function refreshDiscovery(): Promise<void> {
     const snapshots = takeSnapshots(context);
     if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
   });
+}
+
+/**
+ * The bot has joined a server (discord.js `guildCreate`). In routed mode the new server has no commands
+ * until something registers there, so this registers again -- the whole run, through `applyRouting`, the
+ * one path that is already serialized, recorded and tested -- which also rewrites `discovery.json`, so the
+ * panel lists the server within seconds. In single mode there is nothing to register (the one
+ * guild-or-global call already covers a new server, as it always has) and only discovery is refreshed.
+ *
+ * The mode is decided HERE, from a fresh read of routing.json, and NOT inside the chain: `applyRouting`
+ * and `refreshDiscovery` each queue themselves on it, so calling either from inside a queued job would
+ * wait on itself forever. A join that arrives while the boot registration is running queues behind it.
+ * Before `initRouting` it does nothing: the boot registration that follows snapshots the cache, which
+ * already holds the new server.
+ *
+ * Never rejects. It is called from an event listener, where a rejection is a process-level event, and
+ * `applyRouting` CAN reject here: between the read and the call the last placement may have been removed,
+ * which makes that run a single-mode one, and single mode rethrows a failed registration.
+ */
+export async function guildJoined(guild: { id: string; name: string }): Promise<void> {
+  const c = context;
+  if (c === undefined) return;
+  try {
+    c.log.log(`[routing] joined ${guild.name} (${guild.id})`);
+    if (hasPlacements(await readRouting(c.dataDir))) await applyRouting(`joined ${guild.name}`);
+    else await refreshDiscovery();
+  } catch (err) {
+    c.log.error(`[routing] handling the join of ${guild.name} (${guild.id}) failed`, err);
+  }
+}
+
+/**
+ * The bot has left a server (discord.js `guildDelete`: kicked, or the server is gone -- an outage is a
+ * different event). The server stops being offered because discovery is rewritten from what the bot can
+ * see now. routing.json is NOT touched: being kicked and re-invited must not lose a placement, and the
+ * panel already shows a server that is in routing but not in discovery as unavailable (#246). Before
+ * `initRouting` it does nothing. Never rejects, for the reason `guildJoined` gives.
+ */
+export async function guildLeft(guild: { id: string; name: string }): Promise<void> {
+  const c = context;
+  if (c === undefined) return;
+  try {
+    c.log.log(`[routing] left ${guild.name} (${guild.id})`);
+    await refreshDiscovery();
+  } catch (err) {
+    c.log.error(`[routing] handling the departure from ${guild.name} (${guild.id}) failed`, err);
+  }
 }
 
 /** Resolves once everything queued so far has settled. For tests, which need to wait for a refresh
