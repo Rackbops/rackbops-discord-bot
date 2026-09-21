@@ -26,11 +26,12 @@ time, not silently written.
 |---|---|
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
-| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload |
+| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
-| `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or the installed plugin's manifest) |
-| `plugin-request` | Read one plugin-update **request JSON** from stdin (`{action, plugin, version?, at?, days?, requestedBy}` — `action` ∈ `update-now`/`schedule`/`remind`/`skip`/`cancel`), validate it, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
+| `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or the installed plugin's manifest); then one row per installed plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
+| `routing-get` | JSON `{"routing": …, "discovery": …}` — the bot's per-plugin routing record and what it can see (`data/routing.json`, `data/discovery.json`), read from the container like `status` reads `state.json`. A missing, empty or corrupt file is `null`, never an error. Any webhook URL a hand-edit left in either file is redacted (best effort — the files are not meant to hold one), and the bot's webhook store is never opened (#240, ADR-0006) |
+| `plugin-request` | Read one **request JSON** from stdin (`{action, …, requestedBy}`), validate it per action, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. `action` ∈ the five plugin-update actions `update-now`/`schedule`/`remind`/`skip`/`cancel` (`plugin`, `version?`, `at?`, `days?`) or, since #240, `routing-set` (`plugin`, `servers`), `webhook-add` (`url`), `webhook-remove` (`channelId`), `discovery-refresh`. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
 | `version` | JSON `{"schema": N, "composeSchema": M}` — this script's own `BOT_OPS_SCHEMA`, plus the deployed `docker-compose.yml`'s `x-rackbops-schema:` (`null` when unreadable/unset/absent). The admin panel runs this once at startup to check neither deployed file is behind the panel image; see "Keeping `bot-ops.sh` and `docker-compose.yml` current" below |
 
 Run directly on the box to test. `BOT_OPS_CONFIG_DIR` (holds `.env` + `backups/`),
@@ -58,6 +59,16 @@ remind, skip, cancel. The panel is a **separate service that can't write the bot
 bot is the sole writer). So a panel action becomes a **request file** the bot consumes: `plugin-request`
 validates the JSON and writes it into `data/plugins/requests/` via `docker exec -u bun` (the bot runs
 as `bun`, so `-u bun` makes the file bot-owned — a root-created file would be un-deletable by the bot).
+The file is written **atomically and owner-only**: the body goes to `<file>.tmp` in the same directory
+and is `mv`ed to `<file>`, because `cat > <file>` creates the file before filling it and the bot's
+drain (which reads only `*.json`, and refuses one it cannot parse — moved to `rejected/`, or deleted if
+it may carry a webhook URL) could otherwise read it
+half-written — after the panel had already been told `queued`. The temp name must never end in `.json`.
+If any step fails the temp file is removed and `plugin-request` exits non-zero instead of reporting
+`queued` — status 1 and a line of its own (`plugin-request: could not write the request into the bot's
+mailbox`) after docker's stderr; older versions of this script exited with docker's own status and
+printed only docker's stderr, and the panel checks only for non-zero; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
+`bun`, like the write) can still read and delete.
 
 The bot **drains** the mailbox every few seconds on its own timer, at the start of its update tick
 (every ~60s, the backstop) and once at boot, applying each request through the same state builders
@@ -69,9 +80,24 @@ by the bot against the servers and channels it can see; each may carry an option
 chooses, under which the bot records the outcome in `routing.json`'s `results`. A request file that may
 carry a webhook URL is deleted, not moved to `rejected/`, if it is refused. The mailbox can only ever
 run the five update actions on an **already-installed** plugin and those four routing ones; it can't
-enable a new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
+enable a new plugin (that stays `PLUGINS=`-only) or run anything else — the routing actions, described
+below, change where a plugin lives, not which plugins run. `requestedBy` is the panel identity
 (`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
+
+**Routing requests (#240, ADR-0006).** The same mailbox carries four more actions, which change where
+a plugin lives rather than what version it runs: `routing-set` (`{plugin, servers}` — `servers` maps a
+guild id to `{commands: "all" | [channel ids, non-empty], postTo?: channel id}`; an empty object places
+the plugin nowhere), `webhook-add` (`{url}` — a Discord webhook URL, on the `discord.com` /
+`discordapp.com` hosts, with its numeric id and token), `webhook-remove` (`{channelId}`) and
+`discovery-refresh`. `plugin-request` validates each per action before it writes the file and names the
+offending *field* when it refuses — never the value: a webhook URL is a credential, so it travels on
+stdin only and no message echoes any part of it. This script
+only validates and queues; **applying** the requests is the bot's job (since #241, see above), and a
+bot from before that moves such a file to `requests/rejected/` like any unknown action (for a
+`webhook-add` that file still holds the URL, owner-only, until someone clears it — so roll the bot
+forward before the panel). `routing-get` reads
+the two files the bot writes — its routing record and what it can see — so a panel can show them.
 
 ## Keeping `bot-ops.sh` and `docker-compose.yml` current
 
@@ -186,23 +212,92 @@ key back to its documented default.
 
 **Plugin-declared keys** — on top of the static list above, every **installed** plugin (named in
 `PLUGINS=`) contributes its own env keys: `env-get` lists them (non-secret only, after the static
-keys, in manifest order) and `env-set` accepts them, validating each with the format, honouring the
-`required` flag, and refusing the `secret` keys the Plugin Index carries — read from the bot's
-cached `data/plugins/index.json`, never hand-mirrored here. This is where `WARBANDEER_INGEST_PORT`
+keys, in manifest order) and `env-set` accepts them, validating each with the format and honouring
+the `required` flag — read from the bot's cached `data/plugins/index.json`, never hand-mirrored
+here. This is where `WARBANDEER_INGEST_PORT`
 lives now that the connector is the `warbandeer` plugin (issue #100): set `PLUGINS=warbandeer` and
-the key becomes editable once the bot has cached the index. A plugin's `secret` keys are never
-listed or written, exactly like the core secrets below. If the bot isn't running (no cached index),
+the key becomes editable once the bot has cached the index. A plugin's **`secret` keys are
+write-only** (#240, ADR-0006 decision 8): `env-set` accepts them, validated against their `format`
+like any other key, but `env-get` never lists one and `env-schema` reports it only as `secret: true`
+plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A key the deployment
+itself owns (a core credential, or a variable `docker-compose.yml` interpolates) stays out of every
+plugin path even if a manifest declares it. If the bot isn't running (no cached index),
 `env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** — never
 an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
 `env-set` refuses a plugin key in that same state, since it can't read the manifest to validate one;
 edit a plugin's keys while the bot is up. A valid-JSON-but-wrong-shape cached index is treated the
 same way (degraded, never a crash).
 
-**Secrets are intentionally absent** — `DISCORD_TOKEN`, `BLIZZARD_CLIENT_ID`,
-`BLIZZARD_CLIENT_SECRET`, `GITHUB_TOKEN`, `CLOUDFLARE_TUNNEL_TOKEN`. `env-get` never reads them
-out and `env-set` refuses to write them. Edit those by hand with `nano` on the box.
+**Core secrets are intentionally absent** — `DISCORD_TOKEN`, `GITHUB_TOKEN`, `ADMIN_TOKEN`,
+`CLOUDFLARE_TUNNEL_TOKEN` and the other credentials the bot core itself reads. `env-get` never reads
+them out and `env-set` refuses to write them. Edit those by hand with `nano` on the box. (A plugin's
+own `secret` keys are the one exception, and only for writing — see below. The wow plugin's
+`BLIZZARD_CLIENT_ID` / `BLIZZARD_CLIENT_SECRET` are such keys, not core: nothing in the bot core reads
+them, so with `wow` in `PLUGINS=` the panel can set them.)
 
 ## Safety notes
+
+- **Plugin secrets are write-only** (#240, ADR-0006 decision 8). Needing SSH to give a plugin its API
+  key made adding one painful, so `env-set` accepts a key the cached Plugin Index marks `secret:
+  true` — for a plugin named in `PLUGINS=` — and nothing ever reads it back. The value appears in no
+  output this script emits: not in `env-get` (a secret key is never listed), not in `env-schema`
+  (`secret: true` and `isSet` only), not in `env-set`'s result (it names changed *keys*), not in a
+  refusal message (those name a key, and only one that looks like a variable name), not on stderr,
+  and not in `docker`'s argv. These keep that true. (1) A submitted secret is **always written** and
+  reported as changed, even with the value it already has: otherwise "no changes" would tell a caller
+  its guess was the stored value. The one exception is a blank for a key that is already unset, which
+  reveals only what `isSet` already does. (2) What `docker compose` prints is relayed — as `log` by
+  `env-set`, as its output by `restart` — and compose is not ours: it quotes a `.env` line it refuses
+  to parse. So a message that is **about the env file** (it names the file, or says "env file") is
+  **withheld whole** and replaced by the script's own sentence: compose's output mentioned an env file,
+  it is withheld because such a message can quote the file's contents, the line numbers it gave (if
+  any), and running the same command on the host shows the original. That sentence names no path and
+  claims no cause or remedy, and is the same whether the command failed or succeeded. The premise:
+  compose-go's dotenv reader wraps every parse error as `failed to read <path>: …` (compose-spec/
+  compose-go `main`, `dotenv/format.go`, read on 2026-09-21 — upstream `main`, not the compose on any
+  host, which was never run for this), so the messages most likely to quote the file name it; and no
+  amount of guessing which part of a line it printed can be made exact (compose ends a key at `=` or
+  `:`, drops `export`, and trims U+0085 / U+00A0). Anything else is scrubbed (any other message can
+  quote a value too), best effort, of what `env-get` would not print — core
+  credentials, plugin secrets and plain plugin settings alike; only a static key written `KEY=value`
+  is left — worked out from `.env` itself and never from the Plugin Index, which is unavailable exactly
+  when the bot is down and compose is complaining. Every definition of a key counts; a line written
+  any other way, or that is no definition at all, is scrubbed as a whole line and from its first `=`
+  and `:` on; texts are replaced longest first (so a short secret can never unmask a longer one that
+  contains it); and a text under six characters is left alone so the message stays readable (a
+  credential that short is therefore not scrubbed). The second layer is best effort, not a proof: a
+  tool that printed a value transformed would not be caught, and a compose that echoed caller-controlled text could still tell a caller whether a guess
+  equals a stored secret (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
+  refused for every key (it could start a new `.env` line), naming the key only, and so is a value
+  containing `$` or a quote **anywhere**, for every key, secret or plain, static or plugin: compose
+  reads a `.env` value as syntax, so `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core
+  secret into a plugin's key (and `PLUGIN_INDEX_URL=https://host/?t=${DISCORD_TOKEN}` would send it to
+  that host), and a quote can open a value that swallows the lines after it and stops compose loading
+  the file — yet a manifest `format` such as the shipped `^\S+$`, and the static `PLUGIN_INDEX_URL`
+  regex, admit both. (The guard is not limited to a leading quote because compose trims a wider set of
+  whitespace than bash does, U+0085 and U+00A0 among it, before it looks for one; no shipped key needs
+  either character. Older versions of this script checked neither.) Only a value that would change is
+  judged: a plain key resubmitted with the value it already holds is skipped before this check (#44's
+  rule), so a stored value that holds one never blocks an unrelated save; a submitted secret always
+  counts as a change, so it is always judged. (4) A key the
+  deployment owns — the core credentials, the access and admin settings, and every variable
+  `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
+  (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
+  manifest that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails
+  closed on the manifest: a key that *any* plugin in the index declares secret — enabled or not — is
+  never listed as a plain key, a `secret` that is not exactly `false`, `null` or absent counts as secret, an
+  entry whose `key`, `format` or `required` holds a line break (or that has no string `format`) is
+  unusable (a line break could re-frame the rows the script reads and forge a plain row for another
+  plugin's secret) — though an unusable entry that claims `secret` still marks its key secret — and a
+  secret key that
+  collides with a static key is ignored (the static key wins). A panel admin who can set
+  `PLUGIN_INDEX_URL` controls that index — and the plugin code the bot installs from it — so this
+  protects against the panel, its logs and screens, not against whoever owns the index. The
+  backup `env-set` writes still holds the previous `.env` — secrets included — which is why it is
+  `0600`. A **webhook URL** in a `plugin-request` is treated the same way: it travels on stdin only,
+  no message echoes any part of it (the new actions' messages name the field only; an update
+  action's rejected field is echoed only when it is at most 40 printable characters, else `(not
+  shown)`), and every request file is written owner-only (`umask 077`).
 
 - **Compose project + container come from `BOT_OPS_PROJECT` / `BOT_OPS_CONTAINER`** (a panel passes
   them per selected bot) — required, with no default (issue #41: a monorepo-era fallback once

@@ -1,14 +1,26 @@
 // Real-bash tests for ops/bot-ops.sh's env-get / env-set: the script is spawned as-is against a
-// throwaway config dir, with a fake `docker` shim first on PATH (it logs its argv and exits 0, so
-// `up -d --force-recreate` never reaches a daemon) and `jq` from the host. Discovered by the root
+// throwaway config dir, with a fake `docker` shim first on PATH (it logs its argv, serves fixture files
+// for the `exec … cat` reads, and runs the plugin-request write's `sh -c` for real against <bin>/data;
+// every other call exits 0, so `up -d --force-recreate` never reaches a daemon) and `jq` from the host.
+// Discovered by the root
 // `bun test` the same way ops/admin/server.test.ts is. Needs bash + jq on PATH; on a box without
 // them the whole file skips LOUDLY rather than passing vacuously. On Windows, Git's own bash is
 // used — a WSL bash.exe earlier on PATH would run the script against a different filesystem.
-import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, describe, expect, test as bunTest } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { repairRouting } from "../src/routing/model";
+
+// Every test here spawns real bash + jq, ~0.3-0.5 s a call on Windows; a test that loops over a
+// table of cases (the #240 request-validation ones do) can pass Bun's 5 s default on a loaded box, so
+// each test gets a minute instead. Same test bodies, same names; only the ceiling moves.
+const test = (name: string, fn: () => void | Promise<void>, ms = 60_000) => bunTest(name, fn, ms);
+/** For the table-driven tests that spawn bash + jq dozens of times: three minutes, not one. */
+const LONG = 180_000;
+/** For the largest tables (dozens of env-set runs): seven minutes on a loaded Windows box, seconds on Linux. */
+const VERY_LONG = 420_000;
 
 const BOT_OPS_SH = fileURLToPath(new URL("./bot-ops.sh", import.meta.url));
 
@@ -74,6 +86,21 @@ function setup(
      *  path, i.e. the file isn't there in the container (index unavailable / no state). */
     pluginIndex?: string;
     pluginState?: string;
+    /** Fixture text the fake `docker exec … cat` returns for the bot's routing record and its
+     *  discovery file (`/app/data/routing.json`, `/app/data/discovery.json` — #240), verbatim, so a
+     *  test can serve corrupt or hand-edited content. Absent → the file isn't in the container. The
+     *  shim matches by substring, and `/app/data/routing.json` is not a substring of the bot's
+     *  webhook store's path, so a read of that store would never be served by this shim (the
+     *  "never reads the secrets file" test asserts on docker.log, not on this). */
+    routing?: string;
+    discovery?: string;
+    /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
+     *  stdout) and exits with — for the tests that check a recreate message can't carry a secret. */
+    composeUp?: { output: string; exitCode?: number };
+    /** The same for the fake `docker compose … restart` — restart relays compose's output too. */
+    composeRestart?: { output: string; exitCode?: number };
+    /** Inject a failure into the plugin-request write (see the exec handler in setup()). */
+    requestWrite?: "mv-fails" | "exec-fails";
   } = {},
 ): Fixture {
   const root = mkdtempSync(join(tmpdir(), "bot-ops-44-"));
@@ -101,16 +128,54 @@ function setup(
   const pluginStateFile = join(root, "plugin-state.json");
   if (opts.pluginIndex !== undefined) writeFileSync(pluginIndexFile, opts.pluginIndex);
   if (opts.pluginState !== undefined) writeFileSync(pluginStateFile, opts.pluginState);
+  const routingFile = join(root, "routing.json");
+  const discoveryFile = join(root, "discovery.json");
+  const composeOutFile = join(root, "compose-up-output.txt");
+  if (opts.routing !== undefined) writeFileSync(routingFile, opts.routing);
+  if (opts.discovery !== undefined) writeFileSync(discoveryFile, opts.discovery);
+  // "{ENV_FILE}" in a fake compose output stands for the env file's path as the script is given it: compose
+  // names the file it could not read, and that path exists only once the fixture does.
+  const withEnvPath = (text: string): string => text.replaceAll("{ENV_FILE}", bashPath(join(cfg, ".env")));
+  if (opts.composeUp !== undefined) writeFileSync(composeOutFile, withEnvPath(opts.composeUp.output));
+  const composeRestartFile = join(root, "compose-restart-output.txt");
+  if (opts.composeRestart !== undefined) writeFileSync(composeRestartFile, withEnvPath(opts.composeRestart.output));
   const execHandler = [
+    // An absent routing / discovery file exits 1, as a real `docker exec … cat <missing>` does (unlike the
+    // older index / state handlers below, which stay silent with status 0) — routing-get must survive it.
+    opts.routing !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then cat ${JSON.stringify(bashPath(routingFile))}; fi`
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then echo "cat: can't open '/app/data/routing.json': No such file or directory" >&2; exit 1; fi`,
+    opts.discovery !== undefined
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then cat ${JSON.stringify(bashPath(discoveryFile))}; fi`
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then echo "cat: can't open '/app/data/discovery.json': No such file or directory" >&2; exit 1; fi`,
+    opts.composeUp !== undefined
+      ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
+      : "",
+    opts.composeRestart !== undefined
+      ? `if [[ "$1" == "compose" ]] && [[ "\${@: -1}" == "restart" ]]; then cat ${JSON.stringify(bashPath(composeRestartFile))}; exit ${opts.composeRestart.exitCode ?? 0}; fi`
+      : "",
     opts.pluginIndex !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/index.json"* ]]; then cat ${JSON.stringify(bashPath(pluginIndexFile))}; fi`
       : "",
     opts.pluginState !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/state.json"* ]]; then cat ${JSON.stringify(bashPath(pluginStateFile))}; fi`
       : "",
-    // #105 plugin-request write: capture the piped payload so a test can assert the round-trip (the
-    // real docker would run the container's `cat > …/requests/<file>`; the fake records stdin here).
-    `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests/"* ]]; then cat > "$(dirname "$0")/request-stdin.json"; fi`,
+    // #105 plugin-request write. The fake records the piped payload (request-stdin.json) so a test can
+    // assert the round-trip, AND runs the `sh -c` the script sent for real, with `/app/data` pointed at
+    // <bin>/data, so the temp-then-rename write and its cleanup are exercised, not just string-matched.
+    // opts.requestWrite injects a failure: "mv-fails" makes the rename fail after the body is written,
+    // "exec-fails" makes the whole `docker exec` fail (container not running).
+    opts.requestWrite === "exec-fails"
+      ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests"* ]]; then cat > /dev/null; echo "Error response from daemon: container is not running" >&2; exit 1; fi`
+      : [
+          `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/plugins/requests"* ]]; then`,
+          `  cmd="\${@: -1}"; data="$(dirname "$0")/data"; cmd="\${cmd//\\/app\\/data/$data}"`,
+          opts.requestWrite === "mv-fails" ? `  cmd="\${cmd// mv / false }"` : "",
+          `  tee "$(dirname "$0")/request-stdin.json" | sh -c "$cmd"; exit "\${PIPESTATUS[1]}"`,
+          `fi`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
   ]
     .filter(Boolean)
     .join("\n");
@@ -965,11 +1030,12 @@ describe.skipIf(!runnable)("bot-ops.sh env-set validates an installed plugin's k
     ]);
   });
 
-  test("a secret plugin key is refused as not editable, and never listed by env-get", async () => {
+  // #240 changed the FIRST half of this test on purpose: a plugin's secret key used to be refused
+  // here ("not an editable key"); since ADR-0006 decision 8 it is settable, write-only — see the
+  // "accepts a plugin's secret key, write-only (#240)" describe below, which owns that behaviour.
+  // What has NOT changed, and stays pinned here, is that env-get never lists it.
+  test("a secret plugin key is never listed by env-get, and its non-secret sibling is", async () => {
     const fx = setup("PLUGINS=warbandeer\n", { pluginIndex: index });
-    const set = await botOps(fx, ["env-set"], "WARBANDEER_SECRET=hunter2\n");
-    expect(set.exitCode).toBe(1);
-    expect(set.stderr).toContain("'WARBANDEER_SECRET' is not an editable key");
     const env = await envGet(fx);
     expect(env).not.toHaveProperty("WARBANDEER_SECRET");
     expect(env).toHaveProperty("WARBANDEER_INGEST_PORT"); // the non-secret sibling IS listed
@@ -1253,6 +1319,40 @@ describe.skipIf(!runnable)("plugin-request (#105)", () => {
   });
 });
 
+// #240, review rounds 4 and 5: restart relays `docker compose restart`'s output to the panel, and compose
+// quotes a .env line it cannot parse -- so it goes through relay_tool_output, as env-set's `log` does.
+describe.skipIf(!runnable)("bot-ops.sh restart relays compose's output withheld or scrubbed (#240)", () => {
+  test("a secret compose quotes while restarting is scrubbed, the exit status is compose's, and no restart is claimed", async () => {
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET="${OLD_SECRET}\n`, {
+      composeRestart: { output: `compose: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stdout).toBe("compose: line 2: unterminated quoted value [redacted]\n");
+    expect(run.stdout).not.toContain("restarted");
+    expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
+  });
+
+  test("what compose says ABOUT the env file is withheld whole while restarting too, and the restart still fails", async () => {
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET: "${OLD_SECRET}\n`, {
+      composeRestart: { output: `failed to read {ENV_FILE}: line 2: unterminated quoted value "${OLD_SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stdout).toBe(`${withheld("line 2")}\n`);
+    expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
+  });
+
+  test("a successful restart still prints what compose said, then says restarted", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      composeRestart: { output: " Container probe-container  Restarting\n Container probe-container  Started" },
+    });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout).toBe(" Container probe-container  Restarting\n Container probe-container  Started\nrestarted probe-container\n");
+  });
+});
+
 // #60 item 2 / #168: name which .env this command is acting on, on stderr — env-get/status's
 // stdout is JSON the panel parses (#101's lesson), so the new line must never land on stdout.
 describe.skipIf(!runnable)("bot-ops.sh restart/env-set log which env file they act on (issue #60 item 2 / #168)", () => {
@@ -1300,15 +1400,22 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
-  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 2, #205)", () => {
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 3, #240)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=2\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=3\b/);
+  });
+
+  test("reports schema 3 (#240: routing-get, the four routing/webhook request actions, write-only plugin secrets)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["version"]);
+    expect(run.exitCode).toBe(0);
+    expect((run.json as { schema: number }).schema).toBe(3);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
@@ -1328,7 +1435,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -1341,7 +1448,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 });
 
@@ -1354,7 +1461,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 3, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -1365,7 +1472,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -1373,7 +1480,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: null });
+    expect(run.json).toEqual({ schema: 3, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -1381,6 +1488,1492 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 2, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 3, composeSchema: 2 });
+  });
+});
+
+// ---- #240: write-only plugin secrets, routing-get, the four routing / webhook request actions ------
+// Epic #236, ADR-0006. The property everything below rests on: a plugin secret's VALUE (and a webhook
+// URL) never leaves the script — not in env-get, env-schema, env-set's result, a die message, stderr,
+// or docker's argv (docker.log). `everythingObservable` gathers every place a value could surface.
+
+/** A recognisable plugin secret: it matches MUSIC_API_KEY's format below and cannot occur in any
+ *  fixture or output by chance, so "the value appears nowhere" is a meaningful literal search. */
+const SECRET = "sk_live_Zx91QpL7mNv3TrWq";
+const OLD_SECRET = "sk_old_Qw83RtYu12LmNbVc";
+const WEBHOOK_TOKEN = "Zk3nQ8xV1mB7cR4tY9uL2pS6wA0dF5gHjKq";
+const WEBHOOK_URL = `https://discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`;
+
+const SECRET_INDEX = wrapIndex([
+  pluginEntry("music", [
+    envKey("MUSIC_PORT", PORT_RE),
+    envKey("MUSIC_API_KEY", "^[A-Za-z0-9_-]{8,64}$", { secret: true }),
+    envKey("MUSIC_MUST_KEY", "^[a-z]{4,}$", { secret: true, required: true }),
+  ]),
+]);
+const MUSIC_ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_MUST_KEY=abcd\n";
+
+/** Every place a value could surface after a run: both output streams, docker's logged argv, the
+ *  config dir's file names and the backups listing. (A backup's CONTENT legitimately holds the
+ *  previous .env, values included — it is 0600 and asserted separately.) */
+/** The sentence relay_tool_output prints in place of a message that is about the env file: it names no
+ *  path, claims no cause and no remedy, and is the same whether the command failed or succeeded. */
+function withheld(lines?: string): string {
+  const named = lines === undefined ? "" : ` It named ${lines}.`;
+  return `docker compose's output mentioned an env file, so it is withheld: such a message can quote the file's contents.${named} Run the same command on the host to see it.`;
+}
+
+function everythingObservable(fx: Fixture, run: Run): string {
+  return [
+    run.stdout,
+    run.stderr,
+    dockerCalls(fx).join("\n"),
+    readdirSync(fx.cfg).join("\n"),
+    existsSync(join(fx.cfg, "backups")) ? readdirSync(join(fx.cfg, "backups")).join("\n") : "",
+  ].join("\n--\n");
+}
+
+describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, write-only (#240)", () => {
+  test("a secret key is written to .env and named in changed", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["MUSIC_API_KEY"], recreated: true });
+    expect(envText(fx)).toBe(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`);
+    expect(readdirSync(join(fx.cfg, "backups"))).toHaveLength(1);
+    expect(dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"))).toBe(true);
+  });
+
+  test("env-get emits neither its name nor its value, before or after", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const before = await botOps(fx, ["env-get"]);
+    expect(before.exitCode).toBe(0);
+    expect(before.stdout).not.toContain("MUSIC_API_KEY");
+    expect(before.stdout).not.toContain("MUSIC_MUST_KEY"); // a stored secret is not listed either
+    await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    const after = await botOps(fx, ["env-get"]);
+    expect(after.stdout).not.toContain("MUSIC_API_KEY");
+    expect(after.stdout).not.toContain(SECRET);
+    expect(after.stderr).not.toContain(SECRET);
+    expect(after.json).toHaveProperty("MUSIC_PORT"); // the plugin's non-secret sibling IS listed
+    expect(Object.keys(after.json!)).toEqual(Object.keys(before.json!));
+  });
+
+  test("its format is enforced", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], "MUSIC_API_KEY=short\n"); // < 8 chars
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("env-set: value for 'MUSIC_API_KEY' is invalid");
+    expect(envText(fx)).toBe(MUSIC_ENV); // untouched
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("a required secret cannot be blanked, an optional one can be cleared", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const blank = await botOps(fx, ["env-set"], "MUSIC_MUST_KEY=\n");
+    expect(blank.exitCode).toBe(1);
+    expect(blank.stderr).toContain("env-set: 'MUSIC_MUST_KEY' is required and cannot be blank");
+    expect(envText(fx)).toBe(MUSIC_ENV);
+    expect((await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`)).exitCode).toBe(0);
+    const clear = await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect(clear.exitCode).toBe(0);
+    expect(clear.json).toMatchObject({ changed: ["MUSIC_API_KEY"] });
+    expect(envText(fx)).toContain("MUSIC_API_KEY=\n");
+  });
+
+  test("a core secret is still refused", async () => {
+    const fx = setup(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`, { pluginIndex: SECRET_INDEX });
+    for (const key of ["DISCORD_TOKEN", "GITHUB_TOKEN", "ADMIN_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN", "CLOUDFLARE_ACCESS_AUD"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=${SECRET}\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+      expect(everythingObservable(fx, run), key).not.toContain(SECRET);
+    }
+    expect(envText(fx)).toBe(`${MUSIC_ENV}DISCORD_TOKEN=keepme\n`);
+    expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
+  });
+
+  test("the wow plugin's Blizzard client is not core: settable, write-only, listed nowhere but env-schema", async () => {
+    // Shaped like the real wow entry in the published Plugin Index: both keys `secret: true`, format
+    // ^\S+$. BLIZZARD_CLIENT_* belong to that plugin, so the panel must be able to set them.
+    const index = wrapIndex([
+      pluginEntry("wow", [
+        envKey("WOW_REGION", "^(us|eu)$"),
+        envKey("BLIZZARD_CLIENT_ID", "^\\S+$", { secret: true }),
+        envKey("BLIZZARD_CLIENT_SECRET", "^\\S+$", { secret: true }),
+      ]),
+    ]);
+    const base = "PLUGINS=wow\nANNOUNCE_CHANNEL_ID=11111\n";
+    const fx = setup(base, { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], `BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["BLIZZARD_CLIENT_SECRET"], recreated: true });
+    expect(envText(fx)).toBe(`${base}BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.stdout).not.toContain("BLIZZARD");
+    expect(get.stdout).not.toContain(SECRET);
+
+    const schema = await botOps(fx, ["env-schema"]);
+    expect(schema.json).toMatchObject({
+      WOW_REGION: { source: "plugin", required: false },
+      BLIZZARD_CLIENT_ID: { source: "plugin", secret: true, isSet: false },
+      BLIZZARD_CLIENT_SECRET: { source: "plugin", secret: true, isSet: true },
+    });
+    expect(schema.stdout).not.toContain(SECRET);
+
+    // The manifest, not the key's name, is the authority: with wow not enabled the same key is refused.
+    const off = setup("ANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const refused = await botOps(off, ["env-set"], `BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("'BLIZZARD_CLIENT_SECRET' is not an editable key");
+  });
+
+  test("a manifest field holding a line break cannot re-frame the rows and unmask another plugin's secret", async () => {
+    // load_plugin_keys reads five raw lines per key, so a `format` / `required` with embedded newlines
+    // used to shift every later row: the hostile plugin (listed FIRST) forged a plain row for
+    // A_SECRET and env-get listed its stored value. Each payload is framed for one row width.
+    const forged4 = "F1\nF2\nF3\nA_SECRET\n.*\nfalse\nfalse";
+    const forged5 = "^x$\nfalse\nfalse\ntrue\nA_SECRET\n.*\nfalse\nfalse\ntrue\nJUNK";
+    const variants: [string, Record<string, unknown>][] = [
+      ["format, 4-line framing", { format: forged4 }],
+      ["format, 5-line framing", { format: forged5 }],
+      ["required", { required: "false\nfalse\ntrue\nA_SECRET\n.*\nfalse\nfalse\ntrue" }],
+      ["carriage return in the key", { key: "X1\rA_SECRET" }],
+      ["line feed in the key, framed to forge a plain row", { key: "A_SECRET\n.*\nfalse\nfalse\ntrue" }],
+    ];
+    for (const [why, override] of variants) {
+      const evil = { ...envKey("X1", "^x$"), ...override };
+      const index = wrapIndex([
+        pluginEntry("evil", [evil]),
+        pluginEntry("goodplug", [envKey("A_SECRET", "^[A-Za-z0-9_]{8,}$", { secret: true })]),
+      ]);
+      const fx = setup("PLUGINS=evil,goodplug\nANNOUNCE_CHANNEL_ID=11111\nA_SECRET=STOREDVALUE_zzz9\n", { pluginIndex: index });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.exitCode, why).toBe(0);
+      expect(get.stdout, why).not.toContain("A_SECRET");
+      expect(get.stdout, why).not.toContain("STOREDVALUE_zzz9");
+      const schema = await botOps(fx, ["env-schema"]);
+      expect(schema.json, why).toMatchObject({ A_SECRET: { secret: true, isSet: true } });
+      expect(schema.stdout, why).not.toContain("STOREDVALUE_zzz9");
+      expect(Object.keys(schema.json ?? {}), why).not.toContain("X1"); // the hostile entry is dropped whole
+    }
+  });
+
+  test("a carriage return alone in a manifest format or required makes the entry unusable too", async () => {
+    // A CR cannot re-frame the rows the way an LF can, but the entry is still dropped whole, the same way.
+    for (const [why, override] of [
+      ["format", { format: "^x$\r" }],
+      ["required", { required: "true\r" }],
+    ] as [string, Record<string, unknown>][]) {
+      const index = wrapIndex([pluginEntry("evil", [{ ...envKey("X1", "^x$"), ...override }, envKey("X2", "^y$")])]);
+      const fx = setup("PLUGINS=evil\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+      const keys = Object.keys((await botOps(fx, ["env-schema"])).json ?? {});
+      expect(keys, why).not.toContain("X1");
+      expect(keys, why).toContain("X2"); // the well-formed entry beside it still lists
+    }
+  });
+
+  test("a plain key two plugins both declare is listed once, and the FIRST declaration's format is the one enforced", async () => {
+    const index = wrapIndex([pluginEntry("aaa", [envKey("KEY_X", "^a+$")]), pluginEntry("bbb", [envKey("KEY_X", "^b+$")])]);
+    const fx = setup("PLUGINS=aaa,bbb\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const schema = (await botOps(fx, ["env-schema"])).json as unknown as Record<string, { pattern: string }>;
+    expect(schema.KEY_X?.pattern).toBe("^a+$");
+    expect((await botOps(fx, ["env-set"], "KEY_X=bbb\n")).exitCode).toBe(1); // the second plugin's format does not apply
+    expect((await botOps(fx, ["env-set"], "KEY_X=aaa\n")).exitCode).toBe(0);
+  });
+
+  test("a `secret` that is not exactly false or absent counts as secret (fail closed)", async () => {
+    const asSecret: unknown[] = ["yes", 1, "TRUE", "true ", "false", [], {}, "true"];
+    for (const secret of asSecret) {
+      const index = wrapIndex([pluginEntry("p", [envKey("K_SECRET", "^.+$", { secret })])]);
+      const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nK_SECRET=VALUE_OF_K_SECRET\n", { pluginIndex: index });
+      const why = JSON.stringify(secret);
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.stdout, why).not.toContain("K_SECRET");
+      expect(get.stdout, why).not.toContain("VALUE_OF_K_SECRET");
+      const schema = await botOps(fx, ["env-schema"]);
+      expect(schema.json, why).toMatchObject({ K_SECRET: { secret: true, isSet: true } });
+    }
+    for (const plain of [false, null, undefined]) {
+      const extra = plain === undefined ? {} : { secret: plain };
+      const index = wrapIndex([pluginEntry("p", [envKey("K_PLAIN", "^.+$", extra)])]);
+      const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nK_PLAIN=plainvalue\n", { pluginIndex: index });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.json, String(plain)).toMatchObject({ K_PLAIN: "plainvalue" });
+    }
+  });
+
+  test("an unusable manifest entry that claims secret still marks its key secret", async () => {
+    // No `format`, or a `format` with a line break: the entry can never be edited or validated against,
+    // but forgetting its secret claim would let another enabled plugin's plain declaration list the key.
+    const index = wrapIndex([
+      pluginEntry("pa", [
+        { key: "NOFMT_SECRET", description: "no format", secret: true },
+        envKey("BADFMT_SECRET", "^.*\n$", { secret: true }),
+        envKey("BADREQ_SECRET", "^.+$", { secret: true, required: "true\nfalse" }),
+      ]),
+      pluginEntry("pb", [envKey("NOFMT_SECRET", "^.+$"), envKey("BADFMT_SECRET", "^.+$"), envKey("BADREQ_SECRET", "^.+$"), envKey("PB_PORT", PORT_RE)]),
+    ]);
+    const fx = setup(
+      "PLUGINS=pa,pb\nANNOUNCE_CHANNEL_ID=11111\nNOFMT_SECRET=stored-one-1234\nBADFMT_SECRET=stored-two-1234\nBADREQ_SECRET=stored-three-1234\nPB_PORT=8080\n",
+      { pluginIndex: index },
+    );
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.json).toMatchObject({ PB_PORT: "8080" });
+    for (const leak of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET", "stored-one-1234", "stored-two-1234", "stored-three-1234"]) {
+      expect(get.stdout, leak).not.toContain(leak);
+    }
+    // ...and none of them is editable (no usable format to validate a write against)
+    for (const key of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=some-new-value-1\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+    const schema = (await botOps(fx, ["env-schema"])).json ?? {};
+    for (const key of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET"]) expect(Object.keys(schema), key).not.toContain(key);
+  });
+
+  test("a value may not contain a dollar sign or a quote anywhere (compose reads it as syntax)", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("P_SECRET", "^\\S+$", { secret: true }), envKey("P_PLAIN", "^.+$")])]);
+    const base = "PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\n";
+    // compose trims a wider set of whitespace than bash's [[:space:]] (U+0085 and U+00A0 among it) before it
+    // looks for a quote, so a quote is refused wherever it sits, not only at the start.
+    const NEL = String.fromCharCode(0x85);
+    const NBSP = String.fromCharCode(0xa0);
+    const refused = [
+      // every form of interpolation compose knows: $VAR, ${VAR}, ${VAR:-default}, ${VAR-default}, $$, a bare $
+      "${DISCORD_TOKEN}", "abc$def", "$X", "${VAR:-x}", "${VAR-x}", "$$", "$1", "a$", "$",
+      // both quote characters, leading, interior, trailing, alone, and after every kind of leading whitespace
+      '"open', "'open", '"quoted"', 'a"b', "a'b", 'closing"', '"', "'",
+      ' "open', "\t'open", '  "x"', `${NEL}"open`, `${NBSP}"open`,
+    ];
+    for (const key of ["P_SECRET", "P_PLAIN"]) {
+      for (const val of refused) {
+        const fx = setup(base, { pluginIndex: index });
+        const run = await botOps(fx, ["env-set"], `${key}=${val}\n`);
+        const why = `${key}=${JSON.stringify(val)}`;
+        expect(run.exitCode, why).toBe(1);
+        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or a quote`);
+        if (val.trim().length >= 3) expect(everythingObservable(fx, run), why).not.toContain(val); // (a one- or two-character value is in every message by chance)
+        expect(envText(fx), why).toBe(base);
+        expect(existsSync(join(fx.cfg, "backups")), why).toBe(false);
+        expect(recreateCalls(fx).some((c) => c.includes("up -d")), why).toBe(false);
+      }
+      // nothing else is refused: `#` and a backslash still pass `^\S+$` / `^.+$`
+      for (const ok of ["abc-DEF_123", "a#b", "a\\b"]) {
+        const fx = setup(base, { pluginIndex: index });
+        expect((await botOps(fx, ["env-set"], `${key}=${ok}\n`)).exitCode, `${key}=${ok}`).toBe(0);
+      }
+    }
+    // the guard covers static keys too: PLUGIN_INDEX_URL's regex admits `$` and compose would interpolate a
+    // core secret into the URL the bot then fetches its index from
+    const url = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "PLUGIN_INDEX_URL=https://evil.example/x?t=${DISCORD_TOKEN}\n");
+    expect(url.exitCode).toBe(1);
+    expect(url.stderr).toContain("value for 'PLUGIN_INDEX_URL' may not contain a dollar sign or a quote");
+    expect((await botOps(setup(base, { pluginIndex: index }), ["env-set"], "PLUGIN_INDEX_URL=https://index.example/plugins.json\n")).exitCode).toBe(0);
+    // a static key whose own regex also rejects it is stopped by the guard first
+    const stat = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "ANNOUNCE_CHANNEL_ID=1$2\n");
+    expect(stat.stderr).toContain("value for 'ANNOUNCE_CHANNEL_ID' may not contain a dollar sign or a quote");
+  }, VERY_LONG);
+
+  test("the guard covers every static key, whatever its own regex admits", async () => {
+    // PLUGIN_INDEX_URL is the only static key whose regex (`[^[:space:]]+`) admits `$` and quotes; the guard
+    // does not depend on that, so every static key is refused the same way. The list is read from the script.
+    const script = readFileSync(BOT_OPS_SH, "utf8");
+    const spec = script.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+    const keys = [...spec.matchAll(/^\s*'([A-Z0-9_]+)\|/gm)].map((m) => m[1]!);
+    expect(keys).toContain("PLUGIN_INDEX_URL");
+    expect(keys.length).toBeGreaterThanOrEqual(11);
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    for (const key of keys) {
+      for (const bad of ["1$2", '1"2', "1'2"]) {
+        const run = await botOps(fx, ["env-set"], `${key}=${bad}\n`);
+        const why = `${key}=${bad}`;
+        expect(run.exitCode, why).toBe(1);
+        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or a quote`);
+      }
+    }
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
+    // and the one static regex that WOULD admit them, with a value that is otherwise valid
+    for (const url of ["https://index.example/p.json?t=${DISCORD_TOKEN}", "/opt/$HOME/index.json", "https://x.example/it's", 'https://x.example/"q"']) {
+      const run = await botOps(fx, ["env-set"], `PLUGIN_INDEX_URL=${url}\n`);
+      expect(run.exitCode, url).toBe(1);
+      expect(run.stderr, url).toContain("value for 'PLUGIN_INDEX_URL' may not contain a dollar sign or a quote");
+      expect(everythingObservable(fx, run), url).not.toContain(url);
+    }
+  }, VERY_LONG);
+
+  test("the music plugin's SPOTIFY_REDIRECT_URI, whose real manifest format admits `$` and `'`, is refused both", async () => {
+    // The format is copied from the published Plugin Index entry for music.
+    const index = wrapIndex([pluginEntry("music", [envKey("SPOTIFY_REDIRECT_URI", "^https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$")])]);
+    const base = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\n";
+    for (const bad of ["https://x.example/cb?t=${DISCORD_TOKEN}", "https://x.example/cb?t=$ADMIN_TOKEN", "https://x.example/it's"]) {
+      const fx = setup(base, { pluginIndex: index });
+      const run = await botOps(fx, ["env-set"], `SPOTIFY_REDIRECT_URI=${bad}\n`);
+      expect(run.exitCode, bad).toBe(1);
+      expect(run.stderr, bad).toContain("value for 'SPOTIFY_REDIRECT_URI' may not contain a dollar sign or a quote");
+      expect(envText(fx), bad).toBe(base);
+    }
+    const ok = setup(base, { pluginIndex: index });
+    expect((await botOps(ok, ["env-set"], "SPOTIFY_REDIRECT_URI=https://bot.example/spotify/callback\n")).exitCode).toBe(0);
+  });
+
+  test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
+    const index = wrapIndex([
+      pluginEntry("spotify", [envKey("SHARED_KEY", "^[A-Za-z0-9_]{8,}$", { secret: true })]),
+      pluginEntry("music", [envKey("SHARED_KEY", "^.+$"), envKey("MUSIC_PORT", PORT_RE)]),
+    ]);
+    const stored = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nSHARED_KEY=LEFTOVER_VALUE_1\nMUSIC_PORT=8080\n";
+    const off = setup(stored, { pluginIndex: index });
+    const get = await botOps(off, ["env-get"]);
+    expect(get.json).toMatchObject({ MUSIC_PORT: "8080" });
+    expect(get.stdout).not.toContain("SHARED_KEY");
+    expect(get.stdout).not.toContain("LEFTOVER_VALUE_1");
+    expect(Object.keys((await botOps(off, ["env-schema"])).json ?? {})).not.toContain("SHARED_KEY");
+    const refused = await botOps(off, ["env-set"], "SHARED_KEY=another_value_9\n");
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("'SHARED_KEY' is not an editable key");
+
+    const on = setup(stored.replace("PLUGINS=music", "PLUGINS=music,spotify"), { pluginIndex: index });
+    // Both declarers are enabled: the key is gone from env-get, STAYS in env-schema as a secret row (the
+    // secret declaration's format, not the plain one's), and stays editable, write-only.
+    expect((await botOps(on, ["env-schema"])).json).toMatchObject({
+      SHARED_KEY: { pattern: "^[A-Za-z0-9_]{8,}$", required: false, source: "plugin", secret: true, isSet: true },
+    });
+    expect((await botOps(on, ["env-get"])).stdout).not.toContain("SHARED_KEY");
+    expect((await botOps(on, ["env-set"], "SHARED_KEY=another_value_9\n")).exitCode).toBe(0);
+  });
+
+  test("a refusal never echoes a line of a multi-line value as if it were a key name", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    // A PEM-like value read line by line: its later lines look like `KEY=`. None may be echoed.
+    const body = "MUSIC_API_KEY=-----BEGIN KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj=\nAAAAB3NzaC1yc2E=\n-----END KEY-----\n";
+    const run = await botOps(fx, ["env-set"], body);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("'(not shown)' is not an editable key");
+    expect(everythingObservable(fx, run)).not.toContain("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj");
+    expect(everythingObservable(fx, run)).not.toContain("AAAAB3NzaC1yc2E");
+    expect(envText(fx)).toBe(MUSIC_ENV);
+    // A mistyped variable name is still named (upper-case, at most 40 characters)...
+    const typo = await botOps(fx, ["env-set"], "MUSIC_API_KAY=x\n");
+    expect(typo.stderr).toContain("'MUSIC_API_KAY' is not an editable key");
+    // ...and one over that length is not: the limit is exactly 40 characters.
+    const exactly40 = `A${"B".repeat(39)}`;
+    const at40 = await botOps(fx, ["env-set"], `${exactly40}=x\n`);
+    expect(at40.stderr).toContain(`'${exactly40}' is not an editable key`);
+    const long = `A${"B".repeat(40)}`;
+    const over = await botOps(fx, ["env-set"], `${long}=x\n`);
+    expect(over.stderr).toContain("'(not shown)' is not an editable key");
+    expect(over.stderr).not.toContain(long);
+    // only an upper-case, variable-shaped name is echoed: a lower-case or underscore-led one is not
+    for (const odd of ["music_api_key", "_MUSIC_KEY", "Music_Key", "mUSIC_API_KEY"]) {
+      const run = await botOps(fx, ["env-set"], `${odd}=x\n`);
+      expect(run.stderr, odd).toContain("'(not shown)' is not an editable key");
+      expect(run.stderr, odd).not.toContain(odd);
+    }
+  });
+
+  test("a manifest that declares a core credential cannot make it editable, listable or schema-visible", async () => {
+    // Secret or plain, by mistake or through a bad index entry: a key the deployment owns stays out.
+    const index = wrapIndex([
+      pluginEntry("evil", [
+        envKey("DISCORD_TOKEN", "^.+$", { secret: true }),
+        envKey("ADMIN_TOKEN", "^.+$", { secret: true }),
+        envKey("GITHUB_TOKEN", "^.+$"), // declared PLAIN: must not be listed with its value either
+        envKey("BOT_OPS_CONFIG_DIR", "^.+$"),
+        envKey("EVIL_PORT", PORT_RE),
+      ]),
+    ]);
+    const fx = setup("PLUGINS=evil\nDISCORD_TOKEN=tok-1\nADMIN_TOKEN=tok-2\nGITHUB_TOKEN=tok-3\nBOT_OPS_CONFIG_DIR=/x\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const get = await botOps(fx, ["env-get"]);
+    for (const leak of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR", "tok-1", "tok-2", "tok-3"]) {
+      expect(get.stdout, leak).not.toContain(leak);
+    }
+    expect(get.json).toHaveProperty("EVIL_PORT"); // the legitimate key is still listed
+    const schema = await botOps(fx, ["env-schema"]);
+    for (const leak of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR"]) {
+      expect(schema.stdout, leak).not.toContain(leak);
+    }
+    for (const key of ["DISCORD_TOKEN", "ADMIN_TOKEN", "GITHUB_TOKEN", "BOT_OPS_CONFIG_DIR"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=new-value\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+  });
+
+  test("a secret key of a plugin that is not enabled is refused", async () => {
+    const other = "PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n"; // music is in the index but not in PLUGINS
+    const fx = setup(other, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
+    expect(envText(fx)).toBe(other);
+    // ... nor when the index cannot be read at all
+    const noIndex = setup(MUSIC_ENV);
+    const run2 = await botOps(noIndex, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run2.exitCode).toBe(1);
+    expect(run2.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
+    expect(everythingObservable(noIndex, run2)).not.toContain(SECRET);
+  });
+
+  test("the value appears nowhere in stdout, stderr, docker.log or the backups listing", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\nANNOUNCE_CHANNEL_ID=22222\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: expect.arrayContaining(["MUSIC_API_KEY", "ANNOUNCE_CHANNEL_ID"]) });
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(SECRET); // the new value
+    expect(seen).not.toContain(OLD_SECRET); // nor the one it replaced
+    // The backup file legitimately holds the PREVIOUS .env — values included — so it must be owner-only.
+    const [backupName] = readdirSync(join(fx.cfg, "backups"));
+    const backup = join(fx.cfg, "backups", backupName!);
+    expect(readFileSync(backup, "utf8")).toContain(`MUSIC_API_KEY=${OLD_SECRET}`);
+    if (process.platform !== "win32") expect(statSync(backup).mode & 0o777).toBe(0o600);
+  });
+
+  test("a rejected value is never echoed either: the messages name the key only", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const bad = "bad value with spaces and the secret sk_live_Leak123456"; // fails the format
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${bad}\n`);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("value for 'MUSIC_API_KEY' is invalid");
+    expect(everythingObservable(fx, run)).not.toContain("sk_live_Leak123456");
+    const malformed = await botOps(fx, ["env-set"], `MUSIC_API_KEY ${SECRET}\n`); // no `=`
+    expect(malformed.exitCode).toBe(1);
+    expect(everythingObservable(fx, malformed)).not.toContain(SECRET);
+  });
+
+  test("a submitted secret is always written, so a guess cannot be checked against the stored value", async () => {
+    // "No change" would be a read oracle: submit a guess, and an empty `changed` means it IS the value.
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const same = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    const guess = await botOps(fx, ["env-set"], "MUSIC_API_KEY=some_other_guess_1\n");
+    for (const run of [same, guess]) {
+      expect(run.exitCode).toBe(0);
+      expect(run.json).toMatchObject({ ok: true, changed: ["MUSIC_API_KEY"], recreated: true });
+      expect(run.json).not.toHaveProperty("note");
+    }
+    // indistinguishable to a caller: same keys, same shape
+    expect(Object.keys(same.json!).sort()).toEqual(Object.keys(guess.json!).sort());
+  });
+
+  test("a blank for a secret that is already unset changes nothing (that much isSet already says)", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
+    expect(envText(fx)).toBe(MUSIC_ENV);
+  });
+
+  test("a line break inside a value is refused for every key, naming the key only", async () => {
+    // A CR could start a new line in .env (`KEY=a\rDISCORD_TOKEN=evil`); a permissive plugin format
+    // would let it through, so the script refuses it before the format is even consulted.
+    const index = wrapIndex([pluginEntry("lax", [envKey("LAX_KEY", "^.+$", { secret: true }), envKey("LAX_PLAIN", "^.+$")])]);
+    const fx = setup("PLUGINS=lax\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    for (const key of ["LAX_KEY", "LAX_PLAIN"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=abc\rDISCORD_TOKEN=evil\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`env-set: value for '${key}' is invalid`);
+      expect(run.stderr, key).not.toContain("evil");
+    }
+    expect(envText(fx)).toBe("PLUGINS=lax\nANNOUNCE_CHANNEL_ID=11111\n");
+  });
+
+  test("a recreate message that echoes a value is redacted before it reaches the result's log", async () => {
+    // Nothing this script prints carries a value — but `docker compose up` is not ours, and a .env
+    // line it refuses to parse can be quoted back in its error. Both the new and the old value go.
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {
+      pluginIndex: SECRET_INDEX,
+      composeUp: { output: `error while loading .env: line 3: bad value MUSIC_API_KEY=${SECRET} (was ${OLD_SECRET})`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(1); // the recreate failed, and env-set says so
+    expect(run.json).toMatchObject({ ok: false, changed: ["MUSIC_API_KEY"] });
+    expect(String((run.json as { log: string }).log)).toContain("[redacted]");
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(SECRET);
+    expect(seen).not.toContain(OLD_SECRET);
+  });
+
+  test("redaction replaces every occurrence of a secret, stored or submitted", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {
+      pluginIndex: SECRET_INDEX,
+      composeUp: { output: `first ${SECRET} then ${SECRET} and ${OLD_SECRET} and again ${OLD_SECRET} end`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(String((run.json as { log: string }).log)).toBe("first [redacted] then [redacted] and [redacted] and again [redacted] end");
+  });
+
+  test("redaction also covers the stored secret of a plugin that is not enabled", async () => {
+    // `music` is not in PLUGINS, but MUSIC_API_KEY is still a secret sitting in the .env compose reads.
+    const index = wrapIndex([
+      pluginEntry("music", [envKey("MUSIC_API_KEY", "^\\S+$", { secret: true })]),
+      pluginEntry("wb", [envKey("WB_KEY", "^\\S+$", { secret: true })]),
+    ]);
+    const fx = setup(`PLUGINS=wb\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_API_KEY=${OLD_SECRET}\nWB_KEY=old-wb-key-1234\n`, {
+      pluginIndex: index,
+      composeUp: { output: `bad env line MUSIC_API_KEY=${OLD_SECRET} and WB_KEY=${SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `WB_KEY=${SECRET}\n`);
+    const log = String((run.json as { log: string }).log);
+    expect(log).toBe("bad env line MUSIC_API_KEY=[redacted] and WB_KEY=[redacted]");
+  });
+
+  test("an unchanged value is never judged by the compose guard, only what changes is", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("LAX", "^.+$"), envKey("PORT_X", PORT_RE)])]);
+    const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nLAX=stored$value\nPORT_X=80\n", { pluginIndex: index });
+    // the panel echoes the whole form back: LAX is unchanged (a hand-edited value with a dollar sign), PORT_X changes
+    const run = await botOps(fx, ["env-set"], "LAX=stored$value\nPORT_X=81\n");
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ changed: ["PORT_X"] });
+    // ...but changing LAX to another value with a dollar sign is refused
+    const bad = await botOps(fx, ["env-set"], "LAX=other$value\n");
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr).toContain("value for 'LAX' may not contain a dollar sign or a quote");
+  });
+
+  test("redaction treats a secret as a literal, whatever glob characters it holds", async () => {
+    const glob = "pre*fix[ab]?tail";
+    const index = wrapIndex([pluginEntry("g", [envKey("GLOB_KEY", "^.+$", { secret: true })])]);
+    const fx = setup("PLUGINS=g\nANNOUNCE_CHANNEL_ID=11111\n", {
+      pluginIndex: index,
+      composeUp: { output: `bad line GLOB_KEY=${glob}; unrelated preXfixaZtail stays`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `GLOB_KEY=${glob}\n`);
+    const log = String((run.json as { log: string }).log);
+    expect(log).not.toContain(glob);
+    expect(log).toContain("[redacted]");
+    // an unquoted pattern would glob-match this text and redact it too
+    expect(log).toContain("unrelated preXfixaZtail stays");
+  });
+
+  // Review round 4: the scrub took its list of secrets from the cached Plugin Index, so it scrubbed
+  // NOTHING when the index was unavailable -- which is when the bot is down and compose is most likely to
+  // be complaining. What is scrubbed is decided from .env and the static ALLOWED table alone now.
+  test("a stored secret compose echoes is scrubbed when the Plugin Index is unavailable, and when PLUGINS is empty", async () => {
+    const cases: [string, string, { pluginIndex?: string }][] = [
+      ["index unavailable", `${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {}],
+      ["PLUGINS empty", `PLUGINS=\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_API_KEY=${OLD_SECRET}\n`, { pluginIndex: SECRET_INDEX }],
+    ];
+    for (const [name, env, extra] of cases) {
+      const fx = setup(env, {
+        ...extra,
+        // not a message about the env file (that kind is withheld whole, below): this is the value scrub
+        composeUp: { output: `compose: bad line 4: unterminated quoted value ${OLD_SECRET}`, exitCode: 1 },
+      });
+      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+      expect(run.exitCode, name).toBe(1);
+      expect(String((run.json as { log: string }).log), name).toBe("compose: bad line 4: unterminated quoted value [redacted]");
+      expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+    }
+  }, LONG);
+
+  // Review round 5: the value scrub has to guess which part of a line a tool prints, and compose reads .env
+  // by its own rules (a key ends at `=` OR `:`, `export ` is dropped, U+0085 / U+00A0 are whitespace), so a
+  // guess made with bash's rules missed wherever the two disagree. Two layers now. Layer 1: what compose
+  // says ABOUT the env file is not scrubbed but withheld whole -- those are the messages most likely to
+  // quote it (compose-go's dotenv reader words them `failed to read <path>: line N: ...`).
+  // written as char codes, never as the characters themselves: both are invisible in a diff, and an editor
+  // that normalised them away would turn those two rows into copies of the plain one with no test failing
+  const HAND_NBSP = String.fromCharCode(0xa0);
+  const HAND_NEL = String.fromCharCode(0x85);
+  const HAND_EDITED: [string, string, string][] = [
+    // [what is odd about the line, the line, what compose prints of it]
+    ["export and a key compose rejects", `export MY!KEY=${OLD_SECRET}`, `unexpected character '!' in variable name 'MY!KEY=${OLD_SECRET}'`],
+    // no `=` and no `:` either, so only "the line without export" matches what compose quotes
+    ["export, a key compose rejects, and no separator", `export MY!KEY ${OLD_SECRET}`, `unexpected character '!' in variable name 'MY!KEY ${OLD_SECRET}'`],
+    ["a no-break space before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NBSP}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["U+0085 before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NEL}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["compose's colon separator", `BLIZZARD_CLIENT_SECRET: "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["whitespace around the equals sign", `BLIZZARD_CLIENT_SECRET = "${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["a plain unterminated quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+    ["a value printed without its opening quote", `BLIZZARD_CLIENT_SECRET="${OLD_SECRET}`, `bad value ${OLD_SECRET}`],
+    // compose lstrips a RUN of its whitespace, so two blanks in a row must both go (a single pass leaks)
+    ["two no-break spaces before an unterminated quote", `BLIZZARD_CLIENT_SECRET=${HAND_NBSP}${HAND_NBSP}"${OLD_SECRET}`, `unterminated quoted value "${OLD_SECRET}`],
+  ];
+
+  // Each table is walked in two tests: one env-set spawn per row is several seconds on a loaded Windows
+  // box, and all the rows in one test ran past the file's 60 s per-test cap (a timeout that a
+  // mutation-check would then mistake for a kill). The rows are the same whatever the split.
+  const HAND_EDITED_HALVES: [string, [string, string, string][]][] = [
+    ["part 1 of 2", HAND_EDITED.slice(0, 4)],
+    ["part 2 of 2", HAND_EDITED.slice(4)],
+  ];
+
+  for (const [part, rows] of HAND_EDITED_HALVES) {
+    test(
+      `what compose says ABOUT the env file is withheld whole, however the line is written: only the line number survives (${part})`,
+      async () => {
+        expect(HAND_EDITED.length).toBe(9); // the halves between them cover every row
+        for (const [name, line, said] of rows) {
+          // compose-go's dotenv reader wraps every parse error as `failed to read <path>: <error>`
+          const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, {
+            composeUp: { output: `failed to read {ENV_FILE}: line 2: ${said}`, exitCode: 1 },
+          });
+          const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+          expect(run.exitCode, name).toBe(1);
+          expect(String((run.json as { log: string }).log), name).toBe(withheld("line 2"));
+          expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+        }
+      },
+      LONG,
+    );
+  }
+
+  test("a message is about the env file when it names the file OR says 'env file'; every line number is kept, and none is fine", async () => {
+    const cases: [string, string, string | undefined][] = [
+      ["names the file only", `failed to read {ENV_FILE}: line 3: bad ${OLD_SECRET}`, "line 3"],
+      ["says env file only", `Failed to load ENV FILE: line 3: bad ${OLD_SECRET}`, "line 3"],
+      ["two line numbers", `env file {ENV_FILE}: line 9: x ${OLD_SECRET}\nenv file {ENV_FILE}: line 3: y`, "line 3, line 9"],
+      [
+        "numeric order, and a line said twice is named once",
+        `env file {ENV_FILE}: line 10: x\nenv file {ENV_FILE}: line 3: y ${OLD_SECRET}\nenv file {ENV_FILE}: line 10: z`,
+        "line 3, line 10",
+      ],
+      ["no line number", `env file {ENV_FILE} not found: ${OLD_SECRET}`, undefined],
+    ];
+    for (const [name, output, lines] of cases) {
+      const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nHAND_KEY=${OLD_SECRET}\n`, { composeUp: { output, exitCode: 1 } });
+      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+      expect(String((run.json as { log: string }).log), name).toBe(withheld(lines));
+      expect(everythingObservable(fx, run), name).not.toContain(OLD_SECRET);
+    }
+  }, LONG);
+
+  // Review round 6 (reviewer A's F1): compose also says "env file" about the STACK's .env, which is a
+  // different file from $ENV_FILE, and a message that named the right one used to be replaced by a sentence
+  // that named the wrong one, claimed compose "could not read" the file and told the operator to fix a line.
+  // The withheld sentence now names no path and claims no cause, and it is the same whatever compose's status.
+  // What this pins is the WORDS: the fixture says "env file", which is what triggers layer 1. A message that
+  // names the stack's .env by path alone, without those words, goes to layer 2 (by design: the stack .env
+  // holds no secrets, see ops/install.sh), so it is not what this test is about.
+  test("a message that SAYS 'env file' about another file (the stack's own .env) is withheld by the same neutral sentence, naming neither path, whatever compose's status", async () => {
+    const stackEnv = "/opt/stacks/x/.env";
+    const said = `couldn't find env file: ${stackEnv}`;
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { composeUp: { output: said, exitCode: 1 }, composeRestart: { output: said, exitCode: 1 } });
+    const neutral = (text: string, label: string) => {
+      expect(text, label).toBe(withheld());
+      for (const path of [stackEnv, bashPath(fx.envFile)]) expect(text, `${label}: ${path}`).not.toContain(path);
+      expect(text, label).not.toContain("could not read");
+      expect(text, label).not.toContain("fix that line");
+    };
+    const set = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(set.exitCode).toBe(1); // the recreate failed, and env-set says so
+    expect(set.json).toMatchObject({ ok: false });
+    neutral(String((set.json as { log: string }).log), "env-set");
+    // restart: compose's status is the script's, the sentence is the same one, and no restart is claimed
+    const restart = await botOps(fx, ["restart"]);
+    expect(restart.exitCode).toBe(1);
+    neutral(restart.stdout.replace(/\n$/, ""), "restart, failed");
+    expect(restart.stdout).not.toContain("restarted");
+    // and when compose SUCCEEDS with output that mentions the env file: the same sentence, then `restarted`
+    const ok = setup("ANNOUNCE_CHANNEL_ID=11111\n", { composeRestart: { output: `WARN ${said}` } });
+    const success = await botOps(ok, ["restart"]);
+    expect(success.exitCode).toBe(0);
+    expect(success.stdout).toBe(`${withheld()}\nrestarted probe-container\n`);
+  }, LONG);
+
+  // Layer 2, for every message that is NOT about the env file: the same hand-edited lines, scrubbed.
+  for (const [part, rows] of HAND_EDITED_HALVES) {
+    test(
+      `the value scrub reads a line the way compose does: export, a colon, spaces round the equals sign, U+0085 and a no-break space, two of them, a value printed without its opening quote (${part})`,
+      async () => {
+        expect(HAND_EDITED.length).toBe(9); // the halves between them cover every row
+        for (const [name, line, said] of rows) {
+          const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\n${line}\n`, { composeUp: { output: `compose: line 2: ${said}`, exitCode: 1 } });
+          const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+          const log = String((run.json as { log: string }).log);
+          expect(log, name).not.toContain(OLD_SECRET);
+          expect(log, name).toContain("[redacted]");
+          expect(log.startsWith("compose: line 2: "), name).toBe(true);
+        }
+      },
+      LONG,
+    );
+  }
+
+  // Review round 6 (reviewer A's F3): the trailing-blank strips in compose_trim. A tool that prints a stored
+  // value with no blank after it must still match a value stored with one.
+  test("a stored value with a no-break space after it is scrubbed as a tool prints it, without the space", async () => {
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nBLIZZARD_CLIENT_SECRET=${OLD_SECRET}${HAND_NBSP}\n`, {
+      composeUp: { output: `compose: bad value ${OLD_SECRET}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("compose: bad value [redacted]");
+    expect(everythingObservable(fx, run)).not.toContain(OLD_SECRET);
+  });
+
+  test("a core credential compose echoes is scrubbed too: whatever env-get would not print", async () => {
+    const token = "core-token-7Hq2Lm9Xw4Zt";
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nDISCORD_TOKEN=${token}\n`, {
+      composeUp: { output: `bad line DISCORD_TOKEN=${token}`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("bad line DISCORD_TOKEN=[redacted]");
+    expect(everythingObservable(fx, run)).not.toContain(token);
+  });
+
+  // Review round 4: replacing a short value first cut a longer one that contains it in two, and the longer
+  // one then no longer matched -- whoever can set one secret could unmask another. Longest first.
+  test("a short secret never unmasks a longer one that contains it, whichever key holds which", async () => {
+    const long = "CANARYAAAAAABBBB";
+    const short = "AAAAAA";
+    const index = wrapIndex([pluginEntry("two", [envKey("KEY_ONE", "^\\S+$", { secret: true }), envKey("KEY_TWO", "^\\S+$", { secret: true })])]);
+    for (const [one, two] of [
+      [long, short],
+      [short, long],
+    ]) {
+      const fx = setup(`PLUGINS=two\nANNOUNCE_CHANNEL_ID=11111\nKEY_ONE=${one}\nKEY_TWO=${two}\n`, {
+        pluginIndex: index,
+        composeUp: { output: `compose: bad line ${long} end, and ${short} alone`, exitCode: 1 },
+      });
+      const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+      expect(String((run.json as { log: string }).log), `KEY_ONE=${one}`).toBe("compose: bad line [redacted] end, and [redacted] alone");
+    }
+  }, LONG);
+
+  test("every definition of a key is scrubbed, not only the last, and so is a line that is not a definition", async () => {
+    const earlier = "earlier-definition-5Tg8";
+    const tail = "tail-of-a-pasted-multi-line-secret";
+    // The QUOTED definition is the earlier one, so only the scan of the file itself can know it (the values
+    // read for env-get hold the last definition only); it is scrubbed as it stands in the file AND as
+    // compose reads it, without its quotes.
+    const fx = setup(`ANNOUNCE_CHANNEL_ID=11111\nHAND_KEY="${OLD_SECRET}"\nHAND_KEY=${earlier}\n${tail}\n# a comment stays a comment\n`, {
+      composeUp: { output: `line 2: "${OLD_SECRET}" read as ${OLD_SECRET}; line 3: ${earlier}; line 4: ${tail}; # a comment stays a comment`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe(
+      "line 2: [redacted] read as [redacted]; line 3: [redacted]; line 4: [redacted]; # a comment stays a comment",
+    );
+  });
+
+  test("a value under six characters is left alone, and so is the value of a key env-get prints", async () => {
+    // Scrubbing "us" or a port number out of compose's message would make it unreadable for nothing, and a
+    // static ALLOWED key's value is one the panel is shown anyway.
+    const fx = setup("ANNOUNCE_CHANNEL_ID=1234567890\nWOW_REGION=us\nSHORT_KEY=abcde\n", {
+      composeUp: { output: "status: us-east abcde 1234567890", exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], "COMMAND_PREFIX=zz\n");
+    expect(String((run.json as { log: string }).log)).toBe("status: us-east abcde 1234567890");
+  });
+
+  test("a manifest entry with an empty key is skipped, secret or plain, and never crashes the reads", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("", "^.+$", { secret: true }), envKey("", "^.+$"), envKey("P_PORT", PORT_RE)])]);
+    const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nP_PORT=8080\n", { pluginIndex: index });
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.json).toMatchObject({ P_PORT: "8080" });
+    const schema = await botOps(fx, ["env-schema"]);
+    expect(schema.exitCode).toBe(0);
+    expect(Object.keys(schema.json ?? {})).not.toContain("");
+  });
+
+  test("a key one plugin declares secret and another declares plain is secret: never listed, schema says so", async () => {
+    for (const order of [["plain", "secret"], ["secret", "plain"]] as const) {
+      const decl = { plain: pluginEntry("aaa", [envKey("SHARED_KEY", "^.+$")]), secret: pluginEntry("bbb", [envKey("SHARED_KEY", "^.+$", { secret: true })]) };
+      const fx = setup(`PLUGINS=aaa,bbb\nANNOUNCE_CHANNEL_ID=11111\nSHARED_KEY=${SECRET}\n`, { pluginIndex: wrapIndex(order.map((o) => decl[o])) });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.stdout, order.join()).not.toContain("SHARED_KEY");
+      expect(get.stdout, order.join()).not.toContain(SECRET);
+      const schema = (await botOps(fx, ["env-schema"])).json as unknown as Record<string, Record<string, unknown>>;
+      expect(schema.SHARED_KEY, order.join()).toMatchObject({ secret: true, isSet: true });
+    }
+  });
+
+  test("a secret key that collides with a static key is ignored: the static key stays, and stays core", async () => {
+    const index = wrapIndex([pluginEntry("sneaky", [envKey("COMMAND_PREFIX", "^.+$", { secret: true })])]);
+    const fx = setup("PLUGINS=sneaky\nCOMMAND_PREFIX=rb\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    expect((await envGet(fx)).COMMAND_PREFIX).toBe("rb");
+    const schema = await envSchema(fx);
+    expect(schema.COMMAND_PREFIX).toEqual({ pattern: "^[a-z0-9_-]{1,20}$", required: false, source: "core" });
+  });
+
+  test("a secret declared twice: the first declaration's format wins", async () => {
+    const index = wrapIndex([
+      pluginEntry("one", [envKey("TWICE_KEY", "^[0-9]+$", { secret: true })]),
+      pluginEntry("two", [envKey("TWICE_KEY", "^[a-z]+$", { secret: true })]),
+    ]);
+    const fx = setup("PLUGINS=one,two\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    expect((await botOps(fx, ["env-set"], "TWICE_KEY=abc\n")).exitCode).toBe(1);
+    expect((await botOps(fx, ["env-set"], "TWICE_KEY=123\n")).exitCode).toBe(0);
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-schema lists secret keys without their values (#240)", () => {
+  type Row = Record<string, unknown>;
+  const schemaOf = async (fx: Fixture) => (await botOps(fx, ["env-schema"])).json as unknown as Record<string, Row>;
+
+  test("a secret key carries secret:true and isSet:false when unset", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const schema = await schemaOf(fx);
+    expect(schema.MUSIC_API_KEY).toEqual({ pattern: "^[A-Za-z0-9_-]{8,64}$", required: false, source: "plugin", secret: true, isSet: false });
+    // MUSIC_MUST_KEY=abcd is in MUSIC_ENV, so it is set — and its required flag comes through
+    expect(schema.MUSIC_MUST_KEY).toEqual({ pattern: "^[a-z]{4,}$", required: true, source: "plugin", secret: true, isSet: true });
+  });
+
+  test("isSet turns true once it is set, and false again once it is cleared", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ secret: true, isSet: true });
+    await botOps(fx, ["env-set"], "MUSIC_API_KEY=\n");
+    expect((await schemaOf(fx)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    // a quoted-empty value is not "set" either (it reads back as the empty string)
+    const quoted = setup(`${MUSIC_ENV}MUSIC_API_KEY=""\n`, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(quoted)).MUSIC_API_KEY).toMatchObject({ isSet: false });
+    const quotedSet = setup(`${MUSIC_ENV}MUSIC_API_KEY="${SECRET}"\n`, { pluginIndex: SECRET_INDEX });
+    expect((await schemaOf(quotedSet)).MUSIC_API_KEY).toMatchObject({ isSet: true });
+  });
+
+  test("a non-secret entry is exactly {pattern, required, source}", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const schema = await schemaOf(fx);
+    expect(schema.ANNOUNCE_CHANNEL_ID).toEqual({ pattern: "^[0-9]{5,25}$", required: true, source: "core" });
+    expect(schema.MUSIC_PORT).toEqual({ pattern: PORT_RE, required: false, source: "plugin" });
+    for (const [key, row] of Object.entries(schema)) {
+      if (row.secret === true) continue;
+      expect(Object.keys(row).sort(), key).toEqual(["pattern", "required", "source"]);
+    }
+  });
+
+  test("secret rows come after every other row, and env-get never lists them", async () => {
+    const fx = setup(MUSIC_ENV, { pluginIndex: SECRET_INDEX });
+    const [schema, env] = await Promise.all([schemaOf(fx), envGet(fx)]);
+    const keys = Object.keys(schema);
+    expect(keys.slice(-2)).toEqual(["MUSIC_API_KEY", "MUSIC_MUST_KEY"]); // manifest order, last
+    expect(keys.slice(0, -2)).toEqual(Object.keys(env)); // everything before them is exactly env-get's listing
+  });
+
+  test("the value appears nowhere in the output", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${SECRET}\n`, { pluginIndex: SECRET_INDEX });
+    const run = await botOps(fx, ["env-schema"]);
+    expect(run.exitCode).toBe(0);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+    expect(run.stdout).not.toContain("abcd"); // nor the required secret's stored value
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
+  const GUILD = "123456789012345678";
+  const CHANNEL = "223456789012345678";
+  const ROUTING = {
+    v: 1,
+    updatedAt: "2026-09-21T00:00:00.000Z",
+    updatedBy: "email:me@x.com",
+    plugins: { music: { servers: { [GUILD]: { commands: "all", postTo: CHANNEL } } } },
+    webhooks: { [CHANNEL]: { id: "323456789012345678", guildId: GUILD, addedAt: "2026-09-21T00:00:00.000Z", addedBy: "email:me@x.com" } },
+  };
+  const DISCOVERY = {
+    v: 1,
+    generatedAt: "2026-09-21T00:00:00.000Z",
+    bot: { id: "423456789012345678", username: "rackbops" },
+    inviteUrl: "https://discord.com/oauth2/authorize?client_id=423456789012345678&scope=bot%20applications.commands",
+    homeGuildId: GUILD,
+    guilds: [{ id: GUILD, name: "Home", channels: [{ id: CHANNEL, name: "general", canSend: true }], commands: { registered: 4, at: "2026-09-21T00:00:00.000Z" } }],
+    plugins: { music: { posts: true, commands: ["play"] } },
+  };
+  const ENV = "ANNOUNCE_CHANNEL_ID=11111\n";
+  const get = async (fx: Fixture) => botOps(fx, ["routing-get"]);
+
+  test("returns both files", async () => {
+    const fx = setup(ENV, { routing: JSON.stringify(ROUTING), discovery: JSON.stringify(DISCOVERY) });
+    const run = await get(fx);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ routing: ROUTING, discovery: DISCOVERY });
+    expect(run.stderr).toBe("");
+  });
+
+  test("a missing file is null, not an error", async () => {
+    const neither = await get(setup(ENV));
+    expect(neither.exitCode).toBe(0);
+    expect(neither.json).toEqual({ routing: null, discovery: null });
+    expect(neither.stderr).toBe(""); // docker's / cat's own "no such file" text is not relayed
+    const onlyRouting = await get(setup(ENV, { routing: JSON.stringify(ROUTING) }));
+    expect(onlyRouting.json).toEqual({ routing: ROUTING, discovery: null });
+    const onlyDiscovery = await get(setup(ENV, { discovery: JSON.stringify(DISCOVERY) }));
+    expect(onlyDiscovery.json).toEqual({ routing: null, discovery: DISCOVERY });
+  });
+
+  test("a corrupt file is null, not an error", async () => {
+    for (const bad of ['{ "v": 1, "plugins": ', "", "not json at all", "[]", "42", '"a string"', "null", '{"a":1}{"b":2}']) {
+      const fx = setup(ENV, { routing: bad, discovery: JSON.stringify(DISCOVERY) });
+      const run = await get(fx);
+      expect(run.exitCode, bad).toBe(0);
+      expect(run.json, bad).toEqual({ routing: null, discovery: DISCOVERY });
+      expect(run.stderr, bad).toBe(""); // jq's parse error, which may quote the file's text, is not relayed
+    }
+    // and both corrupt at once: still valid JSON on stdout
+    const both = await get(setup(ENV, { routing: "{", discovery: "}" }));
+    expect(both.exitCode).toBe(0);
+    expect(both.json).toEqual({ routing: null, discovery: null });
+  });
+
+  test("never reads the secrets file", async () => {
+    const fx = setup(ENV, { routing: JSON.stringify(ROUTING), discovery: JSON.stringify(DISCOVERY) });
+    await get(fx);
+    const calls = dockerCalls(fx);
+    expect(calls.some((c) => c.includes("routing.secrets"))).toBe(false);
+    // exactly two reads, of exactly the two files
+    expect(calls).toEqual([
+      expect.stringContaining("exec probe-container cat /app/data/routing.json"),
+      expect.stringContaining("exec probe-container cat /app/data/discovery.json"),
+    ]);
+  });
+
+  test("without docker or jq on the PATH it fails loudly rather than printing nulls", async () => {
+    // read_scrubbed_json swallows read errors on purpose, so the `need` checks are what stops a box
+    // with no docker from answering {routing: null, discovery: null}.
+    const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    const bare = setup(ENV);
+    mkdirSync(join(bare.root, "empty")); // removed with the fixture
+    const noDocker = await botOps(bare, ["routing-get"], undefined, { [pathKey]: join(bare.root, "empty") });
+    expect(noDocker.exitCode).not.toBe(0);
+    expect(noDocker.stderr).toContain("'docker' not found on the box");
+    const fx = setup(ENV); // fx.bin holds only the fake docker, so jq is the one that is missing
+    const noJq = await botOps(fx, ["routing-get"], undefined, { [pathKey]: fx.bin });
+    expect(noJq.exitCode).not.toBe(0);
+    expect(noJq.stderr).toContain("'jq' not found on the box");
+  });
+
+  test("the script never names the secrets file", () => {
+    expect(readFileSync(BOT_OPS_SH, "utf8")).not.toContain("routing.secrets");
+  });
+
+  test("a webhook URL a hand-edit left in either file never appears in the output", async () => {
+    const dirtyRouting = {
+      ...ROUTING,
+      note: `see ${WEBHOOK_URL} for the hook`,
+      // url / token / secret / password members are dropped whatever their case
+      webhooks: {
+        [CHANNEL]: {
+          ...ROUTING.webhooks[CHANNEL],
+          url: WEBHOOK_URL,
+          token: WEBHOOK_TOKEN,
+          Token: "TokenCased_9f8e7d6c",
+          URL: "UrlCased_1a2b3c4d",
+          secret: "member-secret-5e6f",
+          Password: "member-password-7a8b",
+        },
+      },
+      [WEBHOOK_URL]: 1, // even as a key
+    };
+    const dirtyDiscovery = {
+      ...DISCOVERY,
+      hook: "https://discordapp.com/api/v10/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWx",
+      tail: "webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz",
+      // the scrub is case-insensitive and does not insist on https
+      hookUpper: "HTTPS://DISCORD.COM/API/WEBHOOKS/123456789012345678/UpperTokenABCDEFGHIJKLMNOP",
+      tailUpper: "WEBHOOKS/123456789012345678/UpperTailTokenXYZ",
+      hookHttp: "http://discord.com/api/webhooks/123456789012345678/HttpTokenABCDEFGHIJKLMNOPQR",
+    };
+    const run = await get(setup(ENV, { routing: JSON.stringify(dirtyRouting), discovery: JSON.stringify(dirtyDiscovery) }));
+    expect(run.exitCode).toBe(0);
+    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b", "UpperTokenABCDEFGHIJKLMNOP", "UpperTailTokenXYZ", "HttpTokenABCDEFGHIJKLMNOPQR", "HTTPS://DISCORD.COM", "http://discord.com"]) {
+      expect(run.stdout, leak).not.toContain(leak);
+    }
+    const out = run.json as { routing: Record<string, unknown>; discovery: Record<string, unknown> };
+    expect(out.routing.plugins).toEqual(ROUTING.plugins); // everything else survives untouched
+    expect(out.routing.webhooks).toEqual(ROUTING.webhooks); // the hand-edited url / token members are dropped, the metadata stays
+    expect(out.discovery.inviteUrl).toBe(DISCOVERY.inviteUrl); // an invite URL is not a webhook URL
+    expect(JSON.stringify(out.routing.note)).toContain("[redacted]");
+  });
+
+  test("a large discovery file (past Linux's 128 KB single-argument limit) comes through whole", async () => {
+    // Windows' command line is capped near 32 KB and Linux's single argument at 128 KB, so the file has
+    // to be bigger than both for a regression to `--argjson` to fail on either CI or a dev box.
+    const channels = Array.from({ length: 1800 }, (_, i) => ({ id: String(500000000000000000n + BigInt(i)), name: `channel-${i}-with-a-reasonably-long-name`, canSend: i % 2 === 0 }));
+    const big = { ...DISCOVERY, guilds: [{ ...DISCOVERY.guilds[0]!, channels }] };
+    expect(JSON.stringify(big).length).toBeGreaterThan(140_000);
+    const run = await get(setup(ENV, { discovery: JSON.stringify(big) }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ routing: null, discovery: big });
+  });
+
+  test("routing-get is a recognised subcommand and appears in usage", async () => {
+    const run = await botOps(setup(ENV), ["bogus-subcommand"]);
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("routing-get");
+  });
+});
+
+describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
+  const ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\n";
+  const req = (o: object) => JSON.stringify(o);
+  const GUILD = "123456789012345678";
+  const CHANNEL = "223456789012345678";
+  const wrote = (fx: Fixture) => dockerCalls(fx).some((c) => c.includes("/app/data/plugins/requests/"));
+  const stdinOf = (fx: Fixture) => readFileSync(join(fx.bin, "request-stdin.json"), "utf8");
+
+  /** What the bot's own reader (src/routing/model.ts) would keep of a `servers` value for a plugin. */
+  const keptByBot = (servers: unknown): unknown => repairRouting({ plugins: { music: { servers } } }).plugins.music?.servers;
+
+  const GOOD_SERVERS: Record<string, unknown>[] = [
+    { [GUILD]: { commands: "all" } },
+    { [GUILD]: { commands: "all", postTo: CHANNEL } },
+    { [GUILD]: { commands: [CHANNEL, "323456789012345678"], postTo: CHANNEL }, "923456789012345678": { commands: "all" } },
+    {}, // an empty object is valid: the plugin is placed nowhere
+    // the id length bounds: 5 and 25 digits are snowflakes, in every position
+    { "12345": { commands: ["22345"], postTo: "32345" } },
+    { ["1".repeat(25)]: { commands: ["2".repeat(25)], postTo: "3".repeat(25) } },
+  ];
+
+  test("routing-set round-trips to the mailbox", async () => {
+    const fx = setup(ENV);
+    const servers = GOOD_SERVERS[1]!;
+    const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-routing-set-\d+\.json$/);
+    const exec = dockerCalls(fx).find((c) => c.startsWith("docker exec -i -u bun"));
+    expect(exec).toContain("/app/data/plugins/requests/");
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "routing-set", plugin: "music", servers, requestedBy: "email:me@x.com" });
+  });
+
+  test("every routing-set shape the script accepts is one the bot's own repair (src/routing/model.ts) keeps intact", async () => {
+    for (const servers of GOOD_SERVERS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "t" }));
+      expect(run.exitCode, JSON.stringify(servers)).toBe(0);
+      expect(keptByBot(servers), JSON.stringify(servers)).toEqual(servers);
+    }
+  });
+
+  const BAD_SERVERS: [string, unknown][] = [
+    ["servers missing", undefined],
+    ["servers null", null],
+    ["servers an array", []],
+    ["servers a string", "all"],
+    ["a non-snowflake server id", { abc: { commands: "all" } }],
+    ["a too-short server id", { "1234": { commands: "all" } }],
+    ["a prototype-ish server id", JSON.parse('{"__proto__": {"commands": "all"}}')],
+    ["a server entry that is not an object", { [GUILD]: "all" }],
+    ["an empty channel list", { [GUILD]: { commands: [] } }],
+    ["a non-snowflake channel in the list", { [GUILD]: { commands: [CHANNEL, "12"] } }],
+    ["a non-string channel in the list", { [GUILD]: { commands: [123456789012345678] } }],
+    ["commands neither all nor a list", { [GUILD]: { commands: "some" } }],
+    ["commands missing", { [GUILD]: { postTo: CHANNEL } }],
+    ["a non-snowflake postTo", { [GUILD]: { commands: "all", postTo: "general" } }],
+    ["a numeric postTo", { [GUILD]: { commands: "all", postTo: 223456789012345678 } }],
+    ["a null postTo", { [GUILD]: { commands: "all", postTo: null } }],
+    // jq's `$` also matches before a trailing newline, so each snowflake is anchored \A...\z: none of these may pass
+    ["a server id with a trailing newline", { [`${GUILD}\n`]: { commands: "all" } }],
+    ["a channel with a trailing newline", { [GUILD]: { commands: [`${CHANNEL}\n`] } }],
+    ["a postTo with a trailing newline", { [GUILD]: { commands: "all", postTo: `${CHANNEL}\n` } }],
+    // the length bounds, one past each edge (5..25 digits) in every position
+    ["a 26-digit server id", { ["1".repeat(26)]: { commands: "all" } }],
+    ["a 26-digit channel", { [GUILD]: { commands: ["2".repeat(26)] } }],
+    ["a 26-digit postTo", { [GUILD]: { commands: "all", postTo: "3".repeat(26) } }],
+    ["a 4-digit channel", { [GUILD]: { commands: ["2234"] } }],
+    ["a 4-digit postTo", { [GUILD]: { commands: "all", postTo: "3234" } }],
+    ["commands an object whose values are snowflakes", { [GUILD]: { commands: { channel: CHANNEL } } }],
+  ];
+  test("routing-set rejects each malformed shape, naming the field, before touching docker", async () => {
+    const fx = setup(ENV);
+    for (const [why, servers] of BAD_SERVERS) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "t" }));
+      expect(run.exitCode, why).not.toBe(0);
+      // names the field and nothing else: no part of the payload is echoed
+      expect(run.stderr.trim(), why).toBe("bot-ops: plugin-request: bad servers");
+      // whatever the script rejects, the bot's own repair would not have kept verbatim
+      if (typeof servers === "object" && servers !== null && !Array.isArray(servers)) {
+        expect(keptByBot(servers), why).not.toEqual(servers);
+      }
+    }
+    const badPlugin = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "Music", servers: {}, requestedBy: "t" }));
+    expect(badPlugin.exitCode).not.toBe(0);
+    expect(badPlugin.stderr).toContain("plugin-request: bad plugin");
+    expect(wrote(fx)).toBe(false);
+  }, LONG);
+
+  test("webhook-add round-trips on stdin", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-webhook-add-\d+\.json$/);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "email:me@x.com" });
+    expect(run.stdout).not.toContain(WEBHOOK_TOKEN); // the result names the file, never the URL
+  });
+
+  test("a webhook url never appears in argv (docker.log), stdout or stderr", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
+    expect(run.exitCode).toBe(0);
+    const seen = everythingObservable(fx, run);
+    expect(seen).not.toContain(WEBHOOK_TOKEN);
+    expect(seen).not.toContain("webhooks/");
+  });
+
+  // A request file is never visible half-written, and is owner-only (#241's gate found the race: `cat >
+  // <final>` creates the file before filling it, and the bot's drain rejects a `.json` it cannot parse).
+  // The fake docker runs the `sh -c` for real against <bin>/data (see setup()), so these check what the
+  // write LEAVES in the directory as well as the command string.
+  const REQUESTS: { action: string; [k: string]: unknown }[] = [
+    { action: "update-now", plugin: "music", version: "1.1.0", requestedBy: "t" },
+    { action: "schedule", plugin: "music", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" },
+    { action: "remind", plugin: "music", version: "1.1.0", days: 3, requestedBy: "t" },
+    { action: "skip", plugin: "music", version: "1.1.0", requestedBy: "t" },
+    { action: "cancel", plugin: "music", requestedBy: "t" },
+    { action: "routing-set", plugin: "music", servers: {}, requestedBy: "t" },
+    { action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" },
+    { action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" },
+    { action: "discovery-refresh", requestedBy: "t" },
+  ];
+  const writeCall = (fx: Fixture): string => dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/")) ?? "";
+  const mailbox = (fx: Fixture): string => join(fx.bin, "data", "plugins", "requests");
+
+  test("the request is written to a .tmp name and renamed into place", async () => {
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, payload.action).toBe(0);
+      const queued = String(run.json?.queued);
+      // `cat > <dir>/<file>.tmp && mv <dir>/<file>.tmp <dir>/<file>`, in that order, the same <file>
+      const m = writeCall(fx).match(/cat > (\/app\/data\/plugins\/requests\/\S+\.json)\.tmp && mv \1\.tmp \1 \|\|/);
+      expect(m, `${payload.action}: ${writeCall(fx)}`).not.toBeNull();
+      expect(m![1], payload.action).toBe(`/app/data/plugins/requests/${queued}`);
+      // and for real: the directory holds exactly the final file, with the whole body, and no temp file
+      expect(readdirSync(mailbox(fx)), payload.action).toEqual([queued]);
+      expect(readFileSync(join(mailbox(fx), queued), "utf8"), payload.action).toBe(stdinOf(fx));
+      // and the body is exactly what was sent: no trailing newline, nothing re-encoded
+      expect(stdinOf(fx), payload.action).toBe(req(payload));
+    }
+  }, LONG);
+
+  test("the temp name does not end in .json, so the bot's drain never lists it", async () => {
+    // The assumption this rests on: the drain lists only names ending .json.
+    const consumer = readFileSync(new URL("../src/plugins/requests.ts", import.meta.url), "utf8");
+    expect(consumer).toMatch(/endsWith\("\.json"\)/);
+    const fx = setup(ENV);
+    expect((await botOps(fx, ["plugin-request"], req(REQUESTS[3]!))).exitCode).toBe(0);
+    const tmp = writeCall(fx).match(/cat > (\S+)/)?.[1] ?? "";
+    expect(tmp).toMatch(/\.json\.tmp$/);
+    expect(tmp.endsWith(".json")).toBe(false);
+  });
+
+  test("the write is owner-only: umask 077 comes after mkdir -p and before the write", async () => {
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      expect((await botOps(fx, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
+      // one shell, in this order: mkdir (ordinary mode for a new requests/), THEN umask, THEN the write.
+      // `umask` must run in the SAME shell as the write: `(umask 077) && cat` narrows a subshell only.
+      expect(writeCall(fx), payload.action).toContain("mkdir -p /app/data/plugins/requests && umask 077 && cat > ");
+    }
+  });
+
+  test("the request file really is 0600 (where the platform has file modes)", async () => {
+    // Git Bash on Windows has no modes; CI on Linux runs the real `sh -c` under the fake docker.
+    if (process.platform === "win32") return;
+    for (const payload of REQUESTS) {
+      const fx = setup(ENV);
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, payload.action).toBe(0);
+      expect(statSync(join(mailbox(fx), String(run.json?.queued))).mode & 0o777, payload.action).toBe(0o600);
+    }
+  });
+
+  test("a failed write removes the temp file and exits non-zero, never reporting queued", async () => {
+    // The rename fails after the body is on disk: the temp file must not be left behind.
+    const fx = setup(ENV, { requestWrite: "mv-fails" });
+    const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stdout).not.toContain("queued");
+    expect(run.stderr).toContain("plugin-request: could not write the request");
+    expect(everythingObservable(fx, run)).not.toContain(WEBHOOK_TOKEN);
+    expect(JSON.parse(stdinOf(fx)).url).toBe(WEBHOOK_URL); // the body did reach the shell...
+    expect(existsSync(mailbox(fx)) ? readdirSync(mailbox(fx)) : []).toEqual([]); // ...and nothing is left behind
+    // The whole `docker exec` failing (container not running) is the same story.
+    const dead = setup(ENV, { requestWrite: "exec-fails" });
+    const run2 = await botOps(dead, ["plugin-request"], req(REQUESTS[3]!));
+    expect(run2.exitCode).not.toBe(0);
+    expect(run2.stdout).not.toContain("queued");
+    expect(run2.stderr).toContain("plugin-request: could not write the request");
+  });
+
+  test("a bad webhook url is rejected without echoing it", async () => {
+    const fx = setup(ENV);
+    const bad: [string, unknown][] = [
+      ["http, not https", `http://discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["another host", `https://example.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a look-alike host", `https://discord.com.evil.example/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a look-alike subdomain", `https://evil.discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a token that is too short", "https://discord.com/api/webhooks/123456789012345678/short"],
+      ["no webhook id", `https://discord.com/api/webhooks/${WEBHOOK_TOKEN}`],
+      ["a non-numeric id", `https://discord.com/api/webhooks/abc/${WEBHOOK_TOKEN}`],
+      ["a query string", `${WEBHOOK_URL}?wait=true`],
+      ["a trailing path", `${WEBHOOK_URL}/extra`],
+      ["a leading space", ` ${WEBHOOK_URL}`],
+      ["a trailing newline", `${WEBHOOK_URL}\n`],
+      ["userinfo", `https://user:pw@discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["another top-level domain", `https://discord.org/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a 4-digit webhook id", `https://discord.com/api/webhooks/1234/${WEBHOOK_TOKEN}`],
+      ["a 26-digit webhook id", `https://discord.com/api/webhooks/${"1".repeat(26)}/${WEBHOOK_TOKEN}`],
+      // every dot in the host pattern is escaped: another character in its place is not a host
+      ["a stray character for the dot in discord.com", `https://discordXcom/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a stray character for the dot in canary.", `https://canaryXdiscord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a stray character for the dot in ptb.", `https://ptbXdiscord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["not a string", 12345],
+      ["an object", { u: WEBHOOK_URL }],
+      ["missing", undefined],
+    ];
+    for (const [why, url] of bad) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url, requestedBy: "t" }));
+      expect(run.exitCode, why).not.toBe(0);
+      expect(run.stderr, why).toContain("plugin-request: bad webhook url");
+      expect(run.stderr, why).not.toContain(WEBHOOK_TOKEN);
+      expect(run.stderr, why).not.toContain("https://");
+      expect(run.stdout, why).not.toContain(WEBHOOK_TOKEN);
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("a webhook url on the canary / ptb / discordapp hosts, with or without an API version, is accepted", async () => {
+    for (const host of ["discord.com", "canary.discord.com", "ptb.discord.com", "discordapp.com"]) {
+      for (const api of ["api", "api/v10"]) {
+        const fx = setup(ENV);
+        const url = `https://${host}/${api}/webhooks/123456789012345678/${WEBHOOK_TOKEN}`;
+        const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url, requestedBy: "t" }));
+        expect(run.exitCode, url).toBe(0);
+      }
+    }
+    // the webhook id is a 5..25-digit snowflake
+    for (const id of ["12345", "1".repeat(25)]) {
+      const run = await botOps(setup(ENV), ["plugin-request"], req({ action: "webhook-add", url: `https://discord.com/api/webhooks/${id}/${WEBHOOK_TOKEN}`, requestedBy: "t" }));
+      expect(run.exitCode, id).toBe(0);
+    }
+  });
+
+  test("a payload that is not a JSON object is refused before anything is indexed into it", async () => {
+    const fx = setup(ENV);
+    for (const body of ["[]", '"skip"', "5", "true", '[{"action":"skip"}]']) {
+      const run = await botOps(fx, ["plugin-request"], body);
+      expect(run.exitCode, body).not.toBe(0);
+      expect(run.stderr, body).toContain("plugin-request: payload is not a JSON object");
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("webhook-remove: accepted with a channel id, rejected naming the field otherwise", async () => {
+    const fx = setup(ENV);
+    const ok = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" }));
+    expect(ok.exitCode).toBe(0);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "webhook-remove", channelId: CHANNEL, requestedBy: "t" });
+    const bad: unknown[] = ["abc", "1234", "12345678901234567890123456", 12345, CHANNEL + "x", "", undefined, null, { id: CHANNEL }, WEBHOOK_URL];
+    for (const channelId of bad) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "webhook-remove", channelId, requestedBy: "t" }));
+      expect(run.exitCode, String(channelId)).not.toBe(0);
+      // names the field and nothing else: a webhook URL put in the wrong field is not echoed back
+      expect(run.stderr.trim(), String(channelId)).toBe("bot-ops: plugin-request: bad channelId");
+    }
+  }, LONG);
+
+  test("webhook-remove: a channel id of 5 and of 25 digits is a snowflake (4 and 26 are refused above)", async () => {
+    for (const id of ["12345", "1".repeat(25)]) {
+      const run = await botOps(setup(ENV), ["plugin-request"], req({ action: "webhook-remove", channelId: id, requestedBy: "t" }));
+      expect(run.exitCode, id).toBe(0);
+    }
+  });
+
+  test("days is checked only for remind, and only when it is there", async () => {
+    // These lines moved into a `case` arm with #240; the behaviour is main's.
+    const fx = setup(ENV);
+    const ok = (payload: object) => botOps(fx, ["plugin-request"], req({ plugin: "music", version: "1.1.0", requestedBy: "t", ...payload }));
+    expect((await ok({ action: "remind" })).exitCode, "remind without days: the bot's default").toBe(0);
+    expect((await ok({ action: "remind", days: 3 })).exitCode, "remind 3").toBe(0);
+    for (const days of [0, 1000]) {
+      const run = await ok({ action: "remind", days });
+      expect(run.exitCode, `remind ${days}`).not.toBe(0);
+      expect(run.stderr, `remind ${days}`).toContain(`plugin-request: bad days '${days}'`);
+    }
+    // an action that has no days never has it judged
+    expect((await ok({ action: "skip", days: 0 })).exitCode, "skip 0").toBe(0);
+    expect((await ok({ action: "update-now", days: 1000 })).exitCode, "update-now 1000").toBe(0);
+  }, LONG);
+
+  test("discovery-refresh round-trips", async () => {
+    const fx = setup(ENV);
+    const run = await botOps(fx, ["plugin-request"], req({ action: "discovery-refresh", requestedBy: "email:me@x.com" }));
+    expect(run.exitCode).toBe(0);
+    expect(run.json?.queued).toMatch(/^\d{10,}-discovery-refresh-\d+\.json$/);
+    expect(JSON.parse(stdinOf(fx))).toEqual({ action: "discovery-refresh", requestedBy: "email:me@x.com" });
+  });
+
+  test("the five update actions still validate exactly as before", async () => {
+    const fx = setup(ENV);
+    // the same two rejections the #105 suite asserts, and one acceptance per family of checks
+    const cases: [object, string][] = [
+      [{ action: "rm-rf", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, "plugin-request: bad action 'rm-rf'"],
+      [{ action: "skip", plugin: "Warbandeer", version: "1.1.0", requestedBy: "t" }, "plugin-request: bad plugin 'Warbandeer'"],
+      [{ action: "update-now", plugin: "warbandeer", version: "1.0.0/../x", requestedBy: "t" }, "plugin-request: bad version '1.0.0/../x'"],
+      [{ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "tomorrow", requestedBy: "t" }, "plugin-request: bad at 'tomorrow'"],
+      [{ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 0, requestedBy: "t" }, "plugin-request: bad days '0'"],
+    ];
+    for (const [payload, msg] of cases) {
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, msg).not.toBe(0);
+      expect(run.stderr, msg).toContain(msg);
+    }
+    // the version check covers every update action except cancel, not just the first one above
+    for (const action of ["update-now", "schedule", "remind", "skip"]) {
+      const run = await botOps(fx, ["plugin-request"], req({ action, plugin: "warbandeer", version: "1.2", at: "2026-09-06T18:30-07:00", days: 3, requestedBy: "t" }));
+      expect(run.exitCode, action).not.toBe(0);
+      expect(run.stderr, action).toContain("plugin-request: bad version '1.2'");
+    }
+    expect(wrote(fx)).toBe(false);
+    for (const payload of [
+      { action: "cancel", plugin: "warbandeer", requestedBy: "t" },
+      { action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" },
+      { action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7, requestedBy: "t" },
+    ]) {
+      expect((await botOps(fx, ["plugin-request"], req(payload))).exitCode, payload.action).toBe(0);
+    }
+    // the new actions do not leak into the old arms: a routing-only field is not required by an update action
+    expect((await botOps(fx, ["plugin-request"], req({ action: "update-now", plugin: "warbandeer", version: "1.1.0" }))).exitCode).toBe(0);
+  });
+
+  test("a rejected request never echoes a value longer than a plugin name would be, whatever field it sits in", async () => {
+    const fx = setup(ENV);
+    const cases: [object, string][] = [
+      [{ action: WEBHOOK_URL, plugin: "music", requestedBy: "t" }, "bad action '(not shown)'"],
+      [{ action: "skip", plugin: WEBHOOK_URL, version: "1.1.0", requestedBy: "t" }, "bad plugin '(not shown)'"],
+      [{ action: "update-now", plugin: "music", version: WEBHOOK_URL, requestedBy: "t" }, "bad version '(not shown)'"],
+      [{ action: "schedule", plugin: "music", version: "1.1.0", at: WEBHOOK_URL, requestedBy: "t" }, "bad at '(not shown)'"],
+      [{ action: "remind", plugin: "music", version: "1.1.0", days: WEBHOOK_URL, requestedBy: "t" }, "bad days '(not shown)'"],
+      [{ action: "routing-set", plugin: WEBHOOK_URL, servers: {}, requestedBy: "t" }, "bad plugin"],
+    ];
+    for (const [payload, msg] of cases) {
+      const run = await botOps(fx, ["plugin-request"], req(payload));
+      expect(run.exitCode, msg).not.toBe(0);
+      expect(run.stderr, msg).toContain(msg);
+      expect(run.stderr, msg).not.toContain(WEBHOOK_TOKEN);
+    }
+    expect(wrote(fx)).toBe(false);
+    // the limit is exactly 40 printable characters: 40 are echoed, 41 are not
+    const at40 = await botOps(fx, ["plugin-request"], req({ action: "skip", plugin: "P".repeat(40), version: "1.1.0" }));
+    expect(at40.stderr).toContain(`bad plugin '${"P".repeat(40)}'`);
+    const at41 = await botOps(fx, ["plugin-request"], req({ action: "skip", plugin: "P".repeat(41), version: "1.1.0" }));
+    expect(at41.stderr).toContain("bad plugin '(not shown)'");
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("a string field with a trailing newline or another control character is refused for every action, not queued with it", async () => {
+    // `$(…)` drops a trailing newline, so such a value used to pass its check and be written with the
+    // character in it, for the bot to reject after the panel had been told `queued`.
+    const fx = setup(ENV);
+    for (const bad of ["\n", "\r", "\t", String.fromCharCode(0)]) {
+      const cases: [string, object][] = [
+        ["update-now plugin", { action: "update-now", plugin: `music${bad}`, version: "1.1.0" }],
+        ["skip version", { action: "skip", plugin: "music", version: `1.1.0${bad}` }],
+        ["schedule at", { action: "schedule", plugin: "music", version: "1.1.0", at: `2026-09-06T18:30-07:00${bad}` }],
+        ["remind days", { action: "remind", plugin: "music", version: "1.1.0", days: `3${bad}` }],
+        ["the action itself", { action: `skip${bad}`, plugin: "music", version: "1.1.0" }],
+        ["cancel plugin", { action: "cancel", plugin: `music${bad}` }],
+        ["routing-set plugin", { action: "routing-set", plugin: `music${bad}`, servers: {} }],
+        ["webhook-add url", { action: "webhook-add", url: `${WEBHOOK_URL}${bad}` }],
+        ["webhook-remove channelId", { action: "webhook-remove", channelId: `${CHANNEL}${bad}` }],
+      ];
+      for (const [why, payload] of cases) {
+        const run = await botOps(fx, ["plugin-request"], req({ ...payload, requestedBy: "t" }));
+        expect(run.exitCode, `${why} ${JSON.stringify(bad)}`).not.toBe(0);
+        expect(run.stderr, `${why} ${JSON.stringify(bad)}`).toContain("plugin-request: bad");
+        expect(run.stderr, `${why} ${JSON.stringify(bad)}`).not.toContain(WEBHOOK_TOKEN);
+      }
+    }
+    expect(wrote(fx)).toBe(false);
+  }, LONG);
+
+  test("the request name ends in two random numbers, so two same-millisecond requests do not share a name", async () => {
+    // RANDOM is seeded through BASH_ENV so the nonce is predictable: it must be two consecutive draws.
+    const fx = setup(ENV);
+    const seed = join(fx.root, "seed.sh");
+    writeFileSync(seed, "RANDOM=7\n");
+    const expected = Bun.spawnSync([BASH!, "-c", "RANDOM=7; printf '%s%s' $RANDOM $RANDOM"]).stdout.toString();
+    expect(expected.length).toBeGreaterThan(1);
+    const run = await botOps(fx, ["plugin-request"], req(REQUESTS[3]!), { BASH_ENV: bashPath(seed) });
+    expect(run.exitCode).toBe(0);
+    // the first part is the epoch in MILLISECONDS: thirteen digits (`date +%s` would give ten)
+    expect(String(run.json?.queued)).toMatch(new RegExp(`^\\d{13}-skip-${expected}\\.json$`));
+  });
+
+  test("a webhook token needs at least 20 characters (Discord's are far longer)", async () => {
+    const fx = setup(ENV);
+    const url = (token: string) => `https://discord.com/api/webhooks/123456789012345678/${token}`;
+    const short = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: url("a".repeat(19)), requestedBy: "t" }));
+    expect(short.exitCode).not.toBe(0);
+    expect(short.stderr).toContain("plugin-request: bad webhook url");
+    expect(wrote(fx)).toBe(false);
+    const ok = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: url("a".repeat(20)), requestedBy: "t" }));
+    expect(ok.exitCode).toBe(0);
+  });
+
+  test("an unknown action, including a near-miss of a new one, is rejected", async () => {
+    const fx = setup(ENV);
+    for (const action of ["webhook-list", "routing-get", "Routing-Set", "webhook_add", ""]) {
+      const run = await botOps(fx, ["plugin-request"], req({ action, plugin: "music", requestedBy: "t" }));
+      expect(run.exitCode, action).not.toBe(0);
+      expect(run.stderr, action).toContain("plugin-request: bad action");
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+});
+
+// The deployment owns a set of keys (core credentials, access control, every variable compose
+// interpolates) that no Plugin Index manifest may make editable. The set is hand-maintained in the
+// script (RESERVED_KEYS), so it is pinned against the two places a new core secret would show up.
+describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
+  const script = readFileSync(BOT_OPS_SH, "utf8");
+  const block = script.match(/declare -A RESERVED_KEYS=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+  const reserved = new Set([...block.matchAll(/\[([A-Z][A-Z0-9_]*)\]=1/g)].map((m) => m[1]!));
+
+  test("the block is found and non-empty (can't pass vacuously)", () => {
+    expect(reserved.size).toBeGreaterThanOrEqual(15);
+    expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
+  });
+
+  // Credentials a first-party plugin owns are NOT reserved, on purpose (ADR-0006 decision 8): the panel
+  // sets them write-only. Add a key here only when a plugin's Plugin Index entry declares it and nothing
+  // in the bot core (src/) reads it. Each entry is checked below against .env.example's "Used by the
+  // <plugin> plugin" block, so this list cannot be used to un-reserve a core key by accident.
+  const PLUGIN_OWNED: Record<string, string> = { BLIZZARD_CLIENT_ID: "wow", BLIZZARD_CLIENT_SECRET: "wow" };
+  const example = readFileSync(new URL("../.env.example", import.meta.url), "utf8");
+  /** .env.example's blank-line-separated blocks: the plugin a "# Used by the <name> plugin" header names
+   *  (or null) and the keys the block sets. */
+  const blocks = example.split(/\r?\n[ \t]*\r?\n/).map((b) => ({
+    plugin: b.match(/^# Used by the ([a-z][a-z0-9-]*) plugin/m)?.[1] ?? null,
+    keys: [...b.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!),
+  }));
+
+  test("every credential-shaped key in .env.example is reserved, bar the plugin-owned exemptions", () => {
+    const keys = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!);
+    const credentialShaped = keys.filter((k) => /TOKEN|SECRET|CLIENT_ID|PASSWORD|_KEY$|ALLOWED_EMAILS|ACCESS_/.test(k));
+    expect(credentialShaped.length).toBeGreaterThanOrEqual(6);
+    expect(credentialShaped.filter((k) => !reserved.has(k) && !(k in PLUGIN_OWNED))).toEqual([]);
+  });
+
+  test("each plugin-owned exemption is unreserved and really sits under its plugin's block in .env.example", () => {
+    expect(Object.keys(PLUGIN_OWNED)).toEqual(["BLIZZARD_CLIENT_ID", "BLIZZARD_CLIENT_SECRET"]);
+    for (const [key, plugin] of Object.entries(PLUGIN_OWNED)) {
+      expect(reserved.has(key), `${key} is plugin-owned, so it must not be reserved`).toBe(false);
+      const block = blocks.find((b) => b.keys.includes(key));
+      expect(block?.plugin, `${key} must sit under a "# Used by the <plugin> plugin" block`).toBe(plugin);
+    }
+    // ...and a core key is in no such block, so listing it as an exemption would fail the check above.
+    expect(blocks.find((b) => b.keys.includes("DISCORD_TOKEN"))?.plugin ?? null).toBeNull();
+  });
+
+  test("every variable docker-compose.yml interpolates is reserved", () => {
+    const compose = readFileSync(new URL("../docker-compose.yml", import.meta.url), "utf8");
+    const vars = [...new Set([...compose.matchAll(/\$\{([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]!))];
+    expect(vars.length).toBeGreaterThanOrEqual(10);
+    expect(vars.filter((v) => !reserved.has(v))).toEqual([]);
+  });
+
+  test("no reserved key is also an ALLOWED_SPEC key (the two sets are disjoint by construction)", () => {
+    const allowedBlock = script.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+    const allowed = [...allowedBlock.matchAll(/^\s*'([A-Z0-9_]+)\|/gm)].map((m) => m[1]!);
+    expect(allowed.length).toBeGreaterThan(5);
+    expect(allowed.filter((k) => reserved.has(k))).toEqual([]);
   });
 });
