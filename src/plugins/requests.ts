@@ -455,6 +455,11 @@ export function validate(
   // check (the one corner where the reason changes for a request that was refused before: the index's
   // current version, incompatible with this bot, and also the installed one, is now "already on", which is
   // the more useful answer). Both values in the reason are already validated text.
+  // #225: an off (carried-forward, enabled: false) plugin is refused before the "already on" check —
+  // an operator sees "off", not a misleading version comparison, when the plugin isn't running at all.
+  if ((action === "update-now" || action === "schedule") && !stateEntry.enabled) {
+    return { ok: false, reason: `${plugin} is off — turn it on first` };
+  }
   if ((action === "update-now" || action === "schedule") && r.version === stateEntry.installedVersion) {
     return { ok: false, reason: `${plugin} is already on ${r.version}` };
   }

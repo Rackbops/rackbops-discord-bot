@@ -113,6 +113,34 @@ describe("validate (#105 trust boundary)", () => {
     // …but an explicit pin to a DIFFERENT (older) version is honored (compat unknowable per-release).
     expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.0.5", requestedBy: "t" }, installed, incompatEntries, 1).ok).toBe(true);
   });
+
+  // #225: a carried-forward off (enabled: false) plugin.
+  const offInstalled = new Map<string, PluginStateEntry>([
+    ["warbandeer", { name: "warbandeer", enabled: false, configured: true, missingEnv: [], active: false, installedVersion: "1.0.0" }],
+  ]);
+
+  test("update-now and schedule are refused for an off plugin; remind, skip and cancel still apply", () => {
+    const offOk = (raw: unknown) => validate(raw, offInstalled, entries, 1);
+    expect(offOk({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" })).toEqual({
+      ok: false,
+      reason: "warbandeer is off — turn it on first",
+    });
+    expect(offOk({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" })).toEqual({
+      ok: false,
+      reason: "warbandeer is off — turn it on first",
+    });
+    expect(offOk({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 7, requestedBy: "t" }).ok).toBe(true);
+    expect(offOk({ action: "skip", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }).ok).toBe(true);
+    expect(offOk({ action: "cancel", plugin: "warbandeer", requestedBy: "t" }).ok).toBe(true);
+  });
+
+  test("an off plugin's bad version is still \"bad version\"", () => {
+    // The off check sits AFTER the shape checks (version/at/days), so a malformed version keeps its
+    // own reason even for a plugin that's off.
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "not-a-version", requestedBy: "t" }, offInstalled, entries, 1);
+    expect(refused.ok).toBe(false);
+    expect(refused.ok === false && refused.reason).toContain("bad version");
+  });
 });
 
 describe("consumePluginRequests drain", () => {

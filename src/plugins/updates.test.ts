@@ -116,6 +116,16 @@ describe("decidePluginUpdates", () => {
     const d = decidePluginUpdates(state([stateEntry("a", "1.0.0")]), index([entry("a", "2.0.0", { hostApiVersion: 2 })]), 1, NOW);
     expect(d[0]).toMatchObject({ to: "2.0.0", compatible: false, neededHostApi: 2, action: "notify" });
   });
+  // #225: an off plugin is never notified or reminded — it isn't running, so there's no one to nag.
+  test("an off plugin is never notified or reminded", () => {
+    const d = decidePluginUpdates(
+      state([stateEntry("a", "1.0.0", { enabled: false, remindAt: "2026-09-01T00:00:00.000Z" })]),
+      index([entry("a", "1.1.0")]),
+      1,
+      NOW,
+    );
+    expect(d).toEqual([]);
+  });
 });
 
 describe("releaseNotesBetween", () => {
@@ -209,6 +219,21 @@ describe("renderPluginsList", () => {
     const out = renderPluginsList(state(plugins), index(entries), NOW);
     expect(out.length).toBeLessThanOrEqual(2000);
     expect(out).toContain("… (list truncated)");
+  });
+  // #225: an off entry shows only that it's off and its pin — no "available" line even when the
+  // index offers something newer, and a pending (paused) schedule still shows.
+  test("an off plugin shows off and its installed version, a pending schedule, and nothing else", () => {
+    const noSchedule = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false })]), index([entry("p", "2.0.0")]), NOW);
+    expect(noSchedule.split("\n")[0]).toMatch(/^• \*\*p\*\* — off \(installed 1\.0\.0\)$/);
+    expect(noSchedule).not.toContain("available");
+    const withSchedule = renderPluginsList(
+      state([stateEntry("p", "1.0.0", { enabled: false, scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" } })]),
+      index([entry("p", "2.0.0")]),
+      NOW,
+    );
+    const scheduledTs = Math.floor(Date.parse("2026-09-06T00:00:00.000Z") / 1000);
+    expect(withSchedule).toContain(`⏳ update to 1.1.0 scheduled <t:${scheduledTs}:R>`);
+    expect(withSchedule).not.toContain("available");
   });
 });
 
@@ -371,6 +396,19 @@ describe("checkPluginUpdates", () => {
   const SNOWFLAKE = "200863115821318144";
   const scheduled = (version: string, at: string, by = SNOWFLAKE) => ({ scheduled: { version, at, requestedBy: by } });
 
+  // #225: an off plugin's schedule is paused, not fired — turning the plugin back on is what resumes it.
+  test("a due schedule on an off plugin does not fire and is kept", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", { enabled: false, ...scheduled("1.1.0", "2026-09-05T11:00:00.000Z") })]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.mutations).toHaveLength(0);
+    expect(h.dms).toHaveLength(0);
+    expect(h.state.plugins[0]?.scheduled).toEqual({ version: "1.1.0", at: "2026-09-05T11:00:00.000Z", requestedBy: SNOWFLAKE });
+  });
+
   test("a due schedule: heads-up DM, sets targetVersion + pendingReport, clears scheduled, restarts once", async () => {
     const h = harness({
       index: index([entry("a", "1.1.0")]),
@@ -471,6 +509,7 @@ describe("parseScheduleTime (#104)", () => {
 describe("planPluginAction (#104)", () => {
   const base = (over: Partial<PluginActionContext> = {}): PluginActionContext => ({
     name: "a",
+    enabled: true,
     installedVersion: "1.0.0",
     latestVersion: "1.1.0",
     compatible: true,
@@ -550,6 +589,30 @@ describe("planPluginAction (#104)", () => {
     expect(r.restart).toBeUndefined();
     expect(r.reply).toContain("needs a newer bot");
   });
+
+  // #225: an off plugin (not in PLUGINS=) is never updated — it isn't running.
+  test("update on an off plugin is refused with no mutation and no restart, now and at a time alike", () => {
+    const now = planPluginAction({ kind: "update" }, base({ enabled: false }));
+    expect(now.mutate).toBeUndefined();
+    expect(now.restart).toBeUndefined();
+    expect(now.reply).toContain("a");
+    expect(now.reply).toContain("turned off");
+    const at = new Date("2026-09-05T18:00:00.000Z");
+    const scheduled = planPluginAction({ kind: "update", at }, base({ enabled: false }));
+    expect(scheduled.mutate).toBeUndefined();
+    expect(scheduled.restart).toBeUndefined();
+    expect(scheduled.reply).toContain("turned off");
+  });
+
+  test("remind, skip and cancel still apply to an off plugin", () => {
+    expect(applied(planPluginAction({ kind: "remind", days: 3 }, base({ enabled: false }))).remindAt).toBe(
+      new Date("2026-09-08T12:00:00.000Z").toISOString(),
+    );
+    expect(applied(planPluginAction({ kind: "skip" }, base({ enabled: false }))).skippedVersion).toBe("1.1.0");
+    const r = planPluginAction({ kind: "cancel" }, base({ enabled: false, hasPending: true }));
+    const seeded = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "x", requestedBy: "admin1" } })]);
+    expect(r.mutate!(seeded).plugins[0]?.scheduled).toBeUndefined();
+  });
 });
 
 describe("decidePluginReportOutcome (#104)", () => {
@@ -570,6 +633,12 @@ describe("decidePluginReportOutcome (#104)", () => {
     expect(r.ok).toBe(false);
     expect(r.message).toContain("failed to start");
     expect(r.message).not.toContain("still on");
+  });
+  // #225: turned off in the same restart an update-now targeted (the pin was consumed but the plugin
+  // never ran) — an honest report, not a false success or a confusing "still on" revert message.
+  test("an off plugin reports that the update did not run", () => {
+    const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { enabled: false, active: false }));
+    expect(r).toEqual({ ok: false, message: "⚠️ **a** is turned off, so the update to 1.1.0 did not run." });
   });
 });
 
