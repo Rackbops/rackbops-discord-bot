@@ -1019,14 +1019,21 @@ _Avoid_: server list, guild cache
   `PLUGIN_KEY_ORDER`, so nothing that lists keys can reach one; (2) **`RESERVED_KEYS`** — the
   deployment's and the core's own keys, in three groups: core credentials and access control, every
   `${VAR}` `docker-compose.yml` interpolates, and (#278) the settings the bot core reads that the panel
-  does not edit (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, and the three the
-  redeploy machinery or docker sets but the core reads from the environment: `HANDOFF_FROM`,
-  `HANDOFF_RESTART_POLICY`, `HOSTNAME`) — are dropped from a manifest whether it declares them secret or
-  not, so a manifest can't make `DISCORD_TOKEN`, or the bot's data directory, editable or listable, with
-  or without its plugin enabled. Pinned by tests against `.env.example` (every credential-shaped key; and
-  every documented key is editable, reserved, or under a plugin's block), the compose file, and the
-  variables the core's source reads (each editable or reserved), so a new core key fails a test until it is
-  decided (a credential a first-party plugin owns is deliberately NOT
+  does not edit (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`; three the redeploy
+  machinery or docker sets but the core reads from the environment: `HANDOFF_FROM`,
+  `HANDOFF_RESTART_POLICY`, `HOSTNAME`; and four the discord.js `Client` the core builds reads:
+  `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`) — are dropped from a manifest
+  whether it declares them secret or not, so a manifest can't make `DISCORD_TOKEN`, or the bot's data
+  directory, editable or listable, with or without its plugin enabled. Pinned by tests: against
+  `.env.example` (every credential-shaped key; and every documented key is editable, reserved, or one of a
+  named list of plugin-owned settings), the compose file, and a regex scan of the core's source (each
+  variable it reads through `env.X`, `env["X"]`, `required`/`optional`/`list("X")` or a `*_ENV` constant is
+  editable or reserved — a net, not a proof: it misses destructuring and dynamic names, and what a
+  dependency reads, which is why the four shard variables are pinned by the behaviour table instead), so a
+  new core key fails a test until it is decided. Runtime-level variables (`NODE_OPTIONS`, `PATH`, the
+  proxy variables, `TAR_OPTIONS`) are read by the runtime or a spawned tool, not by the core's code, and
+  stay claimable (#240's item 22; a possible follow-up). (A credential a first-party plugin owns is
+  deliberately NOT
   reserved: the wow plugin's `BLIZZARD_CLIENT_ID`/`BLIZZARD_CLIENT_SECRET` are declared `secret: true`
   in its Plugin Index entry and nothing in `src/` reads them, so the panel can set them — the test pin
   names them in an explicit exemption list and checks each sits under `.env.example`'s "Used by the
