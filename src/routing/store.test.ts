@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
-import { freshRouting, freshSecrets, type RoutingFile } from "./model";
+import { freshRouting, freshSecrets, type RoutingFile, type RoutingSecretsFile } from "./model";
 import { mutateRouting, mutateSecrets, readRouting, readSecrets, routingPath, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
@@ -58,9 +58,26 @@ describe("readRouting", () => {
   });
 
   test("a wrong-shaped file reads as fresh", async () => {
-    for (const shaped of [[], "text", 5, null, { v: 2, plugins: {} }, { plugins: { music: { servers: {} } } }, { v: 1, plugins: [] }]) {
+    for (const shaped of [[], "text", 5, null, true, { v: 1, plugins: [] }, { v: 1, plugins: "x", webhooks: 7 }, {}]) {
       writeFileSync(routingPath(dir), JSON.stringify(shaped));
       expect(await readRouting(dir)).toEqual(freshRouting());
+    }
+  });
+
+  test("a file with no version, or another one, is read by shape and its placements survive the next write", async () => {
+    // The data-loss case: a hand-seeded file that forgot `v`, or one a newer bot wrote. Reading it as
+    // fresh would let the very next mutate overwrite it, with no copy kept (only an UNPARSEABLE file
+    // is moved aside).
+    const placements = { music: { servers: { [GUILD]: { commands: [CHAN], postTo: CHAN } } } };
+    for (const seeded of [{ plugins: placements }, { v: 2, plugins: placements, futureField: true }, { v: "1", plugins: placements }]) {
+      writeFileSync(routingPath(dir), JSON.stringify(seeded));
+      expect((await readRouting(dir)).plugins).toEqual(placements);
+      await mutateRouting(dir, withPlugin("wow"));
+      const written = JSON.parse(readFileSync(routingPath(dir), "utf8"));
+      expect(written.v).toBe(1);
+      expect(Object.keys(written.plugins).sort()).toEqual(["music", "wow"]);
+      expect(written.plugins.music).toEqual(placements.music);
+      expect(written.futureField).toBeUndefined();
     }
   });
 
@@ -147,6 +164,31 @@ describe("mutateRouting", () => {
     expect(JSON.parse(readFileSync(routingPath(dir), "utf8")).junk).toBeUndefined();
   });
 
+  test("mutateRouting repairs what mutate returns before it writes", async () => {
+    // A caller that builds a value off the shape -- here a webhook carrying its URL -- cannot put it in
+    // routing.json: that file is the one the panel reads, and the URL belongs in the secrets file only.
+    await mutateRouting(dir, (current) => ({
+      ...current,
+      plugins: { ...current.plugins, music: { servers: { [GUILD]: { commands: "all", note: "x" } } }, "Bad Name": { servers: {} } },
+      webhooks: {
+        [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u", url: HOOK_URL, token: "SECRET-TOKEN" },
+      },
+    } as unknown as RoutingFile));
+    const text = readFileSync(routingPath(dir), "utf8");
+    expect(text).not.toContain("SECRET-TOKEN");
+    expect(text).not.toContain("discord.com/api/webhooks");
+    expect(JSON.parse(text)).toEqual({
+      v: 1,
+      updatedAt: "",
+      updatedBy: "",
+      plugins: { music: { servers: { [GUILD]: { commands: "all" } } } },
+      webhooks: { [CHAN]: { id: "444444444444444444", guildId: GUILD, addedAt: "t", addedBy: "u" } },
+    });
+    // And a mutate that returns something that is not a routing file at all writes a valid one.
+    await mutateRouting(dir, () => "not a routing file" as unknown as RoutingFile);
+    expect(JSON.parse(readFileSync(routingPath(dir), "utf8"))).toEqual(freshRouting());
+  });
+
   test("it only ever writes under the directory it is given, never the bot's own data dir", async () => {
     await mutateRouting(dir, withPlugin("music"));
     await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }));
@@ -180,6 +222,27 @@ describe("secrets", () => {
       channels.map((c) => mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, [c]: `https://example.invalid/${c}` } }))),
     );
     expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([...channels].sort());
+  });
+
+  test("a secrets file with no version, or another one, keeps its URLs across the next write", async () => {
+    for (const seeded of [{ webhooks: { [CHAN]: HOOK_URL } }, { v: 2, webhooks: { [CHAN]: HOOK_URL }, extra: 1 }]) {
+      writeFileSync(secretsPath(dir), JSON.stringify(seeded));
+      expect((await readSecrets(dir)).webhooks).toEqual({ [CHAN]: HOOK_URL });
+      await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }), async () => {});
+      expect(JSON.parse(readFileSync(secretsPath(dir), "utf8"))).toEqual({
+        v: 1,
+        webhooks: { [CHAN]: HOOK_URL, "333333333333333332": "https://example.invalid/2" },
+      });
+    }
+  });
+
+  test("mutateSecrets repairs what mutate returns before it writes", async () => {
+    await mutateSecrets(
+      dir,
+      () => ({ v: 1, webhooks: { [CHAN]: HOOK_URL, "not-a-channel": "x", "333333333333333332": 7, "333333333333333333": "" }, extra: 1 }) as unknown as RoutingSecretsFile,
+      async () => {},
+    );
+    expect(JSON.parse(readFileSync(secretsPath(dir), "utf8"))).toEqual({ v: 1, webhooks: { [CHAN]: HOOK_URL } });
   });
 
   test("mutateSecrets hands mutate a repaired value", async () => {

@@ -24,7 +24,10 @@ export const SNOWFLAKE_RE = /^[0-9]{5,25}$/;
 export type CommandScope = "all" | string[];
 export interface ServerRouting {
   commands: CommandScope;
-  /** absent = does not post in this server */
+  /**
+   * absent = this server adds no post target. A plugin with no `postTo` in ANY of its servers posts
+   * to the default announce channel instead (`announceTargets` in `resolve.ts`).
+   */
   postTo?: string;
 }
 /** key: guild id */
@@ -47,7 +50,11 @@ export interface RoutingFile {
   plugins: Record<string, PluginRouting>;
   webhooks: Record<string, WebhookMeta>;
 }
-/** channel id -> webhook URL. The only place a webhook URL is ever stored. */
+/**
+ * channel id -> webhook URL. The only FILE the bot stores a webhook URL in -- though the same bytes
+ * can sit beside it under another name: a corrupt copy is moved aside by `readJsonOrFresh`
+ * (`routing.secrets.json.corrupt-<timestamp>`), and a write whose rename fails leaves its temp file.
+ */
 export interface RoutingSecretsFile {
   v: 1;
   webhooks: Record<string, string>;
@@ -134,16 +141,20 @@ function repairWebhook(value: unknown): WebhookMeta | undefined {
  * Whatever was on disk, as a valid `RoutingFile`. Never throws, and always returns a NEW object
  * (nothing is shared with `raw`, so a caller may mutate the result freely).
  *
- * Anything that is not a plain object, or that does not say `v: 1`, is fresh: a file from a version
- * this code cannot read is not guessed at. Inside a good file, an entry that is malformed is dropped
- * on its own -- a plugin whose name fails `PLUGIN_NAME_RE`; a server whose id is not a snowflake or
- * whose `commands` is neither "all" nor a non-empty list of channel ids; a webhook that lacks its
- * ids -- and a bad `postTo` is dropped from a server that is otherwise kept. Unknown keys are not
- * carried over.
+ * Anything that is not a plain object is fresh. Inside an object, an entry that is malformed is
+ * dropped on its own -- a plugin whose name fails `PLUGIN_NAME_RE`; a server whose id is not a
+ * snowflake or whose `commands` is neither "all" nor a non-empty list of channel ids; a webhook that
+ * lacks its ids -- and a bad `postTo` is dropped from a server that is otherwise kept. Unknown keys
+ * are not carried over.
+ *
+ * The file's own `v` is not consulted: it is read by shape, and the result always says `v: 1`. That
+ * is what keeps a hand-seeded file that forgot `v` from being thrown away whole. It also means that
+ * rolling back from a newer version loses whatever only that version understood -- the next write
+ * drops it -- so a version that changes the shape has to change this reader first.
  */
 export function repairRouting(raw: unknown): RoutingFile {
   const repaired = freshRouting();
-  if (!isPlainObject(raw) || raw.v !== ROUTING_VERSION) return repaired;
+  if (!isPlainObject(raw)) return repaired;
   if (typeof raw.updatedAt === "string") repaired.updatedAt = raw.updatedAt;
   if (typeof raw.updatedBy === "string") repaired.updatedBy = raw.updatedBy;
 
@@ -164,10 +175,13 @@ export function repairRouting(raw: unknown): RoutingFile {
   return repaired;
 }
 
-/** The secrets file, repaired the same way: only `channel id -> non-empty string` pairs survive. */
+/**
+ * The secrets file, repaired the same way (never throws, a new object, `v` not consulted): only
+ * `channel id -> non-empty string` pairs survive.
+ */
 export function repairSecrets(raw: unknown): RoutingSecretsFile {
   const repaired = freshSecrets();
-  if (!isPlainObject(raw) || raw.v !== ROUTING_VERSION || !isPlainObject(raw.webhooks)) return repaired;
+  if (!isPlainObject(raw) || !isPlainObject(raw.webhooks)) return repaired;
   for (const [channelId, url] of Object.entries(raw.webhooks)) {
     if (SNOWFLAKE_RE.test(channelId) && typeof url === "string" && url !== "") repaired.webhooks[channelId] = url;
   }

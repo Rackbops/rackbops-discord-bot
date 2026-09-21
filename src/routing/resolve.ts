@@ -86,9 +86,12 @@ export function commandAllowed(
   parentChannelId?: string,
 ): GateResult {
   const entry = entryOf(routing, plugin);
-  if (entry === undefined || !Object.hasOwn(entry.servers, guildId)) return { allowed: true };
-  const scope: CommandScope | undefined = entry.servers[guildId]?.commands;
-  if (scope === undefined || scope === "all") return { allowed: true };
+  const server = entry !== undefined && Object.hasOwn(entry.servers, guildId) ? entry.servers[guildId] : undefined;
+  // No entry for this server -- the plugin is unplaced, or placed only elsewhere -- means nothing
+  // restricts it here.
+  if (server === undefined) return { allowed: true };
+  const scope: CommandScope = server.commands;
+  if (scope === "all") return { allowed: true };
   if (scope.includes(channelId) || (parentChannelId !== undefined && scope.includes(parentChannelId))) {
     return { allowed: true };
   }
@@ -100,20 +103,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A value that is about to be put in a message the panel shows. Ids are at most 25 characters, so the
- * clip changes nothing for a real request and only stops a hostile one from echoing itself back at
- * length.
+ * A value that is about to be put in a message the panel shows. It cannot throw: a string is used as
+ * it is, a list or an object is named rather than printed (printing one walks it, and JSON a hundred
+ * kilobytes deep overflows the stack in `JSON.stringify` and again in any fallback), and everything
+ * else is a primitive. Ids are at most 25 characters, so the clip changes nothing for a real request
+ * and only stops a hostile one from echoing itself back at length.
  */
 function shown(value: unknown): string {
   let text: string;
   if (typeof value === "string") text = value;
-  else {
-    try {
-      text = JSON.stringify(value) ?? String(value);
-    } catch {
-      text = String(value);
-    }
-  }
+  else if (typeof value === "object" && value !== null) text = Array.isArray(value) ? "[list]" : "[object]";
+  else if (typeof value === "function") text = "[function]";
+  else text = String(value);
   return text.length > 40 ? `${text.slice(0, 37)}...` : text;
 }
 

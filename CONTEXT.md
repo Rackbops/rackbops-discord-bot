@@ -104,10 +104,12 @@ _Avoid_: bundle (bare — ambiguous with the bot's own plugin bundle, `dist/plug
 Where a plugin lives, as data the bot owns (ADR-0006, Epic #236): per plugin, per Discord server,
 which channels its commands work in (`"all"`, or a list) and which channel it posts to. Stored in
 `data/routing.json`, written only by the bot; a webhook URL, being a secret, lives in
-`data/routing.secrets.json` and nowhere else. Per plugin, never per command. #237 added only the
-model — the shapes, the pure decisions in `src/routing/resolve.ts` and the store; the later children
-of the epic wire it into command registration, posting and dispatch, and until then the bot still
-registers every command to `DISCORD_SERVER_ID` and posts to `ANNOUNCE_CHANNEL_ID`.
+`data/routing.secrets.json` and in no other file the bot writes (a corrupt copy moved aside by
+`readJsonOrFresh`, or the temp file of a failed write, is that same file under another name). Per
+plugin, never per command. #237 added only the model — the shapes, the pure decisions in
+`src/routing/resolve.ts` and the store; the later children of the epic wire it into command
+registration, posting and dispatch, and until then the bot still registers its commands to
+`DISCORD_SERVER_ID` (globally when that is unset) and posts to `ANNOUNCE_CHANNEL_ID`.
 _Avoid_: channel config, command permissions (Discord's own per-channel command permissions are a
 different thing, which the bot cannot edit — ADR-0006 decision 7)
 
@@ -120,12 +122,14 @@ _Avoid_: main server, primary guild
 **Placed / unplaced plugin**:
 A plugin is **placed** when `routing.json` has an entry for it, and lives in exactly the servers that
 entry lists; **unplaced** when it has none, and lives in the home server. A placed plugin whose entry
-has no servers lives nowhere (see the gotcha "an entry with no servers lives nowhere").
+has no servers lives nowhere (see the gotcha "A plugin with an entry in `routing.json` and no
+servers lives nowhere").
 _Avoid_: enabled / disabled (that is `PLUGINS=` — whether the bot loads a plugin at all)
 
 **Discovery**:
 What the bot can see of Discord, published by the bot as `data/discovery.json` so that the panel,
-which never holds the Discord token, can offer servers and channels by name: the servers, their text
+which is not given the Discord token in its environment (`docker-compose.yml`'s `admin` service has no
+`env_file:`), can offer servers and channels by name: the servers, their text
 channels and whether the bot can post in each, the outcome of the last command registration per
 server, an invite URL, and per plugin whether it posts and which commands it registered.
 `DiscoveryFile` in `src/routing/model.ts` is its shape and `validatePluginRouting` checks a request
@@ -189,9 +193,9 @@ _Avoid_: server list, guild cache
 | `src/plugins/updates.test.ts` | bun tests (pure, no env/Client): `compareSemver` incl. prerelease; `decidePluginUpdates` (not-newer/uninstalled→no decision; notify-once; notified/skipped/snoozed→none; snooze due→remind; incompatible→`compatible:false`); `releaseNotesBetween` range/order/clamp/placeholder; `notificationMessage` both texts; `renderPluginsList`; `deliverPluginNotification` (per-admin DM, single channel fallback, no-admins warn, all-fail); `checkPluginUpdates` (notify-once + persist, retry cap, remind clears `remindAt`, no-admins persists nothing). #104 tests: `parseScheduleTime` (UTC wrap, ISO+offset, rejection), `planPluginAction` (each action's mutation/reply + refusals), `decidePluginReportOutcome` (3 branches), `reportPluginUpdateOutcome` (clear-before-deliver + fallback), and the scheduled-execution property set — **no restart without a due schedule**, a due schedule restarts once (sets `targetVersion`/`pendingReport`, clears `scheduled`), deferral on `restartPending`, and the cancel-race arbiter (a racing cancel stops the restart) |
 | `src/plugins/requests.ts` | The #105 plugin request **mailbox** consumer. `consumePluginRequests(deps)` drains `data/plugins/requests/*.json` (filename/epoch order) — the panel can't write `state.json`, so each panel action is a file the bot applies. Validates each against `PluginRequest` + formats (`validate`, exported/pure: action ∈ the 5, `plugin` `^[a-z][a-z0-9-]*$`, **`version` anchored semver with no `/` — the traversal gate**, `at` ISO-with-offset, `days` 1-999, plugin must be **installed**, and the one compat check the index allows: current-version-incompatible → reject); applies the survivors through #104's version-parameterized builders (honoring the request's EXPLICIT pin, not the index's current) via the shared `mutatePluginState`; deletes on success (ENOENT-tolerant); a bad file is moved to `requests/rejected/` (never thrown). **Single-flight** (a module promise chain) so the boot drain + a tick drain can't double-process. Collects a single restart-needed flag and `requestRestart`s ONCE after the whole drain (co-dropped `update-now`s share it). Pure over an injected FS seam + mutate/restart deps. Trust boundary: can only ever run the 5 actions on an already-`PLUGINS=`-selected plugin |
 | `src/plugins/requests.test.ts` | bun tests (in-memory FS seam, fake mutate/restart): `validate` every accept + reject reason (unknown action, bad plugin/version, **`/` in version**, not-installed plugin, bad `at`/`days`, current-version-incompatible); the drain — filename order, delete-on-apply, honors the request's explicit version (not the index's), one restart across a multi-file drain, malformed → `rejected/` (never throws), **single-flight** (two concurrent drains apply each file once), empty dir a no-op |
-| `src/routing/model.ts` | **#237, ADR-0006.** The routing contract the bot chain, `ops/bot-ops.sh` and the panel all build against: the `RoutingFile` / `RoutingSecretsFile` / `DiscoveryFile` shapes, `ROUTING_VERSION`, `PLUGIN_NAME_RE`, `SNOWFLAKE_RE`, `freshRouting()` / `freshSecrets()` and `repairRouting()` / `repairSecrets()`. Pure; a repair never throws and always returns a new object. An untrusted key is tested against a regex before it is used, and unknown keys (a stray `url`, `__proto__`) are not carried over. A file that does not say `v: 1` reads as fresh. |
+| `src/routing/model.ts` | **#237, ADR-0006.** The routing contract the bot chain, `ops/bot-ops.sh` and the panel all build against: the `RoutingFile` / `RoutingSecretsFile` / `DiscoveryFile` shapes, `ROUTING_VERSION`, `PLUGIN_NAME_RE`, `SNOWFLAKE_RE`, `freshRouting()` / `freshSecrets()` and `repairRouting()` / `repairSecrets()`. Pure; a repair never throws and always returns a new object. An untrusted key is tested against a regex before it is used, and unknown keys (a stray `url`, `__proto__`) are not carried over. The file's own `v` is not consulted (a hand-seeded file with no `v` keeps its placements); the result always says `v: 1`. |
 | `src/routing/resolve.ts` | **#237.** Pure routing decisions, no I/O and no discord.js: `isPlaced`, `hasPlacements`, `pluginsForGuild`, `announceTargets`, `commandAllowed` (a thread counts as its parent), `validatePluginRouting` (rejections worded for the panel to show). A plugin is always looked up with `Object.hasOwn`, never a bare `routing.plugins[name]` — `constructor` is a legal plugin name. Nothing calls it yet. |
-| `src/routing/store.ts` | **#237.** `readRouting` / `mutateRouting` / `readSecrets` / `mutateSecrets` over `storage.ts`, taking `dataDir` as a parameter and never reading `DATA_DIR`. One module-level `createKeyedJsonMutator` per file, so a read-modify-write is serialized; `mutate` always receives a repaired value; `mutateSecrets` sets the file `0o600` after the write (a failure is logged, not thrown). Tests: `model.test.ts`, `resolve.test.ts`, `store.test.ts` — the `0o600` test skips on Windows and so runs only on CI. |
+| `src/routing/store.ts` | **#237.** `readRouting` / `mutateRouting` / `readSecrets` / `mutateSecrets` over `storage.ts`, taking `dataDir` as a parameter and never reading `DATA_DIR`. One module-level `createKeyedJsonMutator` per file, so a read-modify-write is serialized; `mutate` always receives a repaired value and what it returns is repaired again before it is written (a `url` on a webhook cannot land in `routing.json`); `mutateSecrets` sets the file `0o600` after the write (a failure is logged, not thrown). Tests: `model.test.ts`, `resolve.test.ts`, `store.test.ts` — the `0o600` test skips on Windows and so runs only on CI. |
 
 ## Behavior
 

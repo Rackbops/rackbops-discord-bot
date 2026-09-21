@@ -84,10 +84,14 @@ describe("repairRouting", () => {
     }
   });
 
-  test("a file that does not say v: 1 becomes fresh, whatever else it holds", () => {
+  test("a file's own version is not consulted -- it is read by shape and comes back as v: 1", () => {
+    // A hand-seeded file that forgot `v`, or one a newer version wrote, keeps every placement it
+    // holds: throwing it away whole would be silent data loss on the next write.
     for (const v of [undefined, 0, 2, "1", null]) {
-      expect(repairRouting({ ...good(), v })).toEqual(freshRouting());
+      expect(repairRouting({ ...good(), v })).toEqual(good());
     }
+    const { v: _dropped, ...noVersion } = good();
+    expect(repairRouting(noVersion)).toEqual(good());
   });
 
   test("a wrong-typed plugins or webhooks map becomes empty", () => {
@@ -175,6 +179,27 @@ describe("repairRouting", () => {
       },
     });
     expect(Object.keys(repaired.webhooks)).toEqual([CHAN_1]);
+  });
+
+  test("a webhook needs string addedAt and addedBy, and keeps a string broken only", () => {
+    const ok = { id: HOOK, guildId: GUILD_A, addedAt: "t", addedBy: "u" };
+    const repaired = repairRouting({
+      v: 1,
+      webhooks: {
+        [CHAN_1]: { ...ok, addedBy: undefined },
+        [CHAN_2]: { ...ok, addedBy: 5 },
+        "333333333333333333": { ...ok, addedAt: 5 },
+        // A `broken` that is not text costs the webhook its reason, not the webhook itself.
+        "333333333333333334": { ...ok, broken: 7 },
+        "333333333333333335": { ...ok, broken: { why: "x" } },
+        "333333333333333336": { ...ok, broken: "Unknown Webhook" },
+      },
+    });
+    expect(repaired.webhooks).toEqual({
+      "333333333333333334": ok,
+      "333333333333333335": ok,
+      "333333333333333336": { ...ok, broken: "Unknown Webhook" },
+    });
   });
 
   test("a webhook keeps only its metadata -- a url or token in the file is never carried over", () => {
@@ -290,10 +315,19 @@ describe("repairSecrets", () => {
     expect(repaired.webhooks).not.toBe(input.webhooks);
   });
 
-  test("anything that is not a v: 1 file with a webhooks object is fresh", () => {
-    for (const raw of [null, undefined, 5, "x", [], { v: 2, webhooks: {} }, { webhooks: {} }, { v: 1 }, { v: 1, webhooks: [] }, { v: 1, webhooks: "x" }]) {
+  test("anything that is not an object with a webhooks object is fresh", () => {
+    for (const raw of [null, undefined, 5, "x", [], { v: 1 }, { v: 1, webhooks: [] }, { v: 1, webhooks: "x" }, { webhooks: null }]) {
       expect(repairSecrets(raw)).toEqual(freshSecrets());
     }
+  });
+
+  test("a secrets file's own version is not consulted either -- its URLs survive", () => {
+    // Discarding a v: 2 or version-less file whole would destroy the only copy of every webhook URL.
+    const webhooks = { [CHAN_1]: "https://example.invalid/hook/1" };
+    for (const v of [undefined, 0, 2, "1", null]) {
+      expect(repairSecrets({ v, webhooks })).toEqual({ v: 1, webhooks });
+    }
+    expect(repairSecrets({ webhooks })).toEqual({ v: 1, webhooks });
   });
 
   test("only channel id to non-empty string pairs survive", () => {

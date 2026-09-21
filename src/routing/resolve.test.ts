@@ -80,6 +80,19 @@ describe("isPlaced / hasPlacements", () => {
   });
 });
 
+describe("a server id named like an inherited property", () => {
+  test("is not a server a plugin lives in, and never throws", () => {
+    // Real server ids are snowflakes; the point is that a lookup keyed by an arbitrary string must
+    // not answer for `constructor` just because Object has one.
+    const r = routing({ music: { servers: { [OTHER]: { commands: [OTHER_CHAN] } } } });
+    for (const guildId of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect(pluginsForGuild(r, guildId, ["music"], HOME)).toEqual([]);
+      expect(commandAllowed(r, "music", guildId, OTHER_CHAN)).toEqual({ allowed: true });
+      expect(commandAllowed(r, "music", guildId, "1", "2")).toEqual({ allowed: true });
+    }
+  });
+});
+
 describe("pluginsForGuild", () => {
   test("an unplaced plugin lives in the home server only", () => {
     const loaded = ["music", "wow"];
@@ -356,9 +369,37 @@ describe("validatePluginRouting", () => {
   test("an unserialisable value is reported rather than thrown on", () => {
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    for (const bad of [circular, 10n, Symbol("s")]) {
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare.self = bare;
+    for (const bad of [circular, bare, 10n, Symbol("s"), () => 1]) {
       const result = validatePluginRouting({ servers: { [OTHER]: { commands: [bad] } } }, discovery());
       expect(result.ok).toBe(false);
     }
+  });
+
+  test("JSON nested far past the stack is reported, not thrown on", () => {
+    // ~200,000 levels is only ~400 KB of JSON. Printing such a value overflows the stack in
+    // JSON.stringify, and again in any fallback that tries String() on it -- so a rejection reason
+    // must never print a list or an object, only name it.
+    let deep: unknown = [];
+    for (let i = 0; i < 200_000; i += 1) deep = [deep];
+    const asChannel = validatePluginRouting({ servers: { [OTHER]: { commands: [deep] } } }, discovery());
+    expect(asChannel).toEqual({ ok: false, reason: `channel [list] is not in server ${OTHER}` });
+    const asPostTo = validatePluginRouting({ servers: { [OTHER]: { commands: "all", postTo: deep } } }, discovery());
+    expect(asPostTo).toEqual({ ok: false, reason: `postTo [list] is not in server ${OTHER}` });
+    // The same shape from JSON text, the way a request file would arrive.
+    const text = `{"servers":{"${OTHER}":{"commands":[${"[".repeat(5000)}${"]".repeat(5000)}]}}}`;
+    expect(validatePluginRouting(JSON.parse(text) as unknown, discovery()).ok).toBe(false);
+  });
+
+  test("a list or an object is named in the reason, not printed", () => {
+    expect(validatePluginRouting({ servers: { [OTHER]: { commands: [{ a: 1 }] } } }, discovery())).toEqual({
+      ok: false,
+      reason: `channel [object] is not in server ${OTHER}`,
+    });
+    expect(validatePluginRouting({ servers: { [OTHER]: { commands: [[OTHER_CHAN]] } } }, discovery())).toEqual({
+      ok: false,
+      reason: `channel [list] is not in server ${OTHER}`,
+    });
   });
 });

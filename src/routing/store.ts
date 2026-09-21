@@ -31,7 +31,9 @@ export function secretsPath(dataDir: string): string {
 // queue (the `stateMutator` pattern in `src/plugins/host.ts`). A read-modify-write is serialized end
 // to end: the second `mutate` always sees the first one's result. A plain read-then-write would let
 // two overlapping callers each read the same file and the later write silently drop the earlier
-// change -- a lost update, not a corrupt file.
+// change -- a lost update, not a corrupt file. The queue is keyed by the path STRING, so every caller
+// must spell the directory the same way (production passes `DATA_DIR`); `d`, `d/` and `d\` are three
+// queues.
 const routingMutator = createKeyedJsonMutator<RoutingFile>();
 const secretsMutator = createKeyedJsonMutator<RoutingSecretsFile>();
 
@@ -47,13 +49,16 @@ export async function readRouting(dataDir: string): Promise<RoutingFile> {
 
 /**
  * Serialized read-modify-write of `routing.json`. `mutate` always receives a REPAIRED value (never
- * whatever the file happened to contain) and returns the file to write.
+ * whatever the file happened to contain) and returns the file to write -- which is repaired again
+ * before it is written, so a value that does not fit the shape can never land in the file. Above
+ * all that keeps a webhook URL out of `routing.json` whatever a caller builds: a `url` key on a
+ * webhook is not part of `WebhookMeta` and is dropped.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
   await routingMutator.update(
     routingPath(dataDir),
     freshRouting,
-    (current) => mutate(repairRouting(current)),
+    (current) => repairRouting(mutate(repairRouting(current))),
     "routing",
   );
 }
@@ -63,15 +68,17 @@ export async function readSecrets(dataDir: string): Promise<RoutingSecretsFile> 
 }
 
 /**
- * As `mutateRouting`, for the file that holds webhook URLs -- then makes it owner-only (`0o600`).
- * `chmod` is a parameter only so a test can make it fail; it defaults to `node:fs/promises`'s. A
- * chmod that fails is logged and swallowed: the write itself succeeded, and refusing to report that
- * would leave the caller retrying a change that already landed.
+ * As `mutateRouting` (repaired in, repaired out), for the file that holds webhook URLs -- then makes
+ * it owner-only (`0o600`). `chmod` is a parameter only so a test can make it fail; it defaults to
+ * `node:fs/promises`'s. A chmod that fails is logged and swallowed: the write itself succeeded, and
+ * refusing to report that would leave the caller retrying a change that already landed.
  *
- * The mode is set AFTER the atomic rename, because `writeJsonAtomic` gives the new file the process
- * default. So the file is briefly readable under that default between the rename and this chmod; the
- * data directory is the bot's own volume, which is why that gap is accepted here rather than
- * widening `storage.ts` to write with a mode.
+ * The mode is set AFTER the write, because `writeJsonAtomic` creates its temp file with the process
+ * default and renames it into place. So the URLs are in a default-mode file for the whole write --
+ * the temp file from its creation, then the renamed file until this chmod -- and a write whose rename
+ * fails leaves that temp file behind with the URLs in it. The data directory is the bot's own volume
+ * and nothing serves it, which is why that gap is accepted here rather than widening `storage.ts`
+ * (shared by every data file) to write with a mode; doing so would close it.
  */
 export async function mutateSecrets(
   dataDir: string,
@@ -79,7 +86,12 @@ export async function mutateSecrets(
   chmod: (path: string, mode: number) => Promise<void> = fsChmod,
 ): Promise<void> {
   const path = secretsPath(dataDir);
-  await secretsMutator.update(path, freshSecrets, (current) => mutate(repairSecrets(current)), "routing-secrets");
+  await secretsMutator.update(
+    path,
+    freshSecrets,
+    (current) => repairSecrets(mutate(repairSecrets(current))),
+    "routing-secrets",
+  );
   try {
     await chmod(path, 0o600);
   } catch (err) {
