@@ -138,8 +138,9 @@ connector-status readout instead of a bare port number.
   of mounting. A plugin pinned to a version older than its first settings tab shows
   `v<installed> of this plugin has no settings tab; v<latest> does — update to get it` — not an
   error, just what that version predates.
-- **What a tab can and cannot do.** It can only read and change *its own* declared, non-secret env
-  keys — never another plugin's, never a secret — and every write goes through the same guarded save
+- **What a tab can and cannot do.** It can only read and change *its own* declared env keys —
+  never another plugin's — and a key the plugin declares `secret` can be written but never read back
+  (write-only: `env-get` never returns one). Every write goes through the same guarded save
   the Config section uses (an Origin check, Cloudflare Access, `bot-ops.sh env-set`'s own
   validation, then a recreate). It renders as its own tab, but it isn't a separate door.
 

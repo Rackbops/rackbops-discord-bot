@@ -254,7 +254,7 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
   manifest that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails
   closed on the manifest: a key that *any* plugin in the index declares secret — enabled or not — is
-  never listed as a plain key, a `secret` that is not exactly `false` or absent counts as secret, an
+  never listed as a plain key, a `secret` that is not exactly `false`, `null` or absent counts as secret, an
   entry whose `key`, `format` or `required` holds a line break (or that has no string `format`) is
   unusable (a line break could re-frame the rows the script reads and forge a plain row for another
   plugin's secret) — though an unusable entry that claims `secret` still marks its key secret — and a

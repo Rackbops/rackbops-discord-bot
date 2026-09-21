@@ -46,7 +46,9 @@
 #     it `secret: true` — e.g. the wow plugin's BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET) is
 #     different, on purpose (ADR-0006 decision 8): env-set may WRITE it, and nothing ever reads it
 #     back — env-get never lists it, env-schema says only that it exists and whether it is set, and
-#     no output, error or log line this script emits carries its value.
+#     no output, error or log line this script writes itself carries its value. (The one text it does
+#     not write is `docker compose`'s, which env-set relays as `log`; that is scrubbed of secret values
+#     on a best-effort basis — see redact_secret_values.)
 #   - env-set rebuilds .env line-by-line (no sed) so a value can never inject into the file, and
 #     comment/blank/secret lines are preserved verbatim. An indented or `export`ed line for a key
 #     being changed is rewritten in place as plain `KEY=`.
@@ -410,9 +412,11 @@ declare -A PLUGIN_SECRET_ANY=()
 # isn't running or hasn't cached the index yet — env-get then shows static keys only, never errors).
 PLUGIN_KEYS_STATUS="none"
 
-# Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED from the container's cached index,
-# restricted to the plugins named in this instance's own PLUGINS value. Requires load_env_values to
-# have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
+# Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED (the listable, editable plain keys) and
+# PLUGIN_SECRET_* (the editable secret keys) from the container's cached index, restricted to the
+# plugins named in this instance's own PLUGINS value — except that PLUGIN_SECRET_ANY, the set of keys
+# that must never be listed, is filled from EVERY plugin in the index (#240). Requires
+# load_env_values to have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
 # would lose the globals it sets to a subshell — so it reads docker's output into a variable and
 # parses it via a here-string. No plugins enabled → returns immediately WITHOUT touching docker, so
 # an instance with no plugins pays nothing (and every pre-#101 test, none of which set PLUGINS, sees
@@ -774,7 +778,8 @@ cmd_env_set() {
         # env-schema already reveals.
         { [ -n "$val" ] || [ -n "$(env_value "$key")" ]; } || continue
       fi
-      # A CR (or any line break) in a value would let it start a new line in .env — for a secret
+      # A CR in a value would let it start a new line in .env (an LF cannot reach here: stdin is read a
+      # line at a time, so a value never holds one) — for a secret
       # key the format regex may be permissive, so this is checked here, for every key, before the
       # format. The message names the key, never the value.
       [[ "$val" != *$'\r'* ]] || die "env-set: value for '$key' is invalid"
@@ -918,8 +923,9 @@ cmd_env_set() {
 # Neither file is meant to hold a webhook URL or token, but both are read back from disk a person may
 # have edited, so each is scrubbed on the way out: any member named url / token / secret / password is
 # dropped (the routing model has none — src/routing/model.ts drops them the same way on its own read),
-# and any string that looks like a Discord webhook URL (or a `webhooks/<id>/<token>` tail) becomes
-# "[redacted]" — keys as well as values, since that scrub runs on the compact JSON text. The two
+# and any Discord webhook URL inside a string is replaced by "[redacted]" (a bare `webhooks/<id>/<token>`
+# tail by `webhooks/[redacted]`) — in keys as well as values, since that scrub runs on the compact
+# JSON text. It is best effort: see the routing-get gotcha in CONTEXT.md for what it does not catch. The two
 # documents reach the final jq over a pipe (a builtin printf, so no argv size limit: a discovery.json
 # for a large server can run to tens of KB).
 readonly ROUTING_SCRUB_JQ='

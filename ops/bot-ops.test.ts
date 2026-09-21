@@ -130,10 +130,10 @@ function setup(
     // older index / state handlers below, which stay silent with status 0) — routing-get must survive it.
     opts.routing !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then cat ${JSON.stringify(bashPath(routingFile))}; fi`
-      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then exit 1; fi`,
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/routing.json"* ]]; then echo "cat: can't open '/app/data/routing.json': No such file or directory" >&2; exit 1; fi`,
     opts.discovery !== undefined
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then cat ${JSON.stringify(bashPath(discoveryFile))}; fi`
-      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then exit 1; fi`,
+      : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then echo "cat: can't open '/app/data/discovery.json': No such file or directory" >&2; exit 1; fi`,
     opts.composeUp !== undefined
       ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
       : "",
@@ -1716,11 +1716,20 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     // A mistyped variable name is still named (upper-case, at most 40 characters)...
     const typo = await botOps(fx, ["env-set"], "MUSIC_API_KAY=x\n");
     expect(typo.stderr).toContain("'MUSIC_API_KAY' is not an editable key");
-    // ...and one over that length is not.
+    // ...and one over that length is not: the limit is exactly 40 characters.
+    const exactly40 = `A${"B".repeat(39)}`;
+    const at40 = await botOps(fx, ["env-set"], `${exactly40}=x\n`);
+    expect(at40.stderr).toContain(`'${exactly40}' is not an editable key`);
     const long = `A${"B".repeat(40)}`;
     const over = await botOps(fx, ["env-set"], `${long}=x\n`);
     expect(over.stderr).toContain("'(not shown)' is not an editable key");
     expect(over.stderr).not.toContain(long);
+    // only an upper-case, variable-shaped name is echoed: a lower-case or underscore-led one is not
+    for (const odd of ["music_api_key", "_MUSIC_KEY", "Music_Key"]) {
+      const run = await botOps(fx, ["env-set"], `${odd}=x\n`);
+      expect(run.stderr, odd).toContain("'(not shown)' is not an editable key");
+      expect(run.stderr, odd).not.toContain(odd);
+    }
   });
 
   test("a manifest that declares a core credential cannot make it editable, listable or schema-visible", async () => {
@@ -1843,6 +1852,15 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     const seen = everythingObservable(fx, run);
     expect(seen).not.toContain(SECRET);
     expect(seen).not.toContain(OLD_SECRET);
+  });
+
+  test("redaction replaces every occurrence of a secret, stored or submitted", async () => {
+    const fx = setup(`${MUSIC_ENV}MUSIC_API_KEY=${OLD_SECRET}\n`, {
+      pluginIndex: SECRET_INDEX,
+      composeUp: { output: `first ${SECRET} then ${SECRET} and ${OLD_SECRET} and again ${OLD_SECRET} end`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(String((run.json as { log: string }).log)).toBe("first [redacted] then [redacted] and [redacted] and again [redacted] end");
   });
 
   test("redaction treats a secret as a literal, whatever glob characters it holds", async () => {
@@ -1990,6 +2008,7 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
     const neither = await get(setup(ENV));
     expect(neither.exitCode).toBe(0);
     expect(neither.json).toEqual({ routing: null, discovery: null });
+    expect(neither.stderr).toBe(""); // docker's / cat's own "no such file" text is not relayed
     const onlyRouting = await get(setup(ENV, { routing: JSON.stringify(ROUTING) }));
     expect(onlyRouting.json).toEqual({ routing: ROUTING, discovery: null });
     const onlyDiscovery = await get(setup(ENV, { discovery: JSON.stringify(DISCOVERY) }));
@@ -2002,6 +2021,7 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
       const run = await get(fx);
       expect(run.exitCode, bad).toBe(0);
       expect(run.json, bad).toEqual({ routing: null, discovery: DISCOVERY });
+      expect(run.stderr, bad).toBe(""); // jq's parse error, which may quote the file's text, is not relayed
     }
     // and both corrupt at once: still valid JSON on stdout
     const both = await get(setup(ENV, { routing: "{", discovery: "}" }));
@@ -2019,8 +2039,21 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
       expect.stringContaining("exec probe-container cat /app/data/routing.json"),
       expect.stringContaining("exec probe-container cat /app/data/discovery.json"),
     ]);
-    // the fixture shim matches by substring: prove the secrets path could never satisfy the routing match
-    expect("/app/data/routing.secrets.json".includes("/app/data/routing.json")).toBe(false);
+  });
+
+  test("without docker or jq on the PATH it fails loudly rather than printing nulls", async () => {
+    // read_scrubbed_json swallows read errors on purpose, so the `need` checks are what stops a box
+    // with no docker from answering {routing: null, discovery: null}.
+    const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+    const bare = setup(ENV);
+    mkdirSync(join(bare.root, "empty")); // removed with the fixture
+    const noDocker = await botOps(bare, ["routing-get"], undefined, { [pathKey]: join(bare.root, "empty") });
+    expect(noDocker.exitCode).not.toBe(0);
+    expect(noDocker.stderr).toContain("'docker' not found on the box");
+    const fx = setup(ENV); // fx.bin holds only the fake docker, so jq is the one that is missing
+    const noJq = await botOps(fx, ["routing-get"], undefined, { [pathKey]: fx.bin });
+    expect(noJq.exitCode).not.toBe(0);
+    expect(noJq.stderr).toContain("'jq' not found on the box");
   });
 
   test("the script never names the secrets file", () => {
@@ -2045,10 +2078,18 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
       },
       [WEBHOOK_URL]: 1, // even as a key
     };
-    const dirtyDiscovery = { ...DISCOVERY, hook: "https://discordapp.com/api/v10/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWx", tail: "webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz" };
+    const dirtyDiscovery = {
+      ...DISCOVERY,
+      hook: "https://discordapp.com/api/v10/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWx",
+      tail: "webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz",
+      // the scrub is case-insensitive and does not insist on https
+      hookUpper: "HTTPS://DISCORD.COM/API/WEBHOOKS/123456789012345678/UpperTokenABCDEFGHIJKLMNOP",
+      tailUpper: "WEBHOOKS/123456789012345678/UpperTailTokenXYZ",
+      hookHttp: "http://discord.com/api/webhooks/123456789012345678/HttpTokenABCDEFGHIJKLMNOPQR",
+    };
     const run = await get(setup(ENV, { routing: JSON.stringify(dirtyRouting), discovery: JSON.stringify(dirtyDiscovery) }));
     expect(run.exitCode).toBe(0);
-    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b"]) {
+    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b", "UpperTokenABCDEFGHIJKLMNOP", "UpperTailTokenXYZ", "HttpTokenABCDEFGHIJKLMNOPQR"]) {
       expect(run.stdout, leak).not.toContain(leak);
     }
     const out = run.json as { routing: Record<string, unknown>; discovery: Record<string, unknown> };
@@ -2092,6 +2133,9 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     { [GUILD]: { commands: "all", postTo: CHANNEL } },
     { [GUILD]: { commands: [CHANNEL, "323456789012345678"], postTo: CHANNEL }, "923456789012345678": { commands: "all" } },
     {}, // an empty object is valid: the plugin is placed nowhere
+    // the id length bounds: 5 and 25 digits are snowflakes, in every position
+    { "12345": { commands: ["22345"], postTo: "32345" } },
+    { ["1".repeat(25)]: { commands: ["2".repeat(25)], postTo: "3".repeat(25) } },
   ];
 
   test("routing-set round-trips to the mailbox", async () => {
@@ -2131,13 +2175,25 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     ["a non-snowflake postTo", { [GUILD]: { commands: "all", postTo: "general" } }],
     ["a numeric postTo", { [GUILD]: { commands: "all", postTo: 223456789012345678 } }],
     ["a null postTo", { [GUILD]: { commands: "all", postTo: null } }],
+    // jq's `$` also matches before a trailing newline, so each snowflake is anchored \A...\z: none of these may pass
+    ["a server id with a trailing newline", { [`${GUILD}\n`]: { commands: "all" } }],
+    ["a channel with a trailing newline", { [GUILD]: { commands: [`${CHANNEL}\n`] } }],
+    ["a postTo with a trailing newline", { [GUILD]: { commands: "all", postTo: `${CHANNEL}\n` } }],
+    // the length bounds, one past each edge (5..25 digits) in every position
+    ["a 26-digit server id", { ["1".repeat(26)]: { commands: "all" } }],
+    ["a 26-digit channel", { [GUILD]: { commands: ["2".repeat(26)] } }],
+    ["a 26-digit postTo", { [GUILD]: { commands: "all", postTo: "3".repeat(26) } }],
+    ["a 4-digit channel", { [GUILD]: { commands: ["2234"] } }],
+    ["a 4-digit postTo", { [GUILD]: { commands: "all", postTo: "3234" } }],
+    ["commands an object whose values are snowflakes", { [GUILD]: { commands: { channel: CHANNEL } } }],
   ];
   test("routing-set rejects each malformed shape, naming the field, before touching docker", async () => {
     const fx = setup(ENV);
     for (const [why, servers] of BAD_SERVERS) {
       const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin: "music", servers, requestedBy: "t" }));
       expect(run.exitCode, why).not.toBe(0);
-      expect(run.stderr, why).toContain("plugin-request: bad servers");
+      // names the field and nothing else: no part of the payload is echoed
+      expect(run.stderr.trim(), why).toBe("bot-ops: plugin-request: bad servers");
       // whatever the script rejects, the bot's own repair would not have kept verbatim
       if (typeof servers === "object" && servers !== null && !Array.isArray(servers)) {
         expect(keptByBot(servers), why).not.toEqual(servers);
@@ -2257,6 +2313,13 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
       ["a leading space", ` ${WEBHOOK_URL}`],
       ["a trailing newline", `${WEBHOOK_URL}\n`],
       ["userinfo", `https://user:pw@discord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["another top-level domain", `https://discord.org/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a 4-digit webhook id", `https://discord.com/api/webhooks/1234/${WEBHOOK_TOKEN}`],
+      ["a 26-digit webhook id", `https://discord.com/api/webhooks/${"1".repeat(26)}/${WEBHOOK_TOKEN}`],
+      // every dot in the host pattern is escaped: another character in its place is not a host
+      ["a stray character for the dot in discord.com", `https://discordXcom/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a stray character for the dot in canary.", `https://canaryXdiscord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
+      ["a stray character for the dot in ptb.", `https://ptbXdiscord.com/api/webhooks/123456789012345678/${WEBHOOK_TOKEN}`],
       ["not a string", 12345],
       ["an object", { u: WEBHOOK_URL }],
       ["missing", undefined],
@@ -2281,6 +2344,21 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
         expect(run.exitCode, url).toBe(0);
       }
     }
+    // the webhook id is a 5..25-digit snowflake
+    for (const id of ["12345", "1".repeat(25)]) {
+      const run = await botOps(setup(ENV), ["plugin-request"], req({ action: "webhook-add", url: `https://discord.com/api/webhooks/${id}/${WEBHOOK_TOKEN}`, requestedBy: "t" }));
+      expect(run.exitCode, id).toBe(0);
+    }
+  });
+
+  test("a payload that is not a JSON object is refused before anything is indexed into it", async () => {
+    const fx = setup(ENV);
+    for (const body of ["[]", '"skip"', "5", "true", '[{"action":"skip"}]']) {
+      const run = await botOps(fx, ["plugin-request"], body);
+      expect(run.exitCode, body).not.toBe(0);
+      expect(run.stderr, body).toContain("plugin-request: payload is not a JSON object");
+    }
+    expect(wrote(fx)).toBe(false);
   });
 
   test("webhook-remove: accepted with a channel id, rejected naming the field otherwise", async () => {
@@ -2364,7 +2442,7 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
 
   test("a routing-set plugin name with a trailing newline or another control character is rejected, not queued with it", async () => {
     const fx = setup(ENV);
-    for (const plugin of ["music\n", "music\r", "music\t", "mu sic"]) {
+    for (const plugin of ["music\n", "music\r", "music\t", `mu${String.fromCharCode(0)}sic`]) {
       const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin, servers: {}, requestedBy: "t" }));
       expect(run.exitCode, JSON.stringify(plugin)).not.toBe(0);
       expect(run.stderr, JSON.stringify(plugin)).toContain("plugin-request: bad plugin");
