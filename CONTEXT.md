@@ -1180,7 +1180,9 @@ _Avoid_: server list, guild cache
   switch every plugin off). When bot-ops.sh answers `recreated:false` ("no changes"), the bar says nothing
   was restarted rather than claiming a restart. The bar's two text lines are written only when they change
   (a keystroke must not rewrite a live region), and `admin.css` pads focus scrolling
-  (`scroll-padding-bottom`) so a Tab stop does not land under the sticky bar. The bar is hidden with the
+  (`scroll-padding-bottom`, more while a refused / failed `--danger` bar is up) so a Tab stop does not land
+  under the sticky bar; a long compose log scrolls inside the bar's TITLE (`max-height: 30vh`), never the
+  hint beneath it, which holds the backup path. The bar is hidden with the
   `hidden` attribute while nothing is pending, which restates as `display: none !important` in `admin.css`;
   its `role="status"` text is inside it, so whether a screen reader announces the FIRST appearance depends
   on the reader (it is not verified here). While a request is in flight both buttons are disabled and focus

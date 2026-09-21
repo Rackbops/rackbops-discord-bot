@@ -472,9 +472,14 @@
    :focus-visible ring (rb-theme.css, on everything inside [data-rb-style]) is what shows it. */
 /* A sticky bar covers the bottom of the viewport, and the browser scrolls a focused control only into the
    REST of it: without this a Tab stop can land underneath the bar. The padding is the bar's height (about
-   67px on a desktop, 143px stacked on a phone) with room to spare, while the bar is showing. */
+   67px on a desktop, 143px stacked on a phone) with room to spare, while the bar is showing. A refused or
+   failed bar (--danger) is taller -- its title can hold a compose log, bounded at 30vh below -- so it gets that
+   bound plus the rest of the bar. (The danger rules come after the base ones: equal specificity, source order.) */
 :root:has(.adm-apply:not([hidden])) {
   scroll-padding-bottom: 6rem;
+}
+:root:has(.adm-apply--danger:not([hidden])) {
+  scroll-padding-bottom: calc(30vh + 5rem);
 }
 .adm-apply__text {
   flex: 1 1 260px;
@@ -484,8 +489,11 @@
   gap: 2px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
-  /* A compose log can run to hundreds of lines and it is shown here whole: bound the bar so its buttons
-     stay on screen, and let the words scroll inside it. */
+}
+/* A compose log can run to hundreds of lines and it is shown whole, in the TITLE: bound it, so the bar's
+   buttons stay on screen, and let it scroll inside. The hint beneath it (the backup path, #47) is never
+   inside the scroller, so it is always in view. */
+.adm-apply__text > strong {
   max-height: 30vh;
   overflow-y: auto;
 }
@@ -521,6 +529,9 @@
   }
   :root:has(.adm-apply:not([hidden])) {
     scroll-padding-bottom: 10rem;
+  }
+  :root:has(.adm-apply--danger:not([hidden])) {
+    scroll-padding-bottom: calc(30vh + 10rem);
   }
   .adm-apply__text {
     flex: 0 0 auto;
