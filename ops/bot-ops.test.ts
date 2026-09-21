@@ -1659,7 +1659,8 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     const index = wrapIndex([pluginEntry("p", [envKey("P_SECRET", "^\\S+$", { secret: true }), envKey("P_PLAIN", "^.+$")])]);
     const base = "PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\n";
     for (const key of ["P_SECRET", "P_PLAIN"]) {
-      for (const val of ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"']) {
+      // (compose trims whitespace after the `=` before it looks for a quote, so a leading space or tab does not help)
+      for (const val of ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"', ' "open', "\t'open", '  "x"']) {
         const fx = setup(base, { pluginIndex: index });
         const run = await botOps(fx, ["env-set"], `${key}=${val}\n`);
         const why = `${key}=${val}`;

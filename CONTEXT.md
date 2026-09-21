@@ -968,7 +968,8 @@ _Avoid_: server list, guild cache
   a guess oracle for a stored secret; not seen, and not testable without a real compose); (6) a value
   holding a CR is refused (message names the key only) before its format regex runs, since a
   permissive secret pattern must not let one start a new `.env` line, and a plugin key's value may
-  not contain `$` or start with a quote either (compose reads a `.env` value as syntax:
+  not contain `$` or start with a quote (after any leading whitespace, which compose trims) either
+  (compose reads a `.env` value as syntax:
   `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key, and a
   leading quote opens an unterminated value that stops compose loading the file; a manifest `format`
   such as the shipped `^\S+$` admits both, static keys' regexes already exclude them, and the check

@@ -790,7 +790,10 @@ cmd_env_set() {
       # for every plugin key, secret or plain, and never quoting the value. (A static key's regex
       # already excludes both.)
       if [[ -z "${ALLOWED[$key]+x}" ]]; then
-        [[ "$val" != *'$'* && "$val" != '"'* && "$val" != "'"* ]] \
+        # compose trims whitespace after the `=` before it looks for a quote, so `KEY= "open` is as bad
+        # as `KEY="open`: judge the value with its leading whitespace stripped.
+        local unspaced="${val#"${val%%[![:space:]]*}"}"
+        [[ "$val" != *'$'* && "$unspaced" != '"'* && "$unspaced" != "'"* ]] \
           || die "env-set: value for '$key' may not contain a dollar sign or start with a quote"
       fi
       # Format + required-ness come from the static ALLOWED set, or from the installed plugin's

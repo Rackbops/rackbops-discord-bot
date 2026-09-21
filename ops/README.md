@@ -244,7 +244,8 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   that echoed caller-controlled text could still tell a caller whether a guess equals a stored secret
   (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
   refused for every key (it could start a new `.env` line), naming the key only, and a **plugin** key's
-  value may not contain `$` or start with a quote: compose reads a `.env` value as syntax, so
+  value may not contain `$` or start with a quote (after any leading whitespace — compose trims it
+  first): compose reads a `.env` value as syntax, so
   `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key and a leading
   quote opens an unterminated value that stops compose loading the file, yet a manifest `format` such as
   the shipped `^\S+$` admits both (static keys' regexes already exclude them; plain plugin keys are
