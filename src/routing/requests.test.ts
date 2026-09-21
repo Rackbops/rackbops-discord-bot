@@ -681,9 +681,10 @@ describe("redactWebhookUrls", () => {
   test("redacts every occurrence, in quotes and JSON too", () => {
     const text = `first ${URL_OK}, then "${URL_OK}" and {"url":"${URL_OK}"}`;
     const redacted = redactWebhookUrls(text);
+    // Exactly: the url and nothing around it -- a quote, a comma and a brace are not part of one.
+    expect(redacted).toBe('first [webhook url], then "[webhook url]" and {"url":"[webhook url]"}');
     expect(redacted).not.toContain(TOKEN);
     expect(redacted).not.toContain(WH_ID);
-    expect(redacted.match(/\[webhook url\]/g)).toHaveLength(3);
   });
 
   test("leaves other text alone", () => {

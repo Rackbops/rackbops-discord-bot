@@ -18,8 +18,68 @@ const {
   shouldPollReleases,
   shouldRefreshDiscovery,
   resetDiscoveryGapForTest,
+  livePluginRequestDeps,
 } = await import("./announce");
-const { applyRouting, initRouting, resetRoutingForTest, routingIdleForTest } = await import("./routing/live");
+const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routingIdleForTest } = await import("./routing/live");
+const { DATA_DIR } = await import("./storage");
+const { writeDiscovery } = await import("./routing/discovery");
+const { rmSync: removePath } = await import("node:fs");
+
+describe("livePluginRequestDeps (#241)", () => {
+  test("carries the routing deps, wired to the real routing modules and the bot's own data dir", async () => {
+    const files = ["routing.json", "routing.secrets.json", "discovery.json"].map((name) => join(DATA_DIR, name));
+    const cleanUp = () => files.forEach((f) => removePath(f, { force: true }));
+    cleanUp();
+    // Stub the network BEFORE building the deps: the lookup takes `fetch` when it is made.
+    const asked: string[] = [];
+    const stub = spyOn(globalThis, "fetch").mockImplementation((async (input: Parameters<typeof fetch>[0]) => {
+      asked.push(String(input));
+      return new Response(JSON.stringify({ id: "1234567", channel_id: "333333333333333331", guild_id: "111111111111111111" }), { status: 200 });
+    }) as unknown as typeof fetch);
+    try {
+      const deps = livePluginRequestDeps();
+      // The mailbox is where it always was.
+      expect(deps.requestsDir).toBe(join(DATA_DIR, "plugins", "requests"));
+      const routing = deps.routing;
+      expect(routing).toBeDefined();
+      // The two that are the live routing functions themselves...
+      expect(routing!.applyRouting).toBe(applyRouting);
+      expect(routing!.refreshDiscovery).toBe(refreshDiscovery);
+      expect(routing!.log).toBe(console);
+      expect(routing!.now()).toBeInstanceOf(Date);
+
+      // ...and the store ones are bound to THIS data dir, not to some other path.
+      await routing!.mutateRouting((current) => ({ ...current, updatedBy: "wiring-probe" }));
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "routing.json"), "utf8")).updatedBy).toBe("wiring-probe");
+      expect((await routing!.readRouting()).updatedBy).toBe("wiring-probe");
+      const url = "https://discord.com/api/webhooks/1234567/WIRINGPROBE_0123456789abcd";
+      await routing!.mutateSecrets((current) => ({ ...current, webhooks: { "333333333333333331": url } }));
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "routing.secrets.json"), "utf8")).webhooks["333333333333333331"]).toBe(url);
+
+      // readDiscovery reads this data dir's discovery.json: none yet, then the file that was written.
+      expect(await routing!.readDiscovery()).toBeNull();
+      const published = {
+        v: 1 as const,
+        generatedAt: "2026-09-21T12:00:00.000Z",
+        bot: { id: "9", username: "b" },
+        inviteUrl: "",
+        homeGuildId: null,
+        guilds: [],
+        plugins: {},
+      };
+      await writeDiscovery(DATA_DIR, published);
+      expect(await routing!.readDiscovery()).toEqual(published);
+
+      // The webhook lookup is the real one: it asks discord.com about this id and token.
+      const found = await routing!.fetchWebhook("1234567", "WIRINGPROBE_0123456789abcd");
+      expect(found).toEqual({ ok: true, id: "1234567", channelId: "333333333333333331", guildId: "111111111111111111" });
+      expect(asked).toEqual(["https://discord.com/api/v10/webhooks/1234567/WIRINGPROBE_0123456789abcd"]);
+    } finally {
+      stub.mockRestore();
+      cleanUp();
+    }
+  });
+});
 
 describe("tickChecks", () => {
   // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates; discovery

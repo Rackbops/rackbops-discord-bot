@@ -513,6 +513,51 @@ describe("consumePluginRequests drain", () => {
       expect(h.fs.size).toBe(0);
     });
 
+    test("a file the writer named for webhook-add is treated as secret even when nothing in it can be read", async () => {
+      const r = routingFake();
+      const h = harness({}, { routing: r.deps });
+      // Unparseable, and with no url in its text: only its NAME says what it was meant to carry.
+      h.fs.set("100-webhook-add-1.json", "{ not json");
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: unreadable JSON"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a webhook-add file that cannot even be read is deleted, and the fs error is not quoted", async () => {
+      const r = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook() }, { routing: r.deps });
+      h.deps.readFile = async () => {
+        throw new Error(`EIO reading a file that holds ${URL_OK}`);
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: unreadable JSON"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a url whose slashes are spelled \\u002f is still recognised, wherever the file is named", async () => {
+      const h = harness({});
+      h.fs.set(
+        "100-x.json",
+        String.raw`{"action":"skip","plugin":"ghost","version":"1.1.0","requestedBy":"https://discord.com/api/webhooks/123456/TOKENTOKENTOKENTOKENTOKEN"}`,
+      );
+      await consumePluginRequests(h.deps);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("an update request that carries a url and then fails to apply is deleted, not moved", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", note: URL_OK }) });
+      h.deps.mutateState = async () => {
+        throw new Error("state write failed");
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-skip-1.json: apply failed — state write failed"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
     test("a secret-bearing file whose delete fails is reported by name only", async () => {
       const r = routingFake();
       const h = harness({ "100-webhook-add-1.json": addWebhook({ url: "bad" }) }, { routing: r.deps });

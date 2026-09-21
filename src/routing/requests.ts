@@ -34,10 +34,10 @@ export const WEBHOOK_URL_RE = /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.co
 
 const REDACTED = "[webhook url]";
 // Anything webhook-URL-shaped, in any scheme or case, with or without a version segment or a JSON
-// escape (`\/`), up to the next space or quote. Every quantifier before `discord` is bounded, so this
-// stays linear on a hostile megabyte of text.
+// escape (`\/`), through the last character a URL could hold (a comma, a quote or a brace ends it).
+// Every quantifier before `discord` is bounded, so this stays linear on a hostile megabyte of text.
 const WEBHOOK_TEXT_RE =
-  /(?:[a-z][a-z0-9+.-]{0,15}:\\?\/\\?\/)?(?:[a-z0-9-]{1,63}\.){0,5}discord(?:app)?\.com\\?\/api\\?\/(?:v\d+\\?\/)?webhooks\\?\/[^\s"'`<>]*/gi;
+  /(?:[a-z][a-z0-9+.-]{0,15}:\\?\/\\?\/)?(?:[a-z0-9-]{1,63}\.){0,5}discord(?:app)?\.com\\?\/api\\?\/(?:v\d+\\?\/)?webhooks\\?\/[\w\-.~%+=?&#:@/\\]*/gi;
 
 /** `text` with anything that looks like a webhook URL replaced by `[webhook url]`. */
 export function redactWebhookUrls(text: string): string {
