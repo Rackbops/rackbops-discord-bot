@@ -249,10 +249,16 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   reveals only what `isSet` already does. (2) What `docker compose` prints is relayed — as `log` by
   `env-set`, as its output by `restart` — and compose is not ours: it quotes a `.env` line it refuses
   to parse. So a message that is **about the env file** (it names the file, or says "env file") is
-  **withheld whole** and replaced by the script's own sentence, which keeps only the line numbers:
-  every error compose's `.env` reader raises names the file, and no amount of guessing which part of a
-  line it printed can be made exact (compose ends a key at `=` or `:`, drops `export`, and trims
-  U+0085 / U+00A0). Anything else is scrubbed, best effort, of what `env-get` would not print — core
+  **withheld whole** and replaced by the script's own sentence: compose's output mentioned an env file,
+  it is withheld because such a message can quote the file's contents, the line numbers it gave (if
+  any), and running the same command on the host shows the original. That sentence names no path and
+  claims no cause or remedy, and is the same whether the command failed or succeeded. The premise:
+  compose-go's dotenv reader wraps every parse error as `failed to read <path>: …` (compose-spec/
+  compose-go `main`, `dotenv/format.go`, read on 2026-09-21 — upstream `main`, not the compose on any
+  host, which was never run for this), so the messages most likely to quote the file name it; and no
+  amount of guessing which part of a line it printed can be made exact (compose ends a key at `=` or
+  `:`, drops `export`, and trims U+0085 / U+00A0). Anything else is scrubbed (any other message can
+  quote a value too), best effort, of what `env-get` would not print — core
   credentials, plugin secrets and plain plugin settings alike; only a static key written `KEY=value`
   is left — worked out from `.env` itself and never from the Plugin Index, which is unavailable exactly
   when the bot is down and compose is complaining. Every definition of a key counts; a line written

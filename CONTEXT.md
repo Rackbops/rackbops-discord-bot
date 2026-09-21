@@ -1036,12 +1036,19 @@ _Avoid_: server list, guild cache
   an already-unset key, which `isSet` already reveals); (5) **what compose prints is relayed through
   `relay_tool_output`** — `env-set`'s `log` and everything `restart` prints — since compose quotes a
   `.env` line it refuses to parse. Two layers. **First, a message that is ABOUT the env file is withheld
-  whole**: one that names `$ENV_FILE` or says "env file" is replaced by this script's own sentence, which
-  keeps nothing of compose's but the line numbers. Every error compose's `.env` reader raises names the
-  file, and those are the messages that quote it; withholding does not depend on guessing WHICH part of
-  a line compose printed, which cannot be made exact (review round 5: compose ends a key at `=` OR `:`,
-  drops `export `, and counts U+0085 / U+00A0 as whitespace, so a guess made with bash's rules missed
-  wherever the two disagree). **Second, anything else is scrubbed** (`redact_secret_values`), best
+  whole**: one that names `$ENV_FILE` or says "env file" is replaced by this script's own sentence — it
+  says that compose's output mentioned an env file and is withheld because such a message can quote the
+  file's contents, names the line numbers compose gave (if any), and says the original is what the same
+  command prints on the host. It names no path and claims no cause or remedy, and it is the same whether
+  the command failed or succeeded (the relay never sees the exit status, and compose also says "env
+  file" about the stack's own `.env`, a different file). The premise, sourced: compose-go's dotenv reader
+  wraps every parse error as `failed to read <path>: …` (compose-spec/compose-go `main`,
+  `dotenv/format.go`, read on 2026-09-21 — upstream `main`, NOT the compose installed on any host, which
+  was never run for this), so the messages most likely to quote the file name it; withholding does not
+  depend on guessing WHICH part of a line compose printed, which cannot be made exact (review round 5:
+  compose ends a key at `=` OR `:`, drops `export `, and counts U+0085 / U+00A0 as whitespace, so a guess
+  made with bash's rules missed wherever the two disagree). **Second, anything else is scrubbed**
+  (`redact_secret_values`, because any other message can quote a value too), best
   effort, of what `env-get` would not print. What that is comes from `.env` and the static `ALLOWED`
   table ALONE, never from the Plugin Index: the
   index is unavailable exactly when the bot is down, which is when compose complains, and a scrub that
@@ -1080,9 +1087,12 @@ _Avoid_: server list, guild cache
   key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
   multi-line value is read line by line and a later line's text before its `=` would otherwise be
   echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical, with
-  two deliberate exceptions, both the fail-closed rules above doing their job: a key in `RESERVED_KEYS`
-  that a manifest used to make listable is gone from both (and no longer editable), and so is a plain key
-  of an enabled plugin that ANY other plugin in the index — enabled or not — declares `secret`. A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
+  three deliberate outcomes, all the fail-closed rules above doing their job: (i) a key in `RESERVED_KEYS`
+  that a manifest used to make listable is gone from both and no longer editable; (ii) a plain key of an
+  enabled plugin that a plugin NOT in `PLUGINS` declares `secret` is gone from both and not editable; (iii)
+  a plain key of an enabled plugin that another ENABLED plugin declares `secret` is gone from `env-get`,
+  but STAYS in `env-schema` as a secret row (`secret: true`, `isSet`, the secret declaration's pattern)
+  and stays editable, write-only. A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
   from — and the plugin code the bot then installs — so write-only is a property against the panel,
   its logs and its screens, not against whoever owns the index.
   The same posture covers `plugin-request`: a `webhook-add` URL travels on stdin only, is matched in
