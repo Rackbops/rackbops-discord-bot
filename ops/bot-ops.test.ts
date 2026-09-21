@@ -1933,13 +1933,24 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
     const dirtyRouting = {
       ...ROUTING,
       note: `see ${WEBHOOK_URL} for the hook`,
-      webhooks: { [CHANNEL]: { ...ROUTING.webhooks[CHANNEL], url: WEBHOOK_URL, token: WEBHOOK_TOKEN } },
+      // url / token / secret / password members are dropped whatever their case
+      webhooks: {
+        [CHANNEL]: {
+          ...ROUTING.webhooks[CHANNEL],
+          url: WEBHOOK_URL,
+          token: WEBHOOK_TOKEN,
+          Token: "TokenCased_9f8e7d6c",
+          URL: "UrlCased_1a2b3c4d",
+          secret: "member-secret-5e6f",
+          Password: "member-password-7a8b",
+        },
+      },
       [WEBHOOK_URL]: 1, // even as a key
     };
     const dirtyDiscovery = { ...DISCOVERY, hook: "https://discordapp.com/api/v10/webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWx", tail: "webhooks/123456789012345678/AbCdEfGhIjKlMnOpQrStUvWxYz" };
     const run = await get(setup(ENV, { routing: JSON.stringify(dirtyRouting), discovery: JSON.stringify(dirtyDiscovery) }));
     expect(run.exitCode).toBe(0);
-    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api"]) {
+    for (const leak of [WEBHOOK_TOKEN, "AbCdEfGhIjKlMnOpQrStUvWx", "https://discord.com/api/webhooks", "https://discordapp.com/api", "TokenCased_9f8e7d6c", "UrlCased_1a2b3c4d", "member-secret-5e6f", "member-password-7a8b"]) {
       expect(run.stdout, leak).not.toContain(leak);
     }
     const out = run.json as { routing: Record<string, unknown>; discovery: Record<string, unknown> };
@@ -2150,6 +2161,12 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
       const run = await botOps(fx, ["plugin-request"], req(payload));
       expect(run.exitCode, msg).not.toBe(0);
       expect(run.stderr, msg).toContain(msg);
+    }
+    // the version check covers every update action except cancel, not just the first one above
+    for (const action of ["update-now", "schedule", "remind", "skip"]) {
+      const run = await botOps(fx, ["plugin-request"], req({ action, plugin: "warbandeer", version: "1.2", at: "2026-09-06T18:30-07:00", days: 3, requestedBy: "t" }));
+      expect(run.exitCode, action).not.toBe(0);
+      expect(run.stderr, action).toContain("plugin-request: bad version '1.2'");
     }
     expect(wrote(fx)).toBe(false);
     for (const payload of [
