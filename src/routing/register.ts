@@ -112,11 +112,12 @@ export function describeError(err: unknown): string {
  * The global scope is emptied only once at least one server has taken its own commands. It is what
  * serves every server that has not been given a list of its own, so emptying it when nothing
  * replaced it -- no servers were read, or every one refused -- would leave the bot with no commands
- * anywhere until the next boot. In the second case that is recorded against "global" instead.
+ * anywhere until the next registration. In the second case that is recorded against "global" instead.
  * "At least one" is deliberate: requiring EVERY server to succeed would let one that refuses for good
  * (Discord's 50001) keep the global list, and so double every command everywhere, on every boot. The
  * price is that a server that failed for a passing reason while others succeeded has no commands
- * until the next boot; it is in the log and in `discovery.json` with its error.
+ * until the next registration (the next boot, a routing change from the panel, or a server the bot
+ * joins); it is in the log and in `discovery.json` with its error.
  */
 export async function registerPlan(
   put: (route: `/${string}`, body: CommandJson[]) => Promise<unknown>,

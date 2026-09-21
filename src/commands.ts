@@ -287,16 +287,42 @@ export const CORE_COMMAND_NAMES: string[] = CORE_COMMANDS.map((c) => c.name);
 
 const coreByName = new Map(CORE_COMMANDS.map((c) => [c.name, c]));
 
+/**
+ * May this plugin command run here? A string is the private refusal to show instead; `undefined` lets it
+ * run. Only a plugin's commands are ever put to it (#243).
+ */
+export type CommandGate = (bare: string, interaction: ChatInputCommandInteraction) => Promise<string | undefined>;
+
 export async function handleCommand(
   interaction: ChatInputCommandInteraction,
   lookup: (bare: string) => PluginCommand | undefined = () => undefined,
+  gate: CommandGate = async () => undefined,
 ): Promise<void> {
   const bare = bareName(interaction.commandName);
-  // A core row wins on a name collision (mirrors pluginCommandMap's own rule); the lookup is keyed
-  // by bare name, and a name that matches neither just warns rather than silently dropping.
-  const target = coreByName.get(bare) ?? lookup(bare);
-  if (target) await target.handle(interaction);
-  else console.warn(`[interaction] no handler for /${interaction.commandName}`);
+  // A core row wins on a name collision (mirrors pluginCommandMap's own rule) and is never gated.
+  const core = coreByName.get(bare);
+  if (core) {
+    await core.handle(interaction);
+    return;
+  }
+  // The lookup is keyed by bare name, and a name that matches neither just warns rather than silently dropping.
+  const target = lookup(bare);
+  if (!target) {
+    console.warn(`[interaction] no handler for /${interaction.commandName}`);
+    return;
+  }
+  // A gate that fails must not take the command down: it runs.
+  let refusal: string | undefined;
+  try {
+    refusal = await gate(bare, interaction);
+  } catch (gateError) {
+    console.error(`[gate] could not decide whether /${interaction.commandName} may run here; letting it run`, gateError);
+  }
+  if (refusal !== undefined) {
+    await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await target.handle(interaction);
 }
 
 /**

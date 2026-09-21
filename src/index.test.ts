@@ -169,6 +169,147 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #243: where a plugin posts, and which channels its commands run in. index.ts can't run under test, so
+  // the wiring is pinned in the source, in the same idiom as the block above.
+  describe("plugin announcements and the channel gate are routed (#243)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const depsStart = source.indexOf("const postDeps: PostDeps = {", activateFn);
+    const makeHostStart = source.indexOf("const makeHost = ", activateFn);
+    // The text of the postDeps object alone: `log:` and `dataDir:` appear all over this file.
+    const depsBlock = source.slice(depsStart, makeHostStart);
+    const interactionStart = source.indexOf("client.on(Events.InteractionCreate", activateFn);
+    const handleCall = source.indexOf("await handleCommand(", interactionStart);
+
+    test("a plugin's announce goes through postForPlugin with its own name and the default channel", () => {
+      expect(source).toMatch(/announce:\s*\(message\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps\),/);
+      // The old wiring -- every plugin posting straight to the one channel -- is gone.
+      expect(source).not.toMatch(/announce:\s*\(message\)\s*=>\s*announceTo\(/);
+      expect(depsBlock).toMatch(/defaultChannelId:\s*config\.announceChannelId,/);
+    });
+
+    test("postDeps is built once, in activate(), before the hosts are made", () => {
+      expect(activateFn).toBeGreaterThan(-1);
+      expect(depsStart).toBeGreaterThan(activateFn);
+      expect(makeHostStart).toBeGreaterThan(depsStart);
+      expect((source.match(/const postDeps: PostDeps = \{/g) ?? []).length).toBe(1);
+    });
+
+    test("announceTo is still the bot's send path", () => {
+      expect(depsBlock).toMatch(/sendAsBot:\s*\(channelId,\s*message\)\s*=>\s*announceTo\(client,\s*channelId,\s*message\),/);
+      expect(source).toMatch(/import \{[^}]*\bannounceTo\b[^}]*\} from "\.\/announce";/);
+    });
+
+    test("routing and secrets are read from the data dir, the webhook goes out over the real fetch, and a dead one is marked in the data dir", () => {
+      expect(depsBlock).toMatch(/readRouting:\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/readSecrets:\s*\(\)\s*=>\s*readSecrets\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/executeWebhook:\s*liveExecuteWebhook\(\),/);
+      expect(depsBlock).toMatch(/markBroken:\s*markWebhookBroken\(DATA_DIR\),/);
+      expect(depsBlock).toMatch(/log:\s*console,/);
+    });
+
+    test("the interaction handler passes a gate built from whereOf and gateCommand", () => {
+      // Only a chat-input command is gated: the call is inside the isChatInputCommand branch.
+      expect(interactionStart).toBeGreaterThan(activateFn);
+      expect(handleCall).toBeGreaterThan(interactionStart);
+      expect(source.lastIndexOf("interaction.isChatInputCommand()", handleCall)).toBeGreaterThan(interactionStart);
+      const handleBlock = source.slice(handleCall, source.indexOf("} else if", handleCall));
+      expect(handleBlock).toMatch(/\(bare\)\s*=>\s*commandMap\.get\(bare\)\?\.command,/);
+      // whereOf is handed over as a thunk, never awaited here: the gate calls it only when the channel's own
+      // id cannot decide, so a plugin with no routing (or a listed channel, or a DM) costs no Discord fetch.
+      expect(handleBlock).toMatch(/\(\)\s*=>\s*whereOf\(chatInput,\s*\(id\)\s*=>\s*client\.channels\.fetch\(id\)\)/);
+      expect(handleBlock).not.toMatch(/await\s+whereOf\(/);
+      // The plugin that owns the command is the one whose routing decides, and the command name shown is the registered one.
+      expect(handleBlock).toMatch(
+        /gateCommand\(\s*commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*chatInput,\s*\(\)\s*=>\s*whereOf\([^]*?\),\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console,?\s*\)/,
+      );
+    });
+
+    test("only plugin commands reach the gate: it is an argument to handleCommand, not a check in front of it", () => {
+      // Core commands are resolved inside handleCommand before it consults the gate (commands.ts), so no
+      // gateCommand call may sit outside the handleCommand call.
+      expect((source.match(/gateCommand\(/g) ?? []).length).toBe(1);
+      expect(source.slice(0, handleCall)).not.toMatch(/gateCommand\(/);
+    });
+  });
+
+  // #241: the request mailbox is also drained every few seconds on its own timer. index.ts can't run under
+  // test, so the shape of the wiring is pinned in the source: that the timer is started at all, and how.
+  describe("the request-mailbox timer is wired (#241)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const scheduler = source.indexOf("startScheduler(client", activateFn);
+    const start = source.indexOf("startRequestDrain({", activateFn);
+    // The text of the call alone, so a property name that appears elsewhere cannot satisfy a pin.
+    const call = source.slice(start, source.indexOf("});", start));
+
+    test("the request drain starts after the scheduler, gated on plugin state and restarts, inside a critical section", () => {
+      expect(scheduler).toBeGreaterThan(activateFn);
+      expect(start).toBeGreaterThan(scheduler);
+      expect((source.match(/startRequestDrain\(/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/import \{ startRequestDrain \} from "\.\/plugins\/drain";/);
+      // Nothing is drained until the boot state write and boot drain have landed...
+      expect(call).toMatch(/ready:\s*isPluginStateReady,/);
+      // ...none starts on the way out...
+      expect(call).toMatch(/\n\s*restartPending,\n/);
+      // ...and a drain is a critical section, so a restart an update-now asks for waits for it.
+      expect(call).toMatch(/drain:\s*\(\)\s*=>\s*withCritical\(\(\)\s*=>\s*consumePluginRequests\(livePluginRequestDeps\(\)\)\),/);
+      expect(call).toMatch(/log:\s*console,/);
+    });
+
+    test("every drain runs after initRouting: the boot drain follows registration and precedes the ready flag", () => {
+      const init = source.indexOf("initRouting({", activateFn);
+      const applied = source.indexOf('applyRouting("boot")', activateFn);
+      const bootDrain = source.indexOf("await consumePluginRequests(livePluginRequestDeps())", activateFn);
+      const ready = source.indexOf("markPluginStateReady();", activateFn);
+      for (const pos of [init, applied, bootDrain, ready]) expect(pos).toBeGreaterThan(-1);
+      expect(init).toBeLessThan(applied);
+      expect(applied).toBeLessThan(bootDrain);
+      // The timer's beats (and the tick's) are gated on this flag, so they cannot run before initRouting.
+      expect(bootDrain).toBeLessThan(ready);
+    });
+  });
+
+  // #259: joining and leaving a server. index.ts can't run under test, so the wiring is pinned in the source.
+  describe("a server joined or left after boot is wired to guildJoined / guildLeft (#259)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const createListener = source.indexOf("client.on(Events.GuildCreate", activateFn);
+    const deleteListener = source.indexOf("client.on(Events.GuildDelete", activateFn);
+    const initCall = source.indexOf("initRouting({", activateFn);
+    const bootCall = source.indexOf('applyRouting("boot")', activateFn);
+
+    test("joining and leaving a server are wired to guildJoined / guildLeft, inside activate(), before the boot registration", () => {
+      expect(activateFn).toBeGreaterThan(-1);
+      expect(createListener).toBeGreaterThan(activateFn);
+      expect(deleteListener).toBeGreaterThan(activateFn);
+      // Attached before initRouting and the boot registration, so a server joined while that runs is not missed.
+      expect(createListener).toBeLessThan(initCall);
+      expect(deleteListener).toBeLessThan(initCall);
+      expect(initCall).toBeLessThan(bootCall);
+      expect(source).toMatch(/client\.on\(Events\.GuildCreate,\s*\(guild\)\s*=>\s*void guildJoined\(guild\)\);/);
+      expect(source).toMatch(/client\.on\(Events\.GuildDelete,\s*\(guild\)\s*=>\s*void guildLeft\(guild\)\);/);
+      for (const name of ["guildJoined", "guildLeft"]) {
+        expect(source).toMatch(new RegExp(`import \\{[^}]*\\b${name}\\b[^}]*\\} from "\\./routing/live";`));
+      }
+      // One of each: a second listener would register twice.
+      expect((source.match(/Events\.GuildCreate/g) ?? []).length).toBe(1);
+      expect((source.match(/Events\.GuildDelete/g) ?? []).length).toBe(1);
+    });
+
+    test("neither listener can reject into the emitter", () => {
+      // `void`, and the functions are the never-rejecting ones -- not applyRouting, which can reject in single mode.
+      expect((source.match(/void guildJoined\(guild\)/g) ?? []).length).toBe(1);
+      expect((source.match(/void guildLeft\(guild\)/g) ?? []).length).toBe(1);
+      expect(source).not.toMatch(/Events\.Guild(?:Create|Delete),\s*async/);
+      expect(source).not.toMatch(/Events\.Guild(?:Create|Delete),[^\n]*(?:applyRouting|refreshDiscovery)/);
+      expect(source).not.toMatch(/await guild(?:Joined|Left)\(/);
+    });
+
+    test("availability events are not wired: a server going into or coming back from an outage is neither a join nor a leave", () => {
+      expect(source).not.toMatch(/Events\.GuildAvailable/);
+      expect(source).not.toMatch(/Events\.GuildUnavailable/);
+      expect(source).not.toMatch(/["']guildAvailable["']|["']guildUnavailable["']/);
+    });
+  });
+
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });

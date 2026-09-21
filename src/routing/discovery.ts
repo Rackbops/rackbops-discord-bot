@@ -7,7 +7,7 @@
 
 import { ChannelType, PermissionFlagsBits, type Client } from "discord.js";
 import type { LoadedPlugin, PluginCommandMap } from "../plugins/host";
-import { writeJsonAtomic } from "../storage";
+import { readJsonOrFresh, writeJsonAtomic } from "../storage";
 import type { DiscoveryChannel, DiscoveryFile } from "./model";
 import { ownerOf, type GuildRegistration } from "./register";
 
@@ -145,4 +145,17 @@ export function discoveryPath(dataDir: string): string {
 /** Atomic write, like every other data file. The panel reads this file; nothing else writes it. */
 export async function writeDiscovery(dataDir: string, file: DiscoveryFile): Promise<void> {
   await writeJsonAtomic(discoveryPath(dataDir), file);
+}
+
+/**
+ * The published file, for the bot's own validation of a panel request (#241): null when there is none
+ * to go on. A missing file is null; an unparseable one is moved aside by `readJsonOrFresh`, as every
+ * data file is, and is null too; and so is anything that is not an object with a `guilds` list, so a
+ * file damaged by hand reads as "not published yet" instead of throwing inside validation. Beyond that
+ * the bot is the only writer and the shape is trusted.
+ */
+export async function readDiscovery(dataDir: string): Promise<DiscoveryFile | null> {
+  const raw = await readJsonOrFresh<unknown>(discoveryPath(dataDir), () => null, "discovery");
+  if (typeof raw !== "object" || raw === null || !Array.isArray((raw as { guilds?: unknown }).guilds)) return null;
+  return raw as DiscoveryFile;
 }

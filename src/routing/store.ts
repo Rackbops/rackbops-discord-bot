@@ -15,6 +15,7 @@ import { chmod as fsChmod, mkdir, rename as fsRename, unlink, writeFile as fsWri
 import { dirname } from "node:path";
 import { createKeyedJsonMutator, readJsonOrFresh } from "../storage";
 import {
+  droppedByRepair,
   freshRouting,
   freshSecrets,
   repairRouting,
@@ -22,6 +23,7 @@ import {
   type RoutingFile,
   type RoutingSecretsFile,
 } from "./model";
+import { shown } from "./resolve";
 
 export function routingPath(dataDir: string): string {
   return `${dataDir}/routing.json`;
@@ -40,14 +42,70 @@ export function secretsPath(dataDir: string): string {
 // queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason.
 const routingMutator = createKeyedJsonMutator<RoutingFile>();
 
+// What `readRouting` has already said about a damaged file (#260). It is on the path of every plugin command
+// used in a server (`gateCommand`) and every announcement since #243, and of every join since #259, so a
+// file with one bad entry must not write a line per read: each distinct line is said once per process. (The
+// record is per process, so a problem that is fixed and then put back is not said again until a restart.)
+const said = new Set<string>();
+
+/** Forget what has been said, so a test can see the same problem reported again. */
+export function resetRoutingWarningsForTest(): void {
+  said.clear();
+}
+
+/** What went wrong, as text that is clipped (an engine's message can echo a hostile key) and cannot throw. */
+function describeFailure(err: unknown): string {
+  try {
+    return err instanceof Error ? shown(err.message) : "not an Error";
+  } catch {
+    return "unreadable error";
+  }
+}
+
+/**
+ * Says what the repair of `raw` left out, each distinct line once. Log output only, so nothing in it may
+ * change what `readRouting` returns (`gateCommand` fails open when a read throws, so a throw out of a log
+ * line would let a restricted command run):
+ *  - a logger that throws is swallowed, and the line is recorded as said only once it was written, so it is
+ *    tried again on the next read;
+ *  - `droppedByRepair` throwing is a bug in the report, not in the file: it is swallowed too, and said once
+ *    in place of the report, so a broken report is not mistaken for a clean file.
+ * Exported for the test that needs to hand it a value no file can hold.
+ */
+export function sayWhatWasIgnored(raw: unknown): void {
+  let lines: string[];
+  try {
+    lines = droppedByRepair(raw).map((message) => `[routing] routing.json: ${message}; it is ignored`);
+  } catch (err) {
+    lines = [`[routing] routing.json: could not work out what the repair ignored (${describeFailure(err)})`];
+  }
+  for (const line of lines) {
+    if (said.has(line)) continue;
+    try {
+      console.warn(line);
+      said.add(line);
+    } catch {
+      /* logging must never change what is read */
+    }
+  }
+}
+
 /**
  * The routing file as the bot should act on it. A missing file is fresh; an unparseable one is
  * moved aside (`routing.json.corrupt-<timestamp>`) and read as fresh, as `readJsonOrFresh` does for
  * every data file; a parseable file of the wrong shape is repaired down to whatever in it is valid.
  * Never throws.
+ *
+ * The repair is tolerant and silent (`repairRouting` is pure); what it dropped is worked out beside it
+ * (`droppedByRepair`) and said HERE, at the I/O edge, once per distinct message: a plugin placed in a
+ * server whose entry is malformed would otherwise live nowhere with nothing in the log, and `#247` seeds
+ * this file by hand. Log output only -- what is registered, posted or refused is decided by the repaired
+ * value, exactly as before.
  */
 export async function readRouting(dataDir: string): Promise<RoutingFile> {
-  return repairRouting(await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing"));
+  const raw = await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing");
+  sayWhatWasIgnored(raw);
+  return repairRouting(raw);
 }
 
 /**
@@ -73,8 +131,9 @@ function requireFile<T>(value: T, caller: string): T {
  * whatever the file happened to contain) and returns the file to write, which must be an object and
  * is repaired again before it is written -- so a value that does not fit the shape cannot land in
  * the file. That drops every key outside the shape, a `url` or `token` on a webhook above all. It
- * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, and a
- * webhook's `addedAt`, `addedBy` and `broken`): a caller must not put a webhook URL in any of them.
+ * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, a
+ * webhook's `addedAt`, `addedBy` and `broken`, and a request result's `action`, `at` and `reason`): a
+ * caller must not put a webhook URL in any of them.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
   await routingMutator.update(

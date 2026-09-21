@@ -3,8 +3,8 @@
 // acceptable. No I/O and no discord.js -- every function takes plain data (a `RoutingFile`, or for
 // `validatePluginRouting` the routing a panel sent plus the `DiscoveryFile` of what the bot can see)
 // and returns data, so all of it is tested as data. `register.ts` (#239) uses `hasPlacements` and
-// `pluginsForGuild`; `announceTargets`, `commandAllowed` and `validatePluginRouting` have no caller
-// yet -- posting, the channel gate and the request mailbox are later children of Epic #236.
+// `pluginsForGuild`, `requests.ts` (#241) `validatePluginRouting` and `shown`, `post.ts` (#243)
+// `announceTargets`, and `gate.ts` (#243) `commandAllowed`.
 //
 // Placed vs unplaced is the one distinction to hold on to. A plugin with NO entry in
 // `routing.json` is *unplaced* and lives in the home server; a plugin WITH an entry is *placed* and
@@ -125,7 +125,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * emoji-heavy text of 41 to 79 units with 37 or fewer code points nothing is cut and the ellipsis is
  * still appended. That only ever shows for a hostile value; a real id is at most 25 ASCII digits.
  */
-function shown(value: unknown): string {
+export function shown(value: unknown): string {
   let text: string;
   if (typeof value === "string") text = value;
   else if (typeof value === "object" && value !== null) text = Array.isArray(value) ? "[list]" : "[object]";

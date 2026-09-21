@@ -9,12 +9,13 @@ import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, wr
 import { createClient, CORE_INTENTS } from "./client";
 import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler, announceTo, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
+import { startScheduler, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
+import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
-import { awaitCriticalIdle, beginShutdown } from "./restart";
+import { awaitCriticalIdle, beginShutdown, restartPending, withCritical } from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./plugins/registry";
@@ -39,7 +40,10 @@ import {
 } from "./plugins/host";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { describePlugins } from "./routing/discovery";
-import { applyRouting, initRouting } from "./routing/live";
+import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
+import { gateCommand, whereOf } from "./routing/gate";
+import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
+import { readRouting, readSecrets } from "./routing/store";
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -139,6 +143,17 @@ async function activate(c: Client<true>): Promise<void> {
       now: Date.now,
       log: console,
     });
+    // #243: where a plugin's announcements go -- the channels its routing names, through a channel's
+    // webhook when it has one, and the default channel (ANNOUNCE_CHANNEL_ID) when routing names none.
+    const postDeps: PostDeps = {
+      readRouting: () => readRouting(DATA_DIR),
+      readSecrets: () => readSecrets(DATA_DIR),
+      defaultChannelId: config.announceChannelId,
+      sendAsBot: (channelId, message) => announceTo(client, channelId, message),
+      executeWebhook: liveExecuteWebhook(),
+      markBroken: markWebhookBroken(DATA_DIR),
+      log: console,
+    };
     const makeHost = (entry: PluginIndexEntry): HostApi =>
       createHostApi({
         entry,
@@ -146,7 +161,7 @@ async function activate(c: Client<true>): Promise<void> {
         dataDir: DATA_DIR,
         baseLog: console,
         storage,
-        announce: (message) => announceTo(client, config.announceChannelId, message),
+        announce: (message) => postForPlugin(entry.name, message, postDeps),
       });
     loadResult = await loadPlugins(
       installResult.installed,
@@ -171,7 +186,20 @@ async function activate(c: Client<true>): Promise<void> {
   client.on(Events.InteractionCreate, async (interaction) => {
     try {
       if (interaction.isChatInputCommand()) {
-        await handleCommand(interaction, (bare) => commandMap.get(bare)?.command);
+        // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
+        await handleCommand(
+          interaction,
+          (bare) => commandMap.get(bare)?.command,
+          (bare, chatInput) =>
+            gateCommand(
+              commandMap.get(bare)?.entry.name,
+              chatInput.commandName,
+              chatInput,
+              () => whereOf(chatInput, (id) => client.channels.fetch(id)),
+              () => readRouting(DATA_DIR),
+              console,
+            ),
+        );
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
         await handleReportModal(interaction);
       } else if (interaction.isMessageComponent() || interaction.isModalSubmit()) {
@@ -184,6 +212,19 @@ async function activate(c: Client<true>): Promise<void> {
     }
   });
 
+  // #259: a server the bot joins or leaves after boot. Attached here, before the boot registration below,
+  // so a server joined while that registration is running is not missed: it queues behind it on
+  // live.ts's chain, and before initRouting both do nothing (the boot registration snapshots a cache that
+  // already holds the server). discord.js emits guildCreate only for a server that is new to its cache once
+  // the client is Ready -- not for the servers it lists at start-up -- and guildDelete only when the bot is
+  // really out; a server going into, or coming back from, an outage is the separate availability pair, which
+  // is deliberately NOT wired here: it is neither a join nor a leave. (A server invited while the gateway
+  // session is being re-identified, rather than resumed, can arrive as the availability event instead of a
+  // join; that gap is known and accepted, see CONTEXT.md.) `void`: neither function can reject, so nothing
+  // escapes into the emitter.
+  client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
+  client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
+
   // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
   // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
   // the core WoW checks used to make on that first synchronous tick (the wow plugin owns them now, #107).
@@ -192,6 +233,21 @@ async function activate(c: Client<true>): Promise<void> {
   await activatePlugins(loadResult.loaded, console);
 
   startScheduler(client, pluginTicks(loadResult.loaded, console));
+
+  // #241: the request mailbox is also drained every few seconds on its own timer, so a routing change
+  // made in the panel shows up while the operator is still looking; the `pluginRequests` tick check
+  // stays as the backstop. It is deliberately not part of the tick machinery. Beats do nothing until
+  // the boot state write and the boot drain below have landed (`isPluginStateReady`), which is also
+  // after `initRouting`, and none starts on the way out. The drain is a critical section, so a restart an
+  // update-now asks for waits for it, as it does for a tick. The stop function it returns is not kept:
+  // like the scheduler's own interval, this timer lives as long as the process, and every way out of the
+  // process ends in `process.exit`.
+  startRequestDrain({
+    ready: isPluginStateReady,
+    restartPending,
+    drain: () => withCritical(() => consumePluginRequests(livePluginRequestDeps())),
+    log: console,
+  });
 
   try {
     // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or

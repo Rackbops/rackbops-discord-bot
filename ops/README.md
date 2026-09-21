@@ -67,13 +67,18 @@ If any step fails the temp file is removed and `plugin-request` exits non-zero i
 `queued`; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
 `bun`, like the write) can still read and delete.
 
-The bot **drains** the mailbox at the start of its update tick (every ~60s) and once at boot, applying
-each request through the same state builders `/plugins` uses, then deleting the file. A malformed or
-invalid file (unknown action, bad `plugin`/`version`, a `version` with a slash, a not-installed
-plugin) is moved to `requests/rejected/` with a log line — never applied, never crashing the drain.
-The five update actions above can only ever act on an **already-installed** plugin; the mailbox can't
-enable a new plugin (that stays `PLUGINS=`-only) or run anything else — the routing actions added
-below change where a plugin lives, not which plugins run. `requestedBy` is the panel identity
+The bot **drains** the mailbox every few seconds on its own timer, at the start of its update tick
+(every ~60s, the backstop) and once at boot, applying each request through the same state builders
+`/plugins` uses, then deleting the file. A malformed or invalid file (unknown action, bad
+`plugin`/`version`, a `version` with a slash, a not-installed plugin) is moved to `requests/rejected/`
+with a log line — never applied, never crashing the drain. Since #241 the bot's drain also handles four
+**routing** actions — `routing-set`, `webhook-add`, `webhook-remove`, `discovery-refresh` — validated
+by the bot against the servers and channels it can see; each may carry an optional `id` the panel
+chooses, under which the bot records the outcome in `routing.json`'s `results`. A request file that may
+carry a webhook URL is deleted, not moved to `rejected/`, if it is refused. The mailbox can only ever
+run the five update actions on an **already-installed** plugin and those four routing ones; it can't
+enable a new plugin (that stays `PLUGINS=`-only) or run anything else — the routing actions, described
+below, change where a plugin lives, not which plugins run. `requestedBy` is the panel identity
 (`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
 
@@ -85,10 +90,10 @@ the plugin nowhere), `webhook-add` (`{url}` — a Discord webhook URL, on the `d
 `discovery-refresh`. `plugin-request` validates each per action before it writes the file and names the
 offending *field* when it refuses — never the value: a webhook URL is a credential, so it travels on
 stdin only and no message echoes any part of it. This script
-only validates and queues; **applying** the requests is the bot's job (Epic #236's routing work), and a
-bot without it moves such a file to `requests/rejected/` like any unknown action (for a `webhook-add`
-that file still holds the URL, owner-only, until someone clears it — so roll the bot forward before the
-panel). `routing-get` reads
+only validates and queues; **applying** the requests is the bot's job (since #241, see above), and a
+bot from before that moves such a file to `requests/rejected/` like any unknown action (for a
+`webhook-add` that file still holds the URL, owner-only, until someone clears it — so roll the bot
+forward before the panel). `routing-get` reads
 the two files the bot writes — its routing record and what it can see — so a panel can show them.
 
 ## Keeping `bot-ops.sh` and `docker-compose.yml` current
@@ -557,7 +562,7 @@ Origin-guards and schema-validates it (the same anchored `plugin`/`version` rule
 the bot enforce, so a bad or hostile body is a `400` here), then sets `requestedBy` from the
 **Cloudflare Access identity that made the request, never anything in the body** (`email:<addr>`, or
 `token` on the bearer path), and shells `bot-ops.sh plugin-request` to drop the file in the mailbox.
-The bot applies it on its next tick (within a minute) exactly as it does a `/plugins` command — an
+The bot applies it within seconds (its mailbox timer; the 60s tick is the backstop) exactly as it does a `/plugins` command — an
 **Update now** or a due **Schedule** restarts the bot to install; the identity is recorded in
 `state.json` and shown in `/plugins list`, but because it isn't a Discord user id the bot **logs** the
 outcome rather than trying to DM it. An update whose latest version needs a newer bot than this one
