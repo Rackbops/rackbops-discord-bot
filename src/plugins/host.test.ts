@@ -3,9 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
-import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
-import type { InstalledPlugin } from "./install";
+import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
+import { installPlugins, type InstalledPlugin } from "./install";
 import type { LoadedPlugin } from "./host";
+import { pinsFromState, selectPlugins } from "./registry";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
 // DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
 // once, for every test file, by test/setup.ts's bunfig preload (#136).
@@ -831,5 +832,167 @@ describe("readPluginState / writePluginState round-trip", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  // #222: the producer and the consumer of the version pins, joined through a real file. selectPlugins
+  // can only keep a plugin that is last-good — rather than explicitly pinned, which needs no state — past
+  // an index host-API bump if the state.json a boot WROTE carries the installedVersion the NEXT boot's
+  // pinsFromState reads back; a unit test of either half passes while the join between them is broken.
+  describe("the state.json pins that selectPlugins reads back (#222)", () => {
+    const bumped: PluginIndex = {
+      schemaVersion: 1,
+      generatedAt: "2026-09-20T00:00:00.000Z",
+      plugins: [entry({ name: "wow", version: "2.0.0", hostApiVersion: 2 })], // the bot is host API 1
+    };
+    const HOST_API_SKIP = "needs host API v2, this bot is v1";
+    const wowState = (over: Record<string, unknown> = {}) => ({
+      name: "wow", enabled: true, installedVersion: "1.5.0", configured: true, missingEnv: [], active: true, ...over,
+    });
+
+    test("a boot that came up on 1.5.0 keeps the plugin selectable once the index moves to 2.0.0 / host API 2", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        const v150 = entry({ name: "wow", version: "1.5.0" });
+        await writePluginState({
+          dataDir: dir,
+          storage: realStorage,
+          selected: [{ name: "wow", entry: v150 }],
+          installed: [{ entry: v150, version: "1.5.0", bundlePath: "/a" }],
+          installSkips: {},
+          fallbacks: {},
+          loaded: [loaded(v150, { commands: [] }, true)],
+          loadErrors: {},
+          processEnv: {},
+          previous: await readPluginState(dir, realStorage),
+          now: () => new Date("2026-09-04T00:00:00.000Z"),
+        });
+
+        // the next boot reads its pins exactly as index.ts does
+        const pins = pinsFromState(await readPluginState(dir, realStorage));
+        expect(pins.get("wow")).toEqual({ installedVersion: "1.5.0" });
+        expect(selectPlugins(bumped, [{ name: "wow" }], 1, [], pins)[0]!.skipped).toBeUndefined();
+
+        // no state.json at all (a fresh install) has nothing to honor, so the same bump still skips it
+        const fresh = pinsFromState(await readPluginState(join(dir, "elsewhere"), realStorage));
+        expect(selectPlugins(bumped, [{ name: "wow" }], 1, [], fresh)[0]!.skipped).toBe(HOST_API_SKIP);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // A bot that already booted under the bug had the plugin skipped and rewrote state.json. The last-good
+    // must survive that write, or the fix would only help bots that were never hit. (buildPluginStateFile
+    // records an explicit PLUGINS pin as installedVersion in preference to the previous one — host.ts:340 —
+    // so this holds when nothing pins the plugin explicitly, which is what recovery is about.)
+    test("a boot that SKIPPED the plugin (the pre-#222 outcome) keeps its last-good installedVersion when nothing pins it explicitly, so the next boot recovers it", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        await writeJsonAtomic(join(dir, "plugins", "state.json"), { hostApiVersion: 1, writtenAt: "old", plugins: [wowState()] });
+        await writePluginState({
+          dataDir: dir,
+          storage: realStorage,
+          selected: [{ name: "wow", entry: bumped.plugins[0], skipped: HOST_API_SKIP }],
+          installed: [],
+          installSkips: {},
+          fallbacks: {},
+          loaded: [],
+          loadErrors: {},
+          processEnv: {},
+          previous: await readPluginState(dir, realStorage),
+          now: () => new Date("2026-09-05T00:00:00.000Z"),
+        });
+
+        const written = await readPluginState(dir, realStorage);
+        expect(written.plugins[0]).toMatchObject({ name: "wow", installedVersion: "1.5.0", active: false, error: HOST_API_SKIP });
+        const pins = pinsFromState(written);
+        expect(selectPlugins(bumped, [{ name: "wow" }], 1, [], pins)[0]!.skipped).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // The join with no other test: selection ASSUMES which versions installPlugins will reach for. If a plugin
+    // that selection kept ever had its installer ask the registry for the incompatible current, the fix would
+    // load the very bundle the skip exists to refuse. A fetch that always 404s records every version the
+    // installer reaches for, fallbacks included. This table pins the exact versions for representative shapes;
+    // the grid test below proves the safety property across every combination in it.
+    test("for representative kept shapes, the installer reaches for exactly the versions selection assumed", async () => {
+      type Pins = { installedVersion?: string; targetVersion?: string };
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        const cases: { label: string; pinned?: string; pins?: Pins; reaches: string[] }[] = [
+          { label: "explicit pin", pinned: "1.5.0", reaches: ["1.5.0"] },
+          { label: "explicit pin over a state entry naming the current", pinned: "1.5.0", pins: { installedVersion: "2.0.0", targetVersion: "2.0.0" }, reaches: ["1.5.0"] },
+          { label: "last-good only", pins: { installedVersion: "1.5.0" }, reaches: ["1.5.0"] },
+          { label: "target only", pins: { targetVersion: "1.4.0" }, reaches: ["1.4.0"] },
+          { label: "target, then its last-good fallback", pins: { installedVersion: "1.5.0", targetVersion: "1.4.0" }, reaches: ["1.4.0", "1.5.0"] },
+        ];
+        for (const c of cases) {
+          const configured = c.pinned === undefined ? [{ name: "wow" }] : [{ name: "wow", version: c.pinned }];
+          const selected = selectPlugins(bumped, configured, 1, [], new Map<string, Pins>(c.pins ? [["wow", c.pins]] : []));
+          expect(selected[0]!.skipped, c.label).toBeUndefined();
+          const requested: string[] = [];
+          await installPlugins(selected, dir, c.pins ? { wow: c.pins } : {}, {
+            fetch: async (url) => {
+              requested.push(url.split("/").pop()!);
+              return new Response("not found", { status: 404 });
+            },
+            extract: async () => {},
+            now: () => 0,
+            log: makeLog().log,
+          });
+          expect(requested, c.label).toEqual(c.reaches);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // Safety across a grid, not a hand-picked table: a change that widens the keep rule along ANY of these
+    // dimensions (an equal or newer version counted as older, "some" instead of "every" candidate, no candidate
+    // at all, a last-good fallback that is ignored) keeps a plugin whose installer then asks for the
+    // incompatible current — and fails here, whichever shape it happens to break.
+    test("across a grid of pins and state, whenever selection keeps a plugin the installer never reaches for the current or anything newer", async () => {
+      type Pins = { installedVersion?: string; targetVersion?: string };
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        const older = new Set(["1.4.0", "1.5.0"]); // every grid value below the incompatible current, 2.0.0
+        let kept = 0;
+        let skipped = 0;
+        for (const pinned of [undefined, "1.5.0", "2.0.0", "2.5.0"]) {
+          for (const installedVersion of [undefined, "1.4.0", "1.5.0", "2.0.0", "3.0.0"]) {
+            for (const targetVersion of [undefined, "1.4.0", "2.0.0", "3.0.0"]) {
+              const pins: Pins = {};
+              if (installedVersion !== undefined) pins.installedVersion = installedVersion;
+              if (targetVersion !== undefined) pins.targetVersion = targetVersion;
+              const label = `PLUGINS pin=${pinned} installedVersion=${installedVersion} targetVersion=${targetVersion}`;
+              const configured = pinned === undefined ? [{ name: "wow" }] : [{ name: "wow", version: pinned }];
+              const selected = selectPlugins(bumped, configured, 1, [], new Map<string, Pins>([["wow", pins]]));
+              if (selected[0]!.skipped !== undefined) {
+                skipped++;
+                continue;
+              }
+              kept++;
+              const requested: string[] = [];
+              await installPlugins(selected, dir, { wow: pins }, {
+                fetch: async (url) => {
+                  requested.push(url.split("/").pop()!);
+                  return new Response("not found", { status: 404 });
+                },
+                extract: async () => {},
+                now: () => 0,
+                log: makeLog().log,
+              });
+              expect(requested.length, label).toBeGreaterThan(0);
+              for (const version of requested) expect(older.has(version), `${label} -> the installer reached for ${version}`).toBe(true);
+            }
+          }
+        }
+        expect(kept).toBeGreaterThan(0); // the grid is not vacuous in either direction
+        expect(skipped).toBeGreaterThan(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 });
