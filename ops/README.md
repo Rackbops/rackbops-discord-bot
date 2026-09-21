@@ -539,7 +539,8 @@ There's no *direct* rebuild/deploy button — that stays Discord's `/update` —
 `BOT_BRANCH` through the mounted docker socket within ~15 minutes. Combined with the read-write
 config-dir mount (the panel reads secrets straight from the mounted `.env` — e.g. `GITHUB_TOKEN` for
 the branch chooser below), **panel access is effectively deploy and root-equivalent access — treat it
-like SSH to the box.** The config form on the
+like SSH to the box.** That includes any plugin admin tab the panel mounts: a bundle runs with the
+panel's own authority, so the Plugin Index is the trust boundary (ADR-0005 decision 6). The config form on the
 page is rendered from whatever `GET /api/env` returns (bar `PLUGINS`, below), so it can never drift from
 this script's own `ALLOWED` whitelist above. **One Apply bar (#257) collects every change that needs a
 restart** — the plugin on/off choices on the Plugins tab and every edited config field — in a bar at the
