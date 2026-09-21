@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelType, type Client, type RESTPostAPIChatInputApplicationCommandsJSONBody as CommandJson } from "discord.js";
@@ -623,6 +623,17 @@ describe("guildJoined / guildLeft (#259)", () => {
     await expect(joined).resolves.toBeUndefined();
     expect(h.logs.error.some((line) => line.includes(`[routing] handling the join of Other (${OTHER}) failed`))).toBe(true);
     expect(h.logs.error.some((line) => line.includes("Missing Access"))).toBe(true);
+  });
+
+  test("a join's discovery write failure is logged, and names the join", async () => {
+    await placeMusicInOther();
+    mkdirSync(discoveryPath(dir)); // a directory where the file goes: the write fails
+    const h = harness();
+    initRouting(h.ctx);
+    await expect(guildJoined(OTHER_GUILD)).resolves.toBeUndefined();
+    expect(h.logs.error.some((line) => line.includes("writing discovery.json failed (joined Other)"))).toBe(true);
+    // The registration itself still happened: a panel that cannot be told is no reason to skip the commands.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
   });
 
   test("a leave refreshes discovery and leaves routing.json byte-identical", async () => {
