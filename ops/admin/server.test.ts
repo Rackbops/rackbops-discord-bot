@@ -72,6 +72,8 @@ import {
 import { existsSync } from "node:fs";
 import { loadStaticAssets, STATIC_ASSET_FILES, type StaticAsset } from "./server";
 import { composeThemeCss } from "./theme/build-theme";
+// #242 (panel routing API): its own import statement, like the one above, so it adds lines and removes none.
+import { parseRoutingSetInput, parseWebhookAddInput, redactWebhookUrls } from "./server";
 
 /** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set. */
 function makeStore(opts: { bootstrap?: string[]; dynamic?: string[] } = {}): AdminStore & { dynamic: Set<string> } {
@@ -1288,6 +1290,24 @@ describe("buildInvocation", () => {
 
   test("POST /api/env-schema is not routed (read-only) (#205)", () => {
     expect(buildInvocation("POST", "/api/env-schema", new URLSearchParams(), noBody)).toBeUndefined();
+  });
+
+  test("GET /api/routing maps to routing-get, json (#242)", () => {
+    expect(buildInvocation("GET", "/api/routing", new URLSearchParams(), noBody)).toEqual({
+      args: ["routing-get"],
+      contentType: "application/json",
+    });
+  });
+
+  test("POST /api/routing is not a buildInvocation route: the routing writes are server-native (#242)", () => {
+    for (const [method, path] of [
+      ["POST", "/api/routing"],
+      ["POST", "/api/webhooks"],
+      ["DELETE", "/api/webhooks/333333333333333331"],
+      ["POST", "/api/discovery/refresh"],
+    ] as const) {
+      expect(buildInvocation(method, path, new URLSearchParams(), '{"url":"x"}'), `${method} ${path}`).toBeUndefined();
+    }
   });
 
   test("wrong method on a known path is unrecognised", () => {
@@ -3437,6 +3457,1001 @@ describe("POST /api/plugins/request (#105 panel producer)", () => {
     const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
     const res = await handleRequest(post({ action: "skip", plugin: "warbandeer", version: "1.1.0" }), cfg(bot.run));
     expect(res.status).toBe(504);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// #242: the panel's routing API. Five routes (GET /api/routing, POST /api/routing, POST /api/webhooks,
+// DELETE /api/webhooks/<channel id>, POST /api/discovery/refresh); the four writes are `plugin-request`
+// actions queued through bot-ops.sh, with `requestedBy` from the verified identity and an `id` the SERVER
+// mints. The webhook URL is a secret: body -> parsed value -> stdin, and nowhere else.
+// ---------------------------------------------------------------------------------------------------
+const RT_GUILD_A = "111111111111111111";
+const RT_GUILD_B = "222222222222222222";
+const RT_CHAN_1 = "333333333333333331";
+const RT_CHAN_2 = "333333333333333332";
+const RT_HOOK_ID = "444444444444444444";
+// A distinctive token in a webhook URL: found anywhere it must not be, it is a leak. Like a real token it
+// holds `-` and `_` (a class that forgot either would let the tail of a real token through), and it is
+// long enough that a PARTIAL leak (a run of it) is as visible as the whole.
+const RT_HOOK_TOKEN = "TOKENzq9f3k2m8-v1w7p4r6t5_y0uabcdefghij-XYZ_5aB7cD9eF3-kLmNoPqRs_TuVw";
+const RT_HOOK_URL = `https://discord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`;
+/** Every 8-character run of `secret`: if any of them is in a text, a piece of the secret is in it. */
+const rtWindows = (secret: string, n = 8): string[] => Array.from({ length: secret.length - n + 1 }, (_, i) => secret.slice(i, i + n));
+/** The first 8-character run of `secret` found in `text`, or undefined. */
+const rtLeakedRun = (text: string, secret: string = RT_HOOK_TOKEN): string | undefined => rtWindows(secret).find((run) => text.includes(run));
+
+describe("parseRoutingSetInput (#242)", () => {
+  const body = (servers: unknown, over: Record<string, unknown> = {}) => ({ plugin: "music", servers, ...over });
+
+  test('accepts "all", a channel list, a postTo, and an empty servers object', () => {
+    expect(
+      parseRoutingSetInput(
+        body({ [RT_GUILD_A]: { commands: "all" }, [RT_GUILD_B]: { commands: [RT_CHAN_1, RT_CHAN_2], postTo: RT_CHAN_1 } }),
+      ),
+    ).toEqual({
+      ok: true,
+      input: {
+        plugin: "music",
+        servers: { [RT_GUILD_A]: { commands: "all" }, [RT_GUILD_B]: { commands: [RT_CHAN_1, RT_CHAN_2], postTo: RT_CHAN_1 } },
+      },
+    });
+    // An empty servers object is valid: it places the plugin nowhere.
+    expect(parseRoutingSetInput(body({}))).toEqual({ ok: true, input: { plugin: "music", servers: {} } });
+  });
+
+  test("the shortest (5 digits) and longest (25 digits) ids are accepted for a server, a channel and a postTo", () => {
+    for (const id of ["12345", "1".repeat(25)]) {
+      expect(parseRoutingSetInput(body({ [id]: { commands: [id], postTo: id } })), id).toEqual({
+        ok: true,
+        input: { plugin: "music", servers: { [id]: { commands: [id], postTo: id } } },
+      });
+    }
+  });
+
+  test("body is not a JSON object", () => {
+    for (const raw of [null, undefined, "x", 5, true, [], [body({})]]) {
+      expect(parseRoutingSetInput(raw), JSON.stringify(raw)).toEqual({ ok: false, reason: "body is not a JSON object" });
+    }
+  });
+
+  test("bad plugin name", () => {
+    for (const plugin of [undefined, null, 5, "", "Music", "a_b", "1music", "music/../x", ["music"]]) {
+      expect(parseRoutingSetInput({ plugin, servers: {} }), JSON.stringify(plugin)).toEqual({ ok: false, reason: "bad plugin name" });
+    }
+  });
+
+  test("servers must be an object", () => {
+    for (const servers of [undefined, null, [], "all", 5, [{ commands: "all" }]]) {
+      expect(parseRoutingSetInput(body(servers)), JSON.stringify(servers)).toEqual({ ok: false, reason: "servers must be an object" });
+    }
+  });
+
+  test("bad server id", () => {
+    for (const id of ["main", "1234", "1".repeat(26), "-1", "12 345", ""]) {
+      expect(parseRoutingSetInput(body({ [id]: { commands: "all" } })), id).toEqual({ ok: false, reason: "bad server id" });
+    }
+  });
+
+  test('commands must be "all" or a non-empty list of channel ids', () => {
+    const reason = 'commands must be "all" or a non-empty list of channel ids';
+    for (const entry of [{}, { commands: "none" }, { commands: [] }, { commands: [7] }, { commands: ["abc"] }, { commands: [RT_CHAN_1, 7] }, { commands: ["1234"] }, { commands: null }, { commands: {} }, "all", 7, null, []]) {
+      expect(parseRoutingSetInput(body({ [RT_GUILD_A]: entry })), JSON.stringify(entry)).toEqual({ ok: false, reason });
+    }
+  });
+
+  test("bad postTo", () => {
+    for (const postTo of [7, "x", "1234", null, {}, [], "", [RT_CHAN_1]]) {
+      expect(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", postTo } })), JSON.stringify(postTo)).toEqual({ ok: false, reason: "bad postTo" });
+    }
+    // An absent postTo is not a bad one.
+    expect(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all" } })).ok).toBe(true);
+  });
+
+  test("a reason never contains the value it refused", () => {
+    const secret = "SECRET-VALUE-xyz";
+    for (const raw of [
+      { plugin: secret, servers: {} },
+      { plugin: "music", servers: { [secret]: { commands: "all" } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: secret } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: [secret] } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: secret } } },
+      { plugin: "music", servers: secret },
+    ]) {
+      const result = parseRoutingSetInput(raw);
+      expect(result.ok).toBe(false);
+      expect(JSON.stringify(result)).not.toContain(secret);
+    }
+  });
+
+  test("unknown keys at every level are dropped: the input is rebuilt, not passed on", () => {
+    const raw = {
+      plugin: "music",
+      servers: { [RT_GUILD_A]: { commands: [RT_CHAN_1], postTo: RT_CHAN_2, extra: 1, url: RT_HOOK_URL } },
+      extra: { nested: true },
+      requestedBy: "email:attacker@evil",
+      id: "attacker-chosen-id",
+    };
+    const result = parseRoutingSetInput(raw);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(Object.keys(result.input)).toEqual(["plugin", "servers"]);
+    expect(result.input.servers).toEqual({ [RT_GUILD_A]: { commands: [RT_CHAN_1], postTo: RT_CHAN_2 } });
+    expect(Object.keys(result.input.servers[RT_GUILD_A]!)).toEqual(["commands", "postTo"]);
+    // A copy, not the caller's arrays or objects.
+    expect(result.input.servers).not.toBe(raw.servers);
+    expect(result.input.servers[RT_GUILD_A]!.commands).not.toBe(raw.servers[RT_GUILD_A]!.commands);
+    expect(JSON.stringify(result)).not.toContain(RT_HOOK_TOKEN);
+  });
+
+  test("a __proto__ server key is refused, not assigned", () => {
+    for (const key of ["__proto__", "constructor", "prototype", "toString"]) {
+      const raw = JSON.parse(`{"plugin":"music","servers":{"${key}":{"commands":"all"}}}`);
+      expect(parseRoutingSetInput(raw), key).toEqual({ ok: false, reason: "bad server id" });
+    }
+    // Beside a good one, so it is not just the only key that fails; and nothing leaked onto Object.prototype.
+    const mixed = JSON.parse(`{"plugin":"music","servers":{"${RT_GUILD_A}":{"commands":"all"},"__proto__":{"commands":"all","polluted":true}}}`);
+    expect(parseRoutingSetInput(mixed)).toEqual({ ok: false, reason: "bad server id" });
+    expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    expect(({} as Record<string, unknown>).commands).toBeUndefined();
+  });
+
+  test("a requestedBy or id in the body is dropped", () => {
+    const result = parseRoutingSetInput(body({}, { requestedBy: "email:attacker@evil", id: "attacker-chosen-id" }));
+    expect(result).toEqual({ ok: true, input: { plugin: "music", servers: {} } });
+  });
+});
+
+describe("parseWebhookAddInput (#242)", () => {
+  test("accepts discord.com, discordapp.com, canary, ptb and a versioned path", () => {
+    const token = "abcdefghij0123456789-_ABCDE";
+    for (const url of [
+      `https://discord.com/api/webhooks/${RT_HOOK_ID}/${token}`,
+      `https://discordapp.com/api/webhooks/${RT_HOOK_ID}/${token}`,
+      `https://canary.discord.com/api/webhooks/${RT_HOOK_ID}/${token}`,
+      `https://ptb.discord.com/api/webhooks/${RT_HOOK_ID}/${token}`,
+      `https://discord.com/api/v10/webhooks/${RT_HOOK_ID}/${token}`,
+      `https://discordapp.com/api/v9/webhooks/12345/${"a".repeat(20)}`,
+      `https://discord.com/api/webhooks/${"1".repeat(25)}/${token}`,
+    ]) {
+      expect(parseWebhookAddInput({ url }), url).toEqual({ ok: true, url });
+    }
+  });
+
+  test("a real-sized url is accepted and a url over 512 characters is refused, whatever it looks like", () => {
+    // The longest a real one gets: canary, versioned, a 25-digit id, a 68-character token.
+    const longest = `https://canary.discord.com/api/v10/webhooks/${"1".repeat(25)}/${"aZ-_".repeat(17)}`;
+    expect(longest.length).toBeLessThan(200);
+    expect(parseWebhookAddInput({ url: longest })).toEqual({ ok: true, url: longest });
+    // Exactly at the cap, and one over: the cap is on the trimmed url.
+    const prefix = `https://discord.com/api/webhooks/${RT_HOOK_ID}/`;
+    const atCap = `${prefix}${"a".repeat(512 - prefix.length)}`;
+    expect(atCap).toHaveLength(512);
+    expect(parseWebhookAddInput({ url: atCap })).toEqual({ ok: true, url: atCap });
+    expect(parseWebhookAddInput({ url: `${atCap}a` })).toEqual({ ok: false, reason: "bad webhook url" });
+    expect(parseWebhookAddInput({ url: `  ${atCap}\n` })).toEqual({ ok: true, url: atCap });
+    // A multi-megabyte "token" never gets as far as a pattern match, or bot-ops.sh.
+    const huge = `${prefix}${"a".repeat(5_000_000)}`;
+    const started = performance.now();
+    expect(parseWebhookAddInput({ url: huge })).toEqual({ ok: false, reason: "bad webhook url" });
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  test("trims whitespace, and the trimmed string is what comes back", () => {
+    expect(parseWebhookAddInput({ url: `  ${RT_HOOK_URL}\n` })).toEqual({ ok: true, url: RT_HOOK_URL });
+    expect(parseWebhookAddInput({ url: `\t${RT_HOOK_URL}\r\n` })).toEqual({ ok: true, url: RT_HOOK_URL });
+  });
+
+  test("refuses http, another host, a missing token, a query string, a non-string", () => {
+    const bad = [
+      RT_HOOK_URL.replace("https://", "http://"),
+      `https://example.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com.evil.example/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://evil.example/https://discord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/api/webhooks/${RT_HOOK_ID}`,
+      `https://discord.com/api/webhooks/${RT_HOOK_ID}/`,
+      `https://discord.com/api/webhooks/${RT_HOOK_ID}/${"a".repeat(19)}`,
+      `https://discord.com/api/webhooks/1234/${RT_HOOK_TOKEN}`,
+      `${RT_HOOK_URL}?wait=true`,
+      `${RT_HOOK_URL}/`,
+      `${RT_HOOK_URL}#x`,
+      `${RT_HOOK_URL} extra`,
+      `${RT_HOOK_URL.slice(0, 40)}\n${RT_HOOK_URL.slice(40)}`,
+      `https://user@discord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      // Every dot in the host is a dot, not "any character"; the version segment is `v` and digits.
+      `https://discordXcom/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://canaryXdiscord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://ptbXdiscord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/apiX/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/api/vX/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/api/v/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/api/v1x0/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discord.com/api/webhooksX/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://discordapp.org/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      `https://canary.ptb.discord.com/api/webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`,
+      "",
+      "   ",
+    ];
+    for (const url of bad) expect(parseWebhookAddInput({ url }), url).toEqual({ ok: false, reason: "bad webhook url" });
+    for (const url of [undefined, null, 5, true, [RT_HOOK_URL], { url: RT_HOOK_URL }]) {
+      expect(parseWebhookAddInput({ url }), JSON.stringify(url)).toEqual({ ok: false, reason: "bad webhook url" });
+    }
+    expect(parseWebhookAddInput({})).toEqual({ ok: false, reason: "bad webhook url" });
+  });
+
+  test("body is not a JSON object", () => {
+    for (const raw of [null, undefined, "x", 5, [], [{ url: RT_HOOK_URL }]]) {
+      expect(parseWebhookAddInput(raw), JSON.stringify(raw)).toEqual({ ok: false, reason: "body is not a JSON object" });
+    }
+  });
+
+  test("the reason never contains the value, whatever is wrong with it", () => {
+    for (const url of [RT_HOOK_URL.replace("https://", "http://"), `${RT_HOOK_URL}?wait=true`, `${RT_HOOK_URL}x y`, RT_HOOK_TOKEN]) {
+      const result = parseWebhookAddInput({ url });
+      expect(result).toEqual({ ok: false, reason: "bad webhook url" });
+      expect(JSON.stringify(result)).not.toContain(RT_HOOK_TOKEN);
+    }
+  });
+
+  test("only the url is read: other keys never come back", () => {
+    const result = parseWebhookAddInput({ url: RT_HOOK_URL, requestedBy: "email:attacker@evil", id: "attacker-chosen-id", channelId: RT_CHAN_1 });
+    expect(result).toEqual({ ok: true, url: RT_HOOK_URL });
+  });
+});
+
+describe("redactWebhookUrls (#242)", () => {
+  // Built from character codes: a `backslash u 0 0 2 f` typed into an editor or a tool can be turned into
+  // the character it stands for, and then a case would only be testing a plain slash.
+  const bs = String.fromCharCode(92);
+  const u = (hex: string) => `${bs}u${hex}`;
+  const ODD = "aaaaaaaaaa.bbbbbbbbbb"; // a token with a character no token has, so the path pattern cannot help
+  const T = RT_HOOK_TOKEN;
+  const ID = RT_HOOK_ID;
+  // [name, the url as it might appear, the secret that must not survive]
+  const forms: [string, string, string][] = [
+    ["http", `http://discord.com/api/webhooks/${ID}/${T}`, T],
+    ["https", `https://discord.com/api/webhooks/${ID}/${T}`, T],
+    ["upper case", `HTTPS://DISCORD.COM/API/WEBHOOKS/${ID}/${T}`, T],
+    ["mixed case", `Https://Discord.Com/Api/Webhooks/${ID}/${T}`, T],
+    ["versioned", `https://discord.com/api/v10/webhooks/${ID}/${T}`, T],
+    ["discordapp", `https://discordapp.com/api/webhooks/${ID}/${T}`, T],
+    ["canary", `https://canary.discord.com/api/webhooks/${ID}/${T}`, T],
+    ["ptb", `https://ptb.discord.com/api/webhooks/${ID}/${T}`, T],
+    ["a port", `https://discord.com:443/api/webhooks/${ID}/${T}`, T],
+    ["a doubled slash", `https://discord.com//api/webhooks/${ID}/${T}`, T],
+    ["a trailing dot", `https://discord.com./api/webhooks/${ID}/${T}`, T],
+    ["no host", `/api/webhooks/${ID}/${T}`, T],
+    ["just the path", `webhooks/${ID}/${T}`, T],
+    ["percent-encoded slashes", `https:%2F%2Fdiscord.com%2Fapi%2Fwebhooks%2F${ID}%2F${T}`, T],
+    ["json-escaped slashes", `https:${bs}/${bs}/discord.com${bs}/api${bs}/webhooks${bs}/${ID}${bs}/${T}`, T],
+    ["a unicode-escaped letter in the host", `https://${u("0064")}iscord.com/api/webhooks/${ID}/${T}`, T],
+    ["a unicode-escaped dot", `https://discord${u("002e")}com/api/webhooks/${ID}/${T}`, T],
+    ["unicode-escaped slashes", `https:${u("002f")}${u("002f")}discord.com${u("002f")}api${u("002f")}webhooks${u("002f")}${ID}${u("002f")}${T}`, T],
+    ["unicode-escaped slashes in upper-case hex", `https:${u("002F")}${u("002F")}discord.com${u("002F")}api${u("002F")}webhooks${u("002F")}${ID}${u("002F")}${T}`, T],
+    ["a unicode-escaped letter in webhooks", `https://discord.com/api/${u("0077")}ebhooks/${ID}/${T}`, T],
+    ["a percent-encoded letter in webhooks", `https://discord.com/api/%77ebhooks/${ID}/${T}`, T],
+    ["a percent-encoded letter, lower-case hex", `https://discord.com/api/webhoo%6bs/${ID}/${T}`, T],
+    ["a percent-encoded letter, upper-case hex", `https://discord.com/api/webhoo%6Bs/${ID}/${T}`, T],
+    ["a percent-encoded letter in the host, with an odd token", `https://%64iscord.com/api/webhooks/${ID}/${ODD}`, ODD],
+    ["the host, with an odd token", `https://discord.com/api/webhooks/${ID}/${ODD}`, ODD],
+    ["the host in upper case, with an odd token", `HTTPS://DISCORD.COM/API/WEBHOOKS/${ID}/${ODD}`, ODD],
+    ["the host with a version, with an odd token", `https://discord.com/api/v10/webhooks/${ID}/${ODD}`, ODD],
+    ["upper case, no host", `/API/WEBHOOKS/${ID}/${T}`, T],
+    ["no host, a token with a hyphen", `webhooks/${ID}/aaaaaaaaaa-bbbbbbbbbb`, "aaaaaaaaaa-bbbbbbbbbb"],
+    ["no host, a token with an underscore", `webhooks/${ID}/aaaaaaaaaa_bbbbbbbbbb`, "aaaaaaaaaa_bbbbbbbbbb"],
+    // Not a spelling anything here produces, but the path pattern's own `%2f` catches it once the `%25` is read.
+    ["a doubly percent-encoded slash", `webhooks%252f${ID}%252f${T}`, T],
+    ["no host, a long token that starts with a hyphen and an underscore", `webhooks/${ID}/-_${T}`, T],
+    ["a token of 68 characters that is all hyphens and underscores", `https://discord.com/api/webhooks/${ID}/${"-_".repeat(34)}`, "-_".repeat(34)],
+  ];
+
+  test("redacts http, https, mixed case, versioned and discordapp forms, and every spelling of the slashes and letters", () => {
+    for (const [name, url, secret] of forms) {
+      const out = redactWebhookUrls(`bot-ops: bad payload ${url} (from the writer)`);
+      // No run of eight characters of the token survives, not only "the whole token is gone".
+      expect(rtLeakedRun(out, secret), name).toBeUndefined();
+      expect(out, name).toContain("[webhook url]");
+      // The text around it is kept.
+      expect(out.startsWith("bot-ops: bad payload "), name).toBe(true);
+      expect(out.endsWith(" (from the writer)"), name).toBe(true);
+    }
+  });
+
+  test("a url wrapped in quotes, in JSON or with more text around it is cut to the url", () => {
+    expect(redactWebhookUrls(`bad url '${RT_HOOK_URL}' in payload`)).toBe("bad url '[webhook url]' in payload");
+    expect(redactWebhookUrls(`{"url":"${RT_HOOK_URL}","action":"webhook-add"}`)).toBe('{"url":"[webhook url]","action":"webhook-add"}');
+    expect(redactWebhookUrls(`first ${RT_HOOK_URL} and second ${RT_HOOK_URL.replace("discord.com", "discordapp.com")}`)).toBe("first [webhook url] and second [webhook url]");
+  });
+
+  test("leaves other text alone", () => {
+    for (const text of [
+      "",
+      "bot-ops: plugin-request: invalid action",
+      "100%25 done",
+      `an escape ${u("00e9")} that is not a url`,
+      "https://example.com/api/webhooks-are-nice",
+      "discord.com/api/webhooks",
+      "webhooks/1234/short",
+      `webhooks/${ID}/${"a".repeat(19)}`,
+      "https://discord.com/channels/1/2",
+      "docker: Error response from daemon: no such container",
+    ]) {
+      expect(redactWebhookUrls(text), text).toBe(text);
+    }
+  });
+
+  test("stays fast on a hostile megabyte-ish of text", () => {
+    const started = performance.now();
+    for (const text of ["a.".repeat(100_000), "discord".repeat(30_000), "https://".repeat(30_000), "webhooks/".repeat(30_000), "%2f".repeat(60_000), `${bs}/`.repeat(60_000)]) {
+      redactWebhookUrls(text);
+    }
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+});
+
+describe("routing routes (#242)", () => {
+  const TOKEN = "test-token";
+  const REQ_ID = "req-0123456789";
+  const okStdout = '{"ok":true,"queued":"1757000000000-webhook-add-42.json"}';
+
+  // Captures the invocation so a test can assert args + stdin (the payload).
+  function capturingBotOps(result: BotOpsResult = { exitCode: 0, stdout: okStdout, stderr: "" }) {
+    const calls: BotOpsInvocation[] = [];
+    return { calls, run: async (inv: BotOpsInvocation): Promise<BotOpsResult> => (calls.push(inv), result) };
+  }
+  const cfg = (run: HandlerConfig["runBotOps"], over: Partial<HandlerConfig> = {}): HandlerConfig => ({
+    adminToken: TOKEN,
+    indexHtml: "<html></html>",
+    runBotOps: run,
+    newRequestId: () => REQ_ID,
+    ...over,
+  });
+  function req(method: string, path: string, body?: unknown, headers: Record<string, string> = {}, bearer = true): Request {
+    return new Request(`http://panel.example${path}`, {
+      method,
+      headers: { ...(bearer ? { Authorization: `Bearer ${TOKEN}` } : {}), "Content-Type": "application/json", ...headers },
+      body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+  const jwtCfg = (run: HandlerConfig["runBotOps"], over: Partial<HandlerConfig> = {}) =>
+    cfg(run, { verifyAccessJwt: async () => ({ sub: "real@example.com", email: "real@example.com" }), ...over });
+  const jwtHeaders = { "Cf-Access-Jwt-Assertion": "jwt" };
+
+  // The handler logs an audit line per queued request: recorded here (and kept off the test output).
+  let out: { log: string[]; error: string[] };
+  let restoreConsole: () => void;
+  beforeEach(() => {
+    out = { log: [], error: [] };
+    const log = spyOn(console, "log").mockImplementation((...a: unknown[]) => void out.log.push(a.map(String).join(" ")));
+    const error = spyOn(console, "error").mockImplementation((...a: unknown[]) => void out.error.push(a.map(String).join(" ")));
+    restoreConsole = () => {
+      log.mockRestore();
+      error.mockRestore();
+    };
+  });
+  afterEach(() => restoreConsole());
+  const jsonOf = async (res: Response) => (await res.json()) as { ok?: boolean; id: string; queued?: string };
+
+  interface Route {
+    name: string;
+    method: string;
+    path: string;
+    body?: unknown;
+    /** A body the parser refuses, for the routes that have one. */
+    badBody?: unknown;
+    describe: string;
+    payload: Record<string, unknown>;
+  }
+  const routes: Route[] = [
+    {
+      name: "POST /api/routing",
+      method: "POST",
+      path: "/api/routing",
+      body: { plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: RT_CHAN_1 }, [RT_GUILD_B]: { commands: [RT_CHAN_2] } } },
+      badBody: { plugin: "Music", servers: {} },
+      describe: "routing-set music",
+      payload: { action: "routing-set", plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: RT_CHAN_1 }, [RT_GUILD_B]: { commands: [RT_CHAN_2] } } },
+    },
+    {
+      name: "POST /api/webhooks",
+      method: "POST",
+      path: "/api/webhooks",
+      body: { url: RT_HOOK_URL },
+      badBody: { url: "http://nope" },
+      describe: "webhook-add",
+      payload: { action: "webhook-add", url: RT_HOOK_URL },
+    },
+    {
+      name: "DELETE /api/webhooks/<channel id>",
+      method: "DELETE",
+      path: `/api/webhooks/${RT_CHAN_1}`,
+      describe: `webhook-remove ${RT_CHAN_1}`,
+      payload: { action: "webhook-remove", channelId: RT_CHAN_1 },
+    },
+    {
+      name: "POST /api/discovery/refresh",
+      method: "POST",
+      path: "/api/discovery/refresh",
+      describe: "discovery-refresh",
+      payload: { action: "discovery-refresh" },
+    },
+  ];
+
+  for (const r of routes) {
+    describe(r.name, () => {
+      test("401 without auth, bot-ops never called (even before a bad body is looked at)", async () => {
+        for (const body of r.badBody === undefined ? [r.body] : [r.body, r.badBody]) {
+          const bot = capturingBotOps();
+          const res = await handleRequest(req(r.method, r.path, body, {}, false), cfg(bot.run));
+          expect(res.status).toBe(401);
+          expect(bot.calls).toHaveLength(0);
+        }
+      });
+
+      test("403 cross-site, bot-ops never called (even with a bad body)", async () => {
+        for (const body of r.badBody === undefined ? [r.body] : [r.body, r.badBody]) {
+          const bot = capturingBotOps();
+          const res = await handleRequest(req(r.method, r.path, body, { Origin: "http://evil.com" }), cfg(bot.run));
+          expect(res.status).toBe(403);
+          expect(bot.calls).toHaveLength(0);
+        }
+      });
+
+      test("runs plugin-request with the expected payload on stdin", async () => {
+        const bot = capturingBotOps();
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.status).toBe(200);
+        expect(bot.calls).toHaveLength(1);
+        expect(bot.calls[0]!.args).toEqual(["plugin-request"]);
+        expect(bot.calls[0]!.contentType).toBe("application/json");
+        expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ ...r.payload, requestedBy: "token", id: REQ_ID });
+      });
+
+      test("answers { ok, id, queued }", async () => {
+        const bot = capturingBotOps();
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.headers.get("Content-Type")).toBe("application/json");
+        expect(await res.json()).toEqual({ ok: true, id: REQ_ID, queued: "1757000000000-webhook-add-42.json" });
+      });
+
+      test("logs one audit line naming the action and the actor", async () => {
+        const bot = capturingBotOps();
+        await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(out.log).toEqual([`[admin] plugin-request queued (${r.describe}) — requested by the ADMIN_TOKEN bearer token`]);
+        expect(out.error).toEqual([]);
+      });
+
+      test("a bot-ops failure is a 502 with its stderr", async () => {
+        const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "bot-ops: plugin-request: invalid action\n" });
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.status).toBe(502);
+        expect(await res.text()).toBe("bot-ops: plugin-request: invalid action");
+        expect(out.error).toEqual([
+          "[admin] plugin-request failed (exit 1) — requested by the ADMIN_TOKEN bearer token: bot-ops: plugin-request: invalid action",
+        ]);
+        expect(out.log).toEqual([]);
+      });
+
+      test("a bot-ops failure with no stderr is a 502 saying so", async () => {
+        const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "" });
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.status).toBe(502);
+        expect(await res.text()).toBe("plugin-request failed");
+      });
+
+      test("a timed-out bot-ops is a 504", async () => {
+        const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true });
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.status).toBe(504);
+        expect(await res.text()).toBe("bot-ops.sh timed out");
+      });
+
+      test("requestedBy is the verified email even when the body supplies another, and an id in the body is ignored", async () => {
+        const bot = capturingBotOps();
+        // EVERY route gets a body that tries: the two without a body of their own (DELETE, discovery refresh)
+        // are sent one anyway, since a client can, and it must change nothing. The route's own fields win.
+        const hostile = { requestedBy: "email:attacker@evil", id: "attacker-chosen-id", action: "webhook-add", url: RT_HOOK_URL };
+        const body = { ...hostile, ...(isRecordBody(r.body) ? r.body : {}) };
+        const res = await handleRequest(req(r.method, r.path, body, jwtHeaders, false), jwtCfg(bot.run));
+        expect(res.status).toBe(200);
+        expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ ...r.payload, requestedBy: "email:real@example.com", id: REQ_ID });
+        expect((await jsonOf(res)).id).toBe(REQ_ID);
+        // The bearer path, too: `token`, and the server's id.
+        const viaToken = capturingBotOps();
+        await handleRequest(req(r.method, r.path, body), cfg(viaToken.run));
+        expect(JSON.parse(viaToken.calls[0]!.stdin!)).toEqual({ ...r.payload, requestedBy: "token", id: REQ_ID });
+      });
+
+      test("without newRequestId the id is a UUID the bot accepts, and a different one each time", async () => {
+        const bot = capturingBotOps();
+        const noSeam = cfg(bot.run, { newRequestId: undefined });
+        const ids: string[] = [];
+        for (let i = 0; i < 3; i += 1) {
+          const res = await handleRequest(req(r.method, r.path, r.body), noSeam);
+          ids.push((await jsonOf(res)).id);
+        }
+        for (const id of ids) {
+          expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+          expect(id).toMatch(/^[A-Za-z0-9_-]{8,64}$/); // the bot's REQUEST_ID_RE
+          expect(JSON.parse(bot.calls[ids.indexOf(id)]!.stdin!).id).toBe(id);
+        }
+        expect(new Set(ids).size).toBe(3);
+      });
+
+      test("the answer omits `queued` when bot-ops' output is not JSON", async () => {
+        const bot = capturingBotOps({ exitCode: 0, stdout: "queued\n", stderr: "" });
+        const res = await handleRequest(req(r.method, r.path, r.body), cfg(bot.run));
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ ok: true, id: REQ_ID });
+      });
+    });
+  }
+
+  function isRecordBody(body: unknown): body is Record<string, unknown> {
+    return typeof body === "object" && body !== null && !Array.isArray(body);
+  }
+
+  test("POST /api/routing: invalid JSON is 400, and a refused body is 400 naming the field", async () => {
+    const cases: [unknown, string][] = [
+      ["{ not json", "invalid JSON"],
+      ["", "invalid JSON"],
+      [[], "body is not a JSON object"],
+      ["null", "body is not a JSON object"],
+      [{ servers: {} }, "bad plugin name"],
+      [{ plugin: "music" }, "servers must be an object"],
+      [{ plugin: "music", servers: { main: { commands: "all" } } }, "bad server id"],
+      [{ plugin: "music", servers: { [RT_GUILD_A]: { commands: "some" } } }, 'commands must be "all" or a non-empty list of channel ids'],
+      [{ plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: "x" } } }, "bad postTo"],
+    ];
+    for (const [body, reason] of cases) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(req("POST", "/api/routing", body), cfg(bot.run));
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect(await res.text()).toBe(reason);
+      expect(bot.calls).toHaveLength(0);
+    }
+  });
+
+  test("POST /api/routing: a __proto__ server key sent as JSON text is 400, never queued", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(req("POST", "/api/routing", `{"plugin":"music","servers":{"__proto__":{"commands":"all"}}}`), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe("bad server id");
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  test("POST /api/routing: unknown keys at every level never reach stdin", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(
+      req("POST", "/api/routing", {
+        plugin: "music",
+        servers: { [RT_GUILD_A]: { commands: [RT_CHAN_1], postTo: RT_CHAN_2, extra: "x", url: RT_HOOK_URL } },
+        extra: "y",
+        action: "webhook-remove",
+      }),
+      cfg(bot.run),
+    );
+    expect(res.status).toBe(200);
+    expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({
+      action: "routing-set",
+      plugin: "music",
+      servers: { [RT_GUILD_A]: { commands: [RT_CHAN_1], postTo: RT_CHAN_2 } },
+      requestedBy: "token",
+      id: REQ_ID,
+    });
+    expect(bot.calls[0]!.stdin).not.toContain(RT_HOOK_TOKEN);
+  });
+
+  test("POST /api/routing: an empty servers object is queued (it places the plugin nowhere)", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(req("POST", "/api/routing", { plugin: "wow", servers: {} }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ action: "routing-set", plugin: "wow", servers: {}, requestedBy: "token", id: REQ_ID });
+  });
+
+  test("POST /api/webhooks: invalid JSON is 400, and a refused body is 400 naming the field", async () => {
+    const cases: [unknown, string][] = [
+      ["{ not json", "invalid JSON"],
+      [[], "body is not a JSON object"],
+      [{}, "bad webhook url"],
+      [{ url: 5 }, "bad webhook url"],
+      [{ url: RT_HOOK_URL.replace("https://", "http://") }, "bad webhook url"],
+      [{ url: `${RT_HOOK_URL}?wait=true` }, "bad webhook url"],
+    ];
+    for (const [body, reason] of cases) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(req("POST", "/api/webhooks", body), cfg(bot.run));
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect(await res.text()).toBe(reason);
+      expect(bot.calls).toHaveLength(0);
+    }
+  });
+
+  test("POST /api/webhooks: the url is trimmed, and only the url is read from the body", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(req("POST", "/api/webhooks", { url: `  ${RT_HOOK_URL}\n`, channelId: RT_CHAN_1, action: "webhook-remove" }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ action: "webhook-add", url: RT_HOOK_URL, requestedBy: "token", id: REQ_ID });
+  });
+
+  test("DELETE /api/webhooks/<id>: anything that is not a channel id is 400, a percent-encoded one included", async () => {
+    const encoded = [...RT_CHAN_1].map((c) => `%${c.charCodeAt(0).toString(16)}`).join("");
+    for (const id of ["abc", "", "1234", "1".repeat(26), `${RT_CHAN_1}/extra`, `${RT_CHAN_1}/`, `x/${RT_CHAN_1}`, `${RT_CHAN_2}/${RT_CHAN_1}`, encoded, `${RT_CHAN_1}%2fx`, "..%2f..%2fx", "12 345", "-12345", "12345.5"]) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(req("DELETE", `/api/webhooks/${id}`), cfg(bot.run));
+      expect(res.status, id).toBe(400);
+      expect(await res.text()).toBe("bad channel id");
+      expect(bot.calls, id).toHaveLength(0);
+    }
+  });
+
+  test("DELETE /api/webhooks/<id>: a query string is not part of the id, and never supplies one", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(req("DELETE", `/api/webhooks/${RT_CHAN_1}?x=1`), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(bot.calls[0]!.stdin!).channelId).toBe(RT_CHAN_1);
+    // A query parameter named like the id is ignored: the path's id wins, and a bad path id is not rescued by it.
+    for (const query of [`?id=${RT_CHAN_2}`, `?channelId=${RT_CHAN_2}`, `?id=${RT_CHAN_2}&channelId=${RT_CHAN_2}`]) {
+      const other = capturingBotOps();
+      const ok = await handleRequest(req("DELETE", `/api/webhooks/${RT_CHAN_1}${query}`), cfg(other.run));
+      expect(ok.status, query).toBe(200);
+      expect(JSON.parse(other.calls[0]!.stdin!).channelId, query).toBe(RT_CHAN_1);
+      const bad = capturingBotOps();
+      const refused = await handleRequest(req("DELETE", `/api/webhooks/abc${query}`), cfg(bad.run));
+      expect(refused.status, query).toBe(400);
+      expect(bad.calls, query).toHaveLength(0);
+    }
+  });
+
+  test("DELETE /api/webhooks/<id>: the shortest and longest channel ids are accepted", async () => {
+    for (const id of ["12345", "1".repeat(25)]) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(req("DELETE", `/api/webhooks/${id}`), cfg(bot.run));
+      expect(res.status, id).toBe(200);
+      expect(JSON.parse(bot.calls[0]!.stdin!).channelId, id).toBe(id);
+    }
+  });
+
+  test("POST /api/discovery/refresh: the body is ignored, even garbage", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(req("POST", "/api/discovery/refresh", "{ not json at all", { "Content-Type": "text/plain" }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(JSON.parse(bot.calls[0]!.stdin!)).toEqual({ action: "discovery-refresh", requestedBy: "token", id: REQ_ID });
+  });
+
+  test("any other method on these paths is the existing 404, bot-ops never called", async () => {
+    for (const [method, path] of [
+      ["GET", "/api/webhooks"],
+      ["GET", `/api/webhooks/${RT_CHAN_1}`],
+      ["GET", "/api/discovery/refresh"],
+      ["PUT", "/api/routing"],
+      ["DELETE", "/api/routing"],
+      ["PUT", "/api/webhooks"],
+      ["POST", `/api/webhooks/${RT_CHAN_1}`],
+      ["DELETE", "/api/webhooks"],
+      ["DELETE", "/api/discovery/refresh"],
+      ["GET", "/api/discovery"],
+    ] as const) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(req(method, path, method === "GET" ? undefined : {}), cfg(bot.run));
+      expect(res.status, `${method} ${path}`).toBe(404);
+      expect(bot.calls, `${method} ${path}`).toHaveLength(0);
+    }
+  });
+
+  test("GET /api/routing runs routing-get and passes its JSON through", async () => {
+    const stdout = JSON.stringify({ routing: { v: 1, plugins: {}, webhooks: {}, results: [] }, discovery: { v: 1, guilds: [] } });
+    const bot = capturingBotOps({ exitCode: 0, stdout, stderr: "" });
+    const res = await handleRequest(req("GET", "/api/routing"), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(await res.text()).toBe(stdout);
+    expect(bot.calls).toHaveLength(1);
+    expect(bot.calls[0]!.args).toEqual(["routing-get"]);
+    expect(bot.calls[0]!.stdin).toBeUndefined();
+  });
+
+  test("GET /api/routing: 401 without auth, and a failing routing-get is a 502 with its stderr", async () => {
+    const denied = capturingBotOps();
+    expect((await handleRequest(req("GET", "/api/routing", undefined, {}, false), cfg(denied.run))).status).toBe(401);
+    expect(denied.calls).toHaveLength(0);
+
+    const failing = capturingBotOps({ exitCode: 1, stdout: "", stderr: "bot-ops: routing-get: no data dir" });
+    const res = await handleRequest(req("GET", "/api/routing"), cfg(failing.run));
+    expect(res.status).toBe(502);
+    expect(await res.text()).toBe("bot-ops: routing-get: no data dir");
+    expect(out.error).toEqual(["[admin] routing-get failed (exit 1) — requested by the ADMIN_TOKEN bearer token: bot-ops: routing-get: no data dir"]);
+  });
+});
+
+describe("a webhook url never leaves the stdin payload (#242)", () => {
+  const TOKEN = "test-token";
+  const REQ_ID = "req-0123456789";
+  const bs = String.fromCharCode(92);
+
+  function capturingBotOps(result: BotOpsResult = { exitCode: 0, stdout: '{"ok":true,"queued":"1757000000000-webhook-add-42.json"}', stderr: "" }) {
+    const calls: BotOpsInvocation[] = [];
+    return { calls, run: async (inv: BotOpsInvocation): Promise<BotOpsResult> => (calls.push(inv), result) };
+  }
+  const cfg = (run: HandlerConfig["runBotOps"]): HandlerConfig => ({ adminToken: TOKEN, indexHtml: "<html></html>", runBotOps: run, newRequestId: () => REQ_ID });
+  const post = (path: string, body: unknown) =>
+    new Request(`http://panel.example${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+
+  // Every console method the handler could reach, and both process streams, with the arguments rendered
+  // the way a log line would be. (`console.trace`, `dir` and `table` and a direct `process.stderr.write`
+  // are ways to write a line that a spy on `log` and `error` alone would not see.)
+  let lines: string[];
+  let spies: { mockRestore: () => void }[];
+  beforeEach(() => {
+    lines = [];
+    const render = (a: unknown) => (a instanceof Error ? `${a.message}\n${a.stack}` : typeof a === "string" ? a : JSON.stringify(a));
+    const record = (...args: unknown[]) => void lines.push(args.map(render).join(" "));
+    spies = (["log", "error", "warn", "info", "debug", "trace", "dir", "dirxml", "table"] as const).map((level) =>
+      spyOn(console, level).mockImplementation(record),
+    );
+    for (const stream of [process.stdout, process.stderr]) {
+      spies.push(
+        spyOn(stream, "write").mockImplementation(((chunk: unknown) => {
+          lines.push(`[stream] ${render(typeof chunk === "string" ? chunk : String(chunk))}`);
+          return true;
+        }) as never),
+      );
+    }
+  });
+  afterEach(() => {
+    for (const spy of spies) spy.mockRestore();
+  });
+
+  /** No piece of the token (no run of eight of its characters) is in any response body or header, any
+   *  console line or stream write, or `args`; and the response carries at most a Content-Type. */
+  async function expectNoLeak(where: string, res: Response, bot: ReturnType<typeof capturingBotOps>): Promise<void> {
+    expect(rtLeakedRun(await res.clone().text()), `${where}: the response body`).toBeUndefined();
+    expect(rtLeakedRun(JSON.stringify([...res.headers])), `${where}: the response headers`).toBeUndefined();
+    // (A plain-string Response carries no header object at all until it is sent, so "at most" a Content-Type.)
+    expect([...res.headers.keys()].filter((name) => name !== "content-type"), `${where}: the response's header names`).toEqual([]);
+    expect(rtLeakedRun(lines.join("\n")), `${where}: the console`).toBeUndefined();
+    for (const call of bot.calls) expect(rtLeakedRun(JSON.stringify(call.args)), `${where}: argv`).toBeUndefined();
+  }
+
+  test("an accepted url: on stdin, and nowhere else", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    // It DID reach bot-ops, so this cannot pass by the route doing nothing.
+    expect(bot.calls).toHaveLength(1);
+    expect(bot.calls[0]!.stdin).toContain(RT_HOOK_TOKEN);
+    expect(JSON.parse(bot.calls[0]!.stdin!).url).toBe(RT_HOOK_URL);
+    expect(bot.calls[0]!.args).toEqual(["plugin-request"]);
+    await expectNoLeak("accepted", res, bot);
+    // And something WAS logged, so the console check is not vacuous.
+    expect(lines).toEqual(["[admin] plugin-request queued (webhook-add) — requested by the ADMIN_TOKEN bearer token"]);
+  });
+
+  test("a malformed url (the same token behind http://): a bare 400, nothing echoed", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL.replace("https://", "http://") }), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(await res.clone().text()).toBe("bad webhook url");
+    expect(bot.calls).toHaveLength(0);
+    await expectNoLeak("malformed", res, bot);
+  });
+
+  test("an accepted url whose bot-ops fails with a stderr that holds it: redacted in the answer and the log", async () => {
+    const stderr = `bot-ops: plugin-request: bad url '${RT_HOOK_URL}' in payload\n`;
+    const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr });
+    const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+    expect(res.status).toBe(502);
+    expect(await res.clone().text()).toBe("bot-ops: plugin-request: bad url '[webhook url]' in payload");
+    expect(bot.calls[0]!.stdin).toContain(RT_HOOK_TOKEN); // it was sent, on stdin
+    await expectNoLeak("failed", res, bot);
+    expect(lines).toEqual([
+      "[admin] plugin-request failed (exit 1) — requested by the ADMIN_TOKEN bearer token: bot-ops: plugin-request: bad url '[webhook url]' in payload",
+    ]);
+  });
+
+  test("the same failure with the url spelled with escapes: still redacted", async () => {
+    const spellings = [
+      RT_HOOK_URL.split("/").join(`${bs}/`), // json-escaped slashes
+      RT_HOOK_URL.split("/").join("%2F"), // percent-encoded slashes
+      RT_HOOK_URL.split("/").join(`${bs}u002f`), // unicode-escaped slashes
+      RT_HOOK_URL.replace("webhooks", "%77ebhooks"), // a percent-encoded letter
+      RT_HOOK_URL.replace("https://discord.com", "https://discord.com:443"), // a port
+      `webhooks/${RT_HOOK_ID}/${RT_HOOK_TOKEN}`, // no host
+    ];
+    for (const spelling of spellings) {
+      lines.length = 0;
+      const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: `jq: error: bad input near ${spelling}` });
+      const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+      expect(res.status, spelling).toBe(502);
+      expect(await res.clone().text(), spelling).toContain("[webhook url]");
+      await expectNoLeak(spelling, res, bot);
+    }
+  });
+
+  test("a timed-out bot-ops whose stderr holds the url: a fixed 504 body, and a redacted log line", async () => {
+    const bot = capturingBotOps({ exitCode: 1, stdout: "", stderr: `killed while reading ${RT_HOOK_URL}`, timedOut: true });
+    const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+    expect(res.status).toBe(504);
+    expect(await res.clone().text()).toBe("bot-ops.sh timed out");
+    await expectNoLeak("timed out", res, bot);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("[webhook url]");
+  });
+
+  test("a success whose stdout `queued` holds the url: redacted", async () => {
+    const bot = capturingBotOps({ exitCode: 0, stdout: JSON.stringify({ ok: true, queued: RT_HOOK_URL }), stderr: "" });
+    const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+    expect(res.status).toBe(200);
+    expect(await res.clone().json()).toEqual({ ok: true, id: REQ_ID, queued: "[webhook url]" });
+    await expectNoLeak("queued", res, bot);
+  });
+
+  test("a success whose `queued` is not a string is left out, whatever it holds", async () => {
+    for (const queued of [{ url: RT_HOOK_URL }, [RT_HOOK_URL], 5, null, true]) {
+      const bot = capturingBotOps({ exitCode: 0, stdout: JSON.stringify({ ok: true, queued }), stderr: "" });
+      const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+      expect(res.status).toBe(200);
+      expect(await res.clone().json()).toEqual({ ok: true, id: REQ_ID });
+      await expectNoLeak(JSON.stringify(queued).slice(0, 30), res, bot);
+    }
+  });
+
+  test("a runBotOps that throws, with the payload in its message: a fixed 502, and the log line redacted", async () => {
+    const payloadText = `spawn failed for stdin {"action":"webhook-add","url":"${RT_HOOK_URL}"}`;
+    for (const [thrown, marked] of [
+      [new Error(payloadText), true],
+      [new Error(`${"x".repeat(250)} ${RT_HOOK_URL}`), true],
+      // The url sits past the clip: the line is cut, and there is nothing of the url in what is left.
+      [new Error(`${"x".repeat(5000)} ${RT_HOOK_URL}`), false],
+    ] as const) {
+      lines.length = 0;
+      const calls: BotOpsInvocation[] = [];
+      const run = async (inv: BotOpsInvocation): Promise<BotOpsResult> => {
+        calls.push(inv);
+        throw thrown;
+      };
+      const res = await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(run));
+      expect(res.status).toBe(502);
+      expect(await res.clone().text()).toBe("bot-ops.sh could not be run");
+      await expectNoLeak("thrown", res, { calls } as ReturnType<typeof capturingBotOps>);
+      expect(calls[0]!.stdin).toContain(RT_HOOK_TOKEN); // it was on the payload it threw about
+      expect(lines).toHaveLength(1);
+      expect(lines[0]!.startsWith("[admin] plugin-request could not run bot-ops.sh — requested by the ADMIN_TOKEN bearer token: ")).toBe(true);
+      expect(lines[0]!.includes("[webhook url]")).toBe(marked);
+      // Clipped: the message is 5 KB of x in one of the cases.
+      expect(lines[0]!.length).toBeLessThan(500);
+    }
+  });
+
+  test("a runBotOps that throws something that is not an Error, or an Error whose message cannot be read: still a fixed 502", async () => {
+    const unreadable = Object.defineProperty(new Error("x"), "message", {
+      get(): never {
+        throw new Error(`nested ${RT_HOOK_URL}`);
+      },
+    });
+    for (const [thrown, why] of [
+      [RT_HOOK_URL, "not an Error"],
+      [null, "not an Error"],
+      [{ message: RT_HOOK_URL }, "not an Error"],
+      [unreadable, "unreadable error"],
+    ] as const) {
+      lines.length = 0;
+      const calls: BotOpsInvocation[] = [];
+      const res = await handleRequest(
+        post("/api/webhooks", { url: RT_HOOK_URL }),
+        cfg(async (inv) => {
+          calls.push(inv);
+          throw thrown;
+        }),
+      );
+      expect(res.status).toBe(502);
+      expect(await res.clone().text()).toBe("bot-ops.sh could not be run");
+      await expectNoLeak(why, res, { calls } as ReturnType<typeof capturingBotOps>);
+      expect(lines).toEqual([`[admin] plugin-request could not run bot-ops.sh — requested by the ADMIN_TOKEN bearer token: ${why}`]);
+    }
+  });
+
+  test("a thrown message is redacted BEFORE it is clipped: a clip through a url must not leave a piece of its token", async () => {
+    // The port makes the host pattern miss, so only the path pattern (which needs 20 token characters) can
+    // catch this url. Clipped FIRST, at 300, it would be cut ten characters into the token and nothing would
+    // catch it: those ten would be in the log line.
+    const portPrefix = `https://discord.com:443/api/webhooks/${RT_HOOK_ID}/`;
+    const message = `${"x".repeat(300 - 1 - portPrefix.length - 10)} ${portPrefix}${RT_HOOK_TOKEN}`;
+    const calls: BotOpsInvocation[] = [];
+    const res = await handleRequest(
+      post("/api/webhooks", { url: RT_HOOK_URL }),
+      cfg(async (inv) => {
+        calls.push(inv);
+        throw new Error(message);
+      }),
+    );
+    expect(res.status).toBe(502);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("[webhook url]");
+    await expectNoLeak("clip", res, { calls } as ReturnType<typeof capturingBotOps>);
+  });
+
+  test("a thrown message clipped through a surrogate pair does not leave half of it in the log line", async () => {
+    const emoji = String.fromCodePoint(0x1f600); // two UTF-16 units: the cut at 300 lands between them
+    const res = await handleRequest(
+      post("/api/webhooks", { url: RT_HOOK_URL }),
+      cfg(async () => {
+        throw new Error(`${"x".repeat(299)}${emoji}${"y".repeat(50)}`);
+      }),
+    );
+    expect(res.status).toBe(502);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.isWellFormed()).toBe(true);
+    expect(lines[0]!.endsWith("x".repeat(299))).toBe(true);
+  });
+
+  test("the routing writes speak only through console.log and console.error (source pin)", () => {
+    // The spies above cover the console methods and streams a test can reach; this covers the ones it cannot
+    // (group, count, assert, Bun.write(Bun.stderr, ...)) by pinning what the code that handles a webhook url
+    // is allowed to call at all.
+    const src = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+    const helper = src.slice(src.indexOf("async function queueRoutingRequest("), src.indexOf("/** The whole request lifecycle"));
+    const routes = src.slice(src.indexOf("// #242: the four routing writes."), src.indexOf('if (url.pathname === "/api/admins"'));
+    expect(helper.length).toBeGreaterThan(500);
+    expect(routes.length).toBeGreaterThan(500);
+    expect([...helper.matchAll(/console\.(\w+)/g)].map((m) => m[1])).toEqual(["error", "error", "log"]);
+    expect([...routes.matchAll(/console\./g)]).toHaveLength(0);
+    for (const [name, text] of [["queueRoutingRequest", helper], ["the routing routes", routes]] as const) {
+      expect(text, name).not.toMatch(/process\.(stdout|stderr)|Bun\.(write|stdout|stderr)|\bfetch\(|\bBun\.spawn/);
+    }
+  });
+
+  test("a url in the wrong place of a routing-set body is refused with a fixed reason, never echoed", async () => {
+    const bodies = [
+      { plugin: RT_HOOK_URL, servers: {} },
+      { plugin: "music", servers: { [RT_HOOK_URL]: { commands: "all" } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: RT_HOOK_URL } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: [RT_HOOK_URL] } } },
+      { plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: RT_HOOK_URL } } },
+      { plugin: "music", servers: RT_HOOK_URL },
+    ];
+    for (const body of bodies) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(post("/api/routing", body), cfg(bot.run));
+      expect(res.status).toBe(400);
+      expect(bot.calls).toHaveLength(0);
+      await expectNoLeak(JSON.stringify(body).slice(0, 60), res, bot);
+    }
+  });
+
+  test("a url in the body of the other routes is never read, so never echoed either", async () => {
+    for (const [path, body] of [
+      ["/api/discovery/refresh", { url: RT_HOOK_URL, note: RT_HOOK_URL }],
+      ["/api/routing", { plugin: "music", servers: {}, url: RT_HOOK_URL }],
+    ] as const) {
+      const bot = capturingBotOps();
+      const res = await handleRequest(post(path, body), cfg(bot.run));
+      expect(res.status, path).toBe(200);
+      expect(bot.calls[0]!.stdin, path).not.toContain(RT_HOOK_TOKEN);
+      await expectNoLeak(path, res, bot);
+    }
+  });
+
+  test("a url with invalid JSON around it: a bare 400", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(post("/api/webhooks", `{"url":"${RT_HOOK_URL}"`), cfg(bot.run));
+    expect(res.status).toBe(400);
+    expect(await res.clone().text()).toBe("invalid JSON");
+    await expectNoLeak("invalid JSON", res, bot);
+  });
+
+  test("the audit line for webhook-add and webhook-remove never carries the url or the token", async () => {
+    const bot = capturingBotOps();
+    await handleRequest(post("/api/webhooks", { url: RT_HOOK_URL }), cfg(bot.run));
+    await handleRequest(new Request(`http://panel.example/api/webhooks/${RT_CHAN_1}`, { method: "DELETE", headers: { Authorization: `Bearer ${TOKEN}` } }), cfg(bot.run));
+    expect(lines).toEqual([
+      "[admin] plugin-request queued (webhook-add) — requested by the ADMIN_TOKEN bearer token",
+      `[admin] plugin-request queued (webhook-remove ${RT_CHAN_1}) — requested by the ADMIN_TOKEN bearer token`,
+    ]);
   });
 });
 
