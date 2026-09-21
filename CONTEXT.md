@@ -1283,8 +1283,8 @@ _Avoid_: server list, guild cache
   styles them with selectors that sit wholly inside `:where(.plugin-admin-tab …)` — zero
   specificity, so a bundle's own rules win (a test pins that shape).
 - **The Apply bar derives what is pending from the controls on every event and never stores it (#257).**
-  The bar's only state is its phase (`idle` / `applying` / `done` / `failed`) and the message it is
-  showing; the plan comes from `collectPending()` → `planApply` each time, exactly as the deleted Save
+  The bar's state is its phase (`idle` / `applying` / `done` / `failed`), the message it is showing, and
+  (#275) whether the page is re-reading the server (`applyRereading`); the plan comes from `collectPending()` → `planApply` each time, exactly as the deleted Save
   buttons read the controls at click time. So Discard is "re-render from the baseline" (`loadPlugins()` +
   `loadEnv()`, nothing posted), and there is no second copy of the truth to drift. Two consequences for
   anyone touching the page. (1) **Anything that changes a control's value from code must dispatch an `input`
@@ -1338,13 +1338,27 @@ _Avoid_: server list, guild cache
   `docker compose restart`, which does not reload the env file; tracked in #277).
   **The bar is not interactive while the page re-reads (#275).** Every re-read the bar starts (Discard, a
   re-baselining failure, a success) goes through `rereadFromServer()` (`APPLY`), which sets `applyRereading`,
-  refreshes the bar, awaits `loadPlugins()` and `loadEnv()`, and clears the flag in a `finally` (so a loader
-  that throws cannot leave it locked); while it is set Discard and Apply are `busy` in the pending and failed
-  views and `applyPending` / `discardPending` return at once. Until the reads land the controls still hold the
+  refreshes the bar, awaits `Promise.allSettled([loadPlugins, loadEnv].map(async (load) => load()))`, and
+  clears the flag in a `finally` (so a loader that throws cannot leave it locked); while it is set Discard and
+  Apply are `busy` in the pending and failed views and `applyPending` / `discardPending` return at once.
+  `allSettled`, not `all`: `all` rejects on the FIRST rejection, which would clear the flag while the other
+  list was still loading. Each loader is started inside an async arrow so one that throws SYNCHRONOUSLY becomes
+  its own rejection instead of skipping the other loader. Until the reads land the controls still hold the
   edits that are about to be dropped, so an Apply pressed then would send them: after a Discard it sent the
   very edits just discarded, and after a re-baselining failure the bar offered Apply for the length of the
   re-read. OK stays usable, and a kept-edits refusal (#272) starts no re-read, so it never locks the bar.
   `loadStatus()` is not part of it.
+  **`aria-busy` on `#apply-bar` is set only in the PENDING view, never in the failed or done view**
+  (`applyBarView`'s `ariaBusy`, written by `writeApplyBar`). Both of the latter write their message into the
+  bar's `role="status"` region in the SAME task the re-read starts, and `aria-busy` on a container is
+  specifically licensed to suppress that region's announcements until it clears -- marking the bar busy there
+  risks the failure or success message going unheard (not verified here: no screen reader was at hand). The
+  pending view has no terminal message to lose.
+  **The two GETs `rereadFromServer()` awaits have no timeout of their own** (new versus `a5eb2dd`, #276:
+  before `applyRereading` existed a slow read did not lock the bar's own buttons). A hang blocks Discard and
+  Apply for as long as the request is outstanding, up to the server's own limits (`SUBPROCESS_TIMEOUT_MS =
+  90_000`, `IDLE_TIMEOUT_SECONDS = 120`, `ops/admin/server.ts:498-499`); OK stays usable throughout. Tracked
+  as #282.
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer
