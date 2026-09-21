@@ -82,7 +82,7 @@ export function selectPlugins(
     // nothing else (PluginRelease carries no host API). #222: rather than skip a plugin whenever
     // that differs from this bot's, an OLDER version is kept when the current one needs a NEWER
     // host — an older version may still target ours. Every version installPlugins may try must be
-    // provably older than the current one (its resolution, install.ts:186-208: an explicit
+    // provably older than the current one (its resolution, install.ts:306-328: an explicit
     // PLUGINS pin, and only that; otherwise #104's targetVersion and, should that install fail, the
     // last-good installedVersion). Everything else stays skipped, as before: no pin; a version
     // equal to, newer than, or unorderable against the current one; a current that needs an OLDER
@@ -92,10 +92,11 @@ export function selectPlugins(
     // older version, and a privileged intent the operator hasn't enabled is an unrecoverable login
     // failure. So this only ever un-skips a plugin in cases that cannot change the Client's intents.
     // installPlugins' newest-cached fallback is not modelled (it needs disk access), so a plugin
-    // with no pin and no state.json record stays skipped. Nothing checks a kept version's own host
-    // API: a failed install or a throwing createPlugin is contained per plugin and recorded in
-    // state.json, but a bundle built for another host API may still load. (requests.ts's pre-flight
-    // likewise rules out only the index's current version, without the conditions above.)
+    // with no pin and no state.json record stays skipped. #223: install.ts's reconcileManifest DOES
+    // check a kept version's own declared hostApiVersion — against this host's HOST_API_VERSION, not
+    // entry.hostApiVersion, since entry describes only the index's current version — on both the
+    // cache-reuse and post-extract paths, and refuses a mismatch instead of loading it. (requests.ts's
+    // pre-flight likewise rules out only the index's current version, without the conditions above.)
     const pin = installed.get(cfg.name);
     const candidates =
       cfg.version !== undefined
