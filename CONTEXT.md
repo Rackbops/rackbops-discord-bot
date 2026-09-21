@@ -981,7 +981,8 @@ _Avoid_: server list, guild cache
   neither file is meant to hold a URL: it drops members named exactly `url`/`token`/`secret`/`password`
   and redacts webhook-URL-shaped strings, and does NOT catch a bare token under another name, an id and
   token split across fields, or a percent-encoded URL (`webhooks` and `inviteUrl` are legitimate
-  members of these files, so broader name matching would delete real data). **Treat any new path
+  members of these files, so broader name matching would delete real data; the same drop would hide a
+  plugin literally named `url`/`token`/`secret`/`password` from the `plugins` map). **Treat any new path
   that could print a secret value as a blocker** — `everythingObservable` in `ops/bot-ops.test.ts`
   is the check that walks every output channel for the secret's value.
 - **`docker-compose.yml` on a deployed instance drifts the SAME way `bot-ops.sh` does, and #178

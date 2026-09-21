@@ -64,8 +64,9 @@ The bot **drains** the mailbox at the start of its update tick (every ~60s) and 
 each request through the same state builders `/plugins` uses, then deleting the file. A malformed or
 invalid file (unknown action, bad `plugin`/`version`, a `version` with a slash, a not-installed
 plugin) is moved to `requests/rejected/` with a log line — never applied, never crashing the drain.
-The mailbox can only ever run the five actions on an **already-installed** plugin; it can't enable a
-new plugin (that stays `PLUGINS=`-only) or run anything else. `requestedBy` is the panel identity
+The five update actions above can only ever act on an **already-installed** plugin; the mailbox can't
+enable a new plugin (that stays `PLUGINS=`-only) or run anything else — the routing actions added
+below change where a plugin lives, not which plugins run. `requestedBy` is the panel identity
 (`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
 

@@ -72,6 +72,10 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    or any route the ordinary
    config Save doesn't already use — same-origin inline mounting is a convenience, not an added
    privilege, since the server-side gate is unchanged from before this epic.
+   *(Amended by [ADR-0006](0006-per-plugin-routing.md) decision 8, #240: `env-set` now also accepts an
+   enabled plugin's own `secret: true` key, write-only — so a malicious same-origin bundle could
+   overwrite such a key, but never read one. Core secrets stay refused, and the client-side scope above
+   still confines an honest bundle to its own plugin's non-secret keys.)*
 
 ## Considered Options
 

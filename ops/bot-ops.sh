@@ -344,9 +344,12 @@ readonly ENV_LINE_RE='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)
 #     honest reading, and saving that key rewrites it unquoted — which repairs the file.
 # Deliberately NOT modelled, though compose does these too: an inline ` # comment`, `${VAR}`
 # interpolation, whitespace around the `=`, a `KEY: value` colon separator, and backslash escapes
-# inside double quotes. Nothing env-set writes can produce them (no ALLOWED regex admits `#`, `$`,
-# `:`, `\`, or whitespace); a hand-edit that does shows raw in the panel and normalises on the
-# next save of that key, as before.
+# inside double quotes. No STATIC ALLOWED regex admits `#`, `$`, `:`, `\`, or whitespace, so nothing
+# env-set writes for a static key can produce them; a hand-edit that does shows raw in the panel and
+# normalises on the next save of that key, as before. A PLUGIN key's own manifest `format` can admit
+# them (the shipped wow client keys use `^\S+$`, which allows `#`, `$`, `\` and quotes), and env-set
+# writes such a value verbatim — what compose then makes of it is the plugin author's format to get
+# right, and this script's stored/compared reading of it stays the raw text.
 # A bash `read` loop rather than grep on purpose: Git Bash's grep drops "\r" silently, which
 # would let the CR handling pass its test on a Windows dev box even with the trim deleted.
 declare -A ENV_VALUES=()
@@ -997,8 +1000,12 @@ cmd_plugin_request() {
     routing-set)
       # Where a plugin lives: `servers` maps a guild id to {commands: "all" | [channel ids, non-empty],
       # postTo?: channel id}. An empty `servers` object is valid (the plugin is placed nowhere).
-      # Every message below names the field, never the offending value.
-      [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
+      # Every message below names the field, never the offending value. `plugin` is read through
+      # json_string_field, not the `$(…)` above: that drops a trailing newline, so "music\n" would pass
+      # the name check while the request file kept the newline.
+      local routing_plugin
+      routing_plugin="$(printf '%s' "$payload" | json_string_field plugin)"
+      [[ "$routing_plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
       # \A…\z, not ^…$: in jq's regex flavour `$` also matches before a trailing newline, so "12345\n"
       # would pass as a snowflake (JavaScript's `$`, which the bot uses, does not).
       printf '%s' "$payload" | jq -e '
@@ -1031,11 +1038,12 @@ cmd_plugin_request() {
   local file write_prefix=""
   file="$(date +%s%3N)-${action}-${RANDOM}.json"
   # A webhook-add file holds the URL until the bot consumes it: owner-only (umask 077 in the container
-  # shell that creates it; requests/ itself is bun's). The other actions are written exactly as before.
+  # shell that creates it — set AFTER `mkdir -p`, so a requests/ that does not exist yet is created with
+  # the ordinary mode and only the file is narrowed). The other actions are written exactly as before.
   [ "$action" != "webhook-add" ] || write_prefix="umask 077 && "
   # -i to pipe the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
   printf '%s' "$payload" \
-    | docker exec -i -u bun "$CONTAINER" sh -c "${write_prefix}mkdir -p /app/data/plugins/requests && cat > /app/data/plugins/requests/${file}"
+    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p /app/data/plugins/requests && ${write_prefix}cat > /app/data/plugins/requests/${file}"
   jq -n --arg queued "$file" '{ok: true, queued: $queued}'
 }
 

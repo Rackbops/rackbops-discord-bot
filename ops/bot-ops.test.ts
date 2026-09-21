@@ -1773,6 +1773,32 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(seen).not.toContain(OLD_SECRET);
   });
 
+  test("redaction treats a secret as a literal, whatever glob characters it holds", async () => {
+    const glob = "pre*fix[ab]?tail";
+    const index = wrapIndex([pluginEntry("g", [envKey("GLOB_KEY", "^.+$", { secret: true })])]);
+    const fx = setup("PLUGINS=g\nANNOUNCE_CHANNEL_ID=11111\n", {
+      pluginIndex: index,
+      composeUp: { output: `bad line GLOB_KEY=${glob}; unrelated preXfixaZtail stays`, exitCode: 1 },
+    });
+    const run = await botOps(fx, ["env-set"], `GLOB_KEY=${glob}\n`);
+    const log = String((run.json as { log: string }).log);
+    expect(log).not.toContain(glob);
+    expect(log).toContain("[redacted]");
+    // an unquoted pattern would glob-match this text and redact it too
+    expect(log).toContain("unrelated preXfixaZtail stays");
+  });
+
+  test("a manifest entry with an empty key is skipped, secret or plain, and never crashes the reads", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("", "^.+$", { secret: true }), envKey("", "^.+$"), envKey("P_PORT", PORT_RE)])]);
+    const fx = setup("PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\nP_PORT=8080\n", { pluginIndex: index });
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.json).toMatchObject({ P_PORT: "8080" });
+    const schema = await botOps(fx, ["env-schema"]);
+    expect(schema.exitCode).toBe(0);
+    expect(Object.keys(schema.json ?? {})).not.toContain("");
+  });
+
   test("a key one plugin declares secret and another declares plain is secret: never listed, schema says so", async () => {
     for (const order of [["plain", "secret"], ["secret", "plain"]] as const) {
       const decl = { plain: pluginEntry("aaa", [envKey("SHARED_KEY", "^.+$")]), secret: pluginEntry("bbb", [envKey("SHARED_KEY", "^.+$", { secret: true })]) };
@@ -1960,10 +1986,12 @@ describe.skipIf(!runnable)("bot-ops.sh routing-get (#240)", () => {
     expect(JSON.stringify(out.routing.note)).toContain("[redacted]");
   });
 
-  test("a large discovery file (tens of KB) comes through whole", async () => {
-    const channels = Array.from({ length: 900 }, (_, i) => ({ id: String(500000000000000000n + BigInt(i)), name: `channel-${i}-with-a-reasonably-long-name`, canSend: i % 2 === 0 }));
+  test("a large discovery file (past Linux's 128 KB single-argument limit) comes through whole", async () => {
+    // Windows' command line is capped near 32 KB and Linux's single argument at 128 KB, so the file has
+    // to be bigger than both for a regression to `--argjson` to fail on either CI or a dev box.
+    const channels = Array.from({ length: 1800 }, (_, i) => ({ id: String(500000000000000000n + BigInt(i)), name: `channel-${i}-with-a-reasonably-long-name`, canSend: i % 2 === 0 }));
     const big = { ...DISCOVERY, guilds: [{ ...DISCOVERY.guilds[0]!, channels }] };
-    expect(JSON.stringify(big).length).toBeGreaterThan(60_000);
+    expect(JSON.stringify(big).length).toBeGreaterThan(140_000);
     const run = await get(setup(ENV, { discovery: JSON.stringify(big) }));
     expect(run.exitCode).toBe(0);
     expect(run.json).toEqual({ routing: null, discovery: big });
@@ -2070,7 +2098,7 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
   test("a webhook-add request file is written owner-only; the other actions are written exactly as before", async () => {
     const fx = setup(ENV);
     await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: WEBHOOK_URL, requestedBy: "t" }));
-    expect(dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/"))).toContain("sh -c umask 077 && mkdir -p /app/data/plugins/requests && cat > ");
+    expect(dockerCalls(fx).find((c) => c.includes("/app/data/plugins/requests/"))).toContain("sh -c mkdir -p /app/data/plugins/requests && umask 077 && cat > ");
     for (const payload of [
       { action: "update-now", plugin: "music", version: "1.1.0", requestedBy: "t" },
       { action: "routing-set", plugin: "music", servers: {}, requestedBy: "t" },
@@ -2187,6 +2215,7 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
       [{ action: "skip", plugin: WEBHOOK_URL, version: "1.1.0", requestedBy: "t" }, "bad plugin '(not shown)'"],
       [{ action: "update-now", plugin: "music", version: WEBHOOK_URL, requestedBy: "t" }, "bad version '(not shown)'"],
       [{ action: "schedule", plugin: "music", version: "1.1.0", at: WEBHOOK_URL, requestedBy: "t" }, "bad at '(not shown)'"],
+      [{ action: "remind", plugin: "music", version: "1.1.0", days: WEBHOOK_URL, requestedBy: "t" }, "bad days '(not shown)'"],
       [{ action: "routing-set", plugin: WEBHOOK_URL, servers: {}, requestedBy: "t" }, "bad plugin"],
     ];
     for (const [payload, msg] of cases) {
@@ -2196,6 +2225,33 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
       expect(run.stderr, msg).not.toContain(WEBHOOK_TOKEN);
     }
     expect(wrote(fx)).toBe(false);
+    // the limit is exactly 40 printable characters: 40 are echoed, 41 are not
+    const at40 = await botOps(fx, ["plugin-request"], req({ action: "skip", plugin: "P".repeat(40), version: "1.1.0" }));
+    expect(at40.stderr).toContain(`bad plugin '${"P".repeat(40)}'`);
+    const at41 = await botOps(fx, ["plugin-request"], req({ action: "skip", plugin: "P".repeat(41), version: "1.1.0" }));
+    expect(at41.stderr).toContain("bad plugin '(not shown)'");
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("a routing-set plugin name with a trailing newline or another control character is rejected, not queued with it", async () => {
+    const fx = setup(ENV);
+    for (const plugin of ["music\n", "music\r", "music\t", "mu sic"]) {
+      const run = await botOps(fx, ["plugin-request"], req({ action: "routing-set", plugin, servers: {}, requestedBy: "t" }));
+      expect(run.exitCode, JSON.stringify(plugin)).not.toBe(0);
+      expect(run.stderr, JSON.stringify(plugin)).toContain("plugin-request: bad plugin");
+    }
+    expect(wrote(fx)).toBe(false);
+  });
+
+  test("a webhook token needs at least 20 characters (Discord's are far longer)", async () => {
+    const fx = setup(ENV);
+    const url = (token: string) => `https://discord.com/api/webhooks/123456789012345678/${token}`;
+    const short = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: url("a".repeat(19)), requestedBy: "t" }));
+    expect(short.exitCode).not.toBe(0);
+    expect(short.stderr).toContain("plugin-request: bad webhook url");
+    expect(wrote(fx)).toBe(false);
+    const ok = await botOps(fx, ["plugin-request"], req({ action: "webhook-add", url: url("a".repeat(20)), requestedBy: "t" }));
+    expect(ok.exitCode).toBe(0);
   });
 
   test("an unknown action, including a near-miss of a new one, is rejected", async () => {
