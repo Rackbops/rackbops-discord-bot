@@ -203,10 +203,9 @@ ALLOWED_SPEC=(
   # `PLUGINS=` selects which plugins to install (operator-controlled, panel-edited): a bare `name`
   # or `name@version` to pin, comma-separated; empty = no plugins. The manifest-declared env keys of
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
-  # whitelist at runtime by load_plugin_keys, so a
-  # plugin's own key (e.g. WARBANDEER_INGEST_PORT, a static row here until #100 removed the baked-in
-  # connector) is validated with the FORMAT the Plugin Index carries rather than hand-mirrored per
-  # plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
+  # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
+  # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
   'PLUGINS|^[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?(,[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?)*$'
   # Where the bot fetches the Plugin Index from: an http(s) URL, a file:// URL, or a bare absolute
   # path (config.ts accepts all three; empty clears back to the published default).
@@ -423,7 +422,8 @@ PLUGIN_KEYS_STATUS="ok"
 # Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED (the listable, editable plain keys) and
 # PLUGIN_SECRET_* (the editable secret keys) from the container's cached index — from EVERY plugin in
 # it, not only the ones named in this instance's PLUGINS value (#256): the index, not PLUGINS, decides
-# which keys are plugin keys, and a key of a plugin that is off is inert until the plugin is on. That
+# which keys are plugin keys, and a key of a plugin that is off is inert until the plugin is on. (When
+# two plugins declare the same key, the FIRST declaration in index order governs it, on or off.) That
 # is what lets one env-set turn a plugin on AND set its settings; and env-get, env-schema and env-set
 # all read the keys through this one loader, so they can never disagree about which keys exist. Runs in
 # the CURRENT shell — a command/process substitution would lose the globals it sets to a subshell — so

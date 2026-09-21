@@ -290,8 +290,9 @@ const dockerCalls = (fx: Fixture): string[] => {
   return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
 };
 /** dockerCalls with the read-only `exec … cat /app/data/plugins/index.json` reads load_plugin_keys
- *  makes dropped — for the .env-mechanics tests, whose fixtures now carry PLUGINS=wow (so the whitelist
- *  is built from the plugin index) but which assert on the recreate/guard ops, not that read. Tests that
+ *  makes dropped — for the .env-mechanics tests, whose fixtures carry PLUGINS=wow and seed the plugin
+ *  index the whitelist is built from (since #256 the index is read whatever PLUGINS says), but which
+ *  assert on the recreate/guard ops, not that read. Tests that
  *  DO assert on the index read (or a plugin-request write) use `dockerCalls` directly. */
 const recreateCalls = (fx: Fixture): string[] =>
   dockerCalls(fx).filter((c) => !(c.includes("exec") && c.includes("/app/data/plugins/index.json")));
@@ -396,9 +397,10 @@ describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_CONFIG_DIR/BOT_OPS_COMPO
 
 // The three keys #107 moved off bot-ops.sh's static whitelist into @rackbops/plugin-wow. The
 // .env-mechanics tests below use them as their permissive-key palette (region / realm-slug / IANA-zone
-// shapes) — which post-#107 means seeding a cached Plugin Index so load_plugin_keys merges them back
-// when PLUGINS=wow, exactly as they become editable in production. `wowSetup` prepends PLUGINS=wow +
-// seeds the index; `wowEnv` is the matching expected-.env prefix.
+// shapes) — which post-#107 means seeding a cached Plugin Index so load_plugin_keys merges them back,
+// exactly as they become editable in production (since #256 from the index alone; PLUGINS=wow only keeps
+// the fixture realistic). `wowSetup` prepends PLUGINS=wow + seeds the index; `wowEnv` is the matching
+// expected-.env prefix.
 const WOW_INDEX = JSON.stringify({
   writtenAt: "2026-09-05T00:00:00.000Z",
   index: {
@@ -517,7 +519,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const fx = wowSetup(stored);
     const body = await fullBody(fx, { ANNOUNCE_CHANNEL_ID: "22222" });
     // 11 static whitelisted keys (#101 dropped WARBANDEER_INGEST_PORT; #107 moved the 3 WoW keys to the
-    // wow plugin) + the 3 wow plugin keys merged via PLUGINS=wow = 14 echoed, like the old panel.
+    // wow plugin) + the 3 wow plugin keys merged from the seeded index = 14 echoed, like the old panel.
     expect(body.split("\n")).toHaveLength(14);
     const run = await botOps(fx, ["env-set"], body);
     expect(run.exitCode).toBe(0);
@@ -976,8 +978,8 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
   });
 
   test("WARBANDEER_INGEST_PORT is no longer a static key — refused when no plugin declares it", async () => {
-    // #100 removed the baked-in connector; with no plugins installed the key is unknown to the
-    // whitelist. (It comes back via the manifest once warbandeer is installed — see below.)
+    // #100 removed the baked-in connector; with no cached index (or none declaring it) the key is unknown
+    // to the whitelist. (It comes back via the manifest once the index offers warbandeer — see below.)
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-set"], "WARBANDEER_INGEST_PORT=8080\n");
     expect(run.exitCode).toBe(1);
@@ -986,7 +988,7 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
   });
 });
 
-describe.skipIf(!runnable)("bot-ops.sh env-get lists installed plugins' non-secret keys (#101)", () => {
+describe.skipIf(!runnable)("bot-ops.sh env-get lists plugins' non-secret keys (#101, #256)", () => {
   // #256 changed this on purpose: the loader no longer filters by PLUGINS, so plugin b's key is listed
   // although only plugin a is on (the test used to be "only the enabled plugin's non-secret keys appear").
   test("every index plugin's non-secret keys appear, after the static ones, in manifest order (#256)", async () => {
@@ -1006,7 +1008,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-get lists installed plugins' non-secr
   });
 });
 
-describe.skipIf(!runnable)("bot-ops.sh env-set validates an installed plugin's key from the manifest (#101)", () => {
+describe.skipIf(!runnable)("bot-ops.sh env-set validates a plugin's key from the manifest (#101, #256)", () => {
   const index = wrapIndex([
     pluginEntry("warbandeer", [envKey("WARBANDEER_INGEST_PORT", PORT_RE), envKey("WARBANDEER_SECRET", "^.+$", { secret: true })]),
   ]);
@@ -2540,6 +2542,15 @@ describe.skipIf(!runnable)("plugin settings do not wait for the plugin to be on 
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-get"]);
     expect(run.exitCode).toBe(0); // never an error (D3)
+    expect(run.stderr).toContain("plugins: index unavailable");
+    expect(Object.keys(run.json as object)).toHaveLength(11); // the 11 static keys, nothing merged
+    expect(dockerCalls(fx)).toEqual(["docker exec probe-container cat /app/data/plugins/index.json"]);
+  });
+
+  test("with no PLUGINS and no cached index, env-schema is the static keys plus the same note, after exactly one docker read", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-schema"]);
+    expect(run.exitCode).toBe(0); // never an error (D3), the same posture as env-get
     expect(run.stderr).toContain("plugins: index unavailable");
     expect(Object.keys(run.json as object)).toHaveLength(11); // the 11 static keys, nothing merged
     expect(dockerCalls(fx)).toEqual(["docker exec probe-container cat /app/data/plugins/index.json"]);
