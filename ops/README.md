@@ -549,11 +549,13 @@ other failure **re-reads** the page's state from the bot, so only OK is left on 
 pending after the re-read): a **failed recreate** (a 502 with a JSON body: `.env` was already rewritten,
 so the bar shows the compose error and the backup path, issue #47), a **timeout** (504: the outcome is
 unknown), any status the page does not know, and a plain-text 502 with no such line — a `set -e` abort
-after the write, a kill during the recreate, a proxy's own 502, or a failed backup before the write. A
-**network error, or the page's own timeout,** leaves the controls as they are. After a killed or failed
-recreate `.env` already holds the new values, so Apply answers "Nothing needed applying." (the saved
-settings already held them) and does not redo the recreate, and Restart does not reload the env file
-(#277 tracks a recreate action). The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
+after the write, a kill during the recreate, a proxy's own 502, or a refusal before the write that has no
+`env-set` prefix (a failed backup, the self-update guard). A **network error, or the page's own timeout,**
+leaves the controls as they are. After a failed or killed recreate `.env` already holds the new values but
+the running bot may not: the page has re-read, so nothing is pending and Apply is not offered, and Restart
+does not reload the env file (#277 tracks a recreate action). (Where the page kept its edits although the
+write happened, after a network error, a retry is answered "Nothing needed applying.": the saved settings
+already held them.) The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
 Plugins tab, and two controls for one key would be a conflict with no good answer. Pinning a plugin to a
 version (`name@version`) is set in `.env`; an existing pin is kept while that plugin stays ticked. A few
 fields render as constrained controls instead of free text:

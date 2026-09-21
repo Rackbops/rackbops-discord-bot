@@ -5837,8 +5837,9 @@ describe("describeApplyFailure (#257, the failText logic saveEnv had, split in t
 // before the write). server.ts answers a failed bot-ops.sh with 502 (a JSON body when env-set got as far as the
 // write and the recreate failed; the plain stderr text otherwise) or 504 (we killed it: outcome unknown). The
 // plain stderr text can ALSO come from a failure after the write that printed no JSON -- a `set -e` abort (a
-// tool's own error text), a kill during the recreate (at most the `bot-ops: env file` line), a kill between the
-// mv and that line (an empty body), a proxy's own 502 (HTML) -- and none of those carries an env-set line.
+// tool's own error text), a kill during the recreate (the `bot-ops: env file` line, perhaps after a chown/chmod
+// warning), a kill between the mv and that line (an empty body), a proxy's own 502 (HTML) -- and none of those
+// carries an env-set line.
 describe("failureWroteNothing (#272)", () => {
   const REFUSAL = "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid";
 
@@ -5867,6 +5868,13 @@ describe("failureWroteNothing (#272)", () => {
     expect(failureWroteNothing(502, null, "bot-ops: env-set:no space after the colon")).toBe(false);
     // a failed backup or mktemp BEFORE the write has no env-set line either: it re-baselines, the safe side
     expect(failureWroteNothing(502, null, "install: cannot create regular file '/opt/x/backups/.env.bak': Permission denied")).toBe(false);
+    // a body that PARSES as JSON but that a multiline `^` still matches: JSON.parse accepts a raw U+2028 inside a
+    // string, and `^` in /m mode matches after it. The parsed result is what says "this was JSON".
+    const LS = String.fromCharCode(0x2028);
+    const lineSeparatorBody = `{"ok":false,"backup":"/b","log":"compose: x${LS}bot-ops: env-set: value for 'X' is invalid"}`;
+    expect(() => JSON.parse(lineSeparatorBody)).not.toThrow();
+    expect(/^bot-ops: env-set: /m.test(lineSeparatorBody)).toBe(true);
+    expect(failureWroteNothing(502, JSON.parse(lineSeparatorBody), lineSeparatorBody)).toBe(false);
     // a timeout: the recreate may still finish, whatever the body looks like
     expect(failureWroteNothing(504, null, REFUSAL)).toBe(false);
     expect(failureWroteNothing(504, null, "bot-ops.sh timed out")).toBe(false);
@@ -5878,10 +5886,13 @@ describe("failureWroteNothing (#272)", () => {
 });
 
 // What makes the page's reliance on a message the script owns safe: inside `cmd_env_set`, EVERY `die "env-set: ..."`
-// sits before the write (`mv "$tmp" "$ENV_FILE"`), nothing after the write prints an `env-set:` line, no such die
-// lives outside `cmd_env_set` (a post-write helper could reach it), and `die` prints with the `bot-ops: ` prefix the
-// page's pattern starts with. Whoever adds a die after the write breaks this test, and the messages say why. A pure
-// function over the script text, so its own mutants (a die moved below the mv, ...) are tested too.
+// sits before the write (`mv "$tmp" "$ENV_FILE"`); no code line AFTER the write mentions `env-set:` at all (a die,
+// an echo, a message in a variable, a continuation line, a heredoc); no code line OUTSIDE `cmd_env_set` does either
+// (a post-write helper could reach it); `cmd_env_set` has exactly one write; and `die` prints with the `bot-ops: `
+// prefix the page's pattern starts with. The pin is TEXTUAL: it does not catch a message built from pieces, an ERR
+// trap installed before the write, or a second write of `.env` by other means. Whoever adds a die after the write
+// breaks this test, and the messages say why. A pure function over the script text, so its own mutants (a die
+// moved below the mv, ...) are tested too.
 function envSetRefusalOrderProblems(script: string): string[] {
   const problems: string[] = [];
   if (!/^die\(\) \{ echo "bot-ops: \$\*" >&2; exit 1; \}$/m.test(script)) {
@@ -5897,13 +5908,14 @@ function envSetRefusalOrderProblems(script: string): string[] {
   const dies = [...body.matchAll(/die "env-set:/g)];
   if (dies.length === 0) problems.push('cmd_env_set has no die "env-set: ..." at all (the page would never keep an edit)');
   for (const d of dies) if (d.index! > writeAt) problems.push(`a die "env-set: ..." comes AFTER the write, at cmd_env_set offset ${d.index}`);
-  const afterWrite = body.slice(writeAt);
-  for (const line of afterWrite.split("\n")) {
-    if (/^\s*#/.test(line)) continue;
-    if (/(?:die|echo|printf)\b.*env-set:/.test(line)) problems.push(`a line after the write prints an env-set: message: ${line.trim()}`);
+  const code = (text: string) => text.split("\n").filter((l) => !/^\s*#/.test(l));
+  for (const line of code(body.slice(writeAt))) {
+    if (line.includes("env-set:")) problems.push(`a code line after the write mentions env-set:: ${line.trim()}`);
   }
-  const allDies = [...script.matchAll(/die "env-set:/g)].length;
-  if (allDies !== dies.length) problems.push(`${allDies - dies.length} die "env-set: ..." live outside cmd_env_set`);
+  const outside = script.slice(0, start) + (end === -1 ? "" : script.slice(end));
+  for (const line of code(outside)) {
+    if (line.includes("env-set:")) problems.push(`a code line outside cmd_env_set mentions env-set:: ${line.trim()}`);
+  }
   return problems;
 }
 
@@ -5927,9 +5939,22 @@ describe("bot-ops.sh's env-set refusals all precede the write (#272: what keeps 
   });
 
   test("it catches a message printed after the write, a die outside the function, and a die that loses its prefix", () => {
-    expect(envSetRefusalOrderProblems(script.replace(WRITE, () => `${WRITE}  echo "bot-ops: env-set: late" >&2\n`)).join("\n")).toContain("after the write prints an env-set:");
+    expect(envSetRefusalOrderProblems(script.replace(WRITE, () => `${WRITE}  echo "bot-ops: env-set: late" >&2\n`)).join("\n")).toContain("after the write mentions env-set:");
     expect(envSetRefusalOrderProblems(`${script}\nother() { die "env-set: elsewhere"; }\n`).join("\n")).toContain("outside cmd_env_set");
     expect(envSetRefusalOrderProblems(script.replace('die() { echo "bot-ops: $*" >&2; exit 1; }', () => 'die() { echo "$*" >&2; exit 1; }')).join("\n")).toContain('die() must print "bot-ops: "');
+  });
+
+  // Every SPELLING of the same regression that contains the text `env-set:`: a message held in a variable, a die
+  // whose message is on a continuation line, a heredoc to stderr, single quotes, and a helper OUTSIDE the function.
+  test("it catches the other spellings of a message after the write (variable, continuation line, heredoc, single quotes, a helper elsewhere)", () => {
+    const after = (text: string) => envSetRefusalOrderProblems(script.replace(WRITE, () => `${WRITE}${text}`)).join("\n");
+    expect(after('  msg="env-set: late"\n  die "$msg"\n')).toContain("after the write mentions env-set:");
+    expect(after('  die \\\n    "env-set: late"\n')).toContain("after the write mentions env-set:");
+    expect(after("  cat >&2 <<EOF\nbot-ops: env-set: late\nEOF\n")).toContain("after the write mentions env-set:");
+    expect(after("  die 'env-set: late'\n")).toContain("after the write mentions env-set:");
+    expect(envSetRefusalOrderProblems(`${script}\nhelper() { echo "bot-ops: env-set: x" >&2; }\n`).join("\n")).toContain("outside cmd_env_set mentions env-set:");
+    // a COMMENT that mentions it is fine (the script's own comments may)
+    expect(after("  # env-set: is only a comment here\n")).toBe("");
   });
 
   test("it catches a second write and a missing function (so it cannot pass vacuously)", () => {
@@ -6340,10 +6365,10 @@ describe("applyPending (#257)", () => {
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
   });
 
-  // #272: THE expectation under change. A plain-text 502 is, in every case bot-ops.sh's own checks produce, an
-  // early die() (a refused value, a key that is not editable, a backup that could not be written) that never
-  // reached the write, so the page has nothing to re-baseline against and must not throw away what the user
-  // typed (the rare plain-text 502 that follows the write is described at failureWroteNothing). Until #272 this test said
+  // #272: THE expectation under change. One of env-set's own refusals (a `die "env-set: ..."`: a refused value, a
+  // key that is not editable, a blank required key) never reached the write, so the page has nothing to
+  // re-baseline against and must not throw away what the user typed (a plain-text 502 WITHOUT such a line can
+  // follow the write and re-baselines: see failureWroteNothing). Until #272 this test said
   // `reloads` was { plugins: 1, env: 1, status: 0 } "unconditionally" (#47 parity with the retired saveEnv).
   test("a plain-text failure is shown verbatim, and the user's edits are kept (#272)", async () => {
     const page = runApply({
@@ -6401,6 +6426,21 @@ describe("applyPending (#257)", () => {
   // #272: the rule identifies an env-set refusal POSITIVELY. The plain-text 502s below can all follow the write (or
   // precede it for a reason that is not a refusal), and none carries an `env-set:` line, so the page re-reads
   // instead of keeping edits that may already be the stored values.
+  test("a JSON 502 whose text a multiline `^` would still match (a raw U+2028 in a string) re-baselines: the parsed result decides", async () => {
+    const LS = String.fromCharCode(0x2028);
+    const text = `{"ok":false,"backup":"/b","log":"compose: x${LS}bot-ops: env-set: value for 'WATCHED_REPOS' is invalid"}`;
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      checked: ["warbandeer", "raidhelper"],
+      response: { ok: false, text },
+      resetOnReload: true,
+    });
+    await page.run.applyPending();
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe(APPLY_ENV.WATCHED_REPOS);
+  });
+
   test("a plain-text 502 that is not an env-set refusal re-baselines", async () => {
     const bodies = [
       "jq: error (at <stdin>:0): Cannot iterate over null", // a `set -e` abort after the mv: a tool's own error text

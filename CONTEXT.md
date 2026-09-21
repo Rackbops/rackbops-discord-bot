@@ -1308,20 +1308,25 @@ _Avoid_: server list, guild cache
   the controls keep the user's values and ticks, and the bar shows `Couldn't apply: …` with Discard and
   Apply. The page thereby relies on a message the script owns, so **that order is pinned** by `bot-ops.sh's
   env-set refusals all precede the write` in `server.test.ts` (it reads the script, as the schema drift pin
-  does): whoever adds a die after the write, prints an `env-set:` line after it, adds such a die outside
-  `cmd_env_set`, or changes `die()`'s prefix breaks a test that says why. Everything else re-reads both
-  lists, after which nothing is pending and the bar keeps only OK: a JSON 502 (the recreate failed after
-  `.env` was rewritten, #47), a 504 (we killed it: the outcome is unknown), any other status, and the plain-
-  text 502s the rule deliberately does not trust because they can follow the write -- a `set -e` abort after
-  the `mv` (a tool's own error text), an external kill during the recreate (at most the `bot-ops: env file`
-  line, printed only after the write), a kill between the `mv` and that line (an empty body) and a proxy's
-  own 502 (HTML); a failed backup or `mktemp` before the write also re-reads (no env-set line: the safe
-  side). The `catch` (a network error, or the page's own timeout) leaves the controls as they are: a reload
-  from a server that cannot be reached would replace the input with two error lines. A retry that finds the
-  values in place gets `recreated:false` and the bar says "Nothing needed applying." with the hint that the
-  SAVED settings already held them, because after a killed recreate the running bot may not: nothing in the
-  panel finishes that recreate (Restart is `docker compose restart`, which does not reload the env file;
-  tracked in #277).
+  does): the pin is TEXTUAL, so it fails when a code line after the write, or outside `cmd_env_set`, mentions
+  `env-set:` (a `die`, an `echo`, a message in a variable, a continuation line, a heredoc), when `die()`
+  stops printing the `bot-ops: ` prefix, or when `cmd_env_set` stops having exactly one write; it does not
+  catch a behaviour change that builds the text from pieces, an `ERR` trap, or a second write of `.env`
+  by other means. Everything else re-reads both lists, after which nothing is pending and the bar keeps
+  only OK (for the length of the re-read the bar still shows what was pending: the same window as #275): a
+  JSON 502 (the recreate failed after `.env` was rewritten, #47), a 504 (we killed it: the outcome is
+  unknown), any other status, and the plain-text 502s the rule deliberately does not trust because they
+  can follow the write -- a `set -e` abort after the `mv` (a tool's own error text), an external kill
+  during the recreate (the `bot-ops: env file` line, printed only after the write, perhaps after a
+  chown/chmod warning), a kill between the `mv` and that line (an empty body) and a proxy's own 502 (HTML);
+  a refusal before the write that has no env-set prefix (a failed backup or `mktemp`, the self-update
+  guard) also re-reads: the safe side. The `catch` (a network error, or the page's own timeout) leaves the
+  controls as they are: a reload from a server that cannot be reached would replace the input with two
+  error lines. Where the page never got an answer (that `catch`) but the write happened anyway, its edits
+  are still there, and a retry finds the values in place, gets `recreated:false` and the bar says "Nothing
+  needed applying." with the hint that the SAVED settings already held them, because after a killed
+  recreate the running bot may not: nothing in the panel finishes that recreate (Restart is
+  `docker compose restart`, which does not reload the env file; tracked in #277).
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer

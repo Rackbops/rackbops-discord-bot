@@ -1569,18 +1569,21 @@
   // true only when the failure IS one of env-set's own refusals, identified POSITIVELY: a 502, a body that is
   // not JSON, and a line that starts `bot-ops: env-set: ` (bot-ops.sh's die() prints `bot-ops: ` + its message,
   // and every `die "env-set: ..."` sits before the write, `mv "$tmp" "$ENV_FILE"`; ops/admin/server.test.ts
-  // pins that order, so whoever adds a die after the write breaks a test that says why). Everything else
-  // re-baselines, including the four cases a plain-text 502 can be that this rule deliberately does not trust:
+  // pins that order textually: no code line after the write, or outside cmd_env_set, may mention `env-set:`).
+  // Everything else re-baselines, including the cases a plain-text 502 can be that this rule deliberately does
+  // not trust:
   //   502 + JSON ({ok:false, changed, backup, log})  the recreate failed AFTER .env was rewritten (#47)   -> false
   //   504                                              bot-ops.sh timed out: the outcome is unknown         -> false
   //   502 + plain text WITH an env-set refusal line   a die() before the write                            -> true
   //   502 + plain text WITHOUT one                    a `set -e` abort after the mv (a tool's own error text), a kill
-  //                                                   during the recreate (at most the env-file line), a kill between the
+  //                                                   during the recreate (the env-file line, maybe after a chown warning), a kill between the
   //                                                   mv and that line (an empty body), a proxy's own 502 (HTML), or a
-  //                                                   failed backup / mktemp before the write (the safe side)  -> false
+  //                                                   refusal before the write that has no env-set prefix (a failed
+  //                                                   backup / mktemp, the self-update guard): the safe side  -> false
   //   any other status                                 not a status this page can reason about              -> false
   // `result` is the parsed body, or null when it did not parse as JSON (what applyPending computes); `text` is
-  // the raw body.
+  // the raw body. `result === null` is not redundant: a body can parse as JSON and still hold a line the
+  // multiline `^` matches (JSON.parse accepts a raw U+2028 inside a string, after which `^` matches).
   function failureWroteNothing(status, result, text) {
     return status === 502 && result === null && /^bot-ops: env-set: /m.test(text);
   }
