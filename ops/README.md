@@ -217,7 +217,9 @@ each with the format and honouring the `required` flag — read from the bot's c
 `data/plugins/index.json`, never hand-mirrored here, and read on every `env-get` / `env-schema` /
 `env-set`, even on an instance with no `PLUGINS` (one `docker exec … cat`). The index, not `PLUGINS`,
 decides which keys are plugin keys, so **one `env-set` can turn a plugin on and set its settings** — a
-single restart — and a key of a plugin that is off is inert until the plugin is on. The bot caches the
+single restart — and a key of a plugin that is off is inert until the plugin is on. When two plugins
+declare the same key, the first declaration in index order governs it (its format and `required`), on
+or off. The bot caches the
 index at boot and on its ~15-minute refresh, while the panel's own plugin list comes from the panel's
 own fetch of the index, so for up to that long the panel can show a plugin whose keys this script does
 not know yet. This is where `WARBANDEER_INGEST_PORT`
@@ -226,8 +228,9 @@ the key is editable, in the same save that sets `PLUGINS=warbandeer`. A plugin's
 write-only** (#240, ADR-0006 decision 8): `env-set` accepts them, validated against their `format`
 like any other key, but `env-get` never lists one and `env-schema` reports it only as `secret: true`
 plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A key the deployment
-itself owns (a core credential, or a variable `docker-compose.yml` interpolates) stays out of every
-plugin path even if a manifest declares it. If the bot isn't running (no cached index),
+itself owns (a core credential, or a variable `docker-compose.yml` interpolates — `RESERVED_KEYS`, a
+credential and interpolation denylist, not a list of every variable the bot core reads) stays out of
+every plugin path even if a manifest declares it. If the bot isn't running (no cached index),
 `env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** (also on an
 instance with no `PLUGINS`, since the index is read regardless) — never
 an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and

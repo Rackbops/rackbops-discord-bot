@@ -1088,7 +1088,7 @@ _Avoid_: server list, guild cache
   key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
   multi-line value is read line by line and a later line's text before its `=` would otherwise be
   echoed. Existing `env-get` output and every non-secret `env-schema` entry keep their shape, and their
-  bytes for every key the script listed before, with three deliberate differences: (i) a key in
+  bytes for every key the script listed before, with four deliberate differences: (i) a key in
   `RESERVED_KEYS` that a manifest used to make listable is gone from both and no longer editable; (ii) a
   plain key that ANOTHER index plugin declares `secret` — whichever of the two is in `PLUGINS` — is gone
   from `env-get`, but is in `env-schema` as a secret row (`secret: true`, `isSet`, the secret
@@ -1096,7 +1096,13 @@ _Avoid_: server list, guild cache
   `PLUGINS` are listed and editable too, because the loader reads every plugin in the cached index (the
   panel learns which plugin owns a key from `/api/plugins`, and the cache and the panel's own fetch of the
   index can disagree for up to the bot's ~15-minute index refresh: a plugin the panel already lists may
-  have no keys here yet). A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
+  have no keys here yet); (iv) which declaration of a key governs it is the FIRST in index order, on or
+  off — so a plugin that is off and listed before an enabled one that declares the same key decides that
+  key's format and required-ness (the shipped index has no key declared by two plugins). `RESERVED_KEYS`
+  is a credential and interpolation denylist (#240's plan copy, deviation 22): keys the bot core reads that are not
+  credentials (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`) are not in it, so an
+  index entry that names one makes it listable and editable, where before that took its plugin being in
+  `PLUGINS`; the index is the trust boundary (a panel admin already controls it via `PLUGIN_INDEX_URL`). A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
   from — and the plugin code the bot then installs — so write-only is a property against the panel,
   its logs and its screens, not against whoever owns the index.
   The same posture covers `plugin-request`: a `webhook-add` URL travels on stdin only, is matched in

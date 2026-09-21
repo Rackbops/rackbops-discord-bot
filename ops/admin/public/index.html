@@ -495,9 +495,9 @@
   // scopeToPluginKeys filters a tab's env reads/writes to its OWN plugin's declared keys — the guard
   // against an HONEST bundle touching another key. It is NOT a sandbox: the bundle runs same-origin
   // inline (per #123's first-party posture), so a malicious one bypasses it; the real backstop is the
-  // server (bot-ops env-set validates every key against its whitelist — the static keys, an enabled
-  // plugin's own keys, and, write-only since ADR-0006 decision 8, an enabled plugin's `secret` keys —
-  // and refuses core secrets). adminTabState decides the render mode; buildSetEnvBody builds the guarded-save payload
+  // server (bot-ops env-set validates every key against its whitelist — the static keys, the own keys
+  // of any plugin in the bot's cached Plugin Index (#256: on or off), and, write-only since ADR-0006
+  // decision 8, those plugins' `secret` keys — and refuses core secrets). adminTabState decides the render mode; buildSetEnvBody builds the guarded-save payload
   // (scoped + newline-safe); viewToState maps a /api/plugins row to the AdminApi getState shape.
   function scopeToPluginKeys(obj, envKeys) {
     const keys = new Set(envKeys || []);
