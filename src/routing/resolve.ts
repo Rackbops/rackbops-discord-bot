@@ -2,8 +2,9 @@
 // command may run in a channel, and whether one plugin's routing, as the panel sent it, is
 // acceptable. No I/O and no discord.js -- every function takes plain data (a `RoutingFile`, or for
 // `validatePluginRouting` the routing a panel sent plus the `DiscoveryFile` of what the bot can see)
-// and returns data, so all of it is tested as data. Nothing calls this yet: with #237 merged the bot
-// behaves exactly as before.
+// and returns data, so all of it is tested as data. `register.ts` (#239) uses `hasPlacements` and
+// `pluginsForGuild`; `announceTargets`, `commandAllowed` and `validatePluginRouting` have no caller
+// yet -- posting, the channel gate and the request mailbox are later children of Epic #236.
 //
 // Placed vs unplaced is the one distinction to hold on to. A plugin with NO entry in
 // `routing.json` is *unplaced* and lives in the home server; a plugin WITH an entry is *placed* and

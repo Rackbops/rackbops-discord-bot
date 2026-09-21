@@ -78,6 +78,79 @@ describe("index.ts wiring", () => {
     expect(startSched).toBeLessThan(restPut);
   });
 
+  // #239: registration moved into src/routing/, but with no routing the bot must make EXACTLY the call
+  // it always made. index.ts can't run under test, so the shape of the wiring is pinned in the source.
+  describe("command registration is routed through src/routing (#239)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const initCall = source.indexOf("initRouting({", activateFn);
+    const applyCall = source.indexOf('applyRouting("boot")', activateFn);
+    const catchMessage = source.indexOf("[startup] slash-command registration failed", activateFn);
+    // The text of the initRouting({...}) call alone: a property name like `log:` or `dataDir:` appears
+    // elsewhere in this file, so a pin on the whole source could pass while this call is wrong.
+    const initBlock = source.slice(initCall, applyCall);
+
+    test("the one rest.put is the REST call it always was: the route, and the body as `{ body }`", () => {
+      // Exactly one, and it is the injected `put` -- so every registration goes through the planner.
+      expect((source.match(/rest\.put\(/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/put:\s*\(route,\s*body\)\s*=>\s*rest\.put\(route,\s*\{\s*body\s*\}\)/);
+    });
+
+    test("initRouting is given the full command body, built once", () => {
+      expect(initBlock).toMatch(/fullBody:\s*commandBody,/);
+      // Plugin builders run once, not once per server: buildCommandBody is called exactly once.
+      expect((source.match(/buildCommandBody\(/g) ?? []).length).toBe(1);
+      // And the home server, prefix and data dir are the ones the old code read.
+      expect(initBlock).toMatch(/homeGuildId:\s*config\.guildId,/);
+      expect(initBlock).toMatch(/prefix:\s*config\.commandPrefix,/);
+      expect(initBlock).toMatch(/dataDir:\s*DATA_DIR,/);
+    });
+
+    test("initRouting is given the bot's own id and name, the command map, and the loaded plugins' summaries", () => {
+      // appId is the route's first argument in every PUT, so a wrong one is a wrong route.
+      // The Client the servers are read from.
+      expect(initBlock).toMatch(/client:\s*c,/);
+      expect(initBlock).toMatch(/appId:\s*c\.user\.id,/);
+      expect(initBlock).toMatch(/botUsername:\s*c\.user\.username,/);
+      // The command map is how the planner finds each command's owner: an empty one would read every
+      // plugin command as a core command and send it to every server.
+      expect(initBlock).toMatch(/\n\s*commandMap,\n/);
+      expect(initBlock).toMatch(
+        /plugins:\s*describePlugins\(loadResult\.loaded,\s*commandBody,\s*config\.commandPrefix,\s*commandMap\),/,
+      );
+      expect(initBlock).toMatch(/now:\s*\(\)\s*=>\s*new Date\(\),/);
+      expect(initBlock).toMatch(/log:\s*console,/);
+    });
+
+    test("initRouting and applyRouting sit inside the same try whose catch keeps a failure from taking the bot down", () => {
+      expect(initCall).toBeGreaterThan(activateFn);
+      expect(applyCall).toBeGreaterThan(initCall);
+      const tryStart = source.lastIndexOf("try {", initCall);
+      const catchStart = source.indexOf("} catch (err) {", applyCall);
+      // Nothing between the `try {` and initRouting but the comment that explains it, and the catch that
+      // follows applyRouting is the one with the operator message.
+      expect(tryStart).toBeGreaterThan(source.lastIndexOf("startScheduler(client", initCall));
+      expect(catchStart).toBeGreaterThan(applyCall);
+      expect(catchMessage).toBeGreaterThan(catchStart);
+      expect(source.slice(catchStart, catchMessage)).not.toMatch(/\btry\s*\{/);
+    });
+
+    test("today's `Registered N slash commands` line is printed for single mode only", () => {
+      expect(source).toMatch(
+        /const \{ mode: routingMode \} = await applyRouting\("boot"\);\s*\n\s*if \(routingMode === "single"\) console\.log\(`Registered \$\{commandBody\.length\} slash commands`\);/,
+      );
+      expect((source.match(/Registered \$\{commandBody\.length\} slash commands/g) ?? []).length).toBe(1);
+      // The result's mode is not named `mode`: that is the module-level boot mode (standby or normal),
+      // and shadowing it inside activate() invites an edit that means the other one.
+      expect(source).not.toMatch(/const \{ mode \} = await applyRouting/);
+    });
+
+    test("the operator message for a failed registration is still there, word for word", () => {
+      expect(source).toContain('"[startup] slash-command registration failed" +');
+      expect(source).toContain('"; the bot keeps running, but its slash commands won\'t appear in that guild until this is" +');
+      expect(source).toContain('" bot still needs the applications.commands scope for its commands to appear in a guild.",');
+    });
+  });
+
   test("no ./warbandeer import remains — the baked-in connector is gone (#100)", () => {
     expect(source).not.toMatch(/from "\.\/warbandeer\//);
   });

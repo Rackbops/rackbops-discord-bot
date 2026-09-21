@@ -3,7 +3,7 @@
 // on a wrong BOT_ENV_FILE. Side-effect only; see src/bootLog.ts. Pinned by index.test.ts.
 import "./bootLog";
 import { pathToFileURL } from "node:url";
-import { Client, Events, REST, Routes } from "discord.js";
+import { Client, Events, REST } from "discord.js";
 import { config } from "./config";
 import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "./storage";
 import { createClient, CORE_INTENTS } from "./client";
@@ -38,6 +38,8 @@ import {
   writePluginState,
 } from "./plugins/host";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
+import { describePlugins } from "./routing/discovery";
+import { applyRouting, initRouting } from "./routing/live";
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -182,13 +184,28 @@ async function activate(c: Client<true>): Promise<void> {
   startScheduler(client, pluginTicks(loadResult.loaded, console));
 
   try {
-    await rest.put(
-      config.guildId
-        ? Routes.applicationGuildCommands(c.user.id, config.guildId)
-        : Routes.applicationCommands(c.user.id),
-      { body: commandBody },
-    );
-    console.log(`Registered ${commandBody.length} slash commands`);
+    // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or
+    // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
+    // same route with the same body, and its result is `single` -- so the line below is unchanged.
+    // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
+    // and when it is skipped), into the catch below.
+    initRouting({
+      client: c,
+      put: (route, body) => rest.put(route, { body }),
+      appId: c.user.id,
+      botUsername: c.user.username,
+      dataDir: DATA_DIR,
+      homeGuildId: config.guildId,
+      prefix: config.commandPrefix,
+      fullBody: commandBody,
+      commandMap,
+      plugins: describePlugins(loadResult.loaded, commandBody, config.commandPrefix, commandMap),
+      now: () => new Date(),
+      log: console,
+    });
+    // Not `mode`: that is the module-level boot mode (standby or normal), used again below.
+    const { mode: routingMode } = await applyRouting("boot");
+    if (routingMode === "single") console.log(`Registered ${commandBody.length} slash commands`);
   } catch (err) {
     // A command-registration failure must not take the whole bot down. This used to run unguarded
     // in the ClientReady handler, so a throw became an unhandled rejection, the process crashed,

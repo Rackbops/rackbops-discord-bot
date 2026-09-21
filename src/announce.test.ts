@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import type { Client } from "discord.js";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ChannelType, type Client } from "discord.js";
 import type { Release } from "./github";
 import type { TickCheck } from "./plugins/contract";
 
@@ -13,11 +16,15 @@ const {
   tickChecks,
   announceTo,
   shouldPollReleases,
+  shouldRefreshDiscovery,
+  resetDiscoveryGapForTest,
 } = await import("./announce");
+const { applyRouting, initRouting, resetRoutingForTest, routingIdleForTest } = await import("./routing/live");
 
 describe("tickChecks", () => {
-  // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates), then extras.
-  const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates"];
+  // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates; discovery
+  // (#239) comes after pluginUpdates), then extras.
+  const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates", "discovery"];
 
   test("is the core checks in order, then the extras", () => {
     const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
@@ -32,6 +39,181 @@ describe("tickChecks", () => {
   test("pluginRequests drains the mailbox before pluginUpdates notifies/schedules", () => {
     const names = tickChecks({} as unknown as Client, []).map((c) => c.name);
     expect(names.indexOf("pluginRequests")).toBeLessThan(names.indexOf("pluginUpdates"));
+  });
+
+  test("discovery sits after pluginUpdates and before the plugin ticks", () => {
+    const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
+    const names = tickChecks({} as unknown as Client, extra).map((c) => c.name);
+    expect(names.indexOf("discovery")).toBeGreaterThan(names.indexOf("pluginUpdates"));
+    expect(names.indexOf("discovery")).toBeLessThan(names.indexOf("myplugin:poll"));
+    // Exactly one, and the plugin's tick is still last.
+    expect(names.filter((n) => n === "discovery")).toHaveLength(1);
+    expect(names.at(-1)).toBe("myplugin:poll");
+  });
+
+  test("the discovery check respects its gap", async () => {
+    // Runs the real check against a real refreshDiscovery, told apart by the `generatedAt` each
+    // refresh stamps into discovery.json (the injected clock ticks once per snapshot).
+    const dir = mkdtempSync(join(tmpdir(), "announce-discovery-test-"));
+    let ticks = 0;
+    resetDiscoveryGapForTest();
+    try {
+      initRouting({
+        client: { user: { id: "900000000000000000" }, guilds: { cache: new Map() } } as unknown as Client<true>,
+        put: async () => undefined,
+        appId: "900000000000000000",
+        botUsername: "Setlist Bot",
+        dataDir: dir,
+        homeGuildId: undefined,
+        prefix: "",
+        fullBody: [],
+        commandMap: new Map(),
+        plugins: [],
+        now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, ticks++)),
+        log: console,
+      });
+      const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "discovery")!;
+      const generatedAt = () => JSON.parse(readFileSync(join(dir, "discovery.json"), "utf8")).generatedAt as string;
+      // The check queues its refresh rather than awaiting it, so wait for the queue to drain.
+      const run = async () => {
+        await check.run();
+        await routingIdleForTest();
+      };
+
+      // The first run is the startup catch-up: it refreshes.
+      await run();
+      const first = generatedAt();
+      expect(first).toBe("2026-09-21T12:00:00.000Z");
+      // Straight away again, well inside the gap: it does nothing, so the file is untouched.
+      await run();
+      await run();
+      expect(generatedAt()).toBe(first);
+      expect(ticks).toBe(1);
+    } finally {
+      resetRoutingForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the discovery check does not wait for a registration in flight", async () => {
+    // index.ts starts the scheduler BEFORE it registers so that plugin ticks never wait on a Discord
+    // round trip; a check ahead of them that awaited the queue would put that wait back.
+    const HOME = "111111111111111111";
+    const APP = "900000000000000000";
+    const dir = mkdtempSync(join(tmpdir(), "announce-discovery-test-"));
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const channels = new Map<string, unknown>();
+    const guilds = new Map([[HOME, { id: HOME, name: "Home", channels: { cache: channels } }]]);
+    resetDiscoveryGapForTest();
+    try {
+      initRouting({
+        client: { user: { id: APP }, guilds: { cache: guilds } } as unknown as Client<true>,
+        // A channel appears in Discord while the registration is in flight: the registration takes its
+        // snapshot BEFORE it puts, so its own discovery write cannot contain this channel.
+        put: () => {
+          channels.set("1001", {
+            id: "1001",
+            name: "general",
+            type: ChannelType.GuildText,
+            rawPosition: 1,
+            permissionsFor: () => ({ has: () => true }),
+          });
+          return gate;
+        },
+        appId: APP,
+        botUsername: "Setlist Bot",
+        dataDir: dir,
+        homeGuildId: HOME,
+        prefix: "",
+        fullBody: [{ name: "report", description: "the report command" }],
+        commandMap: new Map(),
+        plugins: [],
+        now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, 0)),
+        log: console,
+      });
+      const boot = applyRouting("boot"); // now waiting on its put
+      const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "discovery")!;
+
+      // The check comes back while the registration is still waiting on Discord...
+      const outcome = await Promise.race([
+        check.run().then(() => "returned"),
+        new Promise<string>((resolve) => setTimeout(() => resolve("waited"), 250)),
+      ]);
+      expect(outcome).toBe("returned");
+
+      // ...and its refresh was not lost: the channel is in discovery.json once both have run. The
+      // registration's own write used the snapshot it took before the put, so only a refresh queued
+      // behind the registration can have put the channel there.
+      release();
+      await boot;
+      await routingIdleForTest();
+      const file = JSON.parse(readFileSync(join(dir, "discovery.json"), "utf8"));
+      expect(file.guilds[0].channels.map((c: { name: string }) => c.name)).toEqual(["general"]);
+    } finally {
+      release();
+      resetRoutingForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a discovery refresh that rejects is logged, not left unhandled", async () => {
+    // A refresh is built not to reject; making one anyway takes a log that throws while it reports an
+    // unreadable server cache. The check is no longer awaiting it, so nothing else would catch it.
+    resetDiscoveryGapForTest();
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      initRouting({
+        client: { user: { id: "900000000000000000" }, get guilds(): never { throw new Error("cache exploded"); } } as unknown as Client<true>,
+        put: async () => undefined,
+        appId: "900000000000000000",
+        botUsername: "Setlist Bot",
+        dataDir: tmpdir(),
+        homeGuildId: undefined,
+        prefix: "",
+        fullBody: [],
+        commandMap: new Map(),
+        plugins: [],
+        now: () => new Date(),
+        log: {
+          log: () => {},
+          warn: () => {},
+          error: () => {
+            throw new Error("log is broken");
+          },
+        },
+      });
+      const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "discovery")!;
+      await expect(check.run()).resolves.toBeUndefined();
+      await routingIdleForTest();
+      expect(errors.mock.calls.some((call) => call[0] === "[tick:discovery]")).toBe(true);
+    } finally {
+      errors.mockRestore();
+      resetRoutingForTest();
+    }
+  });
+});
+
+// Flat 15-min cadence + startup catch-up, exactly like shouldPollReleases (#239).
+describe("shouldRefreshDiscovery", () => {
+  const GAP_MS = 15 * 60 * 1000;
+  const T0 = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+
+  test("startup catch-up: lastAt = 0 is true even before the gap has elapsed", () => {
+    expect(shouldRefreshDiscovery(0, 0)).toBe(true);
+    expect(shouldRefreshDiscovery(GAP_MS - 1, 0)).toBe(true);
+  });
+
+  test("the gap hasn't elapsed -> false, one ms short of 15 minutes -> false", () => {
+    expect(shouldRefreshDiscovery(T0 + 1, T0)).toBe(false);
+    expect(shouldRefreshDiscovery(T0 + GAP_MS - 1, T0)).toBe(false);
+  });
+
+  test("the gap exactly elapsed -> true, and any time after", () => {
+    expect(shouldRefreshDiscovery(T0 + GAP_MS, T0)).toBe(true);
+    expect(shouldRefreshDiscovery(T0 + 10 * GAP_MS, T0)).toBe(true);
   });
 });
 

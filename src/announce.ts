@@ -13,6 +13,7 @@ import { readPluginState, mutatePluginState } from "./plugins/host";
 import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
+import { refreshDiscovery } from "./routing/live";
 
 // Exported so plugins/host.test.ts can pin PLUGIN_TICK_TIMEOUT_MS under it (#217).
 export const TICK_MS = 60 * 1000;
@@ -25,9 +26,14 @@ const RELEASE_POLL_GAP_MS = 15 * 60 * 1000;
 // Bot commits land at any hour, so this polls on a flat cadence too.
 const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
 
+// #239: how often discovery.json is re-snapshotted, so the panel's list of servers and channels
+// follows channels being created and permissions changing without anyone restarting the bot.
+const DISCOVERY_REFRESH_GAP_MS = 15 * 60 * 1000;
+
 let lastReleasePollAt = 0;
 let lastUpdatePollAt = 0;
 let lastPluginPollAt = 0;
+let lastDiscoveryAt = 0;
 
 // The plugin-update check must not run until the boot writePluginState (index.ts, after the
 // scheduler starts) has landed — otherwise its keyed-mutator persist would race that one-time
@@ -238,6 +244,23 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
         }
       },
     },
+    {
+      // Keep data/discovery.json fresh (#239). The refresh is QUEUED, not awaited: it runs behind any
+      // registration on the routing chain, and the plugin ticks after this check must not wait for a
+      // registration's PUTs -- index.ts starts the scheduler before registering precisely so they don't.
+      // startScheduler fires the first tick without awaiting it and index.ts calls initRouting right
+      // after it, so on that first tick the boot registration is already ahead of this refresh (which
+      // is then a redundant rewrite, harmless). refreshDiscovery is built not to reject, but an
+      // unawaited promise that did would be an unhandled rejection, which ends the process -- so it
+      // is caught here rather than left to runTick, which is no longer holding it.
+      name: "discovery",
+      run: async () => {
+        if (shouldRefreshDiscovery(Date.now(), lastDiscoveryAt)) {
+          lastDiscoveryAt = Date.now(); // stamp at start, like checkReleases/checkAutoUpdate
+          void refreshDiscovery().catch((err) => console.error("[tick:discovery]", err));
+        }
+      },
+    },
     ...extra,
   ];
 }
@@ -325,6 +348,18 @@ export function livePluginRequestDeps(): PluginRequestDeps {
 export function shouldPollReleases(now: number, lastPollAt: number): boolean {
   if (lastPollAt === 0) return true; // startup catch-up
   return now - lastPollAt >= RELEASE_POLL_GAP_MS;
+}
+
+// Same shape as shouldPollReleases: a flat cadence with a startup catch-up, `now` and `lastAt` both
+// passed in so every boundary is pinnable.
+export function shouldRefreshDiscovery(now: number, lastAt: number): boolean {
+  if (lastAt === 0) return true; // startup catch-up
+  return now - lastAt >= DISCOVERY_REFRESH_GAP_MS;
+}
+
+/** Forgets when discovery was last refreshed, so the next `discovery` check counts as the first. */
+export function resetDiscoveryGapForTest(): void {
+  lastDiscoveryAt = 0;
 }
 
 async function checkReleases(client: Client): Promise<void> {
