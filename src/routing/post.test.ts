@@ -148,6 +148,17 @@ describe("postForPlugin", () => {
     }
   });
 
+  test("a webhook whose broken flag is an empty string is broken too: any string means broken", async () => {
+    // `repairRouting` keeps a `broken` that is a string, whatever it says; "" must not read as "not broken".
+    const h = harness({
+      routing: routingFor({ webhooks: { [CHAN_A]: meta({ broken: "" }) } }),
+      secrets: secretsOf({ [CHAN_A]: URL_A }),
+    });
+    await postForPlugin("music", "hello", h.deps);
+    expect(h.events).toEqual([`bot:${CHAN_A}:hello`]);
+    expect(h.secretReads).toBe(0);
+  });
+
   test("a broken webhook is skipped and the bot posts", async () => {
     const h = harness({
       routing: routingFor({ webhooks: { [CHAN_A]: meta({ broken: "Discord says that webhook is gone (404)" }) } }),
@@ -367,6 +378,14 @@ describe("liveExecuteWebhook", () => {
     expect(JSON.parse(String(calls[0]!.init.body))).toEqual({ content: "@everyone hello <@123>", allowed_mentions: { parse: [] } });
   });
 
+  test("a redirect is an error, not followed", async () => {
+    // Discord does not redirect a webhook post; following one would send the message on to whatever host
+    // answered and report success for a message that never reached the channel.
+    const { calls, fetchFn } = capture();
+    await liveExecuteWebhook(fetchFn)(URL_A, "hello");
+    expect(calls[0]!.init.redirect).toBe("error");
+  });
+
   test("gives up after ten seconds", async () => {
     const timeout = spyOn(AbortSignal, "timeout");
     try {
@@ -486,6 +505,12 @@ describe("withWebhookBroken", () => {
     expect(after.updatedBy).toBe("who");
     // The input is not changed.
     expect(before.webhooks[CHAN_A]).toEqual(meta());
+  });
+
+  test("an entry that is already broken is marked again with the new reason", () => {
+    // Two 404s can land for the same webhook; the flag says why it is broken, and the later reason stands.
+    const before = file({ [CHAN_A]: meta({ broken: "Discord says that webhook is gone (401)" }) });
+    expect(withWebhookBroken(before, CHAN_A, REASON, meta({ broken: "Discord says that webhook is gone (401)" })).webhooks[CHAN_A]?.broken).toBe(REASON);
   });
 
   test("returns the routing itself when there is nothing to mark", () => {

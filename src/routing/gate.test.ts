@@ -146,7 +146,7 @@ describe("gateCommand", () => {
     // and leaves a line so that a command that ran where it should not have can be explained.
     const unknown = gate("music", here({ channelId: THREAD, parentUnknown: true }));
     expect(await unknown.result).toBeUndefined();
-    expect(unknown.lines).toEqual([["[gate] could not tell where /rsetlist was typed, so it is not refused"]]);
+    expect(unknown.lines).toEqual([[`[gate] could not tell where /rsetlist was typed (channel ${THREAD}), so it is not refused`]]);
     // A channel that IS listed needs no lookup, so it says nothing; and one that is known is judged.
     const listedOne = gate("music", here({ channelId: CHAN_1, parentUnknown: true }));
     expect(await listedOne.result).toBeUndefined();

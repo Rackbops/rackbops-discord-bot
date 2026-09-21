@@ -8,9 +8,10 @@
 // it cannot parse as fresh, which allows everything, and says so in its own `[routing]` line), or where
 // the command was typed cannot be worked out, the command runs: a routing fault must never take a plugin's
 // commands down, and a gate that wrongly refuses is worse than one that wrongly lets a command through.
-// Each way it lets a command through that it would otherwise have refused leaves a `[gate]` line. Core
-// commands never reach it (commands.ts), and only chat-input commands are gated -- a button or a modal
-// belongs to a message that is already in an allowed channel.
+// When the gate itself lets a command through (it could not look at the channel, or it failed) it leaves a
+// `[gate]` line naming the command, and the channel where it can. Core commands never reach it
+// (commands.ts), and only chat-input commands are gated -- a button or a modal belongs to a message that
+// is already in an allowed channel.
 //
 // `whereOf` is the only function here that touches discord.js objects; everything else is data.
 
@@ -88,15 +89,15 @@ export function refusalMessage(commandName: string, channels: readonly string[])
  * command, or `undefined` for anything else. Never throws.
  *
  * Most commands are decided by the channel they were typed in, which is known from the interaction, so
- * `whereOf` -- which may have to fetch the channel from Discord -- is only called when that channel is not
- * one the plugin's routing lists and its parent could make the difference. No routing, "all", a listed
+ * `lookupWhere` (`whereOf`, which may have to fetch the channel from Discord) is only called when that
+ * channel is not one the plugin's routing lists and its parent could make the difference. No routing, "all", a listed
  * channel, a DM and a core command never look anything up.
  */
 export async function gateCommand(
   plugin: string | undefined,
   commandName: string,
   here: Pick<Where, "guildId" | "channelId">,
-  whereOf: () => Promise<Where>,
+  lookupWhere: () => Promise<Where>,
   readRouting: () => Promise<RoutingFile>,
   log: Pick<Console, "error">,
 ): Promise<string | undefined> {
@@ -105,11 +106,11 @@ export async function gateCommand(
     const routing = await readRouting();
     if (commandAllowed(routing, plugin, here.guildId, here.channelId).allowed) return undefined;
     // Not listed under its own id: it may be a thread under a channel that is.
-    const where = await whereOf();
+    const where = await lookupWhere();
     const verdict = commandAllowed(routing, plugin, here.guildId, here.channelId, where.parentChannelId);
     if (verdict.allowed) return undefined;
     if (where.parentUnknown === true) {
-      log.error(`[gate] could not tell where /${commandName} was typed, so it is not refused`);
+      log.error(`[gate] could not tell where /${commandName} was typed (channel ${here.channelId}), so it is not refused`);
       return undefined;
     }
     return refusalMessage(commandName, verdict.channels);

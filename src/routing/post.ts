@@ -134,7 +134,9 @@ const WEBHOOK_TIMEOUT_MS = 10_000;
  * ping everyone through a webhook. `fetchFn` is injected so nothing here needs the network to be tested.
  *
  * Never throws and never puts the URL, or the error a failed fetch threw, in a reason: those are fixed
- * strings (and the status number).
+ * strings (and the status number). A redirect is an error, not followed: Discord does not redirect a
+ * webhook post, and following one would send the message on to whatever host answered and report success
+ * for a message that never reached the channel; as an error it falls back to the bot.
  */
 export function liveExecuteWebhook(fetchFn: typeof fetch = fetch): PostDeps["executeWebhook"] {
   return async (url, message) => {
@@ -145,6 +147,7 @@ export function liveExecuteWebhook(fetchFn: typeof fetch = fetch): PostDeps["exe
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content: message, allowed_mentions: { parse: [] } }),
         signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+        redirect: "error",
       });
     } catch {
       return { ok: false, gone: false, reason: "could not reach Discord" };
