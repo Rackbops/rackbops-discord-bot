@@ -70,13 +70,15 @@ export interface PluginRequestDeps {
   /** What the four routing actions run against (#241). Absent: a routing action is rejected. */
   routing?: RoutingRequestDeps;
   /**
-   * How long to wait before looking a second time at a file that will not parse (default 250 ms; the wait
-   * happens once per drain, however many files need it). The writer is not atomic (`cat > file`; a
-   * write-then-rename has been asked of #240, and an instance can run this bot with the old script anyway),
-   * so a request can be read while it is still being written -- empty, or cut off -- and rejecting it then
-   * would lose a good request. Now that the mailbox is drained every few seconds that is a real window, so
-   * a file that fails to PARSE gets exactly one more look before it is rejected (a file that parses but
-   * fails validation gets none). Injected so no test waits on a wall clock.
+   * How long to wait before looking a second time at a file that will not parse (default 250 ms). The wait
+   * is made once per drain, by the first such file: a later one in the same drain is looked at again at
+   * once, because waiting for each would stall a mailbox of broken files by 250 ms apiece. The writer is not
+   * atomic (`cat > file`; write-then-rename belongs in the writer, `ops/bot-ops.sh`, which is #240's, and an
+   * instance can run this bot with the old script anyway), so a request can be read while it is still being
+   * written -- empty, or cut off -- and rejecting it then would lose a good request. Now that the mailbox is
+   * drained every few seconds that is a real window, so a file that fails to PARSE gets exactly one more
+   * look before it is rejected (a file that parses but fails validation gets none), which covers a write
+   * that finishes within the wait and not one that runs longer. Injected so no test waits on a wall clock.
    */
   tornReadRetryMs?: number;
 }
@@ -88,12 +90,15 @@ const TORN_READ_RETRY_MS = 250;
 // (the shape host.ts's stateMutator uses) serializes them; a restart between conversations is fine.
 let draining: Promise<void> = Promise.resolve();
 
-// Files that were dealt with (applied, or refused) but could not be removed. Left alone a routing request
-// would be applied again on every drain -- a webhook-add asks Discord again each time -- and a refused file
-// would be refused again, and logged again, every few seconds. So each is remembered under its name, with
-// the text that was read: a later drain finds the same text, does NOT handle it again, and tries the delete
-// once more (a transient EBUSY should not leave a secret on disk until a restart). A different text under
-// the same name is a different request and is handled normally.
+// Files that were dealt with but could not be removed: a ROUTING request that was applied, or any file that
+// was refused. (An applied UPDATE request is not among them: its delete is `unlinkTolerant`, as it always
+// was.) Left alone a routing request would be applied again on every drain -- a webhook-add asks Discord
+// again each time -- and a refused file would be refused again, and logged again, every few seconds. So each
+// is remembered under its name, with the text that was read: a later drain finds the same text, does NOT
+// handle it again, and tries the delete once more (a transient EBUSY should not leave a secret on disk
+// until a restart). A different text under the same name is a different request and is handled normally.
+// A file that could not be read at all is remembered as UNREAD, and only that kind is also deleted again
+// when it is still unreadable: a name that was read before may since hold a new request.
 const undeletable = new Map<string, string>();
 // What is remembered for a file that could not even be read.
 const UNREAD = "\0";
@@ -193,7 +198,13 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     try {
       text = await deps.readFile(path);
     } catch (err) {
-      if (stuck !== undefined) continue; // reported already
+      if (stuck !== undefined) {
+        // Reported already. A file that has only ever been unreadable is deleted again; one that was read
+        // (and dealt with) under this name may since have been replaced by a request that has not been
+        // handled, and a failed read must not delete that.
+        if (stuck === UNREAD && (await removeFile(deps, path))) undeletable.delete(file);
+        continue;
+      }
       const gone = await reject(deps, path, file, namedForSecret ? "unreadable JSON" : `unreadable JSON — ${errorText(err)}`, namedForSecret);
       if (!gone) undeletable.set(file, UNREAD);
       continue;
@@ -213,8 +224,9 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     let parsed = tryParse(text);
     if (!parsed.ok) {
       // The writer is not atomic, so this may be a request still being written: look once more before
-      // rejecting it (see `tornReadRetryMs`). The wait is once per drain, however many files need it. If the
-      // file has gone or cannot be read now, the first failure stands.
+      // rejecting it (see `tornReadRetryMs`). The wait is made once per drain, by the first file that needs
+      // it; a later one is looked at again at once. If the file has gone or cannot be read now, the first
+      // failure stands.
       if (!paused) {
         await pause(deps.tornReadRetryMs ?? TORN_READ_RETRY_MS);
         paused = true;

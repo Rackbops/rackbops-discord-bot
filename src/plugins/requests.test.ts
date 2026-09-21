@@ -980,6 +980,113 @@ describe("consumePluginRequests drain", () => {
       }
     });
 
+    test("a request that replaces a stuck one under its name is not deleted unhandled when one read of it fails", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      const realUnlink = h.deps.unlink;
+      const realRead = h.deps.readFile;
+      let canDelete = false;
+      let canRead = true;
+      h.deps.unlink = async (path) => {
+        if (!canDelete) throw new Error("EACCES");
+        return realUnlink(path);
+      };
+      h.deps.readFile = async (path) => {
+        if (!canRead) throw new Error("EIO: i/o error");
+        return realRead(path);
+      };
+      await consumePluginRequests(h.deps); // applied, and the delete failed: remembered as stuck
+      // Another request arrives under that name, the delete would now work, and one read of it fails.
+      h.fs.set("100-discovery-refresh-1.json", JSON.stringify(setPlugin({ id: "req_22222222" })));
+      canDelete = true;
+      canRead = false;
+      await consumePluginRequests(h.deps);
+      expect(h.fs.has("100-discovery-refresh-1.json")).toBe(true);
+      // Once it can be read it is handled, as the new request it is.
+      canRead = true;
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results.map((x) => x.id)).toContain("req_22222222");
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a file that is refused and cannot be removed costs no wait and no log line on later drains, however it was refused", async () => {
+      const cases: [string, string, (h: { deps: PluginRequestDeps }, applied: { n: number }) => void][] = [
+        ["it will not parse", "{ not json", () => {}],
+        ["an update request holds a webhook url", JSON.stringify(wb({ action: "skip", version: "1.1.0", requestedBy: URL_OK })), () => {}],
+        [
+          "applying it failed",
+          JSON.stringify(wb({ action: "skip", version: "1.1.0" })),
+          (h, applied) => {
+            h.deps.mutateState = async () => {
+              applied.n += 1;
+              throw new Error("disk full");
+            };
+          },
+        ],
+      ];
+      for (const [why, text, setup] of cases) {
+        resetPluginRequestsForTest();
+        const delays: number[] = [];
+        const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+          delays.push(ms ?? -1);
+          fn();
+          return 0;
+        }) as never);
+        try {
+          const h = harness({});
+          h.fs.set("100-skip-1.json", text);
+          const applied = { n: 0 };
+          setup(h, applied);
+          h.deps.rename = async () => {
+            throw new Error("EXDEV");
+          };
+          h.deps.unlink = async () => {
+            throw new Error("EACCES");
+          };
+          await consumePluginRequests(h.deps);
+          const before = { warns: h.warns.length, errors: h.errors.length, waits: delays.length, applied: applied.n };
+          expect(before.warns, why).toBe(1);
+          await consumePluginRequests(h.deps);
+          await consumePluginRequests(h.deps);
+          expect(h.warns, why).toHaveLength(before.warns);
+          expect(h.errors, why).toHaveLength(before.errors);
+          expect(delays, why).toHaveLength(before.waits);
+          expect(applied.n, why).toBe(before.applied);
+        } finally {
+          timers.mockRestore();
+        }
+      }
+    });
+
+    test("a file that cannot be read and cannot be removed has its delete tried again, and goes once it can be", async () => {
+      for (const name of ["100-skip-1.json", "100-webhook-add-1.json"]) {
+        resetPluginRequestsForTest();
+        const h = harness({ [name]: wb({ action: "skip", version: "1.1.0" }) });
+        const realUnlink = h.deps.unlink;
+        let canDelete = false;
+        h.deps.readFile = async () => {
+          throw new Error("EIO: i/o error");
+        };
+        h.deps.rename = async () => {
+          throw new Error("EXDEV");
+        };
+        h.deps.unlink = async (path) => {
+          if (!canDelete) throw new Error("EACCES");
+          return realUnlink(path);
+        };
+        await consumePluginRequests(h.deps);
+        const warns = h.warns.length;
+        const errors = h.errors.length;
+        expect(h.fs.size, name).toBe(1);
+        canDelete = true;
+        await consumePluginRequests(h.deps);
+        expect(h.fs.size, name).toBe(0);
+        // Nothing more was said about it.
+        expect(h.warns, name).toHaveLength(warns);
+        expect(h.errors, name).toHaveLength(errors);
+      }
+    });
+
     test("a refused file that cannot be moved or deleted is also skipped from then on", async () => {
       const r = routingFake();
       const h = harness({ "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }) }, { routing: r.deps });
