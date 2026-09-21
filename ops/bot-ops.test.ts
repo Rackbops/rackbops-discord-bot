@@ -19,6 +19,8 @@ import { repairRouting } from "../src/routing/model";
 const test = (name: string, fn: () => void | Promise<void>, ms = 60_000) => bunTest(name, fn, ms);
 /** For the table-driven tests that spawn bash + jq dozens of times: three minutes, not one. */
 const LONG = 180_000;
+/** For the largest tables (dozens of env-set runs): seven minutes on a loaded Windows box, seconds on Linux. */
+const VERY_LONG = 420_000;
 
 const BOT_OPS_SH = fileURLToPath(new URL("./bot-ops.sh", import.meta.url));
 
@@ -1668,7 +1670,13 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     // looks for a quote, so a quote is refused wherever it sits, not only at the start.
     const NEL = String.fromCharCode(0x85);
     const NBSP = String.fromCharCode(0xa0);
-    const refused = ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"', ' "open', "\t'open", '  "x"', `${NEL}"open`, `${NBSP}"open`, 'a"b', "a'b", 'closing"'];
+    const refused = [
+      // every form of interpolation compose knows: $VAR, ${VAR}, ${VAR:-default}, ${VAR-default}, $$, a bare $
+      "${DISCORD_TOKEN}", "abc$def", "$X", "${VAR:-x}", "${VAR-x}", "$$", "$1", "a$", "$",
+      // both quote characters, leading, interior, trailing, alone, and after every kind of leading whitespace
+      '"open', "'open", '"quoted"', 'a"b', "a'b", 'closing"', '"', "'",
+      ' "open', "\t'open", '  "x"', `${NEL}"open`, `${NBSP}"open`,
+    ];
     for (const key of ["P_SECRET", "P_PLAIN"]) {
       for (const val of refused) {
         const fx = setup(base, { pluginIndex: index });
@@ -1676,7 +1684,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
         const why = `${key}=${JSON.stringify(val)}`;
         expect(run.exitCode, why).toBe(1);
         expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or a quote`);
-        expect(everythingObservable(fx, run), why).not.toContain(val);
+        if (val.trim().length >= 3) expect(everythingObservable(fx, run), why).not.toContain(val); // (a one- or two-character value is in every message by chance)
         expect(envText(fx), why).toBe(base);
         expect(existsSync(join(fx.cfg, "backups")), why).toBe(false);
         expect(recreateCalls(fx).some((c) => c.includes("up -d")), why).toBe(false);
@@ -1696,7 +1704,49 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     // a static key whose own regex also rejects it is stopped by the guard first
     const stat = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "ANNOUNCE_CHANNEL_ID=1$2\n");
     expect(stat.stderr).toContain("value for 'ANNOUNCE_CHANNEL_ID' may not contain a dollar sign or a quote");
-  }, LONG);
+  }, VERY_LONG);
+
+  test("the guard covers every static key, whatever its own regex admits", async () => {
+    // PLUGIN_INDEX_URL is the only static key whose regex (`[^[:space:]]+`) admits `$` and quotes; the guard
+    // does not depend on that, so every static key is refused the same way. The list is read from the script.
+    const script = readFileSync(BOT_OPS_SH, "utf8");
+    const spec = script.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+    const keys = [...spec.matchAll(/^\s*'([A-Z0-9_]+)\|/gm)].map((m) => m[1]!);
+    expect(keys).toContain("PLUGIN_INDEX_URL");
+    expect(keys.length).toBeGreaterThanOrEqual(11);
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    for (const key of keys) {
+      for (const bad of ["1$2", '1"2', "1'2"]) {
+        const run = await botOps(fx, ["env-set"], `${key}=${bad}\n`);
+        const why = `${key}=${bad}`;
+        expect(run.exitCode, why).toBe(1);
+        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or a quote`);
+      }
+    }
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
+    // and the one static regex that WOULD admit them, with a value that is otherwise valid
+    for (const url of ["https://index.example/p.json?t=${DISCORD_TOKEN}", "/opt/$HOME/index.json", "https://x.example/it's", 'https://x.example/"q"']) {
+      const run = await botOps(fx, ["env-set"], `PLUGIN_INDEX_URL=${url}\n`);
+      expect(run.exitCode, url).toBe(1);
+      expect(run.stderr, url).toContain("value for 'PLUGIN_INDEX_URL' may not contain a dollar sign or a quote");
+      expect(everythingObservable(fx, run), url).not.toContain(url);
+    }
+  }, VERY_LONG);
+
+  test("the music plugin's SPOTIFY_REDIRECT_URI, whose real manifest format admits `$` and `'`, is refused both", async () => {
+    // The format is copied from the published Plugin Index entry for music.
+    const index = wrapIndex([pluginEntry("music", [envKey("SPOTIFY_REDIRECT_URI", "^https://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$")])]);
+    const base = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\n";
+    for (const bad of ["https://x.example/cb?t=${DISCORD_TOKEN}", "https://x.example/cb?t=$ADMIN_TOKEN", "https://x.example/it's"]) {
+      const fx = setup(base, { pluginIndex: index });
+      const run = await botOps(fx, ["env-set"], `SPOTIFY_REDIRECT_URI=${bad}\n`);
+      expect(run.exitCode, bad).toBe(1);
+      expect(run.stderr, bad).toContain("value for 'SPOTIFY_REDIRECT_URI' may not contain a dollar sign or a quote");
+      expect(envText(fx), bad).toBe(base);
+    }
+    const ok = setup(base, { pluginIndex: index });
+    expect((await botOps(ok, ["env-set"], "SPOTIFY_REDIRECT_URI=https://bot.example/spotify/callback\n")).exitCode).toBe(0);
+  });
 
   test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
     const index = wrapIndex([
