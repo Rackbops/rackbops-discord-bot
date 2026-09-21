@@ -1322,14 +1322,25 @@ describe.skipIf(!BASH)("createRunBotOps (issue #53 item 1/2: subprocess timeout)
     for (const path of scripts.splice(0)) rmSync(path, { force: true });
   });
 
+  // The child here must be ONE process: no `sleep`, no subshell, nothing to orphan. On Windows the timeout
+  // kill reaches only the direct child (createRunBotOps's disclosed gap: there is no process-group kill
+  // there), so a grandchild keeps the stdout/stderr pipes open for its own full duration and `runBotOps`
+  // settles whenever THAT ends, not when the kill lands. This test used to run `sleep 5`, and measured
+  // (bash 5.3 in Git for Windows): 0.2-0.8s when the kill beat bash's spawn of `sleep`, 5.1-5.8s when it
+  // did not (`exec sleep 5` measured the same on msys), and past this test's own 10s
+  // limit under CPU load (5 of 12 runs with 12 busy loops running: the "flaky" failure, ~10.0s). With the
+  // builtin loop below: 0.1-0.7s idle, 0 failures in 24 runs under the same load. A bash builtin loop has
+  // no child to orphan and cannot end on its own before the kill (its 30s bound is longer than this
+  // test's 20s limit), so the only way this promise settles is that the kill landed, on every platform,
+  // and a kill that never lands fails at the limit. The grandchild case has its own POSIX-only test below.
   test("a process that outlives its timeout is killed and reported as timed out", async () => {
-    const script = slowScript("sleep 5\necho should-not-print");
+    const script = slowScript("SECONDS=0\nwhile (( SECONDS < 30 )); do :; done\necho should-not-print");
     const runBotOps = createRunBotOps(script, { timeoutMs: 100, killSignal: "SIGKILL" });
     const result = await runBotOps({ args: [], contentType: "text/plain" });
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).not.toBe(0);
     expect(result.stdout).not.toContain("should-not-print");
-  }, 10000);
+  }, 20000);
 
   test("a process finishing within its timeout is not marked as timed out, exit code/stdout intact", async () => {
     const script = slowScript("echo hi\nexit 3");
