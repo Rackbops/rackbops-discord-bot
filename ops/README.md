@@ -228,9 +228,10 @@ the key is editable, in the same save that sets `PLUGINS=warbandeer`. A plugin's
 write-only** (#240, ADR-0006 decision 8): `env-set` accepts them, validated against their `format`
 like any other key, but `env-get` never lists one and `env-schema` reports it only as `secret: true`
 plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A key the deployment
-itself owns (a core credential, or a variable `docker-compose.yml` interpolates — `RESERVED_KEYS`, a
-credential and interpolation denylist, not a list of every variable the bot core reads) stays out of
-every plugin path even if a manifest declares it. If the bot isn't running (no cached index),
+itself owns (a core credential, or a variable `docker-compose.yml` interpolates) or the bot core reads
+without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, and
+`HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME` — all `RESERVED_KEYS`, #278) stays out of every
+plugin path even if a manifest declares it, on or off. If the bot isn't running (no cached index),
 `env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** (also on an
 instance with no `PLUGINS`, since the index is read regardless) — never
 an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
@@ -290,10 +291,13 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   judged: a plain key resubmitted with the value it already holds is skipped before this check (#44's
   rule), so a stored value that holds one never blocks an unrelated save; a submitted secret always
   counts as a change, so it is always judged. (4) A key the
-  deployment owns — the core credentials, the access and admin settings, and every variable
-  `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
-  (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
-  manifest that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails
+  deployment or the bot core owns — the core credentials, the access and admin settings, every variable
+  `docker-compose.yml` interpolates, and the settings the core reads that the panel does not edit
+  (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
+  `HANDOFF_RESTART_POLICY`, `HOSTNAME`, #278) — is dropped from every plugin path whatever the manifest
+  says, on or off (`RESERVED_KEYS` in the script, pinned by tests against `.env.example`, the compose file
+  and the variables the core's source reads), so a manifest that names `DISCORD_TOKEN` cannot make the
+  panel able to overwrite it. (5) The script fails
   closed on the manifest: a key that *any* plugin in the index declares secret — enabled or not — is
   never listed as a plain key, a `secret` that is not exactly `false`, `null` or absent counts as secret, an
   entry whose `key`, `format` or `required` holds a line break (or that has no string `format`) is
