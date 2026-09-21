@@ -468,10 +468,13 @@
 .adm-apply--ok {
   border-left-color: var(--rb-success);
 }
-/* The bar takes focus while a request is in flight (tabindex="-1", see the page script): show it. */
-.adm-apply:focus-visible {
-  outline: 2px solid var(--rb-accent);
-  outline-offset: 2px;
+/* The bar takes focus while a request is in flight (tabindex="-1", see the page script); the theme's own
+   :focus-visible ring (rb-theme.css, on everything inside [data-rb-style]) is what shows it. */
+/* A sticky bar covers the bottom of the viewport, and the browser scrolls a focused control only into the
+   REST of it: without this a Tab stop can land underneath the bar. The padding is the bar's height (about
+   67px on a desktop, 143px stacked on a phone) with room to spare, while the bar is showing. */
+:root:has(.adm-apply:not([hidden])) {
+  scroll-padding-bottom: 6rem;
 }
 .adm-apply__text {
   flex: 1 1 260px;
@@ -481,6 +484,10 @@
   gap: 2px;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+  /* A compose log can run to hundreds of lines and it is shown here whole: bound the bar so its buttons
+     stay on screen, and let the words scroll inside it. */
+  max-height: 30vh;
+  overflow-y: auto;
 }
 .adm-apply__text .field-hint {
   margin: 0;
@@ -511,6 +518,9 @@
   .adm-apply {
     flex-direction: column;
     align-items: stretch;
+  }
+  :root:has(.adm-apply:not([hidden])) {
+    scroll-padding-bottom: 10rem;
   }
   .adm-apply__text {
     flex: 0 0 auto;

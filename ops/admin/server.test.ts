@@ -4118,6 +4118,14 @@ describe("admin.css uses tokens only", () => {
     const phone = /@media \(max-width: 640px\) \{([\s\S]*)\}\s*$/.exec(bare)?.[1] ?? "";
     expect(phone).toMatch(/\.adm-apply\s*\{\s*flex-direction:\s*column;/);
     expect(phone).toMatch(/\.adm-apply__text\s*\{\s*flex:\s*0 0 auto;/);
+    // A sticky bar covers the bottom of the viewport, so focus scrolling is padded while it shows (the phone
+    // bar, stacked, is taller) -- or a Tab stop lands underneath it. And its text is bounded, so a compose log
+    // of hundreds of lines cannot push the buttons off the screen.
+    expect(rule(":root:has(.adm-apply:not([hidden]))")).toMatch(/scroll-padding-bottom:\s*6rem;/);
+    expect(phone).toMatch(/:root:has\(\.adm-apply:not\(\[hidden\]\)\)\s*\{\s*scroll-padding-bottom:\s*10rem;/);
+    expect(rule(".adm-apply__text")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    // The bar takes focus while a request is in flight and shows no ring of its own: the theme's covers it.
+    expect(themeCss).toMatch(/:where\(:focus-visible\)\s*\{\s*outline:\s*var\(--rb-focus-ring\);/);
     // A control the bar refused (the page sets aria-invalid on it) and a chip field around one.
     expect(rule('.adm [aria-invalid="true"]')).toMatch(/border-color:\s*var\(--rb-danger\);/);
     expect(rule('.tag-field:has([aria-invalid="true"])')).toMatch(/border-color:\s*var\(--rb-danger\);/);
@@ -4477,9 +4485,21 @@ describe("page skeleton", () => {
     // ... and closes before </main>, with nothing between that and the end of <main>.
     const end = markup.indexOf("</main>", start);
     expect(end).toBeGreaterThan(start);
-    const tail = markup.slice(markup.lastIndexOf("<div", start), end); // from the bar's own opening tag
-    expect((tail.match(/<div\b/g) ?? []).length).toBe((tail.match(/<\/div>/g) ?? []).length);
-    // The three tabpanels are the bar's earlier siblings, not its ancestors: it is the last thing in <main>.
+    // The bar's own element: from its opening tag to the </div> that closes it (nested divs counted) ...
+    const open = markup.lastIndexOf("<div", start);
+    let depth = 0;
+    let close = -1;
+    for (const m of markup.slice(open).matchAll(/<div\b|<\/div>/g)) {
+      depth += m[0] === "</div>" ? -1 : 1;
+      if (depth === 0) {
+        close = open + m.index! + m[0].length;
+        break;
+      }
+    }
+    expect(close).toBeGreaterThan(open);
+    // ... and after that, up to </main>, only whitespace and comments: nothing follows it, so it is the LAST
+    // child of <main> (sticky at the bottom of the page) and a sibling of the tabpanels, not inside one.
+    expect(markup.slice(close, end).replace(/<!--[\s\S]*?-->/g, "").trim()).toBe("");
     expect(markup.slice(end + "</main>".length).trim()).toBe("");
   });
 
@@ -4597,7 +4617,7 @@ const planApply = new Function(
 const { applyBarView, describeApplyFailure } = new Function(
   `"use strict";\n${applyBlock("APPLY_VIEW")}\nreturn { applyBarView, describeApplyFailure };`,
 )() as {
-  applyBarView: (state: { count: number; phase: string; error?: string; detail?: string }) => BarView;
+  applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean }) => BarView;
   describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
 };
 
@@ -4619,6 +4639,16 @@ describe("planApply (#257)", () => {
     expect(plan.body).toBe("PLUGINS=warbandeer,raidhelper\nWATCHED_REPOS=acme/two\nANNOUNCE_CHANNEL_ID=222");
     expect(plan.count).toBe(3);
     expect(plan.error).toBeUndefined();
+  });
+
+  test("PLUGINS is ordered by the manifest, not by the order the boxes were ticked in", () => {
+    const plan = planApply({
+      loadedEnv: {},
+      fields: {},
+      plugins: { checkedNames: ["warbandeer", "raidhelper"], currentValue: "", manifestOrder: ["raidhelper", "warbandeer"] },
+    });
+    expect(plan.changes).toEqual([{ key: "PLUGINS", before: "", now: "raidhelper,warbandeer" }]);
+    expect(plan.body).toBe("PLUGINS=raidhelper,warbandeer");
   });
 
   test("an unchanged page plans nothing", () => {
@@ -4710,6 +4740,19 @@ describe("applyBarView (#257)", () => {
     expect(applyBarView({ count: 0, phase: "done" }).hidden).toBe(false); // shown even though nothing is pending any more
   });
 
+  test("done with nothing restarted (bot-ops.sh's \"no changes\" answer): it does not claim a restart", () => {
+    const view = applyBarView({ count: 1, phase: "done", noop: true });
+    expect(view).toEqual({
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      showDiscard: false, showGo: false, showOk: true, busy: false,
+    });
+    expect(`${view.title} ${view.hint}`).not.toMatch(/restarted with/);
+    // noop only means something once an apply has finished: pending changes never read as "nothing needed".
+    expect(applyBarView({ count: 1, phase: "idle", noop: true }).title).toBe("1 change needs a restart");
+    expect(applyBarView({ count: 1, phase: "failed", error: "boom", noop: true }).title).toBe("Couldn't apply: boom");
+    expect(applyBarView({ count: 1, phase: "applying", noop: true }).title).toBe("Restarting the bot…");
+  });
+
   test("failed: the error in the title, the detail as the hint, danger, OK -- plus Discard and Apply while changes are pending", () => {
     expect(applyBarView({ count: 0, phase: "failed", error: "compose: image not found", detail: "Backup: /opt/x/.env.bak.1" })).toEqual({
       hidden: false, tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1",
@@ -4758,7 +4801,7 @@ interface StubEl {
   setAttribute: (name: string, value: string) => void;
   removeAttribute: (name: string) => void;
   getAttribute: (name: string) => string | null;
-  focus: () => void;
+  focus: (options?: { preventScroll?: boolean }) => void;
   contains: (other: unknown) => boolean;
   closest: (selector: string) => unknown;
 }
@@ -4778,6 +4821,9 @@ interface ApplySpec {
   hold?: Promise<void>;
   /** The loaders put the controls back to `loadedEnv` and the server's ticks (a re-render from the baseline). */
   resetOnReload?: boolean;
+  /** The plugin list is not rendered (a failed /api/plugins reload swaps the boxes for an error line) while
+   *  `pluginsData` still holds the previous answer. */
+  noBoxes?: boolean;
 }
 type ApplyPost = { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } };
 
@@ -4791,6 +4837,10 @@ function runApply(spec: ApplySpec) {
     reloads: { plugins: 0, env: 0, status: 0 },
     tabs: [] as [string, boolean][],
     focused: [] as string[],
+    /** The ids focused with { preventScroll: true }. */
+    preventScroll: [] as string[],
+    /** Every write to any stub's textContent, as `id=text` (the bar's words are a live region). */
+    textWrites: [] as string[],
     cancels: 0,
     timeouts: [] as number[],
     selectors: [] as string[],
@@ -4805,7 +4855,11 @@ function runApply(spec: ApplySpec) {
       setAttribute: (name, value) => void el.attrs.set(name, value),
       removeAttribute: (name) => void el.attrs.delete(name),
       getAttribute: (name) => el.attrs.get(name) ?? null,
-      focus: () => { log.focused.push(el.id); state.active = el; },
+      focus: (options) => {
+        log.focused.push(el.id);
+        if (options?.preventScroll) log.preventScroll.push(el.id);
+        state.active = el;
+      },
       contains: (other) => other === el,
       closest: () => null,
       ...over,
@@ -4817,6 +4871,8 @@ function runApply(spec: ApplySpec) {
     };
     Object.defineProperty(el, "hidden", { get: () => hidden, set: (v: boolean) => { hidden = v; if (v) dropsFocus(); }, configurable: true });
     Object.defineProperty(el, "disabled", { get: () => disabled, set: (v: boolean) => { disabled = v; if (v) dropsFocus(); }, configurable: true });
+    let text = "";
+    Object.defineProperty(el, "textContent", { get: () => text, set: (v: string) => { text = v; log.textWrites.push(`${el.id}=${v}`); }, configurable: true });
     if (over.hidden) hidden = true;
     return el;
   };
@@ -4847,7 +4903,7 @@ function runApply(spec: ApplySpec) {
   const pluginsData = spec.pluginsData === undefined ? APPLY_PLUGINS : spec.pluginsData;
   const tickedOnServer = pluginsData ? pluginsData.pluginsValue.split(",").map((t) => t.split("@")[0]!.trim()).filter(Boolean) : [];
   const tickedNow = spec.checked ?? tickedOnServer;
-  const boxes = (pluginsData?.plugins ?? []).map((p) => makeEl(`plugin-${p.name}`, { dataset: { plugin: p.name }, checked: tickedNow.includes(p.name) }));
+  const boxes = spec.noBoxes ? [] : (pluginsData?.plugins ?? []).map((p) => makeEl(`plugin-${p.name}`, { dataset: { plugin: p.name }, checked: tickedNow.includes(p.name) }));
   const boxBaseline = (pluginsData?.plugins ?? []).map((p) => tickedOnServer.includes(p.name));
 
   const document = {
@@ -4947,6 +5003,7 @@ function runApply(spec: ApplySpec) {
 
 describe("applyPending (#257)", () => {
   const ticked = ["warbandeer", "raidhelper"];
+  const returnsSoon = (call: Promise<void>) => Promise.race([call.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100))]);
 
   test("ticking one plugin and editing two fields is ONE POST: PLUGINS first, only those three keys", async () => {
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "22222", WATCHED_REPOS: "eu" }, checked: ticked });
@@ -5022,6 +5079,42 @@ describe("applyPending (#257)", () => {
     expect(page.view().hint).toBe('BOT_BRANCH: "bad branch!" doesn\'t match the expected format (^[A-Za-z0-9._/-]{1,100}$).');
     expect(page.view().tone).toBe("danger");
     expect(page.control("BOT_BRANCH").attrs.get("aria-invalid")).toBe("true");
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 }); // nothing was sent, so nothing is re-read
+  });
+
+  test("a refusal on PLUGINS itself shows the plugins tab, marks no control, and posts nothing", async () => {
+    // A ticked name the PLUGINS pattern rejects (the schema carries bot-ops.sh's own pattern for the key).
+    const schema = { ...APPLY_SCHEMA, PLUGINS: { pattern: "^[a-z][a-z0-9-]*(@[A-Za-z0-9._-]+)?(,[a-z][a-z0-9-]*(@[A-Za-z0-9._-]+)?)*$", required: false, source: "core" } };
+    const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "Bad_Name" }], pluginsValue: "warbandeer" };
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, pluginsData, checked: ["warbandeer", "Bad_Name"], schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.log.tabs).toEqual([["plugins", false]]);
+    expect(page.log.focused).toEqual([]); // there is no single control to send the user to: the tab is the place
+    expect(page.view()).toMatchObject({ hidden: false, tone: "danger", title: "2 changes need a restart" });
+    expect(page.view().hint).toMatch(/^PLUGINS: "warbandeer,Bad_Name" doesn't match the expected format/);
+    for (const el of [...page.controls, ...page.boxes]) expect(el.attrs.has("aria-invalid")).toBe(false);
+  });
+
+  test("with no plugin box rendered (a failed reload of the list) no PLUGINS change is planned, so it cannot wipe them", async () => {
+    // pluginsData is the PREVIOUS answer (PLUGINS=warbandeer); the list on the page is now an error line.
+    // Reading "nothing ticked" against it would post PLUGINS= and switch every plugin off.
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, noBoxes: true });
+    expect(page.run.collectPending().plugins).toBeNull();
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+    // With nothing else changed, there is nothing to apply at all: the bar stays hidden and nothing is posted.
+    const alone = runApply({ loadedEnv: APPLY_ENV, noBoxes: true });
+    alone.run.refreshApplyBar();
+    await alone.run.applyPending();
+    expect(alone.view().hidden).toBe(true);
+    expect(alone.log.posts).toEqual([]);
+  });
+
+  test("with the list rendered, unticking every plugin is still a real change (the guard is 'no box', not 'nothing ticked')", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, checked: [] });
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["PLUGINS="]);
   });
 
   test("with no schema the apply still goes (the degraded path, #207)", async () => {
@@ -5054,6 +5147,31 @@ describe("applyPending (#257)", () => {
     expect(page.view()).toEqual({
       hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", ok: true, discard: false, go: false, disabled: false,
     });
+  });
+
+  test("bot-ops.sh's \"no changes\" answer says nothing was restarted (it never claims a restart it did not do)", async () => {
+    // env-set found .env already holding every value (another operator applied them, or the tab was stale).
+    const text = '{"ok":true,"changed":[],"recreated":false,"note":"no changes"}';
+    const spec: ApplySpec = { loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: true, text } };
+    const page = runApply(spec);
+    await page.run.applyPending();
+    expect(page.view()).toEqual({
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      ok: true, discard: false, go: false, disabled: false,
+    });
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 }); // still re-baselined
+    // Only an explicit recreated:false counts; a real restart (recreated:true), or any other success body, still says applied.
+    for (const body of ['{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}', '{"ok":true,"changed":["X"]}', "OK", ""]) {
+      const real = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: true, text: body } });
+      await real.run.applyPending();
+      expect({ body, title: real.view().title }).toEqual({ body, title: "Applied. The bot restarted with your changes." });
+    }
+    // ... and a later apply on the same page (the edit is still pending) is not stuck on the earlier answer.
+    page.run.onControlEdited({ target: { closest: () => ({}) } });
+    expect(page.view().title).toBe("1 change needs a restart");
+    spec.response = { ok: true, text: '{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}' };
+    await page.run.applyPending();
+    expect(page.view().title).toBe("Applied. The bot restarted with your changes.");
   });
 
   test("a failed recreate shows the compose error and the backup path, and re-baselines (#47)", async () => {
@@ -5138,11 +5256,17 @@ describe("applyPending (#257)", () => {
     expect(page.view()).toEqual({
       hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", ok: false, discard: true, go: true, disabled: true,
     });
-    await page.run.applyPending(); // a second click while one is in flight
-    await page.run.discardPending(); // ... and a Discard
-    expect(page.log.posts).toHaveLength(1);
-    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
-    release();
+    try {
+      // A second click while one is in flight, and a Discard: each must return at once. Raced against a
+      // deadline, because a page that DID start a second request would wait on the held one forever (Bun on
+      // this box neither times such a test out nor exits): the failure has to be an assertion, not a hang.
+      expect(await returnsSoon(page.run.applyPending())).toBe(true);
+      expect(await returnsSoon(page.run.discardPending())).toBe(true);
+      expect(page.log.posts).toHaveLength(1);
+      expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+    } finally {
+      release();
+    }
     await first;
     expect(page.view().title).toBe("Applied. The bot restarted with your changes.");
     expect(page.view().disabled).toBe(false);
@@ -5177,9 +5301,54 @@ describe("applyPending (#257)", () => {
     await pending;
     expect(moved.log.focused).toEqual(["apply-bar"]); // not pulled to OK
   });
+
+  test("a request that throws (a timeout, the network) also lands focus on OK", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: new Error("The operation was aborted.") });
+    page.activate(page.els.go);
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", ok: true });
+    expect(page.log.focused).toEqual(["apply-bar", "apply-ok"]);
+  });
+
+  test("a refusal is over once an apply goes: its message and its aria-invalid mark do not outlive it", async () => {
+    // Refused (blank required field), then the field is filled by something that fires no `input` event
+    // (a reload of the config does), then Apply goes and fails. The refusal is not true any more and must
+    // not come back when the failure is dismissed.
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" },
+      response: { ok: false, text: "nope" },
+    });
+    await page.run.applyPending();
+    expect(page.view().hint).toBe("ANNOUNCE_CHANNEL_ID is required and cannot be blank.");
+    const control = page.control("ANNOUNCE_CHANNEL_ID");
+    expect(control.attrs.has("aria-invalid")).toBe(true);
+    page.edit("ANNOUNCE_CHANNEL_ID", "22222");
+    await page.run.applyPending();
+    expect(page.view().title).toBe("Couldn't apply: nope");
+    expect(control.attrs.has("aria-invalid")).toBe(false);
+    page.run.dismissApplyResult();
+    expect(page.view()).toMatchObject({ tone: "", title: "2 changes need a restart", hint: "The bot goes offline for about 20 seconds while it restarts." });
+  });
+
+  test("a keystroke that leaves the bar's words as they were does not rewrite them (the words are a live region)", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    const writes = (id: string) => page.log.textWrites.filter((w) => w.startsWith(`${id}=`));
+    for (const value of ["e", "eu", "eu,", "eu,ap", "eu,ap,tw"]) {
+      page.edit("WATCHED_REPOS", value);
+      page.run.refreshApplyBar();
+    }
+    expect(page.view().title).toBe("1 change needs a restart");
+    expect(writes("apply-title")).toEqual(["apply-title=1 change needs a restart"]);
+    expect(writes("apply-hint")).toEqual(["apply-hint=The bot goes offline for about 20 seconds while it restarts."]);
+    // A real change of words is written.
+    page.edit("ANNOUNCE_CHANNEL_ID", "22222");
+    page.run.refreshApplyBar();
+    expect(writes("apply-title")).toEqual(["apply-title=1 change needs a restart", "apply-title=2 changes need a restart"]);
+  });
 });
 
-describe("Apply bar events and Discard (#257)", () => {
+describe("Apply bar events (#257)", () => {
   const inside = { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null), getAttribute: () => null, removeAttribute: () => {} };
   const outside = { closest: () => null, getAttribute: () => null, removeAttribute: () => {} };
 
@@ -5236,7 +5405,9 @@ describe("Apply bar events and Discard (#257)", () => {
     release();
     await pending;
   });
+});
 
+describe("discardPending (#257)", () => {
   test("posts nothing and re-renders plugins and env", async () => {
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu", ANNOUNCE_CHANNEL_ID: "" }, checked: ["warbandeer", "raidhelper"], resetOnReload: true });
     await page.run.applyPending(); // a refusal: the control is marked invalid
@@ -5260,8 +5431,21 @@ describe("Apply bar events and Discard (#257)", () => {
     await page.run.discardPending();
     expect(page.view().hidden).toBe(true); // ... and the bar hides with it (the stub drops its focus, as a browser does)
     expect(page.log.focused.at(-1)).toBe("tab-settings");
+    // The tab strip is at the top of a long page and Discard was pressed at the bottom of it: never scroll there.
+    expect(page.log.preventScroll).toEqual(["tab-settings"]);
   });
 
+  test("focus that is somewhere real is left alone when the bar goes", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, resetOnReload: true });
+    await page.run.applyPending();
+    page.activate(page.control("WATCHED_REPOS")); // the user is already typing elsewhere
+    const before = page.log.focused.length;
+    await page.run.discardPending();
+    expect(page.log.focused).toHaveLength(before);
+  });
+});
+
+describe("dismissApplyResult (#257)", () => {
   test("OK on a finished message hides the bar and puts focus back on the open tab", async () => {
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" } });
     page.activate(page.els.go);
@@ -5272,6 +5456,7 @@ describe("Apply bar events and Discard (#257)", () => {
     page.run.dismissApplyResult();
     expect(page.view().hidden).toBe(true);
     expect(page.log.focused.at(-1)).toBe("tab-settings");
+    expect(page.log.preventScroll).toEqual(["tab-settings"]);
   });
 
   test("OK while changes are still pending keeps the bar and puts focus on it, not on Apply", async () => {
@@ -5282,15 +5467,7 @@ describe("Apply bar events and Discard (#257)", () => {
     page.run.dismissApplyResult(); // OK hides, and takes focus with it
     expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
     expect(page.log.focused.at(-1)).toBe("apply-bar"); // an Enter pressed twice must not restart the bot
-  });
-
-  test("focus that is somewhere real is left alone when the bar goes", async () => {
-    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, resetOnReload: true });
-    await page.run.applyPending();
-    page.activate(page.control("WATCHED_REPOS")); // the user is already typing elsewhere
-    const before = page.log.focused.length;
-    await page.run.discardPending();
-    expect(page.log.focused).toHaveLength(before);
+    expect(page.log.preventScroll).toEqual(["apply-bar"]);
   });
 });
 

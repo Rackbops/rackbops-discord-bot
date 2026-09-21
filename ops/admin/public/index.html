@@ -98,8 +98,9 @@
     <section id="plugin-admin-section" class="rb-card" hidden>
       <h2>Plugin Settings</h2>
       <p class="adm-sub">
-        Settings contributed by installed plugins. Each plugin renders its own controls here; changes go
-        through the same guarded save (and bot recreate) as the config above, scoped to that plugin's own keys.
+        Settings contributed by installed plugins. Each plugin renders its own controls here; a plugin's
+        Save goes through the same guarded write (and bot restart) as the Apply bar, scoped to that plugin's
+        own keys.
       </p>
       <div id="plugin-admin-list"></div>
     </section>
@@ -479,6 +480,8 @@
       note.textContent = "Changes apply when the bot restarts: they are collected in the bar below until you apply them.";
       container.appendChild(note);
     } catch (e) {
+      // The boxes are gone but pluginsData still holds the previous answer: collectPending plans no PLUGINS
+      // change while no box is rendered, so this cannot read as "everything unticked".
       if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
     } finally {
       // The baseline moved (or the list failed to load): what is pending is read from the controls again.
@@ -1265,8 +1268,9 @@
 
   // TAG_SYNC:begin
   // Setting an input's value from code fires NO event, and the Apply bar learns of an edit only from an
-  // `input` event bubbling up to #app -- so a chip added or removed must say so itself. This is the one
-  // place a chip editor writes its value carrier.
+  // `input` event bubbling up to #app -- so a chip added or removed must say so itself. Every write to a
+  // chip editor's value carrier after it is built goes through here (its first, seeding write does not: the
+  // page loads that value itself, so the bar has nothing to hear about).
   function syncTagValue(hidden, tokens) {
     hidden.value = tokens.join(",");
     hidden.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1515,14 +1519,19 @@
 
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
-  // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail? }
+  // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail?, noop? }
   //   -> { hidden, tone: ""|"danger"|"ok", title, hint, showDiscard, showGo, showOk, busy }
+  // `noop` (phase "done" only) is bot-ops.sh's "no changes" answer ({ok:true, recreated:false}): the values
+  // were already in place (another operator applied them, or this tab was stale), so nothing restarted.
   function applyBarView(state) {
     const view = (over) => ({ hidden: false, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false, ...over });
     if (state.phase === "applying") {
       return view({ title: "Restarting the bot…", hint: "This takes about 20 seconds.", showDiscard: true, showGo: true, busy: true });
     }
     if (state.phase === "done") {
+      if (state.noop) {
+        return view({ tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.", showOk: true });
+      }
       return view({ tone: "ok", title: "Applied. The bot restarted with your changes.", showOk: true });
     }
     if (state.phase === "failed") {
@@ -1564,6 +1573,7 @@
   let applyPhase = "idle"; // "idle" | "applying" | "done" | "failed"
   let applyError = ""; // the failure being shown (phase "failed") ...
   let applyDetail = ""; // ... and its second line, the backup path
+  let applyNoop = false; // phase "done": bot-ops.sh answered "no changes" (nothing was restarted)
   let applyViolation = ""; // a validation refusal being shown, until the next edit
   let applyInvalid = null; // the control that refusal marked aria-invalid
 
@@ -1574,18 +1584,27 @@
     const fields = {};
     for (const c of document.querySelectorAll("#env-fields [data-key]")) fields[c.dataset.key] = c.value;
     let plugins = null;
-    // Never plan against an untrusted baseline: a failed state read (an empty PLUGINS) could otherwise be
-    // diffed against a ticked subset and wipe the real selection.
+    // Never plan against an untrusted baseline, in two ways. (1) A failed STATE read (an empty PLUGINS) could
+    // be diffed against a ticked subset and wipe the real selection. (2) A list that is NOT RENDERED: a failed
+    // /api/plugins reload swaps the boxes for an error line while pluginsData still holds the previous
+    // answer, and "nothing ticked" diffed against that would post PLUGINS= and switch every plugin off.
     if (pluginsData && !pluginsData.stateError) {
-      plugins = {
-        checkedNames: [...document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")]
-          .filter((c) => c.checked)
-          .map((c) => c.dataset.plugin),
-        currentValue: pluginsData.pluginsValue || "",
-        manifestOrder: (pluginsData.plugins || []).map((p) => p.name),
-      };
+      const boxes = [...document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")];
+      if (boxes.length > 0) {
+        plugins = {
+          checkedNames: boxes.filter((c) => c.checked).map((c) => c.dataset.plugin),
+          currentValue: pluginsData.pluginsValue || "",
+          manifestOrder: (pluginsData.plugins || []).map((p) => p.name),
+        };
+      }
     }
     return { loadedEnv, fields, plugins };
+  }
+
+  // The bar's words are a live region and this runs on every keystroke: write a line only when it CHANGED, so
+  // typing in a field never rewrites (and so never risks re-announcing) text that is already there.
+  function setApplyText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
   }
 
   function writeApplyBar(plan) {
@@ -1594,13 +1613,14 @@
       phase: applyPhase,
       error: applyPhase === "failed" ? applyError : plan.error || applyViolation,
       detail: applyDetail,
+      noop: applyNoop,
     });
     const bar = document.getElementById("apply-bar");
     bar.hidden = view.hidden;
     bar.classList.toggle("adm-apply--danger", view.tone === "danger");
     bar.classList.toggle("adm-apply--ok", view.tone === "ok");
-    document.getElementById("apply-title").textContent = view.title;
-    document.getElementById("apply-hint").textContent = view.hint;
+    setApplyText(document.getElementById("apply-title"), view.title);
+    setApplyText(document.getElementById("apply-hint"), view.hint);
     const ok = document.getElementById("apply-ok");
     const discard = document.getElementById("apply-discard");
     const go = document.getElementById("apply-go");
@@ -1645,17 +1665,18 @@
   }
   // After OK or Discard, the button that had focus is hidden and focus would fall to <body>. Put it back:
   // on the open tab when the bar is gone, on the bar itself when it is still there (not on Apply: an Enter
-  // pressed twice must not restart the bot). Focus that is somewhere real is left alone.
+  // pressed twice must not restart the bot). Focus that is somewhere real is left alone. preventScroll: the tab
+  // strip is at the top of a long page, and the user pressed a button at the bottom of it.
   function settleFocus() {
     const active = document.activeElement;
     if (active && active !== document.body) return;
     const bar = document.getElementById("apply-bar");
     if (!bar.hidden) {
-      bar.focus();
+      bar.focus({ preventScroll: true });
       return;
     }
     const tab = document.querySelector('[role="tab"][aria-selected="true"]');
-    if (tab) tab.focus();
+    if (tab) tab.focus({ preventScroll: true });
   }
 
   // A refusal: the bar says why, the offending control is marked and focused on its own tab, and nothing
@@ -1691,7 +1712,9 @@
       return;
     }
     applyPhase = "applying";
+    // A refusal is over once an apply goes (a reload can fill a blank field without firing `input`).
     applyViolation = "";
+    clearApplyInvalid();
     writeApplyBar(plan);
     focusIfInBar(document.getElementById("apply-bar"));
     // ONE POST /api/env carrying only what changed: the Origin guard, the auth check and bot-ops.sh's own
@@ -1704,6 +1727,8 @@
       let result = null;
       try { result = JSON.parse(text); } catch { /* non-JSON error body — shown verbatim below */ }
       if (res.ok) {
+        // bot-ops.sh answers {ok:true, recreated:false} when .env already held every value: nothing restarted.
+        applyNoop = !!(result && result.recreated === false);
         applyPhase = "done";
         refreshApplyBar();
         loadPlugins();
