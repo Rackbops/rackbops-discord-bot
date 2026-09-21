@@ -40,7 +40,7 @@ import {
 } from "./plugins/host";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { describePlugins } from "./routing/discovery";
-import { applyRouting, initRouting } from "./routing/live";
+import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
 import { gateCommand, whereOf } from "./routing/gate";
 import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
 import { readRouting, readSecrets } from "./routing/store";
@@ -211,6 +211,19 @@ async function activate(c: Client<true>): Promise<void> {
       console.error("[interaction]", err);
     }
   });
+
+  // #259: a server the bot joins or leaves after boot. Attached here, before the boot registration below,
+  // so a server joined while that registration is running is not missed: it queues behind it on
+  // live.ts's chain, and before initRouting both do nothing (the boot registration snapshots a cache that
+  // already holds the server). discord.js emits guildCreate only for a server that is new to its cache once
+  // the client is Ready -- not for the servers it lists at start-up -- and guildDelete only when the bot is
+  // really out; a server going into, or coming back from, an outage is the separate availability pair, which
+  // is deliberately NOT wired here: it is neither a join nor a leave. (A server invited while the gateway
+  // session is being re-identified, rather than resumed, can arrive as the availability event instead of a
+  // join; that gap is known and accepted, see CONTEXT.md.) `void`: neither function can reject, so nothing
+  // escapes into the emitter.
+  client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
+  client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
 
   // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
   // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements

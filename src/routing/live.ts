@@ -8,6 +8,10 @@
 // re-registers or rewrites discovery therefore goes through `enqueue`, and a second call waits behind
 // the first.
 //
+// A server the bot joins or leaves after boot (#259) goes through the same chain: `guildJoined`
+// registers again (routed mode, or a join of the home server) or only refreshes discovery (single mode),
+// `guildLeft` refreshes discovery.
+//
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
 // `single` mode (today's behaviour) the error is rethrown once `discovery.json` has been written (it
 // is not written when the bot's servers could not be read), so `index.ts` reaches its own long
@@ -20,6 +24,7 @@ import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as Command
 import type { PluginCommandMap } from "../plugins/host";
 import { buildDiscovery, snapshotGuilds, writeDiscovery, type GuildSnapshot, type PluginSummary } from "./discovery";
 import { describeError, planRegistration, registerPlan, type GuildRegistration } from "./register";
+import { hasPlacements } from "./resolve";
 import { readRouting } from "./store";
 
 export interface RoutingContext {
@@ -181,6 +186,84 @@ export function refreshDiscovery(): Promise<void> {
     const snapshots = takeSnapshots(context);
     if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
   });
+}
+
+/** A server as it is named in a log line. Total, so a malformed argument cannot make a catch block throw. */
+const label = (guild: { id: string; name: string }): string => `${guild?.name} (${guild?.id})`;
+
+/**
+ * Writes through the context's logger. A logger that throws must neither hold up the work nor turn a join
+ * or a leave into a rejection, so this is where that is swallowed: there is nothing left to tell it to. The
+ * logger is read outside the `try` on purpose: a missing context is a bug to be seen, not one to be
+ * swallowed here.
+ */
+function tell(c: RoutingContext, level: "log" | "error", message: string, err?: unknown): void {
+  const log = c.log;
+  try {
+    if (level === "error") log.error(message, err);
+    else log.log(message);
+  } catch {
+    /* the logger is broken too */
+  }
+}
+
+/**
+ * The bot has joined a server (discord.js `guildCreate`). In routed mode the new server has no commands
+ * until something registers there, so this registers again -- the whole run, through `applyRouting`, the
+ * one path that is already serialized, recorded and tested -- which also rewrites `discovery.json`, so the
+ * file the panel reads lists the server within seconds.
+ *
+ * In single mode registration goes to ONE place, the home server's guild (or everywhere, when there is no
+ * home server), and a join does not change where; only discovery is refreshed. The exception is a join OF
+ * the home server: a bot that was not in it at boot (so that registration was refused) and is invited
+ * later, or one that was removed from it and is added back, has nothing registered there until that is done
+ * again -- it is understood that Discord drops a server's commands when the bot leaves it, which is not
+ * verified against a live server -- and single mode's one call is exactly that registration, so this runs
+ * it. Re-authorizing a bot that is still a member (the usual cure for a 50001) emits no join at all, and
+ * still waits for the next registration. With a home server set, any other joined server gets no commands
+ * in single mode, as before; with none, the global list already reaches it.
+ *
+ * The mode is decided HERE, from a fresh read of routing.json, and NOT inside the chain: `applyRouting`
+ * and `refreshDiscovery` each queue themselves on it, so calling either from inside a queued job would
+ * wait on itself forever. A join that arrives while the boot registration is running queues behind it.
+ * Before `initRouting` it does nothing: the boot registration that follows snapshots the cache, which
+ * already holds the new server.
+ *
+ * Never rejects. It is called from an event listener, where a rejection is a process-level event, and
+ * `applyRouting` CAN reject here: single mode rethrows a failed registration, and this run is a single-mode
+ * one when nothing is placed (a join of the home server with no placements, or a last placement removed
+ * between the read and the call).
+ */
+export async function guildJoined(guild: { id: string; name: string }): Promise<void> {
+  const c = context;
+  if (c === undefined) return;
+  try {
+    tell(c, "log", `[routing] joined ${label(guild)}`);
+    const routing = await readRouting(c.dataDir);
+    if (hasPlacements(routing) || guild.id === c.homeGuildId) await applyRouting(`joined ${guild.name}`);
+    else await refreshDiscovery();
+  } catch (err) {
+    tell(c, "error", `[routing] handling the join of ${label(guild)} failed`, err);
+  }
+}
+
+/**
+ * The bot has left a server (discord.js `guildDelete`: kicked, or the server is gone -- an outage is a
+ * different event). The server stops being offered because discovery is rewritten from what the bot can
+ * see now. routing.json is NOT touched: being kicked and re-invited must not lose a placement. (A server
+ * that is in routing but not in discovery is one the panel has to be able to show as unavailable; the
+ * panel's Servers tab, #246, is the child that builds that view, and its issue text does not yet list this
+ * case.) Before `initRouting` it does nothing. Never rejects, for the reason `guildJoined` gives.
+ */
+export async function guildLeft(guild: { id: string; name: string }): Promise<void> {
+  const c = context;
+  if (c === undefined) return;
+  try {
+    tell(c, "log", `[routing] left ${label(guild)}`);
+    await refreshDiscovery();
+  } catch (err) {
+    tell(c, "error", `[routing] handling the departure from ${label(guild)} failed`, err);
+  }
 }
 
 /** Resolves once everything queued so far has settled. For tests, which need to wait for a refresh
