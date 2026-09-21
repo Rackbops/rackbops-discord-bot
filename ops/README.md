@@ -501,7 +501,15 @@ they're signed in as, plus the JWT's claims for the panel's Identity view), and
 above), `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser), and
 `GET /api/plugins` (the Modify Plugins view — the Plugin Index merged with this instance's installed
 state and current `PLUGINS`; see below), and (**#105**) `POST /api/plugins/request` (an update-action
-button → a request file the bot consumes), and (**#123/#165**) `GET /plugin-admin/<name>.js?v=` +
+button → a request file the bot consumes), and (**#242**) the routing routes: `GET /api/routing`
+(`bot-ops.sh routing-get`: the bot's `routing.json` and `discovery.json` as `{ routing, discovery }`) and
+four writes, `POST /api/routing` (one plugin's server map), `POST /api/webhooks` (`{ url }`),
+`DELETE /api/webhooks/<channel id>` and `POST /api/discovery/refresh`, each a `plugin-request` action the
+bot applies. The **panel never calls Discord**: the server mints each write's request `id` and returns it
+(`{ ok, id, queued }`), and the page learns the outcome, including which channel a new webhook landed on,
+from `routing.results` under that `id` a few seconds later. A webhook URL is a secret here too: it reaches
+`bot-ops.sh` on stdin only, never in `argv`, a log line, a response or an error message (a `bot-ops.sh`
+failure's stderr is redacted before it is logged or returned), and (**#123/#165**) `GET /plugin-admin/<name>.js?v=` +
 `GET /api/plugin-proxy/<name>?path=&v=` (a plugin's own admin-tab bundle and its data assets,
 proxied same-origin from that plugin's own published package on the allowlisted CDN host — see
 "Plugin admin tabs" below), and (**#238**) `GET /rb-theme.css` + `GET /admin.css` (the page's two
@@ -510,7 +518,8 @@ layer like the page itself). The
 `/api/whoami`, `/api/admins`, `/api/branches`, `/plugin-admin/<name>.js`,
 `/api/plugin-proxy/<name>`, `/rb-theme.css` and `/admin.css` routes never shell out to `bot-ops.sh`;
 `/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and
-`/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does), while
+`/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does; the four routing
+writes above use the same subcommand), while
 a plugin's *enabled* state still goes through the ordinary `POST /api/env` (its `PLUGINS` line, sent by
 the Apply bar together with any edited config fields, in one request).
 `/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
