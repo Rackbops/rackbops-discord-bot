@@ -135,19 +135,25 @@ function logRouted(c: RoutingContext, snapshots: readonly GuildSnapshot[], resul
  * says so (`discovery.json` shows `homeGuildId` with no matching guild, which the panel does not read that
  * way yet). Said once per distinct message; a log line, nothing about what is registered changes. Nothing
  * is said when the bot's servers could not be read (`snapshots` is null), when there is no home server, or
- * when every loaded plugin is placed.
+ * when every loaded plugin that has commands is placed.
  */
 function warnHomeServerMissing(c: RoutingContext, routing: RoutingFile, snapshots: readonly GuildSnapshot[] | null): void {
   if (c.homeGuildId === undefined || snapshots === null) return;
   if (snapshots.some((s) => s.id === c.homeGuildId)) return;
-  const nowhere = c.plugins.map((p) => p.name).filter((name) => !isPlaced(routing, name));
+  // A plugin with no commands has nothing to register (its announcements go to the default channel by id,
+  // whatever server that is in), so it loses nothing and is not named.
+  const nowhere = c.plugins.filter((p) => p.commands.length > 0 && !isPlaced(routing, p.name)).map((p) => p.name);
   if (nowhere.length === 0) return;
   const message =
     `[routing] the home server ${shown(c.homeGuildId)} is not one the bot is in, so these plugins, ` +
     `which nobody has placed, are registered nowhere: ${nowhere.join(", ")}`;
   if (said.has(message)) return;
   said.add(message);
-  c.log.warn(message);
+  try {
+    c.log.warn(message);
+  } catch {
+    /* routed mode "never throws": a logger that does must not turn a finished registration into a failure */
+  }
 }
 
 /**

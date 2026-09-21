@@ -519,11 +519,28 @@ describe("droppedByRepair (#260)", () => {
   test("a file with nothing wrong reports nothing", () => {
     expect(droppedByRepair(good())).toEqual([]);
     expect(droppedByRepair(freshRouting())).toEqual([]);
-    // A missing file is the normal case, and so is a raw that is not an object at all.
-    for (const raw of [null, undefined, 42, "routing", true, [], [good()]]) expect(droppedByRepair(raw)).toEqual([]);
+    // Nothing read at all (`readRouting` never hands this over: a missing file is a fresh OBJECT).
+    expect(droppedByRepair(undefined)).toEqual([]);
     // Bookkeeping and stray keys are not configuration: none of these is reported.
     expect(droppedByRepair({ ...good(), results: [{ id: "x" }, 5, null], extra: 1, updatedAt: 5 })).toEqual([]);
     expect(droppedByRepair({ v: 1, plugins: {}, webhooks: {} })).toEqual([]);
+    // A file without `plugins` or `webhooks` at all is fine: a hand-seeded one may have only one of them.
+    expect(droppedByRepair({ v: 1 })).toEqual([]);
+    expect(droppedByRepair({ v: 1, plugins: undefined, webhooks: undefined })).toEqual([]);
+  });
+
+  test("a file that is not an object at all is said so, once", () => {
+    // Existing and parseable but the wrong shape: `readRouting` reads it as fresh, so everything in it is ignored.
+    for (const raw of [null, 42, "routing", true, [], [good()]]) expect(droppedByRepair(raw), JSON.stringify(raw)).toEqual(["the file is not an object"]);
+  });
+
+  test("a plugins or a webhooks that is not an object is said so", () => {
+    for (const bad of [null, 5, "music", true, [], [{ servers: {} }]]) {
+      expect(droppedByRepair({ v: 1, plugins: bad }), JSON.stringify(bad)).toEqual(["plugins is not an object"]);
+      expect(droppedByRepair({ v: 1, webhooks: bad }), JSON.stringify(bad)).toEqual(["webhooks is not an object"]);
+    }
+    // Both at once: two things dropped, two messages, and nothing inside either is walked.
+    expect(droppedByRepair({ v: 1, plugins: [], webhooks: "x" })).toEqual(["plugins is not an object", "webhooks is not an object"]);
   });
 
   test("a webhook entry with a stray url key reports nothing, and no message ever contains the url", () => {
@@ -534,7 +551,9 @@ describe("droppedByRepair (#260)", () => {
     // A dropped one that carried the url says which webhook, and nothing it held.
     const dropped = droppedByRepair(withWebhook({ url: URL_WITH_TOKEN, token: TOKEN, id: "x" }));
     expect(dropped).toEqual([`webhook for ${CHAN_1} is missing its ids`]);
-    // The url everywhere a value or a key can be: nothing in any message.
+    // The url in every place a person could put one -- as a key, as a value the repair drops, and as a `postTo`
+    // on a server that is otherwise kept (the one value a message shows): nothing in any message but the
+    // first 37 characters of it, which end before the token starts.
     const everywhere = {
       v: 1,
       plugins: {
@@ -544,6 +563,7 @@ describe("droppedByRepair (#260)", () => {
             [URL_WITH_TOKEN]: { commands: "all" },
             [GUILD_A]: { commands: URL_WITH_TOKEN, postTo: URL_WITH_TOKEN },
             [GUILD_B]: { commands: [URL_WITH_TOKEN] },
+            "333333333333333333": { commands: "all", postTo: URL_WITH_TOKEN },
           },
         },
         wow: URL_WITH_TOKEN,
@@ -551,9 +571,11 @@ describe("droppedByRepair (#260)", () => {
       webhooks: { [URL_WITH_TOKEN]: { url: URL_WITH_TOKEN }, [CHAN_1]: { id: URL_WITH_TOKEN, url: URL_WITH_TOKEN, guildId: URL_WITH_TOKEN } },
     };
     const messages = droppedByRepair(everywhere);
-    expect(messages.length).toBeGreaterThanOrEqual(7);
+    expect(messages.length).toBeGreaterThanOrEqual(8);
+    // The postTo on the KEPT server is among them, so the branch that shows a value was really reached.
+    const postTo = messages.filter((message) => message.includes("postTo"));
+    expect(postTo).toEqual([`plugin music: server 333333333333333333: postTo ${URL_WITH_TOKEN.slice(0, 37)}... is not a channel id`]);
     for (const message of messages) {
-      // A key that is a url shows its first 37 characters (`shown`), which is before the token starts.
       expect(message).not.toContain(TOKEN);
       expect(message).not.toContain(URL_WITH_TOKEN);
     }
@@ -587,15 +609,19 @@ describe("droppedByRepair (#260)", () => {
     /**
      * An oracle that does not look at droppedByRepair: what `repairRouting` LEFT OUT, worked out by comparing
      * its output with the raw file. A plugin that is gone; a server that is gone from a plugin that is kept; a
-     * postTo lost from a server that is kept; a webhook that is gone. (A dropped plugin's servers are not
-     * counted separately: the plugin is the thing dropped.)
+     * postTo lost from a server that is kept; a webhook that is gone; a `plugins` or `webhooks` that was there
+     * and came back empty because it was not an object; a whole file that was not an object. (A dropped
+     * plugin's servers are not counted separately: the plugin is the thing dropped.)
      */
     function leftOut(raw: unknown): string[] {
       const out: string[] = [];
-      if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return out;
+      const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+      if (raw === undefined) return out;
+      if (!isObject(raw)) return ["the file"];
       const file = raw as { plugins?: unknown; webhooks?: unknown };
       const repaired = repairRouting(raw);
-      const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+      if (file.plugins !== undefined && !isObject(file.plugins)) out.push("plugins");
+      if (file.webhooks !== undefined && !isObject(file.webhooks)) out.push("webhooks");
       if (isObject(file.plugins)) {
         for (const [name, entry] of Object.entries(file.plugins)) {
           const kept = Object.hasOwn(repaired.plugins, name) ? repaired.plugins[name] : undefined;
@@ -652,7 +678,23 @@ describe("droppedByRepair (#260)", () => {
       ["a webhook with stray keys and a non-string broken", { webhooks: { [CHAN_1]: { ...goodHook, url: URL_WITH_TOKEN, token: TOKEN, broken: 7 } } }],
       ["a webhook with a string broken", { webhooks: { [CHAN_1]: { ...goodHook, broken: "gone" } } }],
       ["everything wrong at once", { plugins: { Bad: {}, music: { servers: { x: {}, [A]: { commands: [], postTo: 1 } } } }, webhooks: { y: {}, [CHAN_1]: {} }, results: [null] }],
-      ["plugins and webhooks that are not objects (outside the kinds it reports)", { plugins: [], webhooks: "x" }],
+      ["plugins and webhooks that are not objects", { plugins: [], webhooks: "x" }],
+      ["a plugins that is null", { plugins: null }],
+      ["a webhooks that is a list", { webhooks: [goodHook] }],
+      ["a file that is an empty list", []],
+      ["a file that is null", null],
+      ["a file that is a string", "routing"],
+      ["a file that is a number", 5],
+      ["a file with only a version", { v: 1 }],
+      ["a postTo of 5 digits", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "12345" } } } } }],
+      ["a postTo of 19 digits", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "1".repeat(19) } } } } }],
+      ["a postTo of 25 digits", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "1".repeat(25) } } } } }],
+      ["a postTo of 26 digits", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "1".repeat(26) } } } } }],
+      ["a channel list of 5-digit and 25-digit ids", { plugins: { music: { servers: { [A]: { commands: ["12345", "1".repeat(25)] } } } } }],
+      ["a channel list with a 26-digit id", { plugins: { music: { servers: { [A]: { commands: ["1".repeat(26)] } } } } }],
+      ["a webhook with 25-digit ids", { webhooks: { [CHAN_1]: { ...goodHook, id: "1".repeat(25), guildId: "1".repeat(25) } } }],
+      ["a webhook with a 26-digit id", { webhooks: { [CHAN_1]: { ...goodHook, id: "1".repeat(26) } } }],
+      ["a webhook with a 26-digit guildId", { webhooks: { [CHAN_1]: { ...goodHook, guildId: "1".repeat(26) } } }],
     ];
 
     for (const [label, raw] of fixtures) {

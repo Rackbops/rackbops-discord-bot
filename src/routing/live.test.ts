@@ -871,11 +871,30 @@ describe("a home server the bot is not in (#260)", () => {
 
   test("it names every unplaced plugin, in the order they were loaded, and not the placed one", async () => {
     await placeMusicInOther();
-    const h = harness({ plugins: [...commandWorld().plugins, { name: "extra", commands: [], posts: false }] });
+    const h = harness({ plugins: [...commandWorld().plugins, { name: "extra", commands: ["extra"], posts: false }] });
     home(h);
     initRouting(h.ctx);
     await applyRouting("boot");
     expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow, extra")]);
+  });
+
+  test("a plugin with no commands has nothing to register, so it is not named", async () => {
+    await placeMusicInOther();
+    // `ticker` only posts (its announcements go to the default channel by id): it loses nothing.
+    const h = harness({ plugins: [...commandWorld().plugins, { name: "ticker", commands: [], posts: true }] });
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.warn).toEqual([NOWHERE(HOME, "wow")]);
+  });
+
+  test("no warning when the only unplaced plugin has no commands", async () => {
+    await placeMusicInOther();
+    const h = harness({ plugins: [commandWorld().plugins[0]!, { name: "ticker", commands: [], posts: true }] });
+    home(h);
+    initRouting(h.ctx);
+    expect((await applyRouting("boot")).mode).toBe("routed");
+    expect(h.logs.warn).toEqual([]);
   });
 
   test("a different home server is a different message, and is said once in its own right", async () => {
@@ -922,6 +941,26 @@ describe("a home server the bot is not in (#260)", () => {
     expect(h.logs.warn).toHaveLength(1);
     expect(h.logs.warn[0]).toContain(`the home server ${"9".repeat(37)}... is not one the bot is in`);
     expect(h.logs.warn[0]!.length).toBeLessThan(300);
+  });
+
+  test("a logger that throws on the warning does not turn a finished registration into a failure", async () => {
+    await placeMusicInOther();
+    const h = harness({
+      log: {
+        log: () => {},
+        warn: () => {
+          throw new Error("the log is closed");
+        },
+        error: () => {},
+      },
+    });
+    home(h);
+    initRouting(h.ctx);
+    // Routed mode never throws: the registration and the discovery write were already done.
+    const result = await applyRouting("boot");
+    expect(result.mode).toBe("routed");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([OTHER]);
   });
 
   test("no warning when every loaded plugin is placed", async () => {

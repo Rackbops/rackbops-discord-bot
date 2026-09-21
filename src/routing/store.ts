@@ -41,14 +41,32 @@ export function secretsPath(dataDir: string): string {
 // queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason.
 const routingMutator = createKeyedJsonMutator<RoutingFile>();
 
-// What `readRouting` has already said about a damaged file (#260). It is on the path of every command and
-// every announcement since #243, so a file with one bad entry must not write a line per command: each
-// distinct message is said once per process.
+// What `readRouting` has already said about a damaged file (#260). It is on the path of every plugin command
+// used in a server (`gateCommand`), every announcement and every join since #243, so a file with one bad
+// entry must not write a line per command: each distinct message is said once per process. (The record is
+// per process, so a problem that is fixed and then put back is not said again until a restart.)
 const said = new Set<string>();
 
 /** Forget what has been said, so a test can see the same problem reported again. */
 export function resetRoutingWarningsForTest(): void {
   said.clear();
+}
+
+/**
+ * Says what the repair of `raw` left out, each distinct message once. Log output only, so nothing in it may
+ * change what `readRouting` returns: a logger that throws is swallowed here (`readRouting` "never throws",
+ * and `gateCommand` fails open when it does, so a throw from a log line would let a restricted command run).
+ */
+function sayWhatWasIgnored(raw: unknown): void {
+  try {
+    for (const message of droppedByRepair(raw)) {
+      if (said.has(message)) continue;
+      said.add(message);
+      console.warn(`[routing] routing.json: ${message}; it is ignored`);
+    }
+  } catch {
+    /* logging must never change what is read */
+  }
 }
 
 /**
@@ -65,11 +83,7 @@ export function resetRoutingWarningsForTest(): void {
  */
 export async function readRouting(dataDir: string): Promise<RoutingFile> {
   const raw = await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing");
-  for (const message of droppedByRepair(raw)) {
-    if (said.has(message)) continue;
-    said.add(message);
-    console.warn(`[routing] routing.json: ${message}; it is ignored`);
-  }
+  sayWhatWasIgnored(raw);
   return repairRouting(raw);
 }
 

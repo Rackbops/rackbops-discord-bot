@@ -52,4 +52,3 @@ bun run check
 bun test
 ```
 Mutation checks in a detached scratch worktree, one at a time, `bun test src/routing`. **Every `bun test` with a private temp dir**: `TEMP=R:/repos/Scratch/tmp/bot-260 TMP=R:/repos/Scratch/tmp/bot-260 bun test` (create it first; #252).
-

@@ -255,23 +255,30 @@ export function repairRouting(raw: unknown): RoutingFile {
  * What `repairRouting` would drop from `raw`, as short messages that NAME each dropped thing (#260). Pure,
  * never throws, and silent: `repairRouting` stays tolerant and quiet, and `readRouting` says these once.
  *
- * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and never a
- * value: a value can be anything a person typed, and `shown` clips at 40 characters, which is before a
- * webhook token starts in any URL. A `postTo` is the one place a value is shown, and only clipped and only
- * when it is not a channel id. A webhook entry that carried a stray `url` or `token` key is not a dropped
- * entry -- the repair keeps the entry and drops the key, by design -- so it reports nothing.
+ * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and, with one
+ * exception, never a value: a value can be anything a person typed. `shown` shows at most 40 characters
+ * (a longer text is cut to its first 37 and `...`), which ends before the token starts in a Discord webhook
+ * URL (about 43 characters in at the earliest), so even a URL used as a key is cut before its token. The exception is a bad `postTo`, whose value is shown (through `shown` too) so
+ * the operator can see what was wrong with it. A webhook entry that carried a stray `url` or `token` key is
+ * not a dropped entry -- the repair keeps the entry and drops the key, by design -- so it reports nothing.
  *
  * The primitives are the repair's own (`repairScope`, `repairWebhook`, `isSnowflake` and the two regexes are
  * shared, not copied); how they are combined is mirrored from `repairPlugin` and `repairRouting`, so a
  * table-driven test in `model.test.ts` pins that this says something exactly when the repair drops one of
- * these kinds of thing. NOT reported: a `plugins` or `webhooks` that is not an object at all, a `results` entry
- * (the bot's own bookkeeping, not configuration), and a `raw` that is not an object (a missing file is the
- * normal case).
+ * these kinds of thing. Also said: a `raw` that is not an object at all (the file holds `[]` or `"x"`: a
+ * missing file is not that, `readJsonOrFresh` reads it as a fresh object), and a `plugins` or `webhooks`
+ * that is not an object. NOT reported: a `results` entry (the bot's own bookkeeping, not configuration), and
+ * an `undefined` `raw` (nothing was read, which `readRouting` never hands over).
  */
 export function droppedByRepair(raw: unknown): string[] {
   const dropped: string[] = [];
-  if (!isPlainObject(raw)) return dropped;
+  if (raw === undefined) return dropped;
+  if (!isPlainObject(raw)) {
+    dropped.push("the file is not an object");
+    return dropped;
+  }
 
+  if (raw.plugins !== undefined && !isPlainObject(raw.plugins)) dropped.push("plugins is not an object");
   if (isPlainObject(raw.plugins)) {
     for (const [name, entry] of Object.entries(raw.plugins)) {
       const plugin = `plugin ${shown(name)}`;
@@ -297,6 +304,7 @@ export function droppedByRepair(raw: unknown): string[] {
     }
   }
 
+  if (raw.webhooks !== undefined && !isPlainObject(raw.webhooks)) dropped.push("webhooks is not an object");
   if (isPlainObject(raw.webhooks)) {
     for (const [channelId, entry] of Object.entries(raw.webhooks)) {
       const webhook = `webhook for ${shown(channelId)}`;
