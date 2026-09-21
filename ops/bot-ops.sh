@@ -11,7 +11,12 @@
 # Subcommands:
 #   status        Print JSON: container running?, status line, image, realm status.
 #   logs [N]      Print the last N (default 200, max 5000) container log lines, raw.
-#   restart       Restart the bot process in place (docker compose restart). No env reload.
+#   restart       Restart the bot process in place (docker compose restart). No env reload. SSH-only
+#                 since #277: the admin panel's Restart button calls recreate instead.
+#   recreate      `up -d --force-recreate` so the bot picks up whatever is currently in .env, without
+#                 changing any key first — the same recreate env-set itself does after a save, so a
+#                 recreate a previous env-set started but the panel never saw finish (a kill, a 504)
+#                 can be re-attempted from the panel with no new value submitted (#277).
 #   env-get       Print JSON of the NON-SECRET whitelisted env keys and their EFFECTIVE values —
 #                 .env read the way compose's env_file loader reads it (see load_env_values).
 #   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
@@ -70,7 +75,8 @@ set -euo pipefail
 #    secret keys (#240, ADR-0006).
 # 4: a plugin's env keys are listed and editable whether or not the plugin is in PLUGINS, so one
 #    env-set can turn a plugin on and configure it (#256).
-readonly BOT_OPS_SCHEMA=4
+# 5: adds recreate (#277).
+readonly BOT_OPS_SCHEMA=5
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -623,6 +629,21 @@ cmd_restart() {
   echo "restarted $CONTAINER"
 }
 
+# #277: `up -d --force-recreate` on its own, with no value submitted first — so a recreate env-set
+# started but the panel never confirmed (a kill, a 504) can be finished with one click, and so the
+# admin panel's Restart button (which now calls this instead of cmd_restart) always comes back with
+# whatever is currently in .env. Shares recreate_bot() with cmd_env_set below, so the two recreates
+# can never drift.
+cmd_recreate() {
+  need docker; need jq
+  guard_no_handoff_in_progress
+  local rc=0
+  recreate_bot || rc=$?
+  jq -n --argjson ok "$([ "$rc" -eq 0 ] && echo true || echo false)" --arg log "$RECREATE_LOG" \
+        '{ok: $ok, recreated: true, log: $log}'
+  return "$rc"
+}
+
 cmd_env_get() {
   need jq
   [ -f "$ENV_FILE" ] || die "env-get: $ENV_FILE not found"
@@ -866,6 +887,26 @@ redact_secret_values() {
   printf '%s' "$text"
 }
 
+# Apply: recreate the container so the new env is loaded (a plain restart would not reload it).
+# Deliberately NO --build: a self-update (nazumods/wow#879) tags its freshly built image as the same
+# `<project>-bot:latest` compose expects, so recreating without building reuses it. Adding
+# --build here would rebuild from whatever this checkout happens to be on, silently rolling
+# the bot back to older code every time someone edits a setting.
+# #60 item 2 / #168: same stderr-only convention as cmd_restart — named right before the actual
+# recreate, not earlier, so a save that hits the "no changes" early return above never logs it.
+# Shared by cmd_env_set and cmd_recreate (#277) so the two can never drift. The relayed output
+# travels in the global RECREATE_LOG rather than being returned as a string — a bash function can't
+# return a string without a subshell, and the exit status here must be compose's.
+recreate_bot() {
+  echo "bot-ops: env file $ENV_FILE" >&2
+  local out rc=0
+  out="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
+  # The recreate's own output goes through relay_tool_output before it is echoed back: withheld if
+  # it is about the env file, scrubbed of every value env-get would not print otherwise (#240).
+  RECREATE_LOG="$(relay_tool_output "$out")"
+  return "$rc"
+}
+
 cmd_env_set() {
   need docker; need jq
   guard_no_handoff_in_progress
@@ -1062,21 +1103,12 @@ cmd_env_set() {
   chown "$target_owner" "$ENV_FILE" \
     || echo "bot-ops: warning: couldn't restore .env ownership to $target_owner" >&2
 
-  # Apply: recreate the container so the new env is loaded (a plain restart would not reload it).
-  # Deliberately NO --build: a self-update (nazumods/wow#879) tags its freshly built image as the same
-  # `<project>-bot:latest` compose expects, so recreating without building reuses it. Adding
-  # --build here would rebuild from whatever this checkout happens to be on, silently rolling
-  # the bot back to older code every time someone edits a setting.
-  # #60 item 2 / #168: same stderr-only convention as cmd_restart — named right before the actual
-  # recreate, not earlier, so a save that hits the "no changes" early return above never logs it.
-  echo "bot-ops: env file $ENV_FILE" >&2
-  local recreate_log rc=0
-  recreate_log="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
-
-  # The result names changed KEYS only (never a value), and the recreate's own output goes through
-  # relay_tool_output before it is echoed back in `log`: withheld if it is about the env file, scrubbed
-  # of every value env-get would not print otherwise (#240).
-  recreate_log="$(relay_tool_output "$recreate_log")"
+  # Apply: recreate the container so the new env is loaded (a plain restart would not reload it) —
+  # via the shared recreate_bot() helper (#277), so this and cmd_recreate can never drift. The
+  # result names changed KEYS only (never a value).
+  local rc=0
+  recreate_bot || rc=$?
+  local recreate_log="$RECREATE_LOG"
   local changed_json
   changed_json="$(printf '%s\n' "${!DIFF[@]}" | jq -R . | jq -s .)"
   jq -n --argjson changed "$changed_json" --arg backup "$backup" \
@@ -1261,6 +1293,7 @@ main() {
     status)  cmd_status ;;
     logs)    cmd_logs "$@" ;;
     restart) cmd_restart ;;
+    recreate) cmd_recreate ;;
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
     env-schema) cmd_env_schema ;;
@@ -1270,7 +1303,7 @@ main() {
     # (and its .env/compose-file preconditions) is ever reached — see the comment above readonly
     # BOT_OPS_SCHEMA. No case arm needed here; kept in the usage string below since it's still a
     # real, documented subcommand.
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|env-schema|routing-get|plugin-request|version}" ;;
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|recreate|env-get|env-set|env-schema|routing-get|plugin-request|version}" ;;
   esac
 }
 
