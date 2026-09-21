@@ -2687,6 +2687,78 @@ describe("mergePluginsView surfaces #124 admin fields", () => {
   });
 });
 
+describe("mergePluginsView surfaces #244 card fields", () => {
+  const idx = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
+    schemaVersion: 1,
+    plugins: [{ name: "music", version: "1.3.0", description: "d", ...over }],
+  });
+
+  test("env carries key, description, required, secret in manifest order", () => {
+    const music = mergePluginsView(
+      idx({
+        env: [
+          { key: "MUSIC_CALLBACK_PORT", description: "Where Spotify redirects.", required: true },
+          { key: "SPOTIFY_CLIENT_SECRET", description: "From the Spotify dashboard.", secret: true },
+        ],
+      }),
+      [],
+      "music",
+    ).plugins[0]!;
+    expect(music.env).toEqual([
+      { key: "MUSIC_CALLBACK_PORT", description: "Where Spotify redirects.", required: true, secret: false },
+      { key: "SPOTIFY_CLIENT_SECRET", description: "From the Spotify dashboard.", required: false, secret: true },
+    ]);
+  });
+
+  test("a malformed env element is skipped, a missing description is \"\"", () => {
+    const malformed = {
+      schemaVersion: 1,
+      plugins: [{ name: "music", version: "1.3.0", env: [{ key: "OK" }, null, { notKey: "x" }, { key: 5 }] }],
+    } as unknown as PluginIndex;
+    // Mutation: dropping the `key` guard crashes on the null/wrong-typed elements instead of skipping them.
+    expect(mergePluginsView(malformed, [], "music").plugins[0]!.env).toEqual([
+      { key: "OK", description: "", required: false, secret: false },
+    ]);
+  });
+
+  test("required and secret are true only for a literal true", () => {
+    const strange = {
+      schemaVersion: 1,
+      plugins: [{
+        name: "music",
+        version: "1.3.0",
+        env: [{ key: "A", required: "true" }, { key: "B", required: 1 }, { key: "C", secret: "yes" }, { key: "D", secret: 0 }],
+      }],
+    } as unknown as PluginIndex;
+    // Mutation: `!!e.required` (or similar truthy coercion) would let a non-boolean flip these true.
+    const env = mergePluginsView(strange, [], "music").plugins[0]!.env;
+    expect(env.every((e) => e.required === false && e.secret === false)).toBe(true);
+  });
+
+  test("commands keeps strings only", () => {
+    const mixed = {
+      schemaVersion: 1,
+      plugins: [{ name: "music", version: "1.3.0", commands: ["play", 5, null, "skip"] }],
+    } as unknown as PluginIndex;
+    expect(mergePluginsView(mixed, [], "music").plugins[0]!.commands).toEqual(["play", "skip"]);
+  });
+
+  test("no commands or env on the manifest entry gives empty arrays, not a crash", () => {
+    const music = mergePluginsView(idx(), [], "music").plugins[0]!;
+    expect(music.env).toEqual([]);
+    expect(music.commands).toEqual([]);
+  });
+
+  test("envKeys is unchanged by the #244 widening", () => {
+    const music = mergePluginsView(
+      idx({ env: [{ key: "MUSIC_CALLBACK_PORT" }, { key: "SPOTIFY_CLIENT_SECRET", secret: true }] }),
+      [],
+      "music",
+    ).plugins[0]!;
+    expect(music.envKeys).toEqual(["MUSIC_CALLBACK_PORT", "SPOTIFY_CLIENT_SECRET"]);
+  });
+});
+
 describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => {
   const entry = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
     schemaVersion: 1,
