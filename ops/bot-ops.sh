@@ -17,6 +17,12 @@
 #   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
 #                 remaining one against the effective value, validate the FORMAT of only the ones
 #                 that change, back up .env, apply those changes, then `up -d --force-recreate`.
+#   env-schema    Print JSON: each env-get key's validation, plus a plugin's WRITE-ONLY secret keys as
+#                 {secret, isSet} — never a value (#205, #240).
+#   routing-get   Print JSON {routing, discovery}: the bot's per-plugin routing record and what it can
+#                 see, read from its data dir. A missing or corrupt file is null (#240).
+#   plugin-request  Read one request JSON on stdin and queue it for the bot's mailbox — a plugin
+#                 update action (#105) or a routing / webhook / discovery action (#240).
 #   version       Print JSON: {"schema": N} — this script's BOT_OPS_SCHEMA, so a caller (the admin
 #                 panel) can tell an outdated deployed copy from the one it was built against (#173).
 #
@@ -34,9 +40,16 @@
 #     Dockge manages it), while .env lives under /opt/rackbops-discord-bot/<instance>/ (config dir
 #     stays outside any git checkout — see ops/README.md). Neither is set here — a caller (a panel,
 #     or you by hand) must always pass both; there is no repo-relative fallback.
-#   - Secrets (DISCORD_TOKEN, BLIZZARD_CLIENT_SECRET, GITHUB_TOKEN, ...) are deliberately absent
-#     from ALLOWED. env-get never reads them out; env-set never writes them. Edit those by hand
-#     with nano on the box.
+#   - CORE secrets (DISCORD_TOKEN, GITHUB_TOKEN, ADMIN_TOKEN, the Cloudflare tunnel / Access keys, ...)
+#     are deliberately absent from ALLOWED. env-get never reads them out; env-set never writes them.
+#     Edit those by hand with nano on the box. A PLUGIN-declared secret key (the Plugin Index marks
+#     it `secret: true` — e.g. the wow plugin's BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET) is
+#     different, on purpose (ADR-0006 decision 8): env-set may WRITE it, and nothing ever reads it
+#     back — env-get never lists it, env-schema says only that it exists and whether it is set, and
+#     no output, error or log line this script writes itself carries its value. (The text it does not
+#     write is `docker compose`'s, which env-set relays as `log` and restart relays as its output: a
+#     message about the env file is withheld whole, and anything else is scrubbed, best effort, of what
+#     env-get would not print, core credentials included — see relay_tool_output.)
 #   - env-set rebuilds .env line-by-line (no sed) so a value can never inject into the file, and
 #     comment/blank/secret lines are preserved verbatim. An indented or `export`ed line for a key
 #     being changed is rewritten in place as plain `KEY=`.
@@ -53,7 +66,9 @@ set -euo pipefail
 # a button the old script doesn't have (the #173 incident: Update now failed on debug because
 # install.sh hadn't been re-run since #121 added plugin-request).
 # 2: adds env-schema (#205).
-readonly BOT_OPS_SCHEMA=2
+# 3: adds routing-get, the four routing / webhook plugin-request actions, and write-only plugin
+#    secret keys (#240, ADR-0006).
+readonly BOT_OPS_SCHEMA=3
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -225,6 +240,38 @@ declare -A REQUIRED=(
   [ANNOUNCE_CHANNEL_ID]=1
 )
 
+# Keys the DEPLOYMENT owns — core credentials, access control, and every variable docker-compose.yml
+# interpolates. A Plugin Index manifest may never make one of these editable or listable, whether it
+# declares the key secret or not (#240): a plugin-declared secret key became writable, and a manifest
+# that named DISCORD_TOKEN (by mistake, or through a compromised index entry) would otherwise have
+# made the panel able to overwrite it — the one thing "core secrets stay uneditable" forbids.
+# load_plugin_keys drops these on the way in. Pinned against .env.example's credential-shaped keys
+# and every ${VAR} docker-compose.yml interpolates by ops/bot-ops.test.ts, so a new core secret that
+# is not added here fails a test rather than staying editable by manifest.
+#
+# A credential a first-party PLUGIN owns is deliberately NOT here: the wow plugin's
+# BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET are read by that plugin alone (nothing in the bot core
+# does), its Plugin Index entry declares both `secret: true`, and being panel-settable and write-only
+# is exactly what ADR-0006 decision 8 is for. The test pin names them in an explicit exemption list
+# and checks each sits under .env.example's "Used by the <plugin> plugin" block.
+declare -A RESERVED_KEYS=(
+  [DISCORD_TOKEN]=1
+  [GITHUB_TOKEN]=1
+  [ADMIN_TOKEN]=1
+  [CLOUDFLARE_TUNNEL_TOKEN]=1
+  [CLOUDFLARE_ACCESS_TEAM_DOMAIN]=1
+  [CLOUDFLARE_ACCESS_AUD]=1
+  [ADMIN_ALLOWED_EMAILS]=1
+  [BOT_BUILD_CONTEXT]=1
+  [ADMIN_BUILD_CONTEXT]=1
+  [BOT_ENV_FILE]=1
+  [GIT_SHA]=1
+  [BOT_OPS_CONTAINER]=1
+  [BOT_OPS_PROJECT]=1
+  [BOT_OPS_CONFIG_DIR]=1
+  [BOT_OPS_COMPOSE_FILE]=1
+)
+
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
 # "<container>-next" before it takes the canonical name over. Recreating or restarting the
 # ORIGINAL while that container exists races retireOriginal's own stop/remove/rename and can leave
@@ -300,9 +347,13 @@ readonly ENV_LINE_RE='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)
 #     honest reading, and saving that key rewrites it unquoted — which repairs the file.
 # Deliberately NOT modelled, though compose does these too: an inline ` # comment`, `${VAR}`
 # interpolation, whitespace around the `=`, a `KEY: value` colon separator, and backslash escapes
-# inside double quotes. Nothing env-set writes can produce them (no ALLOWED regex admits `#`, `$`,
-# `:`, `\`, or whitespace); a hand-edit that does shows raw in the panel and normalises on the
-# next save of that key, as before.
+# inside double quotes. Apart from PLUGIN_INDEX_URL (a URL, so it admits `:`, `#` and `$`), no STATIC
+# ALLOWED regex admits `#`, `$`, `:`, `\`, or whitespace, so nothing env-set writes for those keys can
+# produce them; a hand-edit that does shows raw in the panel and normalises on the next save of that
+# key, as before. A PLUGIN key's own manifest `format` can admit them (the shipped wow client keys use
+# `^\S+$`, which allows `#`, `$`, `\` and quotes) — but env-set refuses a `$` or a quote in ANY key's
+# value, because compose acts on those (see the guard in cmd_env_set), and writes a `#` or `\`
+# verbatim; this script's own stored/compared reading of a value stays the raw text.
 # A bash `read` loop rather than grep on purpose: Git Bash's grep drops "\r" silently, which
 # would let the CR handling pass its test on a Windows dev box even with the trim deleted.
 declare -A ENV_VALUES=()
@@ -336,22 +387,38 @@ env_value() {
 # array IS top-level `.plugins`; it is also a different file from the bot's `/app/data/state.json`.
 readonly PLUGIN_INDEX_PATH='/app/data/plugins/index.json'
 readonly PLUGIN_STATE_PATH='/app/data/plugins/state.json'
+# The two files routing-get reads (ADR-0006): the bot's routing record and what it can see. The
+# bot's webhook store is deliberately not among them, and this script never opens it.
+readonly ROUTING_PATH='/app/data/routing.json'
+readonly DISCOVERY_PATH='/app/data/discovery.json'
 
 # The env keys the INSTALLED plugins declare — merged into env-get's listing and env-set's
 # whitelist so the panel manages a plugin's own keys (e.g. WARBANDEER_INGEST_PORT) without this
-# script hand-mirroring each plugin. `secret` keys are dropped entirely — never listed, never
-# editable, exactly like the core secrets. Manifest order is preserved (PLUGIN_KEY_ORDER);
+# script hand-mirroring each plugin. Manifest order is preserved (PLUGIN_KEY_ORDER);
 # PLUGIN_FORMAT / PLUGIN_REQUIRED carry each key's validation.
+#
+# A `secret` key is tracked in a SEPARATE set (PLUGIN_SECRET_*) and never enters PLUGIN_KEY_ORDER /
+# PLUGIN_FORMAT / PLUGIN_REQUIRED (#240, ADR-0006 decision 8): those are what env-get lists, so
+# keeping the secret keys out of them is what makes it structurally impossible for env-get to emit
+# one. A secret key is never listed and never read back, but env-set may write it.
 PLUGIN_KEY_ORDER=()
 declare -A PLUGIN_FORMAT=()
 declare -A PLUGIN_REQUIRED=()
+PLUGIN_SECRET_ORDER=()
+declare -A PLUGIN_SECRET_FORMAT=()
+declare -A PLUGIN_SECRET_REQUIRED=()
+# Every key ANY plugin in the index declares secret, enabled or not: such a key is never listed as a
+# plain one, whichever plugin declares it plain. (PLUGIN_SECRET_FORMAT is the editable subset.)
+declare -A PLUGIN_SECRET_ANY=()
 # "none" (no plugins enabled — no docker read attempted), "ok", or "index unavailable" (the bot
 # isn't running or hasn't cached the index yet — env-get then shows static keys only, never errors).
 PLUGIN_KEYS_STATUS="none"
 
-# Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED from the container's cached index,
-# restricted to the plugins named in this instance's own PLUGINS value. Requires load_env_values to
-# have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
+# Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED (the listable, editable plain keys) and
+# PLUGIN_SECRET_* (the editable secret keys) from the container's cached index, restricted to the
+# plugins named in this instance's own PLUGINS value — except that PLUGIN_SECRET_ANY, the set of keys
+# that must never be listed, is filled from EVERY plugin in the index (#240). Requires
+# load_env_values to have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
 # would lose the globals it sets to a subshell — so it reads docker's output into a variable and
 # parses it via a here-string. No plugins enabled → returns immediately WITHOUT touching docker, so
 # an instance with no plugins pays nothing (and every pre-#101 test, none of which set PLUGINS, sees
@@ -360,8 +427,12 @@ load_plugin_keys() {
   PLUGIN_KEY_ORDER=()
   PLUGIN_FORMAT=()
   PLUGIN_REQUIRED=()
+  PLUGIN_SECRET_ORDER=()
+  PLUGIN_SECRET_FORMAT=()
+  PLUGIN_SECRET_REQUIRED=()
+  PLUGIN_SECRET_ANY=()
   PLUGIN_KEYS_STATUS="none"
-  local plugins_val names_json raw rows key format required secret
+  local plugins_val names_json raw rows key format required secret enabled
   plugins_val="$(env_value PLUGINS)"
   [ -n "$plugins_val" ] || return 0
   PLUGIN_KEYS_STATUS="ok"
@@ -373,10 +444,22 @@ load_plugin_keys() {
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
   fi
-  # Each env key as four RAW lines (key, format, required, secret), NOT @tsv: jq's TSV encoder
-  # escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash reader
-  # would then see it doubled; raw lines pass the regex through verbatim (a `format` never spans
-  # lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
+  # Each env key as five RAW lines (key, format, required, secret, enabled), NOT @tsv: jq's TSV
+  # encoder escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash
+  # reader would then see it doubled; raw lines pass the regex through verbatim (a `format` never
+  # spans lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
+  #
+  # The reader takes exactly five lines per row, so a field that itself held a line break would
+  # re-frame every later row — a hostile manifest could then forge a plain row for another plugin's
+  # secret key and have env-get list its stored value (#240). So a key holding a CR or LF, or a
+  # `format` or `required` doing so (or a `format` that is missing or not a string), makes the entry
+  # unusable inside the program, and `secret` is normalised there too: only an absent / null / false
+  # `secret` means "not secret", ANY other value (a string, a number, an array) counts as secret —
+  # fail closed, never fail open. An unusable entry that CLAIMS secret is not forgotten: it still
+  # marks its key secret (an `enabled` of "false" and an empty format, so it can never be edited or
+  # validated against), otherwise another plugin declaring the same key plain would get it listed.
+  # The `enabled` column carries whether the plugin is in PLUGINS: a key ANY plugin in the index
+  # declares secret is secret for every plugin, but only an enabled plugin's keys are ever editable.
   #
   # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
   # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
@@ -388,25 +471,59 @@ load_plugin_keys() {
   # state.json; without it a valid-JSON-but-wrong-shape cached index crashes ops (a D3 violation).
   if ! rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
     (.index.plugins // [])
-    | map(select((type == "object") and (.name as $n | $names | index($n))))
-    | .[].env[]?
-    | select((type == "object") and (.key | type == "string") and (.format | type == "string"))
-    | (.key, .format, (.required // false | tostring), (.secret // false | tostring))
+    | map(select(type == "object"))
+    | .[]
+    | (.name as $n | (($names | index($n)) != null)) as $on
+    | .env[]?
+    | select((type == "object") and (.key | type == "string") and (.key | test("[\\r\\n]") | not))
+    | (.required // false | tostring) as $req
+    | (if (.secret // false) == false then "false" else "true" end) as $sec
+    | ((.format | type == "string" and (test("[\\r\\n]") | not)) and ($req | test("[\\r\\n]") | not)) as $wellformed
+    | if $wellformed then (.key, .format, $req, $sec, ($on | tostring))
+      elif $sec == "true" then (.key, "", "false", "true", "false")
+      else empty end
   ' 2>/dev/null)"; then
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
   fi
-  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret; do
-    # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
-    # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a
-    # CRLF-saved .env — else the key names and the `secret`/`required` flags are all "…\r".
+  # Two passes over the same rows (#240). Pass 1 collects the SECRET keys, pass 2 the plain ones, so a
+  # key that ANY plugin in the index declares secret — enabled or not — is secret everywhere: another
+  # plugin declaring the same key non-secret must not get it listed, or env-get would emit a value one
+  # manifest called secret. In both passes a key the deployment owns (RESERVED_KEYS) is dropped
+  # whatever the manifest says, and a secret key that collides with a static ALLOWED key is ignored
+  # (static wins, exactly as for a plain plugin key).
+  # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
+  # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a
+  # CRLF-saved .env — else the key names and the `secret`/`required` flags are all "…\r".
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
     key="${key%$'\r'}"
     format="${format%$'\r'}"
     required="${required%$'\r'}"
     secret="${secret%$'\r'}"
+    enabled="${enabled%$'\r'}"
+    [ "$secret" = "true" ] || continue
     [ -n "$key" ] || continue
-    [ "$secret" = "true" ] && continue                # secret keys: never listed or edited
-    [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue   # a key declared twice: first wins
+    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-editable
+    [[ -n "${ALLOWED[$key]+x}" ]] && continue                # a static key: static wins
+    PLUGIN_SECRET_ANY["$key"]=1                              # secret for every plugin, enabled or not
+    [ "$enabled" = "true" ] || continue                      # only an ENABLED plugin's secret key is editable
+    [[ -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] && continue   # a key declared twice: first wins
+    PLUGIN_SECRET_ORDER+=("$key")
+    PLUGIN_SECRET_FORMAT["$key"]="$format"
+    PLUGIN_SECRET_REQUIRED["$key"]="$required"
+  done <<< "$rows"
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
+    key="${key%$'\r'}"
+    format="${format%$'\r'}"
+    required="${required%$'\r'}"
+    secret="${secret%$'\r'}"
+    enabled="${enabled%$'\r'}"
+    [ -n "$key" ] || continue
+    [ "$enabled" = "true" ] || continue                      # a plain key of a plugin that is not enabled is never listed
+    [ "$secret" = "true" ] && continue                       # a secret key: tracked in PLUGIN_SECRET_*, never here
+    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-listable or editable
+    [[ -n "${PLUGIN_SECRET_ANY[$key]+x}" ]] && continue      # another plugin declares it secret: secret wins
+    [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue          # a key declared twice: first wins
     PLUGIN_KEY_ORDER+=("$key")
     PLUGIN_FORMAT["$key"]="$format"
     PLUGIN_REQUIRED["$key"]="$required"
@@ -467,7 +584,16 @@ cmd_restart() {
   # stdout is JSON the panel parses (#101), so a stray stdout line here would be echoed back and
   # rejected the same way.
   echo "bot-ops: env file $ENV_FILE" >&2
-  BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" restart 2>&1
+  # compose reads .env to restart, and quotes a line it cannot parse; its output is relayed to the panel,
+  # so it goes through relay_tool_output, as env-set's `log` does (#240). Captured rather than streamed
+  # for that reason -- so someone running this by hand sees compose's output when it has finished, not
+  # as it goes (the panel never showed a restart's output before it ended, and shows none of it after a
+  # timeout). A failed restart still fails: what is relayed is printed, the exit status is compose's, and
+  # "restarted" is not claimed.
+  local out rc=0
+  out="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" restart 2>&1)" || rc=$?
+  if [ -n "$out" ]; then printf '%s\n' "$(relay_tool_output "$out")"; fi
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
   echo "restarted $CONTAINER"
 }
 
@@ -512,23 +638,36 @@ cmd_env_get() {
 # env-get's exact loading sequence (need jq, the .env-exists check, load_env_values, load_plugin_keys,
 # the same "index unavailable" stderr note) so the two subcommands can never disagree about which
 # keys exist or their order.
+#
+# #240: after those rows come the installed plugins' WRITE-ONLY secret keys, each
+# {pattern, required, source: "plugin", secret: true, isSet} — that the key exists, that it is secret,
+# and whether it is set, never what it holds. `isSet` is tested here in bash (`[ -n "$(env_value …)" ]`)
+# and only the resulting true/false is handed to jq, so the value never reaches jq's argv either.
+# Every non-secret entry is byte-for-byte what it was: the two extra fields are emitted only when the
+# row's `secret` column is "true".
 cmd_env_schema() {
   need jq
   [ -f "$ENV_FILE" ] || die "env-schema: $ENV_FILE not found"
-  local key
+  local key is_set
   load_env_values
   load_plugin_keys
-  # Build the object with jq positional args in groups of four -- key, pattern, required, source --
-  # so a pattern's backslashes and quotes pass through untouched (never string-interpolate a regex
-  # into a jq program).
+  # Build the object with jq positional args in groups of six -- key, pattern, required, source,
+  # secret, isSet -- so a pattern's backslashes and quotes pass through untouched (never
+  # string-interpolate a regex into a jq program). Non-secret rows pass `false false` for the last two.
   local args=()
   for key in "${ENV_KEY_ORDER[@]}"; do
-    args+=("$key" "${ALLOWED[$key]}" "$([[ -n "${REQUIRED[$key]+x}" ]] && echo true || echo false)" core)
+    args+=("$key" "${ALLOWED[$key]}" "$([[ -n "${REQUIRED[$key]+x}" ]] && echo true || echo false)" core false false)
   done
   if [ "${#PLUGIN_KEY_ORDER[@]}" -gt 0 ]; then
     for key in "${PLUGIN_KEY_ORDER[@]}"; do
       [[ -n "${ALLOWED[$key]+x}" ]] && continue   # a plugin key colliding with a static one: static wins, exactly as env-get
-      args+=("$key" "${PLUGIN_FORMAT[$key]}" "${PLUGIN_REQUIRED[$key]:-false}" plugin)
+      args+=("$key" "${PLUGIN_FORMAT[$key]}" "${PLUGIN_REQUIRED[$key]:-false}" plugin false false)
+    done
+  fi
+  if [ "${#PLUGIN_SECRET_ORDER[@]}" -gt 0 ]; then
+    for key in "${PLUGIN_SECRET_ORDER[@]}"; do
+      if [ -n "$(env_value "$key")" ]; then is_set=true; else is_set=false; fi
+      args+=("$key" "${PLUGIN_SECRET_FORMAT[$key]}" "${PLUGIN_SECRET_REQUIRED[$key]:-false}" plugin true "$is_set")
     done
   fi
   if [ "$PLUGIN_KEYS_STATUS" = "index unavailable" ]; then
@@ -537,11 +676,164 @@ cmd_env_schema() {
   # `_nwise`/`nwise` is NOT a real jq builtin -- it's a documentation example jq's own manual shows
   # as something you could define yourself, never compiled into the interpreter (confirmed: absent
   # from `jq -n 'builtins'` on 1.8.2, and `_nwise(4)` fails "not defined" on a plain CLI invocation
-  # with no such def in scope). Group the flat positional array into 4s by index/slice instead --
-  # portable back to jq 1.5, and avoids the plan's original `_nwise(4)` call entirely (#205 deviation).
+  # with no such def in scope). Group the flat positional array into 6s by index/slice instead --
+  # portable back to jq 1.5, and avoids the plan's original `_nwise` call entirely (#205 deviation;
+  # only the stride changed in #240).
   jq -n --args \
-    '[$ARGS.positional as $a | range(0; ($a|length)/4) | $a[.*4:.*4+4] | {(.[0]): {pattern: .[1], required: (.[2] == "true"), source: .[3]}}] | add // {}' \
+    '[$ARGS.positional as $a | range(0; ($a|length)/6) | $a[.*6:.*6+6] | {(.[0]): ({pattern: .[1], required: (.[2] == "true"), source: .[3]} + (if .[4] == "true" then {secret: true, isSet: (.[5] == "true")} else {} end))}] | add // {}' \
     -- "${args[@]}"
+}
+
+# What may be echoed of a submitted key name that is not editable: only something shaped like an
+# environment variable's name — upper-case, at most 40 characters, which every real key here is.
+# A multi-line value (a PEM block, say) is read one line at a time, so a later line's text before its
+# first `=` arrives here as a "key"; naming it would echo a fragment of a secret into an error that the
+# panel's server logs. Anything else is not shown.
+echo_key() {
+  if [[ "$1" =~ ^[A-Z][A-Z0-9_]{0,39}$ ]]; then printf '%s' "$1"; else printf '%s' "(not shown)"; fi
+}
+
+# WHAT IS RELAYED OF ANOTHER TOOL'S OUTPUT. Nothing this script writes itself carries a value; the one
+# way a value can still reach an output is a message from a tool it does not own -- `docker compose`
+# quoting part of a .env line it refused to parse (an unterminated quote pasted by hand, say) -- which
+# env-set relays as `log` and restart relays as its output. Two layers, because the second alone cannot
+# be made exact (review round 5): it has to guess which part of a line compose would print, and compose
+# reads .env by its own rules -- a key ends at `=` OR `:`, `export ` is dropped, and its whitespace
+# includes U+0085 and U+00A0 -- so any guess made with bash's rules misses wherever the two disagree.
+#
+#   1. relay_tool_output WITHHOLDS, whole, any output that is ABOUT the env file: it names the file
+#      ($ENV_FILE) or says "env file". The premise: compose-go's dotenv reader wraps every parse error
+#      as `failed to read <path>: ...` (compose-spec/compose-go `main`, dotenv/format.go, read on
+#      2026-09-21 -- upstream main, NOT the compose installed on any host, which was never run here), so
+#      the messages most likely to quote the file's contents name it. Anything that does not name it
+#      goes to layer 2, because any message can quote a value. What is relayed instead of a withheld
+#      message is this script's own sentence: it names no path, claims no cause and no remedy (it is
+#      the same for a failed run and a successful one, and the script never checked which it saw), and
+#      carries nothing from compose's output but the line numbers (digits only).
+#   2. Everything else goes through redact_secret_values, best effort, as before.
+mentions_env_file() {
+  local text="$1" lower="${1,,}"
+  [[ "$text" == *"$ENV_FILE"* || "$lower" == *"env file"* ]]
+}
+
+relay_tool_output() {
+  local text="$1"
+  if mentions_env_file "$text"; then
+    local lines
+    # Each "line N" once, in numeric order. `|| true`: no "line N" in the text is fine, and must not abort
+    # the script under pipefail.
+    lines="$(printf '%s\n' "$text" | grep -oE 'line [0-9]+' | LC_ALL=C sort -t ' ' -k2,2n -u | tr '\n' ',' || true)"
+    lines="${lines%,}"
+    printf '%s' "docker compose's output mentioned an env file, so it is withheld: such a message can quote the file's contents.${lines:+ It named ${lines//,/, }.} Run the same command on the host to see it."
+    return 0
+  fi
+  redact_secret_values "$text"
+}
+
+# Trim, from both ends of $1, what COMPOSE's .env reader treats as whitespace: ASCII blanks plus U+0085
+# and U+00A0 (matched as their UTF-8 bytes, whatever the locale). Result in REPLY -- no subshell, since
+# this runs several times per line of .env, so the return channel cannot be `local`; the script has no
+# bare `read`, so nothing else touches REPLY.
+compose_trim() {
+  local s="$1" before
+  local nbsp=$'\xc2\xa0' nel=$'\xc2\x85'
+  while :; do
+    before="$s"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    s="${s#"$nbsp"}"; s="${s#"$nel"}"
+    s="${s%"$nbsp"}"; s="${s%"$nel"}"
+    if [ "$s" = "$before" ]; then break; fi
+  done
+  REPLY="$s"
+}
+
+# Replace, in the text given, each text that looks like a .env value env-get would NOT print with
+# "[redacted]" (a best-effort guess, see the end of this comment).
+#
+# What is scrubbed is decided from .env and the static ALLOWED table ALONE, never from the Plugin Index.
+# The index is unavailable exactly when the bot is down, which is when compose is most likely to be
+# complaining: a scrub that leaned on it scrubbed nothing when it mattered (#240, review round 4). Only
+# a static ALLOWED key written the plain way (`KEY=value`) is printable -- those are the keys env-get
+# always lists; every other line is scrubbed: a core credential, a plugin's secret, a plugin's plain
+# setting, a key nobody knows. Scrubbing a plain setting costs nothing; missing a secret does.
+#   - A line written the plain way (`KEY=value`, which compose reads the same way this script does)
+#     gives its value. ANY OTHER line -- another syntax compose accepts (`KEY: value`, `KEY = value`),
+#     one it rejects (`export MY!KEY=...`), or no definition at all (the second line of a pasted
+#     multi-line secret) -- gives several candidate texts, because which part of it a tool prints is
+#     anyone's guess: the whole line; the line without a leading `export`; what follows its first `=`;
+#     what follows its first `:`. Every text is trimmed of compose's whitespace (see compose_trim) and
+#     also tried without an opening quote (an unterminated value is printed from its quote on) and
+#     without both quotes (the way load_env_values reads it). Comments are left alone.
+#   - EVERY definition of a key counts, not only the last.
+#   - So do the values this invocation read BEFORE it rewrote the file (ENV_VALUES -- a replaced value
+#     is no longer in the file). The values being written need no list: the file already holds them.
+#   - LONGEST FIRST. Replacing a short text first cuts a longer one that contains it in two, and the
+#     longer one then no longer matches: whoever can set one secret could unmask another (round 4).
+#   - A text shorter than REDACT_MIN_LENGTH is left alone: those ("us", a port number) are what would
+#     make the relayed text unreadable. That rests on an assumption nothing enforces -- that nobody
+#     stores a credential shorter than six characters -- so such a credential is NOT scrubbed.
+#   - Texts are matched as literals (quoted inside ${...//.../...}, so a `*` or `[` in one is not a glob).
+# Best effort by nature: a tool that prints a value transformed (escaped, truncated) is not caught, and
+# a line written in a syntax neither this list nor layer 1 anticipates is not either.
+readonly REDACT_MIN_LENGTH=6
+redact_secret_values() {
+  local text="$1" line key rest val quote
+  local -a found=() parts=()
+  if [ -f "$ENV_FILE" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      compose_trim "$line"; rest="$REPLY"
+      if [ -z "$rest" ] || [[ "$rest" == \#* ]]; then continue; fi
+      if [[ "$line" =~ $ENV_LINE_RE ]]; then
+        # written the plain way, which compose reads the same way: the value is what follows the `=`
+        key="${BASH_REMATCH[2]}"
+        if [[ -n "${ALLOWED[$key]+x}" ]]; then continue; fi
+        parts=("${BASH_REMATCH[3]}")
+      else
+        # written some other way, or no definition at all: which part a tool prints is anyone's guess
+        parts=("$rest")
+        if [[ "$rest" =~ ^export[[:space:]]+(.*)$ ]]; then
+          rest="${BASH_REMATCH[1]}"
+          parts+=("$rest")
+        fi
+        if [[ "$rest" == *=* ]]; then parts+=("${rest#*=}"); fi
+        if [[ "$rest" == *:* ]]; then parts+=("${rest#*:}"); fi
+      fi
+      for val in "${parts[@]}"; do
+        compose_trim "$val"; val="$REPLY"
+        found+=("$val")
+        quote="${val:0:1}"
+        if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+          val="${val:1}"
+          found+=("$val")
+          if [[ -n "$val" && "${val: -1}" == "$quote" ]]; then found+=("${val:0:${#val}-1}"); fi
+        fi
+      done
+    done < "$ENV_FILE"
+  fi
+  # What env-set read before it rewrote the file (restart loads no values, so this is empty there).
+  if [ "${#ENV_VALUES[@]}" -gt 0 ]; then
+    for key in "${!ENV_VALUES[@]}"; do
+      if [[ -z "${ALLOWED[$key]+x}" ]]; then found+=("${ENV_VALUES[$key]}"); fi
+    done
+  fi
+  if [ "${#found[@]}" -gt 0 ]; then
+    local sorted tab
+    tab="$(printf '\t')"
+    # "<length> TAB <text>" per line, longest first. No text holds a newline (each is part of one line of
+    # .env, or was refused by env-set's line-break check), and everything after the first tab is the text.
+    sorted="$(
+      for val in "${found[@]}"; do
+        if (( ${#val} >= REDACT_MIN_LENGTH )); then printf '%d\t%s\n' "${#val}" "$val"; fi
+      done | LC_ALL=C sort -t "$tab" -k1,1nr
+    )"
+    while IFS= read -r line; do
+      val="${line#*"$tab"}"
+      if [ -n "$val" ]; then text="${text//"$val"/[redacted]}"; fi
+    done <<< "$sorted"
+  fi
+  printf '%s' "$text"
 }
 
 cmd_env_set() {
@@ -586,10 +878,13 @@ cmd_env_set() {
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "env-set: malformed input line (need KEY=VALUE)"
     # Whitelist membership is checked up front whether or not the value changes — that's a
     # question of authority (may the panel touch this key at all?), not of format. A key is
-    # editable if it is a static ALLOWED key OR an installed plugin's own non-secret key; a
-    # plugin's `secret` key was dropped from PLUGIN_FORMAT, so it is refused here exactly like a
-    # core secret.
-    [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" ]] || die "env-set: '$key' is not an editable key"
+    # editable if it is a static ALLOWED key, an installed plugin's own key, OR (#240) an installed
+    # plugin's `secret` key — write-only, see PLUGIN_SECRET_* above. A CORE secret is in none of
+    # those sets (and load_plugin_keys never lets a manifest add a reserved key), so it is refused
+    # here exactly as before. The message names the key (when it looks like a variable name — see
+    # echo_key), never a value.
+    [[ -n "${ALLOWED[$key]+x}" || -n "${PLUGIN_FORMAT[$key]+x}" || -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] \
+      || die "env-set: '$(echo_key "$key")' is not an editable key"
     [[ -n "${SUBMITTED[$key]+x}" ]] || submitted_order+=("$key")
     SUBMITTED["$key"]="$val" # a key repeated on stdin: last wins, like .env itself
   done
@@ -602,16 +897,47 @@ cmd_env_set() {
   # changing was never this script's to judge. A no-op must not restart the bot.
   load_env_values
   declare -A DIFF=()
-  local fmt is_required
+  local fmt is_required is_secret
   if [ "${#SUBMITTED[@]}" -gt 0 ]; then
     for key in "${submitted_order[@]}"; do
       val="${SUBMITTED[$key]}"
-      [ "$val" != "$(env_value "$key")" ] || continue
+      is_secret=""
+      [[ -z "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] || is_secret=1
+      if [ -z "$is_secret" ]; then
+        [ "$val" != "$(env_value "$key")" ] || continue
+      else
+        # A plugin's secret key is write-only, so its stored value is never something a caller may
+        # learn — and "no change" would tell it: a submitted guess that comes back with nothing
+        # changed IS the stored value (a read oracle, one guess at a time). So a submitted secret is
+        # ALWAYS treated as a change and written, and the result says so whatever it held. The one
+        # exception is a blank for a key that is already unset: that reveals only what `isSet` in
+        # env-schema already reveals.
+        { [ -n "$val" ] || [ -n "$(env_value "$key")" ]; } || continue
+      fi
+      # A CR in a value would let it start a new line in .env (an LF cannot reach here: stdin is read a
+      # line at a time, so a value never holds one) — for a secret
+      # key the format regex may be permissive, so this is checked here, for every key, before the
+      # format. The message names the key, never the value.
+      [[ "$val" != *$'\r'* ]] || die "env-set: value for '$key' is invalid"
+      # compose reads a .env value as SYNTAX, and a manifest `format` may admit it (the shipped `^\S+$`
+      # does), as does the static PLUGIN_INDEX_URL regex: a `$` starts an interpolation, so
+      # `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would hand the plugin — and whoever it displays the value
+      # to — a core secret, and `PLUGIN_INDEX_URL=https://host/?t=${DISCORD_TOKEN}` would send it to
+      # that host; a quote can open a multi-line or unterminated value, which swallows the lines after
+      # it and stops compose loading the file at all. So a value may not contain `$` or a quote
+      # ANYWHERE (not just leading: compose trims a wider set of whitespace than bash's `[[:space:]]`,
+      # U+0085 and U+00A0 among it, before it looks for a quote). Refused for every key, secret or
+      # plain, static or plugin, and never quoting the value. No shipped key needs either character.
+      [[ "$val" != *'$'* && "$val" != *'"'* && "$val" != *"'"* ]] \
+        || die "env-set: value for '$key' may not contain a dollar sign or a quote"
       # Format + required-ness come from the static ALLOWED set, or from the installed plugin's
       # manifest entry for a plugin-owned key (a static key wins if somehow both name it).
       if [[ -n "${ALLOWED[$key]+x}" ]]; then
         fmt="${ALLOWED[$key]}"
         is_required="${REQUIRED[$key]+x}"
+      elif [ -n "$is_secret" ]; then
+        fmt="${PLUGIN_SECRET_FORMAT[$key]}"
+        if [ "${PLUGIN_SECRET_REQUIRED[$key]:-false}" = "true" ]; then is_required="x"; else is_required=""; fi
       else
         fmt="${PLUGIN_FORMAT[$key]}"
         if [ "${PLUGIN_REQUIRED[$key]:-false}" = "true" ]; then is_required="x"; else is_required=""; fi
@@ -714,6 +1040,10 @@ cmd_env_set() {
   local recreate_log rc=0
   recreate_log="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
 
+  # The result names changed KEYS only (never a value), and the recreate's own output goes through
+  # relay_tool_output before it is echoed back in `log`: withheld if it is about the env file, scrubbed
+  # of every value env-get would not print otherwise (#240).
+  recreate_log="$(relay_tool_output "$recreate_log")"
   local changed_json
   changed_json="$(printf '%s\n' "${!DIFF[@]}" | jq -R . | jq -s .)"
   jq -n --argjson changed "$changed_json" --arg backup "$backup" \
@@ -723,49 +1053,169 @@ cmd_env_set() {
   return "$rc"
 }
 
-# #105: queue a plugin-update request the bot's mailbox will consume. Reads the request JSON on stdin
+# #240: the bot's routing record and what it can see, as one JSON object — {routing, discovery} —
+# read from its data dir the way cmd_status reads state.json. A file that does not exist yet, is
+# empty, is not one JSON object, or will not parse is `null`: never an error, never partial output
+# (the posture cmd_status takes for state.json). Only those two files are ever opened here.
+#
+# Neither file is meant to hold a webhook URL or token, but both are read back from disk a person may
+# have edited, so each is scrubbed on the way out: any member named url / token / secret / password is
+# dropped (the routing model has none — src/routing/model.ts drops them the same way on its own read),
+# and any Discord webhook URL inside a string is replaced by "[redacted]" (a bare `webhooks/<id>/<token>`
+# tail by `webhooks/[redacted]`) — in keys as well as values, since that scrub runs on the compact
+# JSON text. It is best effort: see the routing-get gotcha in CONTEXT.md for what it does not catch. The two
+# documents reach the final jq over a pipe (a builtin printf, so no argv size limit: a discovery.json
+# for a large server can run to tens of KB).
+readonly ROUTING_SCRUB_JQ='
+  if length == 1 and (.[0] | type) == "object"
+  then (.[0]
+        | walk(if type == "object" then with_entries(select(.key | test("^(url|token|secret|password)$"; "i") | not)) else . end)
+        | tojson
+        | gsub("https?://[^\"\\\\ ]*webhooks/[^\"\\\\ ]*"; "[redacted]"; "i")
+        | gsub("webhooks/[0-9]+/[A-Za-z0-9_.~%-]+"; "webhooks/[redacted]"; "i")
+        | fromjson)
+  else null end'
+# Reads one file from the container into SCRUBBED (a global, so it runs in the CURRENT shell like
+# load_plugin_keys: called through a command substitution, `set -e` would not apply inside it and the
+# `|| true` below — which a real `docker exec … cat` of a file that isn't there needs, since it exits 1
+# and pipefail is on — could be dropped without anyone noticing).
+SCRUBBED="null"
+read_scrubbed_json() {
+  SCRUBBED="$(docker exec "$CONTAINER" cat "$1" 2>/dev/null | jq -c -s "$ROUTING_SCRUB_JQ" 2>/dev/null || true)"
+  [ -n "$SCRUBBED" ] || SCRUBBED="null"
+}
+cmd_routing_get() {
+  need docker; need jq
+  local routing discovery
+  read_scrubbed_json "$ROUTING_PATH"
+  routing="$SCRUBBED"
+  read_scrubbed_json "$DISCOVERY_PATH"
+  discovery="$SCRUBBED"
+  { printf '%s\n' "$routing"; printf '%s\n' "$discovery"; } | jq -s '{routing: .[0], discovery: .[1]}'
+}
+
+# What may be echoed back of a request field that failed validation: only a short printable string
+# (40 characters — every legitimate plugin name, version, timestamp and day count fits, and a webhook
+# URL, whose token alone is longer, does not). Anything else — in particular a value a caller put in
+# the wrong field — is not shown, so a rejected request can never become a log line carrying a secret.
+echo_safe() {
+  if [[ "$1" =~ ^[[:print:]]{0,40}$ ]]; then printf '%s' "$1"; else printf '%s' "(not shown)"; fi
+}
+
+# A top-level field of the JSON on stdin as a STRING — or "" when it is missing, not a string, or
+# holds a control character. The last matters: `$(…)` drops trailing newlines, so a value ending in
+# one ("12345\n") would otherwise validate as "12345" while the request file kept the newline.
+json_string_field() {
+  jq -r --arg f "$1" 'if (.[$f] | type) == "string" and (.[$f] | test("[\\x00-\\x1f]") | not) then .[$f] else "" end'
+}
+
+# #105: queue a plugin request the bot's mailbox will consume. Reads the request JSON on stdin
 # (the admin panel's POST /api/plugins/request, which fills `requestedBy` from the verified Access
-# identity), validates action/plugin/version/at/days, and writes it into the bot's
-# data/plugins/requests/ so the bot — the sole writer of state.json — applies it on its next tick.
-# This is the FIRST docker-exec WRITE and the FIRST `-u bun` in this script: every other exec is a
-# read-only root `cat`, but the write MUST be `-u bun` (the container runs as root for the socket, so
-# a root-created requests/ dir would be un-writable by the bun bot — it could then neither delete a
-# consumed file nor create rejected/). The filename is script-controlled (epoch-ms + validated action
-# + a nonce, so two same-ms same-action requests don't collide); the untrusted JSON is only ever the
-# `cat >` body (a redirect, not eval), never the command or the path.
+# identity), validates it per action, and writes it into the bot's data/plugins/requests/ so the bot —
+# the sole writer of state.json and of its routing record — applies it on its next tick.
+# The five plugin-update actions (update-now, schedule, remind, skip, cancel) are #105's; #240 adds
+# routing-set, webhook-add, webhook-remove and discovery-refresh (ADR-0006), each validated before the
+# file is written. This is the FIRST docker-exec WRITE and the FIRST `-u bun` in this script: every
+# other exec is a read-only root `cat`, but the write MUST be `-u bun` (the container runs as root for
+# the socket, so a root-created requests/ dir would be un-writable by the bun bot — it could then
+# neither delete a consumed file nor create rejected/). The filename is script-controlled (epoch-ms +
+# validated action + a nonce, so two same-ms same-action requests don't collide); the untrusted JSON is
+# only ever the `cat >` body (a redirect, not eval), never the command or the path. The file is written
+# under a temp name and renamed into place, so the bot never sees it half-written (see the write below).
+#
+# THE PAYLOAD MAY NOW HOLD A SECRET: a webhook-add request carries a Discord webhook URL, which is a
+# credential. So it travels on STDIN only — never as an argument (argv is world-readable in `ps` and
+# lands in docker's own command line) — the fields it holds are matched in bash rather than handed to
+# jq as --arg, no `die` below echoes any part of it, and every request file is written owner-only.
 cmd_plugin_request() {
   need docker; need jq
   local payload action plugin version at days
   payload="$(cat)"
   printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || die "plugin-request: payload is not valid JSON"
-  action="$(printf '%s' "$payload" | jq -r '.action // ""')"
-  plugin="$(printf '%s' "$payload" | jq -r '.plugin // ""')"
-  version="$(printf '%s' "$payload" | jq -r '.version // ""')"
-  at="$(printf '%s' "$payload" | jq -r '.at // ""')"
-  days="$(printf '%s' "$payload" | jq -r 'if .days == null then "" else (.days|tostring) end')"
+  # An object, or nothing below can index it (and a jq indexing error is not ours to control).
+  printf '%s' "$payload" | jq -e 'type == "object"' >/dev/null 2>&1 || die "plugin-request: payload is not a JSON object"
+  # The string fields go through json_string_field: `$(…)` drops a trailing newline and a value holding
+  # any control character could pass a check here and still be written to the request file with the
+  # character in it, so such a field reads as "" and fails its check ("music\n" is refused, not queued
+  # and then rejected by the bot). `days` may be a number or a string; a string with a control
+  # character reads as a value that fails the day-count check.
+  action="$(printf '%s' "$payload" | json_string_field action)"
+  plugin="$(printf '%s' "$payload" | json_string_field plugin)"
+  version="$(printf '%s' "$payload" | json_string_field version)"
+  at="$(printf '%s' "$payload" | json_string_field at)"
+  days="$(printf '%s' "$payload" | jq -r 'if .days == null then "" elif (.days | type) == "string" and (.days | test("[\\x00-\\x1f]")) then "?" else (.days | tostring) end')"
 
-  case "$action" in
-    update-now|schedule|remind|skip|cancel) ;;
-    *) die "plugin-request: bad action '$action'" ;;
-  esac
-  [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin '$plugin'"
+  local snowflake_re='^[0-9]{5,25}$'
+  local webhook_re='^https://(canary\.|ptb\.)?discord(app)?\.com/api(/v[0-9]+)?/webhooks/[0-9]{5,25}/[A-Za-z0-9_-]{20,}$'
   # Anchored semver, no slashes — the path-traversal gate (the bot re-validates, but reject early too).
   local ver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
   local iso_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?(\.[0-9]+)?([+-][0-9]{2}:?[0-9]{2}|Z)$'
-  if [ "$action" != "cancel" ]; then
-    [[ "$version" =~ $ver_re ]] || die "plugin-request: bad version '$version'"
-  fi
-  [ "$action" != "schedule" ] || [[ "$at" =~ $iso_re ]] || die "plugin-request: bad at '$at'"
-  if [ "$action" = "remind" ] && [ -n "$days" ]; then
-    # 1-999, matching the bot's own validator — a 0-day snooze is meaningless (the bot rejects it too).
-    { [[ "$days" =~ ^[0-9]{1,3}$ ]] && [ "$days" -ge 1 ]; } || die "plugin-request: bad days '$days'"
-  fi
+  case "$action" in
+    update-now|schedule|remind|skip|cancel)
+      [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin '$(echo_safe "$plugin")'"
+      if [ "$action" != "cancel" ]; then
+        [[ "$version" =~ $ver_re ]] || die "plugin-request: bad version '$(echo_safe "$version")'"
+      fi
+      [ "$action" != "schedule" ] || [[ "$at" =~ $iso_re ]] || die "plugin-request: bad at '$(echo_safe "$at")'"
+      if [ "$action" = "remind" ] && [ -n "$days" ]; then
+        # 1-999, matching the bot's own validator — a 0-day snooze is meaningless (the bot rejects it too).
+        { [[ "$days" =~ ^[0-9]{1,3}$ ]] && [ "$days" -ge 1 ]; } || die "plugin-request: bad days '$(echo_safe "$days")'"
+      fi
+      ;;
+    routing-set)
+      # Where a plugin lives: `servers` maps a guild id to {commands: "all" | [channel ids, non-empty],
+      # postTo?: channel id}. An empty `servers` object is valid (the plugin is placed nowhere).
+      # Every message below names the field, never the offending value.
+      [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
+      # \A…\z, not ^…$: in jq's regex flavour `$` also matches before a trailing newline, so "12345\n"
+      # would pass as a snowflake (JavaScript's `$`, which the bot uses, does not).
+      printf '%s' "$payload" | jq -e '
+        def snowflake: type == "string" and test("\\A[0-9]{5,25}\\z");
+        (.servers | type == "object")
+        and (.servers | to_entries | all(
+          (.key | snowflake)
+          and (.value | type == "object")
+          and ((.value.commands == "all")
+               or ((.value.commands | type == "array") and (.value.commands | length > 0) and (.value.commands | all(snowflake))))
+          and ((.value | has("postTo") | not) or (.value.postTo | snowflake))
+        ))' >/dev/null 2>&1 || die "plugin-request: bad servers"
+      ;;
+    webhook-add)
+      # The URL is a secret: matched in bash from a variable, never passed to jq as --arg, and the
+      # failure message carries no part of it.
+      local url
+      url="$(printf '%s' "$payload" | json_string_field url)"
+      [[ "$url" =~ $webhook_re ]] || die "plugin-request: bad webhook url"
+      ;;
+    webhook-remove)
+      local channel_id
+      channel_id="$(printf '%s' "$payload" | json_string_field channelId)"
+      [[ "$channel_id" =~ $snowflake_re ]] || die "plugin-request: bad channelId"
+      ;;
+    discovery-refresh) ;;
+    *) die "plugin-request: bad action '$(echo_safe "$action")'" ;;
+  esac
 
-  local file
-  file="$(date +%s%3N)-${action}-${RANDOM}.json"
-  # -i to pipe the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
+  local file req_dir='/app/data/plugins/requests'
+  # Two RANDOMs, not one: two requests of the same action in the same millisecond must not share a name
+  # (they would share the temp file too, and one would overwrite the other).
+  file="$(date +%s%3N)-${action}-${RANDOM}${RANDOM}.json"
+  # The write is ATOMIC and OWNER-ONLY (found by #241's review gate). `cat > <final>` creates the file
+  # and only then fills it, so for a moment it exists empty or partial — and the bot's drain lists
+  # `*.json`, reads, and REJECTS a file that does not parse, after this script has already told the
+  # panel {ok: true, queued}: a good request lost silently. So the body goes to `<final>.tmp` in the
+  # SAME directory (the drain's filter is `f.endsWith(".json")`, src/plugins/requests.ts, so a name
+  # ending `.json.tmp` is never picked up — never give the temp file a `.json` ending) and is then
+  # `mv`ed into place, which is atomic within a directory. If any step fails the temp file is removed
+  # and the shell exits 1, so nothing half-written is left behind and this script dies below rather
+  # than reporting `queued`. (A shell that is KILLED mid-write cannot clean up: it leaves a
+  # `<file>.json.tmp`, owner-only and invisible to the drain, that nothing sweeps.) `umask 077` comes AFTER `mkdir -p` (a requests/ that does not exist yet
+  # keeps the ordinary mode; only the file is narrowed): a request may carry a webhook URL, and the bot
+  # — which runs as bun, as does this write — can still read and delete an owner-only file.
+  # -i pipes the payload to the container's stdin; -u bun so the file (and requests/) are bun-owned.
   printf '%s' "$payload" \
-    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p /app/data/plugins/requests && cat > /app/data/plugins/requests/${file}"
+    | docker exec -i -u bun "$CONTAINER" sh -c "mkdir -p ${req_dir} && umask 077 && cat > ${req_dir}/${file}.tmp && mv ${req_dir}/${file}.tmp ${req_dir}/${file} || { rm -f ${req_dir}/${file}.tmp; exit 1; }" \
+    || die "plugin-request: could not write the request into the bot's mailbox"
   jq -n --arg queued "$file" '{ok: true, queued: $queued}'
 }
 
@@ -781,12 +1231,13 @@ main() {
     env-get) cmd_env_get ;;
     env-set) cmd_env_set ;;
     env-schema) cmd_env_schema ;;
+    routing-get) cmd_routing_get ;;
     plugin-request) cmd_plugin_request ;;
     # #173 round 3: version is dispatched near the very top of the script, before this function
     # (and its .env/compose-file preconditions) is ever reached — see the comment above readonly
     # BOT_OPS_SCHEMA. No case arm needed here; kept in the usage string below since it's still a
     # real, documented subcommand.
-    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|env-schema|plugin-request|version}" ;;
+    *) die "usage: bot-ops.sh {status|logs [N]|restart|env-get|env-set|env-schema|routing-get|plugin-request|version}" ;;
   esac
 }
 
