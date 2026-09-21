@@ -72,13 +72,16 @@ export interface PluginRequestDeps {
   /**
    * How long to wait before looking a second time at a file that will not parse (default 250 ms). The wait
    * is made once per drain, by the first such file: a later one in the same drain is looked at again at
-   * once, because waiting for each would stall a mailbox of broken files by 250 ms apiece. The writer is not
-   * atomic (`cat > file`; write-then-rename belongs in the writer, `ops/bot-ops.sh`, which is #240's, and an
-   * instance can run this bot with the old script anyway), so a request can be read while it is still being
-   * written -- empty, or cut off -- and rejecting it then would lose a good request. Now that the mailbox is
-   * drained every few seconds that is a real window, so a file that fails to PARSE gets exactly one more
-   * look before it is rejected (a file that parses but fails validation gets none), which covers a write
-   * that finishes within the wait and not one that runs longer. Injected so no test waits on a wall clock.
+   * once, because waiting for each would stall a mailbox of broken files by 250 ms apiece. A writer older
+   * than #240 is not atomic (`cat > file`; #240 is where `ops/bot-ops.sh` learns to write to a temp name and
+   * rename it), and an instance can run this bot with that older script until `install.sh` is re-run, so a
+   * request can be read while it is still being written -- empty, or cut off -- and rejecting it then would
+   * lose a good request. (That older script can only write the five update actions -- it refuses every
+   * other one -- so the half-written file is never a `webhook-add`, which would be deleted rather than set
+   * aside.) Now that the mailbox is drained every few seconds that is a real window, so a file that fails
+   * to PARSE gets exactly one more look before it is rejected (a file that parses but fails validation gets
+   * none), which covers a write that finishes within the wait and not one that runs longer. Injected so no
+   * test waits on a wall clock.
    */
   tornReadRetryMs?: number;
 }
@@ -98,10 +101,15 @@ let draining: Promise<void> = Promise.resolve();
 // handle it again, and tries the delete once more (a transient EBUSY should not leave a secret on disk
 // until a restart). A different text under the same name is a different request and is handled normally.
 // A file that could not be read at all is remembered as UNREAD, and only that kind is also deleted again
-// when it is still unreadable: a name that was read before may since hold a new request.
-const undeletable = new Map<string, string>();
-// What is remembered for a file that could not even be read.
-const UNREAD = "\0";
+// when it is still unreadable: a name that was read before may since hold a new request. (What is left of
+// that risk: a new request under a name remembered as UNREAD, which is itself unreadable at that moment,
+// goes with it -- it could not have been handled either.)
+//
+// What is remembered for a file that could not even be read. A symbol, not a string: every string is a text
+// some file could hold, and a stuck file whose text happened to BE the marker would be taken for one that
+// was never read -- so a request that later reused its name would be deleted unhandled on one failed read.
+const UNREAD: unique symbol = Symbol("unread");
+const undeletable = new Map<string, string | typeof UNREAD>();
 
 /** Test seam: reset the single-flight chain between cases. */
 export function resetPluginRequestsForTest(): void {
@@ -130,14 +138,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // Whether the text of a request file holds a webhook URL, or enough of one to be its secret: the path
 // `webhooks/<id>/<token>` with or without a host (so a port, a doubled slash or a trailing dot cannot hide
 // it), or the discord API host followed by `webhooks/`. JSON can spell any character as an escape and a
-// URL can percent-encode a slash, so those are read as what they stand for before looking.
+// URL can percent-encode any character (a slash, or a letter of `webhooks` or of the host), so those are
+// read as what they stand for before looking. Each is decoded ONCE: a doubly-encoded spelling (`%2577`)
+// is not chased, since no writer of this mailbox and no URL parser produces one.
 const WEBHOOK_PATH_IN_TEXT = /webhooks\/\d{5,25}\/[\w-]{20,}/i;
 const WEBHOOK_HOST_IN_TEXT = /discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i;
 function carriesWebhookUrl(text: string): boolean {
   const plain = text
     .replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/\\\//g, "/")
-    .replace(/%2f/gi, "/");
+    .replace(/%([0-9a-fA-F]{2})/g, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)));
   return WEBHOOK_PATH_IN_TEXT.test(plain) || WEBHOOK_HOST_IN_TEXT.test(plain);
 }
 
@@ -223,7 +233,7 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     };
     let parsed = tryParse(text);
     if (!parsed.ok) {
-      // The writer is not atomic, so this may be a request still being written: look once more before
+      // A writer older than #240 is not atomic, so this may be a request still being written: look once more before
       // rejecting it (see `tornReadRetryMs`). The wait is made once per drain, by the first file that needs
       // it; a later one is looked at again at once. If the file has gone or cannot be read now, the first
       // failure stands.

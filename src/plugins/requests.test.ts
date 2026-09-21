@@ -601,6 +601,13 @@ describe("consumePluginRequests drain", () => {
         "a unicode-escaped dot": `https://discord${u("002e")}com/api/webhooks/${WH_ID}/${TOKEN}`,
         "unicode-escaped slashes": `https:${u("002f")}${u("002f")}discord.com${u("002f")}api${u("002f")}webhooks${u("002f")}${WH_ID}${u("002f")}${TOKEN}`,
         "a unicode-escaped letter in webhooks": `https://discord.com/api/${u("0077")}ebhooks/${WH_ID}/${TOKEN}`,
+        // Any character can be percent-encoded, not only a slash. With the `w` of `webhooks` encoded neither
+        // half of the detector sees it until the text is decoded; and with a letter of the HOST encoded (and
+        // an odd token, so the path half cannot help) only the decoded host does.
+        "a percent-encoded letter in webhooks": `https://discord.com/api/%77ebhooks/${WH_ID}/${TOKEN}`,
+        "a percent-encoded letter, lower-case hex": `https://discord.com/api/webhoo%6bs/${WH_ID}/${TOKEN}`,
+        "a percent-encoded letter, upper-case hex": `https://discord.com/api/webhoo%6Bs/${WH_ID}/${TOKEN}`,
+        "a percent-encoded letter in the host, with an odd token": `https://%64iscord.com/api/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
         // Forms only the HOST half of the detector can catch: the token has a character no token has, so the
         // path pattern (id, then 20+ token characters) does not match, but the host and `webhooks/` do.
         "the host, with an odd token": `https://discord.com/api/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
@@ -1007,6 +1014,44 @@ describe("consumePluginRequests drain", () => {
       await consumePluginRequests(h.deps);
       expect(r.routing.results.map((x) => x.id)).toContain("req_22222222");
       expect(h.fs.size).toBe(0);
+    });
+
+    test("no text a file can hold is mistaken for the mark of a file that was never read", async () => {
+      // The mark for "could not be read" must not be a string: a stuck file whose whole text WAS that string
+      // would be remembered as unread, and the request that later reused its name deleted unhandled on one
+      // failed read. Tried with the texts the mark has been, or could plausibly be.
+      for (const stuckText of ["\0", "", "unread", "__unread__"]) {
+        resetPluginRequestsForTest();
+        const h = harness({});
+        h.fs.set("100-skip-1.json", stuckText);
+        const realUnlink = h.deps.unlink;
+        const realRead = h.deps.readFile;
+        let canDelete = false;
+        let canRead = true;
+        h.deps.rename = async () => {
+          throw new Error("EXDEV");
+        };
+        h.deps.unlink = async (path) => {
+          if (!canDelete) throw new Error("EACCES");
+          return realUnlink(path);
+        };
+        h.deps.readFile = async (path) => {
+          if (!canRead) throw new Error("EIO: i/o error");
+          return realRead(path);
+        };
+        await consumePluginRequests(h.deps); // will not parse, cannot be moved or deleted: remembered WITH its text
+        // A real request arrives under that name, the delete would now work, and one read of it fails.
+        h.fs.set("100-skip-1.json", JSON.stringify(wb({ action: "skip", version: "1.1.0" })));
+        canDelete = true;
+        canRead = false;
+        await consumePluginRequests(h.deps);
+        expect(h.fs.has("100-skip-1.json"), JSON.stringify(stuckText)).toBe(true);
+        // Once it can be read it is handled, as the new request it is.
+        canRead = true;
+        await consumePluginRequests(h.deps);
+        expect(h.state.plugins[0]?.skippedVersion, JSON.stringify(stuckText)).toBe("1.1.0");
+        expect(h.fs.size, JSON.stringify(stuckText)).toBe(0);
+      }
     });
 
     test("a file that is refused and cannot be removed costs no wait and no log line on later drains, however it was refused", async () => {
