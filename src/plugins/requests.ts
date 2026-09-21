@@ -93,17 +93,31 @@ const TORN_READ_RETRY_MS = 250;
 // (the shape host.ts's stateMutator uses) serializes them; a restart between conversations is fine.
 let draining: Promise<void> = Promise.resolve();
 
-// Files that were dealt with but could not be removed: a ROUTING request that was applied, or any file that
-// was refused. (An applied UPDATE request is not among them: its delete is `unlinkTolerant`, as it always
-// was.) Left alone a routing request would be applied again on every drain -- a webhook-add asks Discord
-// again each time -- and a refused file would be refused again, and logged again, every few seconds. So each
-// is remembered under its name, with the text that was read: a later drain finds the same text, does NOT
-// handle it again, and tries the delete once more (a transient EBUSY should not leave a secret on disk
-// until a restart). A different text under the same name is a different request and is handled normally.
+// Files that were dealt with but could not be removed: a request that was applied (ROUTING or UPDATE), or
+// any file that was refused. Left alone a routing request would be applied again on every drain -- a
+// webhook-add asks Discord again each time --, an update request likewise (an update-now would ask for a
+// restart each time: the bot restarts, the boot drain finds the file again, and it restarts again, until
+// someone deletes the file by hand; #263), and a refused file would be refused again, and logged again,
+// every few seconds. So each is remembered under its name, with the text that was read: a later drain finds
+// the same text, does NOT handle it again, and tries the delete once more (a transient EBUSY should not
+// leave a secret on disk until a restart). A different text under the same name is a different request and
+// is handled normally.
 // A file that could not be read at all is remembered as UNREAD, and only that kind is also deleted again
 // when it is still unreadable: a name that was read before may since hold a new request. (What is left of
 // that risk: a new request under a name remembered as UNREAD, which is itself unreadable at that moment,
 // goes with it -- it could not have been handled either.)
+//
+// What this does NOT survive is a restart -- the map is in memory, and `PluginStateFile` (contract.ts,
+// vendored by another repo) has nowhere to put a persisted list. For an update-now the loop is ended a
+// different way: an update-now or schedule for the version that is ALREADY installed is refused
+// (`validate`), so once the restart the update-now caused has installed the target, the replayed file is
+// refused and no longer pins or restarts. The residual is an undeletable file AND an installed version that
+// never becomes the requested one (the install fails and falls back, is skipped at selection, or an
+// operator's `PLUGINS=name@version` pin wins over the request): one restart per boot, as it was, and left
+// as it is. A second, older hazard is unchanged too: an undeletable update-now that is still in the
+// mailbox after a LATER upgrade past its version (installed 1.2.0, the file says 1.1.0) is replayed once
+// against the newer install -- it pins the older version and restarts, and is refused once that lands --
+// and a stale `schedule` is likewise applied again after a restart. `main` did the same on every drain.
 //
 // What is remembered for a file that could not even be read. A symbol, not a string: every string is a text
 // some file could hold, and a stuck file whose text happened to BE the marker would be taken for one that
@@ -299,7 +313,13 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     try {
       const restart = await apply(v.request, deps);
       if (restart) restartReason ??= `plugin update (panel): ${v.request.plugin} → ${restart}`;
-      await unlinkTolerant(deps, path);
+      // An applied request whose file cannot be removed is remembered, as a routing request is (see
+      // `undeletable`): applied again on every drain it would restart the bot again for an update-now, and
+      // write state again (silently: nothing on this path logs) for the rest (#263).
+      if (!(await removeFile(deps, path))) {
+        deps.log.error(`[plugins] couldn't delete applied request ${file}; it will not be applied again`);
+        undeletable.set(file, text);
+      }
     } catch (err) {
       // An apply failure is unexpected (the mutator write failed) — move it aside so it doesn't loop.
       await refuse(`apply failed — ${errorText(err)}`);
@@ -425,6 +445,19 @@ export function validate(
       return { ok: false, reason: `bad days ${shown(r.days)}` };
     }
   }
+  // An update to the version that is ALREADY installed is a no-op, so it is refused (#263) rather than
+  // pinned and restarted for. That ends the restart loop of an applied update-now whose file cannot be
+  // deleted, once the install has landed (the file is seen again after the restart it caused, and by then it
+  // names the installed version; see the residual beside `undeletable`), and it is a better answer to a
+  // double-click in the panel too. Only these two actions: skip, remind and cancel for the installed version
+  // are harmless and still apply. Placed after the shape checks above (version, schedule time, days), so a
+  // malformed version is still "bad version" and a bad schedule time is still that, and before the host-API
+  // check (the one corner where the reason changes for a request that was refused before: the index's
+  // current version, incompatible with this bot, and also the installed one, is now "already on", which is
+  // the more useful answer). Both values in the reason are already validated text.
+  if ((action === "update-now" || action === "schedule") && r.version === stateEntry.installedVersion) {
+    return { ok: false, reason: `${plugin} is already on ${r.version}` };
+  }
   // The only compatibility check the index shape allows: it carries hostApiVersion for the CURRENT
   // version only (PluginRelease has none). If the pin equals the index's current and is incompatible,
   // reject; any other version is honored (a bad one fails install and reverts + reports, per #104).
@@ -467,15 +500,8 @@ async function apply(r: PluginRequest, deps: PluginRequestDeps): Promise<string 
   }
 }
 
-async function unlinkTolerant(deps: PluginRequestDeps, path: string): Promise<void> {
-  try {
-    await deps.unlink(path);
-  } catch {
-    /* already consumed by a racing drain (single-flight makes this rare) — fine */
-  }
-}
-
-/** Delete a request file. True once it is gone (already gone counts); false if it could not be removed. */
+/** Delete a request file. True once it is gone (already gone counts -- a racing drain may have consumed it,
+ *  which single-flight makes rare); false if it could not be removed. */
 async function removeFile(deps: PluginRequestDeps, path: string): Promise<boolean> {
   try {
     await deps.unlink(path);
