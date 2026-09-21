@@ -418,7 +418,8 @@ layer like the page itself). The
 `/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and
 `/api/plugins/request` shells `bot-ops.sh plugin-request` (the only plugin route that does; the four routing
 writes above use the same subcommand), while
-saving a plugin's *enabled* state still goes through the ordinary `POST /api/env` (only `PLUGINS`).
+a plugin's *enabled* state still goes through the ordinary `POST /api/env` (its `PLUGINS` line, sent by
+the Apply bar together with any edited config fields, in one request).
 `/api/admins` manages only this panel's own allow-list, never the Cloudflare Access policy. State-changing
 routes (the POSTs/DELETE) are additionally guarded against cross-site forgery by an Origin check —
 which relies on `cloudflared` forwarding the public hostname as the `Host` header (the ingress
@@ -434,17 +435,27 @@ There's no *direct* rebuild/deploy button — that stays Discord's `/update` —
 config-dir mount (the panel reads secrets straight from the mounted `.env` — e.g. `GITHUB_TOKEN` for
 the branch chooser below), **panel access is effectively deploy and root-equivalent access — treat it
 like SSH to the box.** The config form on the
-page is rendered from whatever `GET /api/env` returns, so it can never drift from this script's own
-`ALLOWED` whitelist above. Save posts only the fields that changed — the same list the confirm
-dialog previews — never the untouched ones echoed back (issue #44): a stored value the whitelist
-would reject can't block an unrelated save, and a tab loaded before another operator's save can't
-silently revert their unrelated edit. A few fields render as constrained controls instead of free text:
+page is rendered from whatever `GET /api/env` returns (bar `PLUGINS`, below), so it can never drift from
+this script's own `ALLOWED` whitelist above. **One Apply bar (#257) collects every change that needs a
+restart** — the plugin on/off choices on the Plugins tab and every edited config field — in a bar at the
+bottom of the page, visible from any tab and shown only while something is pending, and sends them as a
+**single** `POST /api/env` carrying only what changed (`PLUGINS` first): one restart, however many things
+changed. There is no per-section Save button and no confirm dialog: the bar states the consequence ("the
+bot goes offline for about 20 seconds") next to **Apply and restart**, and **Discard** re-renders every
+control from the bot's current state and sends nothing. The POST carries only the fields that changed —
+never the untouched ones echoed back (issue #44): a stored value the whitelist would reject can't block an
+unrelated apply, and a tab loaded before another operator's save can't silently revert their unrelated
+edit. A failed recreate shows the compose error and the backup path in the bar (issue #47) and re-reads the
+page's state. The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
+Plugins tab, and two controls for one key would be a conflict with no good answer. Pinning a plugin to a
+version (`name@version`) is set in `.env`; an existing pin is kept while that plugin stays ticked. A few
+fields render as constrained controls instead of free text:
 `AUTO_UPDATE` as a select, `BOT_BRANCH` as a live branch chooser (below), and
 `ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors. Every other key — the static ones and each
 installed plugin's manifest keys alike — is a plain text input whose required-ness and format come
 from `GET /api/env-schema` (`bot-ops.sh env-schema`, #205/#207), so a blank required key or a value
-`env-set` would reject is refused before the confirm dialog rather than after a failed,
-restart-triggering save. A plugin that needs a richer control (the wow plugin's region-filtered
+`env-set` would reject is refused before anything is sent (the bar names the field, marks it and opens its
+tab) rather than after a failed, restart-triggering apply. A plugin that needs a richer control (the wow plugin's region-filtered
 realm chooser) ships it in its own admin tab — see ADR-0005 — not in this page. (`realms.json` and
 its `gen-realms.ts` generator moved to the plugins repo with the wow plugin, under `plugins/wow/`.)
 

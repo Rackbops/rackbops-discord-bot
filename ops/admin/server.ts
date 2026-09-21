@@ -772,15 +772,15 @@ export interface PluginsView {
   /** #124: the PANEL's own `ADMIN_API_VERSION`, so the client compares each plugin's declared
    *  `adminApiVersion` against one authoritative value (kept server-side) rather than a second mirror. */
   adminApiVersion: number;
-  /** The instance's raw `PLUGINS=` value, verbatim — the panel's Save diffs against it and reuses
+  /** The instance's raw `PLUGINS=` value, verbatim — the panel's Apply bar diffs against it and reuses
    *  any `name@version` pin it holds, so the merge stays the sole reader of the env value. */
   pluginsValue: string;
   /** Set when the Plugin Index couldn't be loaded — the view then shows installed plugins only. */
   indexError?: string;
   /** Set (by the route, not the merge) when the bot's own state read failed — `status`/`env-get`
-   *  returned non-zero, so `pluginsValue` can't be trusted as a Save baseline (an empty one would
-   *  look like "nothing enabled" and let a Save wipe the real selection). The panel disables Save
-   *  while this is set. */
+   *  returned non-zero, so `pluginsValue` can't be trusted as an Apply baseline (an empty one would
+   *  look like "nothing enabled" and let an Apply wipe the real selection). The panel disables every
+   *  plugin box, and plans no `PLUGINS` change, while this is set. */
   stateError?: string;
 }
 
@@ -1809,8 +1809,8 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     const index = config.listPluginIndex ? await config.listPluginIndex() : null;
     const view = mergePluginsView(index, statusPlugins, pluginsValue);
     // A failed state read leaves pluginsValue empty, which would look like "no plugins enabled" and
-    // let a Save wipe the real selection — surface it (distinct from indexError) so the panel can
-    // disable Save until the bot is readable again, rather than acting on a false-empty baseline.
+    // let an Apply wipe the real selection — surface it (distinct from indexError) so the panel can
+    // disable the plugin boxes until the bot is readable again, rather than acting on a false-empty baseline.
     if (statusRes.exitCode !== 0 || envRes.exitCode !== 0) {
       view.stateError = "the bot's current state couldn't be read";
     }
