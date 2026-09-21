@@ -540,8 +540,14 @@ bot goes offline for about 20 seconds") next to **Apply and restart**, and **Dis
 control from the bot's current state and sends nothing. The POST carries only the fields that changed —
 never the untouched ones echoed back (issue #44): a stored value the whitelist would reject can't block an
 unrelated apply, and a tab loaded before another operator's save can't silently revert their unrelated
-edit. A failed recreate shows the compose error and the backup path in the bar (issue #47) and re-reads the
-page's state. The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
+edit. When an apply fails the bar says why (`Couldn't apply: …`) and offers **Discard** and **Apply and
+restart** again, and what happens to the controls depends on what the answer proves (#272). A **refusal
+that wrote nothing** — an early `die()` in `bot-ops.sh`, an HTTP 502 whose body is plain text — **keeps**
+the user's edits and plugin ticks, so one refused value can be corrected without retyping the rest. A
+**failed recreate** (a 502 with a JSON body: `.env` was already rewritten, so the bar shows the compose
+error and the backup path, issue #47), a **timeout** (504: the outcome is unknown) and any status the page
+does not know **re-read** the page's state from the bot. A **network error, or the page's own timeout,**
+leaves the controls as they are. The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
 Plugins tab, and two controls for one key would be a conflict with no good answer. Pinning a plugin to a
 version (`name@version`) is set in `.env`; an existing pin is kept while that plugin stays ticked. A few
 fields render as constrained controls instead of free text:

@@ -5617,6 +5617,10 @@ describe("page skeleton", () => {
 //   savePlugins "a rejected save surfaces bot-ops.sh's own message"                     -> `a plain-text failure is shown verbatim ...`
 //   savePlugins "refuses to post when stateError is set (no wipe ...)"                  -> `an unreadable bot state cannot produce a PLUGINS change` + planApply `with plugins null ...`
 // planPluginsSave / planEnvSave / validateEnvChanges are unchanged and their own tests are untouched.
+// #272 supersedes the two "... and re-baselines" carry-overs above for a PLAIN-TEXT failure only: that answer now
+// KEEPS the user's edits (`a plain-text failure is shown verbatim, and the user's edits are kept`); the #47
+// re-baseline is pinned by `a failed recreate ...` (JSON 502), `a 504 re-baselines ...` and `any other status
+// re-baselines too ...`, and by `failureWroteNothing (#272)`.
 // ---------------------------------------------------------------------------------------------------
 const applyIndexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
 const applyBlock = (name: string): string =>
@@ -5653,11 +5657,12 @@ interface BarView {
 const planApply = new Function(
   `"use strict";\n${applyBlock("PLUGINS_SAVE_PLAN")}\n${applyBlock("ENV_SAVE_PLAN")}\n${applyBlock("APPLY_PLAN")}\nreturn planApply;`,
 )() as (input: ApplyPlanInput) => ApplyPlan;
-const { applyBarView, describeApplyFailure } = new Function(
-  `"use strict";\n${applyBlock("APPLY_VIEW")}\nreturn { applyBarView, describeApplyFailure };`,
+const { applyBarView, describeApplyFailure, failureWroteNothing } = new Function(
+  `"use strict";\n${applyBlock("APPLY_VIEW")}\nreturn { applyBarView, describeApplyFailure, failureWroteNothing };`,
 )() as {
   applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean }) => BarView;
   describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
+  failureWroteNothing: (status: number, result: unknown) => boolean;
 };
 
 describe("planApply (#257)", () => {
@@ -5823,6 +5828,24 @@ describe("describeApplyFailure (#257, the failText logic saveEnv had, split in t
   });
 });
 
+// #272: after a failed POST /api/env, may the page keep what the user typed? Only when the answer PROVES
+// nothing was written. server.ts answers a failed bot-ops.sh with 502 (JSON body when env-set got as far as
+// the write and the recreate failed; the plain stderr text for an early die()) or 504 (we killed it: outcome
+// unknown).
+describe("failureWroteNothing (#272)", () => {
+  test("only a plain-text 502 proves nothing was written", () => {
+    expect(failureWroteNothing(502, null)).toBe(true);
+    // a failed recreate: .env was rewritten first (#47)
+    expect(failureWroteNothing(502, { ok: false, changed: ["X"], backup: "/b", log: "compose: boom" })).toBe(false);
+    expect(failureWroteNothing(502, { ok: false })).toBe(false);
+    expect(failureWroteNothing(502, {})).toBe(false);
+    // a timeout: the recreate may still finish
+    expect(failureWroteNothing(504, null)).toBe(false);
+    // a status this page cannot reason about is not proof of anything
+    for (const status of [200, 400, 401, 403, 404, 500, 503]) expect({ status, wroteNothing: failureWroteNothing(status, null) }).toEqual({ status, wroteNothing: false });
+  });
+});
+
 // The DOM half, lifted with every page global injected and run against a stub page. The stub THROWS on any
 // element id it was not given and on any selector the collector is not allowed: a plugin's own settings
 // bundle renders arbitrary DOM inside this page, so a page-wide [data-key] would be a bug, not a convenience.
@@ -5854,8 +5877,9 @@ interface ApplySpec {
   /** The ticked plugin names (default: the names in pluginsValue). */
   checked?: string[];
   schema?: Record<string, unknown>;
-  /** What api() answers; an Error is thrown by it (a timeout, the 401 "unauthorized"). */
-  response?: { ok: boolean; text: string } | Error;
+  /** What api() answers; an Error is thrown by it (a timeout, the 401 "unauthorized"). `status` defaults to
+   *  200 for `ok: true` and 502 for `ok: false` (what bot-ops.sh's failures come back as, server.ts ~1683). */
+  response?: { ok: boolean; text: string; status?: number } | Error;
   /** api() waits for this before answering: an in-flight request. */
   hold?: Promise<void>;
   /** The loaders put the controls back to `loadedEnv` and the server's ticks (a re-render from the baseline). */
@@ -5981,7 +6005,7 @@ function runApply(spec: ApplySpec) {
     if (spec.hold) await spec.hold;
     if (spec.response instanceof Error) throw spec.response;
     const r = spec.response ?? { ok: true, text: '{"ok":true,"changed":["X"]}' };
-    return { ok: r.ok, text: async () => r.text };
+    return { ok: r.ok, status: r.status ?? (r.ok ? 200 : 502), text: async () => r.text };
   };
   const timeoutSignal = (ms: number) => {
     log.timeouts.push(ms);
@@ -6224,16 +6248,73 @@ describe("applyPending (#257)", () => {
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
   });
 
-  test("a plain-text failure is shown verbatim, and re-baselines (#47)", async () => {
+  // #272: THE expectation under change. A plain-text 502 is an early die() in bot-ops.sh (a refused value, a
+  // key that is not editable, a backup that could not be written): it never reached the write, so the page has
+  // nothing to re-baseline against and must not throw away what the user typed. Until #272 this test said
+  // `reloads` was { plugins: 1, env: 1, status: 0 } "unconditionally" (#47 parity with the retired saveEnv).
+  test("a plain-text failure is shown verbatim, and the user's edits are kept (#272)", async () => {
     const page = runApply({
       loadedEnv: APPLY_ENV,
       fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      checked: ["warbandeer", "raidhelper"],
       response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+      resetOnReload: true, // a reload WOULD put the controls back to the server's values: the asserts below prove none ran
     });
     await page.run.applyPending();
-    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", hint: "" });
-    // Unconditionally: a plain-text answer can still follow a rewritten .env, and the page cannot tell.
+    expect(page.view()).toEqual({
+      hidden: false, tone: "danger", title: "Couldn't apply: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", hint: "",
+      ok: true, discard: true, go: true, disabled: false,
+    });
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+    expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe("eu");
+    expect(page.boxes.find((b) => b.dataset.plugin === "raidhelper")!.checked).toBe(true);
+  });
+
+  test("a 504 re-baselines, because the outcome is unknown", async () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      checked: ["warbandeer", "raidhelper"],
+      response: { ok: false, status: 504, text: "bot-ops.sh timed out" },
+      resetOnReload: true,
+    });
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: bot-ops.sh timed out", hint: "", ok: true });
+    // the recreate may still finish and .env may already hold the new values: the page re-reads both
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe(APPLY_ENV.WATCHED_REPOS);
+  });
+
+  test("any other status re-baselines too: a status this page does not know is not proof that nothing was written", async () => {
+    for (const status of [400, 403, 500, 503]) {
+      const page = runApply({
+        loadedEnv: APPLY_ENV,
+        fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+        response: { ok: false, status, text: "something plain-text" },
+      });
+      await page.run.applyPending();
+      expect({ status, reloads: page.log.reloads }).toEqual({ status, reloads: { plugins: 1, env: 1, status: 0 } });
+    }
+  });
+
+  test("retrying after a kept-edits failure posts the same body again, and a no-changes answer says nothing needed applying", async () => {
+    const spec: ApplySpec = {
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      checked: ["warbandeer", "raidhelper"],
+      response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+    };
+    const page = runApply(spec);
+    await page.run.applyPending();
+    expect(page.view().title).toMatch(/^Couldn't apply/);
+    // The user presses Apply and restart again with nothing edited (the narrow window after the write: .env
+    // already holds the values, so env-set answers recreated:false).
+    spec.response = { ok: true, text: '{"ok":true,"changed":[],"recreated":false,"note":"no changes"}' };
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(2);
+    expect(page.log.posts[1]?.opts.body).toBe(page.log.posts[0]?.opts.body);
+    expect(page.log.posts[0]?.opts.body).toBe("PLUGINS=warbandeer,raidhelper\nWATCHED_REPOS=eu");
+    expect(page.view()).toMatchObject({ tone: "ok", title: "Nothing needed applying.", ok: true });
   });
 
   test("a timeout is shown", async () => {
@@ -6447,6 +6528,25 @@ describe("Apply bar events (#257)", () => {
 });
 
 describe("discardPending (#257)", () => {
+  test("Discard after a kept-edits failure restores the server's values and posts nothing more (#272)", async () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      checked: ["warbandeer", "raidhelper"],
+      response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+      resetOnReload: true,
+    });
+    await page.run.applyPending();
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 }); // the edits were kept ...
+    expect(page.view()).toMatchObject({ tone: "danger", discard: true, go: true });
+    await page.run.discardPending(); // ... and Discard still puts every control back
+    expect(page.log.posts).toHaveLength(1); // only the failed apply: Discard sends nothing
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe(APPLY_ENV.WATCHED_REPOS);
+    expect(page.boxes.find((b) => b.dataset.plugin === "raidhelper")!.checked).toBe(false);
+    expect(page.view().hidden).toBe(true); // nothing pending, and the failure message is gone with the phase
+  });
+
   test("posts nothing and re-renders plugins and env", async () => {
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu", ANNOUNCE_CHANNEL_ID: "" }, checked: ["warbandeer", "raidhelper"], resetOnReload: true });
     await page.run.applyPending(); // a refusal: the control is marked invalid
