@@ -42,9 +42,9 @@ export function secretsPath(dataDir: string): string {
 const routingMutator = createKeyedJsonMutator<RoutingFile>();
 
 // What `readRouting` has already said about a damaged file (#260). It is on the path of every plugin command
-// used in a server (`gateCommand`), every announcement and every join since #243, so a file with one bad
-// entry must not write a line per command: each distinct message is said once per process. (The record is
-// per process, so a problem that is fixed and then put back is not said again until a restart.)
+// used in a server (`gateCommand`) and every announcement since #243, and of every join since #259, so a
+// file with one bad entry must not write a line per read: each distinct line is said once per process. (The
+// record is per process, so a problem that is fixed and then put back is not said again until a restart.)
 const said = new Set<string>();
 
 /** Forget what has been said, so a test can see the same problem reported again. */
@@ -53,19 +53,30 @@ export function resetRoutingWarningsForTest(): void {
 }
 
 /**
- * Says what the repair of `raw` left out, each distinct message once. Log output only, so nothing in it may
- * change what `readRouting` returns: a logger that throws is swallowed here (`readRouting` "never throws",
- * and `gateCommand` fails open when it does, so a throw from a log line would let a restricted command run).
+ * Says what the repair of `raw` left out, each distinct line once. Log output only, so nothing in it may
+ * change what `readRouting` returns (`gateCommand` fails open when a read throws, so a throw out of a log
+ * line would let a restricted command run):
+ *  - a logger that throws is swallowed, and the line is recorded as said only once it was written, so it is
+ *    tried again on the next read;
+ *  - `droppedByRepair` throwing is a bug in the report, not in the file: it is swallowed too, and said once
+ *    in place of the report, so a broken report is not mistaken for a clean file.
+ * Exported for the test that needs to hand it a value no file can hold.
  */
-function sayWhatWasIgnored(raw: unknown): void {
+export function sayWhatWasIgnored(raw: unknown): void {
+  let lines: string[];
   try {
-    for (const message of droppedByRepair(raw)) {
-      if (said.has(message)) continue;
-      said.add(message);
-      console.warn(`[routing] routing.json: ${message}; it is ignored`);
+    lines = droppedByRepair(raw).map((message) => `[routing] routing.json: ${message}; it is ignored`);
+  } catch (err) {
+    lines = [`[routing] routing.json: could not work out what the repair ignored (${err instanceof Error ? err.message : "not an Error"})`];
+  }
+  for (const line of lines) {
+    if (said.has(line)) continue;
+    try {
+      console.warn(line);
+      said.add(line);
+    } catch {
+      /* logging must never change what is read */
     }
-  } catch {
-    /* logging must never change what is read */
   }
 }
 

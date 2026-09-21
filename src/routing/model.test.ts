@@ -617,11 +617,12 @@ describe("droppedByRepair (#260)", () => {
       const out: string[] = [];
       const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
       if (raw === undefined) return out;
-      if (!isObject(raw)) return ["the file"];
-      const file = raw as { plugins?: unknown; webhooks?: unknown };
       const repaired = repairRouting(raw);
-      if (file.plugins !== undefined && !isObject(file.plugins)) out.push("plugins");
-      if (file.webhooks !== undefined && !isObject(file.webhooks)) out.push("webhooks");
+      const cameBackEmpty = (r: RoutingFile) => Object.keys(r.plugins).length === 0 && Object.keys(r.webhooks).length === 0;
+      if (!isObject(raw)) return cameBackEmpty(repaired) ? ["the file"] : [];
+      const file = raw as { plugins?: unknown; webhooks?: unknown };
+      if (file.plugins !== undefined && !isObject(file.plugins) && Object.keys(repaired.plugins).length === 0) out.push("plugins");
+      if (file.webhooks !== undefined && !isObject(file.webhooks) && Object.keys(repaired.webhooks).length === 0) out.push("webhooks");
       if (isObject(file.plugins)) {
         for (const [name, entry] of Object.entries(file.plugins)) {
           const kept = Object.hasOwn(repaired.plugins, name) ? repaired.plugins[name] : undefined;

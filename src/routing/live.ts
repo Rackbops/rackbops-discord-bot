@@ -148,11 +148,12 @@ function warnHomeServerMissing(c: RoutingContext, routing: RoutingFile, snapshot
     `[routing] the home server ${shown(c.homeGuildId)} is not one the bot is in, so these plugins, ` +
     `which nobody has placed, are registered nowhere: ${nowhere.join(", ")}`;
   if (said.has(message)) return;
-  said.add(message);
   try {
     c.log.warn(message);
+    said.add(message);
   } catch {
-    /* routed mode "never throws": a logger that does must not turn a finished registration into a failure */
+    /* A logger that throws must not turn a finished registration into a failure (`logRouted` above is not
+       guarded, and that is not changed here); it is not recorded as said, so the next registration tries again. */
   }
 }
 

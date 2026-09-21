@@ -963,6 +963,30 @@ describe("a home server the bot is not in (#260)", () => {
     expect(readDiscovery().guilds.map((g) => g.id)).toEqual([OTHER]);
   });
 
+  test("a warning the logger failed to write is tried again at the next registration, not lost", async () => {
+    await placeMusicInOther();
+    let calls = 0;
+    const written: string[] = [];
+    const h = harness({
+      log: {
+        log: () => {},
+        warn: (line: unknown) => {
+          calls += 1;
+          if (calls === 1) throw new Error("the log is closed");
+          written.push(String(line));
+        },
+        error: () => {},
+      },
+    });
+    home(h);
+    initRouting(h.ctx);
+    await applyRouting("boot"); // the logger throws: swallowed, not recorded as said
+    await applyRouting("routing changed"); // tried again, written
+    await applyRouting("routing changed"); // said: nothing more
+    expect(written).toEqual([NOWHERE(HOME, "wow")]);
+    expect(calls).toBe(2);
+  });
+
   test("no warning when every loaded plugin is placed", async () => {
     await mutateRouting(dir, (c) => ({
       ...c,

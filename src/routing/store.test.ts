@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, secretsPath } from "./store";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, sayWhatWasIgnored, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -645,6 +645,42 @@ describe("readRouting says what it ignored (#260)", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  test("a line the logger failed to write is tried again on the next read, not lost", async () => {
+    write(music({ [GUILD]: { commands: "none" } }));
+    let calls = 0;
+    const written: string[] = [];
+    const warn = spyOn(console, "warn").mockImplementation((line: unknown) => {
+      calls += 1;
+      if (calls === 1) throw new Error("the log is closed");
+      written.push(String(line));
+    });
+    try {
+      await readRouting(dir); // the logger throws: swallowed, and not recorded as said
+      await readRouting(dir); // so it is tried again, and written
+      await readRouting(dir); // and now it is said, so nothing more
+    } finally {
+      warn.mockRestore();
+    }
+    expect(written).toEqual([NO_COMMANDS]);
+    expect(calls).toBe(2);
+  });
+
+  test("a report that throws is said once, in place of the report, and never escapes", async () => {
+    // No file can hold this (JSON has no getters); it stands for a bug in the report on some input.
+    const hostile = {
+      plugins: {
+        get music(): never {
+          throw new Error("boom");
+        },
+      },
+    };
+    const lines = await said(async () => {
+      expect(() => sayWhatWasIgnored(hostile)).not.toThrow();
+      sayWhatWasIgnored(hostile);
+    });
+    expect(lines).toEqual(["[routing] routing.json: could not work out what the repair ignored (boom)"]);
   });
 
   test("what the bot acts on is exactly what repairRouting gives: this is log output only", async () => {

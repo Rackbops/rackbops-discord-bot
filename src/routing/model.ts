@@ -253,22 +253,25 @@ export function repairRouting(raw: unknown): RoutingFile {
 
 /**
  * What `repairRouting` would drop from `raw`, as short messages that NAME each dropped thing (#260). Pure,
- * never throws, and silent: `repairRouting` stays tolerant and quiet, and `readRouting` says these once.
+ * silent, and, like `repairRouting`, not going to throw on anything `JSON.parse` can produce: `repairRouting`
+ * stays tolerant and quiet, and `readRouting` says these once.
  *
  * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and, with one
  * exception, never a value: a value can be anything a person typed. `shown` shows at most 40 characters
- * (a longer text is cut to its first 37 and `...`), which ends before the token starts in a Discord webhook
- * URL (about 43 characters in at the earliest), so even a URL used as a key is cut before its token. The exception is a bad `postTo`, whose value is shown (through `shown` too) so
- * the operator can see what was wrong with it. A webhook entry that carried a stray `url` or `token` key is
- * not a dropped entry -- the repair keeps the entry and drops the key, by design -- so it reports nothing.
+ * (a longer text is cut to its first 37 and `...`). A token starts at character 39 of a Discord webhook URL
+ * at the earliest (51 or later with a real id), so a URL used as a key is cut before its token. The
+ * exception is a bad `postTo`, whose value is shown (through `shown` too) so the operator can see what was
+ * wrong with it. A webhook entry that carried a stray `url` or `token` key is not a dropped entry -- the
+ * repair keeps the entry and drops the key, by design -- so it reports nothing.
  *
  * The primitives are the repair's own (`repairScope`, `repairWebhook`, `isSnowflake` and the two regexes are
- * shared, not copied); how they are combined is mirrored from `repairPlugin` and `repairRouting`, so a
- * table-driven test in `model.test.ts` pins that this says something exactly when the repair drops one of
- * these kinds of thing. Also said: a `raw` that is not an object at all (the file holds `[]` or `"x"`: a
- * missing file is not that, `readJsonOrFresh` reads it as a fresh object), and a `plugins` or `webhooks`
- * that is not an object. NOT reported: a `results` entry (the bot's own bookkeeping, not configuration), and
- * an `undefined` `raw` (nothing was read, which `readRouting` never hands over).
+ * shared, not copied, and the reason a webhook is refused is asked of `repairWebhook` itself); how they are
+ * combined is mirrored from `repairPlugin` and `repairRouting`, so a table-driven test in `model.test.ts`
+ * pins that this says something exactly when the repair drops one of these kinds of thing. Also said: a
+ * `raw` that is not an object at all (the file holds `[]` or `"x"`: a missing file is not that,
+ * `readJsonOrFresh` reads it as a fresh object), and a `plugins` or `webhooks` that is not an object. NOT
+ * reported: a `results` entry (the bot's own bookkeeping, not configuration), and an `undefined` `raw`
+ * (nothing was read, which `readRouting` never hands over).
  */
 export function droppedByRepair(raw: unknown): string[] {
   const dropped: string[] = [];
@@ -312,8 +315,10 @@ export function droppedByRepair(raw: unknown): string[] {
         dropped.push(`${webhook} is not a channel id`);
       } else if (repairWebhook(entry) === undefined) {
         // `repairWebhook` refuses for two reasons and the message says which: naming the wrong one would
-        // send whoever is reading the log to the wrong field.
-        if (!isPlainObject(entry) || !isSnowflake(entry.id) || !isSnowflake(entry.guildId)) dropped.push(`${webhook} is missing its ids`);
+        // send whoever is reading the log to the wrong field. The repair is asked, not second-guessed: would
+        // it keep this entry if it had an addedAt and an addedBy? If so, those were what was missing.
+        const withDates = isPlainObject(entry) ? { ...entry, addedAt: "-", addedBy: "-" } : entry;
+        if (repairWebhook(withDates) === undefined) dropped.push(`${webhook} is missing its ids`);
         else dropped.push(`${webhook} is missing its addedAt or addedBy`);
       }
     }
