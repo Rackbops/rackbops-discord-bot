@@ -109,11 +109,16 @@ describe("planRegistration", () => {
   });
 
   test("the single plan's body is a copy, so a caller cannot change the full body through it", () => {
-    const w = world();
-    const p = plan({ routing: freshRouting() });
-    if (p.mode !== "single") throw new Error("expected single");
-    p.body.pop();
-    expect(w.fullBody).toHaveLength(CORE.length + MUSIC.length + WOW.length);
+    // Both scopes: the guild plan and the global plan build their body on separate lines.
+    for (const homeGuildId of [HOME, undefined]) {
+      const w = world();
+      // Hand plan() this world's own array; a plan() built from its own world could never show the sharing.
+      const p = plan({ routing: freshRouting(), fullBody: w.fullBody, homeGuildId });
+      if (p.mode !== "single") throw new Error("expected single");
+      expect(p.body).not.toBe(w.fullBody);
+      p.body.pop();
+      expect(w.fullBody).toHaveLength(CORE.length + MUSIC.length + WOW.length);
+    }
   });
 
   test("a placed plugin's commands go only to its servers", () => {
