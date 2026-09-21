@@ -884,7 +884,10 @@ _Avoid_: server list, guild cache
   invariant above), so an intent a plugin needs has to be declared in its Plugin Index entry
   (`PluginIndexEntry.intents`, numeric `GatewayIntentBits` values so the JSON needs no discord.js)
   and unioned in by `collectIntents()` — there is no path for a plugin to request an intent at
-  `activate()` time and have it take effect that boot. `src/plugins/*` (index.ts, registry.ts)
+  `activate()` time and have it take effect that boot. Nor does a declared intent deliver anything
+  (#221): the host owns every gateway listener and passes a plugin only the interactions addressed to
+  it, so the field is reserved for a future event seam, and today all it does is widen the gateway
+  subscription of the whole bot (`contract.ts`'s doc on `intents`). `src/plugins/*` (index.ts, registry.ts)
   stays free of `src/config.ts` on purpose — it's read-only data plumbing that has to work before
   config exists in the boot sequence.
 - **A Plugin Index entry describes the index's CURRENT version only — never read it as a fact
@@ -920,8 +923,9 @@ _Avoid_: server list, guild cache
   (option 2 of #222) would fix those. `requests.ts`'s pre-flight also rules out only the
   current version, but accepts any other (no direction, ordering or intents test), so an update
   request it accepts can still be skipped at the next boot. `contract.ts`'s doc on
-  `HOST_API_VERSION` ("skipped … never loaded") is now imprecise for the same reason; it is left as
-  is because the plugins repo vendors that file verbatim behind a `check-contract` drift check.
+  `HOST_API_VERSION` states this exception (#221 replaced its old "skipped … never loaded" wording);
+  the plugins repo vendors that file verbatim behind a `check-contract` drift check, so an edit to it
+  is a paired change with a re-vendor there.
 - **Extraction is atomic, and the installed bundle's own manifest is reconciled against the host on
   every load (#224, #223).** `install.ts`'s `tryInstallVersion` extracts into a sibling `.staging-*`
   dir under `<dataDir>/plugins/<name>/`, then renames it into `<name>/<version>/` only after

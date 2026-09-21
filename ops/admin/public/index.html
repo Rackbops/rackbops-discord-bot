@@ -494,11 +494,15 @@
   // Pure helpers for the admin tabs, lifted so ops/admin/server.test.ts can pin them.
   // scopeToPluginKeys filters a tab's env reads/writes to its OWN plugin's declared keys — the guard
   // against an HONEST bundle touching another key. It is NOT a sandbox: the bundle runs same-origin
-  // inline (per #123's first-party posture), so a malicious one bypasses it; the real backstop is the
-  // server (bot-ops env-set validates every key against its whitelist — the static keys, the own keys
-  // of any plugin in the bot's cached Plugin Index (#256: on or off), and, write-only since ADR-0006
-  // decision 8, those plugins' `secret` keys — and refuses core secrets). adminTabState decides the render mode; buildSetEnvBody builds the guarded-save payload
-  // (scoped + newline-safe); viewToState maps a /api/plugins row to the AdminApi getState shape.
+  // inline (per #123's first-party posture), so a malicious one bypasses it, and the server is not a
+  // boundary against it either. bot-ops env-set validates every key against its whitelist — the static
+  // keys, the own keys of any plugin in the bot's cached Plugin Index (#256: on or off), and,
+  // write-only since ADR-0006 decision 8, those plugins' `secret` keys — and refuses core secrets, but
+  // that whitelist admits PLUGIN_INDEX_URL and PLUGINS, which are levers into code execution in the bot
+  // container. The Plugin Index is the trust boundary: an admin bundle has the panel's own authority
+  // (ADR-0005 decision 6, #226). adminTabState decides the render mode; buildSetEnvBody builds the
+  // guarded-save payload (scoped + newline-safe); viewToState maps a /api/plugins row to the AdminApi
+  // getState shape.
   function scopeToPluginKeys(obj, envKeys) {
     const keys = new Set(envKeys || []);
     const out = {};
