@@ -68,7 +68,8 @@ type AnnounceKind = "release";
 
 // Per-kind channel routing: the seam future announcement kinds plug into (see issue nazumods/wow#528). Only
 // `release` remains a core announcement — the WoW announcements moved to the wow plugin (#107), which
-// posts through host.announce → ANNOUNCE_CHANNEL_ID — so this currently always resolves the release channel.
+// posts through host.announce (`postForPlugin`: the channels its routing names, ANNOUNCE_CHANNEL_ID when it
+// names none) — so this currently always resolves the release channel.
 function channelFor(_kind: AnnounceKind): string {
   return config.releaseAnnounceChannelId;
 }
@@ -96,8 +97,9 @@ export async function sendToChannel(
 }
 
 /** Posts `message` to a specific channel, through the bot's own send path. Split out from
- * `announce` so a plugin's `HostApi.announce` (which posts to `ANNOUNCE_CHANNEL_ID`) reuses exactly
- * this path — the `[announce]` log line stays byte-identical. */
+ * `announce` so a plugin's `HostApi.announce` reuses exactly this path for every channel that has no
+ * webhook (`postForPlugin` in src/routing/post.ts, which posts through the webhook instead when there
+ * is one and prints the same line) — the `[announce]` log line stays byte-identical. */
 export async function announceTo(client: Client, channelId: string, message: string): Promise<void> {
   await sendToChannel(client, channelId, message);
   console.log("[announce]", message);
