@@ -85,6 +85,9 @@ describe("index.ts wiring", () => {
     const initCall = source.indexOf("initRouting({", activateFn);
     const applyCall = source.indexOf('applyRouting("boot")', activateFn);
     const catchMessage = source.indexOf("[startup] slash-command registration failed", activateFn);
+    // The text of the initRouting({...}) call alone: a property name like `log:` or `dataDir:` appears
+    // elsewhere in this file, so a pin on the whole source could pass while this call is wrong.
+    const initBlock = source.slice(initCall, applyCall);
 
     test("the one rest.put is the REST call it always was: the route, and the body as `{ body }`", () => {
       // Exactly one, and it is the injected `put` -- so every registration goes through the planner.
@@ -93,27 +96,27 @@ describe("index.ts wiring", () => {
     });
 
     test("initRouting is given the full command body, built once", () => {
-      expect(source).toMatch(/fullBody:\s*commandBody,/);
+      expect(initBlock).toMatch(/fullBody:\s*commandBody,/);
       // Plugin builders run once, not once per server: buildCommandBody is called exactly once.
       expect((source.match(/buildCommandBody\(/g) ?? []).length).toBe(1);
       // And the home server, prefix and data dir are the ones the old code read.
-      expect(source).toMatch(/homeGuildId:\s*config\.guildId,/);
-      expect(source).toMatch(/prefix:\s*config\.commandPrefix,/);
-      expect(source).toMatch(/dataDir:\s*DATA_DIR,/);
+      expect(initBlock).toMatch(/homeGuildId:\s*config\.guildId,/);
+      expect(initBlock).toMatch(/prefix:\s*config\.commandPrefix,/);
+      expect(initBlock).toMatch(/dataDir:\s*DATA_DIR,/);
     });
 
     test("initRouting is given the bot's own id and name, the command map, and the loaded plugins' summaries", () => {
       // appId is the route's first argument in every PUT, so a wrong one is a wrong route.
-      expect(source).toMatch(/appId:\s*c\.user\.id,/);
-      expect(source).toMatch(/botUsername:\s*c\.user\.username,/);
+      expect(initBlock).toMatch(/appId:\s*c\.user\.id,/);
+      expect(initBlock).toMatch(/botUsername:\s*c\.user\.username,/);
       // The command map is how the planner finds each command's owner: an empty one would read every
       // plugin command as a core command and send it to every server.
-      expect(source).toMatch(/\n\s*commandMap,\n/);
-      expect(source).toMatch(
+      expect(initBlock).toMatch(/\n\s*commandMap,\n/);
+      expect(initBlock).toMatch(
         /plugins:\s*describePlugins\(loadResult\.loaded,\s*commandBody,\s*config\.commandPrefix,\s*commandMap\),/,
       );
-      expect(source).toMatch(/now:\s*\(\)\s*=>\s*new Date\(\),/);
-      expect(source).toMatch(/log:\s*console,/);
+      expect(initBlock).toMatch(/now:\s*\(\)\s*=>\s*new Date\(\),/);
+      expect(initBlock).toMatch(/log:\s*console,/);
     });
 
     test("initRouting and applyRouting sit inside the same try whose catch keeps a failure from taking the bot down", () => {
