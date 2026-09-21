@@ -125,7 +125,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * emoji-heavy text of 41 to 79 units with 37 or fewer code points nothing is cut and the ellipsis is
  * still appended. That only ever shows for a hostile value; a real id is at most 25 ASCII digits.
  */
-function shown(value: unknown): string {
+export function shown(value: unknown): string {
   let text: string;
   if (typeof value === "string") text = value;
   else if (typeof value === "object" && value !== null) text = Array.isArray(value) ? "[list]" : "[object]";

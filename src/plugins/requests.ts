@@ -1,13 +1,35 @@
-// The plugin request MAILBOX (#105). The admin panel can't write state.json (the bot is the sole
-// writer), so each panel action becomes a request file in data/plugins/requests/ (written by
-// `ops/bot-ops.sh plugin-request` via `docker exec -u bun`). The bot drains them — validating each
-// against `PluginRequest`, applying the surviving ones through the SAME version-parameterized state
-// builders `/plugins` uses (#104), then deleting the file (a malformed/invalid one is moved aside to
-// requests/rejected/). This is the trust boundary: a dropped file can only ever run the five actions
-// on an ALREADY-installed plugin — never arbitrary code, never a path outside requests/, never enable
-// a new plugin (that stays `PLUGINS=`-only). Pure over injected deps (a filesystem seam + the mutate/
-// restart deps) so it unit-tests in a temp dir.
+// The plugin request MAILBOX (#105, extended by #241). The admin panel can't write the bot's data (the
+// bot is the sole writer), so each panel action becomes a request file in data/plugins/requests/
+// (written by `ops/bot-ops.sh plugin-request` via `docker exec -u bun`). The bot drains them --
+// validating each, applying the surviving ones, then deleting the file (a malformed/invalid one is moved
+// aside to requests/rejected/). Two families share the directory:
+//
+//   * the five UPDATE actions (update-now, schedule, remind, skip, cancel) on an ALREADY-installed
+//     plugin, validated against `PluginRequest` and applied through the SAME version-parameterized state
+//     builders `/plugins` uses (#104) -- this file;
+//   * the four ROUTING actions (routing-set, webhook-add, webhook-remove, discovery-refresh) against
+//     servers and channels the bot can see -- `src/routing/requests.ts`, which this file only
+//     dispatches to.
+//
+// This is the trust boundary: a dropped file can only ever run those nine actions -- never arbitrary
+// code, never a path outside requests/, never enable a new plugin (that stays `PLUGINS=`-only).
+//
+// A file that may carry a WEBHOOK URL is a secret: its rejection deletes it rather than moving it to
+// rejected/, and no reason it produces quotes a parser or a fetch error. See `src/routing/requests.ts`.
+//
+// Pure over injected deps (a filesystem seam + the mutate/restart deps) so it unit-tests in a temp dir.
 import { join } from "node:path";
+import { withResult, type RequestResult } from "../routing/model";
+import {
+  applyRoutingRequest,
+  parseRoutingRequest,
+  redactWebhookUrls,
+  requestIdOf,
+  ROUTING_ACTIONS,
+  RoutingRefusal,
+  type RoutingRequestDeps,
+} from "../routing/requests";
+import { shown } from "../routing/resolve";
 import type { PluginIndex, PluginIndexEntry, PluginRequest, PluginStateEntry, PluginStateFile } from "./contract";
 import {
   cancelPending,
@@ -44,6 +66,8 @@ export interface PluginRequestDeps {
   hostApiVersion: number;
   now: () => Date;
   log: PluginUpdateLog;
+  /** What the four routing actions run against (#241). Absent: a routing action is rejected. */
+  routing?: RoutingRequestDeps;
 }
 
 // Single-flight: the boot drain and a tick drain (both call consumePluginRequests) must not overlap —
@@ -66,6 +90,26 @@ export function consumePluginRequests(deps: PluginRequestDeps): Promise<void> {
   return run;
 }
 
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Whether the text of a request file holds a webhook URL. JSON may spell a slash `\/` or `/`, so
+// those are read as the slash they are before looking.
+const WEBHOOK_URL_IN_TEXT = /discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\//i;
+function carriesWebhookUrl(text: string): boolean {
+  return WEBHOOK_URL_IN_TEXT.test(text.replace(/\\\//g, "/").replace(/\\u002f/gi, "/"));
+}
+
+interface PluginContext {
+  installed: Map<string, PluginStateEntry>;
+  entryByName: Map<string, PluginIndexEntry>;
+}
+
 async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   let files: string[];
   try {
@@ -75,23 +119,57 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   }
   if (files.length === 0) return;
 
-  const [index, state] = await Promise.all([deps.loadIndex(), deps.readState()]);
-  const installed = new Map(state.plugins.map((p) => [p.name, p]));
-  const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
+  // The Plugin Index is a network fetch (five-second timeout) and only the five update actions need it,
+  // so it is loaded the first time a file needs it -- once per drain -- and never for a drain of routing
+  // requests alone. A load that throws propagates out of the drain exactly as it always has, leaving
+  // the files that were not reached queued.
+  let pluginContext: Promise<PluginContext> | undefined;
+  const loadPluginContext = (): Promise<PluginContext> =>
+    (pluginContext ??= Promise.all([deps.loadIndex(), deps.readState()]).then(([index, state]) => ({
+      installed: new Map(state.plugins.map((p) => [p.name, p])),
+      entryByName: new Map(index.plugins.map((e) => [e.name, e])),
+    })));
   let restartReason: string | undefined;
 
   for (const file of files) {
     const path = join(deps.requestsDir, file);
-    let raw: unknown;
+    // The writer names a webhook request for its action, so the name alone says it may hold a URL --
+    // even when the file cannot be read or parsed.
+    const namedForSecret = file.includes("webhook-add");
+    let text: string;
     try {
-      raw = JSON.parse(await deps.readFile(path));
+      text = await deps.readFile(path);
     } catch (err) {
-      await reject(deps, path, file, `unreadable JSON — ${err instanceof Error ? err.message : String(err)}`);
+      await reject(deps, path, file, namedForSecret ? "unreadable JSON" : `unreadable JSON — ${errorText(err)}`, namedForSecret);
       continue;
     }
-    const v = validate(raw, installed, entryByName, deps.hostApiVersion);
+    const secretBearing = namedForSecret || carriesWebhookUrl(text);
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (err) {
+      // A parser's message quotes what it choked on, which for such a file may be the URL.
+      await reject(deps, path, file, secretBearing ? "unreadable JSON" : `unreadable JSON — ${errorText(err)}`, secretBearing);
+      continue;
+    }
+
+    const action = isRecord(raw) ? raw.action : undefined;
+    if (typeof action === "string" && ROUTING_ACTIONS.has(action)) {
+      await handleRoutingRequest(deps, path, file, raw, action, secretBearing || action === "webhook-add");
+      continue;
+    }
+
+    const { installed, entryByName } = await loadPluginContext();
+    // #249: validation must not be able to wedge the mailbox. A throw here used to escape the drain with
+    // this file still queued, so every later drain threw on it again.
+    let v: Valid;
+    try {
+      v = validate(raw, installed, entryByName, deps.hostApiVersion);
+    } catch (err) {
+      v = { ok: false, reason: `validation threw — ${errorText(err)}` };
+    }
     if (!v.ok) {
-      await reject(deps, path, file, v.reason);
+      await reject(deps, path, file, v.reason, secretBearing);
       continue;
     }
     try {
@@ -100,7 +178,7 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
       await unlinkTolerant(deps, path);
     } catch (err) {
       // An apply failure is unexpected (the mutator write failed) — move it aside so it doesn't loop.
-      await reject(deps, path, file, `apply failed — ${err instanceof Error ? err.message : String(err)}`);
+      await reject(deps, path, file, `apply failed — ${errorText(err)}`, secretBearing);
     }
   }
 
@@ -109,10 +187,71 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   if (restartReason !== undefined) deps.requestRestart(restartReason);
 }
 
+type Outcome = { ok: true; channelId?: string } | { ok: false; reason: string };
+
+/**
+ * One routing request: parse, apply, record what became of it under the id the panel chose (if it chose
+ * one), then delete the file -- or, for a refusal, reject it. A request is "applied" once its change is
+ * written; see `applyRoutingRequest`.
+ */
+async function handleRoutingRequest(
+  deps: PluginRequestDeps,
+  path: string,
+  file: string,
+  raw: unknown,
+  action: string,
+  secretBearing: boolean,
+): Promise<void> {
+  const routing = deps.routing;
+  let outcome: Outcome;
+  let plugin: string | undefined;
+  if (routing === undefined) {
+    outcome = { ok: false, reason: "routing is not available" };
+  } else {
+    const parsed = parseRoutingRequest(raw);
+    if (!parsed.ok) {
+      outcome = { ok: false, reason: parsed.reason };
+    } else {
+      if (parsed.request.action === "routing-set") plugin = parsed.request.plugin;
+      try {
+        const applied = await applyRoutingRequest(parsed.request, routing);
+        outcome = { ok: true, ...(applied.channelId === undefined ? {} : { channelId: applied.channelId }) };
+      } catch (err) {
+        outcome = { ok: false, reason: err instanceof RoutingRefusal ? err.message : `apply failed — ${errorText(err)}` };
+      }
+    }
+  }
+
+  // No reason leaves this function, in a log or in a result, without passing through this.
+  const reason = outcome.ok ? undefined : redactWebhookUrls(outcome.reason);
+  const id = requestIdOf(raw);
+  if (routing !== undefined && id !== undefined) {
+    const result: RequestResult = {
+      id,
+      action,
+      ...(plugin === undefined ? {} : { plugin }),
+      ...(outcome.ok && outcome.channelId !== undefined ? { channelId: outcome.channelId } : {}),
+      ok: outcome.ok,
+      ...(reason === undefined ? {} : { reason }),
+      at: deps.now().toISOString(),
+    };
+    try {
+      await routing.mutateRouting((current) => withResult(current, result));
+    } catch (err) {
+      // The change is already made; failing to say so must not turn an applied request into a rejected one.
+      deps.log.warn(`[plugins] couldn't record the result of request ${file}: ${redactWebhookUrls(errorText(err))}`);
+    }
+  }
+
+  if (outcome.ok) await unlinkTolerant(deps, path);
+  else await reject(deps, path, file, reason ?? "rejected", secretBearing);
+}
+
 type Valid = { ok: true; request: PluginRequest } | { ok: false; reason: string };
 
 /** Validate a parsed request against `PluginRequest` + formats + the installed/compatibility
- *  pre-flight. Pure. A `false` result is moved to rejected/; a `true` result is safe to apply. */
+ *  pre-flight. Pure. A `false` result is moved to rejected/; a `true` result is safe to apply.
+ *  Every untrusted value that goes into a reason goes through `shown`: it cannot throw and it clips. */
 export function validate(
   raw: unknown,
   installed: Map<string, PluginStateEntry>,
@@ -122,8 +261,8 @@ export function validate(
   if (typeof raw !== "object" || raw === null) return { ok: false, reason: "not an object" };
   const r = raw as Record<string, unknown>;
   const action = r.action;
-  if (typeof action !== "string" || !ACTIONS.has(action)) return { ok: false, reason: `unknown action ${JSON.stringify(action)}` };
-  if (typeof r.plugin !== "string" || !PLUGIN_NAME_RE.test(r.plugin)) return { ok: false, reason: `bad plugin name ${JSON.stringify(r.plugin)}` };
+  if (typeof action !== "string" || !ACTIONS.has(action)) return { ok: false, reason: `unknown action ${shown(action)}` };
+  if (typeof r.plugin !== "string" || !PLUGIN_NAME_RE.test(r.plugin)) return { ok: false, reason: `bad plugin name ${shown(r.plugin)}` };
   if (typeof r.requestedBy !== "string" || r.requestedBy.length === 0) return { ok: false, reason: "missing requestedBy" };
   const plugin = r.plugin;
 
@@ -135,17 +274,17 @@ export function validate(
   // `version` (required for all but cancel) — the traversal-safe gate.
   if (action !== "cancel") {
     if (typeof r.version !== "string" || !VERSION_RE.test(r.version)) {
-      return { ok: false, reason: `bad version ${JSON.stringify(r.version)}` };
+      return { ok: false, reason: `bad version ${shown(r.version)}` };
     }
   }
   if (action === "schedule") {
     if (typeof r.at !== "string" || !ISO_OFFSET_RE.test(r.at) || Number.isNaN(Date.parse(r.at))) {
-      return { ok: false, reason: `bad schedule time ${JSON.stringify(r.at)}` };
+      return { ok: false, reason: `bad schedule time ${shown(r.at)}` };
     }
   }
   if (action === "remind" && r.days !== undefined) {
     if (typeof r.days !== "number" || !Number.isInteger(r.days) || r.days < 1 || r.days > 999) {
-      return { ok: false, reason: `bad days ${JSON.stringify(r.days)}` };
+      return { ok: false, reason: `bad days ${shown(r.days)}` };
     }
   }
   // The only compatibility check the index shape allows: it carries hostApiVersion for the CURRENT
@@ -198,8 +337,22 @@ async function unlinkTolerant(deps: PluginRequestDeps, path: string): Promise<vo
   }
 }
 
-async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string): Promise<void> {
-  deps.log.warn(`[plugins] rejecting request ${file}: ${reason}`);
+/**
+ * Refuse a request file. Logged, then moved aside to rejected/ so an operator can look at it -- except a
+ * `secretBearing` file, which may hold a webhook URL and is DELETED instead: rejected/ would keep the
+ * secret on disk indefinitely, in a folder nobody treats as secret. If that delete fails the error names
+ * the file and nothing else.
+ */
+async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string, secretBearing = false): Promise<void> {
+  deps.log.warn(`[plugins] rejecting request ${file}: ${redactWebhookUrls(reason)}`);
+  if (secretBearing) {
+    try {
+      await deps.unlink(path);
+    } catch {
+      deps.log.error(`[plugins] couldn't delete rejected request ${file}`);
+    }
+    return;
+  }
   const rejectedDir = join(deps.requestsDir, "rejected");
   try {
     await deps.mkdir(rejectedDir);

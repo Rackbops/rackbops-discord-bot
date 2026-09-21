@@ -3,6 +3,8 @@
 // `consumePluginRequests` is tested for order, delete-on-apply, quarantine, one-restart-per-drain,
 // and the single-flight guard.
 import { beforeEach, describe, expect, test } from "bun:test";
+import { freshRouting, freshSecrets, repairRouting, repairSecrets, type DiscoveryFile, type RoutingFile } from "../routing/model";
+import type { RoutingRequestDeps } from "../routing/requests";
 import type { PluginIndex, PluginIndexEntry, PluginStateEntry, PluginStateFile } from "./contract";
 import { consumePluginRequests, resetPluginRequestsForTest, validate, type PluginRequestDeps } from "./requests";
 
@@ -65,12 +67,16 @@ describe("validate (#105 trust boundary)", () => {
 describe("consumePluginRequests drain", () => {
   beforeEach(resetPluginRequestsForTest);
 
-  function harness(files: Record<string, unknown>) {
+  function harness(files: Record<string, unknown>, opts: { routing?: RoutingRequestDeps; state?: PluginStateFile } = {}) {
     const fs = new Map<string, string>(Object.entries(files).map(([k, v]) => [k, JSON.stringify(v)]));
     const rejected: string[] = [];
     const restarts: string[] = [];
     const mutations: number[] = [];
-    let state: PluginStateFile = { hostApiVersion: 1, writtenAt: "", plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0.0" }] };
+    const warns: string[] = [];
+    const errors: string[] = [];
+    let indexLoads = 0;
+    let stateReads = 0;
+    let state: PluginStateFile = opts.state ?? { hostApiVersion: 1, writtenAt: "", plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0.0" }] };
     const deps: PluginRequestDeps = {
       requestsDir: REQ_DIR,
       readDir: async (dir) => (dir === REQ_DIR ? [...fs.keys()] : Promise.reject(new Error("ENOENT"))),
@@ -90,15 +96,37 @@ describe("consumePluginRequests drain", () => {
         rejected.push(to.slice((REQ_DIR + "/rejected/").length));
       },
       mkdir: async () => {},
-      loadIndex: async (): Promise<PluginIndex> => ({ schemaVersion: 1, generatedAt: "", plugins: [entry("warbandeer", "1.1.0")] }),
-      readState: async () => state,
+      loadIndex: async (): Promise<PluginIndex> => {
+        indexLoads += 1;
+        return { schemaVersion: 1, generatedAt: "", plugins: [entry("warbandeer", "1.1.0")] };
+      },
+      readState: async () => {
+        stateReads += 1;
+        return state;
+      },
       mutateState: async (mutate) => { state = mutate(state); mutations.push(1); },
       requestRestart: (reason) => restarts.push(reason),
       hostApiVersion: 1,
       now: () => new Date("2026-09-05T12:00:00.000Z"),
-      log: { info() {}, warn() {}, error() {} },
+      log: {
+        info() {},
+        warn: (message) => void warns.push(message),
+        error: (message, err) => void errors.push(err === undefined ? message : `${message} ${String(err)}`),
+      },
+      ...(opts.routing === undefined ? {} : { routing: opts.routing }),
     };
-    return { deps, fs, rejected, restarts, mutations, get state() { return state; } };
+    return {
+      deps,
+      fs,
+      rejected,
+      restarts,
+      mutations,
+      warns,
+      errors,
+      get indexLoads() { return indexLoads; },
+      get stateReads() { return stateReads; },
+      get state() { return state; },
+    };
   }
   const wb = (over: object) => ({ plugin: "warbandeer", requestedBy: "email:me@x.com", ...over });
 
@@ -174,5 +202,479 @@ describe("consumePluginRequests drain", () => {
     await consumePluginRequests(h.deps);
     expect(h.mutations).toHaveLength(0);
     expect(h.restarts).toHaveLength(0);
+  });
+
+  // -------------------------------------------------------------------------------------------------
+  // #241: the four routing actions share the directory, and #249's fix rides along.
+  // -------------------------------------------------------------------------------------------------
+  describe("routing requests in the mailbox (#241)", () => {
+    const HOME = "111111111111111111";
+    const OTHER = "222222222222222222";
+    const CH = "333333333333333331";
+    const WH_ID = "555555555555555555";
+    const TOKEN = "TOKEN_abcdefghij0123456789xyz";
+    const URL_OK = `https://discord.com/api/webhooks/${WH_ID}/${TOKEN}`;
+    const ID = "req_12345678";
+    const AT = "2026-09-05T12:00:00.000Z";
+
+    const discovery = (): DiscoveryFile => ({
+      v: 1,
+      generatedAt: AT,
+      bot: { id: "900000000000000000", username: "Setlist Bot" },
+      inviteUrl: "",
+      homeGuildId: HOME,
+      guilds: [{ id: HOME, name: "Home", channels: [{ id: CH, name: "general", canSend: true }], commands: null }],
+      plugins: {},
+    });
+
+    /** Routing deps over an in-memory routing.json, recording what was called. */
+    function routingFake(over: Partial<RoutingRequestDeps> = {}) {
+      let routing: RoutingFile = freshRouting();
+      let secrets = freshSecrets();
+      const calls: string[] = [];
+      const deps: RoutingRequestDeps = {
+        readDiscovery: async () => discovery(),
+        readRouting: async () => structuredClone(routing),
+        mutateRouting: async (mutate) => {
+          calls.push("mutateRouting");
+          routing = repairRouting(mutate(repairRouting(routing)));
+        },
+        mutateSecrets: async (mutate) => {
+          calls.push("mutateSecrets");
+          secrets = repairSecrets(mutate(repairSecrets(secrets)));
+        },
+        fetchWebhook: async () => ({ ok: true, id: WH_ID, channelId: CH, guildId: HOME }),
+        applyRouting: async (reason) => {
+          calls.push(`applyRouting ${reason}`);
+          return {};
+        },
+        refreshDiscovery: async () => void calls.push("refreshDiscovery"),
+        now: () => new Date(AT),
+        log: { warn() {} },
+        ...over,
+      };
+      return {
+        deps,
+        calls,
+        get routing() {
+          return routing;
+        },
+        get secrets() {
+          return secrets;
+        },
+      };
+    }
+
+    const req = (over: object = {}) => ({ requestedBy: "email:me@x.com", id: ID, ...over });
+    const refresh = (over: object = {}) => req({ action: "discovery-refresh", ...over });
+    const setPlugin = (over: object = {}) => req({ action: "routing-set", plugin: "music", servers: { [HOME]: { commands: "all" } }, ...over });
+    const addWebhook = (over: object = {}) => req({ action: "webhook-add", url: URL_OK, ...over });
+    const removeWebhook = (over: object = {}) => req({ action: "webhook-remove", channelId: CH, ...over });
+
+    test("a routing action is dispatched and removed from the mailbox", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.calls).toContain("refreshDiscovery");
+      expect(h.fs.size).toBe(0);
+      expect(h.rejected).toEqual([]);
+      expect(h.warns).toEqual([]);
+    });
+
+    test("routing-set, webhook-add and webhook-remove are each applied and removed", async () => {
+      const r = routingFake();
+      const h = harness(
+        {
+          "100-routing-set-1.json": setPlugin({ id: undefined }),
+          "200-webhook-add-1.json": addWebhook({ id: undefined }),
+          "300-webhook-remove-1.json": removeWebhook({ id: undefined }),
+        },
+        { routing: r.deps },
+      );
+      await consumePluginRequests(h.deps);
+      expect(r.calls).toEqual([
+        "mutateRouting",
+        "applyRouting routing-set music",
+        "mutateSecrets",
+        "mutateRouting",
+        "mutateRouting",
+        "mutateSecrets",
+      ]);
+      expect(h.fs.size).toBe(0);
+      expect(h.rejected).toEqual([]);
+      expect(r.routing.plugins.music).toEqual({ servers: { [HOME]: { commands: "all" } } });
+      expect(r.routing.webhooks).toEqual({});
+      expect(r.secrets.webhooks).toEqual({});
+    });
+
+    test("each invalid form is rejected with a reason naming the field", async () => {
+      const r = routingFake();
+      const h = harness(
+        {
+          "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }),
+          "200-routing-set-1.json": setPlugin({ servers: "nope" }),
+          "300-webhook-remove-1.json": removeWebhook({ channelId: "abc" }),
+          "400-x.json": req({ action: "discovery-refresh", requestedBy: "" }),
+        },
+        { routing: r.deps },
+      );
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([
+        "[plugins] rejecting request 100-routing-set-1.json: bad plugin name",
+        "[plugins] rejecting request 200-routing-set-1.json: routing must be an object with a servers object",
+        "[plugins] rejecting request 300-webhook-remove-1.json: bad channel id",
+        "[plugins] rejecting request 400-x.json: missing requestedBy",
+      ]);
+      // A refusal that carries no url is set aside for the operator, as an invalid update request is.
+      expect(h.rejected.sort()).toEqual(["100-routing-set-1.json", "200-routing-set-1.json", "300-webhook-remove-1.json", "400-x.json"]);
+      // The only routing writes are the four results (each request carried an id): nothing was applied.
+      expect(r.calls).toEqual(["mutateRouting", "mutateRouting", "mutateRouting", "mutateRouting"]);
+      expect(r.routing.results.map((x) => [x.ok, x.reason])).toEqual([
+        [false, "bad plugin name"],
+        [false, "routing must be an object with a servers object"],
+        [false, "bad channel id"],
+        [false, "missing requestedBy"],
+      ]);
+    });
+
+    test("with no routing deps a routing action is rejected", async () => {
+      const h = harness({
+        "100-routing-set-1.json": setPlugin(),
+        "200-webhook-add-1.json": addWebhook(),
+      });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([
+        "[plugins] rejecting request 100-routing-set-1.json: routing is not available",
+        "[plugins] rejecting request 200-webhook-add-1.json: routing is not available",
+      ]);
+      // The routing-set is set aside; the webhook-add may carry a url, so it is deleted.
+      expect(h.rejected).toEqual(["100-routing-set-1.json"]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("the five update actions validate and apply exactly as before", async () => {
+      const r = routingFake();
+      const h = harness(
+        {
+          "100-skip-1.json": wb({ action: "skip", version: "1.1.0" }),
+          "200-cancel-1.json": wb({ action: "cancel" }),
+          "300-skip-2.json": wb({ action: "skip", version: "latest" }),
+          "400-skip-3.json": wb({ plugin: "ghost", action: "skip", version: "1.1.0" }),
+        },
+        { routing: r.deps },
+      );
+      await consumePluginRequests(h.deps);
+      // Two acceptances, applied through the state mutator (skip, then cancel clears the pending state)...
+      expect(h.mutations).toHaveLength(2);
+      expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0");
+      // ...and two rejections, quarantined as they always were, with their old reasons' substance.
+      expect(h.rejected.sort()).toEqual(["300-skip-2.json", "400-skip-3.json"]);
+      expect(h.warns.some((w) => w.includes("300-skip-2.json") && w.includes("bad version"))).toBe(true);
+      expect(h.warns.some((w) => w.includes("400-skip-3.json") && w.includes("ghost is not an installed plugin"))).toBe(true);
+      // None of it went near the routing handler, and it recorded no result.
+      expect(r.calls).toEqual([]);
+      expect(r.routing.results).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a request whose validation throws is rejected, and the next file in the drain is still applied", async () => {
+      // #249: `validate` threw out of the drain with the file still queued, so it threw on every later drain.
+      const trap = {
+        name: "trap",
+        enabled: true,
+        configured: true,
+        missingEnv: [],
+        active: true,
+        get installedVersion(): string {
+          throw new Error("boom");
+        },
+      } as unknown as PluginStateEntry;
+      const state: PluginStateFile = {
+        hostApiVersion: 1,
+        writtenAt: "",
+        plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0.0" }, trap],
+      };
+      const h = harness(
+        {
+          "100-skip-1.json": wb({ plugin: "trap", action: "skip", version: "1.1.0" }),
+          "200-skip-1.json": wb({ action: "skip", version: "1.1.0" }),
+        },
+        { state },
+      );
+      await consumePluginRequests(h.deps);
+      expect(h.rejected).toEqual(["100-skip-1.json"]);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-skip-1.json: validation threw — boom"]);
+      expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0"); // the next file was still applied
+      expect(h.fs.size).toBe(0); // and the thrower is gone, so it cannot wedge the next drain
+    });
+
+    test("validate does not throw on a 100k-deep action, plugin, version, at or days", () => {
+      const nest = (kind: "array" | "object"): unknown => {
+        let value: unknown = "leaf";
+        for (let i = 0; i < 100_000; i += 1) value = kind === "array" ? [value] : { next: value };
+        return value;
+      };
+      const installed = installedMap(["warbandeer", "1.0.0"]);
+      const entries = entryMap(entry("warbandeer", "1.1.0"));
+      for (const kind of ["array", "object"] as const) {
+        const deep = nest(kind);
+        const base = { action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "2026-09-06T18:30-07:00", requestedBy: "t" };
+        const cases: Record<string, object> = {
+          action: { ...base, action: deep },
+          plugin: { ...base, plugin: deep },
+          version: { ...base, version: deep },
+          at: { ...base, at: deep },
+          days: { ...base, action: "remind", days: deep },
+        };
+        for (const [field, raw] of Object.entries(cases)) {
+          let result: ReturnType<typeof validate> | undefined;
+          expect(() => (result = validate(raw, installed, entries, 1)), `${kind} ${field}`).not.toThrow();
+          expect(result?.ok, `${kind} ${field}`).toBe(false);
+          // Named, not printed: the reason stays short however deep the value was.
+          expect(result && !result.ok && result.reason.length, `${kind} ${field}`).toBeLessThan(80);
+        }
+      }
+    });
+
+    test("the reasons an update request is refused with still name the field and quote a short value", () => {
+      const installed = installedMap(["warbandeer", "1.0.0"]);
+      const entries = entryMap(entry("warbandeer", "1.1.0"));
+      const why = (raw: object) => {
+        const v = validate(raw, installed, entries, 1);
+        return v.ok ? undefined : v.reason;
+      };
+      expect(why({ action: "nope", plugin: "warbandeer", requestedBy: "t" })).toContain("unknown action");
+      expect(why({ action: "skip", plugin: "Bad", requestedBy: "t" })).toContain("bad plugin name");
+      expect(why({ action: "skip", plugin: "warbandeer", version: "latest", requestedBy: "t" })).toContain("bad version");
+      expect(why({ action: "schedule", plugin: "warbandeer", version: "1.1.0", at: "soon", requestedBy: "t" })).toContain("bad schedule time");
+      expect(why({ action: "remind", plugin: "warbandeer", version: "1.1.0", days: 0, requestedBy: "t" })).toContain("bad days");
+      // A long value is clipped rather than echoed at length.
+      expect(why({ action: "skip", plugin: "warbandeer", version: "x".repeat(5000), requestedBy: "t" })!.length).toBeLessThan(80);
+    });
+
+    test("the Plugin Index is not loaded for a drain of routing requests only", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh(), "200-routing-set-1.json": setPlugin() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(h.indexLoads).toBe(0);
+      expect(h.stateReads).toBe(0);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("… and is loaded once for a drain that mixes both", async () => {
+      const r = routingFake();
+      const h = harness(
+        {
+          "100-discovery-refresh-1.json": refresh(),
+          "200-skip-1.json": wb({ action: "skip", version: "1.1.0" }),
+          "300-routing-set-1.json": setPlugin(),
+          "400-cancel-1.json": wb({ action: "cancel" }),
+        },
+        { routing: r.deps },
+      );
+      await consumePluginRequests(h.deps);
+      expect(h.indexLoads).toBe(1);
+      expect(h.stateReads).toBe(1);
+      expect(h.fs.size).toBe(0);
+      expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0");
+    });
+
+    test("a Plugin Index that cannot be loaded leaves the update files queued, as it always did", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0" }) });
+      h.deps.loadIndex = async () => {
+        throw new Error("index down");
+      };
+      await expect(consumePluginRequests(h.deps)).rejects.toThrow("index down");
+      expect(h.fs.size).toBe(1);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("a rejected file that carries a webhook url is deleted, not moved to rejected/", async () => {
+      const r = routingFake();
+      const escaped = String.raw`{"action":"skip","plugin":"ghost","version":"1.1.0","requestedBy":"https:\/\/discord.com\/api\/webhooks\/123456\/TOKENTOKENTOKENTOKENTOKEN"}`;
+      const h = harness(
+        {
+          // Refused by the parser, named for what it carries.
+          "100-webhook-add-1.json": addWebhook({ url: "https://discord.com/api/webhooks/123456/short" }),
+          // Refused as an update request, but its text holds a url.
+          "200-x.json": wb({ plugin: "ghost", action: "skip", version: "1.1.0", requestedBy: URL_OK }),
+          // The same, with the slashes JSON-escaped.
+          "400-y.json": {},
+          // A webhook-add the writer named for something else.
+          "500-z.json": addWebhook({ url: "nope" }),
+          // A refusal that carries nothing secret is still set aside.
+          "600-w.json": wb({ action: "nope", version: "1.1.0" }),
+        },
+        { routing: r.deps },
+      );
+      h.fs.set("400-y.json", escaped);
+      await consumePluginRequests(h.deps);
+      expect(h.rejected).toEqual(["600-w.json"]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("a secret-bearing file whose delete fails is reported by name only", async () => {
+      const r = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook({ url: "bad" }) }, { routing: r.deps });
+      h.deps.unlink = async () => {
+        throw new Error(`EACCES: cannot delete, the file holds ${URL_OK}`);
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.errors).toEqual(["[plugins] couldn't delete rejected request 100-webhook-add-1.json"]);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("an unparseable file named webhook-add is deleted and its reason carries no parser text", async () => {
+      const r = routingFake();
+      const h = harness({}, { routing: r.deps });
+      h.fs.set("100-webhook-add-1.json", `{"action":"webhook-add","url":"${URL_OK}", oops`);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: unreadable JSON"]);
+      expect(h.rejected).toEqual([]);
+      expect(h.fs.size).toBe(0);
+    });
+
+    test("an unparseable file that is not secret keeps its parser message, and is set aside", async () => {
+      const h = harness({});
+      h.fs.set("100-skip-1.json", "{ not json");
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(1);
+      expect(h.warns[0]).toContain("100-skip-1.json: unreadable JSON — ");
+      expect(h.rejected).toEqual(["100-skip-1.json"]);
+    });
+
+    test("an unparseable file whose TEXT holds a url, whatever it is named, carries no parser text", async () => {
+      const h = harness({});
+      h.fs.set("100-x.json", `{"note":"https://discord.com/api/webhooks/123456/${TOKEN}" oops`);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-x.json: unreadable JSON"]);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("a reason that somehow contains a webhook url is redacted in the log and in the result", async () => {
+      // The request is well-formed; the lookup dependency blows up with the url in its message. Nothing
+      // in this code path should produce that, which is why it is checked against a dep that does.
+      const r = routingFake({
+        fetchWebhook: async () => {
+          throw new Error(`lookup failed for ${URL_OK}`);
+        },
+      });
+      const h = harness({ "100-webhook-add-1.json": addWebhook() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-webhook-add-1.json: apply failed — lookup failed for [webhook url]"]);
+      expect(r.routing.results).toEqual([
+        { id: ID, action: "webhook-add", ok: false, reason: "apply failed — lookup failed for [webhook url]", at: AT },
+      ]);
+      expect(JSON.stringify([h.warns, h.errors, r.routing])).not.toContain(TOKEN);
+    });
+
+    test("an applied request records an ok result under its id", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([{ id: ID, action: "discovery-refresh", ok: true, at: AT }]);
+    });
+
+    test("an applied routing-set records its plugin", async () => {
+      const r = routingFake();
+      const h = harness({ "100-routing-set-1.json": setPlugin() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([{ id: ID, action: "routing-set", plugin: "music", ok: true, at: AT }]);
+    });
+
+    test("an applied webhook-add records the channel Discord named", async () => {
+      const r = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook(), "200-webhook-remove-1.json": removeWebhook({ id: "req_87654321" }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([
+        { id: ID, action: "webhook-add", channelId: CH, ok: true, at: AT },
+        { id: "req_87654321", action: "webhook-remove", channelId: CH, ok: true, at: AT },
+      ]);
+    });
+
+    test("a refused request records its reason", async () => {
+      const r = routingFake();
+      const h = harness({ "100-routing-set-1.json": setPlugin({ servers: { [OTHER]: { commands: "all" } } }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([
+        { id: ID, action: "routing-set", plugin: "music", ok: false, reason: `server ${OTHER} is not one the bot is in`, at: AT },
+      ]);
+    });
+
+    test("a request that fails to parse is still recorded under its id, without the fields it got wrong", async () => {
+      const r = routingFake();
+      const h = harness({ "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([{ id: ID, action: "routing-set", ok: false, reason: "bad plugin name", at: AT }]);
+    });
+
+    test("a request with no id records nothing", async () => {
+      const r = routingFake();
+      const h = harness(
+        {
+          "100-discovery-refresh-1.json": refresh({ id: undefined }),
+          "200-discovery-refresh-1.json": refresh({ id: "bad id" }),
+          "300-routing-set-1.json": setPlugin({ id: undefined, servers: { [OTHER]: { commands: "all" } } }),
+        },
+        { routing: r.deps },
+      );
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([]);
+      // Applied and refused alike: the only mutateRouting calls would be result writes, and there were none.
+      expect(r.calls).toEqual(["refreshDiscovery", "refreshDiscovery", "refreshDiscovery"]);
+      // The two that were fine were still applied and removed; the refusal was set aside.
+      expect(h.rejected).toEqual(["300-routing-set-1.json"]);
+    });
+
+    test("a failing result write does not fail the request", async () => {
+      const r = routingFake({
+        mutateRouting: async () => {
+          throw new Error("disk full");
+        },
+      });
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      // Applied and removed -- not rejected, and the failure is said out loud.
+      expect(h.fs.size).toBe(0);
+      expect(h.rejected).toEqual([]);
+      expect(h.warns).toEqual(["[plugins] couldn't record the result of request 100-discovery-refresh-1.json: disk full"]);
+    });
+
+    test("update actions record no result", async () => {
+      const r = routingFake();
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", id: ID }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([]);
+      expect(r.calls).toEqual([]);
+    });
+
+    test("two routing requests arriving together are applied one after the other, never interleaved", async () => {
+      const order: string[] = [];
+      const gate: { release: () => void } = { release: () => {} };
+      const blocked = new Promise<void>((resolve) => (gate.release = resolve));
+      const r = routingFake({
+        refreshDiscovery: async () => {
+          order.push("first:start");
+          await blocked;
+          order.push("first:end");
+        },
+        applyRouting: async (reason) => {
+          order.push(`second:${reason}`);
+          return {};
+        },
+      });
+      const h = harness(
+        { "100-discovery-refresh-1.json": refresh(), "200-routing-set-1.json": setPlugin() },
+        { routing: r.deps },
+      );
+      const drain = consumePluginRequests(h.deps);
+      // A second drain started while the first is stuck on its first file must not reach the second file.
+      const second = consumePluginRequests(h.deps);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(order).toEqual(["first:start"]);
+      gate.release();
+      await Promise.all([drain, second]);
+      expect(order).toEqual(["first:start", "first:end", "second:routing-set music"]);
+    });
   });
 });

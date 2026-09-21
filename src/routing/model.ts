@@ -42,6 +42,26 @@ export interface WebhookMeta {
   /** why Discord refused it, once it has */
   broken?: string;
 }
+/**
+ * What became of one panel request (#241), so the panel can show it: the panel chooses an `id`, drops
+ * a request carrying it, and looks for that id here. `reason` is the operator-facing "no", and never
+ * carries a webhook URL. `channelId` is the channel a webhook request landed on, when it did.
+ */
+export interface RequestResult {
+  id: string;
+  action: string;
+  plugin?: string;
+  channelId?: string;
+  ok: boolean;
+  reason?: string;
+  at: string;
+}
+/** How many results `routing.json` keeps: the newest. */
+export const MAX_RESULTS = 20;
+/** What a panel may use as a request id: short, and nothing that needs escaping anywhere. */
+export const REQUEST_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const MAX_REASON_LENGTH = 300;
+
 /** `webhooks` key: channel id. Metadata only -- the URL is in `RoutingSecretsFile`. */
 export interface RoutingFile {
   v: 1;
@@ -49,6 +69,8 @@ export interface RoutingFile {
   updatedBy: string;
   plugins: Record<string, PluginRouting>;
   webhooks: Record<string, WebhookMeta>;
+  /** Outcomes of panel requests, oldest first, at most `MAX_RESULTS`. */
+  results: RequestResult[];
 }
 /**
  * channel id -> webhook URL. The only FILE the bot stores a webhook URL in -- though the same bytes
@@ -85,7 +107,7 @@ export interface DiscoveryFile {
 }
 
 export function freshRouting(): RoutingFile {
-  return { v: ROUTING_VERSION, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {} };
+  return { v: ROUTING_VERSION, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] };
 }
 
 export function freshSecrets(): RoutingSecretsFile {
@@ -141,14 +163,38 @@ function repairWebhook(value: unknown): WebhookMeta | undefined {
 }
 
 /**
+ * One request result, or undefined. Only an `id` that a panel could have chosen, a string `action` and
+ * `at`, and a boolean `ok` make one; `plugin` and `channelId` are kept when they have the shape of a
+ * plugin name / snowflake, `reason` when it is text (clipped), and nothing else is copied.
+ */
+function repairResult(value: unknown): RequestResult | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const { id, action, plugin, channelId, ok, reason, at } = value;
+  if (typeof id !== "string" || !REQUEST_ID_RE.test(id)) return undefined;
+  if (typeof action !== "string" || typeof at !== "string" || typeof ok !== "boolean") return undefined;
+  const repaired: RequestResult = { id, action, ok, at };
+  if (typeof plugin === "string" && PLUGIN_NAME_RE.test(plugin)) repaired.plugin = plugin;
+  if (isSnowflake(channelId)) repaired.channelId = channelId;
+  if (typeof reason === "string") repaired.reason = reason.slice(0, MAX_REASON_LENGTH);
+  return repaired;
+}
+
+/** `file` with `result` appended, keeping the newest `MAX_RESULTS`. Pure. */
+export function withResult(file: RoutingFile, result: RequestResult): RoutingFile {
+  return { ...file, results: [...file.results, result].slice(-MAX_RESULTS) };
+}
+
+/**
  * Whatever was on disk, as a valid `RoutingFile`. Never throws, and always returns a NEW object
  * (nothing is shared with `raw`, so a caller may mutate the result freely).
  *
  * Anything that is not a plain object is fresh. Inside an object, an entry that is malformed is
  * dropped on its own -- a plugin whose name fails `PLUGIN_NAME_RE`; a server whose id is not a
  * snowflake or whose `commands` is neither "all" nor a non-empty list of channel ids; a webhook that
- * lacks its ids -- and a bad `postTo` is dropped from a server that is otherwise kept. Unknown keys
- * are not carried over.
+ * lacks its ids; a result without a valid `id`, `action`, `at` and `ok` -- and a bad `postTo` is
+ * dropped from a server that is otherwise kept. Unknown keys are not carried over. A file written
+ * before `results` existed has none and repairs to an empty list; the list is trimmed to the newest
+ * `MAX_RESULTS`.
  *
  * The file's own `v` is not consulted: it is read by shape, and the result always says `v: 1`. That
  * is what keeps a hand-seeded file that forgot `v` from being thrown away whole. It also means that
@@ -174,6 +220,13 @@ export function repairRouting(raw: unknown): RoutingFile {
       const webhook = repairWebhook(entry);
       if (webhook !== undefined) repaired.webhooks[channelId] = webhook;
     }
+  }
+  if (Array.isArray(raw.results)) {
+    for (const entry of raw.results) {
+      const result = repairResult(entry);
+      if (result !== undefined) repaired.results.push(result);
+    }
+    repaired.results = repaired.results.slice(-MAX_RESULTS);
   }
   return repaired;
 }
