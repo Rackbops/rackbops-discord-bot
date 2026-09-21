@@ -2,7 +2,7 @@
 // no real filesystem. `validate` (the trust boundary) is tested directly for every reject reason;
 // `consumePluginRequests` is tested for order, delete-on-apply, quarantine, one-restart-per-drain,
 // and the single-flight guard.
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { freshRouting, freshSecrets, repairRouting, repairSecrets, type DiscoveryFile, type RoutingFile } from "../routing/model";
 import type { RoutingRequestDeps } from "../routing/requests";
 import type { PluginIndex, PluginIndexEntry, PluginStateEntry, PluginStateFile } from "./contract";
@@ -637,6 +637,67 @@ describe("consumePluginRequests drain", () => {
         expect(h.warns).toEqual([]);
         expect(h.state.plugins[0]?.skippedVersion).toBe("1.1.0");
       }
+    });
+
+    test("the second look waits 200 ms by default, and tornReadRetryMs overrides it", async () => {
+      const delays: number[] = [];
+      const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+        delays.push(ms ?? -1);
+        fn();
+        return 0;
+      }) as never);
+      try {
+        const byDefault = harness({});
+        delete byDefault.deps.tornReadRetryMs;
+        byDefault.fs.set("100-skip-1.json", "{ not json");
+        await consumePluginRequests(byDefault.deps);
+        expect(delays).toEqual([200]);
+
+        delays.length = 0;
+        const custom = harness({});
+        custom.deps.tornReadRetryMs = 7;
+        custom.fs.set("100-skip-1.json", "{ not json");
+        await consumePluginRequests(custom.deps);
+        expect(delays).toEqual([7]);
+
+        // A file that parses the first time is not waited for at all.
+        delays.length = 0;
+        const fine = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0" }) });
+        delete fine.deps.tornReadRetryMs;
+        await consumePluginRequests(fine.deps);
+        expect(delays).toEqual([]);
+      } finally {
+        timers.mockRestore();
+      }
+    });
+
+    test("what the second look reads is what is judged: a url that only the complete file holds is still caught", async () => {
+      const h = harness({});
+      const complete = JSON.stringify(wb({ action: "skip", version: "1.1.0", requestedBy: URL_OK }));
+      h.fs.set("100-x.json", complete);
+      const real = h.deps.readFile;
+      let reads = 0;
+      h.deps.readFile = async (path) => {
+        reads += 1;
+        // The first look finds the file cut off before the url; the second finds all of it.
+        return reads === 1 ? '{"action":"skip","plugin":"warbandeer","version":"1.1.0","requestedBy":"em' : real(path);
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual(["[plugins] rejecting request 100-x.json: a webhook url does not belong in this request"]);
+      expect(h.mutations).toHaveLength(0);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("a refused file that was moved aside is not remembered as stuck: a later request under the same name is handled", async () => {
+      const r = routingFake();
+      const h = harness({ "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(h.rejected).toEqual(["100-routing-set-1.json"]);
+      // The same name arrives again, this time a good request, before the next drain has seen the folder empty.
+      h.fs.set("100-routing-set-1.json", JSON.stringify(setPlugin()));
+      await consumePluginRequests(h.deps);
+      expect(r.calls).toContain("applyRouting routing-set music");
+      expect(h.fs.size).toBe(0);
     });
 
     test("a file that is still unparseable the second time is rejected, and one that has gone is not a crash", async () => {

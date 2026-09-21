@@ -280,6 +280,16 @@ describe("parseRoutingRequest", () => {
     expect(short.ok && short.request.requestedBy).toBe(`${"z".repeat(100)} [webhook url]`);
   });
 
+  test("a hostile requestedBy of several megabytes is parsed quickly, because only its start is scanned", () => {
+    // Redaction costs about a second per megabyte on text built to be slow for it; the bound is what keeps
+    // one request from holding the drain for seconds.
+    const hostile = `${"a".repeat(63)}.`.repeat(60_000); // about 3.8 MB
+    const started = Date.now();
+    const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: hostile });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(parsed.ok && parsed.request.requestedBy).toHaveLength(200);
+  });
+
   test("requestedBy is well-formed text: a clip never ends on half a surrogate pair", () => {
     const pair = String.fromCodePoint(0x1f600);
     const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: "a".repeat(199) + pair });
