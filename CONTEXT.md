@@ -260,13 +260,16 @@ _Avoid_: server list, guild cache
   again, which also rewrites `discovery.json` (the file the panel reads), so it lists the server within
   seconds — and, in single mode, only a discovery refresh: single mode registers to one place (the home
   server, or globally when there is none), which a join does not change, except that a join **of the home
-  server** runs the registration again (a bot re-invited to it with the `applications.commands` scope a
-  50001 said it lacked has nothing there until it does, and so, it is understood, may one that was kicked:
-  Discord drops a server's commands when the bot leaves it, which is not verified against a live server). A joined server that is not the home server gets
-  no commands in single mode, as before. A server it **leaves** (`guildDelete`) refreshes discovery and
-  nothing else: `routing.json` is not touched, so being kicked and re-invited loses no placement (a server
-  that is in routing but not in discovery is what #246, the panel's Servers tab, is to show as
-  unavailable). Neither does anything before `initRouting`.
+  server** runs the registration again (a bot that was not in it at boot, so that registration was refused,
+  and is invited later, or that was removed from it and is added back, has nothing there until it does;
+  Discord is understood to drop a server's commands when the bot leaves it, which is not verified against
+  a live server. Re-authorizing a bot that is still a member, the usual cure for a 50001, emits no join at
+  all and waits for the next registration). With a home server set, any other joined server gets no
+  commands in single mode, as before; with none, the global list already reaches it. A server it
+  **leaves** (`guildDelete`) refreshes discovery and nothing else: `routing.json` is not touched, so being
+  kicked and re-invited loses no placement (a server that is in routing but not in discovery is one the
+  panel has to be able to show as unavailable; that view is #246's, and its issue text does not yet list
+  this case). Neither does anything before `initRouting`.
 - **The request mailbox** (#105, #241) is `data/plugins/requests/*.json`, drained in filename order by
   one single-flight consumer: at boot (after `initRouting`, before `markPluginStateReady()`), on every
   60-second tick, and every five seconds on `startRequestDrain`'s timer once the boot has landed. Nine
@@ -1042,15 +1045,20 @@ _Avoid_: server list, guild cache
   outage (`guildAvailable`) never reach it, and `guildDelete` only when the guild really goes (an outage
   returns early as `guildUnavailable`, in `src/client/actions/GuildDelete.js`). `index.test.ts` pins that
   the two availability events are not wired, and a discord.js bump that changes those handlers is what to
-  re-read. Two gaps follow from wiring only these two events, and are accepted. A server invited while the
-  bot's gateway session is being re-identified (not resumed) arrives as `guildAvailable`, not
+  re-read. Three gaps follow from wiring only these two events, and are accepted. A server invited while
+  the bot's gateway session is being re-identified (not resumed) arrives as `guildAvailable`, not
   `guildCreate`: `READY` puts a stub of every server it lists, new ones included, in the cache before its
   `GUILD_CREATE` arrives, which then takes the "guild is cached" branch. Such a server gets no join, so its
-  commands wait for the next registration and its place in `discovery.json` for the 15-minute tick. And a
-  kick while the bot is disconnected emits no `guildDelete` at all (the cache keeps what a later `READY` no
-  longer lists), so the server stays in the cache, and in discovery, until a restart. A resume replays what
-  was missed and is not affected. Wiring `guildAvailable` was ruled out on purpose: it fires for every
-  server coming back from an outage, and a join is not that.
+  commands wait for the next registration and its place in `discovery.json` for the 15-minute tick. A
+  kick while the bot is disconnected emits no `guildDelete` at all (the cache keeps what a later `READY`
+  no longer lists), so the server stays in the cache, and in discovery, until a restart. And a server
+  invited during an outage, whose first `GUILD_CREATE` says it is unavailable, reaches `guildCreate` as a
+  stub with no name and no channels: the join registers against the stub, the full data arrives later as
+  `guildAvailable`, and nothing refreshes discovery until the tick. (A resume is understood to replay what
+  was missed, as `guildCreate`, so it is not affected; that is the gateway protocol, not something this
+  repo ran against a live gateway.) Wiring `guildAvailable` was not built: it fires for every server
+  coming back from an outage, and a join is not that; a version that filtered it to servers not seen
+  before would close the first and third gaps, and nobody has asked for it yet.
 - **`announce` rejects only when EVERY target failed (#243).** A plugin that sees `announce` reject
   typically posts again on its next tick, and a retry posts again to the channels that DID get the
   message — once a minute, for as long as one channel stays unreachable. So a partial failure is logged

@@ -562,18 +562,24 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(h.puts).toHaveLength(1);
   });
 
-  test("a join of the home server in single mode registers again: the bot re-invited with the scope it lacked", async () => {
-    // The boot registration was refused (50001, the bot lacks the applications.commands scope there), the
-    // operator re-invites the bot, and the join must put the commands there; single mode's one call is that.
+  /** The bot's own server list, for the home server. */
+  const leaveHome = (h: Harness) => void h.world.guilds.delete(HOME);
+  const joinHome = (h: Harness) =>
+    void h.world.guilds.set(HOME, { id: HOME, name: "Home", channels: { cache: new Map([["1001", textChannel("1001", "general", 1)]]) } });
+
+  test("a join of the home server in single mode registers again: the bot was not in it at boot, and is invited later", async () => {
+    // The boot registration was refused (the bot is not in the home server, so Discord answers 50001) and
+    // single mode rethrew it; when the bot is invited, the join must put the commands there. Single mode's
+    // one call is that registration.
     const failures: Record<string, unknown> = { [guildRoute(HOME)]: new Error("Missing Access (50001)") };
     const h = harness({ failures });
+    leaveHome(h);
     initRouting(h.ctx);
     await expect(applyRouting("boot")).rejects.toThrow("Missing Access");
-    const refused = readDiscovery().guilds.find((g) => g.id === HOME)!.commands;
-    expect(refused?.registered).toBe(0);
-    expect(refused?.error).toContain("Missing Access (50001)");
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([OTHER]);
 
     delete failures[guildRoute(HOME)];
+    joinHome(h);
     await handleJoin(HOME_GUILD);
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(HOME)]);
     // Exactly the call it always made in single mode: the full body, to the home server.
@@ -581,6 +587,25 @@ describe("guildJoined / guildLeft (#259)", () => {
     const home = readDiscovery().guilds.find((g) => g.id === HOME)!;
     expect(home.commands).toMatchObject({ registered: CORE.length + MUSIC.length + WOW.length });
     expect(home.commands?.error).toBeUndefined();
+  });
+
+  test("a join of the home server in single mode registers again: the bot was removed from it and is added back", async () => {
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts).toHaveLength(1);
+
+    leaveHome(h);
+    await handleLeave(HOME_GUILD);
+    // A leave registers nothing, and the server stops being listed.
+    expect(h.puts).toHaveLength(1);
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([OTHER]);
+
+    joinHome(h);
+    await handleJoin(HOME_GUILD);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(HOME)]);
+    expect(names(h.puts[1]!.body)).toEqual([...CORE, ...MUSIC, ...WOW]);
+    expect(readDiscovery().guilds.find((g) => g.id === HOME)!.commands).toMatchObject({ registered: CORE.length + MUSIC.length + WOW.length });
   });
 
   test("a join in single mode with no home server registers nothing: the global list already reaches a new server", async () => {
@@ -692,6 +717,38 @@ describe("guildJoined / guildLeft (#259)", () => {
     initRouting(h.ctx);
     await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
     await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
+  });
+
+  test("a logger that throws on the join's own line does not stop the work", async () => {
+    // The line that says a server was joined is written before anything is done; a broken logger must not
+    // be able to hold the registration up. (Routed mode, so the run's own report line is left alone.)
+    await placeMusicInOther();
+    const h = harness({
+      log: {
+        log: (line: unknown) => {
+          if (String(line).startsWith("[routing] joined")) throw new Error("the logger broke");
+        },
+        warn: () => {},
+        error: () => {},
+      },
+    });
+    leaveOther(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    h.puts.length = 0;
+    joinOther(h);
+    await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
+  });
+
+  test("a malformed guild does not make a join or a leave reject", async () => {
+    // discord.js always hands over a Guild; this is about the catch block, which names the server.
+    const h = harness();
+    initRouting(h.ctx);
+    await expect(withinDeadline(guildJoined(null as never), "guildJoined(null)")).resolves.toBeUndefined();
+    await expect(withinDeadline(guildLeft(undefined as never), "guildLeft(undefined)")).resolves.toBeUndefined();
+    expect(h.logs.error.some((line) => line.includes("handling the join of undefined (undefined) failed"))).toBe(true);
   });
 
   test("a join's discovery write failure is logged, and names the join", async () => {

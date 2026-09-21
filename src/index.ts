@@ -219,8 +219,9 @@ async function activate(c: Client<true>): Promise<void> {
   // the client is Ready -- not for the servers it lists at start-up -- and guildDelete only when the bot is
   // really out; a server going into, or coming back from, an outage is the separate availability pair, which
   // is deliberately NOT wired here: it is neither a join nor a leave. (A server invited while the gateway
-  // session is being re-identified, rather than resumed, can arrive as that pair instead; that gap is known
-  // and accepted, see CONTEXT.md.) `void`: neither function can reject, so nothing escapes into the emitter.
+  // session is being re-identified, rather than resumed, can arrive as the availability event instead of a
+  // join; that gap is known and accepted, see CONTEXT.md.) `void`: neither function can reject, so nothing
+  // escapes into the emitter.
   client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
   client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
 
