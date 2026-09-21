@@ -69,10 +69,11 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    refusing every secret — see the amendment below) and always goes through the existing guarded `POST /api/env`: the
    cross-site-write Origin gate (checked first — a forged request must not be actioned no matter
    whose ambient Access session it rides) → Access auth → `bot-ops.sh env-set`'s own
-   whitelist/format validation → recreate. A bundle cannot reach another plugin's keys, a secret,
-   or any route the ordinary
+   whitelist/format validation → recreate. An honest bundle cannot reach another plugin's keys, and no
+   bundle can READ a secret or use any route the ordinary
    config Save doesn't already use — same-origin inline mounting is a convenience, not an added
-   privilege, since the server-side gate is unchanged from before this epic.
+   privilege, since the server-side gate is unchanged from before this epic. (What a bundle can WRITE
+   changed with #240 — see the amendment that follows.)
    *(Amended by [ADR-0006](0006-per-plugin-routing.md) decision 8, #240: `env-set` now also accepts an
    enabled plugin's own `secret: true` key, write-only. The client-side scope above is built from every
    key name a plugin declares, secret ones included (`envKeys` in `ops/admin/server.ts`), so an honest

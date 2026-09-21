@@ -1020,21 +1020,36 @@ _Avoid_: server list, guild cache
   `secret` still marks its key secret (never editable), so it cannot be forgotten into a listing; (4) **env-set's own decision reveals nothing about a
   stored secret** — a submitted secret is always treated as a change and written, because a "no
   changes" answer would tell a caller its guess equals the stored value (the one skip is a blank for
-  an already-unset key, which `isSet` already reveals); (5) **compose's relayed output is scrubbed of
-  every `.env` value that `env-get` would not print** (`redact_secret_values`) — in `env-set`'s `log`
-  and in `restart`'s output alike, since compose quotes a `.env` line it refuses to parse. What is
-  scrubbed is decided from `.env` and the static `ALLOWED` table ALONE, never from the Plugin Index: the
+  an already-unset key, which `isSet` already reveals); (5) **what compose prints is relayed through
+  `relay_tool_output`** — `env-set`'s `log` and everything `restart` prints — since compose quotes a
+  `.env` line it refuses to parse. Two layers. **First, a message that is ABOUT the env file is withheld
+  whole**: one that names `$ENV_FILE` or says "env file" is replaced by this script's own sentence, which
+  keeps nothing of compose's but the line numbers. Every error compose's `.env` reader raises names the
+  file, and those are the messages that quote it; withholding does not depend on guessing WHICH part of
+  a line compose printed, which cannot be made exact (review round 5: compose ends a key at `=` OR `:`,
+  drops `export `, and counts U+0085 / U+00A0 as whitespace, so a guess made with bash's rules missed
+  wherever the two disagree). **Second, anything else is scrubbed** (`redact_secret_values`), best
+  effort, of what `env-get` would not print. What that is comes from `.env` and the static `ALLOWED`
+  table ALONE, never from the Plugin Index: the
   index is unavailable exactly when the bot is down, which is when compose complains, and a scrub that
   leaned on it scrubbed nothing then (review round 4). So a core credential, a plugin's secret, a
-  plugin's plain setting and a key nobody knows are all scrubbed; only a static `ALLOWED` key's value is
-  left. Every definition of a key counts (not only the last), quoted and unquoted; a line that is not a
-  definition (the tail of a pasted multi-line secret) is scrubbed whole; the values `env-set` read
+  plugin's plain setting and a key nobody knows are all scrubbed; only a static `ALLOWED` key written
+  the plain way is left. A `KEY=value` line gives its value; any other line — `KEY: value`,
+  `KEY = value`, `export MY!KEY=…`, the tail of a pasted multi-line secret — gives the whole line, the
+  line without `export`, and what follows its first `=` and its first `:`; each text is trimmed of
+  compose's whitespace and tried with and without its quotes. Every definition of a key counts, not
+  only the last; the values `env-set` read
   before it rewrote the file count too (a replaced value is no longer in it; the new ones already are);
   and values are replaced LONGEST FIRST — a short value
   replaced first cuts a longer one that contains it in two, which then no longer matches, so whoever
-  could set one secret could unmask another. A value under six characters is left alone (scrubbing
-  `us` or a port out of compose's message would make it unreadable, and no credential is that short).
-  Best effort, not a proof: a tool that prints a value transformed is not caught, and a compose that
+  could set one secret could unmask another. A text under six characters is left alone (scrubbing
+  `us` or a port out of compose's message would make it unreadable) — which assumes nobody stores a
+  credential that short; one that is, is not scrubbed. `restart` captures compose's output to do this,
+  so by hand it appears when compose has finished rather than as it goes (the panel never showed it
+  earlier, and shows none of it after a timeout). Known limit, pre-existing: a secret written
+  `KEY: value` is invisible to `load_env_values`, so `env-get` calls the key unset and `env-set` appends
+  a `KEY=` line beside it instead of replacing it. Best effort, not a proof: a tool that prints a value
+  transformed is not caught by the second layer, and a compose that
   echoed caller-controlled text into `log` could still act as a guess oracle for a stored secret (not
   seen, and not testable without a real compose); (6) a value
   holding a CR is refused (message names the key only) before its format regex runs, since a
@@ -1048,8 +1063,10 @@ _Avoid_: server list, guild cache
   checked neither; no shipped key needs either character); (7) a refusal names a submitted
   key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
   multi-line value is read line by line and a later line's text before its `=` would otherwise be
-  echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical for a
-  well-formed index. A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
+  echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical, with
+  two deliberate exceptions, both the fail-closed rules above doing their job: a key in `RESERVED_KEYS`
+  that a manifest used to make listable is gone from both (and no longer editable), and so is a plain key
+  of an enabled plugin that ANY other plugin in the index — enabled or not — declares `secret`. A panel admin who can set `PLUGIN_INDEX_URL` controls the index this all reads
   from — and the plugin code the bot then installs — so write-only is a property against the panel,
   its logs and its screens, not against whoever owns the index.
   The same posture covers `plugin-request`: a `webhook-add` URL travels on stdin only, is matched in

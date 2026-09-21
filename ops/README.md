@@ -26,7 +26,7 @@ time, not silently written.
 |---|---|
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
-| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed scrubbed of every `.env` value `env-get` would not print (#240); a failed restart prints it, exits with compose's status, and does not say `restarted` |
+| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 | `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or the installed plugin's manifest); then one row per installed plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
@@ -61,7 +61,8 @@ validates the JSON and writes it into `data/plugins/requests/` via `docker exec 
 as `bun`, so `-u bun` makes the file bot-owned — a root-created file would be un-deletable by the bot).
 The file is written **atomically and owner-only**: the body goes to `<file>.tmp` in the same directory
 and is `mv`ed to `<file>`, because `cat > <file>` creates the file before filling it and the bot's
-drain (which reads only `*.json` and moves one it cannot parse to `rejected/`) could otherwise read it
+drain (which reads only `*.json`, and refuses one it cannot parse — moved to `rejected/`, or deleted if
+it may carry a webhook URL) could otherwise read it
 half-written — after the panel had already been told `queued`. The temp name must never end in `.json`.
 If any step fails the temp file is removed and `plugin-request` exits non-zero instead of reporting
 `queued`; `umask 077` keeps a request that may carry a webhook URL owner-only, which the bot (running as
@@ -245,14 +246,19 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   its guess was the stored value. The one exception is a blank for a key that is already unset, which
   reveals only what `isSet` already does. (2) What `docker compose` prints is relayed — as `log` by
   `env-set`, as its output by `restart` — and compose is not ours: it quotes a `.env` line it refuses
-  to parse. So both are scrubbed of **every `.env` value that `env-get` would not print** — core
-  credentials, plugin secrets and plain plugin settings alike; only a static key's value is left —
-  worked out from `.env` itself and never from the Plugin Index, which is unavailable exactly when the
-  bot is down and compose is complaining. Every definition of a key counts, a stray line that is not a
-  definition is scrubbed whole, values are replaced longest first (so a short secret can never unmask
-  a longer one that contains it), and a value under six characters is left alone so the message stays
-  readable. That is best effort, not a proof: a tool that printed a value transformed would not be
-  caught, and a compose that echoed caller-controlled text could still tell a caller whether a guess
+  to parse. So a message that is **about the env file** (it names the file, or says "env file") is
+  **withheld whole** and replaced by the script's own sentence, which keeps only the line numbers:
+  every error compose's `.env` reader raises names the file, and no amount of guessing which part of a
+  line it printed can be made exact (compose ends a key at `=` or `:`, drops `export`, and trims
+  U+0085 / U+00A0). Anything else is scrubbed, best effort, of what `env-get` would not print — core
+  credentials, plugin secrets and plain plugin settings alike; only a static key written `KEY=value`
+  is left — worked out from `.env` itself and never from the Plugin Index, which is unavailable exactly
+  when the bot is down and compose is complaining. Every definition of a key counts; a line written
+  any other way, or that is no definition at all, is scrubbed as a whole line and from its first `=`
+  and `:` on; texts are replaced longest first (so a short secret can never unmask a longer one that
+  contains it); and a text under six characters is left alone so the message stays readable (a
+  credential that short is therefore not scrubbed). The second layer is best effort, not a proof: a
+  tool that printed a value transformed would not be caught, and a compose that echoed caller-controlled text could still tell a caller whether a guess
   equals a stored secret (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
   refused for every key (it could start a new `.env` line), naming the key only, and so is a value
   containing `$` or a quote **anywhere**, for every key, secret or plain, static or plugin: compose

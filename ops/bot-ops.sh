@@ -47,9 +47,9 @@
 #     different, on purpose (ADR-0006 decision 8): env-set may WRITE it, and nothing ever reads it
 #     back — env-get never lists it, env-schema says only that it exists and whether it is set, and
 #     no output, error or log line this script writes itself carries its value. (The text it does not
-#     write is `docker compose`'s, which env-set relays as `log` and restart relays as its output; both
-#     are scrubbed of every .env value that env-get would not print, core credentials included, on a
-#     best-effort basis — see redact_secret_values.)
+#     write is `docker compose`'s, which env-set relays as `log` and restart relays as its output: a
+#     message about the env file is withheld whole, and anything else is scrubbed, best effort, of what
+#     env-get would not print, core credentials included — see relay_tool_output.)
 #   - env-set rebuilds .env line-by-line (no sed) so a value can never inject into the file, and
 #     comment/blank/secret lines are preserved verbatim. An indented or `export`ed line for a key
 #     being changed is rewritten in place as plain `KEY=`.
@@ -585,12 +585,14 @@ cmd_restart() {
   # rejected the same way.
   echo "bot-ops: env file $ENV_FILE" >&2
   # compose reads .env to restart, and quotes a line it cannot parse; its output is relayed to the panel,
-  # so it goes through the same scrub as env-set's `log` (#240). Captured rather than streamed for that
-  # reason. A failed restart still fails: its (scrubbed) output is printed, the exit status is compose's,
-  # and "restarted" is not claimed.
+  # so it goes through relay_tool_output, as env-set's `log` does (#240). Captured rather than streamed
+  # for that reason -- so someone running this by hand sees compose's output when it has finished, not
+  # as it goes (the panel never showed a restart's output before it ended, and shows none of it after a
+  # timeout). A failed restart still fails: what is relayed is printed, the exit status is compose's, and
+  # "restarted" is not claimed.
   local out rc=0
   out="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" restart 2>&1)" || rc=$?
-  if [ -n "$out" ]; then printf '%s\n' "$(redact_secret_values "$out")"; fi
+  if [ -n "$out" ]; then printf '%s\n' "$(relay_tool_output "$out")"; fi
   if [ "$rc" -ne 0 ]; then return "$rc"; fi
   echo "restarted $CONTAINER"
 }
@@ -691,57 +693,115 @@ echo_key() {
   if [[ "$1" =~ ^[A-Z][A-Z0-9_]{0,39}$ ]]; then printf '%s' "$1"; else printf '%s' "(not shown)"; fi
 }
 
-# Replace, in the text given, every .env value that env-get would NOT print with "[redacted]". Nothing
-# this script writes itself carries a value; the one way a value can still reach an output is a message
-# from a tool this script does not own — `docker compose` quoting part of a .env line it refused to
-# parse (an unterminated quote pasted by hand, say) — which env-set relays as `log` and restart relays
-# as its output.
+# WHAT IS RELAYED OF ANOTHER TOOL'S OUTPUT. Nothing this script writes itself carries a value; the one
+# way a value can still reach an output is a message from a tool it does not own -- `docker compose`
+# quoting part of a .env line it refused to parse (an unterminated quote pasted by hand, say) -- which
+# env-set relays as `log` and restart relays as its output. Two layers, because the second alone cannot
+# be made exact (review round 5): it has to guess which part of a line compose would print, and compose
+# reads .env by its own rules -- a key ends at `=` OR `:`, `export ` is dropped, and its whitespace
+# includes U+0085 and U+00A0 -- so any guess made with bash's rules misses wherever the two disagree.
+#
+#   1. relay_tool_output WITHHOLDS, whole, any output that is ABOUT the env file: it names the file
+#      ($ENV_FILE) or says "env file". Every error compose's .env reader raises names the file it was
+#      reading, and those are exactly the messages that quote its contents. What is relayed instead is
+#      this script's own sentence, carrying nothing from compose's but the line numbers (digits only).
+#   2. Everything else goes through redact_secret_values, best effort, as before.
+mentions_env_file() {
+  local text="$1" lower="${1,,}"
+  [[ "$text" == *"$ENV_FILE"* || "$lower" == *"env file"* ]]
+}
+
+relay_tool_output() {
+  local text="$1"
+  if mentions_env_file "$text"; then
+    local lines
+    # `|| true`: no "line N" in the text is fine, and must not abort the script under pipefail.
+    lines="$(printf '%s\n' "$text" | grep -oE 'line [0-9]+' | LC_ALL=C sort -u | tr '\n' ',' || true)"
+    lines="${lines%,}"
+    printf '%s' "docker compose could not read the env file ($ENV_FILE)${lines:+ -- ${lines//,/, }}. Its own message is withheld because it quotes the file; fix that line on the host."
+    return 0
+  fi
+  redact_secret_values "$text"
+}
+
+# Trim, from both ends of $1, what COMPOSE's .env reader treats as whitespace: ASCII blanks plus U+0085
+# and U+00A0 (matched as their UTF-8 bytes, whatever the locale). Result in REPLY -- no subshell, since
+# this runs several times per line of .env.
+compose_trim() {
+  local s="$1" before
+  local nbsp=$'\xc2\xa0' nel=$'\xc2\x85'
+  while :; do
+    before="$s"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    s="${s#"$nbsp"}"; s="${s#"$nel"}"
+    s="${s%"$nbsp"}"; s="${s%"$nel"}"
+    if [ "$s" = "$before" ]; then break; fi
+  done
+  REPLY="$s"
+}
+
+# Replace, in the text given, every .env value that env-get would NOT print with "[redacted]".
 #
 # What is scrubbed is decided from .env and the static ALLOWED table ALONE, never from the Plugin Index.
 # The index is unavailable exactly when the bot is down, which is when compose is most likely to be
 # complaining: a scrub that leaned on it scrubbed nothing when it mattered (#240, review round 4). Only
-# a static ALLOWED key is printable (those are the keys env-get always lists); everything else — a core
-# credential, a plugin's secret, a plugin's plain setting, a key nobody knows — is scrubbed. Scrubbing
-# a plain setting costs nothing; missing a secret does.
-#   - EVERY definition of a key in the file counts, not only the last (compose may be quoting the
-#     earlier one), raw and with one layer of quotes stripped, the way load_env_values reads it; and so
-#     do the values this invocation read BEFORE it rewrote the file (ENV_VALUES — a replaced value is no
-#     longer in the file). The values being written need no list of their own: by the time compose
-#     runs, the file already holds them.
-#   - A line that is neither blank, a comment, nor a KEY=value definition — the second line of a
-#     pasted multi-line secret — is scrubbed whole.
-#   - LONGEST FIRST. Replacing a short value first cuts a longer one that contains it in two, and the
+# a static ALLOWED key written the plain way (`KEY=value`) is printable -- those are the keys env-get
+# always lists; every other line is scrubbed: a core credential, a plugin's secret, a plugin's plain
+# setting, a key nobody knows. Scrubbing a plain setting costs nothing; missing a secret does.
+#   - A line written the plain way (`KEY=value`, which compose reads the same way this script does)
+#     gives its value. ANY OTHER line -- another syntax compose accepts (`KEY: value`, `KEY = value`),
+#     one it rejects (`export MY!KEY=...`), or no definition at all (the second line of a pasted
+#     multi-line secret) -- gives several candidate texts, because which part of it a tool prints is
+#     anyone's guess: the whole line; the line without a leading `export`; what follows its first `=`;
+#     what follows its first `:`. Every text is trimmed of compose's whitespace (see compose_trim) and
+#     also tried without an opening quote (an unterminated value is printed from its quote on) and
+#     without both quotes (the way load_env_values reads it). Comments are left alone.
+#   - EVERY definition of a key counts, not only the last.
+#   - So do the values this invocation read BEFORE it rewrote the file (ENV_VALUES -- a replaced value
+#     is no longer in the file). The values being written need no list: the file already holds them.
+#   - LONGEST FIRST. Replacing a short text first cuts a longer one that contains it in two, and the
 #     longer one then no longer matches: whoever can set one secret could unmask another (round 4).
-#   - A value shorter than REDACT_MIN_LENGTH is left alone: those ("us", a port number) are what would
-#     make the relayed text unreadable, and no credential is that short.
-#   - Values are matched as literals (quoted inside ${…//…/…}, so a `*` or `[` in one is not a glob).
-# Best effort by nature: a tool that prints a value transformed (escaped, truncated) is not caught.
+#   - A text shorter than REDACT_MIN_LENGTH is left alone: those ("us", a port number) are what would
+#     make the relayed text unreadable. That rests on an assumption nothing enforces -- that nobody
+#     stores a credential shorter than six characters -- so such a credential is NOT scrubbed.
+#   - Texts are matched as literals (quoted inside ${...//.../...}, so a `*` or `[` in one is not a glob).
+# Best effort by nature: a tool that prints a value transformed (escaped, truncated) is not caught, and
+# a line written in a syntax neither this list nor layer 1 anticipates is not either.
 readonly REDACT_MIN_LENGTH=6
 redact_secret_values() {
-  local text="$1" line key raw val
-  local -a found=()
+  local text="$1" line key rest val quote
+  local -a found=() parts=()
   if [ -f "$ENV_FILE" ]; then
     while IFS= read -r line || [ -n "$line" ]; do
       line="${line%$'\r'}"
+      compose_trim "$line"; rest="$REPLY"
+      if [ -z "$rest" ] || [[ "$rest" == \#* ]]; then continue; fi
       if [[ "$line" =~ $ENV_LINE_RE ]]; then
+        # written the plain way, which compose reads the same way: the value is what follows the `=`
         key="${BASH_REMATCH[2]}"
         if [[ -n "${ALLOWED[$key]+x}" ]]; then continue; fi
-        raw="${BASH_REMATCH[3]}"
-        raw="${raw#"${raw%%[![:space:]]*}"}"
-        raw="${raw%"${raw##*[![:space:]]}"}"
+        parts=("${BASH_REMATCH[3]}")
       else
-        raw="${line#"${line%%[![:space:]]*}"}"
-        raw="${raw%"${raw##*[![:space:]]}"}"
-        # a comment is not a secret (and a `#`-leading VALUE is handled above, as a value)
-        if [[ "$raw" == \#* ]]; then continue; fi
+        # written some other way, or no definition at all: which part a tool prints is anyone's guess
+        parts=("$rest")
+        if [[ "$rest" =~ ^export[[:space:]]+(.*)$ ]]; then
+          rest="${BASH_REMATCH[1]}"
+          parts+=("$rest")
+        fi
+        if [[ "$rest" == *=* ]]; then parts+=("${rest#*=}"); fi
+        if [[ "$rest" == *:* ]]; then parts+=("${rest#*:}"); fi
       fi
-      if [ -z "$raw" ]; then continue; fi
-      found+=("$raw")
-      if (( ${#raw} >= 2 )); then
-        case "$raw" in
-          \"*\" | \'*\') found+=("${raw:1:${#raw}-2}") ;;
-        esac
-      fi
+      for val in "${parts[@]}"; do
+        compose_trim "$val"; val="$REPLY"
+        found+=("$val")
+        quote="${val:0:1}"
+        if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+          val="${val:1}"
+          found+=("$val")
+          if [[ -n "$val" && "${val: -1}" == "$quote" ]]; then found+=("${val:0:${#val}-1}"); fi
+        fi
+      done
     done < "$ENV_FILE"
   fi
   # What env-set read before it rewrote the file (restart loads no values, so this is empty there).
@@ -753,8 +813,8 @@ redact_secret_values() {
   if [ "${#found[@]}" -gt 0 ]; then
     local sorted tab
     tab="$(printf '\t')"
-    # "<length> TAB <value>" per line, longest first. No value holds a newline (they are single lines of
-    # .env, or were refused by env-set's line-break check), and everything after the first tab is the value.
+    # "<length> TAB <text>" per line, longest first. No text holds a newline (each is part of one line of
+    # .env, or was refused by env-set's line-break check), and everything after the first tab is the text.
     sorted="$(
       for val in "${found[@]}"; do
         if (( ${#val} >= REDACT_MIN_LENGTH )); then printf '%d\t%s\n' "${#val}" "$val"; fi
@@ -972,9 +1032,10 @@ cmd_env_set() {
   local recreate_log rc=0
   recreate_log="$(BOT_ENV_FILE="$ENV_FILE" docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --force-recreate 2>&1)" || rc=$?
 
-  # The result names changed KEYS only (never a value), and the recreate's own output is scrubbed of
-  # any plugin-secret value before it is echoed back in `log` (#240).
-  recreate_log="$(redact_secret_values "$recreate_log")"
+  # The result names changed KEYS only (never a value), and the recreate's own output goes through
+  # relay_tool_output before it is echoed back in `log`: withheld if it is about the env file, scrubbed
+  # of every value env-get would not print otherwise (#240).
+  recreate_log="$(relay_tool_output "$recreate_log")"
   local changed_json
   changed_json="$(printf '%s\n' "${!DIFF[@]}" | jq -R . | jq -s .)"
   jq -n --argjson changed "$changed_json" --arg backup "$backup" \
