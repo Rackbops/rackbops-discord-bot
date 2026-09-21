@@ -545,9 +545,12 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(run.stderr).toContain("env-set: value for 'ANNOUNCE_CHANNEL_ID' is invalid");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
     expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
-    // Only the #51-item-5 guard's own `docker ps` check ran — the invalid value never reached
-    // the recreate step.
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    // Only the #51-item-5 guard's own `docker ps` check and the read of the cached index (#256) ran —
+    // the invalid value never reached the recreate step.
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"),
+    ]);
   });
 
   test("validation runs only over CHANGED keys, and names the first invalid one in submission order", async () => {
@@ -586,7 +589,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=11111\nDISCORD_TOKEN=secret\n");
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain("'DISCORD_TOKEN' is not an editable key");
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"), // #256
+    ]);
   });
 
   test("a malformed line is refused as such — including an empty or non-key-shaped key", async () => {
@@ -610,7 +616,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     const run = await botOps(fx, ["env-set"], "");
     expect(run.exitCode).toBe(0);
     expect(run.json).toEqual({ ok: true, changed: [], recreated: false, note: "no changes" });
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"), // #256
+    ]);
   });
 
   test("submitting the stored value spelled differently (quotes, CR, export, duplicate) is a no-op", async () => {
@@ -714,6 +723,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\n");
     expect(dockerCalls(fx)).toEqual([
       expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"), // #256
       expect.stringContaining("up -d --force-recreate"),
     ]);
   });
@@ -727,7 +737,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     expect(run.stderr).toContain("env-set: 'ANNOUNCE_CHANNEL_ID' is required and cannot be blank");
     expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=11111\n");
     expect(existsSync(join(fx.cfg, "backups"))).toBe(false);
-    expect(dockerCalls(fx)).toEqual([expect.stringContaining("ps -a --filter")]);
+    expect(dockerCalls(fx)).toEqual([
+      expect.stringContaining("ps -a --filter"),
+      expect.stringContaining("exec probe-container cat /app/data/plugins/index.json"), // #256
+    ]);
   });
 
   test("blanking a required key alongside a valid, unrelated change rejects the WHOLE submission", async () => {
@@ -974,7 +987,9 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
 });
 
 describe.skipIf(!runnable)("bot-ops.sh env-get lists installed plugins' non-secret keys (#101)", () => {
-  test("only the enabled plugin's non-secret keys appear, after the static ones, in manifest order", async () => {
+  // #256 changed this on purpose: the loader no longer filters by PLUGINS, so plugin b's key is listed
+  // although only plugin a is on (the test used to be "only the enabled plugin's non-secret keys appear").
+  test("every index plugin's non-secret keys appear, after the static ones, in manifest order (#256)", async () => {
     const index = wrapIndex([
       pluginEntry("a", [envKey("A_ONE", "^[a-z]+$"), envKey("A_SECRET", "^.+$", { secret: true }), envKey("A_TWO", "^[0-9]+$")]),
       pluginEntry("b", [envKey("B_ONE", "^.+$")]),
@@ -984,10 +999,10 @@ describe.skipIf(!runnable)("bot-ops.sh env-get lists installed plugins' non-secr
     expect(env.A_ONE).toBe("xyz"); // listed, with its effective value from .env
     expect(env.A_TWO).toBe(""); // listed even when unset in .env
     expect(env).not.toHaveProperty("A_SECRET"); // a secret key is never listed
-    expect(env).not.toHaveProperty("B_ONE"); // plugin b isn't in PLUGINS
+    expect(env.B_ONE).toBe(""); // plugin b isn't in PLUGINS, and its key is listed anyway
     const keys = Object.keys(env);
     expect(keys).toContain("PLUGINS");
-    expect(keys.slice(-2)).toEqual(["A_ONE", "A_TWO"]); // plugin keys after the static ones, manifest order
+    expect(keys.slice(-3)).toEqual(["A_ONE", "A_TWO", "B_ONE"]); // plugin keys after the static ones, manifest order
   });
 });
 
@@ -1055,12 +1070,14 @@ describe.skipIf(!runnable)("bot-ops.sh env-get is graceful when the Plugin Index
     expect(Object.keys(env)).toHaveLength(11); // the 11 static keys, nothing merged
   });
 
-  test("no PLUGINS set → no docker read at all, no note", async () => {
+  // #256 changed this on purpose: load_plugin_keys no longer looks at PLUGINS, so an instance with none
+  // now makes the one read of the cached index too, and notes when there is no cache yet.
+  test("no PLUGINS set → one docker read of the index and, with no cache, the index-unavailable note (#256)", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-get"]);
     expect(run.exitCode).toBe(0);
-    expect(run.stderr).not.toContain("index unavailable");
-    expect(dockerCalls(fx)).toHaveLength(0); // load_plugin_keys short-circuits before docker
+    expect(run.stderr).toContain("plugins: index unavailable");
+    expect(dockerCalls(fx)).toEqual([expect.stringContaining("exec probe-container cat /app/data/plugins/index.json")]);
   });
 });
 
@@ -1624,8 +1641,9 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     });
     expect(schema.stdout).not.toContain(SECRET);
 
-    // The manifest, not the key's name, is the authority: with wow not enabled the same key is refused.
-    const off = setup("ANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    // The manifest, not the key's name, is the authority: with an index that does not offer wow at all the
+    // same key is refused (#256: it used to be "with wow not enabled" — an index that offers wow is enough now).
+    const off = setup("ANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: wrapIndex([pluginEntry("other", [envKey("OTHER_PORT", PORT_RE)])]) });
     const refused = await botOps(off, ["env-set"], `BLIZZARD_CLIENT_SECRET=${SECRET}\n`);
     expect(refused.exitCode).toBe(1);
     expect(refused.stderr).toContain("'BLIZZARD_CLIENT_SECRET' is not an editable key");
@@ -1822,7 +1840,9 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect((await botOps(ok, ["env-set"], "SPOTIFY_REDIRECT_URI=https://bot.example/spotify/callback\n")).exitCode).toBe(0);
   });
 
-  test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
+  // #256 flipped the second half on purpose: the test used to end "…but stays uneditable unless that plugin
+  // is enabled". The secret declaration is now a secret row, write-only, whichever plugin is on.
+  test("a key any plugin in the index declares secret is never listed as plain, and is editable (write-only) whichever plugin is on (#256)", async () => {
     const index = wrapIndex([
       pluginEntry("spotify", [envKey("SHARED_KEY", "^[A-Za-z0-9_]{8,}$", { secret: true })]),
       pluginEntry("music", [envKey("SHARED_KEY", "^.+$"), envKey("MUSIC_PORT", PORT_RE)]),
@@ -1833,10 +1853,16 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     expect(get.json).toMatchObject({ MUSIC_PORT: "8080" });
     expect(get.stdout).not.toContain("SHARED_KEY");
     expect(get.stdout).not.toContain("LEFTOVER_VALUE_1");
-    expect(Object.keys((await botOps(off, ["env-schema"])).json ?? {})).not.toContain("SHARED_KEY");
-    const refused = await botOps(off, ["env-set"], "SHARED_KEY=another_value_9\n");
-    expect(refused.exitCode).toBe(1);
-    expect(refused.stderr).toContain("'SHARED_KEY' is not an editable key");
+    // spotify is off, but its secret declaration is in the index: a secret row in env-schema, never a plain one
+    const offSchema = await botOps(off, ["env-schema"]);
+    expect(offSchema.json).toMatchObject({
+      SHARED_KEY: { pattern: "^[A-Za-z0-9_]{8,}$", required: false, source: "plugin", secret: true, isSet: true },
+    });
+    expect(offSchema.stdout).not.toContain("LEFTOVER_VALUE_1");
+    const accepted = await botOps(off, ["env-set"], "SHARED_KEY=another_value_9\n");
+    expect(accepted.exitCode).toBe(0);
+    expect(accepted.json).toMatchObject({ changed: ["SHARED_KEY"] });
+    expect(everythingObservable(off, accepted)).not.toContain("another_value_9");
 
     const on = setup(stored.replace("PLUGINS=music", "PLUGINS=music,spotify"), { pluginIndex: index });
     // Both declarers are enabled: the key is gone from env-get, STAYS in env-schema as a secret row (the
@@ -1905,13 +1931,23 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     }
   });
 
-  test("a secret key of a plugin that is not enabled is refused", async () => {
+  // #256 changed this on purpose (it used to be "a secret key of a plugin that is not enabled is refused"):
+  // the index, not PLUGINS, decides which keys are plugin keys, so a secret key of a plugin that is off
+  // is accepted, write-only. A key of a plugin ABSENT from the index is still refused.
+  test("a secret key of a plugin that is not enabled is accepted, write-only; one absent from the index is refused (#256)", async () => {
     const other = "PLUGINS=warbandeer\nANNOUNCE_CHANNEL_ID=11111\n"; // music is in the index but not in PLUGINS
     const fx = setup(other, { pluginIndex: SECRET_INDEX });
     const run = await botOps(fx, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
-    expect(run.exitCode).toBe(1);
-    expect(run.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
-    expect(envText(fx)).toBe(other);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, changed: ["MUSIC_API_KEY"], recreated: true });
+    expect(envText(fx)).toBe(`${other}MUSIC_API_KEY=${SECRET}\n`);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+    // a plugin that the index does not offer at all: the key is not a plugin key, so it is refused
+    const absent = setup(other, { pluginIndex: wrapIndex([pluginEntry("other", [envKey("OTHER_KEY", "^.+$", { secret: true })])]) });
+    const refused = await botOps(absent, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("'MUSIC_API_KEY' is not an editable key");
+    expect(envText(absent)).toBe(other);
     // ... nor when the index cannot be read at all
     const noIndex = setup(MUSIC_ENV);
     const run2 = await botOps(noIndex, ["env-set"], `MUSIC_API_KEY=${SECRET}\n`);
@@ -2354,6 +2390,159 @@ describe.skipIf(!runnable)("bot-ops.sh env-schema lists secret keys without thei
     expect(run.exitCode).toBe(0);
     expect(everythingObservable(fx, run)).not.toContain(SECRET);
     expect(run.stdout).not.toContain("abcd"); // nor the required secret's stored value
+  });
+});
+
+// #256: load_plugin_keys reads every plugin in the cached Plugin Index, not only the ones in PLUGINS, so
+// ONE env-set can turn a plugin on and set its settings. Nothing else about those keys moved: a secret key
+// stays write-only and unlisted, a reserved key stays reserved, a static key wins a collision, and an
+// unavailable index still degrades to the static keys.
+describe.skipIf(!runnable)("plugin settings do not wait for the plugin to be on (#256)", () => {
+  const OA_INDEX = wrapIndex([
+    pluginEntry("wow", [envKey("WOW_REGION", "^(us|eu|kr|tw)$")]),
+    pluginEntry("music", [envKey("MUSIC_PORT", PORT_RE), envKey("MUSIC_API_KEY", "^[A-Za-z0-9_-]{8,64}$", { secret: true })]),
+  ]);
+  const ON = "PLUGINS=wow\nANNOUNCE_CHANNEL_ID=11111\n"; // wow is on; music is in the index but off
+  const recreates = (fx: Fixture): number => dockerCalls(fx).filter((c) => c.includes("up -d --force-recreate")).length;
+
+  test("with PLUGINS=wow, env-schema lists music's keys too, the secret one as secret + isSet", async () => {
+    const unset = setup(ON, { pluginIndex: OA_INDEX });
+    const before = (await botOps(unset, ["env-schema"])).json as unknown as Record<string, Record<string, unknown>>;
+    expect(before.WOW_REGION).toEqual({ pattern: "^(us|eu|kr|tw)$", required: false, source: "plugin" });
+    expect(before.MUSIC_PORT).toEqual({ pattern: PORT_RE, required: false, source: "plugin" });
+    expect(before.MUSIC_API_KEY).toEqual({ pattern: "^[A-Za-z0-9_-]{8,64}$", required: false, source: "plugin", secret: true, isSet: false });
+    const set = setup(`${ON}MUSIC_API_KEY=${SECRET}\n`, { pluginIndex: OA_INDEX });
+    const run = await botOps(set, ["env-schema"]);
+    expect((run.json as unknown as Record<string, unknown>).MUSIC_API_KEY).toMatchObject({ secret: true, isSet: true });
+    expect(run.stdout).not.toContain(SECRET); // isSet, never a value
+  });
+
+  test("with PLUGINS=wow, env-get lists music's plain key and never its secret one", async () => {
+    const fx = setup(`${ON}MUSIC_PORT=8080\nMUSIC_API_KEY=${SECRET}\n`, { pluginIndex: OA_INDEX });
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ MUSIC_PORT: "8080", WOW_REGION: "" });
+    expect(run.stdout).not.toContain("MUSIC_API_KEY");
+    expect(run.stdout).not.toContain(SECRET);
+  });
+
+  test("with PLUGINS empty, an index plugin's keys are still listed", async () => {
+    // The first plugin on a fresh instance: nothing is in PLUGINS yet, and its settings are already there to fill in.
+    for (const env of ["ANNOUNCE_CHANNEL_ID=11111\n", "PLUGINS=\nANNOUNCE_CHANNEL_ID=11111\n"]) {
+      const fx = setup(env, { pluginIndex: OA_INDEX });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.json, env).toMatchObject({ WOW_REGION: "", MUSIC_PORT: "" });
+      expect(get.stderr, env).not.toContain("index unavailable");
+      const schema = (await botOps(fx, ["env-schema"])).json as unknown as Record<string, unknown>;
+      expect(Object.keys(schema), env).toEqual(expect.arrayContaining(["WOW_REGION", "MUSIC_PORT", "MUSIC_API_KEY"]));
+    }
+  });
+
+  test("one env-set call turns music on and sets its plain and its secret setting, with one recreate", async () => {
+    const fx = setup(ON, { pluginIndex: OA_INDEX });
+    const run = await botOps(fx, ["env-set"], `PLUGINS=wow,music\nMUSIC_PORT=8080\nMUSIC_API_KEY=${SECRET}\n`);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ ok: true, recreated: true });
+    // all three keys are named as changed (the order of `changed` is not this test's business)
+    expect([...(run.json as { changed: string[] }).changed].sort()).toEqual(["MUSIC_API_KEY", "MUSIC_PORT", "PLUGINS"]);
+    // and .env holds all three lines, the new ones appended after what was there
+    const lines = envText(fx).split("\n");
+    expect(lines.slice(0, 2)).toEqual(["PLUGINS=wow,music", "ANNOUNCE_CHANNEL_ID=11111"]);
+    expect(lines.slice(2).filter(Boolean).sort()).toEqual([`MUSIC_API_KEY=${SECRET}`, "MUSIC_PORT=8080"]);
+    expect(recreates(fx)).toBe(1);
+    expect(everythingObservable(fx, run)).not.toContain(SECRET);
+  });
+
+  test("a key no index plugin declares is still refused, and so is a core secret", async () => {
+    const fx = setup(ON, { pluginIndex: OA_INDEX });
+    for (const key of ["MUSIC_NOT_DECLARED", "DISCORD_TOKEN"]) {
+      const run = await botOps(fx, ["env-set"], `PLUGINS=wow,music\n${key}=some-value-123\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+    expect(envText(fx)).toBe(ON);
+    expect(recreates(fx)).toBe(0);
+  });
+
+  test("a reserved key declared by a plugin that is off is never listed and still refused", async () => {
+    const index = wrapIndex([
+      pluginEntry("wow", [envKey("WOW_REGION", "^(us|eu|kr|tw)$")]),
+      pluginEntry("music", [envKey("DISCORD_TOKEN", "^.+$"), envKey("GITHUB_TOKEN", "^.+$", { secret: true }), envKey("MUSIC_PORT", PORT_RE)]),
+    ]);
+    const fx = setup(`${ON}DISCORD_TOKEN=${OLD_SECRET}\nGITHUB_TOKEN=${SECRET}\n`, { pluginIndex: index });
+    const get = await botOps(fx, ["env-get"]);
+    const schema = await botOps(fx, ["env-schema"]);
+    for (const out of [get, schema]) {
+      expect(out.json).toHaveProperty("MUSIC_PORT"); // music's other key IS there: the entry was not dropped whole
+      expect(out.stdout).not.toContain("DISCORD_TOKEN");
+      expect(out.stdout).not.toContain("GITHUB_TOKEN");
+      expect(out.stdout).not.toContain(OLD_SECRET);
+      expect(out.stdout).not.toContain(SECRET);
+    }
+    for (const key of ["DISCORD_TOKEN", "GITHUB_TOKEN"]) {
+      const run = await botOps(fx, ["env-set"], `PLUGINS=wow,music\n${key}=new-value-123\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+  });
+
+  test("a bad value for an off plugin's key is refused naming the key, never the value", async () => {
+    const fx = setup(ON, { pluginIndex: OA_INDEX });
+    const badPort = "not-a-port-VALUE-1";
+    const badSecret = "short-secret";
+    for (const [key, value, format] of [
+      ["MUSIC_PORT", badPort, "plain"],
+      ["MUSIC_API_KEY", `${badSecret}!`, "secret"], // `!` is outside the manifest's [A-Za-z0-9_-] format
+    ]) {
+      const run = await botOps(fx, ["env-set"], `PLUGINS=wow,music\n${key}=${value}\n`);
+      expect(run.exitCode, format).toBe(1);
+      expect(run.stderr, format).toContain(`env-set: value for '${key}' is invalid`);
+      expect(run.stderr, format).not.toContain(value);
+      expect(run.stdout, format).not.toContain(value);
+    }
+    expect(envText(fx)).toBe(ON); // nothing was written: the PLUGINS change in the same call never applied either
+    expect(recreates(fx)).toBe(0);
+  });
+
+  test("an unusable entry that claims secret still marks its key secret and is still not editable", async () => {
+    // `format` holds a line break, so the entry is unusable — but it claims `secret`, so its key must still be
+    // remembered as secret (another plugin declaring the same key plain must not get it listed) and must
+    // never be editable or listed as a secret row: the `usable` column's one job.
+    const index = wrapIndex([
+      pluginEntry("evil", [{ ...envKey("SHARED_X", "^a$\n^b$"), secret: true }]),
+      pluginEntry("music", [envKey("SHARED_X", "^.+$"), envKey("MUSIC_PORT", PORT_RE)]),
+    ]);
+    for (const env of ["PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nSHARED_X=stored-value-1\n", "ANNOUNCE_CHANNEL_ID=11111\nSHARED_X=stored-value-1\n"]) {
+      const fx = setup(env, { pluginIndex: index });
+      const get = await botOps(fx, ["env-get"]);
+      expect(get.json, env).toHaveProperty("MUSIC_PORT");
+      expect(get.stdout, env).not.toContain("SHARED_X");
+      expect(get.stdout, env).not.toContain("stored-value-1");
+      const schema = await botOps(fx, ["env-schema"]);
+      expect(schema.json, env).toHaveProperty("MUSIC_PORT");
+      expect(schema.stdout, env).not.toContain("SHARED_X");
+      const run = await botOps(fx, ["env-set"], "SHARED_X=another-value-2\n");
+      expect(run.exitCode, env).toBe(1);
+      expect(run.stderr, env).toContain("'SHARED_X' is not an editable key");
+    }
+  });
+
+  test("the first declaration of a key in index order wins, whichever plugin is on", async () => {
+    // Plugin `aaa` is listed first and is OFF; `bbb` is on and declares the same key with another format.
+    const index = wrapIndex([pluginEntry("aaa", [envKey("SHARED_KEY", "^a+$")]), pluginEntry("bbb", [envKey("SHARED_KEY", "^b+$")])]);
+    const fx = setup("PLUGINS=bbb\nANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    expect(((await botOps(fx, ["env-schema"])).json as unknown as Record<string, { pattern: string }>).SHARED_KEY?.pattern).toBe("^a+$");
+    expect((await botOps(fx, ["env-set"], "SHARED_KEY=bbb\n")).exitCode).toBe(1);
+    expect((await botOps(fx, ["env-set"], "SHARED_KEY=aaa\n")).exitCode).toBe(0);
+  });
+
+  test("with no PLUGINS and no cached index, env-get is the static keys plus the index-unavailable note, after exactly one docker read", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-get"]);
+    expect(run.exitCode).toBe(0); // never an error (D3)
+    expect(run.stderr).toContain("plugins: index unavailable");
+    expect(Object.keys(run.json as object)).toHaveLength(11); // the 11 static keys, nothing merged
+    expect(dockerCalls(fx)).toEqual(["docker exec probe-container cat /app/data/plugins/index.json"]);
   });
 });
 
