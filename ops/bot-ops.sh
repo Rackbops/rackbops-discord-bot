@@ -68,7 +68,9 @@ set -euo pipefail
 # 2: adds env-schema (#205).
 # 3: adds routing-get, the four routing / webhook plugin-request actions, and write-only plugin
 #    secret keys (#240, ADR-0006).
-readonly BOT_OPS_SCHEMA=3
+# 4: a plugin's env keys are listed and editable whether or not the plugin is in PLUGINS, so one
+#    env-set can turn a plugin on and configure it (#256).
+readonly BOT_OPS_SCHEMA=4
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -200,7 +202,8 @@ ALLOWED_SPEC=(
   'COMMAND_PREFIX|^[a-z0-9_-]{1,20}$'
   # `PLUGINS=` selects which plugins to install (operator-controlled, panel-edited): a bare `name`
   # or `name@version` to pin, comma-separated; empty = no plugins. The manifest-declared env keys of
-  # the plugins named here are merged into this whitelist at runtime by load_plugin_keys, so a
+  # every plugin in the cached index (whether or not it is named here, #256) are merged into this
+  # whitelist at runtime by load_plugin_keys, so a
   # plugin's own key (e.g. WARBANDEER_INGEST_PORT, a static row here until #100 removed the baked-in
   # connector) is validated with the FORMAT the Plugin Index carries rather than hand-mirrored per
   # plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
@@ -392,10 +395,12 @@ readonly PLUGIN_STATE_PATH='/app/data/plugins/state.json'
 readonly ROUTING_PATH='/app/data/routing.json'
 readonly DISCOVERY_PATH='/app/data/discovery.json'
 
-# The env keys the INSTALLED plugins declare — merged into env-get's listing and env-set's
-# whitelist so the panel manages a plugin's own keys (e.g. WARBANDEER_INGEST_PORT) without this
-# script hand-mirroring each plugin. Manifest order is preserved (PLUGIN_KEY_ORDER);
-# PLUGIN_FORMAT / PLUGIN_REQUIRED carry each key's validation.
+# The env keys EVERY plugin in the bot's cached Plugin Index declares, whether or not that plugin is
+# in PLUGINS (#256) — merged into env-get's listing and env-set's whitelist so the panel manages a
+# plugin's own keys (e.g. WARBANDEER_INGEST_PORT) without this script hand-mirroring each plugin, and
+# so a plugin can be turned on and configured in ONE save. A key of a plugin that is off is inert until
+# the plugin is on. Manifest order is preserved (PLUGIN_KEY_ORDER); PLUGIN_FORMAT / PLUGIN_REQUIRED
+# carry each key's validation.
 #
 # A `secret` key is tracked in a SEPARATE set (PLUGIN_SECRET_*) and never enters PLUGIN_KEY_ORDER /
 # PLUGIN_FORMAT / PLUGIN_REQUIRED (#240, ADR-0006 decision 8): those are what env-get lists, so
@@ -407,22 +412,25 @@ declare -A PLUGIN_REQUIRED=()
 PLUGIN_SECRET_ORDER=()
 declare -A PLUGIN_SECRET_FORMAT=()
 declare -A PLUGIN_SECRET_REQUIRED=()
-# Every key ANY plugin in the index declares secret, enabled or not: such a key is never listed as a
-# plain one, whichever plugin declares it plain. (PLUGIN_SECRET_FORMAT is the editable subset.)
+# Every key ANY plugin in the index declares secret: such a key is never listed as a plain one,
+# whichever plugin declares it plain. (PLUGIN_SECRET_FORMAT is the editable subset: the keys of usable
+# entries.)
 declare -A PLUGIN_SECRET_ANY=()
-# "none" (no plugins enabled — no docker read attempted), "ok", or "index unavailable" (the bot
-# isn't running or hasn't cached the index yet — env-get then shows static keys only, never errors).
-PLUGIN_KEYS_STATUS="none"
+# "ok", or "index unavailable" (the bot isn't running or hasn't cached the index yet — env-get then
+# shows static keys only, never errors).
+PLUGIN_KEYS_STATUS="ok"
 
 # Populate PLUGIN_KEY_ORDER / PLUGIN_FORMAT / PLUGIN_REQUIRED (the listable, editable plain keys) and
-# PLUGIN_SECRET_* (the editable secret keys) from the container's cached index, restricted to the
-# plugins named in this instance's own PLUGINS value — except that PLUGIN_SECRET_ANY, the set of keys
-# that must never be listed, is filled from EVERY plugin in the index (#240). Requires
-# load_env_values to have run (reads the effective PLUGINS). Runs in the CURRENT shell — a command/process substitution
-# would lose the globals it sets to a subshell — so it reads docker's output into a variable and
-# parses it via a here-string. No plugins enabled → returns immediately WITHOUT touching docker, so
-# an instance with no plugins pays nothing (and every pre-#101 test, none of which set PLUGINS, sees
-# no new docker call). A missing/unreadable/invalid index is "unavailable", never an error (D3).
+# PLUGIN_SECRET_* (the editable secret keys) from the container's cached index — from EVERY plugin in
+# it, not only the ones named in this instance's PLUGINS value (#256): the index, not PLUGINS, decides
+# which keys are plugin keys, and a key of a plugin that is off is inert until the plugin is on. That
+# is what lets one env-set turn a plugin on AND set its settings; and env-get, env-schema and env-set
+# all read the keys through this one loader, so they can never disagree about which keys exist. Runs in
+# the CURRENT shell — a command/process substitution would lose the globals it sets to a subshell — so
+# it reads docker's output into a variable and parses it via a here-string. It always makes ONE
+# read-only `docker exec … cat` of the cached index (an instance with no plugins pays that read too,
+# and notes "index unavailable" on stderr when the bot has not cached the index yet). A
+# missing/unreadable/invalid index is "unavailable", never an error (D3).
 load_plugin_keys() {
   PLUGIN_KEY_ORDER=()
   PLUGIN_FORMAT=()
@@ -431,20 +439,14 @@ load_plugin_keys() {
   PLUGIN_SECRET_FORMAT=()
   PLUGIN_SECRET_REQUIRED=()
   PLUGIN_SECRET_ANY=()
-  PLUGIN_KEYS_STATUS="none"
-  local plugins_val names_json raw rows key format required secret enabled
-  plugins_val="$(env_value PLUGINS)"
-  [ -n "$plugins_val" ] || return 0
   PLUGIN_KEYS_STATUS="ok"
-  # PLUGINS is `name(@version)?(,…)*`; the index is keyed by bare name, so drop any @version pin.
-  names_json="$(printf '%s' "$plugins_val" \
-                | jq -R 'split(",") | map(split("@")[0] | select(length > 0))')"
+  local raw rows key format required secret usable
   raw="$(docker exec "$CONTAINER" cat "$PLUGIN_INDEX_PATH" 2>/dev/null || true)"
   if [ -z "$raw" ] || ! printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
   fi
-  # Each env key as five RAW lines (key, format, required, secret, enabled), NOT @tsv: jq's TSV
+  # Each env key as five RAW lines (key, format, required, secret, usable), NOT @tsv: jq's TSV
   # encoder escapes a backslash, which an ERE `format` may legitimately carry (`\.`), and the bash
   # reader would then see it doubled; raw lines pass the regex through verbatim (a `format` never
   # spans lines). `.index.plugins` is the cache wrapper, not a bare `.plugins`.
@@ -456,10 +458,11 @@ load_plugin_keys() {
   # unusable inside the program, and `secret` is normalised there too: only an absent / null / false
   # `secret` means "not secret", ANY other value (a string, a number, an array) counts as secret —
   # fail closed, never fail open. An unusable entry that CLAIMS secret is not forgotten: it still
-  # marks its key secret (an `enabled` of "false" and an empty format, so it can never be edited or
+  # marks its key secret (a `usable` of "false" and an empty format, so it can never be edited or
   # validated against), otherwise another plugin declaring the same key plain would get it listed.
-  # The `enabled` column carries whether the plugin is in PLUGINS: a key ANY plugin in the index
-  # declares secret is secret for every plugin, but only an enabled plugin's keys are ever editable.
+  # The `usable` column is "true" for a well-formed entry and "false" for that secret-only row (it
+  # cannot be dropped to four lines: an empty `format` is a legal well-formed value, so it cannot
+  # double as the marker). A key ANY plugin in the index declares secret is secret for every plugin.
   #
   # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
   # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
@@ -469,17 +472,16 @@ load_plugin_keys() {
   # `.index.plugins` can't index) as "index unavailable" via `2>/dev/null` + the `if !`, rather than
   # letting pipefail + set -e abort the whole env-get/env-set. Same posture cmd_status takes for
   # state.json; without it a valid-JSON-but-wrong-shape cached index crashes ops (a D3 violation).
-  if ! rows="$(printf '%s' "$raw" | jq -r --argjson names "$names_json" '
+  if ! rows="$(printf '%s' "$raw" | jq -r '
     (.index.plugins // [])
     | map(select(type == "object"))
     | .[]
-    | (.name as $n | (($names | index($n)) != null)) as $on
     | .env[]?
     | select((type == "object") and (.key | type == "string") and (.key | test("[\\r\\n]") | not))
     | (.required // false | tostring) as $req
     | (if (.secret // false) == false then "false" else "true" end) as $sec
     | ((.format | type == "string" and (test("[\\r\\n]") | not)) and ($req | test("[\\r\\n]") | not)) as $wellformed
-    | if $wellformed then (.key, .format, $req, $sec, ($on | tostring))
+    | if $wellformed then (.key, .format, $req, $sec, "true")
       elif $sec == "true" then (.key, "", "false", "true", "false")
       else empty end
   ' 2>/dev/null)"; then
@@ -487,40 +489,40 @@ load_plugin_keys() {
     return 0
   fi
   # Two passes over the same rows (#240). Pass 1 collects the SECRET keys, pass 2 the plain ones, so a
-  # key that ANY plugin in the index declares secret — enabled or not — is secret everywhere: another
-  # plugin declaring the same key non-secret must not get it listed, or env-get would emit a value one
-  # manifest called secret. In both passes a key the deployment owns (RESERVED_KEYS) is dropped
-  # whatever the manifest says, and a secret key that collides with a static ALLOWED key is ignored
-  # (static wins, exactly as for a plain plugin key).
+  # key that ANY plugin in the index declares secret is secret everywhere: another plugin declaring the
+  # same key non-secret must not get it listed, or env-get would emit a value one manifest called
+  # secret. In both passes a key the deployment owns (RESERVED_KEYS) is dropped whatever the manifest
+  # says, and a secret key that collides with a static ALLOWED key is ignored (static wins, exactly as
+  # for a plain plugin key).
   # jq.exe on a Windows dev box emits CRLF, so each field carries a trailing "\r" that a native
   # Linux jq never adds; strip it (a no-op on Linux) the same way load_env_values strips a
   # CRLF-saved .env — else the key names and the `secret`/`required` flags are all "…\r".
-  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r usable; do
     key="${key%$'\r'}"
     format="${format%$'\r'}"
     required="${required%$'\r'}"
     secret="${secret%$'\r'}"
-    enabled="${enabled%$'\r'}"
+    usable="${usable%$'\r'}"
     [ "$secret" = "true" ] || continue
     [ -n "$key" ] || continue
     [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-editable
     [[ -n "${ALLOWED[$key]+x}" ]] && continue                # a static key: static wins
-    PLUGIN_SECRET_ANY["$key"]=1                              # secret for every plugin, enabled or not
-    [ "$enabled" = "true" ] || continue                      # only an ENABLED plugin's secret key is editable
+    PLUGIN_SECRET_ANY["$key"]=1                              # secret for every plugin that declares it
+    [ "$usable" = "true" ] || continue                       # an unusable entry's secret claim marks the key, but is never editable
     [[ -n "${PLUGIN_SECRET_FORMAT[$key]+x}" ]] && continue   # a key declared twice: first wins
     PLUGIN_SECRET_ORDER+=("$key")
     PLUGIN_SECRET_FORMAT["$key"]="$format"
     PLUGIN_SECRET_REQUIRED["$key"]="$required"
   done <<< "$rows"
-  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r enabled; do
+  while IFS= read -r key && IFS= read -r format && IFS= read -r required && IFS= read -r secret && IFS= read -r usable; do
     key="${key%$'\r'}"
     format="${format%$'\r'}"
     required="${required%$'\r'}"
     secret="${secret%$'\r'}"
-    enabled="${enabled%$'\r'}"
+    # (`usable` is read to consume the row's fifth line but not tested here: an unusable row always
+    # carries secret = "true", so the line below already skips it.)
     [ -n "$key" ] || continue
-    [ "$enabled" = "true" ] || continue                      # a plain key of a plugin that is not enabled is never listed
-    [ "$secret" = "true" ] && continue                       # a secret key: tracked in PLUGIN_SECRET_*, never here
+    [ "$secret" = "true" ] && continue                       # a secret key (an unusable row always is one): tracked in PLUGIN_SECRET_*, never here
     [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-listable or editable
     [[ -n "${PLUGIN_SECRET_ANY[$key]+x}" ]] && continue      # another plugin declares it secret: secret wins
     [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue          # a key declared twice: first wins
@@ -610,9 +612,10 @@ cmd_env_get() {
   for key in "${ENV_KEY_ORDER[@]}"; do
     args+=(--arg "$key" "$(env_value "$key")")
   done
-  # After the static keys, append each INSTALLED plugin's non-secret env keys in manifest order, so
-  # the panel's config form renders them (e.g. WARBANDEER_INGEST_PORT once the warbandeer plugin is
-  # installed) — read from the container's cached index by load_plugin_keys, never hand-mirrored.
+  # After the static keys, append every plugin's non-secret env keys in manifest order — the plugins in
+  # the cached Plugin Index, whether or not each is in PLUGINS (#256) — so the panel's config form
+  # renders them (e.g. WARBANDEER_INGEST_PORT) and a plugin can be configured in the same save that
+  # turns it on. Read from the container's cached index by load_plugin_keys, never hand-mirrored.
   load_plugin_keys
   if [ "${#PLUGIN_KEY_ORDER[@]}" -gt 0 ]; then
     for key in "${PLUGIN_KEY_ORDER[@]}"; do
@@ -623,11 +626,11 @@ cmd_env_get() {
   # A note, deliberately NOT a JSON field: env-get's stdout must stay a flat {KEY: value} map the
   # panel round-trips back through env-set (a lowercase `plugins` meta key would be echoed and then
   # rejected as un-editable). #102's panel learns index availability from its own fetch of the index;
-  # here we just say on stderr why a configured plugin's keys aren't being shown.
+  # here we just say on stderr why the plugins' keys aren't being shown.
   if [ "$PLUGIN_KEYS_STATUS" = "index unavailable" ]; then
     echo "bot-ops: plugins: index unavailable — showing static keys only (the bot isn't running or hasn't cached the Plugin Index yet)" >&2
   fi
-  # Build a {KEY: value, ...} object over the static keys then the installed plugins' keys, in that
+  # Build a {KEY: value, ...} object over the static keys then the plugins' keys, in that
   # order — jq preserves --arg insertion order in $ARGS.named, and the admin panel's front-end
   # renders this object's keys in the order it receives them rather than re-sorting.
   jq -n "${args[@]}" '$ARGS.named'
@@ -639,7 +642,10 @@ cmd_env_get() {
 # the same "index unavailable" stderr note) so the two subcommands can never disagree about which
 # keys exist or their order.
 #
-# #240: after those rows come the installed plugins' WRITE-ONLY secret keys, each
+# #256: the plugin rows are those of EVERY plugin in the cached index, enabled or not (see
+# load_plugin_keys), so the panel can draw and validate a plugin's settings before the plugin is on.
+#
+# #240: after those rows come the plugins' WRITE-ONLY secret keys, each
 # {pattern, required, source: "plugin", secret: true, isSet} — that the key exists, that it is secret,
 # and whether it is set, never what it holds. `isSet` is tested here in bash (`[ -n "$(env_value …)" ]`)
 # and only the resulting true/false is handed to jq, so the value never reaches jq's argv either.
@@ -850,12 +856,14 @@ cmd_env_set() {
     [[ -n "${ALLOWED[$rkey]+x}" ]] || die "env-set: '$rkey' is in REQUIRED but not ALLOWED"
   done
 
-  # Merge in each INSTALLED plugin's declared env keys (from the container's cached index) so the
-  # whitelist below accepts them alongside the static ALLOWED set — read once, up front. Needs the
-  # effective PLUGINS value, so load .env first. No plugins → no docker read (load_plugin_keys
-  # short-circuits), a no-op on an instance with no plugins. The manifest reflects the CURRENTLY
-  # installed plugins: a plugin's own key becomes editable only once that plugin is in PLUGINS and
-  # the bot has cached the index, not in the same save that first adds the plugin.
+  # Merge in every plugin's declared env keys (from the container's cached index) so the whitelist
+  # below accepts them alongside the static ALLOWED set — read once, up front, with one docker read
+  # even on an instance with no plugins. The index, not PLUGINS, decides which keys are plugin keys
+  # (#256): a plugin's own key is editable in the SAME save that first adds the plugin to PLUGINS, which
+  # is what makes turning a plugin on and configuring it one restart. That widens which keys this
+  # accepts, and is safe because the index already decides what a plugin key is, a key of a plugin that
+  # is off is inert until the plugin is on, and a reserved (core) key stays reserved whatever a manifest
+  # says. A key no plugin in the index declares, and a core secret, are still refused below.
   load_env_values
   load_plugin_keys
 
@@ -878,8 +886,9 @@ cmd_env_set() {
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "env-set: malformed input line (need KEY=VALUE)"
     # Whitelist membership is checked up front whether or not the value changes — that's a
     # question of authority (may the panel touch this key at all?), not of format. A key is
-    # editable if it is a static ALLOWED key, an installed plugin's own key, OR (#240) an installed
-    # plugin's `secret` key — write-only, see PLUGIN_SECRET_* above. A CORE secret is in none of
+    # editable if it is a static ALLOWED key, a plugin's own key, OR (#240) a plugin's `secret` key —
+    # write-only, see PLUGIN_SECRET_* above — where "a plugin" is any plugin in the cached index, on or
+    # off (#256), and a key no index plugin declares is refused. A CORE secret is in none of
     # those sets (and load_plugin_keys never lets a manifest add a reserved key), so it is refused
     # here exactly as before. The message names the key (when it looks like a variable name — see
     # echo_key), never a value.
@@ -930,8 +939,8 @@ cmd_env_set() {
       # plain, static or plugin, and never quoting the value. No shipped key needs either character.
       [[ "$val" != *'$'* && "$val" != *'"'* && "$val" != *"'"* ]] \
         || die "env-set: value for '$key' may not contain a dollar sign or a quote"
-      # Format + required-ness come from the static ALLOWED set, or from the installed plugin's
-      # manifest entry for a plugin-owned key (a static key wins if somehow both name it).
+      # Format + required-ness come from the static ALLOWED set, or from the plugin's manifest entry
+      # in the cached index for a plugin-owned key (a static key wins if somehow both name it).
       if [[ -n "${ALLOWED[$key]+x}" ]]; then
         fmt="${ALLOWED[$key]}"
         is_required="${REQUIRED[$key]+x}"
