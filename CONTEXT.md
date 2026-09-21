@@ -75,7 +75,8 @@ _Avoid_: context, container, services, host (bare)
 **Plugin State**:
 `data/plugins/state.json`, written by the bot after activation: per plugin, enabled / installed /
 available / configured / active, the error if any, and the notification, snooze, skip and schedule
-bookkeeping. Read by `ops/bot-ops.sh status` and the admin panel.
+bookkeeping. Read by `ops/bot-ops.sh status` and the admin panel. **#225:** a plugin taken out of
+`PLUGINS` keeps its entry, `enabled: false`, instead of being dropped.
 _Avoid_: plugin list, cache
 
 **Admin tab**:
@@ -902,8 +903,9 @@ _Avoid_: server list, guild cache
   current needing an OLDER host than the bot's (assuming a plugin's host API never decreases across
   its versions, no older version can match); an entry with intents;
   and a plugin with no pin and no `state.json` record — `installPlugins`' newest-cached fallback is
-  not modelled (it needs disk access), and `state.json` only records the plugins listed in
-  `PLUGINS`, so one left out for a boot loses its record: pin `PLUGINS=name@version` to recover.
+  not modelled (it needs disk access). **#225: a plugin left out of `PLUGINS` no longer loses its
+  record** — `buildPluginStateFile` carries its previous entry forward as `enabled: false` (see the
+  gotcha below), so the no-record case above is now only a fresh install or a deleted `state.json`.
   Limits: the pins carry no provenance, so a rolled-back bot (state written under a newer host API)
   or a skipped explicit pin that `buildPluginStateFile` recorded as `installedVersion`
   (`host.ts`) can keep a version this bot never ran; **#223: `install.ts`'s `reconcileManifest` now
@@ -941,6 +943,38 @@ _Avoid_: server list, guild cache
   test fixture) never refuses — refusing there would brick every already-installed plugin on the next
   boot. The function is total (never throws): its cache-path call sits outside `tryInstallVersion`'s
   own `try`, so a throw there would take `installPlugins` down for every plugin, not just this one.
+- **Off plugins stay in `state.json` (#225).** Taking a plugin out of `PLUGINS=` used to drop its
+  entire `state.json` entry on the next boot — `installedVersion`, `skippedVersion`, `remindAt`,
+  `scheduled`, all gone. Re-enabling it later then fell through to `newestCachedVersion`, which can
+  silently reinstall a version the operator moved *away* from (install 1.2, decide it's bad, pin back
+  to 1.1 — both version directories now exist on disk; disable and re-enable and the bot comes back on
+  1.2). `buildPluginStateFile` now carries the previous entry forward as `enabled: false, active:
+  false` for any plugin not selected this boot, keeping `installedVersion` (the pin — the whole
+  point), `notifiedVersion`/`skippedVersion`/`remindAt`/`scheduled`, and `configured`/`missingEnv` as
+  the last boot it ran left them; it drops `targetVersion`/`availableVersion`/`error`, which only a
+  boot that actually ran the plugin can know. Nothing acts on an off entry: `decidePluginUpdates` and
+  `runDueSchedules` (`updates.ts`) both skip it — no notification, no reminder, and a scheduled update
+  is **paused, not fired**, resuming at the first update tick after the plugin is turned back on (two
+  restarts close together; `/plugins list` and the panel show the pending schedule throughout, so this
+  is documented behaviour, not a hidden trap). `requests.ts`'s `validate` and `/plugins update` both
+  refuse `update-now`/`schedule` for an off plugin (`<name> is off — turn it on first` / turned-off
+  wording); `remind`/`skip`/`cancel` still apply since they're bookkeeping only. A `pendingReport`
+  whose plugin was turned off in the same restart that consumed its update pin reports "is turned off,
+  so the update … did not run" rather than a false success or a confusing revert message. **Not fixed
+  here:** the admin panel still offers *Update now* on a carried-off plugin's card until #244 folds in
+  an `enabled` check — the bot refuses the request with the reason above, which the panel surfaces, so
+  nothing silently succeeds, but the button itself is misleading until then.
+- **A plugin option that asks for autocomplete gets a warning, not a working picker (#218).** Nothing
+  in `src/` routes an autocomplete interaction to plugin code — `buildCommandBody` (`host.ts`) still
+  registers the command (dropping it would remove a working command over a dead picker; a typed value
+  still works), but warns once per command, naming every option path (`autocompleteOptionPaths`, which
+  walks subcommand groups/subcommands recursively) that declared `autocomplete: true`. `index.ts`'s
+  `InteractionCreate` handler answers every autocomplete interaction with `interaction.respond([])`,
+  so Discord's picker shows "no options" immediately instead of failing after its own 3s timeout with
+  no explanation anywhere in the log. Actually routing an autocomplete interaction to a plugin's own
+  handler needs an addition to `PluginCommand` in `contract.ts` — out of scope here (that file is
+  vendored verbatim by `rackbops-bot-plugins`) — tracked as its own contract-change issue, #287, to
+  land with the post-#236 contract batch (#219/#248/#220) in one paired vendor bump.
 - **`ops/admin/Dockerfile`'s `COPY server.ts admin-contract.ts ./` must name every relative local
   import `server.ts` has, or the admin container crash-loops at boot.** #124 added the
   `./admin-contract` import; a missed COPY update shipped in the same epic and crash-looped with

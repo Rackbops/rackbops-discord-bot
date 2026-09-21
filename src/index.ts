@@ -206,6 +206,11 @@ async function activate(c: Client<true>): Promise<void> {
         // #185: core's report: modal check above always wins that prefix, regardless of what
         // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
         await dispatchPluginInteraction(loadResult.loaded, interaction, console);
+      } else if (interaction.isAutocomplete()) {
+        // #218: the host routes no autocomplete to plugins (see host.ts's buildCommandBody warning);
+        // an empty answer closes the picker cleanly at once instead of Discord's own 3s timeout
+        // failure. Core declares no autocomplete option, so there is nothing to route past this.
+        await interaction.respond([]);
       }
     } catch (err) {
       console.error("[interaction]", err);

@@ -139,6 +139,27 @@ export function pluginCommandMap(
  * `COMMAND_PREFIX`-named builder (so a plugin can't register outside the namespace). A command that
  * builds to the wrong name is dropped and logged rather than trusted.
  */
+/** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
+ *  `"group sub q"`) whose built JSON declares `autocomplete: true` — the host never routes an
+ *  autocomplete interaction to a plugin (see `buildCommandBody` below and `index.ts`'s handler), so
+ *  these are dead pickers. Total: a malformed/absent `options` (not an array) yields `[]`. */
+export function autocompleteOptionPaths(json: RESTPostAPIChatInputApplicationCommandsJSONBody): string[] {
+  const paths: string[] = [];
+  const walk = (options: unknown, prefix: readonly string[]): void => {
+    if (!Array.isArray(options)) return;
+    for (const opt of options) {
+      if (typeof opt !== "object" || opt === null) continue;
+      const o = opt as { name?: unknown; autocomplete?: unknown; options?: unknown };
+      if (typeof o.name !== "string") continue;
+      const path = [...prefix, o.name];
+      if (o.autocomplete === true) paths.push(path.join(" "));
+      walk(o.options, path);
+    }
+  };
+  walk((json as { options?: unknown }).options, []);
+  return paths;
+}
+
 export function buildCommandBody(
   prefix: string,
   coreCommandJson: readonly RESTPostAPIChatInputApplicationCommandsJSONBody[],
@@ -160,6 +181,17 @@ export function buildCommandBody(
     if (built.name !== `${prefix}${bare}`) {
       log.warn(`[plugins] ${entry.name}: command "${bare}" built the wrong name "${built.name}" — dropping it`);
       continue;
+    }
+    // #218: a live command with a dead picker is still better than dropping it outright — warn, don't
+    // refuse. A typed value still works; only the autocomplete suggestions never load (index.ts
+    // answers every autocomplete interaction with an empty list — see its handler for why).
+    const autocompletePaths = autocompleteOptionPaths(built);
+    if (autocompletePaths.length > 0) {
+      log.warn(
+        `[plugins] ${entry.name}: command "${bare}" asks for autocomplete on ` +
+          `${autocompletePaths.map((p) => `"${p}"`).join(", ")} — the host does not route autocomplete ` +
+          `to plugins (#287), so the picker offers no suggestions; a typed value still works`,
+      );
     }
     body.push(built);
   }
@@ -366,6 +398,17 @@ function missingRequiredEnv(entry: PluginIndexEntry, processEnv: Record<string, 
  * (`notifiedVersion`/`skippedVersion`/`remindAt`/`scheduled`, and the top-level `pendingReport`)
  * from the previous file — the bot is the only writer of those, and #103/#104 own them. Pure so the
  * content and the preservation are unit-tested directly.
+ *
+ * **#225:** a plugin taken out of `PLUGINS=` (not in `opts.selected` this boot) is no longer dropped —
+ * its previous entry is carried forward as `enabled: false, active: false`, appended after the
+ * selected entries, in the previous file's order, de-duplicated by name (first wins). Carried:
+ * `installedVersion` (the pin — the whole point, so re-enabling never falls through to
+ * `newestCachedVersion` and silently reuses a version the operator moved away from),
+ * `notifiedVersion`/`skippedVersion`/`remindAt`/`scheduled`, `configured`/`missingEnv` exactly as the
+ * last boot it ran left them. Dropped: `targetVersion` (a one-boot transient that never ran this
+ * boot), `availableVersion` (recomputed each boot from the index, only for selected plugins), `error`
+ * (a this-boot outcome). An entry that was already `enabled: false` is carried again the same way —
+ * off entries never expire on their own.
  */
 export function buildPluginStateFile(opts: {
   selected: readonly SelectedPlugin[];
@@ -414,7 +457,37 @@ export function buildPluginStateFile(opts: {
     return entry;
   });
 
-  const state: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: opts.now.toISOString(), plugins };
+  // #225: carry forward every previous entry that isn't selected this boot, as enabled: false — its
+  // pin and bookkeeping survive a disable, so re-enabling later resolves against installedVersion
+  // instead of falling through to newestCachedVersion (which could out-rank a hand-lowered pin the
+  // same way #104's update-fallback already guards against). Previous-file order, de-duplicated by
+  // name (first wins) — a corrupt previous file with a repeated name must not double an entry.
+  const selectedNames = new Set(opts.selected.map((sp) => sp.name));
+  const carriedNames = new Set<string>();
+  const offEntries: PluginStateEntry[] = [];
+  for (const prev of opts.previous.plugins) {
+    if (selectedNames.has(prev.name) || carriedNames.has(prev.name)) continue;
+    carriedNames.add(prev.name);
+    const offEntry: PluginStateEntry = {
+      name: prev.name,
+      enabled: false,
+      configured: prev.configured,
+      missingEnv: prev.missingEnv,
+      active: false,
+    };
+    if (prev.installedVersion !== undefined) offEntry.installedVersion = prev.installedVersion;
+    if (prev.notifiedVersion !== undefined) offEntry.notifiedVersion = prev.notifiedVersion;
+    if (prev.skippedVersion !== undefined) offEntry.skippedVersion = prev.skippedVersion;
+    if (prev.remindAt !== undefined) offEntry.remindAt = prev.remindAt;
+    if (prev.scheduled !== undefined) offEntry.scheduled = prev.scheduled;
+    offEntries.push(offEntry);
+  }
+
+  const state: PluginStateFile = {
+    hostApiVersion: HOST_API_VERSION,
+    writtenAt: opts.now.toISOString(),
+    plugins: [...plugins, ...offEntries],
+  };
   if (opts.previous.pendingReport !== undefined) state.pendingReport = opts.previous.pendingReport;
   return state;
 }

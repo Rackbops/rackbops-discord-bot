@@ -98,6 +98,7 @@ export function decidePluginUpdates(
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
   const decisions: PluginUpdateDecision[] = [];
   for (const p of state.plugins) {
+    if (!p.enabled) continue; // #225: an off plugin is never notified, reminded or updated
     const from = p.installedVersion;
     if (!from) continue; // never installed — nothing to update
     const entry = entryByName.get(p.name);
@@ -171,6 +172,16 @@ export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _n
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
   const out = state.plugins
     .map((p) => {
+      // #225: an off entry shows only that it's off and its pin — no "available", no notes, since
+      // nothing about it will change until it's turned back on. A pending schedule still shows (it's
+      // paused, not cancelled) so /plugins cancel has something visible to act on.
+      if (!p.enabled) {
+        let offLine = `• **${p.name}** — off (installed ${p.installedVersion ?? "(not installed)"})`;
+        if (p.scheduled) {
+          offLine += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
+        }
+        return offLine;
+      }
       let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
       const entry = entryByName.get(p.name);
       if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
@@ -252,6 +263,8 @@ export type PluginAction =
 /** What the handler knows about the plugin when planning an action (from state + the fresh index). */
 export interface PluginActionContext {
   name: string;
+  /** Listed in `PLUGINS=` this boot (#225): an off plugin is never updated. */
+  enabled: boolean;
   installedVersion?: string;
   /** The index's current version, or undefined if the plugin isn't in the index. */
   latestVersion?: string;
@@ -369,6 +382,12 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
     return { reply: `Cancelled the pending update for **${name}**.`, mutate: cancelPending(name) };
   }
 
+  // #225: an off plugin can still be reminded/skipped/cancelled (bookkeeping only) but never updated —
+  // it isn't running, and installPlugins never touches an off entry.
+  if (action.kind === "update" && !ctx.enabled) {
+    return { reply: `⚠️ **${name}** is turned off (not in \`PLUGINS=\`) — turn it on first, then update.` };
+  }
+
   // update / remind / skip all need a newer version to act on.
   if (!hasNewer(ctx)) {
     return { reply: `**${name}** is already on the latest version (${ctx.installedVersion ?? "?"}).` };
@@ -428,6 +447,11 @@ export function decidePluginReportOutcome(
 ): { ok: boolean; message: string } {
   const to = report.toVersion;
   const name = report.plugin;
+  // #225: turned off in the same restart an update-now targeted (the request applied, then the
+  // operator disabled it before the boot landed) — the pin was consumed but the plugin never ran.
+  if (entry?.enabled === false) {
+    return { ok: false, message: `⚠️ **${name}** is turned off, so the update to ${to} did not run.` };
+  }
   const installed = entry?.installedVersion;
   if (entry && installed === to && entry.active) {
     return { ok: true, message: `✅ **${name}** is now ${to}.` };
@@ -582,6 +606,7 @@ async function runDueSchedules(deps: PluginUpdateDeps): Promise<void> {
   const state = await deps.readState();
   const now = deps.now();
   for (const p of state.plugins) {
+    if (!p.enabled) continue; // #225: an off plugin's schedule is paused, not fired
     const sched = p.scheduled;
     if (!sched || now.getTime() < Date.parse(sched.at)) continue;
 
