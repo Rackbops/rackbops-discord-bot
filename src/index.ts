@@ -17,7 +17,7 @@ import { resolveBootMode, takeOver } from "./redeploy";
 import { awaitCriticalIdle, beginShutdown } from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
-import { selectPlugins, collectIntents, describeSkips } from "./plugins/registry";
+import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./plugins/registry";
 import { HOST_API_VERSION } from "./plugins/contract";
 import type { HostApi, HostStorage, PluginIndexEntry, PluginModule, PluginStateFile } from "./plugins/contract";
 import { installPlugins, tarExtract } from "./plugins/install";
@@ -44,11 +44,21 @@ import { applyRouting, initRouting } from "./routing/live";
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
 const pluginIndexResult = await loadPluginIndex(config.pluginIndexUrl, DATA_DIR);
+// #222: the previous boot's per-plugin version pins (state.json), so a plugin that is last-good on an
+// older version — rather than explicitly pinned, which needs no state — can be kept when the index
+// moves to a version declaring a different host API (all a hostApiVersion in the index describes is
+// its current version). This is a second read of the file activate() reads for installPlugins, kept
+// separate on purpose: activate()'s read sits inside its own try/catch, while this one is total —
+// pinsFromState accepts any parsed shape, and readPluginState already degrades a corrupt file to
+// fresh (moving it aside once, here, instead of in activate()).
+const bootStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
+const installedPins = pinsFromState(await readPluginState(DATA_DIR, bootStorage));
 const selectedPlugins = selectPlugins(
   pluginIndexResult.index,
   config.plugins,
   HOST_API_VERSION,
   CORE_COMMAND_NAMES,
+  installedPins,
 );
 const skipReasons = describeSkips(selectedPlugins);
 for (const line of skipReasons) console.warn(`[plugins] ${line}`);

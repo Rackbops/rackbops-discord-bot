@@ -60,7 +60,7 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    keys are set is its business. An enabled-but-unconfigured plugin still loads and registers commands
    that say what is missing — today's `/link` "isn't configured" reply, unchanged.
 3. **A plugin never crashes the bot.** Index unreachable → the cached copy (warn); no cache → no
-   plugins (warn). An unknown name, an incompatible `hostApiVersion`, a download or integrity
+   plugins (warn). An unknown name, an incompatible `hostApiVersion` (decision 5 says when an older pinned version is kept instead), a download or integrity
    failure, a throwing `createPlugin`/`activate` → that plugin is skipped with the reason recorded in
    `state.json`. An invalid plugin env value skips that plugin with the same error text in the log,
    where the baked-in connector refused to boot.
@@ -75,7 +75,9 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    installed and the available version, from each plugin's changelog via the index); the admin then
    chooses now, a scheduled time, remind me later, or skip this version — from Discord or the admin
    panel. There is no auto-update flag. `PLUGINS=name@version` is a hard pin. Compatibility is
-   `hostApiVersion === HOST_API_VERSION`, integer equality.
+   `hostApiVersion === HOST_API_VERSION`, integer equality — checked against the index's current
+   version only, the one version the index describes; an older pinned or last-good version is kept
+   when that current version needs a newer host (#222; the conditions are in `src/plugins/registry.ts`).
 6. **Storage.** `HostApi.storage` hands over the storage primitives (today
    `src/warbandeer/storage.ts`, promoted to `src/storage.ts` when the connector moves out) and
    `HostApi.dataDir` is the same `data/` directory, so `data/links.json` and `data/characters/` keep their paths — the

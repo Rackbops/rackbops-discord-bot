@@ -1,11 +1,38 @@
 // Pure plugin selection — no I/O, no imports beyond the contract's types. Runs after the Plugin
 // Index is loaded (src/plugins/index.ts) and before the discord.js Client is constructed
 // (src/index.ts), so every skip decision here is made from data alone, never from plugin code.
-import type { PluginIndex, PluginIndexEntry } from "./contract";
+import type { PluginIndex, PluginIndexEntry, PluginStateEntry } from "./contract";
 
 interface ConfiguredPlugin {
   name: string;
   version?: string;
+}
+
+/** The two `state.json` fields that decide which version `installPlugins` resolves for a plugin
+ * when there is no explicit `PLUGINS=name@version` pin: the last-good `installedVersion`, and #104's
+ * transient `targetVersion` (an explicit `/plugins update` the next boot should try first). */
+type VersionPins = Pick<PluginStateEntry, "installedVersion" | "targetVersion">;
+
+const VERSION_PREFIX = /^(\d+)\.(\d+)\.(\d+)/;
+
+/**
+ * `a` is provably older than `b`: both begin with dotted `major.minor.patch` numbers, small enough
+ * to compare exactly, and `a`'s are lower. Everything else — equal, newer, a prerelease tag on the
+ * same numbers, text that isn't a version at all (the index's shape check only wants a string, so
+ * `version: "latest"` passes it) — is "not older", so a caller that keeps only provably-older
+ * versions stays on its conservative path for anything it cannot order.
+ */
+function isOlderVersion(a: string, b: string): boolean {
+  const pa = VERSION_PREFIX.exec(a);
+  const pb = VERSION_PREFIX.exec(b);
+  if (!pa || !pb) return false;
+  for (let i = 1; i <= 3; i++) {
+    const na = Number(pa[i]);
+    const nb = Number(pb[i]);
+    if (!Number.isSafeInteger(na) || !Number.isSafeInteger(nb)) return false;
+    if (na !== nb) return na < nb;
+  }
+  return false;
 }
 
 /**
@@ -21,17 +48,23 @@ export interface SelectedPlugin {
 
 /**
  * Walks `configured` (parsed `PLUGINS=` tokens, in order) against the Plugin Index, skipping a
- * plugin that isn't published, needs a newer host, is itself named after a reserved core command
- * (#185 — its interaction-routing prefix would collide), or whose command names collide with core
- * or an earlier-selected plugin. A skipped plugin is still returned (with `skipped` set) so a
- * caller can report why — this is what #99/#101/#102 read to build `state.json` and the panel's
- * listing.
+ * plugin that isn't published, whose index entry needs a different host API than this bot's (unless
+ * an older pinned or last-good version is kept — see the check below), is itself named after a
+ * reserved core command (#185 — its interaction-routing prefix would collide), or whose command
+ * names collide with core or an earlier-selected plugin. A skipped plugin is still returned (with
+ * `skipped` set) so a caller can report why — this is what #99/#101/#102 read to build `state.json`
+ * and the panel's listing.
+ *
+ * `installed` is the previous boot's per-plugin pins (`pinsFromState`) — what lets a last-good or
+ * target version be kept past an index host-API bump. Left out, only an explicit
+ * `PLUGINS=name@version` pin can be.
  */
 export function selectPlugins(
   index: PluginIndex,
   configured: ConfiguredPlugin[],
   hostApiVersion: number,
   coreCommandNames: readonly string[],
+  installed: ReadonlyMap<string, VersionPins> = new Map(),
 ): SelectedPlugin[] {
   const byName = new Map(index.plugins.map((entry) => [entry.name, entry]));
   const claimedBy = new Map<string, string>();
@@ -45,7 +78,35 @@ export function selectPlugins(
       continue;
     }
 
-    if (entry.hostApiVersion !== hostApiVersion) {
+    // The index's hostApiVersion describes `entry.version` — the index's CURRENT version — and
+    // nothing else (PluginRelease carries no host API). #222: rather than skip a plugin whenever
+    // that differs from this bot's, an OLDER version is kept when the current one needs a NEWER
+    // host — an older version may still target ours. Every version installPlugins may try must be
+    // provably older than the current one (its resolution, install.ts:186-208: an explicit
+    // PLUGINS pin, and only that; otherwise #104's targetVersion and, should that install fail, the
+    // last-good installedVersion). Everything else stays skipped, as before: no pin; a version
+    // equal to, newer than, or unorderable against the current one; a current that needs an OLDER
+    // host than ours (assuming a plugin's host API never decreases across its versions, no older
+    // version can match either); and an entry that declares intents —
+    // collectIntents would union them into the whole Client for a plugin that only ever runs the
+    // older version, and a privileged intent the operator hasn't enabled is an unrecoverable login
+    // failure. So this only ever un-skips a plugin in cases that cannot change the Client's intents.
+    // installPlugins' newest-cached fallback is not modelled (it needs disk access), so a plugin
+    // with no pin and no state.json record stays skipped. Nothing checks a kept version's own host
+    // API: a failed install or a throwing createPlugin is contained per plugin and recorded in
+    // state.json, but a bundle built for another host API may still load. (requests.ts's pre-flight
+    // likewise rules out only the index's current version, without the conditions above.)
+    const pin = installed.get(cfg.name);
+    const candidates =
+      cfg.version !== undefined
+        ? [cfg.version]
+        : [pin?.targetVersion, pin?.installedVersion].filter((v): v is string => v !== undefined);
+    const keepOlder =
+      entry.hostApiVersion > hostApiVersion &&
+      (entry.intents ?? []).length === 0 &&
+      candidates.length > 0 &&
+      candidates.every((v) => isOlderVersion(v, entry.version));
+    if (entry.hostApiVersion !== hostApiVersion && !keepOlder) {
       selected.push({
         name: cfg.name,
         entry,
@@ -92,6 +153,31 @@ export function selectPlugins(
     selected.push({ name: cfg.name, entry, pinnedVersion: cfg.version });
   }
   return selected;
+}
+
+/**
+ * `selectPlugins`' `installed` argument, built from the previous boot's `state.json`: each named
+ * plugin's last-good `installedVersion` and #104's transient `targetVersion`. Total on purpose —
+ * `readJsonOrFresh` guarantees the file PARSED, not that it has the shape `PluginStateFile`
+ * declares, and this runs in index.ts's top-level boot block, where a throw would take the whole bot
+ * down instead of degrading (a plugin never crashes the bot, ADR-0004). Anything unrecognised
+ * contributes no pin, so that plugin is judged on its explicit `PLUGINS=` pin alone — as if there
+ * were no state.json.
+ */
+export function pinsFromState(state: unknown): Map<string, VersionPins> {
+  const pins = new Map<string, VersionPins>();
+  const plugins = (state as { plugins?: unknown } | null | undefined)?.plugins;
+  if (!Array.isArray(plugins)) return pins;
+  for (const p of plugins) {
+    if (typeof p !== "object" || p === null) continue;
+    const { name, installedVersion, targetVersion } = p as Record<string, unknown>;
+    if (typeof name !== "string") continue;
+    const pin: VersionPins = {};
+    if (typeof installedVersion === "string") pin.installedVersion = installedVersion;
+    if (typeof targetVersion === "string") pin.targetVersion = targetVersion;
+    if (pin.installedVersion !== undefined || pin.targetVersion !== undefined) pins.set(name, pin);
+  }
+  return pins;
 }
 
 /** One `"<name>: <reason>"` line per skipped plugin, for the caller to log — kept out of this
