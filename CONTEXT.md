@@ -1313,8 +1313,7 @@ _Avoid_: server list, guild cache
   stops printing the `bot-ops: ` prefix, or when `cmd_env_set` stops having exactly one write; it does not
   catch a behaviour change that builds the text from pieces, an `ERR` trap, or a second write of `.env`
   by other means. Everything else re-reads both lists, after which nothing is pending and the bar keeps
-  only OK (for the length of the re-read the bar still shows what was pending: the same window as #275): a
-  JSON 502 (the recreate failed after `.env` was rewritten, #47), a 504 (we killed it: the outcome is
+  only OK: a JSON 502 (the recreate failed after `.env` was rewritten, #47), a 504 (we killed it: the outcome is
   unknown), any other status, and the plain-text 502s the rule deliberately does not trust because they
   can follow the write -- a `set -e` abort after the `mv` (a tool's own error text), an external kill
   during the recreate (the `bot-ops: env file` line, printed only after the write, perhaps after a
@@ -1327,6 +1326,15 @@ _Avoid_: server list, guild cache
   needed applying." with the hint that the SAVED settings already held them, because after a killed
   recreate the running bot may not: nothing in the panel finishes that recreate (Restart is
   `docker compose restart`, which does not reload the env file; tracked in #277).
+  **The bar is not interactive while the page re-reads (#275).** Every re-read the bar starts (Discard, a
+  re-baselining failure, a success) goes through `rereadFromServer()` (`APPLY`), which sets `applyRereading`,
+  refreshes the bar, awaits `loadPlugins()` and `loadEnv()`, and clears the flag in a `finally` (so a loader
+  that throws cannot leave it locked); while it is set Discard and Apply are `busy` in the pending and failed
+  views and `applyPending` / `discardPending` return at once. Until the reads land the controls still hold the
+  edits that are about to be dropped, so an Apply pressed then would send them: after a Discard it sent the
+  very edits just discarded, and after a re-baselining failure the bar offered Apply for the length of the
+  re-read. OK stays usable, and a kept-edits refusal (#272) starts no re-read, so it never locks the bar.
+  `loadStatus()` is not part of it.
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer

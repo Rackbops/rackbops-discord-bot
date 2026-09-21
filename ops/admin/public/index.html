@@ -1520,8 +1520,12 @@
 
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
-  // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail?, noop? }
+  // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail?, noop?, rereading? }
   //   -> { hidden, tone: ""|"danger"|"ok", title, hint, showDiscard, showGo, showOk, busy }
+  // `rereading` (#275) is true while the page re-reads the plugins and the config from the server: the controls
+  // still hold what the user typed until those reads land, so the bar must not be interactive meanwhile --
+  // Discard and Apply are `busy` (disabled) in the pending view and in the failed view. OK stays usable (it only
+  // dismisses a message). The "applying" view is already busy and the "done" view offers only OK: unchanged.
   // `noop` (phase "done" only) is bot-ops.sh's "no changes" answer ({ok:true, recreated:false}): the SAVED
   // settings (.env) already held the values (another operator applied them, this tab was stale, or an earlier
   // apply wrote them and did not finish its recreate), so nothing restarted. The hint says what it knows, the
@@ -1545,6 +1549,7 @@
         showOk: true,
         showDiscard: state.count > 0,
         showGo: state.count > 0,
+        busy: !!state.rereading,
       });
     }
     if (state.count === 0) return view({ hidden: true });
@@ -1554,6 +1559,7 @@
       hint: state.error || "The bot goes offline for about 20 seconds while it restarts.",
       showDiscard: true,
       showGo: true,
+      busy: !!state.rereading,
     });
   }
   // A failed POST /api/env, as the bar's two lines (issue #47). A failed RECREATE arrives as JSON
@@ -1601,6 +1607,12 @@
   let applyNoop = false; // phase "done": bot-ops.sh answered "no changes" (nothing was restarted)
   let applyViolation = ""; // a validation refusal being shown, until the next edit
   let applyInvalid = null; // the control that refusal marked aria-invalid
+  // #275: true while the page re-reads the plugins and the config from the server (rereadFromServer). The
+  // controls keep the user's edits until those reads land, so an Apply pressed meanwhile would send edits the
+  // page is about to drop: after a Discard (it would send the very edits just discarded) and after a
+  // re-baselining failure (the bar offered Apply for the length of the re-read). While the flag is set the bar's
+  // Discard and Apply are busy and applyPending / discardPending return, as they do while a request is in flight.
+  let applyRereading = false;
 
   // The planner's input, read from EXACTLY two places: the config controls (a chip field's hidden carrier
   // included) and the plugin tick boxes. Never a page-wide [data-key]: a plugin's own settings bundle
@@ -1639,6 +1651,7 @@
       error: applyPhase === "failed" ? applyError : plan.error || applyViolation,
       detail: applyDetail,
       noop: applyNoop,
+      rereading: applyRereading,
     });
     const bar = document.getElementById("apply-bar");
     bar.hidden = view.hidden;
@@ -1663,6 +1676,30 @@
   function clearApplyInvalid() {
     if (applyInvalid) applyInvalid.removeAttribute("aria-invalid");
     applyInvalid = null;
+  }
+
+  // The ONE place the bar re-reads the server (#275): Discard, a re-baselining failure and a success all call it,
+  // so the bar cannot be interactive while the controls are about to be replaced. It sets the flag and refreshes
+  // the bar (Discard and Apply go busy), waits for both lists, and in a `finally` clears the flag and refreshes
+  // the bar again, so a loader that throws or rejects can never leave it locked. Focus follows the rule for
+  // buttons that become disabled (#257): if it is inside the bar (the Discard just pressed) it rests on the bar
+  // itself meanwhile, and the caller's recovery (settleFocus, focusIfInBar) runs when it ends. loadStatus() is
+  // not part of it: a success starts that separately, un-awaited.
+  async function rereadFromServer() {
+    applyRereading = true;
+    refreshApplyBar();
+    const bar = document.getElementById("apply-bar");
+    if (document.activeElement !== bar) focusIfInBar(bar);
+    try {
+      await Promise.all([loadPlugins(), loadEnv()]);
+    } catch (e) {
+      // The loaders report their own failures on the page; a rejection here is unexpected, and the bar must not
+      // stay locked (the finally below) or turn it into an unhandled rejection at a caller that does not await.
+      console.error("re-reading the panel's state failed", e);
+    } finally {
+      applyRereading = false;
+      refreshApplyBar();
+    }
   }
 
   // The one delegated handler behind #app's `input` and `change` listeners. Only an edit INSIDE the config
@@ -1720,7 +1757,7 @@
   }
 
   async function applyPending() {
-    if (applyPhase === "applying") return;
+    if (applyPhase === "applying" || applyRereading) return;
     const plan = planApply(collectPending());
     if (plan.count === 0) return;
     if (plan.error) {
@@ -1756,9 +1793,8 @@
         applyNoop = !!(result && result.recreated === false);
         applyPhase = "done";
         refreshApplyBar();
-        loadPlugins();
-        loadEnv();
-        loadStatus();
+        loadStatus(); // separate and un-awaited, as before: the status grid is not part of the bar's re-read
+        await rereadFromServer(); // awaited so withBusy keeps Apply disabled until the reads land
       } else {
         const failure = describeApplyFailure(text, result);
         applyPhase = "failed";
@@ -1769,12 +1805,13 @@
         // and the cases it does not trust; issue #47: a failed recreate arrives after .env was rewritten, so the
         // edits ARE the stored values). For a refusal the controls keep the user's values and ticks and the bar
         // shows the failure with Discard and Apply, so one refused value can be corrected without retyping the
-        // rest. The catch below is unchanged: a network error or the page's own timeout leaves the controls as
-        // they are (a reload from a server that cannot be reached would replace the user's input with two
-        // error lines).
+        // rest: nothing is re-read, so the bar is never locked. The catch below is unchanged: a network error or
+        // the page's own timeout leaves the controls as they are (a reload from a server that cannot be reached
+        // would replace the user's input with two error lines). A re-read goes through rereadFromServer (#275):
+        // until its reads land the controls still hold the edits it is about to drop, so Discard and Apply are
+        // busy (the bar used to offer Apply for that long, and an Apply pressed then sent a second POST).
         if (!failureWroteNothing(res.status, result, text)) {
-          loadPlugins();
-          loadEnv();
+          await rereadFromServer(); // awaited so withBusy keeps Apply disabled until the reads land; OK stays usable
         }
       }
       focusIfInBar(document.getElementById("apply-ok"));
@@ -1795,14 +1832,15 @@
     }
   }
 
-  // Sends nothing: the controls are re-rendered from what the server holds, which IS the baseline.
+  // Sends nothing: the controls are re-rendered from what the server holds, which IS the baseline. Until that
+  // re-read lands the bar is busy (rereadFromServer), so neither Apply nor a second Discard can act on the
+  // edits being dropped (#275).
   async function discardPending() {
-    if (applyPhase === "applying") return;
+    if (applyPhase === "applying" || applyRereading) return;
     applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();
-    await Promise.all([loadPlugins(), loadEnv()]);
-    refreshApplyBar();
+    await rereadFromServer();
     settleFocus();
   }
 
