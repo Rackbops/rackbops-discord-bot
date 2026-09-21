@@ -9,8 +9,11 @@
 // the first.
 //
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
-// `single` mode (today's behaviour) the error is rethrown AFTER discovery has recorded it, so
-// `index.ts` reaches its own long `catch`; in `routed` mode nothing here ever throws.
+// `single` mode (today's behaviour) the error is rethrown AFTER `discovery.json` has been written, so
+// `index.ts` reaches its own long `catch`; in `routed` mode nothing here ever throws. The failure is
+// written against the home server's entry -- when the bot can see that server. A failure of the
+// global scope (no home server) has no entry to go on, and `DiscoveryFile` has no other slot for it,
+// so that one reaches the operator through `index.ts`'s message only.
 
 import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as CommandJson } from "discord.js";
 import type { PluginCommandMap } from "../plugins/host";
@@ -59,14 +62,16 @@ function enqueue<T>(job: () => Promise<T>): Promise<T> {
   return next;
 }
 
-/** The servers the bot is in. A view for the panel and the plan's server list must never be the reason
- *  a registration cannot happen, so a failure here is logged and reads as "no servers". */
-function takeSnapshots(c: RoutingContext): GuildSnapshot[] {
+/** The servers the bot is in, or null when they could not be read. A failure here is logged and must
+ *  not stop `single` mode's one PUT (which needs no server list), so it is contained. It is NOT
+ *  the same as "no servers": the caller plans with none, so a routed run registers nowhere, and
+ *  writes no `discovery.json`, so a passing failure never blanks the file the panel is showing. */
+function takeSnapshots(c: RoutingContext): GuildSnapshot[] | null {
   try {
     return snapshotGuilds(c.client);
   } catch (err) {
     c.log.error("[routing] could not read the bot's servers from Discord's cache", err);
-    return [];
+    return null;
   }
 }
 
@@ -109,7 +114,7 @@ function logRouted(c: RoutingContext, snapshots: readonly GuildSnapshot[], resul
   }
   for (const r of results) {
     if (r.guildId === "global" && r.error !== undefined) {
-      c.log.error(`[routing] couldn't empty the global command list, so commands may show twice: ${r.error}`);
+      c.log.error(`[routing] the global command list was not emptied (${r.error}), so commands may show twice`);
     }
   }
 }
@@ -133,7 +138,7 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
       prefix: c.prefix,
       commandMap: c.commandMap,
       loaded: c.plugins.map((p) => p.name),
-      guildIds: snapshots.map((s) => s.id),
+      guildIds: (snapshots ?? []).map((s) => s.id),
       homeGuildId: c.homeGuildId,
     });
 
@@ -159,8 +164,8 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
 
     lastRegistrations = results;
     // After registering, not before: the file carries what each server was actually told.
-    await writeView(c, snapshots, results, reason);
-    if (plan.mode === "routed") logRouted(c, snapshots, results);
+    if (snapshots !== null) await writeView(c, snapshots, results, reason);
+    if (plan.mode === "routed") logRouted(c, snapshots ?? [], results);
     if (failure !== undefined) throw failure.error;
     return { mode: plan.mode, results };
   });
@@ -171,8 +176,15 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
 export function refreshDiscovery(): Promise<void> {
   return enqueue(async () => {
     if (context === undefined) return;
-    await writeView(context, takeSnapshots(context), lastRegistrations, "refresh");
+    const snapshots = takeSnapshots(context);
+    if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
   });
+}
+
+/** Resolves once everything queued so far has settled. For tests, which need to wait for a refresh
+ *  they started without awaiting it (the `discovery` tick check does not wait for its refresh). */
+export function routingIdleForTest(): Promise<void> {
+  return chain.then(() => {});
 }
 
 export function resetRoutingForTest(): void {

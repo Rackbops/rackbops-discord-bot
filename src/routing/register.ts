@@ -82,6 +82,9 @@ export interface GuildRegistration {
 
 const MAX_ERROR_LENGTH = 200;
 
+/** What is recorded against "global" when the empty put was skipped because every server refused. */
+const NOT_EMPTIED = "not attempted: no server accepted its commands";
+
 /**
  * A failure as one line of text for `discovery.json` and the log: `<message> (<code>)` for a Discord
  * API error (duck-typed on a numeric `code`, so no discord.js class is needed), else `String(err)`,
@@ -105,6 +108,11 @@ export function describeError(err: unknown): string {
  * (a burst of PUTs invites a 429), each in its own try/catch, then -- when `clearGlobal` -- one
  * final `put` that empties the global scope, also guarded. A failure there is recorded against that
  * server (or "global") and the loop carries on; routed mode never throws.
+ *
+ * The global scope is emptied only once at least one server has taken its own commands. It is what
+ * serves every server that has not been given a list of its own, so emptying it when nothing
+ * replaced it -- no servers were read, or every one refused -- would leave the bot with no commands
+ * anywhere until the next boot. In the second case that is recorded against "global" instead.
  */
 export async function registerPlan(
   put: (route: `/${string}`, body: CommandJson[]) => Promise<unknown>,
@@ -128,13 +136,20 @@ export async function registerPlan(
     }
   }
   if (plan.clearGlobal) {
-    try {
-      await put(Routes.applicationCommands(appId), []);
-    } catch (err) {
-      // Reported only on failure: a global list that could not be emptied means every command may
-      // show twice, which is worth surfacing; a successful empty has nothing to say.
-      results.push({ guildId: "global", registered: 0, error: describeError(err), at: now().toISOString() });
+    if (results.some((r) => r.error === undefined)) {
+      try {
+        await put(Routes.applicationCommands(appId), []);
+      } catch (err) {
+        // Reported only on failure: a global list that could not be emptied means every command may
+        // show twice, which is worth surfacing; a successful empty has nothing to say.
+        results.push({ guildId: "global", registered: 0, error: describeError(err), at: now().toISOString() });
+      }
+    } else if (results.length > 0) {
+      // Servers were tried and every one refused: the global list is still all they have.
+      results.push({ guildId: "global", registered: 0, error: NOT_EMPTIED, at: now().toISOString() });
     }
+    // No servers at all: nothing to replace it with, and nothing to say -- a bot in no server has no
+    // one to show a command twice.
   }
   return results;
 }

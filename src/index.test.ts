@@ -102,6 +102,20 @@ describe("index.ts wiring", () => {
       expect(source).toMatch(/dataDir:\s*DATA_DIR,/);
     });
 
+    test("initRouting is given the bot's own id and name, the command map, and the loaded plugins' summaries", () => {
+      // appId is the route's first argument in every PUT, so a wrong one is a wrong route.
+      expect(source).toMatch(/appId:\s*c\.user\.id,/);
+      expect(source).toMatch(/botUsername:\s*c\.user\.username,/);
+      // The command map is how the planner finds each command's owner: an empty one would read every
+      // plugin command as a core command and send it to every server.
+      expect(source).toMatch(/\n\s*commandMap,\n/);
+      expect(source).toMatch(
+        /plugins:\s*describePlugins\(loadResult\.loaded,\s*commandBody,\s*config\.commandPrefix,\s*commandMap\),/,
+      );
+      expect(source).toMatch(/now:\s*\(\)\s*=>\s*new Date\(\),/);
+      expect(source).toMatch(/log:\s*console,/);
+    });
+
     test("initRouting and applyRouting sit inside the same try whose catch keeps a failure from taking the bot down", () => {
       expect(initCall).toBeGreaterThan(activateFn);
       expect(applyCall).toBeGreaterThan(initCall);
@@ -117,9 +131,12 @@ describe("index.ts wiring", () => {
 
     test("today's `Registered N slash commands` line is printed for single mode only", () => {
       expect(source).toMatch(
-        /const \{ mode \} = await applyRouting\("boot"\);\s*\n\s*if \(mode === "single"\) console\.log\(`Registered \$\{commandBody\.length\} slash commands`\);/,
+        /const \{ mode: routingMode \} = await applyRouting\("boot"\);\s*\n\s*if \(routingMode === "single"\) console\.log\(`Registered \$\{commandBody\.length\} slash commands`\);/,
       );
       expect((source.match(/Registered \$\{commandBody\.length\} slash commands/g) ?? []).length).toBe(1);
+      // The result's mode is not named `mode`: that is the module-level boot mode (standby or normal),
+      // and shadowing it inside activate() invites an edit that means the other one.
+      expect(source).not.toMatch(/const \{ mode \} = await applyRouting/);
     });
 
     test("the operator message for a failed registration is still there, word for word", () => {

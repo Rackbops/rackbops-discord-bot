@@ -397,13 +397,39 @@ describe("registerPlan in routed mode", () => {
     expect(calls.map((c) => c.route)).not.toContain(GLOBAL_ROUTE);
   });
 
-  test("routed mode with no servers makes no calls, and a global clear only when asked", async () => {
+  test("routed mode with no servers makes no calls at all, even when asked to empty the global scope", async () => {
+    // Nothing would replace the global list, so it is left alone -- and there is nothing to report:
+    // a bot in no server has no one to show a command twice.
     const none = fakePut();
     expect(await registerPlan(none.put, APP, plan({ routing: placed, guildIds: [] }), now)).toEqual([]);
     expect(none.calls).toEqual([]);
-    const clearing = fakePut();
-    await registerPlan(clearing.put, APP, plan({ routing: placed, guildIds: [], homeGuildId: undefined }), now);
-    expect(clearing.calls).toEqual([{ route: GLOBAL_ROUTE, body: [] }]);
+    const asked = fakePut();
+    expect(await registerPlan(asked.put, APP, plan({ routing: placed, guildIds: [], homeGuildId: undefined }), now)).toEqual([]);
+    expect(asked.calls).toEqual([]);
+  });
+
+  test("routed mode leaves the global scope alone when every server refused, and says so", async () => {
+    const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const { calls, put } = fakePut({ [guildRoute(HOME)]: refusal, [guildRoute(OTHER)]: refusal });
+    const results = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
+    // Both servers were tried; the empty put to the global scope was not sent.
+    expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    // The skip is recorded against "global", after the servers' own results.
+    expect(results.map((r) => [r.guildId, r.registered, r.error])).toEqual([
+      [HOME, 0, "Missing Access (50001)"],
+      [OTHER, 0, "Missing Access (50001)"],
+      ["global", 0, "not attempted: no server accepted its commands"],
+    ]);
+  });
+
+  test("routed mode empties the global scope once one server took its commands, even if another refused", async () => {
+    const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const { calls, put } = fakePut({ [guildRoute(HOME)]: refusal });
+    const results = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
+    expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), GLOBAL_ROUTE]);
+    expect(calls.at(-1)!.body).toEqual([]);
+    // A successful empty adds nothing to the results.
+    expect(results.map((r) => r.guildId)).toEqual([HOME, OTHER]);
   });
 });
 

@@ -43,7 +43,10 @@ export function snapshotGuilds(client: Client<true>): GuildSnapshot[] {
     channels.sort(
       (a, b) => a.position - b.position || compareText(a.channel.name, b.channel.name) || compareText(a.channel.id, b.channel.id),
     );
-    snapshots.push({ id: guild.id, name: guild.name, channels: channels.map((c) => c.channel) });
+    // discord.js leaves `name` unset on the stub of a server that is unavailable (an outage); its id
+    // stands in, so `discovery.json` always carries the `name` its shape promises.
+    const name = typeof guild.name === "string" ? guild.name : guild.id;
+    snapshots.push({ id: guild.id, name, channels: channels.map((c) => c.channel) });
   }
   return snapshots.sort((a, b) => compareText(a.name, b.name) || compareText(a.id, b.id));
 }

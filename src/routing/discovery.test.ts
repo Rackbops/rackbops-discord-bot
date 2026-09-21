@@ -132,6 +132,17 @@ describe("snapshotGuilds", () => {
     expect(asked).toEqual([[PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages]]);
   });
 
+  test("an unavailable server, whose name discord.js leaves unset, is listed under its id", () => {
+    const client = fakeClient([
+      { id: OTHER, name: "Zebra", channels: [] },
+      { id: HOME, name: undefined as unknown as string, channels: [] },
+    ]);
+    const snapshots = snapshotGuilds(client);
+    // A name is always text (so the file has the `name` its shape promises) and the order is by it.
+    expect(snapshots.map((g) => g.name)).toEqual([HOME, "Zebra"]);
+    expect(JSON.parse(JSON.stringify(snapshots))[0]).toHaveProperty("name", HOME);
+  });
+
   test("a server the bot can see no channels in is still listed, with none", () => {
     expect(snapshotGuilds(fakeClient([{ id: HOME, name: "Home", channels: [] }]))).toEqual([{ id: HOME, name: "Home", channels: [] }]);
   });

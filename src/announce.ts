@@ -245,15 +245,19 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       },
     },
     {
-      // Keep data/discovery.json fresh (#239). The boot registration writes it. The first tick can run
-      // before or after that registration, depending on how long the checks ahead of this one take:
-      // before it, refreshDiscovery has nothing to describe yet and does nothing; after it, the
-      // refresh is a redundant rewrite. Either way the gap is stamped, so the next one is a gap later.
+      // Keep data/discovery.json fresh (#239). The refresh is QUEUED, not awaited: it runs behind any
+      // registration on the routing chain, and the plugin ticks after this check must not wait for a
+      // registration's PUTs -- index.ts starts the scheduler before registering precisely so they don't.
+      // startScheduler fires the first tick without awaiting it and index.ts calls initRouting right
+      // after it, so on that first tick the boot registration is already ahead of this refresh (which
+      // is then a redundant rewrite, harmless). refreshDiscovery is built not to reject, but an
+      // unawaited promise that did would be an unhandled rejection, which ends the process -- so it
+      // is caught here rather than left to runTick, which is no longer holding it.
       name: "discovery",
       run: async () => {
         if (shouldRefreshDiscovery(Date.now(), lastDiscoveryAt)) {
           lastDiscoveryAt = Date.now(); // stamp at start, like checkReleases/checkAutoUpdate
-          await refreshDiscovery();
+          void refreshDiscovery().catch((err) => console.error("[tick:discovery]", err));
         }
       },
     },
@@ -351,6 +355,11 @@ export function shouldPollReleases(now: number, lastPollAt: number): boolean {
 export function shouldRefreshDiscovery(now: number, lastAt: number): boolean {
   if (lastAt === 0) return true; // startup catch-up
   return now - lastAt >= DISCOVERY_REFRESH_GAP_MS;
+}
+
+/** Forgets when discovery was last refreshed, so the next `discovery` check counts as the first. */
+export function resetDiscoveryGapForTest(): void {
+  lastDiscoveryAt = 0;
 }
 
 async function checkReleases(client: Client): Promise<void> {

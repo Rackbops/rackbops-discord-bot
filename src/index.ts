@@ -187,7 +187,8 @@ async function activate(c: Client<true>): Promise<void> {
     // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or
     // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
     // same route with the same body, and its result is `single` -- so the line below is unchanged.
-    // A `single` failure is rethrown after discovery.json records it, into the catch below.
+    // A `single` failure is rethrown after discovery.json is written (see live.ts for what it records),
+    // into the catch below.
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),
@@ -202,8 +203,9 @@ async function activate(c: Client<true>): Promise<void> {
       now: () => new Date(),
       log: console,
     });
-    const { mode } = await applyRouting("boot");
-    if (mode === "single") console.log(`Registered ${commandBody.length} slash commands`);
+    // Not `mode`: that is the module-level boot mode (standby or normal), used again below.
+    const { mode: routingMode } = await applyRouting("boot");
+    if (routingMode === "single") console.log(`Registered ${commandBody.length} slash commands`);
   } catch (err) {
     // A command-registration failure must not take the whole bot down. This used to run unguarded
     // in the ClientReady handler, so a throw became an unhandled rejection, the process crashed,

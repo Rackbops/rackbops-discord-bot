@@ -241,7 +241,34 @@ describe("applyRouting", () => {
     const result = await applyRouting("boot");
     expect(h.puts.at(-1)).toEqual({ route: globalRoute, body: [] });
     expect(result.mode).toBe("routed");
-    expect(h.logs.error).toEqual(["[routing] couldn't empty the global command list, so commands may show twice: Error: nope"]);
+    expect(h.logs.error).toEqual(["[routing] the global command list was not emptied (Error: nope), so commands may show twice"]);
+  });
+
+  test("routed mode with no home server leaves the global scope alone when every server refused, and logs it", async () => {
+    await placeMusicInOther();
+    const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const h = harness({ homeGuildId: undefined, failures: { [guildRoute(HOME)]: refusal, [guildRoute(OTHER)]: refusal } });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    // Both servers were tried and no empty put followed: the global list is all they have.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect(h.logs.error.at(-1)).toBe(
+      "[routing] the global command list was not emptied (not attempted: no server accepted its commands), so commands may show twice",
+    );
+  });
+
+  test("routed mode with no home server does not empty the global scope when the servers could not be read", async () => {
+    await placeMusicInOther();
+    const h = harness({ homeGuildId: undefined });
+    const broken = { user: h.world.client.user, get guilds(): never { throw new Error("cache exploded"); } } as unknown as Client<true>;
+    initRouting({ ...h.ctx, client: broken });
+    const result = await applyRouting("boot");
+    // No server list means no servers registered -- and above all no empty put, which would leave the
+    // bot with no commands anywhere.
+    expect(h.puts).toEqual([]);
+    expect(result).toEqual({ mode: "routed", results: [] });
+    // And no discovery.json written from a read that failed.
+    expect(existsSync(discoveryPath(dir))).toBe(false);
   });
 
   test("routed mode with the bot in no servers registers nothing and still writes discovery", async () => {
@@ -302,6 +329,30 @@ describe("applyRouting", () => {
     expect(h.logs.error).toEqual([]);
   });
 
+  test("a single-mode failure of the global scope is rethrown, and discovery has no place for it", async () => {
+    // With no home server the one PUT goes to the global scope, which belongs to no server's entry.
+    // discovery.json is still written, and the failure reaches the operator through index.ts's message.
+    const failure = new Error("boom");
+    const h = harness({ homeGuildId: undefined, failures: { [`/applications/${APP}/commands`]: failure } });
+    initRouting(h.ctx);
+    await expect(applyRouting("boot")).rejects.toBe(failure);
+    const file = readDiscovery();
+    expect(file.guilds.map((g) => g.commands)).toEqual([null, null]);
+    expect(JSON.stringify(file)).not.toContain("boom");
+    expect(h.logs.error).toEqual([]);
+  });
+
+  test("a home server the bot cannot see is still tried in single mode, and its failure rethrown", async () => {
+    const refusal = Object.assign(new Error("Unknown Guild"), { code: 10004 });
+    const h = harness({ failures: { [guildRoute(HOME)]: refusal } });
+    h.world.guilds.delete(HOME);
+    initRouting(h.ctx);
+    await expect(applyRouting("boot")).rejects.toBe(refusal);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+    // The failure is recorded against the home server's entry, and there is no such entry to carry it.
+    expect(readDiscovery().guilds.map((g) => [g.id, g.commands])).toEqual([[OTHER, null]]);
+  });
+
   test("a failed run does not stop the ones queued behind it", async () => {
     const refusal = new Error("Missing Access");
     const h = harness({ failures: { [guildRoute(HOME)]: refusal } });
@@ -337,6 +388,8 @@ describe("applyRouting", () => {
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
     expect(h.puts[0]!.body).toEqual(h.cw.fullBody);
     expect(h.logs.error[0]).toContain("could not read the bot's servers");
+    // A read that failed is not a server list: nothing is written from it.
+    expect(existsSync(discoveryPath(dir))).toBe(false);
   });
 
   test("applyRouting before initRouting rejects, and the queue works afterwards", async () => {
@@ -388,6 +441,26 @@ describe("refreshDiscovery", () => {
     release();
     await Promise.all([applying, refreshing]);
     expect(readDiscovery().guilds.find((g) => g.id === HOME)!.commands).not.toBeNull();
+  });
+
+  test("a refresh whose server cache cannot be read keeps the discovery.json it already has", async () => {
+    const h = harness();
+    let broken = false;
+    const client = {
+      user: h.world.client.user,
+      get guilds() {
+        if (broken) throw new Error("cache exploded");
+        return h.world.client.guilds;
+      },
+    } as unknown as Client<true>;
+    initRouting({ ...h.ctx, client });
+    await applyRouting("boot");
+    const before = readFileSync(discoveryPath(dir), "utf8");
+    // The read fails for a while: the file the panel is showing is not blanked by it.
+    broken = true;
+    await refreshDiscovery();
+    expect(readFileSync(discoveryPath(dir), "utf8")).toBe(before);
+    expect(h.logs.error.at(-1)).toContain("could not read the bot's servers");
   });
 
   test("a refresh whose write fails is logged, not thrown", async () => {
