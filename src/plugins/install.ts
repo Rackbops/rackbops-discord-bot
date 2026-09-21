@@ -3,9 +3,9 @@
 // Pure over injected I/O (fetch/extract/now/log) so it unit-tests with a fake fetch + fixture
 // tarball and never hits the network or the real data dir. No plugin CODE runs here — that is
 // loadPlugins/activatePlugins in host.ts, inside the bot's activate() after takeOver().
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import type { PluginIndexEntry } from "./contract";
+import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
@@ -94,7 +94,13 @@ function newestCachedVersion(dataDir: string, name: string): string | undefined 
   let versions: string[];
   try {
     versions = readdirSync(pluginDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && e.name !== "tmp" && existsSync(join(pluginDir, e.name, "dist", "plugin.js")))
+      .filter(
+        (e) =>
+          e.isDirectory() &&
+          e.name !== "tmp" &&
+          !e.name.startsWith(".") && // a crashed extract's `.staging-*` leftover is never a version
+          existsSync(join(pluginDir, e.name, "dist", "plugin.js")),
+      )
       .map((e) => e.name);
   } catch {
     return undefined;
@@ -110,8 +116,100 @@ function integrityMatches(bytes: Uint8Array, integrity: string): boolean {
   return actual === expected;
 }
 
-/** Install ONE specific version: reuse a cached `<name>/<version>/dist/plugin.js` with no fetch, else
- *  download the tarball, verify its `dist.integrity`, and extract. Never throws — returns a reason. */
+interface BotPluginManifest {
+  hostApiVersion?: unknown;
+  commands?: unknown;
+  env?: unknown;
+}
+
+/** #223: reconciles the extracted bundle's own `package.json` `botPlugin` block — what it was
+ *  actually built against — with what the host is about to hand it. Called on BOTH the cache-reuse
+ *  fast path and a fresh extract (before the extract is committed by rename), since a pinned bundle
+ *  is served by the fast path forever and never re-extracted.
+ *
+ *  Total: never throws. A missing, unreadable, unparseable `package.json`, or one with no `botPlugin`
+ *  block, warns and returns ok — an already-installed plugin (or a test fixture) with no manifest
+ *  must never be bricked by this check. `commands`/`env` key-set divergence from `entry` only warns
+ *  (the host still acts on the index entry for both — see the per-version env-key-scoping gotcha in
+ *  `ops/README.md`/`CONTEXT.md`, not restated here). The one refusal is a declared `hostApiVersion`
+ *  that differs from the HOST's own `HOST_API_VERSION` — deliberately not `entry.hostApiVersion`,
+ *  which describes only the index's CURRENT version: #222's `keepOlder` path legitimately installs an
+ *  older version built against a different host API than that current entry declares. */
+export function reconcileManifest(
+  entry: PluginIndexEntry,
+  version: string,
+  packageJsonPath: string,
+  log: InstallLog,
+): { ok: true } | { ok: false; reason: string } {
+  const warnSkip = (why: string): { ok: true } => {
+    log.warn(`[plugins] ${entry.name}@${version}: ${why}, skipping reconciliation`);
+    return { ok: true };
+  };
+
+  let raw: string;
+  try {
+    raw = readFileSync(packageJsonPath, "utf8");
+  } catch {
+    return warnSkip("no readable package.json in the extracted bundle");
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return warnSkip("package.json is not valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) return warnSkip("package.json is not an object");
+
+  const botPlugin = (parsed as Record<string, unknown>).botPlugin;
+  if (typeof botPlugin !== "object" || botPlugin === null) return warnSkip("package.json has no botPlugin block");
+  const manifest = botPlugin as BotPluginManifest;
+
+  if (typeof manifest.hostApiVersion === "number" && manifest.hostApiVersion !== HOST_API_VERSION) {
+    return {
+      ok: false,
+      reason: `${entry.package}@${version} was built against host API v${manifest.hostApiVersion}, this bot is v${HOST_API_VERSION}`,
+    };
+  }
+
+  if (Array.isArray(manifest.commands)) {
+    const declared = new Set(manifest.commands.filter((c): c is string => typeof c === "string"));
+    const indexed = new Set(entry.commands);
+    const diverges = declared.size !== indexed.size || [...declared].some((c) => !indexed.has(c));
+    if (diverges) {
+      log.warn(
+        `[plugins] ${entry.name}@${version}: package.json's commands (${[...declared].join(", ") || "none"}) ` +
+          `diverge from the index entry's (${entry.commands.join(", ") || "none"})`,
+      );
+    }
+  }
+
+  if (Array.isArray(manifest.env)) {
+    const declaredKeys = new Set(
+      manifest.env
+        .filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null)
+        .map((e) => e.key)
+        .filter((k): k is string => typeof k === "string"),
+    );
+    const indexedKeys = new Set(entry.env.map((e) => e.key));
+    const diverges = declaredKeys.size !== indexedKeys.size || [...declaredKeys].some((k) => !indexedKeys.has(k));
+    if (diverges) {
+      log.warn(
+        `[plugins] ${entry.name}@${version}: package.json's env keys (${[...declaredKeys].join(", ") || "none"}) ` +
+          `diverge from the index entry's (${[...indexedKeys].join(", ") || "none"})`,
+      );
+    }
+  }
+
+  return { ok: true };
+}
+
+/** Install ONE specific version: reuse a cached `<name>/<version>/dist/plugin.js` with no fetch (after
+ *  reconciling its package.json against the host — see `reconcileManifest`), else download the
+ *  tarball, verify its `dist.integrity`, extract into a sibling staging dir, reconcile the staged
+ *  package.json, and rename the staging dir into place. So anything at `<version>/dist/plugin.js` came
+ *  from a completed, integrity-verified, contract-reconciled extract — never a partial one left behind
+ *  by a `tar` that died mid-write (#224). Never throws — returns a reason. */
 async function tryInstallVersion(
   entry: PluginIndexEntry,
   name: string,
@@ -119,11 +217,16 @@ async function tryInstallVersion(
   dataDir: string,
   deps: InstallDeps,
 ): Promise<{ ok: true; plugin: InstalledPlugin } | { ok: false; reason: string }> {
-  const versionDir = join(dataDir, "plugins", name, version);
+  const pluginDir = join(dataDir, "plugins", name);
+  const versionDir = join(pluginDir, version);
   // `tar --strip-components=1` drops only the tarball's leading `package/`, so `package/dist/plugin.js`
   // extracts to `<versionDir>/dist/plugin.js` (not `<versionDir>/plugin.js`).
   const bundlePath = join(versionDir, "dist", "plugin.js");
-  if (existsSync(bundlePath)) return { ok: true, plugin: { entry, version, bundlePath } };
+  if (existsSync(bundlePath)) {
+    const reconciled = reconcileManifest(entry, version, join(versionDir, "package.json"), deps.log);
+    if (!reconciled.ok) return reconciled;
+    return { ok: true, plugin: { entry, version, bundlePath } };
+  }
   try {
     const meta = (await fetchJson(
       deps.fetch,
@@ -143,13 +246,25 @@ async function tryInstallVersion(
     const tmpDir = join(dataDir, "plugins", "tmp");
     mkdirSync(tmpDir, { recursive: true });
     const tarPath = join(tmpDir, `${name}-${version}-${deps.now()}.tgz`);
+    // Sits under `plugins/<name>/` (not `tmp/`) so the rename below stays within one filesystem.
+    const stagingDir = join(pluginDir, `.staging-${version}-${deps.now()}`);
     try {
       await Bun.write(tarPath, bytes);
-      await deps.extract(tarPath, versionDir);
+      await deps.extract(tarPath, stagingDir);
+      const stagingBundlePath = join(stagingDir, "dist", "plugin.js");
+      if (!existsSync(stagingBundlePath)) {
+        return { ok: false, reason: `extract produced no plugin.js for ${entry.package}@${version}` };
+      }
+      // Reconcile the staged copy BEFORE the rename — a bundle refused on hostApiVersion must never
+      // land in the cache at all (a later boot's fast path would otherwise reuse it unreconciled).
+      const reconciled = reconcileManifest(entry, version, join(stagingDir, "package.json"), deps.log);
+      if (!reconciled.ok) return reconciled;
+      rmSync(versionDir, { recursive: true, force: true }); // clear any earlier partial extract
+      renameSync(stagingDir, versionDir);
     } finally {
       rmSync(tarPath, { force: true });
+      rmSync(stagingDir, { recursive: true, force: true }); // no-op after a successful rename
     }
-    if (!existsSync(bundlePath)) return { ok: false, reason: `extract produced no plugin.js for ${entry.package}@${version}` };
     deps.log.info(`[plugins] ${name}@${version} downloaded, integrity ok`);
     return { ok: true, plugin: { entry, version, bundlePath } };
   } catch (err) {
@@ -163,6 +278,11 @@ async function tryInstallVersion(
  * then the last-good `installedVersion` from the previous `state.json`, then the newest cached version,
  * then the index's current version — the bot NEVER moves an installed plugin to a newer version on its
  * own. A cached `data/plugins/<name>/<version>/dist/plugin.js` is reused with no fetch.
+ *
+ * #223: every install (cached or freshly extracted) is reconciled against the bundle's own
+ * `package.json` `botPlugin` block — see `reconcileManifest`. A `hostApiVersion` that differs from
+ * this host's `HOST_API_VERSION` refuses the bundle (recorded in `skips`/`fallbacks` like any other
+ * install failure); a `commands`/`env` divergence only warns.
  *
  * #104 failure fallback: when a `/plugins update` **target** install fails, fall back to the recorded
  * last-good `installedVersion` (deterministically — NOT `newestCachedVersion`, which could out-rank a
