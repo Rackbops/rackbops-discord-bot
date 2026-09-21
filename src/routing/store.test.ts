@@ -683,6 +683,35 @@ describe("readRouting says what it ignored (#260)", () => {
     expect(lines).toEqual(["[routing] routing.json: could not work out what the repair ignored (boom)"]);
   });
 
+  test("a report that throws says why only in clipped text, and describing the failure cannot throw either", async () => {
+    const failing = (thrown: unknown) => ({
+      plugins: {
+        get music(): never {
+          throw thrown;
+        },
+      },
+    });
+    // An engine message can echo a hostile key: it is clipped like any other key.
+    const long = await said(async () => sayWhatWasIgnored(failing(new Error("z".repeat(1000)))));
+    expect(long).toEqual([`[routing] routing.json: could not work out what the repair ignored (${"z".repeat(37)}...)`]);
+    resetRoutingWarningsForTest();
+    // An Error whose message cannot even be read, and a thrown value that is not an Error at all.
+    const unreadable = Object.defineProperty(new Error("x"), "message", {
+      get(): never {
+        throw new Error("nested");
+      },
+    });
+    const odd = await said(async () => {
+      expect(() => sayWhatWasIgnored(failing(unreadable))).not.toThrow();
+      resetRoutingWarningsForTest();
+      expect(() => sayWhatWasIgnored(failing("just a string"))).not.toThrow();
+    });
+    expect(odd).toEqual([
+      "[routing] routing.json: could not work out what the repair ignored (unreadable error)",
+      "[routing] routing.json: could not work out what the repair ignored (not an Error)",
+    ]);
+  });
+
   test("what the bot acts on is exactly what repairRouting gives: this is log output only", async () => {
     const raw = { plugins: { Bad: {}, music: { servers: { [GUILD]: { commands: "none" }, [OTHER]: { commands: "all", postTo: 7 } } } }, webhooks: { [CHAN]: {} } };
     write(raw);

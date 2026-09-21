@@ -23,6 +23,7 @@ import {
   type RoutingFile,
   type RoutingSecretsFile,
 } from "./model";
+import { shown } from "./resolve";
 
 export function routingPath(dataDir: string): string {
   return `${dataDir}/routing.json`;
@@ -52,6 +53,15 @@ export function resetRoutingWarningsForTest(): void {
   said.clear();
 }
 
+/** What went wrong, as text that is clipped (an engine's message can echo a hostile key) and cannot throw. */
+function describeFailure(err: unknown): string {
+  try {
+    return err instanceof Error ? shown(err.message) : "not an Error";
+  } catch {
+    return "unreadable error";
+  }
+}
+
 /**
  * Says what the repair of `raw` left out, each distinct line once. Log output only, so nothing in it may
  * change what `readRouting` returns (`gateCommand` fails open when a read throws, so a throw out of a log
@@ -67,7 +77,7 @@ export function sayWhatWasIgnored(raw: unknown): void {
   try {
     lines = droppedByRepair(raw).map((message) => `[routing] routing.json: ${message}; it is ignored`);
   } catch (err) {
-    lines = [`[routing] routing.json: could not work out what the repair ignored (${err instanceof Error ? err.message : "not an Error"})`];
+    lines = [`[routing] routing.json: could not work out what the repair ignored (${describeFailure(err)})`];
   }
   for (const line of lines) {
     if (said.has(line)) continue;

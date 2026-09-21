@@ -316,7 +316,8 @@ export function droppedByRepair(raw: unknown): string[] {
       } else if (repairWebhook(entry) === undefined) {
         // `repairWebhook` refuses for two reasons and the message says which: naming the wrong one would
         // send whoever is reading the log to the wrong field. The repair is asked, not second-guessed: would
-        // it keep this entry if it had an addedAt and an addedBy? If so, those were what was missing.
+        // it keep this entry if it had an addedAt and an addedBy? If so, those were what was missing. (Any
+        // string will do for them today; a stricter rule for those two fields would have to change this.)
         const withDates = isPlainObject(entry) ? { ...entry, addedAt: "-", addedBy: "-" } : entry;
         if (repairWebhook(withDates) === undefined) dropped.push(`${webhook} is missing its ids`);
         else dropped.push(`${webhook} is missing its addedAt or addedBy`);
