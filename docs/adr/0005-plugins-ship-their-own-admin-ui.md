@@ -85,7 +85,10 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    tab can write its own secret keys but never read one back through `getEnv` — it is fed by `env-get`,
    which never returns them — and a malicious same-origin bundle could overwrite ANY enabled plugin's
    secret key through the same route, but not read one back that way; the `PLUGIN_INDEX_URL` path above
-   is the exception, and it is the accepted trust boundary. Core secrets stay refused.)*
+   is the exception, and it is the accepted trust boundary. Core secrets stay refused. Since #256
+   "enabled" no longer limits any of this: `env-set` accepts the keys, secret ones included, of EVERY
+   plugin in the bot's cached Plugin Index, on or off, so one save can turn a plugin on and configure it;
+   a bundle with the panel's authority could already set `PLUGINS` and then the key in a second save.)*
 
 ## Considered Options
 

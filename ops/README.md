@@ -27,9 +27,9 @@ time, not silently written.
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
-| `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every installed plugin (from the Plugin Index) |
+| `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every plugin in the cached Plugin Index, whether or not the plugin is in `PLUGINS` (#256) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
-| `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or the installed plugin's manifest); then one row per installed plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
+| `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or a plugin's manifest in the cached index, on or off, #256); then one row per plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
 | `routing-get` | JSON `{"routing": …, "discovery": …}` — the bot's per-plugin routing record and what it can see (`data/routing.json`, `data/discovery.json`), read from the container like `status` reads `state.json`. A missing, empty or corrupt file is `null`, never an error. Any webhook URL a hand-edit left in either file is redacted (best effort — the files are not meant to hold one), and the bot's webhook store is never opened (#240, ADR-0006) |
 | `plugin-request` | Read one **request JSON** from stdin (`{action, …, requestedBy}`), validate it per action, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. `action` ∈ the five plugin-update actions `update-now`/`schedule`/`remind`/`skip`/`cancel` (`plugin`, `version?`, `at?`, `days?`) or, since #240, `routing-set` (`plugin`, `servers`), `webhook-add` (`url`), `webhook-remove` (`channelId`), `discovery-refresh`. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
 | `version` | JSON `{"schema": N, "composeSchema": M}` — this script's own `BOT_OPS_SCHEMA`, plus the deployed `docker-compose.yml`'s `x-rackbops-schema:` (`null` when unreadable/unset/absent). The admin panel runs this once at startup to check neither deployed file is behind the panel image; see "Keeping `bot-ops.sh` and `docker-compose.yml` current" below |
@@ -210,19 +210,29 @@ them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is 
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
 key back to its documented default.
 
-**Plugin-declared keys** — on top of the static list above, every **installed** plugin (named in
-`PLUGINS=`) contributes its own env keys: `env-get` lists them (non-secret only, after the static
-keys, in manifest order) and `env-set` accepts them, validating each with the format and honouring
-the `required` flag — read from the bot's cached `data/plugins/index.json`, never hand-mirrored
-here. This is where `WARBANDEER_INGEST_PORT`
-lives now that the connector is the `warbandeer` plugin (issue #100): set `PLUGINS=warbandeer` and
-the key becomes editable once the bot has cached the index. A plugin's **`secret` keys are
+**Plugin-declared keys** — on top of the static list above, **every plugin in the bot's cached Plugin
+Index** contributes its own env keys, whether or not the plugin is in `PLUGINS=` (#256): `env-get` lists
+them (non-secret only, after the static keys, in manifest order) and `env-set` accepts them, validating
+each with the format and honouring the `required` flag — read from the bot's cached
+`data/plugins/index.json`, never hand-mirrored here, and read on every `env-get` / `env-schema` /
+`env-set`, even on an instance with no `PLUGINS` (one `docker exec … cat`). The index, not `PLUGINS`,
+decides which keys are plugin keys, so **one `env-set` can turn a plugin on and set its settings** — a
+single restart — and a key of a plugin that is off is inert until the plugin is on. When two plugins
+declare the same key, the first declaration in index order governs it (its format and `required`), on
+or off. The bot caches the
+index at boot and on its ~15-minute refresh, while the panel's own plugin list comes from the panel's
+own fetch of the index, so for up to that long the panel can show a plugin whose keys this script does
+not know yet. This is where `WARBANDEER_INGEST_PORT`
+lives now that the connector is the `warbandeer` plugin (issue #100): once the bot has cached the index
+the key is editable, in the same save that sets `PLUGINS=warbandeer`. A plugin's **`secret` keys are
 write-only** (#240, ADR-0006 decision 8): `env-set` accepts them, validated against their `format`
 like any other key, but `env-get` never lists one and `env-schema` reports it only as `secret: true`
 plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A key the deployment
-itself owns (a core credential, or a variable `docker-compose.yml` interpolates) stays out of every
-plugin path even if a manifest declares it. If the bot isn't running (no cached index),
-`env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** — never
+itself owns (a core credential, or a variable `docker-compose.yml` interpolates — `RESERVED_KEYS`, a
+credential and interpolation denylist, not a list of every variable the bot core reads) stays out of
+every plugin path even if a manifest declares it. If the bot isn't running (no cached index),
+`env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** (also on an
+instance with no `PLUGINS`, since the index is read regardless) — never
 an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
 `env-set` refuses a plugin key in that same state, since it can't read the manifest to validate one;
 edit a plugin's keys while the bot is up. A valid-JSON-but-wrong-shape cached index is treated the
@@ -233,13 +243,13 @@ same way (degraded, never a crash).
 them out and `env-set` refuses to write them. Edit those by hand with `nano` on the box. (A plugin's
 own `secret` keys are the one exception, and only for writing — see below. The wow plugin's
 `BLIZZARD_CLIENT_ID` / `BLIZZARD_CLIENT_SECRET` are such keys, not core: nothing in the bot core reads
-them, so with `wow` in `PLUGINS=` the panel can set them.)
+them, so the panel can set them whenever the cached index offers `wow`.)
 
 ## Safety notes
 
 - **Plugin secrets are write-only** (#240, ADR-0006 decision 8). Needing SSH to give a plugin its API
   key made adding one painful, so `env-set` accepts a key the cached Plugin Index marks `secret:
-  true` — for a plugin named in `PLUGINS=` — and nothing ever reads it back. The value appears in no
+  true` — for any plugin in the index, on or off (#256) — and nothing ever reads it back. The value appears in no
   output this script emits: not in `env-get` (a secret key is never listed), not in `env-schema`
   (`secret: true` and `isSet` only), not in `env-set`'s result (it names changed *keys*), not in a
   refusal message (those name a key, and only one that looks like a variable name), not on stderr,
@@ -561,7 +571,7 @@ version (`name@version`) is set in `.env`; an existing pin is kept while that pl
 fields render as constrained controls instead of free text:
 `AUTO_UPDATE` as a select, `BOT_BRANCH` as a live branch chooser (below), and
 `ADMIN_USER_IDS`/`WATCHED_REPOS` as chip/tag editors. Every other key — the static ones and each
-installed plugin's manifest keys alike — is a plain text input whose required-ness and format come
+plugin's manifest keys alike — is a plain text input whose required-ness and format come
 from `GET /api/env-schema` (`bot-ops.sh env-schema`, #205/#207), so a blank required key or a value
 `env-set` would reject is refused before anything is sent (the bar names the field, marks it and opens its
 tab) rather than after a failed, restart-triggering apply. A plugin that needs a richer control (the wow plugin's region-filtered
