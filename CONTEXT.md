@@ -1181,8 +1181,9 @@ _Avoid_: server list, guild cache
   was restarted rather than claiming a restart. The bar's two text lines are written only when they change
   (a keystroke must not rewrite a live region), and `admin.css` pads focus scrolling
   (`scroll-padding-bottom`, more while a refused / failed `--danger` bar is up) so a Tab stop does not land
-  under the sticky bar; a long compose log scrolls inside the bar's TITLE (`max-height: 30vh`), never the
-  hint beneath it, which holds the backup path. The bar is hidden with the
+  under the sticky bar; the bar's text is height-bounded (`max-height: 30vh`) as two SEPARATE scrollers -- a
+  long compose log scrolls inside the TITLE and never pushes the hint beneath it (the backup path) out of
+  view, and a refusal that echoes a huge pasted value scrolls inside the hint. The bar is hidden with the
   `hidden` attribute while nothing is pending, which restates as `display: none !important` in `admin.css`;
   its `role="status"` text is inside it, so whether a screen reader announces the FIRST appearance depends
   on the reader (it is not verified here). While a request is in flight both buttons are disabled and focus

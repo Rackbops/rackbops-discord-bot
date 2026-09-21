@@ -4106,7 +4106,7 @@ describe("admin.css uses tokens only", () => {
     expect(phone).toMatch(/\.adm \.rb-btn[\s\S]*min-height:\s*44px;/);
   });
 
-  test("the Apply bar (#257) is sticky at the bottom, stacks on a phone, and a refused control shows it", () => {
+  test("the Apply bar (#257): sticky at the bottom, stacks on a phone, pads focus scrolling, bounds its text, marks a refused control", () => {
     const bare = css.replace(/\/\*[\s\S]*?\*\//g, "");
     const rule = (selector: string) => new RegExp(`(^|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^{}]*)\\}`).exec(bare)?.[2] ?? "";
     expect(rule(".adm-apply")).toMatch(/position:\s*sticky;[\s\S]*bottom:\s*0;/);
@@ -4123,14 +4123,19 @@ describe("admin.css uses tokens only", () => {
     // of hundreds of lines cannot push the buttons off the screen.
     expect(rule(":root:has(.adm-apply:not([hidden]))")).toMatch(/scroll-padding-bottom:\s*6rem;/);
     expect(phone).toMatch(/:root:has\(\.adm-apply:not\(\[hidden\]\)\)\s*\{\s*scroll-padding-bottom:\s*10rem;/);
-    // A refused or failed bar is taller (its title can hold a compose log, bounded at 30vh below), so its
-    // padding is that bound plus the rest of the bar. Equal specificity: each danger rule must FOLLOW its base rule.
+    // A failed bar (a compose log in its title) and a refused one (the offending value in its hint) can be
+    // taller, both bounded at 30vh below, so the --danger padding is that bound plus the rest of the bar
+    // (unclamped, on purpose: see admin.css). Equal specificity: each danger rule must FOLLOW its base rule.
     expect(rule(":root:has(.adm-apply--danger:not([hidden]))")).toMatch(/scroll-padding-bottom:\s*calc\(30vh \+ 5rem\);/);
     expect(phone).toMatch(/:root:has\(\.adm-apply--danger:not\(\[hidden\]\)\)\s*\{\s*scroll-padding-bottom:\s*calc\(30vh \+ 10rem\);/);
     expect(bare.indexOf(":root:has(.adm-apply--danger")).toBeGreaterThan(bare.indexOf(":root:has(.adm-apply:not([hidden]))"));
     expect(phone.indexOf(":root:has(.adm-apply--danger")).toBeGreaterThan(phone.indexOf(":root:has(.adm-apply:not([hidden]))"));
-    // The scroller is on the TITLE only: the hint beneath it holds the backup path (#47) and must never scroll out of view.
+    // The title and the hint are two SEPARATE scrollers, each bounded at 30vh, and the wrapper around them is
+    // neither: the hint holds the backup path (#47), which must never be inside the title's scroller (a
+    // 300-line log would push it out of view), while a pasted 3000-character value in a refusal cannot make
+    // the bar taller than the bound either.
     expect(rule(".adm-apply__text > strong")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    expect(rule(".adm-apply__text .field-hint")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
     expect(rule(".adm-apply__text")).not.toMatch(/max-height|overflow-y/);
     // The bar takes focus while a request is in flight and shows no ring of its own: the theme's covers it.
     expect(themeCss).toMatch(/:where\(:focus-visible\)\s*\{\s*outline:\s*var\(--rb-focus-ring\);/);
