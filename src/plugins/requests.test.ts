@@ -609,6 +609,11 @@ describe("consumePluginRequests drain", () => {
         "the host as discordapp.com, with an odd token": `https://discordapp.com/api/webhooks/${WH_ID}/aaaaaaaaaa.bbbbbbbbbb`,
         // A form only the PATH half can catch, in upper case: there is no host to fall back on.
         "upper case, no host": `/API/WEBHOOKS/${WH_ID}/${TOKEN}`,
+        // Real tokens hold hyphens and underscores; the run of token characters must not stop at them.
+        "no host, a token with a hyphen": `webhooks/${WH_ID}/aaaaaaaaaa-bbbbbbbbbb`,
+        "no host, a token with an underscore": `webhooks/${WH_ID}/aaaaaaaaaa_bbbbbbbbbb`,
+        // Hex digits of an escape are read in either case.
+        "unicode-escaped slashes in upper-case hex": `https:${u("002F")}${u("002F")}discord.com${u("002F")}api${u("002F")}webhooks${u("002F")}${WH_ID}${u("002F")}${TOKEN}`,
       };
       for (const [name, url] of Object.entries(forms)) {
         const h = harness({});
@@ -718,6 +723,31 @@ describe("consumePluginRequests drain", () => {
       expect(h.rejected).toEqual([]);
     });
 
+    test("a webhook-add whose id is (part of) its own url records no result, and the request is still applied", async () => {
+      const cases: [string, string][] = [
+        ["the whole token", TOKEN],
+        ["the start of the token", TOKEN.slice(0, 12)],
+        ["the end of the token", TOKEN.slice(-12)],
+        ["a stretch of the url", `${WH_ID}`],
+        ["the token with something around it", `x${TOKEN}y`],
+      ];
+      for (const [name, id] of cases) {
+        const r = routingFake();
+        const h = harness({ "100-webhook-add-1.json": addWebhook({ id }) }, { routing: r.deps });
+        await consumePluginRequests(h.deps);
+        expect(r.routing.results, name).toEqual([]);
+        expect(JSON.stringify(r.routing), name).not.toContain(TOKEN);
+        // Dropped, not fatal: the webhook was added and the file removed.
+        expect(r.calls, name).toContain("mutateSecrets");
+        expect(h.fs.size, name).toBe(0);
+      }
+      // An ordinary id is kept.
+      const kept = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook({ id: "req_12345678" }) }, { routing: kept.deps });
+      await consumePluginRequests(h.deps);
+      expect(kept.routing.results.map((x) => x.id)).toEqual(["req_12345678"]);
+    });
+
     test("a refused file that was moved aside is not remembered as stuck: a later request under the same name is handled", async () => {
       const r = routingFake();
       const h = harness({ "100-routing-set-1.json": setPlugin({ plugin: "Bad Name" }) }, { routing: r.deps });
@@ -818,24 +848,115 @@ describe("consumePluginRequests drain", () => {
       expect(h.rejected).toEqual([]);
     });
 
-    test("a routing request whose file cannot be deleted is not applied again on the next drain", async () => {
+    test("a routing request whose file cannot be deleted is not applied again, and its delete is retried on the next drains", async () => {
       const r = routingFake();
-      const h = harness({ "100-webhook-add-1.json": addWebhook(), "200-routing-set-1.json": setPlugin({ servers: { [OTHER]: { commands: "all" } }, id: "req_00000002" }) }, { routing: r.deps });
-      h.deps.unlink = async () => {
-        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      const h = harness({ "100-webhook-add-1.json": addWebhook() }, { routing: r.deps });
+      const realUnlink = h.deps.unlink;
+      let unlinkAttempts = 0;
+      let failing = true;
+      h.deps.unlink = async (path) => {
+        unlinkAttempts += 1;
+        if (failing) throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+        return realUnlink(path);
       };
       await consumePluginRequests(h.deps);
-      // The applied one is reported by name, and the refused one (whose secret-bearing file cannot go either)
-      // by name too...
+      // Applied once, reported by name only, and the file is still there (it holds the url).
       expect(h.errors).toEqual(["[plugins] couldn't delete applied request 100-webhook-add-1.json; it will not be applied again"]);
+      expect(h.fs.size).toBe(1);
       const callsAfterFirst = r.calls.length;
       const resultsAfterFirst = r.routing.results.length;
-      // ...and neither is done again by the next drains.
+      const attemptsAfterFirst = unlinkAttempts;
+      // Two more drains while it is still stuck: not applied again, no new error, and the delete IS tried again.
       await consumePluginRequests(h.deps);
       await consumePluginRequests(h.deps);
       expect(r.calls).toHaveLength(callsAfterFirst);
       expect(r.routing.results).toHaveLength(resultsAfterFirst);
       expect(h.errors).toHaveLength(1);
+      expect(unlinkAttempts).toBe(attemptsAfterFirst + 2);
+      // The busy file is released: the next drain removes it, and still does not apply it again.
+      failing = false;
+      await consumePluginRequests(h.deps);
+      expect(h.fs.size).toBe(0);
+      expect(r.calls).toHaveLength(callsAfterFirst);
+    });
+
+    test("a secret-bearing refusal whose file cannot be deleted is skipped from then on, and deleted once it can be", async () => {
+      const r = routingFake();
+      const h = harness({ "100-webhook-add-1.json": addWebhook({ url: "https://discord.com/api/webhooks/123456/short" }) }, { routing: r.deps });
+      const realUnlink = h.deps.unlink;
+      let failing = true;
+      h.deps.unlink = async (path) => {
+        if (failing) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+        return realUnlink(path);
+      };
+      await consumePluginRequests(h.deps);
+      expect(h.errors).toEqual(["[plugins] couldn't delete rejected request 100-webhook-add-1.json"]);
+      expect(h.warns).toHaveLength(1);
+      const resultsAfterFirst = r.routing.results.length;
+      // Not refused again, logged again or recorded again.
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(1);
+      expect(h.errors).toHaveLength(1);
+      expect(r.routing.results).toHaveLength(resultsAfterFirst);
+      // And it goes as soon as it can, never into rejected/.
+      failing = false;
+      await consumePluginRequests(h.deps);
+      expect(h.fs.size).toBe(0);
+      expect(h.rejected).toEqual([]);
+    });
+
+    test("a different request under the name of a stuck one is handled, not mistaken for it", async () => {
+      const r = routingFake();
+      const h = harness({ "100-discovery-refresh-1.json": refresh() }, { routing: r.deps });
+      h.deps.unlink = async () => {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      };
+      await consumePluginRequests(h.deps);
+      const first = r.calls.filter((c) => c === "refreshDiscovery").length;
+      // Someone puts another request under the same name (different text) while the first is stuck.
+      h.fs.set("100-discovery-refresh-1.json", JSON.stringify(refresh({ id: "req_99999999" })));
+      await consumePluginRequests(h.deps);
+      expect(r.calls.filter((c) => c === "refreshDiscovery").length).toBe(first + 1);
+    });
+
+    test("an update file that is refused and cannot be moved or deleted is not refused, and logged, again on every drain", async () => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "not-a-version" }) });
+      h.deps.rename = async () => {
+        throw new Error("EXDEV");
+      };
+      h.deps.unlink = async () => {
+        throw new Error("EACCES");
+      };
+      await consumePluginRequests(h.deps);
+      const warns = h.warns.length;
+      const errors = h.errors.length;
+      await consumePluginRequests(h.deps);
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toHaveLength(warns);
+      expect(h.errors).toHaveLength(errors);
+    });
+
+    test("two files that will not parse cost one pause between them, not one each", async () => {
+      const delays: number[] = [];
+      const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number) => {
+        delays.push(ms ?? -1);
+        fn();
+        return 0;
+      }) as never);
+      try {
+        const h = harness({});
+        delete h.deps.tornReadRetryMs;
+        h.fs.set("100-a.json", "{ not json");
+        h.fs.set("200-b.json", "{ also not json");
+        h.fs.set("300-c.json", "nope");
+        await consumePluginRequests(h.deps);
+        // Each was still read a second time and rejected; the wait happened once.
+        expect(delays).toEqual([250]);
+        expect(h.rejected.sort()).toEqual(["100-a.json", "200-b.json", "300-c.json"]);
+      } finally {
+        timers.mockRestore();
+      }
     });
 
     test("a refused file that cannot be moved or deleted is also skipped from then on", async () => {

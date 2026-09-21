@@ -439,6 +439,12 @@ describe("request results (#241)", () => {
     const cleaned = clip(`a${lone}b`, 10);
     expect(cleaned).toBe(`a${String.fromCharCode(0xfffd)}b`);
     expect(() => encodeURIComponent(cleaned)).not.toThrow();
+    // The edges of the surrogate range: the first and last HIGH surrogate at the cut are dropped, the unit
+    // just below the range is kept, and a lone LOW one is replaced.
+    expect(clip("x".repeat(9) + String.fromCharCode(0xd800), 10)).toBe("x".repeat(9));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xdbff), 10)).toBe("x".repeat(9));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xd7ff), 10)).toBe("x".repeat(9) + String.fromCharCode(0xd7ff));
+    expect(clip("x".repeat(9) + String.fromCharCode(0xdc00), 10)).toBe("x".repeat(9) + String.fromCharCode(0xfffd));
     // Short text and the empty string come back as they were.
     expect(clip("short", 200)).toBe("short");
     expect(clip("", 5)).toBe("");

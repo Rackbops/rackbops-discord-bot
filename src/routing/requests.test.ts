@@ -361,6 +361,20 @@ describe("parseRoutingRequest", () => {
     expect(requestIdOf({ id: "req_12345678" })).toBe("req_12345678");
   });
 
+  test("a webhook-add's id is dropped when it is the pasted url, the token, or any stretch of either", () => {
+    const withId = (id: string, action = "webhook-add") => ({ action, url: URL_OK, requestedBy: ME, channelId: CH_HOME, id });
+    for (const id of [TOKEN, TOKEN.slice(0, 10), TOKEN.slice(-10), WH_ID, `${TOKEN}${TOKEN}`, `pre-${TOKEN}-post`]) {
+      expect(requestIdOf(withId(id)), id).toBeUndefined();
+      const parsed = parseRoutingRequest(withId(id));
+      expect(parsed.ok && "id" in parsed.request, id).toBe(false);
+    }
+    // A request that is not a webhook-add has no token to protect, so its id is kept whatever it looks like.
+    expect(requestIdOf(withId(TOKEN, "webhook-remove"))).toBe(TOKEN);
+    expect(requestIdOf(withId("req_12345678"))).toBe("req_12345678");
+    // And one whose url is not a string cannot be checked against it.
+    expect(requestIdOf({ action: "webhook-add", url: 5, id: "req_12345678" })).toBe("req_12345678");
+  });
+
   test("an id that is malformed is dropped, not fatal", () => {
     for (const id of [undefined, null, 5, "", "short", "x".repeat(65), "has space", "quo\"te-id", "../../etc/x", {}, ["req_12345678"]]) {
       const parsed = parseRoutingRequest({ action: "discovery-refresh", requestedBy: ME, id });

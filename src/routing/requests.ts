@@ -75,7 +75,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function requestIdOf(raw: unknown): string | undefined {
   if (!isRecord(raw)) return undefined;
   const id = raw.id;
-  return typeof id === "string" && REQUEST_ID_RE.test(id) ? id : undefined;
+  if (typeof id !== "string" || !REQUEST_ID_RE.test(id)) return undefined;
+  // An id is stored in routing.json, where the panel reads it. A webhook-add's id that is the pasted url,
+  // the token, or any stretch of either is that secret in another place: it is dropped (not fatal; the
+  // request goes ahead and records no result). Every consumer of an id goes through here, so the parser
+  // and the drain agree.
+  if (raw.action === "webhook-add" && typeof raw.url === "string") {
+    const token = WEBHOOK_URL_RE.exec(raw.url)?.[2];
+    if (raw.url.includes(id) || (token !== undefined && id.includes(token))) return undefined;
+  }
+  return id;
 }
 
 /**
@@ -97,12 +106,12 @@ export function parseRoutingRequest(raw: unknown): ParsedRoutingRequest {
   // `requestedBy` ends up in routing.json's `updatedBy` / `addedBy`, which the panel reads, and `id` in a
   // result, so neither may carry a webhook url. `requestedBy` is redacted BEFORE it is clipped (a clip
   // could leave half a url that the redaction no longer sees); and for a webhook-add the token itself is
-  // taken out of both wherever it sits, in whatever shape, since it is the one thing that must not leak.
+  // taken out of it wherever it sits, in whatever shape, since it is the one thing that must not leak.
+  // (The id is scrubbed in `requestIdOf`.)
   const base = (token?: string) => {
     const scrubbed = token === undefined ? submitted : submitted.split(token).join(REDACTED);
     const requestedBy = clip(redactWebhookUrls(scrubbed.slice(0, MAX_REQUESTED_BY_SCAN)), MAX_REQUESTED_BY);
-    const id = token !== undefined && submittedId?.includes(token) ? undefined : submittedId;
-    return id === undefined ? { requestedBy } : { id, requestedBy };
+    return submittedId === undefined ? { requestedBy } : { id: submittedId, requestedBy };
   };
 
   switch (action) {
