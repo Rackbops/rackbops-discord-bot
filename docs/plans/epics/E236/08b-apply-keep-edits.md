@@ -68,3 +68,17 @@ bun test ops/admin/server.test.ts --timeout 20000
 
 Mutation checks in a detached scratch worktree, one mutant at a time. **Process guards (standing):** every command foreground with an explicit timeout; ONE `server.test.ts` run at a time, never parallel copies; a private temp dir per run (`TEMP`/`TMP` under `R:/repos/Scratch/tmp/bot-272`, create it first — `test/setup.ts` sweeps the shared one, #252); reviewers run nothing in the background, get a 45-minute budget, and are stopped when their verdict is in; before reporting idle, list your processes by age and `taskkill /T /F` any leftover. Do not merge.
 
+
+---
+
+## Amendment (2026-09-21, from PR #276's review gate; the plan above is left as written)
+
+Two independent reviewers reproduced plain-text 502s that FOLLOW the write (a `set -e` abort after the `mv`, an external kill during the recreate, a proxy's own 502), so the decided rule `status === 502 && result === null` was wrong in its premise. The orchestrator replaced it with POSITIVE identification of env-set's own refusals:
+
+```js
+function failureWroteNothing(status, result, text) {
+  return status === 502 && result === null && /^bot-ops: env-set: /m.test(text);
+}
+```
+
+`applyPending` passes the body text it already has. It is safe because `die()` prints `bot-ops: ` + its message and every `die "env-set: ..."` in `cmd_env_set` sits before the write (`mv "$tmp" "$ENV_FILE"`); a source-order pin in `ops/admin/server.test.ts` reads `ops/bot-ops.sh` and fails when that stops being true. A plain-text 502 with no such line (a tool's own error text, an empty body, HTML) re-baselines. Also changed: the noop hint reads "The saved settings already held these values, so the bot was not restarted." (the old wording was false after a killed recreate). Follow-ups: #275 (Apply while a re-read is in flight), #277 (finish a failed or killed recreate from the panel).
