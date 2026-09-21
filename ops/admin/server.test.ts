@@ -5662,7 +5662,7 @@ const { applyBarView, describeApplyFailure, failureWroteNothing } = new Function
 )() as {
   applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean }) => BarView;
   describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
-  failureWroteNothing: (status: number, result: unknown) => boolean;
+  failureWroteNothing: (status: number, result: unknown, text: string) => boolean;
 };
 
 describe("planApply (#257)", () => {
@@ -5786,11 +5786,14 @@ describe("applyBarView (#257)", () => {
 
   test("done with nothing restarted (bot-ops.sh's \"no changes\" answer): it does not claim a restart", () => {
     const view = applyBarView({ count: 1, phase: "done", noop: true });
+    // #272: THE wording under change. The hint used to say "The bot already had these values", which is false after
+    // an apply that wrote .env and was killed before its recreate finished: the running bot does not have them.
+    // It now says what the answer proves, that the SAVED settings hold them.
     expect(view).toEqual({
-      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The saved settings already held these values, so the bot was not restarted.",
       showDiscard: false, showGo: false, showOk: true, busy: false,
     });
-    expect(`${view.title} ${view.hint}`).not.toMatch(/restarted with/);
+    expect(`${view.title} ${view.hint}`).not.toMatch(/restarted with|The bot already had/);
     // noop only means something once an apply has finished: pending changes never read as "nothing needed".
     expect(applyBarView({ count: 1, phase: "idle", noop: true }).title).toBe("1 change needs a restart");
     expect(applyBarView({ count: 1, phase: "failed", error: "boom", noop: true }).title).toBe("Couldn't apply: boom");
@@ -5828,22 +5831,110 @@ describe("describeApplyFailure (#257, the failText logic saveEnv had, split in t
   });
 });
 
-// #272: after a failed POST /api/env, may the page keep what the user typed? Only for bot-ops.sh's own early
-// refusal. server.ts answers a failed bot-ops.sh with 502 (JSON body when env-set got as far as the write and
-// the recreate failed; the plain stderr text for an early die() -- and, rarely, for a failure after the write
-// that printed no JSON: a `set -e` abort, an external kill; those look the same to the page) or 504 (we killed
-// it: outcome unknown).
+// #272: after a failed POST /api/env, may the page keep what the user typed? Only when the failure IS one of
+// env-set's own refusals, identified POSITIVELY: a 502, a body that is not JSON, and a line that starts
+// `bot-ops: env-set: ` (bot-ops.sh's die() prints `bot-ops: ` + its message and every `die "env-set: ..."` sits
+// before the write). server.ts answers a failed bot-ops.sh with 502 (a JSON body when env-set got as far as the
+// write and the recreate failed; the plain stderr text otherwise) or 504 (we killed it: outcome unknown). The
+// plain stderr text can ALSO come from a failure after the write that printed no JSON -- a `set -e` abort (a
+// tool's own error text), a kill during the recreate (at most the `bot-ops: env file` line), a kill between the
+// mv and that line (an empty body), a proxy's own 502 (HTML) -- and none of those carries an env-set line.
 describe("failureWroteNothing (#272)", () => {
-  test("only a plain-text 502 (bot-ops.sh's early refusal) counts as a failure that wrote nothing", () => {
-    expect(failureWroteNothing(502, null)).toBe(true);
-    // a failed recreate: .env was rewritten first (#47)
-    expect(failureWroteNothing(502, { ok: false, changed: ["X"], backup: "/b", log: "compose: boom" })).toBe(false);
-    expect(failureWroteNothing(502, { ok: false })).toBe(false);
-    expect(failureWroteNothing(502, {})).toBe(false);
-    // a timeout: the recreate may still finish
-    expect(failureWroteNothing(504, null)).toBe(false);
-    // a status this page cannot reason about says nothing
-    for (const status of [200, 400, 401, 403, 404, 500, 503]) expect({ status, wroteNothing: failureWroteNothing(status, null) }).toEqual({ status, wroteNothing: false });
+  const REFUSAL = "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid";
+
+  test("an env-set refusal (a 502, not JSON, a line starting `bot-ops: env-set: `) is a failure that wrote nothing", () => {
+    expect(failureWroteNothing(502, null, REFUSAL)).toBe(true);
+    expect(failureWroteNothing(502, null, "bot-ops: env-set: 'FOO' is not an editable key")).toBe(true);
+    // the line need not be the first one: the anchor is a line start, not the start of the body
+    expect(failureWroteNothing(502, null, `a warning first\n${REFUSAL}\ntrailing text`)).toBe(true);
+  });
+
+  test("everything that is not one of those re-baselines", () => {
+    // a failed recreate: .env was rewritten first (#47), and the body parsed as JSON
+    expect(failureWroteNothing(502, { ok: false, changed: ["X"], backup: "/b", log: "compose: boom" }, REFUSAL)).toBe(false);
+    expect(failureWroteNothing(502, { ok: false }, REFUSAL)).toBe(false);
+    expect(failureWroteNothing(502, {}, REFUSAL)).toBe(false);
+    // a `set -e` abort after the mv: a tool's own error text, or the env-file line the script prints before the recreate
+    expect(failureWroteNothing(502, null, "jq: error (at <stdin>:0): Cannot iterate over null")).toBe(false);
+    expect(failureWroteNothing(502, null, "bot-ops: env file /x/.env")).toBe(false);
+    // a kill between the mv and that line: an empty body (and server.ts's own fallback text for it)
+    expect(failureWroteNothing(502, null, "")).toBe(false);
+    expect(failureWroteNothing(502, null, "bot-ops.sh failed")).toBe(false);
+    // a proxy's own 502
+    expect(failureWroteNothing(502, null, "<html><head><title>502 Bad Gateway</title></head><body>cloudflared</body></html>")).toBe(false);
+    // `env-set:` in the middle of a line is not an env-set line
+    expect(failureWroteNothing(502, null, `note: ${REFUSAL}`)).toBe(false);
+    expect(failureWroteNothing(502, null, "bot-ops: env-set:no space after the colon")).toBe(false);
+    // a failed backup or mktemp BEFORE the write has no env-set line either: it re-baselines, the safe side
+    expect(failureWroteNothing(502, null, "install: cannot create regular file '/opt/x/backups/.env.bak': Permission denied")).toBe(false);
+    // a timeout: the recreate may still finish, whatever the body looks like
+    expect(failureWroteNothing(504, null, REFUSAL)).toBe(false);
+    expect(failureWroteNothing(504, null, "bot-ops.sh timed out")).toBe(false);
+    // a status this page cannot reason about says nothing, even with a refusal-looking body
+    for (const status of [200, 400, 401, 403, 404, 500, 503]) {
+      expect({ status, wroteNothing: failureWroteNothing(status, null, REFUSAL) }).toEqual({ status, wroteNothing: false });
+    }
+  });
+});
+
+// What makes the page's reliance on a message the script owns safe: inside `cmd_env_set`, EVERY `die "env-set: ..."`
+// sits before the write (`mv "$tmp" "$ENV_FILE"`), nothing after the write prints an `env-set:` line, no such die
+// lives outside `cmd_env_set` (a post-write helper could reach it), and `die` prints with the `bot-ops: ` prefix the
+// page's pattern starts with. Whoever adds a die after the write breaks this test, and the messages say why. A pure
+// function over the script text, so its own mutants (a die moved below the mv, ...) are tested too.
+function envSetRefusalOrderProblems(script: string): string[] {
+  const problems: string[] = [];
+  if (!/^die\(\) \{ echo "bot-ops: \$\*" >&2; exit 1; \}$/m.test(script)) {
+    problems.push('die() must print "bot-ops: " + its message to stderr: the page keeps edits only for a line starting `bot-ops: env-set: `');
+  }
+  const start = script.indexOf("\ncmd_env_set() {");
+  if (start === -1) return [...problems, "cmd_env_set() was not found"];
+  const end = script.indexOf("\n}\n", start);
+  const body = script.slice(start, end === -1 ? undefined : end);
+  const writes = [...body.matchAll(/mv "\$tmp" "\$ENV_FILE"/g)];
+  if (writes.length !== 1) return [...problems, `cmd_env_set must contain exactly one write (mv "$tmp" "$ENV_FILE"), found ${writes.length}`];
+  const writeAt = writes[0]!.index!;
+  const dies = [...body.matchAll(/die "env-set:/g)];
+  if (dies.length === 0) problems.push('cmd_env_set has no die "env-set: ..." at all (the page would never keep an edit)');
+  for (const d of dies) if (d.index! > writeAt) problems.push(`a die "env-set: ..." comes AFTER the write, at cmd_env_set offset ${d.index}`);
+  const afterWrite = body.slice(writeAt);
+  for (const line of afterWrite.split("\n")) {
+    if (/^\s*#/.test(line)) continue;
+    if (/(?:die|echo|printf)\b.*env-set:/.test(line)) problems.push(`a line after the write prints an env-set: message: ${line.trim()}`);
+  }
+  const allDies = [...script.matchAll(/die "env-set:/g)].length;
+  if (allDies !== dies.length) problems.push(`${allDies - dies.length} die "env-set: ..." live outside cmd_env_set`);
+  return problems;
+}
+
+describe("bot-ops.sh's env-set refusals all precede the write (#272: what keeps failureWroteNothing true)", () => {
+  const script = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
+  const WRITE = '  mv "$tmp" "$ENV_FILE"\n';
+
+  test("in the real script", () => {
+    expect(envSetRefusalOrderProblems(script)).toEqual([]);
+    // not vacuous: the pin looked at real refusals (the script has nine today)
+    expect([...script.matchAll(/die "env-set:/g)].length).toBeGreaterThanOrEqual(5);
+    expect(script.split(WRITE).length - 1).toBe(1);
+  });
+
+  test("it catches a die moved below the write", () => {
+    const first = 'die "env-set: $ENV_FILE not found"';
+    expect(script.split(first).length - 1).toBe(1);
+    // (function replacers throughout: the script text is full of `$` sequences a string replacement would expand)
+    const moved = script.replace(first, () => "true").replace(WRITE, () => `${WRITE}  die "env-set: moved below the write"\n`);
+    expect(envSetRefusalOrderProblems(moved).join("\n")).toContain("AFTER the write");
+  });
+
+  test("it catches a message printed after the write, a die outside the function, and a die that loses its prefix", () => {
+    expect(envSetRefusalOrderProblems(script.replace(WRITE, () => `${WRITE}  echo "bot-ops: env-set: late" >&2\n`)).join("\n")).toContain("after the write prints an env-set:");
+    expect(envSetRefusalOrderProblems(`${script}\nother() { die "env-set: elsewhere"; }\n`).join("\n")).toContain("outside cmd_env_set");
+    expect(envSetRefusalOrderProblems(script.replace('die() { echo "bot-ops: $*" >&2; exit 1; }', () => 'die() { echo "$*" >&2; exit 1; }')).join("\n")).toContain('die() must print "bot-ops: "');
+  });
+
+  test("it catches a second write and a missing function (so it cannot pass vacuously)", () => {
+    expect(envSetRefusalOrderProblems(script.replace(WRITE, () => `${WRITE}${WRITE}`)).join("\n")).toContain("exactly one write");
+    expect(envSetRefusalOrderProblems(script.replace("cmd_env_set() {", () => "cmd_renamed() {")).join("\n")).toContain("cmd_env_set() was not found");
   });
 });
 
@@ -6220,7 +6311,7 @@ describe("applyPending (#257)", () => {
     const page = runApply(spec);
     await page.run.applyPending();
     expect(page.view()).toEqual({
-      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The saved settings already held these values, so the bot was not restarted.",
       ok: true, discard: false, go: false, disabled: false,
     });
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 }); // still re-baselined
@@ -6285,17 +6376,51 @@ describe("applyPending (#257)", () => {
     // the recreate may still finish and .env may already hold the new values: the page re-reads both
     expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
     expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe(APPLY_ENV.WATCHED_REPOS);
+    // and whatever the body looks like: a 504 whose body reads like a refusal is still a timeout
+    const lookalike = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      response: { ok: false, status: 504, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+    });
+    await lookalike.run.applyPending();
+    expect(lookalike.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
   });
 
-  test("any other status re-baselines too: a status this page does not know is not proof that nothing was written", async () => {
+  test("any other status re-baselines too: a status this page does not know says nothing, even with a refusal-looking body", async () => {
     for (const status of [400, 403, 500, 503]) {
       const page = runApply({
         loadedEnv: APPLY_ENV,
         fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
-        response: { ok: false, status, text: "something plain-text" },
+        response: { ok: false, status, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
       });
       await page.run.applyPending();
       expect({ status, reloads: page.log.reloads }).toEqual({ status, reloads: { plugins: 1, env: 1, status: 0 } });
+    }
+  });
+
+  // #272: the rule identifies an env-set refusal POSITIVELY. The plain-text 502s below can all follow the write (or
+  // precede it for a reason that is not a refusal), and none carries an `env-set:` line, so the page re-reads
+  // instead of keeping edits that may already be the stored values.
+  test("a plain-text 502 that is not an env-set refusal re-baselines", async () => {
+    const bodies = [
+      "jq: error (at <stdin>:0): Cannot iterate over null", // a `set -e` abort after the mv: a tool's own error text
+      "bot-ops: env file /opt/rackbops/.env", // the line env-set prints just before the recreate: the write already happened
+      "", // a kill between the mv and that line
+      "bot-ops.sh failed", // server.ts's fallback for an empty stderr
+      "<html><body>502 Bad Gateway</body></html>", // a proxy's own 502
+      "install: cannot create regular file '/opt/x/backups/.env.bak': Permission denied", // before the write, but no refusal
+    ];
+    for (const text of bodies) {
+      const page = runApply({
+        loadedEnv: APPLY_ENV,
+        fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+        checked: ["warbandeer", "raidhelper"],
+        response: { ok: false, text },
+        resetOnReload: true,
+      });
+      await page.run.applyPending();
+      expect({ text, reloads: page.log.reloads }).toEqual({ text, reloads: { plugins: 1, env: 1, status: 0 } });
+      expect(page.controls.find((c) => c.dataset.key === "WATCHED_REPOS")!.value).toBe(APPLY_ENV.WATCHED_REPOS);
     }
   });
 

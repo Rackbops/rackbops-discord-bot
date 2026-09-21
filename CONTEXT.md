@@ -1301,19 +1301,27 @@ _Avoid_: server list, guild cache
   on the reader (it is not verified here). While a request is in flight both buttons are disabled and focus
   rests on the bar itself (`tabindex="-1"`); it lands on OK when the request ends, and returns to the open
   tab (or the bar) when OK / Discard hide the focused button.
-  **After a failed apply the controls are re-read from the bot unless the answer is `bot-ops.sh`'s own early
-  refusal (#272).** `failureWroteNothing(status, result)` (`APPLY_VIEW`) is true only for a plain-text 502
-  (`result === null`: an early `die()` in `bot-ops.sh`, before the write, the case server.ts describes as
-  "an early die() that never wrote any stdout"): the controls keep the user's values and ticks, and the bar
-  shows `Couldn't apply: …` with Discard and Apply. A JSON 502 (the recreate failed after `.env` was
-  rewritten, #47), a 504 (we killed it: the outcome is unknown) and any status the page does not know
-  re-read both lists, after which nothing is pending and the bar keeps only OK. The `catch` (a network
-  error, or the page's own timeout) leaves the controls as they are: a reload from a server that cannot be
-  reached would replace the input with two error lines. **The plain-text 502 is not a proof that nothing was
-  written**: it can also follow the write (a `set -e` abort after the `mv`, an external SIGTERM or OOM kill
-  during the recreate, which `createRunBotOps` deliberately keeps apart from a timeout, or a proxy's own
-  502). A retry then finds the values in place, `env-set` answers `recreated:false` and the bar reports
-  "Nothing needed applying."; nothing redoes a recreate that never finished (accepted for #272).
+  **After a failed apply the controls are re-read from the bot unless the failure IS one of `env-set`'s own
+  refusals (#272).** `failureWroteNothing(status, result, text)` (`APPLY_VIEW`) is true only for a 502 whose
+  body is not JSON and has a line that starts `bot-ops: env-set: ` (`die()` prints `bot-ops: ` + its
+  message, and every `die "env-set: ..."` in `cmd_env_set` sits before the write, `mv "$tmp" "$ENV_FILE"`):
+  the controls keep the user's values and ticks, and the bar shows `Couldn't apply: …` with Discard and
+  Apply. The page thereby relies on a message the script owns, so **that order is pinned** by `bot-ops.sh's
+  env-set refusals all precede the write` in `server.test.ts` (it reads the script, as the schema drift pin
+  does): whoever adds a die after the write, prints an `env-set:` line after it, adds such a die outside
+  `cmd_env_set`, or changes `die()`'s prefix breaks a test that says why. Everything else re-reads both
+  lists, after which nothing is pending and the bar keeps only OK: a JSON 502 (the recreate failed after
+  `.env` was rewritten, #47), a 504 (we killed it: the outcome is unknown), any other status, and the plain-
+  text 502s the rule deliberately does not trust because they can follow the write -- a `set -e` abort after
+  the `mv` (a tool's own error text), an external kill during the recreate (at most the `bot-ops: env file`
+  line, printed only after the write), a kill between the `mv` and that line (an empty body) and a proxy's
+  own 502 (HTML); a failed backup or `mktemp` before the write also re-reads (no env-set line: the safe
+  side). The `catch` (a network error, or the page's own timeout) leaves the controls as they are: a reload
+  from a server that cannot be reached would replace the input with two error lines. A retry that finds the
+  values in place gets `recreated:false` and the bar says "Nothing needed applying." with the hint that the
+  SAVED settings already held them, because after a killed recreate the running bot may not: nothing in the
+  panel finishes that recreate (Restart is `docker compose restart`, which does not reload the env file;
+  tracked in #277).
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer

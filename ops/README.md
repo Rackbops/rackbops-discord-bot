@@ -541,16 +541,19 @@ control from the bot's current state and sends nothing. The POST carries only th
 never the untouched ones echoed back (issue #44): a stored value the whitelist would reject can't block an
 unrelated apply, and a tab loaded before another operator's save can't silently revert their unrelated
 edit. When an apply fails the bar says why (`Couldn't apply: …`), and what happens to the controls depends
-on the answer (#272). `bot-ops.sh`'s own **early refusal** — an HTTP 502 whose body is plain text, the
-script's `die()` before it writes — **keeps** the user's edits and plugin ticks and leaves **Discard** and
-**Apply and restart** on the bar, so one refused value can be corrected without retyping the rest. (That
-answer is not a proof: it can rarely follow the write — a `set -e` abort after the `mv`, an external kill
-during the recreate, a proxy's own 502 — and a retry then finds the values in place and is told nothing
-needed applying; nothing redoes a recreate that never finished.) A **failed recreate** (a 502 with a JSON
-body: `.env` was already rewritten, so the bar shows the compose error and the backup path, issue #47), a
-**timeout** (504: the outcome is unknown) and any status the page does not know **re-read** the page's
-state from the bot, so only OK is left on the bar (nothing is pending after the re-read). A **network
-error, or the page's own timeout,** leaves the controls as they are. The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
+on the answer (#272). One of `env-set`'s own **refusals** — an HTTP 502 whose plain-text body has a line
+starting `bot-ops: env-set: `, the script's `die "env-set: …"` before it writes — **keeps** the user's
+edits and plugin ticks and leaves **Discard** and **Apply and restart** on the bar, so one refused value
+can be corrected without retyping the rest (a test pins that every such `die` precedes the write). Any
+other failure **re-reads** the page's state from the bot, so only OK is left on the bar (nothing is
+pending after the re-read): a **failed recreate** (a 502 with a JSON body: `.env` was already rewritten,
+so the bar shows the compose error and the backup path, issue #47), a **timeout** (504: the outcome is
+unknown), any status the page does not know, and a plain-text 502 with no such line — a `set -e` abort
+after the write, a kill during the recreate, a proxy's own 502, or a failed backup before the write. A
+**network error, or the page's own timeout,** leaves the controls as they are. After a killed or failed
+recreate `.env` already holds the new values, so Apply answers "Nothing needed applying." (the saved
+settings already held them) and does not redo the recreate, and Restart does not reload the env file
+(#277 tracks a recreate action). The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
 Plugins tab, and two controls for one key would be a conflict with no good answer. Pinning a plugin to a
 version (`name@version`) is set in `.env`; an existing pin is kept while that plugin stays ticked. A few
 fields render as constrained controls instead of free text:
