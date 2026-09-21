@@ -1861,21 +1861,15 @@ describe("handleRequest", () => {
   });
 });
 
-// The panel's save path, pinned against the page's OWN source: the pure planEnvSave and saveEnv
-// itself are lifted from index.html (between their ENV_SAVE_PLAN / ENV_SAVE markers) and evaluated
-// here, so what issue #44 hinged on — the POST body carries ONLY the keys whose value changed, never
-// an untouched field echoed back — is asserted on the real functions, not a re-implementation. The
-// consumer boundary is what a green planEnvSave alone can't prove (a saveEnv that planned against
-// `{}` instead of the loaded env, or posted every control, would leave the bug in place), so saveEnv
-// is run against a stubbed page and the body it actually hands to api() is what's asserted.
-describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
+// The pure config diff, pinned against the page's OWN source: planEnvSave is lifted from index.html
+// (between its ENV_SAVE_PLAN markers) and evaluated here, so what issue #44 hinged on — the body carries
+// ONLY the keys whose value changed, never an untouched field echoed back — is asserted on the real
+// function, not a re-implementation. (#257: the saveEnv that used to wrap it is gone; the consumer
+// boundary — the POST body applyPending actually hands to api() — is pinned in the `applyPending (#257)`
+// describe below, where every one of saveEnv's tests was carried over by name.)
+describe("admin panel planEnvSave: only the changed keys (issue #44)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const planSrc = indexSrc.match(/\/\/ ENV_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE_PLAN:end/)?.[1];
-  const saveSrc = indexSrc.match(/\/\/ ENV_SAVE:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE:end/)?.[1];
-  // compilePattern/validateEnvChanges live between their own markers, same reason as planSrc/saveSrc
-  // — saveEnv reaches validateEnvChanges via closure in the real page's single IIFE scope, so the
-  // isolated eval below must lift and inject it explicitly, not just the two ENV_SAVE functions.
-  const schemaSrc = indexSrc.match(/\/\/ ENV_SCHEMA:begin\n([\s\S]*?)\n\s*\/\/ ENV_SCHEMA:end/)?.[1];
   type Plan = { changes: { key: string; before: string; now: string }[]; body: string };
   // "use strict" up front, matching the page's own IIFE (index.html:226): without it, a `Function`
   // body silently creates a global on an assignment to an un-injected or misspelled identifier
@@ -1886,138 +1880,8 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
       c: typeof current,
     ) => Plan)(loaded, current);
 
-  /** Runs the page's real saveEnv with `controls` as the rendered fields and `loaded` as what
-   *  GET /api/env returned, recording what it confirms and POSTs. Every page global saveEnv touches
-   *  is injected: document (only #env-msg and the field controls are looked up), confirm, api,
-   *  loadEnv/loadStatus (the post-save re-baseline), and loadedEnv. */
-  interface FakePage {
-    posts: { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } }[];
-    confirms: string[];
-    msg: { textContent: string; className: string };
-    reloads: number;
-  }
-  // Matches the shape GET /api/env-schema actually returns (#205) for the one key these tests
-  // exercise required-ness on; a test that needs a different schema (a format check, or the
-  // degraded {} path) overrides it via opts.loadedSchema.
-  const DEFAULT_SCHEMA = { ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: true, source: "core" } };
-  async function runSaveEnv(
-    loaded: Record<string, string>,
-    controls: Record<string, string>,
-    opts: { confirm?: boolean; response?: { ok: boolean; text: string }; loadedSchema?: Record<string, unknown> } = {},
-  ): Promise<FakePage> {
-    const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, reloads: 0 };
-    const document = {
-      getElementById: (id: string) => (id === "env-msg" ? page.msg : null),
-      querySelectorAll: (selector: string) =>
-        selector === "#env-fields [data-key]" ? Object.entries(controls).map(([key, value]) => ({ dataset: { key }, value })) : [],
-    };
-    const confirm = (text: string): boolean => {
-      page.confirms.push(text);
-      return opts.confirm ?? true;
-    };
-    const api = async (path: string, o: { method?: string; body?: string; signal?: AbortSignal }) => {
-      page.posts.push({ path, opts: o });
-      const r = opts.response ?? { ok: true, text: '{"ok":true,"changed":["ANNOUNCE_CHANNEL_ID"]}' };
-      return { ok: r.ok, text: async () => r.text };
-    };
-    // A no-op fake (no real delay) — saveEnv's real timeoutSignal wiring is already covered for
-    // real by the dedicated TIMEOUT_SIGNAL unit tests; this harness only needs to prove saveEnv
-    // calls it and forwards the resulting signal into api() (issue #53 item 2).
-    const timeoutSignal = (_ms: number) => ({ signal: new AbortController().signal, cancel: () => {} });
-    const saveEnv = new Function(
-      "document",
-      "confirm",
-      "api",
-      "loadEnv",
-      "loadStatus",
-      "loadedEnv",
-      "loadedSchema",
-      "MUTATION_TIMEOUT_MS",
-      "timeoutSignal",
-      `${schemaSrc ?? ""}\n${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn saveEnv;`,
-    )(
-      document,
-      confirm,
-      api,
-      () => page.reloads++,
-      () => {},
-      loaded,
-      opts.loadedSchema ?? DEFAULT_SCHEMA,
-      110000,
-      timeoutSignal,
-    ) as () => Promise<void>;
-    await saveEnv();
-    return page;
-  }
-
-  test("both marked functions are present in the served page", () => {
+  test("the marked function is present in the served page", () => {
     expect(planSrc).toContain("function planEnvSave(");
-    expect(saveSrc).toContain("async function saveEnv(");
-  });
-
-  test("saveEnv POSTs only the changed fields, diffed against the LOADED env, and previews the same", async () => {
-    // The issue's exact setup: two stored values the whitelist would reject, both untouched.
-    // ANNOUNCE_CHANNEL_ID values are 5 digits (not the old placeholder "111"/"222") so they satisfy
-    // DEFAULT_SCHEMA's real ^[0-9]{5,25}$ pattern (#207) — this test predates client-side format
-    // validation and isn't testing that pattern itself, so the values just need to pass it.
-    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "11111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage" };
-    const page = await runSaveEnv(loaded, { ...loaded, ANNOUNCE_CHANNEL_ID: "22222" });
-    expect(page.posts).toHaveLength(1);
-    const [post] = page.posts;
-    expect(post?.path).toBe("/api/env");
-    expect(post?.opts.method).toBe("POST");
-    expect(post?.opts.body).toBe("ANNOUNCE_CHANNEL_ID=22222");
-    // issue #53 item 2: the POST now carries a real AbortSignal, not none at all.
-    expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
-    expect(page.confirms).toHaveLength(1);
-    expect(page.confirms[0]).toContain('ANNOUNCE_CHANNEL_ID: "11111" → "22222"');
-    expect(page.confirms[0]).not.toContain("ADMIN_USER_IDS");
-    expect(page.msg).toEqual({ textContent: "Saved: ANNOUNCE_CHANNEL_ID", className: "msg ok" });
-    expect(page.reloads).toBe(1); // re-baselined, so a second save diffs against the new state
-  });
-
-  test("saveEnv with nothing changed posts nothing and says so", async () => {
-    const same = { ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" };
-    const page = await runSaveEnv(same, { ...same });
-    expect(page.posts).toEqual([]);
-    expect(page.confirms).toEqual([]);
-    expect(page.msg.textContent).toBe("No changes.");
-  });
-
-  test("a declined confirm posts nothing", async () => {
-    const page = await runSaveEnv({ WATCHED_REPOS: "us" }, { WATCHED_REPOS: "eu" }, { confirm: false });
-    expect(page.confirms).toHaveLength(1);
-    expect(page.posts).toEqual([]);
-    expect(page.reloads).toBe(0);
-  });
-
-  test("a rejected save surfaces bot-ops.sh's own message and re-baselines (issue #47)", async () => {
-    const page = await runSaveEnv(
-      { WATCHED_REPOS: "us" },
-      { WATCHED_REPOS: "eu" },
-      { response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" } },
-    );
-    expect(page.msg).toEqual({ textContent: "Failed: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", className: "msg error" });
-    // .env may already have been rewritten even though this particular response is plain text
-    // (a die() before any rewrite, in this case) — saveEnv can't tell the difference from the
-    // response shape alone, so it re-baselines unconditionally on any failure.
-    expect(page.reloads).toBe(1);
-  });
-
-  test("a failed recreate shows the compose error and backup path, not the raw JSON, and re-baselines (issue #47)", async () => {
-    const page = await runSaveEnv(
-      { REPORT_ROLE_ID: "stormrage" },
-      { REPORT_ROLE_ID: "orgrimmar" },
-      {
-        response: {
-          ok: false,
-          text: '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}',
-        },
-      },
-    );
-    expect(page.msg.className).toBe("msg error");
-    expect(page.msg.textContent).toBe("Failed: compose: image not found\nBackup: /opt/x/.env.bak.1");
-    expect(page.reloads).toBe(1);
   });
 
   test("the body carries only the keys whose value differs, in field order (not alphabetical)", () => {
@@ -2059,50 +1923,6 @@ describe("admin panel saveEnv posts only the changed keys (issue #44)", () => {
   test("the confirm preview and the body name exactly the same keys", () => {
     const plan = planEnvSave({ A: "1", B: "2", C: "3" }, { A: "1", B: "x", C: "y" });
     expect(plan.body.split("\n").map((l) => l.split("=")[0])).toEqual(plan.changes.map((c) => c.key));
-  });
-
-  // Blanking a REQUIRED key (issue #45): the panel must refuse to submit before the confirm
-  // dialog, not after a failed save — bot-ops.sh's env-set would reject it anyway, but only once
-  // the container has already been recreated with the bad value.
-  test("blanking a required field is refused before the confirm dialog — nothing is posted", async () => {
-    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" }, { ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "us" });
-    expect(page.confirms).toEqual([]);
-    expect(page.posts).toEqual([]);
-    expect(page.msg).toEqual({ textContent: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.", className: "msg error" });
-    expect(page.reloads).toBe(0);
-  });
-
-  test("blanking a required field alongside an unrelated valid change blocks the WHOLE save", async () => {
-    const page = await runSaveEnv({ ANNOUNCE_CHANNEL_ID: "111", WATCHED_REPOS: "us" }, { ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" });
-    expect(page.posts).toEqual([]); // the WATCHED_REPOS change is not posted either
-    expect(page.msg.className).toBe("msg error");
-  });
-
-  // #207: a bad-format (not just blank) value is now blocked client-side too, reading BOT_BRANCH's
-  // pattern from the schema exactly the way the deleted BRANCH_NAME_RE mirror used to hardcode it.
-  test("a bad-format value (BOT_BRANCH) is refused before the confirm dialog, with the format message (#207)", async () => {
-    const page = await runSaveEnv(
-      { BOT_BRANCH: "main" },
-      { BOT_BRANCH: "bad branch!" },
-      { loadedSchema: { BOT_BRANCH: { pattern: "^[A-Za-z0-9._/-]{1,100}$", required: false, source: "core" } } },
-    );
-    expect(page.confirms).toEqual([]);
-    expect(page.posts).toEqual([]);
-    expect(page.msg).toEqual({
-      textContent: 'BOT_BRANCH: "bad branch!" doesn\'t match the expected format (^[A-Za-z0-9._/-]{1,100}$).',
-      className: "msg error",
-    });
-    expect(page.reloads).toBe(0);
-  });
-
-  // #207's degraded path: an old deployed bot-ops.sh (pre-#205) or a transient GET /api/env-schema
-  // failure leaves loadedSchema at {} (loadEnv's own fallback) — the panel must NOT block the save
-  // client-side in that case (env-set, server-side, stays the authority either way).
-  test("with no schema loaded ({}), a value that WOULD be refused is submitted anyway — the degraded path (#207)", async () => {
-    const page = await runSaveEnv({ BOT_BRANCH: "main" }, { BOT_BRANCH: "bad branch!" }, { loadedSchema: {} });
-    expect(page.confirms).toHaveLength(1);
-    expect(page.posts).toHaveLength(1);
-    expect(page.posts[0]?.opts.body).toBe("BOT_BRANCH=bad branch!");
   });
 });
 
@@ -2285,7 +2105,8 @@ describe("AUTO_UPDATE (panel ↔ bot-ops.sh UI-shape mirror)", () => {
 // #207: the panel's client-side env validation (required-ness, format) reads GET /api/env-schema
 // live instead of hardcoding a copy of bot-ops.sh's ALLOWED_SPEC regexes — compilePattern/
 // validateEnvChanges are pinned against the page's OWN source (lifted from index.html between
-// their ENV_SCHEMA markers), same discipline as planEnvSave/saveEnv above.
+// their ENV_SCHEMA markers), same discipline as planEnvSave above (applyPending reaches
+// validateEnvChanges through the same lift).
 describe("env schema drives client-side validation (#207)", () => {
   const botOpsSrc = readFileSync(new URL("../bot-ops.sh", import.meta.url), "utf8");
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
@@ -3608,14 +3429,13 @@ describe("POST /api/plugins/request (#105 panel producer)", () => {
   });
 });
 
-// The plugin Save path, pinned against the page's OWN source — mirrors the saveEnv lift above. The
-// pure planPluginsSave and savePlugins are lifted from index.html (between their PLUGINS_SAVE_PLAN /
-// PLUGINS_SAVE markers) and evaluated here, so the consumer boundary (savePlugins POSTs PLUGINS=<value>
-// and ONLY that) is proven on the real function, not a re-implementation.
-describe("admin panel plugin Save (#102)", () => {
+// The pure PLUGINS plan, pinned against the page's OWN source: planPluginsSave is lifted from index.html
+// (between its PLUGINS_SAVE_PLAN markers) and evaluated here. (#257: the savePlugins that used to wrap
+// it is gone; the consumer boundary — PLUGINS first in the ONE POST applyPending sends, only when it
+// changed, never planned against an unreadable state — is pinned in `applyPending (#257)` below.)
+describe("admin panel planPluginsSave (#102)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const planSrc = indexSrc.match(/\/\/ PLUGINS_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ PLUGINS_SAVE_PLAN:end/)?.[1];
-  const saveSrc = indexSrc.match(/\/\/ PLUGINS_SAVE:begin\n([\s\S]*?)\n\s*\/\/ PLUGINS_SAVE:end/)?.[1];
 
   type Plan = { value: string; changed: boolean };
   const planPluginsSave = (checked: string[], current: string, order: string[]): Plan =>
@@ -3625,9 +3445,8 @@ describe("admin panel plugin Save (#102)", () => {
       o: string[],
     ) => Plan)(checked, current, order);
 
-  test("both marked functions are present in the served page", () => {
+  test("the marked function is present in the served page", () => {
     expect(planSrc).toContain("function planPluginsSave(");
-    expect(saveSrc).toContain("async function savePlugins(");
   });
 
   describe("planPluginsSave (pure)", () => {
@@ -3660,115 +3479,6 @@ describe("admin panel plugin Save (#102)", () => {
     });
   });
 
-  interface FakePage {
-    posts: { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } }[];
-    confirms: string[];
-    msg: { textContent: string; className: string };
-    reloads: { plugins: number; env: number; status: number };
-  }
-  async function runSavePlugins(
-    pluginsData: { plugins: { name: string }[]; pluginsValue: string; stateError?: string },
-    checked: string[],
-    opts: { confirm?: boolean; response?: { ok: boolean; text: string } } = {},
-  ): Promise<FakePage> {
-    const page: FakePage = { posts: [], confirms: [], msg: { textContent: "", className: "" }, reloads: { plugins: 0, env: 0, status: 0 } };
-    const checkedSet = new Set(checked);
-    const boxes = pluginsData.plugins.map((p) => ({ checked: checkedSet.has(p.name), dataset: { plugin: p.name }, type: "checkbox" }));
-    const document = {
-      getElementById: (id: string) => (id === "plugins-msg" ? page.msg : null),
-      querySelectorAll: (selector: string) => (selector === "#plugins-list input[type=checkbox]" ? boxes : []),
-    };
-    const confirm = (text: string): boolean => {
-      page.confirms.push(text);
-      return opts.confirm ?? true;
-    };
-    const api = async (path: string, o: { method?: string; body?: string; signal?: AbortSignal }) => {
-      page.posts.push({ path, opts: o });
-      const r = opts.response ?? { ok: true, text: '{"ok":true,"changed":["PLUGINS"]}' };
-      return { ok: r.ok, text: async () => r.text };
-    };
-    const timeoutSignal = (_ms: number) => ({ signal: new AbortController().signal, cancel: () => {} });
-    const savePlugins = new Function(
-      "document",
-      "confirm",
-      "api",
-      "timeoutSignal",
-      "MUTATION_TIMEOUT_MS",
-      "loadPlugins",
-      "loadEnv",
-      "loadStatus",
-      "pluginsData",
-      `${planSrc ?? ""}\n${saveSrc ?? ""}\nreturn savePlugins;`,
-    )(
-      document,
-      confirm,
-      api,
-      timeoutSignal,
-      110000,
-      () => page.reloads.plugins++,
-      () => page.reloads.env++,
-      () => page.reloads.status++,
-      pluginsData,
-    ) as () => Promise<void>;
-    await savePlugins();
-    return page;
-  }
-
-  test("savePlugins POSTs only PLUGINS with the planned value, then re-baselines all three views", async () => {
-    const page = await runSavePlugins(
-      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
-      ["warbandeer", "raidhelper"],
-    );
-    expect(page.posts).toHaveLength(1);
-    const [post] = page.posts;
-    expect(post?.path).toBe("/api/env");
-    expect(post?.opts.method).toBe("POST");
-    expect(post?.opts.body).toBe("PLUGINS=warbandeer,raidhelper");
-    expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
-    expect(page.confirms).toHaveLength(1);
-    expect(page.confirms[0]).toContain("warbandeer,raidhelper");
-    expect(page.msg.className).toBe("msg ok");
-    expect(page.reloads).toEqual({ plugins: 1, env: 1, status: 1 });
-  });
-
-  test("savePlugins with no change posts nothing and says so", async () => {
-    const page = await runSavePlugins({ plugins: [{ name: "warbandeer" }], pluginsValue: "warbandeer@1.0.0" }, ["warbandeer"]);
-    expect(page.posts).toEqual([]);
-    expect(page.confirms).toEqual([]);
-    expect(page.msg.textContent).toBe("No changes.");
-  });
-
-  test("a declined confirm posts nothing", async () => {
-    const page = await runSavePlugins(
-      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
-      ["warbandeer", "raidhelper"],
-      { confirm: false },
-    );
-    expect(page.confirms).toHaveLength(1);
-    expect(page.posts).toEqual([]);
-    expect(page.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
-  });
-
-  test("a rejected save surfaces bot-ops.sh's own message", async () => {
-    const page = await runSavePlugins(
-      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" },
-      ["warbandeer", "raidhelper"],
-      { response: { ok: false, text: "bot-ops: env-set: value for 'PLUGINS' is invalid" } },
-    );
-    expect(page.msg.className).toBe("msg error");
-    expect(page.msg.textContent).toContain("bot-ops");
-  });
-
-  test("savePlugins refuses to post when stateError is set (no wipe against a false-empty baseline)", async () => {
-    // The dangerous case: state read failed so pluginsValue came back "", the operator ticks a
-    // subset — without the guard this would POST PLUGINS=<subset> and drop the rest.
-    const page = await runSavePlugins(
-      { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "", stateError: "the bot's current state couldn't be read" },
-      ["warbandeer"],
-    );
-    expect(page.posts).toEqual([]);
-    expect(page.confirms).toEqual([]);
-  });
 });
 
 // The badge DECISIONS are pure {text, kind} functions lifted from index.html's PLUGIN_BADGES markers
@@ -3873,8 +3583,8 @@ describe("admin panel plugin request helpers (#105, lifted from index.html)", ()
   });
 });
 
-// The send consumer, pinned against the page's OWN source — mirrors the savePlugins lift. Proves the
-// boundary (POSTs to /api/plugins/request, re-loads on success, never adds requestedBy), not just the
+// The send consumer, pinned against the page's OWN source, the same lift-and-stub way as applyPending.
+// Proves the boundary (POSTs to /api/plugins/request, re-loads on success, never adds requestedBy), not just the
 // pure payload — the "break lives between changed and unchanged code" lesson.
 describe("admin panel sendPluginRequest (#105, lifted from index.html)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
@@ -4396,6 +4106,44 @@ describe("admin.css uses tokens only", () => {
     expect(phone).toMatch(/\.adm \.rb-btn[\s\S]*min-height:\s*44px;/);
   });
 
+  test("the Apply bar (#257): sticky at the bottom, stacks on a phone, pads focus scrolling, bounds its text, marks a refused control", () => {
+    const bare = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    const rule = (selector: string) => new RegExp(`(^|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^{}]*)\\}`).exec(bare)?.[2] ?? "";
+    expect(rule(".adm-apply")).toMatch(/position:\s*sticky;[\s\S]*bottom:\s*0;/);
+    // The tone rides on the left edge, in tokens: a colour, never small text.
+    expect(rule(".adm-apply--danger")).toMatch(/border-left-color:\s*var\(--rb-danger\);/);
+    expect(rule(".adm-apply--ok")).toMatch(/border-left-color:\s*var\(--rb-success\);/);
+    // On a phone it stacks, and in a column the text's flex-basis would be a HEIGHT (a 260px-tall bar), so the
+    // text goes back to its content's size.
+    const phone = /@media \(max-width: 640px\) \{([\s\S]*)\}\s*$/.exec(bare)?.[1] ?? "";
+    expect(phone).toMatch(/\.adm-apply\s*\{\s*flex-direction:\s*column;/);
+    expect(phone).toMatch(/\.adm-apply__text\s*\{\s*flex:\s*0 0 auto;/);
+    // A sticky bar covers the bottom of the viewport, so focus scrolling is padded while it shows (the phone
+    // bar, stacked, is taller) -- or a Tab stop lands underneath it. And its text is bounded, so a compose log
+    // of hundreds of lines cannot push the buttons off the screen.
+    expect(rule(":root:has(.adm-apply:not([hidden]))")).toMatch(/scroll-padding-bottom:\s*6rem;/);
+    expect(phone).toMatch(/:root:has\(\.adm-apply:not\(\[hidden\]\)\)\s*\{\s*scroll-padding-bottom:\s*10rem;/);
+    // A failed bar (a compose log in its title) and a refused one (the offending value in its hint) can be
+    // taller, both bounded at 30vh below, so the --danger padding is that bound plus the rest of the bar
+    // (unclamped, on purpose: see admin.css). Equal specificity: each danger rule must FOLLOW its base rule.
+    expect(rule(":root:has(.adm-apply--danger:not([hidden]))")).toMatch(/scroll-padding-bottom:\s*calc\(30vh \+ 5rem\);/);
+    expect(phone).toMatch(/:root:has\(\.adm-apply--danger:not\(\[hidden\]\)\)\s*\{\s*scroll-padding-bottom:\s*calc\(30vh \+ 10rem\);/);
+    expect(bare.indexOf(":root:has(.adm-apply--danger")).toBeGreaterThan(bare.indexOf(":root:has(.adm-apply:not([hidden]))"));
+    expect(phone.indexOf(":root:has(.adm-apply--danger")).toBeGreaterThan(phone.indexOf(":root:has(.adm-apply:not([hidden]))"));
+    // The title and the hint are two SEPARATE scrollers, each bounded at 30vh, and the wrapper around them is
+    // neither: the hint holds the backup path (#47), which must never be inside the title's scroller (a
+    // 300-line log would push it out of view), while a pasted 3000-character value in a refusal cannot make
+    // the bar taller than the bound either.
+    expect(rule(".adm-apply__text > strong")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    expect(rule(".adm-apply__text .field-hint")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    expect(rule(".adm-apply__text")).not.toMatch(/max-height|overflow-y/);
+    // The bar takes focus while a request is in flight and shows no ring of its own: the theme's covers it.
+    expect(themeCss).toMatch(/:where\(:focus-visible\)\s*\{\s*outline:\s*var\(--rb-focus-ring\);/);
+    // A control the bar refused (the page sets aria-invalid on it) and a chip field around one.
+    expect(rule('.adm [aria-invalid="true"]')).toMatch(/border-color:\s*var\(--rb-danger\);/);
+    expect(rule('.tag-field:has([aria-invalid="true"])')).toMatch(/border-color:\s*var\(--rb-danger\);/);
+  });
+
   test("the rules for a plugin's own bare controls sit wholly inside :where(), so a bundle's styling wins", () => {
     // A published plugin bundle builds bare label / input / select / textarea / button elements, so
     // admin.css styles them by tag name under .plugin-admin-tab. Every such selector must be ONE
@@ -4647,7 +4395,9 @@ describe("page skeleton", () => {
     const script = indexSrc.slice(indexSrc.indexOf("<script>", bodyStart));
     const looked = new Set([...script.matchAll(/getElementById\("([^"]+)"\)/g)].map((m) => m[1]!));
     expect(looked.size).toBeGreaterThan(25); // can't pass vacuously
-    for (const id of ["lock", "restart", "unlock", "save-env", "save-plugins", "logs-out", "status-grid"]) expect(looked.has(id)).toBe(true);
+    for (const id of ["lock", "restart", "unlock", "apply-bar", "apply-title", "apply-hint", "apply-go", "apply-discard", "apply-ok", "logs-out", "status-grid"]) {
+      expect(looked.has(id)).toBe(true);
+    }
     const missing = [...looked].filter((id) => markup.split(`id="${id}"`).length - 1 !== 1);
     expect(missing).toEqual([]);
   });
@@ -4668,8 +4418,11 @@ describe("page skeleton", () => {
       ['<input id="logs-filter" class="rb-input"', 1],
       ['id="logs-wrap" class="rb-checkbox"', 1],
       ['<pre id="logs-out" class="rb-pre rb-log"', 1],
-      ['<button id="save-env" class="rb-btn rb-btn--primary">', 1],
-      ['<button id="save-plugins" class="rb-btn rb-btn--primary">', 1],
+      ['<button id="apply-go" type="button" class="rb-btn rb-btn--primary">', 1], // #257: the ONE apply button
+      ['<button id="apply-discard" type="button" class="rb-btn rb-btn--ghost">', 1],
+      ['<button id="apply-ok" type="button" class="rb-btn rb-btn--ghost" hidden>', 1],
+      ['<div id="apply-bar" class="adm-apply" tabindex="-1" hidden>', 1],
+      ['<div class="adm-apply__text" role="status">', 1], // the announced text
       ['<button id="add-admin" class="rb-btn rb-btn--primary">', 1],
       ['<input id="admin-email" class="rb-input"', 1],
       ['<div id="env-fields" class="adm-fields">', 1],
@@ -4684,7 +4437,7 @@ describe("page skeleton", () => {
       ['class="instance-badge rb-badge rb-badge--md"', 2],
       ['<label class="inline-check rb-label">', 1], // the Wrap toggle
       ['class="status-grid"', 2], // status and identity
-      ['class="msg"', 4], // restart, config, plugins, admins
+      ['class="msg"', 2], // restart, admins (#257: the config and plugins message lines went with the Save buttons)
       // built by the page script
       ['btn.className = "rb-btn rb-btn--danger rb-btn--sm";', 1], // Remove admin
       ['check.className = "rb-checkbox";', 1], // a plugin's tick box
@@ -4714,19 +4467,1047 @@ describe("page skeleton", () => {
 
   test("every lifted block is still present", () => {
     // The thirteen blocks server.test.ts lifted out of the page before #238, plus the four it added
-    // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES). A rename or a deleted marker would otherwise
-    // leave a lifted `new Function` evaluating an empty string.
+    // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES), minus the two save blocks #257 deleted
+    // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC). A
+    // rename or a deleted marker would otherwise leave a lifted `new Function` evaluating an empty string.
     const names = [
       "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_BADGES", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
-      "PLUGINS_SAVE", "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
-      "ENV_SAVE", "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
+      "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
+      "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
+      "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
     ];
-    expect(names.length).toBe(17);
+    expect(names.length).toBe(19);
+    // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
+    for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
+      expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
+    }
     for (const name of names) {
       expect({ name, begin: indexSrc.split(`// ${name}:begin\n`).length - 1 }).toEqual({ name, begin: 1 });
       expect({ name, end: indexSrc.split(`// ${name}:end\n`).length - 1 }).toEqual({ name, end: 1 });
     }
   });
+
+  // ---- #257: the Apply bar's place in the page ----
+  test("the apply bar is the last child of #app, outside every tabpanel", () => {
+    const inPanels = panelOfIds();
+    expect(markup).toContain('id="apply-bar"');
+    expect(inPanels.has("apply-bar")).toBe(false);
+    const start = markup.indexOf('id="apply-bar"');
+    // After the last tabpanel opens ...
+    expect(start).toBeGreaterThan(markup.lastIndexOf('role="tabpanel"'));
+    // ... and closes before </main>, with nothing between that and the end of <main>.
+    const end = markup.indexOf("</main>", start);
+    expect(end).toBeGreaterThan(start);
+    // The bar's own element: from its opening tag to the </div> that closes it (nested divs counted) ...
+    const open = markup.lastIndexOf("<div", start);
+    let depth = 0;
+    let close = -1;
+    for (const m of markup.slice(open).matchAll(/<div\b|<\/div>/g)) {
+      depth += m[0] === "</div>" ? -1 : 1;
+      if (depth === 0) {
+        close = open + m.index! + m[0].length;
+        break;
+      }
+    }
+    expect(close).toBeGreaterThan(open);
+    // ... and after that, up to </main>, only whitespace and comments: nothing follows it, so it is the LAST
+    // child of <main> (sticky at the bottom of the page) and a sibling of the tabpanels, not inside one.
+    expect(markup.slice(close, end).replace(/<!--[\s\S]*?-->/g, "").trim()).toBe("");
+    expect(markup.slice(end + "</main>".length).trim()).toBe("");
+  });
+
+  test("neither Save button nor its message line remains, and applying asks for no confirm(", () => {
+    for (const gone of ["save-plugins", "save-env", "plugins-msg", "env-msg", "savePlugins", "saveEnv"]) {
+      expect({ gone, found: indexSrc.includes(gone) }).toEqual({ gone, found: false });
+    }
+    // The confirm() dialogs that stay: removing an admin, an update action, Restart. None is in the bar.
+    expect((indexSrc.match(/\bconfirm\(/g) ?? []).length).toBe(3);
+    expect(applyBlock("APPLY")).not.toContain("confirm(");
+    expect(applyBlock("APPLY_PLAN")).not.toContain("confirm(");
+  });
+
+  test("the Config editor does not render a PLUGINS field (loadEnv skips that key)", () => {
+    // loadEnv is far too DOM-heavy to lift; the wiring is pinned in source, the file's idiom for it.
+    const loadEnv = indexSrc.slice(indexSrc.indexOf("async function loadEnv()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
+    expect(loadEnv.length).toBeGreaterThan(500);
+    expect(loadEnv).toContain('if (key === "PLUGINS") continue;');
+    expect(loadEnv.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(loadEnv.indexOf("buildEnvControl(key, value)"));
+  });
+
+  test("the bar is wired: the buttons through withBusy, and ONE delegated input and change listener on #app", () => {
+    expect(indexSrc).toContain('document.getElementById("apply-go").addEventListener("click", (e) => withBusy(e.currentTarget, applyPending));');
+    expect(indexSrc).toContain('document.getElementById("apply-discard").addEventListener("click", (e) => withBusy(e.currentTarget, discardPending));');
+    expect(indexSrc).toContain('document.getElementById("apply-ok").addEventListener("click", dismissApplyResult);');
+    expect(indexSrc.split('app.addEventListener("input", onControlEdited);').length - 1).toBe(1);
+    expect(indexSrc.split('app.addEventListener("change", onControlEdited);').length - 1).toBe(1);
+  });
+
+  test("the bar re-reads what is pending whenever a baseline moves: loadEnv and loadPlugins end in refreshApplyBar", () => {
+    const loadEnv = indexSrc.slice(indexSrc.indexOf("async function loadEnv()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
+    const loadPlugins = indexSrc.slice(indexSrc.indexOf("async function loadPlugins()"), indexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
+    for (const [name, src] of [["loadEnv", loadEnv], ["loadPlugins", loadPlugins]] as const) {
+      const finallyBlock = src.slice(src.lastIndexOf("} finally {"));
+      expect({ name, refreshes: finallyBlock.includes("refreshApplyBar();") }).toEqual({ name, refreshes: true });
+    }
+  });
+
+  test("while the bot's state is unreadable every plugin box is rendered disabled", () => {
+    expect(indexSrc).toContain("container.appendChild(buildPluginRow(p, indexAvailable, !!data.stateError))");
+    expect(indexSrc).toContain("if (stateError || (!p.inIndex && !p.enabled)) check.disabled = true;");
+  });
+
+  test("config is POSTed from ONE place: applyPending (a plugin bundle's own setEnv is separate, and unchanged)", () => {
+    const post = 'api("/api/env", { method: "POST", body: plan.body, signal })';
+    expect(applyBlock("APPLY").split(post).length - 1).toBe(1);
+    expect(indexSrc.split(post).length - 1).toBe(1);
+  });
+
+  test("the chip editor writes its value carrier only through syncTagValue, so the bar hears every chip change", () => {
+    const tagControl = indexSrc.slice(indexSrc.indexOf("function buildTagControl("), indexSrc.indexOf("function buildEnvControl("));
+    expect(tagControl).toContain("const sync = () => syncTagValue(hidden, tokens);");
+    // The one direct write is the initial seeding with the RAW loaded value (before the bar could care).
+    expect(tagControl.split("hidden.value =").length - 1).toBe(1);
+    expect(tagControl).toContain("hidden.value = value;");
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------
+// #257: the Apply bar. Every change that needs a restart -- the plugin on/off choices and every edited
+// config field -- collects in ONE bar and costs ONE POST /api/env and one restart. It replaces the two
+// save paths (savePlugins, saveEnv); every guarantee their tests pinned is carried over BY NAME below:
+//   saveEnv  "POSTs only the changed fields ... (#44)"        -> `an untouched field is never posted ...` +
+//                                                                 `ticking one plugin and editing two fields is ONE POST ...`
+//   saveEnv  "with nothing changed posts nothing"             -> `nothing changed: nothing is posted`
+//   saveEnv  "a declined confirm posts nothing"               -> `no confirm is asked` (there is none to decline)
+//   saveEnv  "a rejected save surfaces bot-ops.sh's own message and re-baselines (#47)" -> `a plain-text failure is shown verbatim ...`
+//   saveEnv  "a failed recreate shows the compose error and backup path ... (#47)"      -> `a failed recreate shows the compose error ...`
+//   saveEnv  "blanking a required field is refused ... nothing is posted (#45)"         -> `a blank required field blocks the whole apply ...`
+//   saveEnv  "... alongside an unrelated valid change blocks the WHOLE save"            -> the same test (a plugin tick and a field change ride along)
+//   saveEnv  "a bad-format value (BOT_BRANCH) is refused ... (#207)"                    -> `a bad format blocks the whole apply the same way`
+//   saveEnv  "with no schema loaded ({}) ... the degraded path (#207)"                  -> `with no schema the apply still goes`
+//   saveEnv  "the POST now carries a real AbortSignal (#53)"  -> `the POST carries an AbortSignal ...`
+//   savePlugins "POSTs only PLUGINS ... then re-baselines all three views"              -> `ticking a plugin alone posts PLUGINS alone` + `success re-loads plugins, env and status ...`
+//   savePlugins "with no change posts nothing"                -> `nothing changed: nothing is posted` + planApply `a formatting-only PLUGINS difference plans nothing`
+//   savePlugins "a rejected save surfaces bot-ops.sh's own message"                     -> `a plain-text failure is shown verbatim ...`
+//   savePlugins "refuses to post when stateError is set (no wipe ...)"                  -> `an unreadable bot state cannot produce a PLUGINS change` + planApply `with plugins null ...`
+// planPluginsSave / planEnvSave / validateEnvChanges are unchanged and their own tests are untouched.
+// ---------------------------------------------------------------------------------------------------
+const applyIndexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+const applyBlock = (name: string): string =>
+  applyIndexSrc.match(new RegExp(`// ${name}:begin\\n([\\s\\S]*?)\\n\\s*// ${name}:end`))?.[1] ?? "";
+
+interface ApplyChange {
+  key: string;
+  before: string;
+  now: string;
+}
+interface ApplyPlanInput {
+  loadedEnv: Record<string, string>;
+  fields: Record<string, string>;
+  plugins: { checkedNames: string[]; currentValue: string; manifestOrder: string[] } | null;
+}
+interface ApplyPlan {
+  changes: ApplyChange[];
+  body: string;
+  count: number;
+  error?: string;
+}
+interface BarView {
+  hidden: boolean;
+  tone: string;
+  title: string;
+  hint: string;
+  showDiscard: boolean;
+  showGo: boolean;
+  showOk: boolean;
+  busy: boolean;
+}
+// "use strict" up front, like the page's own IIFE: without it a lifted `Function` body silently creates
+// a global on an assignment to an un-injected identifier instead of throwing.
+const planApply = new Function(
+  `"use strict";\n${applyBlock("PLUGINS_SAVE_PLAN")}\n${applyBlock("ENV_SAVE_PLAN")}\n${applyBlock("APPLY_PLAN")}\nreturn planApply;`,
+)() as (input: ApplyPlanInput) => ApplyPlan;
+const { applyBarView, describeApplyFailure } = new Function(
+  `"use strict";\n${applyBlock("APPLY_VIEW")}\nreturn { applyBarView, describeApplyFailure };`,
+)() as {
+  applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean }) => BarView;
+  describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
+};
+
+describe("planApply (#257)", () => {
+  const W = { checkedNames: ["warbandeer", "raidhelper"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] };
+
+  test("PLUGINS comes first, then the changed fields in field order", () => {
+    const plan = planApply({
+      loadedEnv: { WATCHED_REPOS: "acme/one", ANNOUNCE_CHANNEL_ID: "111", DISCORD_SERVER_ID: "" },
+      fields: { WATCHED_REPOS: "acme/two", ANNOUNCE_CHANNEL_ID: "222", DISCORD_SERVER_ID: "" },
+      plugins: W,
+    });
+    // WATCHED_REPOS before ANNOUNCE_CHANNEL_ID though it sorts after it: the loaded field order, never re-sorted.
+    expect(plan.changes).toEqual([
+      { key: "PLUGINS", before: "warbandeer", now: "warbandeer,raidhelper" },
+      { key: "WATCHED_REPOS", before: "acme/one", now: "acme/two" },
+      { key: "ANNOUNCE_CHANNEL_ID", before: "111", now: "222" },
+    ]);
+    expect(plan.body).toBe("PLUGINS=warbandeer,raidhelper\nWATCHED_REPOS=acme/two\nANNOUNCE_CHANNEL_ID=222");
+    expect(plan.count).toBe(3);
+    expect(plan.error).toBeUndefined();
+  });
+
+  test("PLUGINS is ordered by the manifest, not by the order the boxes were ticked in", () => {
+    const plan = planApply({
+      loadedEnv: {},
+      fields: {},
+      plugins: { checkedNames: ["warbandeer", "raidhelper"], currentValue: "", manifestOrder: ["raidhelper", "warbandeer"] },
+    });
+    expect(plan.changes).toEqual([{ key: "PLUGINS", before: "", now: "raidhelper,warbandeer" }]);
+    expect(plan.body).toBe("PLUGINS=raidhelper,warbandeer");
+  });
+
+  test("an unchanged page plans nothing", () => {
+    const plan = planApply({ loadedEnv: { A: "1", B: "" }, fields: { A: "1", B: "" }, plugins: { ...W, checkedNames: ["warbandeer"] } });
+    expect(plan).toEqual({ changes: [], body: "", count: 0 });
+  });
+
+  test("a formatting-only PLUGINS difference plans nothing", () => {
+    const plan = planApply({ loadedEnv: {}, fields: {}, plugins: { checkedNames: ["warbandeer", "raidhelper"], currentValue: "warbandeer, raidhelper", manifestOrder: ["warbandeer", "raidhelper"] } });
+    expect(plan.count).toBe(0);
+  });
+
+  test("an existing name@version pin survives", () => {
+    const plan = planApply({ loadedEnv: {}, fields: {}, plugins: { ...W, currentValue: "warbandeer@1.0.0" } });
+    expect(plan.changes).toEqual([{ key: "PLUGINS", before: "warbandeer@1.0.0", now: "warbandeer@1.0.0,raidhelper" }]);
+    expect(plan.body).toBe("PLUGINS=warbandeer@1.0.0,raidhelper");
+  });
+
+  test("unticking every plugin is a change to an empty PLUGINS", () => {
+    const plan = planApply({ loadedEnv: {}, fields: {}, plugins: { ...W, checkedNames: [] } });
+    expect(plan.changes).toEqual([{ key: "PLUGINS", before: "warbandeer", now: "" }]);
+    expect(plan.body).toBe("PLUGINS=");
+  });
+
+  test("with plugins null, a ticked box plans nothing", () => {
+    // `plugins` is null when the bot's state could not be read: nothing may be planned against it, whatever
+    // is ticked, while the config fields still plan normally.
+    const plan = planApply({ loadedEnv: { PLUGINS: "warbandeer", A: "1" }, fields: { A: "2" }, plugins: null });
+    expect(plan.changes).toEqual([{ key: "A", before: "1", now: "2" }]);
+    expect(plan.body).toBe("A=2");
+  });
+
+  test("a PLUGINS field among the env fields is ignored", () => {
+    const plan = planApply({ loadedEnv: { PLUGINS: "warbandeer", A: "1" }, fields: { PLUGINS: "raidhelper", A: "2" }, plugins: { ...W, checkedNames: ["warbandeer"] } });
+    expect(plan.changes).toEqual([{ key: "A", before: "1", now: "2" }]);
+    expect(plan.body).not.toContain("PLUGINS");
+  });
+
+  test("a line break in a value is an error and the body is empty", () => {
+    for (const bad of ["8080\nANNOUNCE_CHANNEL_ID=1", "8080\rX=1", "8080\r\nX=1", "\n"]) {
+      const plan = planApply({ loadedEnv: { OK: "1", PORT: "" }, fields: { OK: "2", PORT: bad }, plugins: null });
+      expect(plan.error, JSON.stringify(bad)).toBe("PORT must not contain a line break.");
+      expect(plan.body, JSON.stringify(bad)).toBe("");
+      expect(plan.count).toBe(2); // the bar still says how many changes are pending
+    }
+    // The FIRST offending key is named.
+    expect(planApply({ loadedEnv: {}, fields: { A: "x\ny", B: "x\ny" }, plugins: null }).error).toBe("A must not contain a line break.");
+  });
+});
+
+describe("applyBarView (#257)", () => {
+  const hiddenView: BarView = { hidden: true, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false };
+  const HINT = "The bot goes offline for about 20 seconds while it restarts.";
+
+  test("idle with nothing pending: the bar is hidden", () => {
+    expect(applyBarView({ count: 0, phase: "idle" })).toEqual(hiddenView);
+  });
+
+  test("idle with changes pending: the count, the consequence, Discard and Apply and restart", () => {
+    expect(applyBarView({ count: 3, phase: "idle" })).toEqual({
+      hidden: false, tone: "", title: "3 changes need a restart", hint: HINT, showDiscard: true, showGo: true, showOk: false, busy: false,
+    });
+  });
+
+  test("the count is singular for one", () => {
+    expect(applyBarView({ count: 1, phase: "idle" }).title).toBe("1 change needs a restart");
+    expect(applyBarView({ count: 2, phase: "idle" }).title).toBe("2 changes need a restart");
+  });
+
+  test("idle with a validation error: the same title, the error as the hint, danger, both buttons", () => {
+    expect(applyBarView({ count: 2, phase: "idle", error: "ANNOUNCE_CHANNEL_ID is required and cannot be blank." })).toEqual({
+      hidden: false, tone: "danger", title: "2 changes need a restart", hint: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.",
+      showDiscard: true, showGo: true, showOk: false, busy: false,
+    });
+  });
+
+  test("applying: Restarting the bot..., both buttons shown and busy", () => {
+    expect(applyBarView({ count: 3, phase: "applying" })).toEqual({
+      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", showDiscard: true, showGo: true, showOk: false, busy: true,
+    });
+    // ... whatever else is in the state: an in-flight request has one message.
+    expect(applyBarView({ count: 0, phase: "applying", error: "x", detail: "y" }).title).toBe("Restarting the bot…");
+  });
+
+  test("done: it says the change is running, ok tone, only OK", () => {
+    expect(applyBarView({ count: 3, phase: "done" })).toEqual({
+      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", showDiscard: false, showGo: false, showOk: true, busy: false,
+    });
+    expect(applyBarView({ count: 0, phase: "done" }).hidden).toBe(false); // shown even though nothing is pending any more
+  });
+
+  test("done with nothing restarted (bot-ops.sh's \"no changes\" answer): it does not claim a restart", () => {
+    const view = applyBarView({ count: 1, phase: "done", noop: true });
+    expect(view).toEqual({
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      showDiscard: false, showGo: false, showOk: true, busy: false,
+    });
+    expect(`${view.title} ${view.hint}`).not.toMatch(/restarted with/);
+    // noop only means something once an apply has finished: pending changes never read as "nothing needed".
+    expect(applyBarView({ count: 1, phase: "idle", noop: true }).title).toBe("1 change needs a restart");
+    expect(applyBarView({ count: 1, phase: "failed", error: "boom", noop: true }).title).toBe("Couldn't apply: boom");
+    expect(applyBarView({ count: 1, phase: "applying", noop: true }).title).toBe("Restarting the bot…");
+  });
+
+  test("failed: the error in the title, the detail as the hint, danger, OK -- plus Discard and Apply while changes are pending", () => {
+    expect(applyBarView({ count: 0, phase: "failed", error: "compose: image not found", detail: "Backup: /opt/x/.env.bak.1" })).toEqual({
+      hidden: false, tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1",
+      showDiscard: false, showGo: false, showOk: true, busy: false,
+    });
+    const again = applyBarView({ count: 2, phase: "failed", error: "boom" });
+    expect([again.showOk, again.showDiscard, again.showGo]).toEqual([true, true, true]);
+    expect(again.hint).toBe("");
+  });
+
+  test("failed with no error text still says something", () => {
+    expect(applyBarView({ count: 1, phase: "failed", error: "" }).title).toBe("Couldn't apply: bot-ops.sh error");
+  });
+});
+
+describe("describeApplyFailure (#257, the failText logic saveEnv had, split in two lines)", () => {
+  test("a failed recreate: the compose error, and the backup path as the detail -- never the raw JSON (#47)", () => {
+    const text = '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+    expect(describeApplyFailure(text, JSON.parse(text))).toEqual({ error: "compose: image not found", detail: "Backup: /opt/x/.env.bak.1" });
+  });
+  test("a log with no backup, and a backup with no log", () => {
+    expect(describeApplyFailure("{}", { log: "compose: boom" })).toEqual({ error: "compose: boom", detail: "" });
+    expect(describeApplyFailure("{}", { backup: "/x/.env.bak" })).toEqual({ error: "bot-ops.sh error", detail: "Backup: /x/.env.bak" });
+  });
+  test("anything else is shown verbatim: plain text, an empty body, JSON without a log or a backup", () => {
+    expect(describeApplyFailure("bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", null)).toEqual({ error: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", detail: "" });
+    expect(describeApplyFailure("", null)).toEqual({ error: "bot-ops.sh error", detail: "" });
+    expect(describeApplyFailure('{"ok":false}', {})).toEqual({ error: '{"ok":false}', detail: "" });
+  });
+});
+
+// The DOM half, lifted with every page global injected and run against a stub page. The stub THROWS on any
+// element id it was not given and on any selector the collector is not allowed: a plugin's own settings
+// bundle renders arbitrary DOM inside this page, so a page-wide [data-key] would be a bug, not a convenience.
+interface StubEl {
+  id: string;
+  hidden: boolean;
+  disabled: boolean;
+  textContent: string;
+  value: string;
+  checked: boolean;
+  dataset: Record<string, string>;
+  classes: Set<string>;
+  attrs: Map<string, string>;
+  classList: { toggle: (name: string, force?: boolean) => boolean };
+  setAttribute: (name: string, value: string) => void;
+  removeAttribute: (name: string) => void;
+  getAttribute: (name: string) => string | null;
+  focus: (options?: { preventScroll?: boolean }) => void;
+  contains: (other: unknown) => boolean;
+  closest: (selector: string) => unknown;
+}
+interface ApplySpec {
+  loadedEnv: Record<string, string>;
+  /** The config controls' current values, in field order (default: loadedEnv, nothing edited). */
+  fields?: Record<string, string>;
+  /** Field keys whose control is a chip editor: the [data-key] carrier is a hidden input, the control is a typing input. */
+  tags?: string[];
+  pluginsData?: { plugins: { name: string }[]; pluginsValue: string; stateError?: string } | null;
+  /** The ticked plugin names (default: the names in pluginsValue). */
+  checked?: string[];
+  schema?: Record<string, unknown>;
+  /** What api() answers; an Error is thrown by it (a timeout, the 401 "unauthorized"). */
+  response?: { ok: boolean; text: string } | Error;
+  /** api() waits for this before answering: an in-flight request. */
+  hold?: Promise<void>;
+  /** The loaders put the controls back to `loadedEnv` and the server's ticks (a re-render from the baseline). */
+  resetOnReload?: boolean;
+  /** The plugin list is not rendered (a failed /api/plugins reload swaps the boxes for an error line) while
+   *  `pluginsData` still holds the previous answer. */
+  noBoxes?: boolean;
+}
+type ApplyPost = { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } };
+
+const APPLY_SCHEMA = { ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: true, source: "core" } };
+const APPLY_PLUGINS = { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "warbandeer" };
+const APPLY_ENV = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "11111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage", WATCHED_REPOS: "us" };
+
+function runApply(spec: ApplySpec) {
+  const log = {
+    posts: [] as ApplyPost[],
+    reloads: { plugins: 0, env: 0, status: 0 },
+    tabs: [] as [string, boolean][],
+    focused: [] as string[],
+    /** The ids focused with { preventScroll: true }. */
+    preventScroll: [] as string[],
+    /** Every write to any stub's textContent, as `id=text` (the bar's words are a live region). */
+    textWrites: [] as string[],
+    cancels: 0,
+    timeouts: [] as number[],
+    selectors: [] as string[],
+  };
+  const state: { active: StubEl | null } = { active: null };
+  const makeEl = (id: string, over: Partial<StubEl> = {}): StubEl => {
+    let hidden = false;
+    let disabled = false;
+    const el: StubEl = {
+      id, hidden, disabled, textContent: "", value: "", checked: false, dataset: {}, classes: new Set(), attrs: new Map(),
+      classList: { toggle: (name, force) => { const want = force ?? !el.classes.has(name); if (want) el.classes.add(name); else el.classes.delete(name); return want; } },
+      setAttribute: (name, value) => void el.attrs.set(name, value),
+      removeAttribute: (name) => void el.attrs.delete(name),
+      getAttribute: (name) => el.attrs.get(name) ?? null,
+      focus: (options) => {
+        log.focused.push(el.id);
+        if (options?.preventScroll) log.preventScroll.push(el.id);
+        state.active = el;
+      },
+      contains: (other) => other === el,
+      closest: () => null,
+      ...over,
+    };
+    // The browser drops focus to <body> when the focused element (or one inside it) is hidden -- and, in
+    // Firefox, when it is disabled. The stub does both, so a page that forgot focus shows up as a lost one.
+    const dropsFocus = () => {
+      if (state.active && (state.active === el || el.contains(state.active))) state.active = null;
+    };
+    Object.defineProperty(el, "hidden", { get: () => hidden, set: (v: boolean) => { hidden = v; if (v) dropsFocus(); }, configurable: true });
+    Object.defineProperty(el, "disabled", { get: () => disabled, set: (v: boolean) => { disabled = v; if (v) dropsFocus(); }, configurable: true });
+    let text = "";
+    Object.defineProperty(el, "textContent", { get: () => text, set: (v: string) => { text = v; log.textWrites.push(`${el.id}=${v}`); }, configurable: true });
+    if (over.hidden) hidden = true;
+    return el;
+  };
+
+  const bar = makeEl("apply-bar", { hidden: true });
+  const title = makeEl("apply-title");
+  const hint = makeEl("apply-hint");
+  const ok = makeEl("apply-ok", { hidden: true });
+  const discard = makeEl("apply-discard");
+  const go = makeEl("apply-go");
+  const inBar: unknown[] = [bar, title, hint, ok, discard, go];
+  bar.contains = (other) => inBar.includes(other);
+  const tab = makeEl("tab-settings");
+  const body = makeEl("body");
+
+  const baseline = { ...spec.loadedEnv }; // what the server holds: what a re-render restores
+  const fieldEntries = Object.entries(spec.fields ?? spec.loadedEnv);
+  const byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go].map((e) => [e.id, e]));
+  const controls = fieldEntries.map(([key, value]) => {
+    const carrier = makeEl(`carrier-${key}`, { value, dataset: { key } });
+    // A plain control is its own [data-key] element and carries the id its label points at; a chip
+    // editor's carrier is a hidden input, and the id belongs to the typing input beside it.
+    const control = (spec.tags ?? []).includes(key) ? makeEl(`env-${key}`) : carrier;
+    if (control === carrier) carrier.id = `env-${key}`;
+    byId.set(`env-${key}`, control);
+    return carrier;
+  });
+  const pluginsData = spec.pluginsData === undefined ? APPLY_PLUGINS : spec.pluginsData;
+  const tickedOnServer = pluginsData ? pluginsData.pluginsValue.split(",").map((t) => t.split("@")[0]!.trim()).filter(Boolean) : [];
+  const tickedNow = spec.checked ?? tickedOnServer;
+  const boxes = spec.noBoxes ? [] : (pluginsData?.plugins ?? []).map((p) => makeEl(`plugin-${p.name}`, { dataset: { plugin: p.name }, checked: tickedNow.includes(p.name) }));
+  const boxBaseline = (pluginsData?.plugins ?? []).map((p) => tickedOnServer.includes(p.name));
+
+  const document = {
+    body,
+    get activeElement() { return state.active ?? body; },
+    getElementById: (id: string): StubEl => {
+      const el = byId.get(id);
+      if (!el) throw new Error(`harness: the page asked for an element it was not given: #${id}`);
+      return el;
+    },
+    querySelectorAll: (selector: string): StubEl[] => {
+      log.selectors.push(selector);
+      if (selector === "#env-fields [data-key]") return controls;
+      if (selector === "#plugins-list input[type=checkbox][data-plugin]") return boxes;
+      throw new Error(`harness: the collector may read only its two selectors, not ${JSON.stringify(selector)}`);
+    },
+    querySelector: (selector: string): StubEl | null => {
+      if (selector === '[role="tab"][aria-selected="true"]') return tab;
+      throw new Error(`harness: unexpected querySelector(${JSON.stringify(selector)})`);
+    },
+  };
+  // The real loaders re-render every control from the persisted state. With `resetOnReload` the stubs do
+  // the same to the stub controls (back to the baseline they started from), so Discard is observable end
+  // to end; without it they only count (after a real apply the new baseline IS what was typed).
+  const loadEnv = async () => {
+    log.reloads.env++;
+    if (spec.resetOnReload) controls.forEach((c) => { c.value = baseline[c.dataset.key!] ?? ""; });
+  };
+  const loadPlugins = async () => {
+    log.reloads.plugins++;
+    if (spec.resetOnReload) boxes.forEach((b, i) => { b.checked = boxBaseline[i]!; });
+  };
+  const loadStatus = async () => void log.reloads.status++;
+  const api = async (path: string, opts: ApplyPost["opts"]) => {
+    log.posts.push({ path, opts });
+    if (spec.hold) await spec.hold;
+    if (spec.response instanceof Error) throw spec.response;
+    const r = spec.response ?? { ok: true, text: '{"ok":true,"changed":["X"]}' };
+    return { ok: r.ok, text: async () => r.text };
+  };
+  const timeoutSignal = (ms: number) => {
+    log.timeouts.push(ms);
+    return { signal: new AbortController().signal, cancel: () => void log.cancels++ };
+  };
+  const confirm = () => {
+    throw new Error("confirm() must not be asked: the bar is the confirmation");
+  };
+  const showTab = (id: string, moveFocus: boolean) => void log.tabs.push([id, moveFocus]);
+
+  const run = new Function(
+    "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
+    `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending };",
+  )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
+    applyPending: () => Promise<void>;
+    discardPending: () => Promise<void>;
+    refreshApplyBar: () => void;
+    onControlEdited: (e: unknown) => void;
+    dismissApplyResult: () => void;
+    collectPending: () => ApplyPlanInput;
+  };
+
+  return {
+    run,
+    log,
+    els: { bar, title, hint, ok, discard, go, tab, body },
+    controls,
+    boxes,
+    /** The control the page marks / focuses for `key` (a chip editor's typing input, else the field itself). */
+    control: (key: string) => byId.get(`env-${key}`)!,
+    edit(key: string, value: string) {
+      const c = controls.find((x) => x.dataset.key === key)!;
+      c.value = value;
+      return c;
+    },
+    tick(name: string, on: boolean) {
+      const b = boxes.find((x) => x.dataset.plugin === name)!;
+      b.checked = on;
+      return b;
+    },
+    activate(el: StubEl | null) { state.active = el; },
+    /** What the bar is showing right now. */
+    view() {
+      return {
+        hidden: bar.hidden,
+        tone: bar.classes.has("adm-apply--danger") ? "danger" : bar.classes.has("adm-apply--ok") ? "ok" : "",
+        title: title.textContent,
+        hint: hint.textContent,
+        ok: !ok.hidden,
+        discard: !discard.hidden,
+        go: !go.hidden,
+        disabled: go.disabled && discard.disabled,
+      };
+    },
+  };
+}
+
+describe("applyPending (#257)", () => {
+  const ticked = ["warbandeer", "raidhelper"];
+  const returnsSoon = (call: Promise<void>) => Promise.race([call.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100))]);
+
+  test("ticking one plugin and editing two fields is ONE POST: PLUGINS first, only those three keys", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "22222", WATCHED_REPOS: "eu" }, checked: ticked });
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(1);
+    const [post] = page.log.posts;
+    expect(post?.path).toBe("/api/env");
+    expect(post?.opts.method).toBe("POST");
+    expect(post?.opts.body).toBe("PLUGINS=warbandeer,raidhelper\nANNOUNCE_CHANNEL_ID=22222\nWATCHED_REPOS=eu");
+  });
+
+  test("ticking a plugin alone posts PLUGINS alone", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, checked: ticked });
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["PLUGINS=warbandeer,raidhelper"]);
+  });
+
+  test("an untouched field is never posted, even when its stored value would fail its format (#44)", async () => {
+    // The issue's exact setup: two stored values the whitelist would reject, both untouched. The schema is
+    // strict about the very field that holds one, so posting it would be refused: it must not be sent at all.
+    const loaded = { DISCORD_SERVER_ID: "", ANNOUNCE_CHANNEL_ID: "11111", ADMIN_USER_IDS: "123456, 234567", REPORT_ROLE_ID: "stormrage" };
+    const schema = { ...APPLY_SCHEMA, ADMIN_USER_IDS: { pattern: "^[0-9]+(,[0-9]+)*$", required: false, source: "core" } };
+    const page = runApply({ loadedEnv: loaded, fields: { ...loaded, ANNOUNCE_CHANNEL_ID: "22222" }, schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(1);
+    expect(page.log.posts[0]?.opts.body).toBe("ANNOUNCE_CHANNEL_ID=22222");
+  });
+
+  test("nothing changed: nothing is posted, and the bar stays hidden", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    await page.run.applyPending();
+    page.run.refreshApplyBar();
+    expect(page.log.posts).toEqual([]);
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+    expect(page.view().hidden).toBe(true);
+  });
+
+  test("a blank required field blocks the whole apply, names the key, marks the control invalid, shows its tab, and posts nothing (#45)", async () => {
+    // A plugin tick and an unrelated valid change ride along: they are not posted either.
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" }, checked: ticked });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.view()).toMatchObject({
+      hidden: false,
+      tone: "danger",
+      title: "3 changes need a restart",
+      hint: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.",
+      go: true,
+      discard: true,
+    });
+    const control = page.control("ANNOUNCE_CHANNEL_ID");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    expect(page.log.tabs).toEqual([["settings", false]]);
+    expect(page.log.focused).toEqual(["env-ANNOUNCE_CHANNEL_ID"]);
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+  });
+
+  test("a refusal on a chip field marks and focuses its typing input, not the hidden carrier", async () => {
+    const schema = { ADMIN_USER_IDS: { pattern: "^[0-9,]+$", required: true, source: "core" } };
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ADMIN_USER_IDS: "" }, tags: ["ADMIN_USER_IDS"], schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.log.focused).toEqual(["env-ADMIN_USER_IDS"]);
+    expect(page.control("ADMIN_USER_IDS").attrs.get("aria-invalid")).toBe("true");
+    expect(page.controls.find((c) => c.dataset.key === "ADMIN_USER_IDS")!.attrs.has("aria-invalid")).toBe(false);
+  });
+
+  test("a bad format blocks the whole apply the same way (#207)", async () => {
+    const schema = { BOT_BRANCH: { pattern: "^[A-Za-z0-9._/-]{1,100}$", required: false, source: "core" } };
+    const page = runApply({ loadedEnv: { BOT_BRANCH: "main", A: "1" }, fields: { BOT_BRANCH: "bad branch!", A: "2" }, schema, pluginsData: null });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.view().hint).toBe('BOT_BRANCH: "bad branch!" doesn\'t match the expected format (^[A-Za-z0-9._/-]{1,100}$).');
+    expect(page.view().tone).toBe("danger");
+    expect(page.control("BOT_BRANCH").attrs.get("aria-invalid")).toBe("true");
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 }); // nothing was sent, so nothing is re-read
+  });
+
+  test("a refusal on PLUGINS itself shows the plugins tab, marks no control, and posts nothing", async () => {
+    // A ticked name the PLUGINS pattern rejects (the schema carries bot-ops.sh's own pattern for the key).
+    const schema = { ...APPLY_SCHEMA, PLUGINS: { pattern: "^[a-z][a-z0-9-]*(@[A-Za-z0-9._-]+)?(,[a-z][a-z0-9-]*(@[A-Za-z0-9._-]+)?)*$", required: false, source: "core" } };
+    const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "Bad_Name" }], pluginsValue: "warbandeer" };
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, pluginsData, checked: ["warbandeer", "Bad_Name"], schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.log.tabs).toEqual([["plugins", false]]);
+    expect(page.log.focused).toEqual([]); // there is no single control to send the user to: the tab is the place
+    expect(page.view()).toMatchObject({ hidden: false, tone: "danger", title: "2 changes need a restart" });
+    expect(page.view().hint).toMatch(/^PLUGINS: "warbandeer,Bad_Name" doesn't match the expected format/);
+    for (const el of [...page.controls, ...page.boxes]) expect(el.attrs.has("aria-invalid")).toBe(false);
+  });
+
+  test("with no plugin box rendered (a failed reload of the list) no PLUGINS change is planned, so it cannot wipe them", async () => {
+    // pluginsData is the PREVIOUS answer (PLUGINS=warbandeer); the list on the page is now an error line.
+    // Reading "nothing ticked" against it would post PLUGINS= and switch every plugin off.
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, noBoxes: true });
+    expect(page.run.collectPending().plugins).toBeNull();
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+    // With nothing else changed, there is nothing to apply at all: the bar stays hidden and nothing is posted.
+    const alone = runApply({ loadedEnv: APPLY_ENV, noBoxes: true });
+    alone.run.refreshApplyBar();
+    await alone.run.applyPending();
+    expect(alone.view().hidden).toBe(true);
+    expect(alone.log.posts).toEqual([]);
+  });
+
+  test("with the list rendered, unticking every plugin is still a real change (the guard is 'no box', not 'nothing ticked')", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, checked: [] });
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["PLUGINS="]);
+  });
+
+  test("with no schema the apply still goes (the degraded path, #207)", async () => {
+    const page = runApply({ loadedEnv: { BOT_BRANCH: "main" }, fields: { BOT_BRANCH: "bad branch!" }, schema: {}, pluginsData: null });
+    await page.run.applyPending();
+    expect(page.log.posts.map((p) => p.opts.body)).toEqual(["BOT_BRANCH=bad branch!"]);
+  });
+
+  test("a line break in a value is refused before anything is sent", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu\nANNOUNCE_CHANNEL_ID=1" } });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.view()).toMatchObject({ hidden: false, tone: "danger", hint: "WATCHED_REPOS must not contain a line break." });
+  });
+
+  test("the POST carries an AbortSignal, and the timer is cancelled when the request settles (#53)", async () => {
+    for (const response of [undefined, { ok: false, text: "nope" }, new Error("boom")]) {
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response });
+      await page.run.applyPending();
+      expect(page.log.posts[0]?.opts.signal).toBeInstanceOf(AbortSignal);
+      expect(page.log.timeouts).toEqual([110000]);
+      expect(page.log.cancels).toBe(1);
+    }
+  });
+
+  test("success re-loads plugins, env and status, and the bar says applied", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, checked: ticked });
+    await page.run.applyPending();
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 });
+    expect(page.view()).toEqual({
+      hidden: false, tone: "ok", title: "Applied. The bot restarted with your changes.", hint: "", ok: true, discard: false, go: false, disabled: false,
+    });
+  });
+
+  test("bot-ops.sh's \"no changes\" answer says nothing was restarted (it never claims a restart it did not do)", async () => {
+    // env-set found .env already holding every value (another operator applied them, or the tab was stale).
+    const text = '{"ok":true,"changed":[],"recreated":false,"note":"no changes"}';
+    const spec: ApplySpec = { loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: true, text } };
+    const page = runApply(spec);
+    await page.run.applyPending();
+    expect(page.view()).toEqual({
+      hidden: false, tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.",
+      ok: true, discard: false, go: false, disabled: false,
+    });
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 1 }); // still re-baselined
+    // Only an explicit recreated:false counts; a real restart (recreated:true), or any other success body, still says applied.
+    for (const body of ['{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}', '{"ok":true,"changed":["X"]}', "OK", ""]) {
+      const real = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: true, text: body } });
+      await real.run.applyPending();
+      expect({ body, title: real.view().title }).toEqual({ body, title: "Applied. The bot restarted with your changes." });
+    }
+    // ... and a later apply on the same page (the edit is still pending) is not stuck on the earlier answer.
+    page.run.onControlEdited({ target: { closest: () => ({}) } });
+    expect(page.view().title).toBe("1 change needs a restart");
+    spec.response = { ok: true, text: '{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}' };
+    await page.run.applyPending();
+    expect(page.view().title).toBe("Applied. The bot restarted with your changes.");
+  });
+
+  test("a failed recreate shows the compose error and the backup path, and re-baselines (#47)", async () => {
+    const text = '{"ok":false,"changed":["REPORT_ROLE_ID"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, REPORT_ROLE_ID: "orgrimmar" }, response: { ok: false, text } });
+    await page.run.applyPending();
+    const view = page.view();
+    expect(view).toMatchObject({ hidden: false, tone: "danger", title: "Couldn't apply: compose: image not found", hint: "Backup: /opt/x/.env.bak.1", ok: true });
+    expect(`${view.title}${view.hint}`).not.toContain('"ok"'); // never the raw JSON blob
+    // .env may already have been rewritten: the plugins and the config are re-read; nothing "restarted".
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+  });
+
+  test("a plain-text failure is shown verbatim, and re-baselines (#47)", async () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" },
+      response: { ok: false, text: "bot-ops: env-set: value for 'WATCHED_REPOS' is invalid" },
+    });
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: bot-ops: env-set: value for 'WATCHED_REPOS' is invalid", hint: "" });
+    // Unconditionally: a plain-text answer can still follow a rewritten .env, and the page cannot tell.
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+  });
+
+  test("a timeout is shown", async () => {
+    const aborted = Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: aborted });
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: The operation was aborted.", ok: true });
+    expect(page.log.cancels).toBe(1);
+  });
+
+  test("unauthorized is swallowed: the bar does not stay on Restarting the bot...", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: new Error("unauthorized") });
+    await page.run.applyPending();
+    // Back to what is pending (the gate is what the user sees); no error is shown for it.
+    expect(page.view()).toMatchObject({ hidden: false, tone: "", title: "1 change needs a restart", ok: false, go: true });
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+  });
+
+  test("an unreadable bot state cannot produce a PLUGINS change", async () => {
+    // The dangerous case: the state read failed, so pluginsValue came back "" -- ticking a subset would post
+    // PLUGINS=<subset> and drop the rest. With the state unreadable (or not loaded yet) it is never planned.
+    for (const pluginsData of [{ ...APPLY_PLUGINS, pluginsValue: "", stateError: "the bot's current state couldn't be read" }, null]) {
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, pluginsData, checked: ["warbandeer"] });
+      await page.run.applyPending();
+      expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+      // ... and it does not so much as look at the boxes.
+      expect(page.log.selectors).not.toContain("#plugins-list input[type=checkbox][data-plugin]");
+    }
+    // Nothing else changed: nothing at all is posted.
+    const alone = runApply({ loadedEnv: APPLY_ENV, pluginsData: { ...APPLY_PLUGINS, pluginsValue: "", stateError: "x" }, checked: ["warbandeer"] });
+    await alone.run.applyPending();
+    expect(alone.log.posts).toEqual([]);
+  });
+
+  test("no confirm is asked", async () => {
+    // The injected confirm() throws: any call would fail this apply (and its failure paths).
+    for (const response of [undefined, { ok: false, text: "nope" }]) {
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, checked: ticked, response });
+      await page.run.applyPending();
+      expect(page.log.posts).toHaveLength(1);
+    }
+  });
+
+  test("the collector reads exactly two selectors, so a plugin bundle's DOM cannot feed the bar", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    const input = page.run.collectPending();
+    expect(page.log.selectors).toEqual(["#env-fields [data-key]", "#plugins-list input[type=checkbox][data-plugin]"]);
+    expect(Object.keys(input.fields)).toEqual(Object.keys(APPLY_ENV));
+    expect(input.plugins).toEqual({ checkedNames: ["warbandeer"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] });
+    expect(input.loadedEnv).toBe(APPLY_ENV);
+  });
+
+  test("while the request is in flight the bar says Restarting the bot..., both buttons are disabled, and a second apply is ignored", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, hold });
+    const first = page.run.applyPending();
+    await Promise.resolve();
+    expect(page.view()).toEqual({
+      hidden: false, tone: "", title: "Restarting the bot…", hint: "This takes about 20 seconds.", ok: false, discard: true, go: true, disabled: true,
+    });
+    try {
+      // A second click while one is in flight, and a Discard: each must return at once. Raced against a
+      // deadline, because a page that DID start a second request would wait on the held one forever (Bun on
+      // this box neither times such a test out nor exits): the failure has to be an assertion, not a hang.
+      expect(await returnsSoon(page.run.applyPending())).toBe(true);
+      expect(await returnsSoon(page.run.discardPending())).toBe(true);
+      expect(page.log.posts).toHaveLength(1);
+      expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
+    } finally {
+      release();
+    }
+    await first;
+    expect(page.view().title).toBe("Applied. The bot restarted with your changes.");
+    expect(page.view().disabled).toBe(false);
+  });
+
+  test("focus rests on the bar while a request is in flight and lands on OK when it ends", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, hold });
+    page.activate(page.els.go); // the Apply button was focused (and is about to be disabled)
+    const pending = page.run.applyPending();
+    await Promise.resolve();
+    expect(page.log.focused).toEqual(["apply-bar"]);
+    release();
+    await pending;
+    expect(page.log.focused).toEqual(["apply-bar", "apply-ok"]);
+  });
+
+  test("focus lost to the page (Firefox drops a disabled button's focus) is recovered too, but focus the user moved elsewhere is not pulled back", async () => {
+    const lost = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" } });
+    await lost.run.applyPending(); // nothing is focused
+    expect(lost.log.focused).toEqual(["apply-bar", "apply-ok"]);
+
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const moved = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, hold });
+    moved.activate(moved.els.go);
+    const pending = moved.run.applyPending();
+    await Promise.resolve();
+    moved.activate(moved.control("WATCHED_REPOS")); // the user tabbed into a field during the restart
+    release();
+    await pending;
+    expect(moved.log.focused).toEqual(["apply-bar"]); // not pulled to OK
+  });
+
+  test("a request that throws (a timeout, the network) also lands focus on OK", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: new Error("The operation was aborted.") });
+    page.activate(page.els.go);
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", ok: true });
+    expect(page.log.focused).toEqual(["apply-bar", "apply-ok"]);
+  });
+
+  test("a refusal is over once an apply goes: its message and its aria-invalid mark do not outlive it", async () => {
+    // Refused (blank required field), then the field is filled by something that fires no `input` event
+    // (a reload of the config does), then Apply goes and fails. The refusal is not true any more and must
+    // not come back when the failure is dismissed.
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" },
+      response: { ok: false, text: "nope" },
+    });
+    await page.run.applyPending();
+    expect(page.view().hint).toBe("ANNOUNCE_CHANNEL_ID is required and cannot be blank.");
+    const control = page.control("ANNOUNCE_CHANNEL_ID");
+    expect(control.attrs.has("aria-invalid")).toBe(true);
+    page.edit("ANNOUNCE_CHANNEL_ID", "22222");
+    await page.run.applyPending();
+    expect(page.view().title).toBe("Couldn't apply: nope");
+    expect(control.attrs.has("aria-invalid")).toBe(false);
+    page.run.dismissApplyResult();
+    expect(page.view()).toMatchObject({ tone: "", title: "2 changes need a restart", hint: "The bot goes offline for about 20 seconds while it restarts." });
+  });
+
+  test("a keystroke that leaves the bar's words as they were does not rewrite them (the words are a live region)", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    const writes = (id: string) => page.log.textWrites.filter((w) => w.startsWith(`${id}=`));
+    for (const value of ["e", "eu", "eu,", "eu,ap", "eu,ap,tw"]) {
+      page.edit("WATCHED_REPOS", value);
+      page.run.refreshApplyBar();
+    }
+    expect(page.view().title).toBe("1 change needs a restart");
+    expect(writes("apply-title")).toEqual(["apply-title=1 change needs a restart"]);
+    expect(writes("apply-hint")).toEqual(["apply-hint=The bot goes offline for about 20 seconds while it restarts."]);
+    // A real change of words is written.
+    page.edit("ANNOUNCE_CHANNEL_ID", "22222");
+    page.run.refreshApplyBar();
+    expect(writes("apply-title")).toEqual(["apply-title=1 change needs a restart", "apply-title=2 changes need a restart"]);
+  });
+});
+
+describe("Apply bar events (#257)", () => {
+  const inside = { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null), getAttribute: () => null, removeAttribute: () => {} };
+  const outside = { closest: () => null, getAttribute: () => null, removeAttribute: () => {} };
+
+  test("an edit inside the config fields or the plugin list shows the bar; an event from anywhere else does nothing", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    page.run.onControlEdited({ target: outside });
+    expect(page.view().hidden).toBe(true);
+    page.edit("WATCHED_REPOS", "eu");
+    page.run.onControlEdited({ target: outside }); // the logs filter, the admin e-mail box, a plugin's own bundle ...
+    expect(page.view().hidden).toBe(true); // ... never reach the bar, even with a real change pending
+    page.run.onControlEdited({ target: inside });
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, discard: true });
+    page.tick("raidhelper", true);
+    page.run.onControlEdited({ target: inside });
+    expect(page.view().title).toBe("2 changes need a restart");
+    page.edit("WATCHED_REPOS", "us");
+    page.tick("raidhelper", false);
+    page.run.onControlEdited({ target: inside });
+    expect(page.view().hidden).toBe(true); // putting it back leaves nothing pending: derived, never stored
+  });
+
+  test("an event with no usable target is ignored, not thrown on", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    for (const e of [undefined, null, {}, { target: null }, { target: {} }]) expect(() => page.run.onControlEdited(e)).not.toThrow();
+  });
+
+  test("an edit dismisses a finished message and a refusal, and clears aria-invalid", async () => {
+    const refused = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" } });
+    await refused.run.applyPending();
+    const control = refused.control("ANNOUNCE_CHANNEL_ID");
+    expect(control.attrs.has("aria-invalid")).toBe(true);
+    refused.edit("ANNOUNCE_CHANNEL_ID", "22222");
+    refused.run.onControlEdited({ target: inside });
+    expect(control.attrs.has("aria-invalid")).toBe(false);
+    expect(refused.view()).toMatchObject({ tone: "", hint: "The bot goes offline for about 20 seconds while it restarts." });
+
+    for (const response of [undefined, { ok: false, text: "nope" }]) {
+      const done = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response });
+      await done.run.applyPending();
+      expect(done.view().ok).toBe(true);
+      done.run.onControlEdited({ target: inside }); // any edit: back to what is pending
+      expect(done.view()).toMatchObject({ ok: false, go: true, tone: "" });
+    }
+  });
+
+  test("an edit while a request is in flight does not clear the Restarting message", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, hold });
+    const pending = page.run.applyPending();
+    await Promise.resolve();
+    page.run.onControlEdited({ target: inside });
+    expect(page.view().title).toBe("Restarting the bot…");
+    release();
+    await pending;
+  });
+});
+
+describe("discardPending (#257)", () => {
+  test("posts nothing and re-renders plugins and env", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu", ANNOUNCE_CHANNEL_ID: "" }, checked: ["warbandeer", "raidhelper"], resetOnReload: true });
+    await page.run.applyPending(); // a refusal: the control is marked invalid
+    await page.run.discardPending();
+    expect(page.log.posts).toEqual([]);
+    expect(page.log.reloads).toEqual({ plugins: 1, env: 1, status: 0 });
+    // Every control is back at the baseline, so nothing is pending and the bar is gone.
+    const restored = page.run.collectPending();
+    expect(restored.fields).toEqual(APPLY_ENV);
+    expect(restored.plugins?.checkedNames).toEqual(["warbandeer"]);
+    expect(page.view().hidden).toBe(true);
+    expect(page.control("ANNOUNCE_CHANNEL_ID").attrs.has("aria-invalid")).toBe(false);
+  });
+
+  test("Discard on a failed apply also clears the failure, and focus returns to the open tab when the bar goes", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: false, text: "nope" }, resetOnReload: true });
+    page.activate(page.els.go);
+    await page.run.applyPending();
+    expect(page.view()).toMatchObject({ tone: "danger", ok: true, discard: true, go: true }); // changes are still pending
+    page.activate(page.els.discard); // Discard is the one clicked ...
+    await page.run.discardPending();
+    expect(page.view().hidden).toBe(true); // ... and the bar hides with it (the stub drops its focus, as a browser does)
+    expect(page.log.focused.at(-1)).toBe("tab-settings");
+    // The tab strip is at the top of a long page and Discard was pressed at the bottom of it: never scroll there.
+    expect(page.log.preventScroll).toEqual(["tab-settings"]);
+  });
+
+  test("focus that is somewhere real is left alone when the bar goes", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, resetOnReload: true });
+    await page.run.applyPending();
+    page.activate(page.control("WATCHED_REPOS")); // the user is already typing elsewhere
+    const before = page.log.focused.length;
+    await page.run.discardPending();
+    expect(page.log.focused).toHaveLength(before);
+  });
+});
+
+describe("dismissApplyResult (#257)", () => {
+  test("OK on a finished message hides the bar and puts focus back on the open tab", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" } });
+    page.activate(page.els.go);
+    await page.run.applyPending();
+    expect(page.log.focused.at(-1)).toBe("apply-ok");
+    // The real loaders have re-rendered the controls from the new state: nothing is pending.
+    page.controls.forEach((c) => { c.value = APPLY_ENV[c.dataset.key as keyof typeof APPLY_ENV] ?? ""; });
+    page.run.dismissApplyResult();
+    expect(page.view().hidden).toBe(true);
+    expect(page.log.focused.at(-1)).toBe("tab-settings");
+    expect(page.log.preventScroll).toEqual(["tab-settings"]);
+  });
+
+  test("OK while changes are still pending keeps the bar and puts focus on it, not on Apply", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: { ok: false, text: "nope" } });
+    page.activate(page.els.go);
+    await page.run.applyPending();
+    expect(page.log.focused.at(-1)).toBe("apply-ok");
+    page.run.dismissApplyResult(); // OK hides, and takes focus with it
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
+    expect(page.log.focused.at(-1)).toBe("apply-bar"); // an Enter pressed twice must not restart the bot
+    expect(page.log.preventScroll).toEqual(["apply-bar"]);
+  });
+});
+
+describe("syncTagValue (#257)", () => {
+  const syncTagValue = new Function(`"use strict";\n${applyBlock("TAG_SYNC")}\nreturn syncTagValue;`)() as (
+    hidden: { value: string; dispatchEvent: (e: Event) => boolean },
+    tokens: string[],
+  ) => void;
+
+  test("writes the joined value and dispatches a bubbling input event", () => {
+    const events: Event[] = [];
+    const hidden = { value: "stale", dispatchEvent: (e: Event) => (events.push(e), true) };
+    syncTagValue(hidden, ["123456", "234567"]);
+    expect(hidden.value).toBe("123456,234567");
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("input");
+    expect(events[0]!.bubbles).toBe(true);
+  });
+
+  test("an empty list writes an empty value, and still says so", () => {
+    const events: Event[] = [];
+    const hidden = { value: "a", dispatchEvent: (e: Event) => (events.push(e), true) };
+    syncTagValue(hidden, []);
+    expect(hidden.value).toBe("");
+    expect(events).toHaveLength(1);
+  });
+
 });
 
 // The DOM half of the tabs (showTab + the click / keydown / hashchange wiring), lifted from index.html
