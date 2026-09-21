@@ -13,6 +13,7 @@ import { readPluginState, mutatePluginState } from "./plugins/host";
 import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
+import { refreshDiscovery } from "./routing/live";
 
 // Exported so plugins/host.test.ts can pin PLUGIN_TICK_TIMEOUT_MS under it (#217).
 export const TICK_MS = 60 * 1000;
@@ -25,9 +26,14 @@ const RELEASE_POLL_GAP_MS = 15 * 60 * 1000;
 // Bot commits land at any hour, so this polls on a flat cadence too.
 const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
 
+// #239: how often discovery.json is re-snapshotted, so the panel's list of servers and channels
+// follows channels being created and permissions changing without anyone restarting the bot.
+const DISCOVERY_REFRESH_GAP_MS = 15 * 60 * 1000;
+
 let lastReleasePollAt = 0;
 let lastUpdatePollAt = 0;
 let lastPluginPollAt = 0;
+let lastDiscoveryAt = 0;
 
 // The plugin-update check must not run until the boot writePluginState (index.ts, after the
 // scheduler starts) has landed — otherwise its keyed-mutator persist would race that one-time
@@ -238,6 +244,19 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
         }
       },
     },
+    {
+      // Keep data/discovery.json fresh (#239). The boot registration writes it. The first tick can run
+      // before or after that registration, depending on how long the checks ahead of this one take:
+      // before it, refreshDiscovery has nothing to describe yet and does nothing; after it, the
+      // refresh is a redundant rewrite. Either way the gap is stamped, so the next one is a gap later.
+      name: "discovery",
+      run: async () => {
+        if (shouldRefreshDiscovery(Date.now(), lastDiscoveryAt)) {
+          lastDiscoveryAt = Date.now(); // stamp at start, like checkReleases/checkAutoUpdate
+          await refreshDiscovery();
+        }
+      },
+    },
     ...extra,
   ];
 }
@@ -325,6 +344,13 @@ export function livePluginRequestDeps(): PluginRequestDeps {
 export function shouldPollReleases(now: number, lastPollAt: number): boolean {
   if (lastPollAt === 0) return true; // startup catch-up
   return now - lastPollAt >= RELEASE_POLL_GAP_MS;
+}
+
+// Same shape as shouldPollReleases: a flat cadence with a startup catch-up, `now` and `lastAt` both
+// passed in so every boundary is pinnable.
+export function shouldRefreshDiscovery(now: number, lastAt: number): boolean {
+  if (lastAt === 0) return true; // startup catch-up
+  return now - lastAt >= DISCOVERY_REFRESH_GAP_MS;
 }
 
 async function checkReleases(client: Client): Promise<void> {

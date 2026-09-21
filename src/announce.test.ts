@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Client } from "discord.js";
 import type { Release } from "./github";
 import type { TickCheck } from "./plugins/contract";
@@ -13,11 +16,14 @@ const {
   tickChecks,
   announceTo,
   shouldPollReleases,
+  shouldRefreshDiscovery,
 } = await import("./announce");
+const { initRouting, resetRoutingForTest } = await import("./routing/live");
 
 describe("tickChecks", () => {
-  // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates), then extras.
-  const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates"];
+  // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates; discovery
+  // (#239) comes after pluginUpdates), then extras.
+  const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates", "discovery"];
 
   test("is the core checks in order, then the extras", () => {
     const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
@@ -32,6 +38,75 @@ describe("tickChecks", () => {
   test("pluginRequests drains the mailbox before pluginUpdates notifies/schedules", () => {
     const names = tickChecks({} as unknown as Client, []).map((c) => c.name);
     expect(names.indexOf("pluginRequests")).toBeLessThan(names.indexOf("pluginUpdates"));
+  });
+
+  test("discovery sits after pluginUpdates and before the plugin ticks", () => {
+    const extra: TickCheck[] = [{ name: "myplugin:poll", run: async () => {} }];
+    const names = tickChecks({} as unknown as Client, extra).map((c) => c.name);
+    expect(names.indexOf("discovery")).toBeGreaterThan(names.indexOf("pluginUpdates"));
+    expect(names.indexOf("discovery")).toBeLessThan(names.indexOf("myplugin:poll"));
+    // Exactly one, and the plugin's tick is still last.
+    expect(names.filter((n) => n === "discovery")).toHaveLength(1);
+    expect(names.at(-1)).toBe("myplugin:poll");
+  });
+
+  test("the discovery check respects its gap", async () => {
+    // Runs the real check against a real refreshDiscovery, told apart by the `generatedAt` each
+    // refresh stamps into discovery.json (the injected clock ticks once per snapshot).
+    const dir = mkdtempSync(join(tmpdir(), "announce-discovery-test-"));
+    let ticks = 0;
+    try {
+      initRouting({
+        client: { user: { id: "900000000000000000" }, guilds: { cache: new Map() } } as unknown as Client<true>,
+        put: async () => undefined,
+        appId: "900000000000000000",
+        botUsername: "Setlist Bot",
+        dataDir: dir,
+        homeGuildId: undefined,
+        prefix: "",
+        fullBody: [],
+        commandMap: new Map(),
+        plugins: [],
+        now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, ticks++)),
+        log: console,
+      });
+      const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "discovery")!;
+      const generatedAt = () => JSON.parse(readFileSync(join(dir, "discovery.json"), "utf8")).generatedAt as string;
+
+      // The first run is the startup catch-up: it refreshes.
+      await check.run();
+      const first = generatedAt();
+      expect(first).toBe("2026-09-21T12:00:00.000Z");
+      // Straight away again, well inside the gap: it does nothing, so the file is untouched.
+      await check.run();
+      await check.run();
+      expect(generatedAt()).toBe(first);
+      expect(ticks).toBe(1);
+    } finally {
+      resetRoutingForTest();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Flat 15-min cadence + startup catch-up, exactly like shouldPollReleases (#239).
+describe("shouldRefreshDiscovery", () => {
+  const GAP_MS = 15 * 60 * 1000;
+  const T0 = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+
+  test("startup catch-up: lastAt = 0 is true even before the gap has elapsed", () => {
+    expect(shouldRefreshDiscovery(0, 0)).toBe(true);
+    expect(shouldRefreshDiscovery(GAP_MS - 1, 0)).toBe(true);
+  });
+
+  test("the gap hasn't elapsed -> false, one ms short of 15 minutes -> false", () => {
+    expect(shouldRefreshDiscovery(T0 + 1, T0)).toBe(false);
+    expect(shouldRefreshDiscovery(T0 + GAP_MS - 1, T0)).toBe(false);
+  });
+
+  test("the gap exactly elapsed -> true, and any time after", () => {
+    expect(shouldRefreshDiscovery(T0 + GAP_MS, T0)).toBe(true);
+    expect(shouldRefreshDiscovery(T0 + 10 * GAP_MS, T0)).toBe(true);
   });
 });
 
