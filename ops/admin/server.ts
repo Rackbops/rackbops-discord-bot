@@ -1263,13 +1263,15 @@ const ROUTING_WEBHOOK_PATH_RE = /webhooks(?:\\?\/|%2f)\d{5,25}(?:\\?\/|%2f)[\w-]
 
 /**
  * `text` with anything that looks like a webhook URL replaced by `[webhook url]`; text with none is
- * returned as it was. JSON can spell any character as an escape (`/`, `\/`) and a URL can
- * percent-encode any character (`%77ebhooks`), so those are read as what they stand for BEFORE looking.
- * The three reads run once each, in that order (so a `%` that produces a `%` is percent-decoded too);
- * a spelling encoded more deeply than that is not chased, since nothing in this path produces one. (`\/`
- * is also tolerated by the two patterns themselves, as it is in the bot's: the decode is belt to that
- * brace.) When something is found the DECODED text is what comes back, redacted; text that only looked
- * escaped but holds no URL is not touched.
+ * returned as it was. JSON can spell any character as a backslash-u escape (four hex digits: 002f is a
+ * slash, 0025 a percent sign) or a slash as backslash-slash, and a URL can percent-encode any character
+ * (`%77ebhooks`), so those are read as what they stand for BEFORE looking. The three reads run once each,
+ * in that order (so a percent sign that the backslash-u read produces is percent-decoded too); a spelling
+ * encoded more deeply than that is not chased, since nothing in this path produces one. (Backslash-slash is
+ * also tolerated by the two patterns themselves, as it is in the bot's: the decode is belt to that brace;
+ * and the path pattern's own `%2f` catches a doubly-encoded slash by accident, which no writer relies on.)
+ * When something is found the DECODED text is what comes back, redacted; text that only looked escaped but
+ * holds no URL is not touched.
  */
 export function redactWebhookUrls(text: string): string {
   const plain = text
@@ -1683,7 +1685,14 @@ async function queueRoutingRequest(
     // other text that came from outside this function, and clipped; the answer is a fixed one.
     let why = "not an Error";
     try {
-      if (err instanceof Error) why = redactWebhookUrls(String(err.message)).slice(0, 300);
+      if (err instanceof Error) {
+        // Redact FIRST, then clip: a clip through the middle of a url could leave a piece of its token
+        // that no pattern recognises any more.
+        why = redactWebhookUrls(String(err.message)).slice(0, 300);
+        // ... and a clip through a surrogate pair would leave half of it in the log line.
+        const last = why.charCodeAt(why.length - 1);
+        if (last >= 0xd800 && last <= 0xdbff) why = why.slice(0, -1);
+      }
     } catch {
       why = "unreadable error";
     }

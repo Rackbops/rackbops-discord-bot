@@ -3907,6 +3907,8 @@ describe("redactWebhookUrls (#242)", () => {
     ["upper case, no host", `/API/WEBHOOKS/${ID}/${T}`, T],
     ["no host, a token with a hyphen", `webhooks/${ID}/aaaaaaaaaa-bbbbbbbbbb`, "aaaaaaaaaa-bbbbbbbbbb"],
     ["no host, a token with an underscore", `webhooks/${ID}/aaaaaaaaaa_bbbbbbbbbb`, "aaaaaaaaaa_bbbbbbbbbb"],
+    // Not a spelling anything here produces, but the path pattern's own `%2f` catches it once the `%25` is read.
+    ["a doubly percent-encoded slash", `webhooks%252f${ID}%252f${T}`, T],
     ["no host, a long token that starts with a hyphen and an underscore", `webhooks/${ID}/-_${T}`, T],
     ["a token of 68 characters that is all hyphens and underscores", `https://discord.com/api/webhooks/${ID}/${"-_".repeat(34)}`, "-_".repeat(34)],
   ];
@@ -4518,6 +4520,56 @@ describe("a webhook url never leaves the stdin payload (#242)", () => {
       expect(await res.clone().text()).toBe("bot-ops.sh could not be run");
       await expectNoLeak(why, res, { calls } as ReturnType<typeof capturingBotOps>);
       expect(lines).toEqual([`[admin] plugin-request could not run bot-ops.sh — requested by the ADMIN_TOKEN bearer token: ${why}`]);
+    }
+  });
+
+  test("a thrown message is redacted BEFORE it is clipped: a clip through a url must not leave a piece of its token", async () => {
+    // The port makes the host pattern miss, so only the path pattern (which needs 20 token characters) can
+    // catch this url. Clipped FIRST, at 300, it would be cut ten characters into the token and nothing would
+    // catch it: those ten would be in the log line.
+    const portPrefix = `https://discord.com:443/api/webhooks/${RT_HOOK_ID}/`;
+    const message = `${"x".repeat(300 - 1 - portPrefix.length - 10)} ${portPrefix}${RT_HOOK_TOKEN}`;
+    const calls: BotOpsInvocation[] = [];
+    const res = await handleRequest(
+      post("/api/webhooks", { url: RT_HOOK_URL }),
+      cfg(async (inv) => {
+        calls.push(inv);
+        throw new Error(message);
+      }),
+    );
+    expect(res.status).toBe(502);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("[webhook url]");
+    await expectNoLeak("clip", res, { calls } as ReturnType<typeof capturingBotOps>);
+  });
+
+  test("a thrown message clipped through a surrogate pair does not leave half of it in the log line", async () => {
+    const emoji = String.fromCodePoint(0x1f600); // two UTF-16 units: the cut at 300 lands between them
+    const res = await handleRequest(
+      post("/api/webhooks", { url: RT_HOOK_URL }),
+      cfg(async () => {
+        throw new Error(`${"x".repeat(299)}${emoji}${"y".repeat(50)}`);
+      }),
+    );
+    expect(res.status).toBe(502);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.isWellFormed()).toBe(true);
+    expect(lines[0]!.endsWith("x".repeat(299))).toBe(true);
+  });
+
+  test("the routing writes speak only through console.log and console.error (source pin)", () => {
+    // The spies above cover the console methods and streams a test can reach; this covers the ones it cannot
+    // (group, count, assert, Bun.write(Bun.stderr, ...)) by pinning what the code that handles a webhook url
+    // is allowed to call at all.
+    const src = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+    const helper = src.slice(src.indexOf("async function queueRoutingRequest("), src.indexOf("/** The whole request lifecycle"));
+    const routes = src.slice(src.indexOf("// #242: the four routing writes."), src.indexOf('if (url.pathname === "/api/admins"'));
+    expect(helper.length).toBeGreaterThan(500);
+    expect(routes.length).toBeGreaterThan(500);
+    expect([...helper.matchAll(/console\.(\w+)/g)].map((m) => m[1])).toEqual(["error", "error", "log"]);
+    expect([...routes.matchAll(/console\./g)]).toHaveLength(0);
+    for (const [name, text] of [["queueRoutingRequest", helper], ["the routing routes", routes]] as const) {
+      expect(text, name).not.toMatch(/process\.(stdout|stderr)|Bun\.(write|stdout|stderr)|\bfetch\(|\bBun\.spawn/);
     }
   });
 
