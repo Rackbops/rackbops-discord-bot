@@ -130,3 +130,19 @@ Mutation checks in a scratch worktree, one at a time, `bun test src/routing src/
 
 **Run every `bun test` — yours, your reviewers', your mutation runs — with a private temp dir**, e.g. `TEMP=R:/repos/Scratch/tmp/bot-243 TMP=R:/repos/Scratch/tmp/bot-243 bun test` (create it first). `test/setup.ts` sweeps every `rackbops-bot-test-data-*` directory in the system temp dir at start-up (#252), so two suites running at once on this machine delete each other's data dir mid-run.
 
+---
+
+## Implementation notes (added by the implementer; everything above is the plan as posted)
+
+Where the build differs from the plan, and why. Each is tested.
+
+- **`markBroken` names the webhook it is marking.** `PostDeps.markBroken(channelId, reason, seen)` takes the `WebhookMeta` the post was made with, and `withWebhookBroken` (new, pure) marks the entry only if it still has the same `id` and `addedAt`. Without it a post in flight for ten seconds could deliver a stale 404 to a webhook the operator had just replaced, and mark the new one broken (review round 1). `markWebhookBroken(dataDir)` drops the plan's `now` parameter: nothing used it.
+- **`Where` has `parentUnknown?: true`.** The plan says the gate fails open when "the channel's parent cannot be determined", and its `Where` had no way to say so; without it an uncached thread whose fetch fails would be refused.
+- **`gateCommand(plugin, commandName, here, whereOf, readRouting, log)`.** The plan passed a resolved `Where`. Resolving it can mean a REST fetch, on the interaction path, for every command; so `whereOf` is a thunk and is called only when the channel's own id is not on the plugin's list (review round 1). It logs a `[gate]` line when it lets through a command it could not judge.
+- **`postForPlugin` catches more.** A throwing `readRouting` posts to the default channel, a throwing `readSecrets` posts as the bot, and a throwing `executeWebhook` falls back to the bot without marking anything, each with a fixed log line; when every target failed the errors other than the first (which is thrown) are logged.
+- **`handleCommand` catches a throwing gate** (fails open, logs `[gate] ...`); its catch variable is `gateError` because an existing source-pin test in `commands.test.ts` finds the last `} catch (err) {` in the file.
+- **`refusalMessage` for three to five channels** reads `<#1>, <#2> or <#3>`; the plan gave only one, two and more than five.
+- **Docs beyond the plan's list:** a comment line in `.env.example`; two stale comments in `announce.ts`; and, once #241 had merged, the three sentences that said posting and the gate were "a later child" / `announceTargets` and `commandAllowed` "have no caller" (the `CONTEXT.md` glossary paragraph, the `resolve.ts` File Map row, `resolve.ts`'s header). The `CONTEXT.md` `src/index.ts` row is untouched, as instructed.
+- **Stale and not editable here:** the comment on `HostApi.announce` in `src/plugins/contract.ts` still says it "posts to `ANNOUNCE_CHANNEL_ID`, through the bot's own send path". `contract.ts` is untouched by design (and `check-contract` compares it verbatim), so that comment is for the next contract bump.
+- **Accepted, in the `CONTEXT.md` gotchas:** an ambiguous webhook failure (a timeout, a 5xx) can post a message twice, because any failure falls back to the bot; and the targets are posted serially with ten seconds allowed per webhook, against the 30 s plugin tick budget.
+
