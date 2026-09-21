@@ -243,15 +243,22 @@ them, so with `wow` in `PLUGINS=` the panel can set them.)
   ours and can quote a `.env` line it refuses to parse. That is best effort, not a proof: a compose
   that echoed caller-controlled text could still tell a caller whether a guess equals a stored secret
   (not observed; there is no compose on the dev box to test against). (3) A value containing a CR is
-  refused for every key (it could start a new `.env` line), naming the key only. (4) A key the
+  refused for every key (it could start a new `.env` line), naming the key only, and a **plugin** key's
+  value may not contain `$` or start with a quote: compose reads a `.env` value as syntax, so
+  `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key and a leading
+  quote opens an unterminated value that stops compose loading the file, yet a manifest `format` such as
+  the shipped `^\S+$` admits both (static keys' regexes already exclude them; plain plugin keys are
+  covered too, which older versions of this script did not check). (4) A key the
   deployment owns — the core credentials, the access and admin settings, and every variable
   `docker-compose.yml` interpolates — is dropped from every plugin path whatever the manifest says
   (`RESERVED_KEYS` in the script, pinned by a test against `.env.example` and the compose file), so a
   manifest that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails
   closed on the manifest: a key that *any* plugin in the index declares secret — enabled or not — is
   never listed as a plain key, a `secret` that is not exactly `false` or absent counts as secret, an
-  entry whose `key`, `format` or `required` holds a line break is dropped whole (it could re-frame the
-  rows the script reads and forge a plain row for another plugin's secret), and a secret key that
+  entry whose `key`, `format` or `required` holds a line break (or that has no string `format`) is
+  unusable (a line break could re-frame the rows the script reads and forge a plain row for another
+  plugin's secret) — though an unusable entry that claims `secret` still marks its key secret — and a
+  secret key that
   collides with a static key is ignored (the static key wins). A panel admin who can set
   `PLUGIN_INDEX_URL` controls that index — and the plugin code the bot installs from it — so this
   protects against the panel, its logs and screens, not against whoever owns the index. The

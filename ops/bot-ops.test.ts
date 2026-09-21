@@ -1624,6 +1624,63 @@ describe.skipIf(!runnable)("bot-ops.sh env-set accepts a plugin's secret key, wr
     }
   });
 
+  test("an unusable manifest entry that claims secret still marks its key secret", async () => {
+    // No `format`, or a `format` with a line break: the entry can never be edited or validated against,
+    // but forgetting its secret claim would let another enabled plugin's plain declaration list the key.
+    const index = wrapIndex([
+      pluginEntry("pa", [
+        { key: "NOFMT_SECRET", description: "no format", secret: true },
+        envKey("BADFMT_SECRET", "^.*\n$", { secret: true }),
+        envKey("BADREQ_SECRET", "^.+$", { secret: true, required: "true\nfalse" }),
+      ]),
+      pluginEntry("pb", [envKey("NOFMT_SECRET", "^.+$"), envKey("BADFMT_SECRET", "^.+$"), envKey("BADREQ_SECRET", "^.+$"), envKey("PB_PORT", PORT_RE)]),
+    ]);
+    const fx = setup(
+      "PLUGINS=pa,pb\nANNOUNCE_CHANNEL_ID=11111\nNOFMT_SECRET=stored-one-1234\nBADFMT_SECRET=stored-two-1234\nBADREQ_SECRET=stored-three-1234\nPB_PORT=8080\n",
+      { pluginIndex: index },
+    );
+    const get = await botOps(fx, ["env-get"]);
+    expect(get.exitCode).toBe(0);
+    expect(get.json).toMatchObject({ PB_PORT: "8080" });
+    for (const leak of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET", "stored-one-1234", "stored-two-1234", "stored-three-1234"]) {
+      expect(get.stdout, leak).not.toContain(leak);
+    }
+    // ...and none of them is editable (no usable format to validate a write against)
+    for (const key of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET"]) {
+      const run = await botOps(fx, ["env-set"], `${key}=some-new-value-1\n`);
+      expect(run.exitCode, key).toBe(1);
+      expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+    }
+    const schema = (await botOps(fx, ["env-schema"])).json ?? {};
+    for (const key of ["NOFMT_SECRET", "BADFMT_SECRET", "BADREQ_SECRET"]) expect(Object.keys(schema), key).not.toContain(key);
+  });
+
+  test("a plugin key's value may not contain a dollar sign or start with a quote (compose reads it as syntax)", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("P_SECRET", "^\\S+$", { secret: true }), envKey("P_PLAIN", "^.+$")])]);
+    const base = "PLUGINS=p\nANNOUNCE_CHANNEL_ID=11111\n";
+    for (const key of ["P_SECRET", "P_PLAIN"]) {
+      for (const val of ["${DISCORD_TOKEN}", "abc$def", "$X", '"open', "'open", '"quoted"']) {
+        const fx = setup(base, { pluginIndex: index });
+        const run = await botOps(fx, ["env-set"], `${key}=${val}\n`);
+        const why = `${key}=${val}`;
+        expect(run.exitCode, why).toBe(1);
+        expect(run.stderr, why).toContain(`value for '${key}' may not contain a dollar sign or start with a quote`);
+        expect(everythingObservable(fx, run), why).not.toContain(val);
+        expect(envText(fx), why).toBe(base);
+        expect(existsSync(join(fx.cfg, "backups")), why).toBe(false);
+        expect(recreateCalls(fx).some((c) => c.includes("up -d")), why).toBe(false);
+      }
+      // only `$` and a LEADING quote are refused: the rest of `^\S+$` / `^.+$` still passes
+      for (const ok of ["abc-DEF_123", "a#b", "a\\b", 'a"b', "a'b"]) {
+        const fx = setup(base, { pluginIndex: index });
+        expect((await botOps(fx, ["env-set"], `${key}=${ok}\n`)).exitCode, `${key}=${ok}`).toBe(0);
+      }
+    }
+    // a static key is checked by its own regex, not this guard
+    const stat = await botOps(setup(base, { pluginIndex: index }), ["env-set"], "ANNOUNCE_CHANNEL_ID=1$2\n");
+    expect(stat.stderr).toContain("value for 'ANNOUNCE_CHANNEL_ID' is invalid");
+  });
+
   test("a key any plugin in the index declares secret is never listed as plain, but stays uneditable unless that plugin is enabled", async () => {
     const index = wrapIndex([
       pluginEntry("spotify", [envKey("SHARED_KEY", "^[A-Za-z0-9_]{8,}$", { secret: true })]),

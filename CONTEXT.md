@@ -955,9 +955,10 @@ _Avoid_: server list, guild cache
   index declares secret (enabled or not) is never listed as a plain key, whichever plugin declares it
   plain (only an enabled plugin's secret key is editable); a secret declared twice is first-wins; a
   `secret` that is not exactly `false`/absent (`"yes"`, `1`, `[]`) counts as secret; and an entry whose
-  `key`/`format`/`required` holds a CR or LF is dropped whole, because the row reader takes five raw
-  lines per key and a stray newline would re-frame every later row and let a hostile entry forge a
-  plain row for another plugin's secret key; (4) **env-set's own decision reveals nothing about a
+  `key`/`format`/`required` holds a CR or LF (or that has no string `format`) is unusable, because the
+  row reader takes five raw lines per key and a stray newline would re-frame every later row and let a
+  hostile entry forge a plain row for another plugin's secret key — but an unusable entry that claims
+  `secret` still marks its key secret (never editable), so it cannot be forgotten into a listing; (4) **env-set's own decision reveals nothing about a
   stored secret** — a submitted secret is always treated as a change and written, because a "no
   changes" answer would tell a caller its guess equals the stored value (the one skip is a blank for
   an already-unset key, which `isSet` already reveals); (5) the recreate's own output is scrubbed of
@@ -965,7 +966,12 @@ _Avoid_: server list, guild cache
   might echo, not a proof (a compose that echoed caller-controlled text into `log` could still act as
   a guess oracle for a stored secret; not seen, and not testable without a real compose); (6) a value
   holding a CR is refused (message names the key only) before its format regex runs, since a
-  permissive secret pattern must not let one start a new `.env` line; (7) a refusal names a submitted
+  permissive secret pattern must not let one start a new `.env` line, and a plugin key's value may
+  not contain `$` or start with a quote either (compose reads a `.env` value as syntax:
+  `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}` would interpolate a core secret into a plugin's key, and a
+  leading quote opens an unterminated value that stops compose loading the file; a manifest `format`
+  such as the shipped `^\S+$` admits both, static keys' regexes already exclude them, and the check
+  covers plain plugin keys too, which `main` did not); (7) a refusal names a submitted
   key only when it looks like a variable name (`echo_key`: upper-case, at most 40 characters), since a
   multi-line value is read line by line and a later line's text before its `=` would otherwise be
   echoed. Existing `env-get` output and every non-secret `env-schema` entry stay byte-identical for a

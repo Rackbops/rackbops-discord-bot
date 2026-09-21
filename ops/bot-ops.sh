@@ -446,11 +446,14 @@ load_plugin_keys() {
   # The reader takes exactly five lines per row, so a field that itself held a line break would
   # re-frame every later row — a hostile manifest could then forge a plain row for another plugin's
   # secret key and have env-get list its stored value (#240). So a key holding a CR or LF, or a
-  # `format` or `required` doing so, drops the whole entry inside the program, and `secret` is
-  # normalised there too: only an absent / null / false `secret` means "not secret", ANY other value
-  # (a string, a number, an array) counts as secret — fail closed, never fail open. The `enabled`
-  # column carries whether the plugin is in PLUGINS: a key ANY plugin in the index declares secret is
-  # secret for every plugin, but only an enabled plugin's keys are ever editable.
+  # `format` or `required` doing so (or a `format` that is missing or not a string), makes the entry
+  # unusable inside the program, and `secret` is normalised there too: only an absent / null / false
+  # `secret` means "not secret", ANY other value (a string, a number, an array) counts as secret —
+  # fail closed, never fail open. An unusable entry that CLAIMS secret is not forgotten: it still
+  # marks its key secret (an `enabled` of "false" and an empty format, so it can never be edited or
+  # validated against), otherwise another plugin declaring the same key plain would get it listed.
+  # The `enabled` column carries whether the plugin is in PLUGINS: a key ANY plugin in the index
+  # declares secret is secret for every plugin, but only an enabled plugin's keys are ever editable.
   #
   # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
   # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
@@ -466,11 +469,13 @@ load_plugin_keys() {
     | .[]
     | (.name as $n | (($names | index($n)) != null)) as $on
     | .env[]?
-    | select((type == "object") and (.key | type == "string") and (.format | type == "string"))
+    | select((type == "object") and (.key | type == "string") and (.key | test("[\\r\\n]") | not))
     | (.required // false | tostring) as $req
     | (if (.secret // false) == false then "false" else "true" end) as $sec
-    | select([.key, .format, $req] | all(test("[\\r\\n]") | not))
-    | (.key, .format, $req, $sec, ($on | tostring))
+    | ((.format | type == "string" and (test("[\\r\\n]") | not)) and ($req | test("[\\r\\n]") | not)) as $wellformed
+    | if $wellformed then (.key, .format, $req, $sec, ($on | tostring))
+      elif $sec == "true" then (.key, "", "false", "true", "false")
+      else empty end
   ' 2>/dev/null)"; then
     PLUGIN_KEYS_STATUS="index unavailable"
     return 0
@@ -773,6 +778,16 @@ cmd_env_set() {
       # key the format regex may be permissive, so this is checked here, for every key, before the
       # format. The message names the key, never the value.
       [[ "$val" != *$'\r'* ]] || die "env-set: value for '$key' is invalid"
+      # compose reads a .env value as SYNTAX, and a plugin key's own manifest `format` may admit it (the
+      # shipped `^\S+$` does): a `$` starts an interpolation, so `SPOTIFY_CLIENT_ID=${DISCORD_TOKEN}`
+      # would hand the plugin — and whoever it displays the value to — a core secret; a leading quote
+      # opens a multi-line or unterminated value, which stops compose loading the file at all. Refused
+      # for every plugin key, secret or plain, and never quoting the value. (A static key's regex
+      # already excludes both.)
+      if [[ -z "${ALLOWED[$key]+x}" ]]; then
+        [[ "$val" != *'$'* && "$val" != '"'* && "$val" != "'"* ]] \
+          || die "env-set: value for '$key' may not contain a dollar sign or start with a quote"
+      fi
       # Format + required-ness come from the static ALLOWED set, or from the installed plugin's
       # manifest entry for a plugin-owned key (a static key wins if somehow both name it).
       if [[ -n "${ALLOWED[$key]+x}" ]]; then
