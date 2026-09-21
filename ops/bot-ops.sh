@@ -242,14 +242,23 @@ declare -A REQUIRED=(
   [ANNOUNCE_CHANNEL_ID]=1
 )
 
-# Keys the DEPLOYMENT owns — core credentials, access control, and every variable docker-compose.yml
-# interpolates. A Plugin Index manifest may never make one of these editable or listable, whether it
-# declares the key secret or not (#240): a plugin-declared secret key became writable, and a manifest
-# that named DISCORD_TOKEN (by mistake, or through a compromised index entry) would otherwise have
-# made the panel able to overwrite it — the one thing "core secrets stay uneditable" forbids.
-# load_plugin_keys drops these on the way in. Pinned against .env.example's credential-shaped keys
-# and every ${VAR} docker-compose.yml interpolates by ops/bot-ops.test.ts, so a new core secret that
-# is not added here fails a test rather than staying editable by manifest.
+# Keys the DEPLOYMENT and the bot CORE own, that a Plugin Index manifest may never make editable or
+# listable, whether it declares the key secret or not. Three groups:
+#   1. core credentials, access control, and every variable docker-compose.yml interpolates (#240): a
+#      plugin-declared secret key became writable, and a manifest that named DISCORD_TOKEN (by mistake,
+#      or through a compromised index entry) would otherwise have made the panel able to overwrite it —
+#      the one thing "core secrets stay uneditable" forbids.
+#   2. settings the bot CORE reads that the panel deliberately does not edit (#278): a careless manifest
+#      must not be able to turn the repo self-update anchors to, the plugin registry, the data
+#      directory or the runtime mode into a field on a plugin's card. Since #256 an index entry needs
+#      no enabled plugin to do that, so they are reserved. The three at the end are set by the bot's own
+#      redeploy machinery or by docker itself, but are read from the environment, so a `.env` line
+#      would reach them.
+# load_plugin_keys drops these on the way in. Pinned by ops/bot-ops.test.ts against .env.example's
+# credential-shaped keys, every ${VAR} docker-compose.yml interpolates, every key documented in
+# .env.example (each is editable, reserved, or under a plugin's block) and every variable the bot
+# core's source reads (each is editable or reserved), so a new core key that is not decided here fails
+# a test rather than staying claimable by manifest.
 #
 # A credential a first-party PLUGIN owns is deliberately NOT here: the wow plugin's
 # BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET are read by that plugin alone (nothing in the bot core
@@ -272,6 +281,14 @@ declare -A RESERVED_KEYS=(
   [BOT_OPS_PROJECT]=1
   [BOT_OPS_CONFIG_DIR]=1
   [BOT_OPS_COMPOSE_FILE]=1
+  # Group 2 (#278): read by the bot core (src/), not edited by the panel.
+  [GITHUB_REPO]=1              # src/config.ts: the repo self-update and release polling anchor to
+  [PLUGIN_REGISTRY_URL]=1      # src/plugins/install.ts: where plugin bundles are downloaded from
+  [BOT_DATA_DIR]=1             # src/storage.ts: the bot's data directory
+  [NODE_ENV]=1                 # src/storage.ts: the runtime mode
+  [HANDOFF_FROM]=1             # src/handoff.ts: set by the redeploy machinery; makes a boot a standby
+  [HANDOFF_RESTART_POLICY]=1   # src/handoff.ts: likewise
+  [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
 )
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
@@ -505,7 +522,7 @@ load_plugin_keys() {
     usable="${usable%$'\r'}"
     [ "$secret" = "true" ] || continue
     [ -n "$key" ] || continue
-    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-editable
+    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a key the deployment or the core owns: never plugin-editable
     [[ -n "${ALLOWED[$key]+x}" ]] && continue                # a static key: static wins
     PLUGIN_SECRET_ANY["$key"]=1                              # secret for every plugin that declares it
     [ "$usable" = "true" ] || continue                       # an unusable entry's secret claim marks the key, but is never editable
@@ -523,7 +540,7 @@ load_plugin_keys() {
     # carries secret = "true", so the line below already skips it.)
     [ -n "$key" ] || continue
     [ "$secret" = "true" ] && continue                       # a secret key (an unusable row always is one): tracked in PLUGIN_SECRET_*, never here
-    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a core credential: never plugin-listable or editable
+    [[ -n "${RESERVED_KEYS[$key]+x}" ]] && continue          # a key the deployment or the core owns: never plugin-listable or editable
     [[ -n "${PLUGIN_SECRET_ANY[$key]+x}" ]] && continue      # another plugin declares it secret: secret wins
     [[ -n "${PLUGIN_FORMAT[$key]+x}" ]] && continue          # a key declared twice: first wins
     PLUGIN_KEY_ORDER+=("$key")

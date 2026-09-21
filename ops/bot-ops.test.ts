@@ -3163,6 +3163,58 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
     expect(blocks.find((b) => b.keys.includes("DISCORD_TOKEN"))?.plugin ?? null).toBeNull();
   });
 
+  // #278: the credential-shaped pin above only catches secrets. Two settings the core reads that are not
+  // credentials (GITHUB_REPO, PLUGIN_REGISTRY_URL) slipped through it, so this one covers EVERY key
+  // .env.example documents: each is editable by the panel (ALLOWED_SPEC), reserved, or sits under a
+  // "# Used by the <plugin> plugin" block (owned by that plugin). A new core key fails here until someone
+  // decides which of the three it is.
+  const allowedBlock = script.match(/ALLOWED_SPEC=\(([\s\S]*?)\n\)/)?.[1] ?? "";
+  const allowedKeys = new Set([...allowedBlock.matchAll(/^\s*'([A-Z0-9_]+)\|/gm)].map((m) => m[1]!));
+
+  test("every core key in .env.example the panel does not edit is reserved", () => {
+    const pluginOwned = new Set(blocks.filter((b) => b.plugin !== null).flatMap((b) => b.keys));
+    const documented = [...example.matchAll(/^#?\s*([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!);
+    expect(documented.length).toBeGreaterThanOrEqual(20);
+    expect(allowedKeys.size).toBeGreaterThan(5);
+    expect(pluginOwned.has("WOW_REGION") && pluginOwned.has("BLIZZARD_CLIENT_ID")).toBe(true); // the blocks are found
+    // the two #278 added are documented there, and are decided by being reserved
+    for (const key of ["GITHUB_REPO", "PLUGIN_REGISTRY_URL"]) {
+      expect(documented, key).toContain(key);
+      expect(reserved.has(key), key).toBe(true);
+    }
+    expect(documented.filter((k) => !allowedKeys.has(k) && !reserved.has(k) && !pluginOwned.has(k))).toEqual([]);
+  });
+
+  // #278: BOT_DATA_DIR and NODE_ENV are read by the core but not documented in .env.example, so the pin above
+  // could never have caught them. Every environment variable the core's SOURCE reads must be editable or
+  // reserved. The scan is a set of regexes over src/ (not the tests): `process.env.X` and an `env`
+  // parameter's `env.X`, config.ts's `required("X")` / `optional("X")` / `list("X")`, and handoff.ts's
+  // `const X_ENV = "X"` names. It cannot see a read it has no regex for, so it is a net, not a proof.
+  test("every environment variable the bot core's source reads is editable or reserved", () => {
+    const files: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.isDirectory()) walk(join(dir, entry.name));
+        else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) files.push(join(dir, entry.name));
+      }
+    };
+    walk(fileURLToPath(new URL("../src/", import.meta.url)));
+    const read = new Map<string, string>(); // variable -> the first file that reads it
+    for (const file of files) {
+      const text = readFileSync(file, "utf8");
+      for (const re of [/\benv\.([A-Z][A-Z0-9_]*)\b/g, /\b(?:required|optional|list)\("([A-Z][A-Z0-9_]*)"\)/g, /\bconst [A-Z0-9_]+_ENV = "([A-Z][A-Z0-9_]*)"/g]) {
+        for (const m of text.matchAll(re)) if (!read.has(m[1]!)) read.set(m[1]!, file);
+      }
+    }
+    expect(files.length).toBeGreaterThan(20);
+    expect(read.size).toBeGreaterThanOrEqual(15); // can't pass vacuously
+    // the reads the scan must see, or its regexes have rotted
+    for (const key of ["DISCORD_TOKEN", "GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HOSTNAME", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY"]) {
+      expect(read.has(key), `the scan should see ${key}`).toBe(true);
+    }
+    expect([...read].filter(([k]) => !allowedKeys.has(k) && !reserved.has(k)).map(([k, f]) => `${k} (${f})`)).toEqual([]);
+  });
+
   test("every variable docker-compose.yml interpolates is reserved", () => {
     const compose = readFileSync(new URL("../docker-compose.yml", import.meta.url), "utf8");
     const vars = [...new Set([...compose.matchAll(/\$\{([A-Z][A-Z0-9_]*)/g)].map((m) => m[1]!))];
@@ -3176,4 +3228,46 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
     expect(allowed.length).toBeGreaterThan(5);
     expect(allowed.filter((k) => reserved.has(k))).toEqual([]);
   });
+});
+
+// #278: a manifest may not claim a setting the bot's CORE reads and the panel does not edit. Since #256 an
+// index entry needs no enabled plugin to make a key listable and editable, so these are reserved; the table
+// below is the behaviour, and the RESERVED_KEYS describe above pins that the set stays complete.
+describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel does not edit (#278)", () => {
+  const CORE_SETTINGS = ["GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY", "HOSTNAME"];
+  // Two plugins claim every one of them, one plain and one `secret: true`. Each also declares a benign key,
+  // so a dropped claim is told apart from a dropped entry.
+  const CLAIMS = wrapIndex([
+    pluginEntry("plain-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$")), envKey("PLAIN_CLAIM_PORT", PORT_RE)]),
+    pluginEntry("secret-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$", { secret: true })), envKey("SECRET_CLAIM_PORT", PORT_RE)]),
+  ]);
+  const STORED = "GITHUB_REPO=Rackbops/rackbops-discord-bot\nBOT_DATA_DIR=/srv/data\nNODE_ENV=production\n";
+
+  for (const [state, plugins] of [
+    ["PLUGINS empty", ""],
+    ["the plugin enabled", "plain-claim,secret-claim"],
+  ] as const) {
+    test(`a core setting a manifest names is never listed and never editable, whether or not that plugin is on (${state})`, async () => {
+      const env = `${plugins ? `PLUGINS=${plugins}\n` : ""}ANNOUNCE_CHANNEL_ID=11111\n${STORED}`;
+      const fx = setup(env, { pluginIndex: CLAIMS });
+      const get = await botOps(fx, ["env-get"]);
+      const schema = await botOps(fx, ["env-schema"]);
+      for (const [name, out] of [["env-get", get], ["env-schema", schema]] as const) {
+        expect(out.exitCode, name).toBe(0);
+        // the entries were read (a dropped claim, not a dropped entry) ...
+        expect(out.json, name).toHaveProperty("PLAIN_CLAIM_PORT");
+        expect(out.json, name).toHaveProperty("SECRET_CLAIM_PORT");
+        // ... and no claimed setting is listed, as a plain key or as a secret row
+        for (const key of CORE_SETTINGS) expect(Object.keys(out.json ?? {}), `${name}: ${key}`).not.toContain(key);
+      }
+      expect(get.stdout).not.toContain("Rackbops/rackbops-discord-bot"); // a stored value is not shown either
+      for (const key of CORE_SETTINGS) {
+        const run = await botOps(fx, ["env-set"], `${key}=some-value-1\n`);
+        expect(run.exitCode, key).toBe(1);
+        expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+      }
+      expect(envText(fx)).toBe(env); // .env untouched
+      expect(dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"))).toBe(false); // nothing recreated
+    }, LONG);
+  }
 });
