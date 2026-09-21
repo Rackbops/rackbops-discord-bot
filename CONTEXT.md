@@ -885,7 +885,10 @@ _Avoid_: server list, guild cache
   invariant above), so an intent a plugin needs has to be declared in its Plugin Index entry
   (`PluginIndexEntry.intents`, numeric `GatewayIntentBits` values so the JSON needs no discord.js)
   and unioned in by `collectIntents()` — there is no path for a plugin to request an intent at
-  `activate()` time and have it take effect that boot. `src/plugins/*` (index.ts, registry.ts)
+  `activate()` time and have it take effect that boot. Nor does a declared intent deliver anything
+  (#221): the host owns every gateway listener and passes a plugin only the interactions addressed to
+  it, so the field is reserved for a future event seam, and today all it does is widen the gateway
+  subscription of the whole bot (`contract.ts`'s doc on `intents`). `src/plugins/*` (index.ts, registry.ts)
   stays free of `src/config.ts` on purpose — it's read-only data plumbing that has to work before
   config exists in the boot sequence.
 - **A Plugin Index entry describes the index's CURRENT version only — never read it as a fact
@@ -922,8 +925,9 @@ _Avoid_: server list, guild cache
   (option 2 of #222) would fix those. `requests.ts`'s pre-flight also rules out only the
   current version, but accepts any other (no direction, ordering or intents test), so an update
   request it accepts can still be skipped at the next boot. `contract.ts`'s doc on
-  `HOST_API_VERSION` ("skipped … never loaded") is now imprecise for the same reason; it is left as
-  is because the plugins repo vendors that file verbatim behind a `check-contract` drift check.
+  `HOST_API_VERSION` states this exception (#221 replaced its old "skipped … never loaded" wording);
+  the plugins repo vendors that file verbatim behind a `check-contract` drift check, so an edit to it
+  is a paired change with a re-vendor there.
 - **Extraction is atomic, and the installed bundle's own manifest is reconciled against the host on
   every load (#224, #223).** `install.ts`'s `tryInstallVersion` extracts into a sibling `.staging-*`
   dir under `<dataDir>/plugins/<name>/`, then renames it into `<name>/<version>/` only after
@@ -1351,8 +1355,8 @@ _Avoid_: server list, guild cache
   styles them with selectors that sit wholly inside `:where(.plugin-admin-tab …)` — zero
   specificity, so a bundle's own rules win (a test pins that shape).
 - **The Apply bar derives what is pending from the controls on every event and never stores it (#257).**
-  The bar's only state is its phase (`idle` / `applying` / `done` / `failed`) and the message it is
-  showing; the plan comes from `collectPending()` → `planApply` each time, exactly as the deleted Save
+  The bar's state is its phase (`idle` / `applying` / `done` / `failed`), the message it is showing, and
+  (#275) whether the page is re-reading the server (`applyRereading`); the plan comes from `collectPending()` → `planApply` each time, exactly as the deleted Save
   buttons read the controls at click time. So Discard is "re-render from the baseline" (`loadPlugins()` +
   `loadEnv()`, nothing posted), and there is no second copy of the truth to drift. Two consequences for
   anyone touching the page. (1) **Anything that changes a control's value from code must dispatch an `input`
@@ -1391,8 +1395,7 @@ _Avoid_: server list, guild cache
   stops printing the `bot-ops: ` prefix, or when `cmd_env_set` stops having exactly one write; it does not
   catch a behaviour change that builds the text from pieces, an `ERR` trap, or a second write of `.env`
   by other means. Everything else re-reads both lists, after which nothing is pending and the bar keeps
-  only OK (for the length of the re-read the bar still shows what was pending: the same window as #275): a
-  JSON 502 (the recreate failed after `.env` was rewritten, #47), a 504 (we killed it: the outcome is
+  only OK: a JSON 502 (the recreate failed after `.env` was rewritten, #47), a 504 (we killed it: the outcome is
   unknown), any other status, and the plain-text 502s the rule deliberately does not trust because they
   can follow the write -- a `set -e` abort after the `mv` (a tool's own error text), an external kill
   during the recreate (the `bot-ops: env file` line, printed only after the write, perhaps after a
@@ -1405,6 +1408,29 @@ _Avoid_: server list, guild cache
   needed applying." with the hint that the SAVED settings already held them, because after a killed
   recreate the running bot may not: nothing in the panel finishes that recreate (Restart is
   `docker compose restart`, which does not reload the env file; tracked in #277).
+  **The bar is not interactive while the page re-reads (#275).** Every re-read the bar starts (Discard, a
+  re-baselining failure, a success) goes through `rereadFromServer()` (`APPLY`), which sets `applyRereading`,
+  refreshes the bar, awaits `Promise.allSettled([loadPlugins, loadEnv].map(async (load) => load()))`, and
+  clears the flag in a `finally` (so a loader that throws cannot leave it locked); while it is set Discard and
+  Apply are `busy` in the pending and failed views and `applyPending` / `discardPending` return at once.
+  `allSettled`, not `all`: `all` rejects on the FIRST rejection, which would clear the flag while the other
+  list was still loading. Each loader is started inside an async arrow so one that throws SYNCHRONOUSLY becomes
+  its own rejection instead of skipping the other loader. Until the reads land the controls still hold the
+  edits that are about to be dropped, so an Apply pressed then would send them: after a Discard it sent the
+  very edits just discarded, and after a re-baselining failure the bar offered Apply for the length of the
+  re-read. OK stays usable, and a kept-edits refusal (#272) starts no re-read, so it never locks the bar.
+  `loadStatus()` is not part of it.
+  **`aria-busy` on `#apply-bar` is set only in the PENDING view, never in the failed or done view**
+  (`applyBarView`'s `ariaBusy`, written by `writeApplyBar`). Both of the latter write their message into the
+  bar's `role="status"` region in the SAME task the re-read starts, and `aria-busy` on a container is
+  specifically licensed to suppress that region's announcements until it clears -- marking the bar busy there
+  risks the failure or success message going unheard (not verified here: no screen reader was at hand). The
+  pending view has no terminal message to lose.
+  **The two GETs `rereadFromServer()` awaits have no timeout of their own** (new versus `a5eb2dd`, #276:
+  before `applyRereading` existed a slow read did not lock the bar's own buttons). A hang blocks Discard and
+  Apply for as long as the request is outstanding, up to the server's own limits (`SUBPROCESS_TIMEOUT_MS =
+  90_000`, `IDLE_TIMEOUT_SECONDS = 120`, `ops/admin/server.ts:498-499`); OK stays usable throughout. Tracked
+  as #282.
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer
