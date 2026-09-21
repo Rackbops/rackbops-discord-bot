@@ -1522,8 +1522,10 @@
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
   // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail?, noop? }
   //   -> { hidden, tone: ""|"danger"|"ok", title, hint, showDiscard, showGo, showOk, busy }
-  // `noop` (phase "done" only) is bot-ops.sh's "no changes" answer ({ok:true, recreated:false}): the values
-  // were already in place (another operator applied them, or this tab was stale), so nothing restarted.
+  // `noop` (phase "done" only) is bot-ops.sh's "no changes" answer ({ok:true, recreated:false}): the SAVED
+  // settings (.env) already held the values (another operator applied them, this tab was stale, or an earlier
+  // apply wrote them and did not finish its recreate), so nothing restarted. The hint says what it knows, the
+  // file, not that the running bot has them.
   function applyBarView(state) {
     const view = (over) => ({ hidden: false, tone: "", title: "", hint: "", showDiscard: false, showGo: false, showOk: false, busy: false, ...over });
     if (state.phase === "applying") {
@@ -1531,7 +1533,7 @@
     }
     if (state.phase === "done") {
       if (state.noop) {
-        return view({ tone: "ok", title: "Nothing needed applying.", hint: "The bot already had these values, so it was not restarted.", showOk: true });
+        return view({ tone: "ok", title: "Nothing needed applying.", hint: "The saved settings already held these values, so the bot was not restarted.", showOk: true });
       }
       return view({ tone: "ok", title: "Applied. The bot restarted with your changes.", showOk: true });
     }
@@ -1562,6 +1564,28 @@
       return { error: result.log || "bot-ops.sh error", detail: result.backup ? "Backup: " + result.backup : "" };
     }
     return { error: text || "bot-ops.sh error", detail: "" };
+  }
+  // Did a failed POST /api/env write nothing? Only then may the page keep what the user typed (#272). It is
+  // true only when the failure IS one of env-set's own refusals, identified POSITIVELY: a 502, a body that is
+  // not JSON, and a line that starts `bot-ops: env-set: ` (bot-ops.sh's die() prints `bot-ops: ` + its message,
+  // and every `die "env-set: ..."` sits before the write, `mv "$tmp" "$ENV_FILE"`; ops/admin/server.test.ts
+  // pins that order textually: no code line after the write, or outside cmd_env_set, may mention `env-set:`).
+  // Everything else re-baselines, including the cases a plain-text 502 can be that this rule deliberately does
+  // not trust:
+  //   502 + JSON ({ok:false, changed, backup, log})  the recreate failed AFTER .env was rewritten (#47)   -> false
+  //   504                                              bot-ops.sh timed out: the outcome is unknown         -> false
+  //   502 + plain text WITH an env-set refusal line   a die() before the write                            -> true
+  //   502 + plain text WITHOUT one                    a `set -e` abort after the mv (a tool's own error text), a kill
+  //                                                   during the recreate (the env-file line, maybe after a chown warning), a kill between the
+  //                                                   mv and that line (an empty body), a proxy's own 502 (HTML), or a
+  //                                                   refusal before the write that has no env-set prefix (a failed
+  //                                                   backup / mktemp, the self-update guard): the safe side  -> false
+  //   any other status                                 not a status this page can reason about              -> false
+  // `result` is the parsed body, or null when it did not parse as JSON (what applyPending computes); `text` is
+  // the raw body. `result === null` is not redundant: a body can parse as JSON and still hold a line the
+  // multiline `^` matches (JSON.parse accepts a raw U+2028 inside a string, after which `^` matches).
+  function failureWroteNothing(status, result, text) {
+    return status === 502 && result === null && /^bot-ops: env-set: /m.test(text);
   }
   // APPLY_VIEW:end
 
@@ -1741,9 +1765,17 @@
         applyError = failure.error;
         applyDetail = failure.detail;
         refreshApplyBar();
-        // .env may already have been rewritten even though the recreate failed (issue #47): re-baseline.
-        loadPlugins();
-        loadEnv();
+        // Re-baseline unless the failure IS one of env-set's own refusals (see failureWroteNothing for the rule
+        // and the cases it does not trust; issue #47: a failed recreate arrives after .env was rewritten, so the
+        // edits ARE the stored values). For a refusal the controls keep the user's values and ticks and the bar
+        // shows the failure with Discard and Apply, so one refused value can be corrected without retyping the
+        // rest. The catch below is unchanged: a network error or the page's own timeout leaves the controls as
+        // they are (a reload from a server that cannot be reached would replace the user's input with two
+        // error lines).
+        if (!failureWroteNothing(res.status, result, text)) {
+          loadPlugins();
+          loadEnv();
+        }
       }
       focusIfInBar(document.getElementById("apply-ok"));
     } catch (e) {
