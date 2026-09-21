@@ -1,289 +1,146 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-rb-style="arcane-obsidian">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex, nofollow" />
 <title>Bot Admin — __INSTANCE_NAME__</title>
-<style>
-  /* Theme-aware: light is the base palette; the dark palette overrides it under the viewer's
-     prefers-color-scheme. `color-scheme: light dark` lets native controls (scrollbars, the <select>
-     and datalist popups, autofill) follow the same preference. */
-  :root {
-    color-scheme: light dark;
-    --bg: #f4f5f7;
-    --panel: #ffffff;
-    --border: #c3c9d4;
-    --text: #1a1d24;
-    --muted: #59616e;
-    --accent: #2563eb;
-    --danger: #cf2b31;
-    --ok: #147a4a;
-    --inset: #e6e9ee; /* recessed fields: inputs, <pre>, the instance badge, the tag box */
-    --chip: #eef1f6;  /* a tag chip's fill — lighter than the --inset box so a chip lifts off it */
-    --btn2: #4b5563;  /* neutral secondary button (Lock, Remove) — always paired with white text */
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1115;
-      --panel: #171a21;
-      --border: #2a2f3a;
-      --text: #e6e8eb;
-      --muted: #9aa3b2;
-      --accent: #4f8cff;
-      --danger: #e5484d;
-      --ok: #2fb170;
-      --inset: #0d0f13;
-      --chip: #1b2130;
-      --btn2: #333;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: var(--bg);
-    color: var(--text);
-  }
-  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 18px; margin: 0 0 20px; }
-  h2 { font-size: 14px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  section {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    margin-bottom: 16px;
-  }
-  button {
-    font: inherit;
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 7px 14px;
-    cursor: pointer;
-  }
-  button.danger { background: var(--danger); }
-  button:disabled { opacity: 0.5; cursor: default; }
-  input, textarea, select {
-    font: inherit;
-    background: var(--inset);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 6px 8px;
-    width: 100%;
-  }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
-  .field-hint { font-size: 11px; color: var(--muted); margin: 0 0 4px; }
-  /* #173: a hard-to-miss warning — bot-ops.sh drifted behind the panel image it's paired with.
-     Distinct from .field-hint/.msg (both quiet, per-field/per-action notices): this is instance-
-     wide, so it renders once at the very top of the page rather than beside any one section. */
-  .banner-warn { background: var(--danger); color: #fff; font-size: 13px; font-weight: 600; padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
-  /* Tag/chip editor for comma-separated list fields (ADMIN_USER_IDS, WATCHED_REPOS). Looks like an
-     input box with each entry as a removable chip, plus an inline field to type the next one. */
-  .tag-field { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; background: var(--inset); border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
-  .tag-field .tag { display: inline-flex; align-items: center; gap: 4px; background: var(--chip); border: 1px solid var(--border); border-radius: 999px; padding: 2px 4px 2px 10px; font-size: 12px; word-break: break-all; }
-  .tag-field .tag button { background: transparent; color: var(--muted); border: none; border-radius: 999px; padding: 2px 6px; font-size: 14px; line-height: 1; cursor: pointer; width: auto; }
-  .tag-field .tag button:hover { color: var(--danger); }
-  .tag-field .tag-add { flex: 1 1 100px; min-width: 80px; width: auto; border: none; background: transparent; padding: 2px; }
-  /* The add input is borderless/transparent, so show focus on the whole field instead of a ring
-     around just the caret (which WCAG 2.4.7 doesn't count). */
-  .tag-field:focus-within { border-color: var(--accent); }
-  .tag-field .tag-add:focus { outline: none; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .status-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; }
-  .status-grid dt { color: var(--muted); }
-  .status-grid dd { margin: 0; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
-  .dot.up { background: var(--ok); }
-  .dot.down { background: var(--danger); }
-  pre {
-    background: var(--inset);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 10px;
-    max-height: 320px;
-    overflow: auto;
-    white-space: pre-wrap;
-    word-break: break-all;
-    font-size: 12px;
-  }
-  pre.nowrap { white-space: pre; word-break: normal; }
-  input[type="checkbox"] { width: auto; margin: 0; vertical-align: middle; }
-  .inline-check { display: inline-flex; align-items: center; gap: 5px; margin: 0; font-size: 12px; color: var(--muted); white-space: nowrap; cursor: pointer; }
-  #logs-filter { flex: 1 1 160px; width: auto; min-width: 140px; }
-  .msg { font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
-  .msg.error { color: var(--danger); }
-  .msg.ok { color: var(--ok); }
-  .panel-header { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 20px; }
-  .panel-header h1 { margin: 0; }
-  /* The instance this panel manages — a wrong-instance guard, so it's deliberately prominent and
-     present on both the gate and the app, not just the browser tab title. */
-  .instance-badge {
-    display: inline-block;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text);
-    background: var(--inset);
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    padding: 2px 10px;
-    letter-spacing: 0.02em;
-    /* Never let a long, unbroken instance name push a horizontal scrollbar — wrap it instead,
-       especially in the narrow 360px gate. */
-    max-width: 100%;
-    overflow-wrap: anywhere;
-  }
-  /* Who the panel authenticated as — pushed to the far end of the header row; wraps under on
-     narrow screens (the header is flex-wrap). */
-  .whoami { margin-left: auto; font-size: 12px; color: var(--muted); }
-  .admin-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
-  .admin-row:last-child { border-bottom: none; }
-  .admin-row .email { flex: 1; word-break: break-all; }
-  .admin-row .tag { font-size: 11px; color: var(--muted); }
-  .admin-row button { background: var(--btn2); padding: 4px 10px; font-size: 12px; }
-  .admin-row button.danger { background: var(--danger); }
-  .plugin-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
-  .plugin-row:last-child { border-bottom: none; }
-  .plugin-row input[type="checkbox"] { width: auto; margin-top: 3px; flex: none; }
-  .plugin-admin-tab { padding: 10px 0; border-bottom: 1px solid var(--border); }
-  .plugin-admin-tab:last-child { border-bottom: none; }
-  .plugin-admin-tab h3 { margin: 0 0 8px; font-size: 13px; }
-  .plugin-info { flex: 1; min-width: 0; }
-  .plugin-name { font-weight: 600; word-break: break-all; }
-  .plugin-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
-  .plugin-meta { font-size: 11px; color: var(--muted); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .plugin-badge { display: inline-block; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border); }
-  .plugin-badge.update { color: var(--accent); border-color: var(--accent); }
-  .plugin-badge.active { color: var(--ok); border-color: var(--ok); }
-  .plugin-badge.warn { color: var(--danger); border-color: var(--danger); }
-  .plugin-update { margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--inset); }
-  .plugin-changes { margin: 0 0 8px; }
-  .plugin-changes summary { cursor: pointer; font-size: 12px; color: var(--accent); }
-  .plugin-changes .rel { margin-top: 6px; }
-  .plugin-changes .rel-ver { font-weight: 600; font-size: 12px; }
-  .plugin-changes .rel-meta { font-size: 11px; color: var(--muted); }
-  .plugin-changes .rel-notes { font-size: 12px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
-  .plugin-incompat { font-size: 11px; color: var(--danger); margin-bottom: 6px; }
-  .plugin-sched-note { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
-  .plugin-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .plugin-actions button { padding: 4px 10px; font-size: 12px; }
-  .plugin-actions button.secondary { background: var(--btn2); }
-  .plugin-actions .sched { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .plugin-actions input[type="datetime-local"] { width: auto; padding: 3px 6px; font-size: 12px; }
-  .plugin-actions-msg { font-size: 11px; margin-top: 6px; white-space: pre-wrap; }
-  .plugin-actions-msg.ok { color: var(--ok); }
-  .plugin-actions-msg.error { color: var(--danger); }
-  #gate { max-width: 360px; margin: 80px auto; text-align: center; }
-  #gate .panel-header { justify-content: center; }
-</style>
+<!-- The Rackbops design system (rb-theme.css, generated from a pinned @rackbops/styles) is scoped to
+     data-rb-style on <html>. Dark (arcane-obsidian) is the no-script default above; this sets the
+     viewer's preference before the stylesheets load, so first paint is already the right scheme, and
+     follows a later change of the OS setting. There is deliberately no toggle. -->
+<script>
+(() => {
+  const dark = window.matchMedia("(prefers-color-scheme: dark)");
+  const apply = () => { document.documentElement.dataset.rbStyle = dark.matches ? "arcane-obsidian" : "arcane-parchment"; };
+  apply();
+  dark.addEventListener("change", apply);
+})();
+</script>
+<link rel="stylesheet" href="/rb-theme.css">
+<link rel="stylesheet" href="/admin.css">
 </head>
 <body>
 
-<div id="gate" hidden>
-  <div class="panel-header">
-    <h1>Bot Admin</h1>
-    <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
+<div id="gate" class="adm-gate" hidden>
+  <div class="adm-head">
+    <h1 class="rb-wordmark"><span class="rb-wordmark__spark" aria-hidden="true">&#9670;</span>bot admin</h1>
+    <span class="instance-badge rb-badge rb-badge--md" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
   </div>
-  <p style="color: var(--muted)">Paste the admin token to continue.</p>
-  <input id="token-input" type="password" placeholder="Admin token" autocomplete="off" />
-  <div class="row" style="margin-top: 10px; justify-content: center">
-    <button id="unlock">Unlock</button>
+  <p class="adm-sub">Paste the admin token to continue.</p>
+  <input id="token-input" class="rb-input" type="password" placeholder="Admin token" autocomplete="off" />
+  <div class="row">
+    <button id="unlock" class="rb-btn rb-btn--primary">Unlock</button>
   </div>
 </div>
 
-<main id="app" hidden>
+<main id="app" class="adm" hidden>
   <!-- #173/#178: deployment-file drift warning — text is set dynamically from /api/status's
        outdatedFiles by describeOutdatedBanner(), naming whichever of bot-ops.sh/docker-compose.yml
        is behind; hidden whenever that field is absent/empty (both up to date). This static content
-       is a placeholder only, never actually seen. See loadStatus() below. -->
-  <div id="bot-ops-outdated-banner" class="banner-warn" hidden></div>
-  <div class="panel-header">
-    <h1>Bot Admin</h1>
-    <span class="instance-badge" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
+       is a placeholder only, never actually seen. See loadStatus() below. Instance-wide, so it sits
+       above the tabs and stays visible whichever one is open. -->
+  <div id="bot-ops-outdated-banner" class="banner-warn rb-alert rb-alert--danger" hidden></div>
+  <div class="adm-head">
+    <h1 class="rb-wordmark"><span class="rb-wordmark__spark" aria-hidden="true">&#9670;</span>bot admin</h1>
+    <span class="instance-badge rb-badge rb-badge--md" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
     <span id="whoami" class="whoami"></span>
+    <button id="lock" class="rb-btn rb-btn--ghost">Lock</button>
   </div>
 
-  <section id="status-section">
-    <h2>Status</h2>
-    <dl class="status-grid" id="status-grid"><dt>Loading…</dt></dl>
-    <div class="row" style="margin-top: 12px">
-      <button id="refresh-status">Refresh</button>
-      <button id="restart" class="danger">Restart</button>
-      <button id="lock" style="margin-left: auto; background: var(--btn2)">Lock</button>
+  <!-- The three tabs only show and hide: every section below still loads at unlock, exactly as when
+       they were stacked. The open tab lives in the URL hash (#overview / #plugins / #settings). -->
+  <nav aria-label="Sections">
+    <div class="rb-tabstrip" role="tablist">
+      <button type="button" class="rb-tabstrip__tab rb-tabstrip__tab--active" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0">Overview</button>
+      <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-plugins" aria-controls="panel-plugins" aria-selected="false" tabindex="-1">Plugins</button>
+      <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
     </div>
-    <div id="restart-msg" class="msg"></div>
-  </section>
+  </nav>
 
-  <section>
-    <h2>Logs</h2>
-    <div class="row">
-      <input id="logs-n" type="number" value="200" min="1" max="5000" style="width: 90px" aria-label="Number of log lines to load" />
-      <button id="load-logs">Load</button>
-      <input id="logs-filter" type="text" placeholder="Filter loaded lines…" autocomplete="off" aria-label="Filter loaded log lines" />
-      <label class="inline-check"><input type="checkbox" id="logs-wrap" checked /> Wrap</label>
-    </div>
-    <div id="logs-meta" class="field-hint" style="margin-top: 6px"></div>
-    <pre id="logs-out" style="margin-top: 6px">(not loaded)</pre>
-  </section>
+  <div id="panel-overview" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+    <section id="status-section" class="rb-card">
+      <h2>Status</h2>
+      <dl class="status-grid" id="status-grid"><dt>Loading…</dt></dl>
+      <div class="row adm-actions">
+        <button id="refresh-status" class="rb-btn">Refresh</button>
+        <button id="restart" class="rb-btn rb-btn--danger">Restart</button>
+      </div>
+      <div id="restart-msg" class="msg"></div>
+    </section>
 
-  <section>
-    <h2>Config</h2>
-    <div id="env-fields">Loading…</div>
-    <div class="row" style="margin-top: 12px">
-      <button id="save-env">Save changes</button>
-    </div>
-    <div id="env-msg" class="msg"></div>
-  </section>
+    <section id="logs-section" class="rb-card">
+      <h2>Logs</h2>
+      <div class="row">
+        <input id="logs-n" class="rb-input" type="number" value="200" min="1" max="5000" style="width: 90px" aria-label="Number of log lines to load" />
+        <button id="load-logs" class="rb-btn">Load</button>
+        <input id="logs-filter" class="rb-input" type="text" placeholder="Filter loaded lines…" autocomplete="off" aria-label="Filter loaded log lines" />
+        <label class="inline-check rb-label"><input type="checkbox" id="logs-wrap" class="rb-checkbox" checked /> Wrap</label>
+      </div>
+      <div id="logs-meta" class="field-hint" style="margin-top: 6px"></div>
+      <pre id="logs-out" class="rb-pre rb-log" style="margin-top: 6px">(not loaded)</pre>
+    </section>
+  </div>
 
-  <section id="plugins-section">
-    <h2>Plugins</h2>
-    <p style="color: var(--muted); margin: 0 0 10px">
-      Choose which plugins this instance runs. Ticking or unticking a plugin sets the
-      <code>PLUGINS</code> list and recreates the bot to apply it. This never installs code from the
-      browser — only plugins offered by the Plugin Index can be enabled. A disabled plugin's stored
-      data is left untouched.
-    </p>
-    <div id="plugins-list">Loading…</div>
-    <div class="row" style="margin-top: 12px">
-      <button id="save-plugins">Save changes</button>
-    </div>
-    <div id="plugins-msg" class="msg"></div>
-  </section>
+  <div id="panel-plugins" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-plugins" tabindex="0" hidden>
+    <section id="plugins-section" class="rb-card">
+      <h2>Plugins</h2>
+      <p class="adm-sub">
+        Choose which plugins this instance runs. Ticking or unticking a plugin sets the
+        <code>PLUGINS</code> list and recreates the bot to apply it. This never installs code from the
+        browser — only plugins offered by the Plugin Index can be enabled. A disabled plugin's stored
+        data is left untouched.
+      </p>
+      <div id="plugins-list">Loading…</div>
+      <div class="row adm-actions">
+        <button id="save-plugins" class="rb-btn rb-btn--primary">Save changes</button>
+      </div>
+      <div id="plugins-msg" class="msg"></div>
+    </section>
 
-  <section id="plugin-admin-section" hidden>
-    <h2>Plugin Settings</h2>
-    <p style="color: var(--muted); margin: 0 0 10px">
-      Settings contributed by installed plugins. Each plugin renders its own controls here; changes go
-      through the same guarded save (and bot recreate) as the config above, scoped to that plugin's own keys.
-    </p>
-    <div id="plugin-admin-list"></div>
-  </section>
+    <section id="plugin-admin-section" class="rb-card" hidden>
+      <h2>Plugin Settings</h2>
+      <p class="adm-sub">
+        Settings contributed by installed plugins. Each plugin renders its own controls here; changes go
+        through the same guarded save (and bot recreate) as the config above, scoped to that plugin's own keys.
+      </p>
+      <div id="plugin-admin-list"></div>
+    </section>
+  </div>
 
-  <section id="admins-section">
-    <h2>Admins</h2>
-    <p style="color: var(--muted); margin: 0 0 10px">
-      Who may use this panel — among people Cloudflare Access already lets reach it. Bootstrap
-      admins (from the <code>ADMIN_ALLOWED_EMAILS</code> env var) are permanent; edit them on the
-      box and recreate the admin container (re-run install.sh's step 4) for the change to take effect.
-    </p>
-    <div id="admins-list">Loading…</div>
-    <div class="row" style="margin-top: 12px">
-      <input id="admin-email" type="email" placeholder="new-admin@example.com" autocomplete="off" style="max-width: 320px" />
-      <button id="add-admin">Add admin</button>
-    </div>
-    <div id="admins-msg" class="msg"></div>
-  </section>
+  <div id="panel-settings" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-settings" tabindex="0" hidden>
+    <section id="config-section" class="rb-card">
+      <h2>Config</h2>
+      <div id="env-fields" class="adm-fields">Loading…</div>
+      <div class="row adm-actions">
+        <button id="save-env" class="rb-btn rb-btn--primary">Save changes</button>
+      </div>
+      <div id="env-msg" class="msg"></div>
+    </section>
 
-  <section id="identity-section">
-    <h2>Identity</h2>
-    <p style="color: var(--muted); margin: 0 0 10px">
-      Everything Cloudflare Access hands this panel about you, from the verified Access token.
-    </p>
-    <dl class="status-grid" id="identity-grid"><dt>Loading…</dt></dl>
-  </section>
+    <section id="admins-section" class="rb-card">
+      <h2>Admins</h2>
+      <p class="adm-sub">
+        Who may use this panel — among people Cloudflare Access already lets reach it. Bootstrap
+        admins (from the <code>ADMIN_ALLOWED_EMAILS</code> env var) are permanent; edit them on the
+        box and recreate the admin container (re-run install.sh's step 4) for the change to take effect.
+      </p>
+      <div id="admins-list">Loading…</div>
+      <div class="row adm-actions">
+        <input id="admin-email" class="rb-input" type="email" placeholder="new-admin@example.com" autocomplete="off" style="max-width: 320px" />
+        <button id="add-admin" class="rb-btn rb-btn--primary">Add admin</button>
+      </div>
+      <div id="admins-msg" class="msg"></div>
+    </section>
+
+    <section id="identity-section" class="rb-card">
+      <h2>Identity</h2>
+      <p class="adm-sub">
+        Everything Cloudflare Access hands this panel about you, from the verified Access token.
+      </p>
+      <dl class="status-grid" id="identity-grid"><dt>Loading…</dt></dl>
+    </section>
+  </div>
 </main>
 
 <script>
@@ -355,7 +212,75 @@
     loadEnv();
     loadPlugins();
     loadAdmins();
+    showTab(tabFromHash(location.hash), false);
   }
+
+  // TABS:begin
+  // Pure tab decisions, lifted so ops/admin/server.test.ts can pin them: which tab a URL hash names
+  // (anything unknown or empty opens Overview), and which tab an arrow / Home / End key moves to
+  // (arrows wrap; any other key leaves the current tab). The DOM half is showTab, below.
+  const TAB_IDS = ["overview", "plugins", "settings"];
+  function tabFromHash(hash) {
+    const id = String(hash || "").replace(/^#/, "");
+    return TAB_IDS.includes(id) ? id : "overview";
+  }
+  function nextTabId(current, key) {
+    const i = TAB_IDS.indexOf(current);
+    if (i === -1) return current;
+    if (key === "ArrowRight") return TAB_IDS[(i + 1) % TAB_IDS.length];
+    if (key === "ArrowLeft") return TAB_IDS[(i + TAB_IDS.length - 1) % TAB_IDS.length];
+    if (key === "Home") return TAB_IDS[0];
+    if (key === "End") return TAB_IDS[TAB_IDS.length - 1];
+    return current;
+  }
+  // TABS:end
+
+  // TABS_DOM:begin
+  // The DOM half of the tabs, lifted with a stubbed page so ops/admin/server.test.ts can pin it too
+  // (it needs TABS above). Purely show/hide — nothing is loaded or reloaded when a tab opens.
+  const TAB_NAV_KEYS = ["ArrowLeft", "ArrowRight", "Home", "End"];
+
+  // Opens one tab (ARIA tabs pattern, automatic activation): the tab is aria-selected and the only
+  // one in the Tab order (roving tabindex), its panel is the only one shown, and the choice is
+  // written to the URL hash so a reload lands on it. replaceState, not location.hash, so switching
+  // tabs neither scrolls nor stacks history entries. The tabs and panels are looked up by their own
+  // ids (never by role), so ARIA tabs a plugin's settings bundle builds inside the page are left alone.
+  function showTab(id, moveFocus) {
+    for (const tabId of TAB_IDS) {
+      const on = tabId === id;
+      const tab = document.getElementById("tab-" + tabId);
+      tab.setAttribute("aria-selected", String(on));
+      tab.tabIndex = on ? 0 : -1;
+      tab.classList.toggle("rb-tabstrip__tab--active", on);
+      if (on && moveFocus) tab.focus();
+      document.getElementById("panel-" + tabId).hidden = !on;
+    }
+    history.replaceState(null, "", "#" + id);
+    // Work that had to wait for a panel to be visible (LOGS_SCROLL, below) is picked up here.
+    if (typeof afterTabShown === "function") afterTabShown(id);
+  }
+
+  // Click, arrow / Home / End keys on the tablist, and a hand-edited hash all open a tab.
+  function wireTabs(tablist) {
+    tablist.addEventListener("click", (e) => {
+      const tab = e.target.closest('[role="tab"]');
+      if (tab) showTab(tab.id.replace(/^tab-/, ""), false);
+    });
+    tablist.addEventListener("keydown", (e) => {
+      const tab = e.target.closest('[role="tab"]');
+      // A modified key is the browser's (Alt+Left is Back), not ours.
+      if (!tab || !TAB_NAV_KEYS.includes(e.key) || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      e.preventDefault();
+      showTab(nextTabId(tab.id.replace(/^tab-/, ""), e.key), true);
+    });
+    window.addEventListener("hashchange", () => showTab(tabFromHash(location.hash), false));
+  }
+  // TABS_DOM:end
+  // Guarded so a missing tablist can only cost the tabs, never the token gate (this line runs before
+  // the boot code at the bottom of the script, and a throw here would leave the page blank).
+  const tablist = document.querySelector('[role="tablist"]');
+  if (tablist) wireTabs(tablist);
+  else console.error("admin: no [role=tablist] in the page, so the tabs are not wired");
 
   // JWT claims that are unix-second timestamps — humanized in the Identity view.
   const TIME_CLAIMS = new Set(["iat", "exp", "nbf", "auth_time"]);
@@ -436,7 +361,7 @@
           row.appendChild(tag);
         } else {
           const btn = document.createElement("button");
-          btn.className = "danger";
+          btn.className = "rb-btn rb-btn--danger rb-btn--sm";
           btn.textContent = "Remove";
           btn.addEventListener("click", (e) => withBusy(e.currentTarget, () => removeAdmin(email)));
           row.appendChild(btn);
@@ -520,8 +445,7 @@
       container.innerHTML = "";
       if (data.stateError) {
         const notice = document.createElement("div");
-        notice.className = "field-hint";
-        notice.style.color = "var(--danger)";
+        notice.className = "field-hint field-hint--danger";
         notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
         container.appendChild(notice);
       }
@@ -734,12 +658,18 @@
     }
   }
 
+  // PLUGIN_BADGE_CLASSES:begin
+  // The badge DECISION ({text, kind}, from PLUGIN_BADGES below) keeps its own kind vocabulary; this
+  // maps it onto the library's semantic badge modifiers. `kind` stays on the element as before.
+  const BADGE_MODIFIERS = new Map([["active", "rb-badge--success"], ["warn", "rb-badge--warning"], ["update", "rb-badge--info"]]);
   function makeBadge(text, kind) {
     const b = document.createElement("span");
-    b.className = "plugin-badge" + (kind ? " " + kind : "");
+    const modifier = BADGE_MODIFIERS.get(kind);
+    b.className = "rb-badge plugin-badge" + (kind ? " " + kind : "") + (modifier ? " " + modifier : "");
     b.textContent = text;
     return b;
   }
+  // PLUGIN_BADGE_CLASSES:end
 
   // PLUGIN_BADGES:begin
   // Pure badge DECISIONS ({text, kind}), split from DOM rendering so ops/admin/server.test.ts can
@@ -802,6 +732,7 @@
 
     const check = document.createElement("input");
     check.type = "checkbox";
+    check.className = "rb-checkbox";
     check.checked = !!p.enabled;
     check.dataset.plugin = p.name;
     check.id = "plugin-" + p.name;
@@ -943,6 +874,7 @@
     if (canInstall) {
       const now = document.createElement("button");
       now.type = "button";
+      now.className = "rb-btn rb-btn--primary rb-btn--sm";
       now.textContent = "Update now";
       wire(
         now,
@@ -955,10 +887,11 @@
       sched.className = "sched";
       const when = document.createElement("input");
       when.type = "datetime-local";
+      when.className = "rb-input";
       when.value = toDatetimeLocalValue(new Date(Date.now() + 60 * 60 * 1000)); // default: an hour out
       const schedBtn = document.createElement("button");
       schedBtn.type = "button";
-      schedBtn.className = "secondary";
+      schedBtn.className = "rb-btn rb-btn--sm";
       schedBtn.textContent = "Schedule";
       wire(
         schedBtn,
@@ -981,14 +914,14 @@
     if (hasUpdate) {
       const remind = document.createElement("button");
       remind.type = "button";
-      remind.className = "secondary";
+      remind.className = "rb-btn rb-btn--sm";
       remind.textContent = "Remind me in 7 days";
       wire(remind, () => pluginRequestPayload("remind", p.name, p.latestVersion, { days: 7 }), null);
       actions.appendChild(remind);
 
       const skip = document.createElement("button");
       skip.type = "button";
-      skip.className = "secondary";
+      skip.className = "rb-btn rb-btn--sm";
       skip.textContent = "Skip this version";
       wire(
         skip,
@@ -1001,7 +934,7 @@
     if (p.scheduled) {
       const cancel = document.createElement("button");
       cancel.type = "button";
-      cancel.className = "danger";
+      cancel.className = "rb-btn rb-btn--danger rb-btn--sm";
       cancel.textContent = "Cancel scheduled update";
       wire(cancel, () => pluginRequestPayload("cancel", p.name), 'Cancel the scheduled update for "' + p.name + '"?');
       actions.appendChild(cancel);
@@ -1247,11 +1180,27 @@
     meta.textContent = matched.length + " of " + allLines.length + " lines match";
   }
 
-  // Newest lines are last (docker logs order), so "scroll to bottom" == show the most recent.
+  // LOGS_SCROLL:begin
+  // Newest lines are last (docker logs order), so "scroll to bottom" == show the most recent. The log
+  // block lives in the Overview tab, and scrollTop does nothing on an element that isn't laid out: if
+  // the admin switched tabs while the load was in flight, the jump waits (logsScrollPending) until
+  // showTab opens a tab again (afterTabShown) and the block is laid out, instead of being silently lost.
+  let logsScrollPending = false;
   function scrollLogsToBottom() {
     const out = document.getElementById("logs-out");
+    if (out.offsetParent === null) {
+      logsScrollPending = true;
+      return;
+    }
+    logsScrollPending = false;
     out.scrollTop = out.scrollHeight;
   }
+  // Called by showTab after every tab switch; scrollLogsToBottom re-defers itself while Overview is
+  // still hidden, so only opening Overview actually scrolls.
+  function afterTabShown() {
+    if (logsScrollPending) scrollLogsToBottom();
+  }
+  // LOGS_SCROLL:end
 
   document.getElementById("load-logs").addEventListener("click", (e) =>
     withBusy(e.currentTarget, async () => {
@@ -1372,7 +1321,7 @@
 
     const add = document.createElement("input");
     add.type = "text";
-    add.className = "tag-add";
+    add.className = "tag-add rb-input";
     add.id = "env-" + key; // the field the <label> focuses (wrapper carries dataset.focusId)
     add.placeholder = meta.placeholder || "add…";
     add.autocomplete = "off";
@@ -1434,6 +1383,7 @@
     let control;
     if (meta.control === "select") {
       control = document.createElement("select");
+      control.className = "rb-select";
       const options = ["", ...meta.options];
       // Represent an out-of-enum stored value (e.g. a hand-edited .env) faithfully as its own
       // option, rather than silently coercing the select to blank — which would misrepresent it
@@ -1449,10 +1399,12 @@
     } else if (meta.control === "branch" && branchesData) {
       // <select> of the configured repo's live branches (value = label = branch name).
       control = document.createElement("select");
+      control.className = "rb-select";
       const re = compilePattern(loadedSchema.BOT_BRANCH && loadedSchema.BOT_BRANCH.pattern);
       populateBranchSelect(control, branchesData, value, re);
     } else {
       control = document.createElement("input");
+      control.className = "rb-input";
       control.value = value;
     }
     control.id = "env-" + key;
@@ -1486,6 +1438,7 @@
         const value = env[key] ?? "";
         const control = buildEnvControl(key, value);
         const label = document.createElement("label");
+        label.className = "rb-label";
         label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
         // Clicking the label focuses the field; a composite control (tags) points at its nested
         // input via dataset.focusId, since the wrapper itself isn't focusable.
