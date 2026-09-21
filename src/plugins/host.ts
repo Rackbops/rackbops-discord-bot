@@ -166,9 +166,40 @@ export function buildCommandBody(
   return body;
 }
 
+/** The most one plugin tick gets (#217) before `pluginTicks` stops waiting on it: its check then
+ *  rejects, which `runTick` logs as that plugin's own failure before moving on to the next plugin.
+ *  Kept under `announce.ts`'s 60s `TICK_MS` so a single hung tick can't by itself hold `guardedTick`
+ *  past the next interval — `runTick` awaits checks one after another, so before this a hung tick
+ *  held every plugin loaded after it for as long as it hung. It bounds the WAIT, not the call:
+ *  cancelling would need an AbortSignal in `TickCheck.run`, a contract change every plugin would have
+ *  to opt into, so the abandoned call keeps running — concurrently with whatever runs next, that
+ *  plugin's other ticks included — and `pluginTicks` skips that tick (with a warning) until it
+ *  settles, rather than starting a second call on top of it. A call that never settles therefore
+ *  silences that tick until the bot restarts; its siblings keep running. */
+export const PLUGIN_TICK_TIMEOUT_MS = 30_000;
+
+/** Rejects if `p` hasn't settled within `ms`, and clears its timer either way — unlike
+ *  `disposePlugins`' race below (a one-shot on the way out, where a leftover timer is harmless),
+ *  this runs on every 60s tick, and a timer left armed after its tick settled would sit dead for up
+ *  to `ms`, holding the event loop open that long. Once the timeout wins, `p`'s late settle lands on
+ *  an already-settled resolve/reject and is dropped, never an unhandled rejection. */
+function withTickTimeout(p: Promise<void>, ms: number, label: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`plugin tick ${label} exceeded ${ms}ms`)), ms);
+    p.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
 /** Each plugin tick wrapped so it only runs while that plugin's `running` flag is true — a tick
- * can fire between startScheduler and activatePlugins, and must not run before activate() resolved. */
-export function pluginTicks(loaded: readonly LoadedPlugin[], log: BaseLog): TickCheck[] {
+ * can fire between startScheduler and activatePlugins, and must not run before activate() resolved —
+ * is abandoned after `timeoutMs` if it hasn't settled (#217, see PLUGIN_TICK_TIMEOUT_MS), and is never
+ * started while its own previous call is still pending. `timeoutMs` is the test seam, like
+ * `guardedTick`'s `watchdogMs`: real callers take the default. */
+export function pluginTicks(
+  loaded: readonly LoadedPlugin[],
+  log: BaseLog,
+  timeoutMs = PLUGIN_TICK_TIMEOUT_MS,
+): TickCheck[] {
   const checks: TickCheck[] = [];
   for (const lp of loaded) {
     try {
@@ -176,10 +207,29 @@ export function pluginTicks(loaded: readonly LoadedPlugin[], log: BaseLog): Tick
       // throwing getter) must skip this plugin's ticks, never throw out of here into activate()'s
       // caller (this runs OUTSIDE the setup try, at the startScheduler call).
       for (const tick of lp.plugin.ticks ?? []) {
+        const name = `${lp.entry.name}:${tick.name}`;
+        // Per check, not per plugin or per name: true from the moment a call starts until that call
+        // ITSELF settles — not until the wait on it gives up — so a call the timeout abandoned still
+        // blocks a second one being started on top of it (#217). `pluginTicks` runs once, at boot, so
+        // this outlives every tick.
+        let inFlight = false;
         checks.push({
-          name: `${lp.entry.name}:${tick.name}`,
+          name,
           run: async () => {
-            if (lp.running) await tick.run();
+            if (!lp.running) return;
+            if (inFlight) {
+              log.warn(`[plugins] ${name}: its previous tick is still running — skipping this one`);
+              return;
+            }
+            inFlight = true;
+            // The async wrapper still starts the tick synchronously, but turns a sync throw or a plain
+            // (non-promise) return — plugin code is only type-asserted — into a promise, so EVERY path
+            // reaches the finally that releases the flag; a throw that skipped it would silence this
+            // tick for good.
+            const call = (async () => tick.run())().finally(() => {
+              inFlight = false;
+            });
+            await withTickTimeout(call, timeoutMs, name);
           },
         });
       }
@@ -229,7 +279,7 @@ export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
  * throw — sync or async, including a malformed non-function `dispose` — is isolated exactly like
  * `activatePlugins` isolates a throwing `activate()`, logged and never propagated, and never stops
  * any other plugin's own dispose (`Promise.allSettled`, not `Promise.all`). `running` is flipped
- * false for every plugin this touches regardless of outcome, so `pluginTicks`' gate (`:166`) stops
+ * false for every plugin this touches regardless of outcome, so `pluginTicks`' running gate stops
  * ticking against a resource that dispose either released or failed to release — a dying handle is
  * not a reason to keep using it. Mutates each LoadedPlugin in place, like `activatePlugins`.
  */

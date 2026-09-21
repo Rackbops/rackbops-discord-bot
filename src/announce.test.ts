@@ -282,9 +282,9 @@ describe("guardedTick", () => {
 
   // A call with no timeout of its own could hang forever, leaving tickInFlight stuck true
   // permanently and silently freezing every future tick — not just the one stuck check. The bot's
-  // own network is bounded now (#88, #130), so what this still backstops is discord.js's REST and
-  // arbitrary third-party plugin ticks. `watchdogMs` is the injected test seam so this doesn't
-  // actually wait out the real 5-minute bound.
+  // own network is bounded now (#88, #130) and so is the wait on each plugin tick (#217), so what
+  // this still backstops is discord.js's REST. `watchdogMs` is the injected test seam so this
+  // doesn't actually wait out the real 5-minute bound.
   test("a run() that never settles has its guard released by the watchdog", async () => {
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
     try {

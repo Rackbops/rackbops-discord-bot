@@ -12,6 +12,12 @@
 // awaits the same critical section (bounded by `SHUTDOWN_GRACE_MS`, kept meaningfully under
 // `docker stop`'s own SIGKILL timeout) before letting the process exit — see `awaitCriticalIdle`
 // and `handoffExemption` below for how a handoff's own holder avoids waiting on itself.
+//
+// The one exception is a plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #217):
+// the host stops waiting on it rather than let one hung plugin hold every requested restart forever,
+// so that tick's critical section closes while its call is still running. From then until the call
+// settles, neither a restart request nor a SIGTERM/SIGINT drain waits for it — including one that
+// arrives after the section closed, not just one already pending when it did.
 
 /** Distinct from a crash, so a supervisor can tell an update apart from a failure. */
 export const RESTART_EXIT_CODE = 75;
