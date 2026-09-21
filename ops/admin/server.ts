@@ -442,9 +442,12 @@ export interface BotOpsResult {
  * Pure: maps a request's method/path/query/body onto a bot-ops.sh invocation, or `undefined`
  * for a route this panel doesn't recognise. No new bot-ops.sh capability is introduced here —
  * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`env-get`/
- * `env-set`/`env-schema`). The `plugin-request` subcommand (#105) is deliberately NOT dispatched here: it's a
- * server-native route (`POST /api/plugins/request`) so `requestedBy` can be set from the verified
- * identity, so it never reaches buildInvocation.
+ * `env-set`/`env-schema`/`routing-get`). The `plugin-request` subcommand (#105) is deliberately NOT
+ * dispatched here: it's a server-native route (`POST /api/plugins/request`) so `requestedBy` can be set
+ * from the verified identity, so it never reaches buildInvocation -- and neither do the four routing
+ * writes (#242: `POST /api/routing`, `POST /api/webhooks`, `DELETE /api/webhooks/<channel id>`,
+ * `POST /api/discovery/refresh`), which are `plugin-request` actions and server-native for the same
+ * reason (plus: the server mints the request id, and one of them carries a secret).
  */
 export function buildInvocation(
   method: string,
@@ -470,6 +473,11 @@ export function buildInvocation(
   }
   if (method === "GET" && pathname === "/api/env-schema") {
     return { args: ["env-schema"], contentType: "application/json" };
+  }
+  // #242: `{ routing, discovery }`, both files the bot writes, read 1:1 -- so the generic path's 502/504
+  // handling applies unchanged. (Neither file holds a webhook URL: those are in routing.secrets.json.)
+  if (method === "GET" && pathname === "/api/routing") {
+    return { args: ["routing-get"], contentType: "application/json" };
   }
   return undefined;
 }
@@ -1160,6 +1168,109 @@ export function parsePluginRequestInput(
   return { ok: true, request };
 }
 
+// ---------------------------------------------------------------------------------------------------
+// #242: the routing writes. Each is a `plugin-request` action the bot applies (#241); this file only
+// validates the body, adds `requestedBy` and a server-minted `id`, and queues it through bot-ops.sh.
+// The panel is its own package and cannot import `src/`, so these are its own copies of the bot's
+// patterns (`src/routing/model.ts`, `src/routing/requests.ts`), kept in step by hand.
+// ---------------------------------------------------------------------------------------------------
+
+/** A Discord id (server or channel): 5 to 25 digits. Mirrors the bot's `SNOWFLAKE_RE`. */
+const ROUTING_SNOWFLAKE_RE = /^[0-9]{5,25}$/;
+/** The webhook URLs the bot accepts: https, discord.com or discordapp.com (canary and ptb too), with or
+ *  without an API version. Mirrors the bot's `WEBHOOK_URL_RE` (which also captures the id and token). */
+const ROUTING_WEBHOOK_URL_RE =
+  /^https:\/\/(?:canary\.|ptb\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d{5,25}\/[A-Za-z0-9_-]{20,}$/;
+
+export interface RoutingSetInput {
+  plugin: string;
+  servers: Record<string, { commands: "all" | string[]; postTo?: string }>;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Validates `POST /api/routing`'s body and REBUILDS it: `{ plugin, servers }` and nothing else, every
+ * key of `servers` and every field of its entries copied one by one from what passed, so no unknown key
+ * (a `requestedBy`, an `id`, a `__proto__`) can reach the mailbox. A server id is tested against the
+ * snowflake pattern BEFORE it is assigned, so `__proto__` can never become a key. An empty `servers` is
+ * valid: it places the plugin nowhere. The bot re-validates against what it actually sees (defence in
+ * depth). A reason names the field and never echoes a value.
+ */
+export function parseRoutingSetInput(raw: unknown): { ok: true; input: RoutingSetInput } | { ok: false; reason: string } {
+  if (!isPlainRecord(raw)) return { ok: false, reason: "body is not a JSON object" };
+  if (typeof raw.plugin !== "string" || !REQUEST_PLUGIN_NAME_RE.test(raw.plugin)) {
+    return { ok: false, reason: "bad plugin name" };
+  }
+  if (!isPlainRecord(raw.servers)) return { ok: false, reason: "servers must be an object" };
+  const servers: RoutingSetInput["servers"] = {};
+  for (const [guildId, entry] of Object.entries(raw.servers)) {
+    if (!ROUTING_SNOWFLAKE_RE.test(guildId)) return { ok: false, reason: "bad server id" };
+    const commands = isPlainRecord(entry) ? entry.commands : undefined;
+    let scope: "all" | string[];
+    if (commands === "all") {
+      scope = "all";
+    } else if (
+      Array.isArray(commands) &&
+      commands.length > 0 &&
+      commands.every((c) => typeof c === "string" && ROUTING_SNOWFLAKE_RE.test(c))
+    ) {
+      scope = [...(commands as string[])];
+    } else {
+      return { ok: false, reason: 'commands must be "all" or a non-empty list of channel ids' };
+    }
+    const rebuilt: RoutingSetInput["servers"][string] = { commands: scope };
+    const postTo = (entry as Record<string, unknown>).postTo;
+    if (postTo !== undefined) {
+      if (typeof postTo !== "string" || !ROUTING_SNOWFLAKE_RE.test(postTo)) return { ok: false, reason: "bad postTo" };
+      rebuilt.postTo = postTo;
+    }
+    servers[guildId] = rebuilt;
+  }
+  return { ok: true, input: { plugin: raw.plugin, servers } };
+}
+
+/**
+ * Validates `POST /api/webhooks`'s body: `{ url }`, trimmed (a pasted URL often carries a newline), and
+ * the trimmed string is what is returned. The reason for a bad URL is `bad webhook url` and nothing more:
+ * not the value, not its length, not which part was wrong.
+ */
+export function parseWebhookAddInput(raw: unknown): { ok: true; url: string } | { ok: false; reason: string } {
+  if (!isPlainRecord(raw)) return { ok: false, reason: "body is not a JSON object" };
+  const url = typeof raw.url === "string" ? raw.url.trim() : undefined;
+  if (url === undefined || !ROUTING_WEBHOOK_URL_RE.test(url)) return { ok: false, reason: "bad webhook url" };
+  return { ok: true, url };
+}
+
+const ROUTING_REDACTED = "[webhook url]";
+// Anything webhook-URL-shaped, in any scheme or case, with or without a version segment, through the last
+// character a URL could hold. Every quantifier before `discord` is bounded, so this stays linear on a
+// hostile megabyte of text. (Copied from the bot's `WEBHOOK_TEXT_RE`.)
+const ROUTING_WEBHOOK_TEXT_RE =
+  /(?:[a-z][a-z0-9+.-]{0,15}:\\?\/\\?\/)?(?:[a-z0-9-]{1,63}\.){0,5}discord(?:app)?\.com\\?\/api\\?\/(?:v\d+\\?\/)?webhooks\\?\/[\w\-.~%+=?&#:@/\\]*/gi;
+// The same without a host, so a port, a doubled slash or a trailing dot in the host (which the pattern
+// above does not know) is still cut down to the part that matters. (The bot's `WEBHOOK_PATH_RE`.)
+const ROUTING_WEBHOOK_PATH_RE = /webhooks(?:\\?\/|%2f)\d{5,25}(?:\\?\/|%2f)[\w-]{20,}/gi;
+
+/**
+ * `text` with anything that looks like a webhook URL replaced by `[webhook url]`; text with none is
+ * returned as it was. JSON can spell any character as an escape (`/`, `\/`) and a URL can
+ * percent-encode any character (`%77ebhooks`), so those are read as what they stand for BEFORE looking --
+ * each decoded once: a doubly-encoded spelling is not chased, since nothing in this path produces one.
+ * When something is found the DECODED text is what comes back, redacted; text that only looked escaped
+ * but holds no URL is not touched.
+ */
+export function redactWebhookUrls(text: string): string {
+  const plain = text
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/%([0-9a-fA-F]{2})/g, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+  const redacted = plain.replace(ROUTING_WEBHOOK_TEXT_RE, ROUTING_REDACTED).replace(ROUTING_WEBHOOK_PATH_RE, ROUTING_REDACTED);
+  return redacted === plain ? text : redacted;
+}
+
 /** I/O seams for the Plugin Index lister — injected so the read-on-demand + cache logic is testable
  *  without a real filesystem or network. */
 export interface PluginIndexListerDeps {
@@ -1263,6 +1374,10 @@ export interface HandlerConfig {
    *  both fields are present exactly when there's something to report — the same convention
    *  `/api/plugins`'s `indexError`/`stateError` use. */
   outdatedFiles?: string[];
+  /** #242: mints the id of a routing request (the id the page then looks up in `routing.results`). A test
+   *  seam: absent, it is `crypto.randomUUID()`, which matches the bot's `/^[A-Za-z0-9_-]{8,64}$/`. The id
+   *  is ALWAYS the server's, never the client's. */
+  newRequestId?: () => string;
 }
 
 /** How a request authorized, carried through so mutating actions can be attributed. `email` is
@@ -1521,6 +1636,46 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
   return new Response("method not allowed", { status: 405 });
 }
 
+/** The four routing writes the panel can queue (#242) -- the bot's `ROUTING_ACTIONS`. */
+type RoutingRequestBody =
+  | { action: "routing-set"; plugin: string; servers: RoutingSetInput["servers"] }
+  | { action: "webhook-add"; url: string }
+  | { action: "webhook-remove"; channelId: string }
+  | { action: "discovery-refresh" };
+
+/**
+ * Queues one routing request through `bot-ops.sh plugin-request` (#242) and answers `{ ok, id, queued }`.
+ * `request` is built by the caller from VALIDATED fields, never from the client's body; `requestedBy` and
+ * `id` are added here, after it, from the verified identity and the server's own counter, so nothing the
+ * client sent can override them. The payload goes to bot-ops.sh on STDIN as JSON and nowhere else -- a
+ * `webhook-add` carries a secret, so it is never in `argv`, a log line, a response or an error.
+ * `describe` is for the audit line and must NEVER be built from a webhook url.
+ *
+ * Anything bot-ops.sh wrote (its stderr in a failure, its `queued` in a success) passes through
+ * `redactWebhookUrls` before it is logged or answered: a `die "... '$url'"` in the script would otherwise
+ * carry the secret straight back to the page and into `docker logs`.
+ */
+async function queueRoutingRequest(
+  config: HandlerConfig,
+  auth: Authorization,
+  request: RoutingRequestBody,
+  describe: string,
+): Promise<Response> {
+  const requestedBy = auth.email ? `email:${auth.email}` : "token";
+  const id = config.newRequestId?.() ?? crypto.randomUUID();
+  const payload = JSON.stringify({ ...request, requestedBy, id });
+  const result = await config.runBotOps({ args: ["plugin-request"], stdin: payload, contentType: "application/json" });
+  if (result.exitCode !== 0) {
+    const stderr = redactWebhookUrls(result.stderr.trim());
+    console.error(`[admin] plugin-request failed (exit ${result.exitCode}) — requested by ${describeActor(auth)}: ${stderr}`);
+    if (result.timedOut) return new Response("bot-ops.sh timed out", { status: 504 });
+    return new Response(stderr || "plugin-request failed", { status: 502 });
+  }
+  console.log(`[admin] plugin-request queued (${describe}) — requested by ${describeActor(auth)}`);
+  const queued = safeJsonField(result.stdout, "queued");
+  return jsonResponse({ ok: true, id, queued: typeof queued === "string" ? redactWebhookUrls(queued) : undefined });
+}
+
 /** The whole request lifecycle, DI'd per CLAUDE.md's "keep I/O at the edges" convention (matches
  * updateReport.ts's injected-deliverer shape) — every dependency arrives as a parameter, nothing
  * is read from process.env or the filesystem inside this function. */
@@ -1669,6 +1824,45 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
       return new Response(result.stdout, { headers: { "Content-Type": "application/json" } });
     }
     return jsonResponse({ ok: true });
+  }
+
+  // #242: the four routing writes. Each is a `plugin-request` action, server-native for the same reason as
+  // the route above (`requestedBy` from the verified identity) plus one more: the SERVER mints the request
+  // id the page then looks up in `routing.results`. All four are POST/DELETE, so the isCrossSiteWrite gate
+  // and the auth check above already stand in front of them. The body of each is rebuilt from validated
+  // fields (nothing from the client is forwarded), and a webhook URL travels body -> parsed value -> stdin
+  // and nowhere else (see queueRoutingRequest). Any other method on these paths falls through to the 404.
+  if (req.method === "POST" && url.pathname === "/api/routing") {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await req.text());
+    } catch {
+      return new Response("invalid JSON", { status: 400 });
+    }
+    const parsed = parseRoutingSetInput(raw);
+    if (!parsed.ok) return new Response(parsed.reason, { status: 400 });
+    const { plugin, servers } = parsed.input;
+    return queueRoutingRequest(config, auth, { action: "routing-set", plugin, servers }, `routing-set ${plugin}`);
+  }
+  if (req.method === "POST" && url.pathname === "/api/webhooks") {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(await req.text());
+    } catch {
+      return new Response("invalid JSON", { status: 400 });
+    }
+    const parsed = parseWebhookAddInput(raw);
+    if (!parsed.ok) return new Response(parsed.reason, { status: 400 });
+    return queueRoutingRequest(config, auth, { action: "webhook-add", url: parsed.url }, "webhook-add");
+  }
+  if (req.method === "DELETE" && url.pathname.startsWith("/api/webhooks/")) {
+    // The pathname is not percent-decoded, so an encoded or nested id simply fails the pattern.
+    const channelId = url.pathname.slice("/api/webhooks/".length);
+    if (!ROUTING_SNOWFLAKE_RE.test(channelId)) return new Response("bad channel id", { status: 400 });
+    return queueRoutingRequest(config, auth, { action: "webhook-remove", channelId }, `webhook-remove ${channelId}`);
+  }
+  if (req.method === "POST" && url.pathname === "/api/discovery/refresh") {
+    return queueRoutingRequest(config, auth, { action: "discovery-refresh" }, "discovery-refresh");
   }
 
   if (url.pathname === "/api/admins" && config.adminStore) {
