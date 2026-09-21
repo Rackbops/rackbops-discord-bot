@@ -1,0 +1,83 @@
+# Where a plugin lives is bot-owned data, applied live
+
+Until Epic #236 every slash command was registered to one guild (`DISCORD_SERVER_ID`, one
+`rest.put` in `src/index.ts`) and every plugin's `announce` posted to one channel
+(`ANNOUNCE_CHANNEL_ID`). Neither was a per-plugin setting, and neither could be reached from the
+admin panel. Going live with the `music` plugin on 2026-09-20 made the cost concrete: its commands
+were wanted in a second server the bot was already in, and the only way to get them there was a
+hand-made call to the Discord API.
+
+Three constraints shape the answer. The panel is a separate container that **never holds the Discord
+token** (`docker-compose.yml`'s `admin` service is deliberately not given the instance `.env`), so it
+cannot ask Discord which servers or channels exist. Configuration today is **flat `.env` scalars that
+only take effect on a container recreate** (`ops/bot-ops.sh env-set`), which is the wrong shape and
+the wrong latency for "this plugin, these servers, these channels". And `src/plugins/contract.ts` is
+a **shipped contract**: changing `HostApi` affects every published plugin.
+
+**Decision:** where a plugin lives is data the bot owns, in its data dir, changed through the
+request mailbox and applied without a restart.
+
+1. **`data/routing.json` is the record, and the bot is its only writer.** Per plugin, per server:
+   where its commands work (`"all"`, or a list of channels) and the channel it posts to. The panel
+   asks for a change by dropping a request in the mailbox (`src/plugins/requests.ts`), exactly as it
+   already does for plugin updates; the bot validates it against what it can actually see, writes
+   the file, re-registers commands and carries on. Nothing restarts.
+2. **Routing is per plugin, not per command.** A plugin's whole command set goes where the plugin
+   lives. Core commands (`report`, `update`, `plugins`) go to every server the bot is in; the two
+   admin ones are already hidden from non-admins by `setDefaultMemberPermissions(0)`.
+3. **A plugin nobody has placed lives in the home server.** `DISCORD_SERVER_ID` stops meaning "the
+   only server" and becomes "the home server": a plugin with no entry in `routing.json` registers
+   there and posts to `ANNOUNCE_CHANNEL_ID`, exactly as before. With no `routing.json` at all the
+   bot makes byte-for-byte the registration call it makes today.
+4. **The bot publishes what it can see, as `data/discovery.json`.** Its servers, their text
+   channels and whether it can post in each, the outcome of the last command registration per
+   server, and an invite URL carrying the `applications.commands` scope. The panel reads that file
+   and offers names to pick from; nobody types a Discord id.
+5. **Posting goes through the channel's webhook when one is registered, and as the bot when none
+   is.** A webhook is an upgrade — its own name and avatar — never a requirement. A webhook URL is
+   a secret: it is stored only in `data/routing.secrets.json`, never in `routing.json`,
+   `discovery.json`, a log line or a rejected request.
+6. **`HostApi.announce(message)` does not change.** The host resolves a plugin's channels where it
+   builds that plugin's `announce`; `HOST_API_VERSION` does not move and no published plugin is
+   affected.
+7. **Channel restrictions are enforced by the bot at dispatch**, because a bot cannot edit
+   Discord's per-channel command permissions (that needs a user's bearer token). A command used
+   outside its channels gets a private reply naming the right ones; a thread counts as its parent.
+8. **The panel may set plugin-declared secret keys, write-only.** A key the Plugin Index marks
+   `secret: true` can be written through `env-set`, is never returned by `env-get`, and appears in
+   `env-schema` only as `secret` + `isSet`. Core secrets stay uneditable. This loosens
+   "secrets are never edited by ops tooling" deliberately: needing SSH to give a plugin its API key
+   was half of what made adding one painful, and the panel is already behind Cloudflare Access, an
+   email allow-list and the cross-site-write gate. A plugin's admin bundle already runs with the
+   panel's authority (#226); write-only keeps a compromised one from *reading* a secret.
+
+## Considered Options
+
+- **Encode routing in `.env`** (a JSON value, or compound keys). Fits `env-set` with the least new
+  plumbing, but every change costs a recreate — about twenty seconds offline to move a plugin into a
+  channel — and a map of maps in an env var is unreviewable. Rejected.
+- **Give the panel the Discord token** so it can list servers and register commands itself.
+  Rejected: it would hand the root-equivalent panel container the one secret it is deliberately
+  kept from, and create a second writer of Discord state racing the bot.
+- **`announce(message, channelId?)`**, the plugin sourcing the id from its own env key (#219 as
+  filed). Rejected for this case: it moves the pasted snowflake from one env key to many, makes every
+  plugin re-implement "where do I post", and changes a shipped contract. Named destinations
+  (`announce(message, "alerts")`, mapped to channels in the same panel row) remain a compatible
+  later extension and stay open on #219.
+- **Per-command routing.** Rejected as unneeded: the one apparently curated per-server command set
+  in production turned out to be a stale registration, not a choice.
+- **Global command registration.** Puts every command in every server, with up to an hour's
+  propagation. Rejected: it is the opposite of choosing where a plugin lives.
+
+## Consequences
+
+- The bot manages the command list of **every** server it is in, not only the home server. A server
+  no plugin lives in gets the core commands and nothing else, so a deployment must seed
+  `routing.json` to mirror what is live before its first routed boot (#247).
+- `ops/bot-ops.sh` gains a read of two more files and four request actions, and its schema number
+  moves (#240); a deployed instance needs `ops/install.sh` re-run, which the panel's out-of-date
+  banner already reports.
+- Discovery is only as fresh as the bot's last write. The panel shows when it was generated and
+  offers a refresh; it never guesses.
+- Two bots in one server do not disturb each other: commands are scoped to the application, and
+  `COMMAND_PREFIX` already keeps their names apart.

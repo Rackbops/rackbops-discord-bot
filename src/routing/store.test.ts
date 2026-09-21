@@ -1,0 +1,243 @@
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DATA_DIR } from "../storage";
+import { freshRouting, freshSecrets, type RoutingFile } from "./model";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, routingPath, secretsPath } from "./store";
+
+const GUILD = "111111111111111111";
+const CHAN = "333333333333333331";
+const HOOK_URL = "https://discord.com/api/webhooks/444444444444444444/SECRET-TOKEN";
+
+let dir: string;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "routing-store-test-"));
+});
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Adds a plugin placed in one server -- the smallest change that shows up in a read. */
+function withPlugin(name: string): (current: RoutingFile) => RoutingFile {
+  return (current) => ({ ...current, plugins: { ...current.plugins, [name]: { servers: { [GUILD]: { commands: "all" } } } } });
+}
+
+describe("paths", () => {
+  test("the two files are routing.json and routing.secrets.json in the directory given", () => {
+    // Spelled out as literals: these are data paths on a deployed volume, permanent once shipped.
+    expect(routingPath("/data")).toBe("/data/routing.json");
+    expect(secretsPath("/data")).toBe("/data/routing.secrets.json");
+  });
+});
+
+describe("readRouting", () => {
+  test("a missing file reads as fresh", async () => {
+    expect(await readRouting(dir)).toEqual(freshRouting());
+    // Reading never creates the file.
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("an unparseable file reads as fresh and is moved aside", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const damaged of ["", "{", '{"v":1,"plugins":{"music":', "not json at all"]) {
+        writeFileSync(routingPath(dir), damaged);
+        expect(await readRouting(dir)).toEqual(freshRouting());
+        expect(existsSync(routingPath(dir))).toBe(false);
+        // The damaged bytes are kept for inspection, not thrown away.
+        const aside = readdirSync(dir).filter((f) => f.startsWith("routing.json.corrupt-"));
+        expect(aside).toHaveLength(1);
+        expect(readFileSync(join(dir, aside[0]!), "utf8")).toBe(damaged);
+        rmSync(join(dir, aside[0]!));
+      }
+      expect(error).toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  test("a wrong-shaped file reads as fresh", async () => {
+    for (const shaped of [[], "text", 5, null, { v: 2, plugins: {} }, { plugins: { music: { servers: {} } } }, { v: 1, plugins: [] }]) {
+      writeFileSync(routingPath(dir), JSON.stringify(shaped));
+      expect(await readRouting(dir)).toEqual(freshRouting());
+    }
+  });
+
+  test("a partly-valid file is read down to what is valid", async () => {
+    writeFileSync(
+      routingPath(dir),
+      JSON.stringify({
+        v: 1,
+        plugins: {
+          music: { servers: { [GUILD]: { commands: [CHAN], postTo: CHAN } } },
+          "Bad Name": { servers: {} },
+        },
+      }),
+    );
+    expect((await readRouting(dir)).plugins).toEqual({ music: { servers: { [GUILD]: { commands: [CHAN], postTo: CHAN } } } });
+  });
+});
+
+describe("mutateRouting", () => {
+  test("mutateRouting persists and the next read sees it", async () => {
+    await mutateRouting(dir, withPlugin("music"));
+    expect((await readRouting(dir)).plugins).toEqual({ music: { servers: { [GUILD]: { commands: "all" } } } });
+    // It is on disk, as valid JSON, under the expected name -- not just held in memory.
+    expect(JSON.parse(readFileSync(routingPath(dir), "utf8")).plugins.music.servers[GUILD].commands).toBe("all");
+    await mutateRouting(dir, withPlugin("wow"));
+    expect(Object.keys((await readRouting(dir)).plugins).sort()).toEqual(["music", "wow"]);
+  });
+
+  test("two overlapping mutateRouting calls both land", async () => {
+    // Fired together, not awaited in turn: a read-then-write with nothing serializing it would let
+    // several of these read the same empty file and each write only its own plugin. Twenty calls
+    // make that all but certain to show, where two might get lucky.
+    const names = Array.from({ length: 20 }, (_, i) => `plugin-${i}`);
+    await Promise.all(names.map((name) => mutateRouting(dir, withPlugin(name))));
+    expect(Object.keys((await readRouting(dir)).plugins).sort()).toEqual([...names].sort());
+  });
+
+  test("a mutate that throws fails its own call and leaves the file, and the queue, working", async () => {
+    await mutateRouting(dir, withPlugin("music"));
+    const before = readFileSync(routingPath(dir), "utf8");
+    await expect(
+      mutateRouting(dir, () => {
+        throw new Error("boom");
+      }),
+    ).rejects.toThrow("boom");
+    expect(readFileSync(routingPath(dir), "utf8")).toBe(before);
+    // The failure did not wedge the per-file queue.
+    await mutateRouting(dir, withPlugin("wow"));
+    expect(Object.keys((await readRouting(dir)).plugins).sort()).toEqual(["music", "wow"]);
+  });
+
+  test("mutate always receives a repaired value", async () => {
+    const seen: RoutingFile[] = [];
+    const capture = (current: RoutingFile): RoutingFile => {
+      seen.push(structuredClone(current));
+      return current;
+    };
+    // No file at all.
+    await mutateRouting(dir, capture);
+    // A wrong-shaped one, and one that is half good.
+    writeFileSync(routingPath(dir), JSON.stringify([1, 2]));
+    await mutateRouting(dir, capture);
+    writeFileSync(
+      routingPath(dir),
+      JSON.stringify({
+        v: 1,
+        updatedBy: "someone",
+        plugins: { music: { servers: { [GUILD]: { commands: [CHAN] }, "bad-id": { commands: "all" } } }, Nope: { servers: {} } },
+        junk: true,
+      }),
+    );
+    await mutateRouting(dir, capture);
+
+    expect(seen[0]).toEqual(freshRouting());
+    expect(seen[1]).toEqual(freshRouting());
+    expect(seen[2]).toEqual({
+      v: 1,
+      updatedAt: "",
+      updatedBy: "someone",
+      plugins: { music: { servers: { [GUILD]: { commands: [CHAN] } } } },
+      webhooks: {},
+    });
+    // And what was written back is the repaired file, not the damage.
+    expect(JSON.parse(readFileSync(routingPath(dir), "utf8")).junk).toBeUndefined();
+  });
+
+  test("it only ever writes under the directory it is given, never the bot's own data dir", async () => {
+    await mutateRouting(dir, withPlugin("music"));
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }));
+    expect(existsSync(join(DATA_DIR, "routing.json"))).toBe(false);
+    expect(existsSync(join(DATA_DIR, "routing.secrets.json"))).toBe(false);
+  });
+});
+
+describe("secrets", () => {
+  test("a missing or wrong-shaped secrets file reads as fresh", async () => {
+    expect(await readSecrets(dir)).toEqual(freshSecrets());
+    for (const shaped of [[], "x", null, { v: 1 }, { v: 3, webhooks: {} }]) {
+      writeFileSync(secretsPath(dir), JSON.stringify(shaped));
+      expect(await readSecrets(dir)).toEqual(freshSecrets());
+    }
+  });
+
+  test("mutateSecrets persists, and never touches routing.json", async () => {
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, [CHAN]: HOOK_URL } }));
+    expect((await readSecrets(dir)).webhooks).toEqual({ [CHAN]: HOOK_URL });
+    // The webhook URL is in exactly one file.
+    expect(readdirSync(dir).sort()).toEqual(["routing.secrets.json"]);
+    await mutateRouting(dir, withPlugin("music"));
+    expect(readFileSync(routingPath(dir), "utf8")).not.toContain("SECRET-TOKEN");
+    expect(readFileSync(routingPath(dir), "utf8")).not.toContain("discord.com/api/webhooks");
+  });
+
+  test("two overlapping mutateSecrets calls both land", async () => {
+    const channels = Array.from({ length: 20 }, (_, i) => String(500000 + i));
+    await Promise.all(
+      channels.map((c) => mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, [c]: `https://example.invalid/${c}` } }))),
+    );
+    expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([...channels].sort());
+  });
+
+  test("mutateSecrets hands mutate a repaired value", async () => {
+    writeFileSync(secretsPath(dir), JSON.stringify({ v: 1, webhooks: { [CHAN]: HOOK_URL, "not-a-channel": "x", "444444444444444445": 7 }, junk: 1 }));
+    let seen: unknown;
+    await mutateSecrets(dir, (s) => {
+      seen = structuredClone(s);
+      return s;
+    });
+    expect(seen).toEqual({ v: 1, webhooks: { [CHAN]: HOOK_URL } });
+  });
+
+  // chmod is a no-op-ish on Windows (it can only toggle the read-only bit), so this can only be
+  // observed on Linux -- which is CI. It is CI-ONLY: a green run on a Windows box says nothing.
+  test.skipIf(process.platform === "win32")("the secrets file is owner-only after a write", async () => {
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }));
+    expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o600);
+    // Every later write replaces the file, so it has to be set again each time.
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { ...s.webhooks, "333333333333333332": "https://example.invalid/2" } }));
+    expect(statSync(secretsPath(dir)).mode & 0o777).toBe(0o600);
+  });
+
+  test("mutateSecrets asks for owner-only on the secrets file, after the write", async () => {
+    // The same guarantee as the CI-only test above, observed through the injected chmod so it runs
+    // on every platform: the right path, the right mode, and only once the file exists.
+    const calls: { path: string; mode: number; existed: boolean }[] = [];
+    await mutateSecrets(
+      dir,
+      (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }),
+      async (path, mode) => {
+        calls.push({ path, mode, existed: existsSync(path) });
+      },
+    );
+    expect(calls).toEqual([{ path: secretsPath(dir), mode: 0o600, existed: true }]);
+  });
+
+  test("a chmod failure is logged, not thrown", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(
+        mutateSecrets(
+          dir,
+          (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }),
+          async () => {
+            throw new Error("EPERM: operation not permitted");
+          },
+        ),
+      ).resolves.toBeUndefined();
+      // The write itself landed.
+      expect((await readSecrets(dir)).webhooks).toEqual({ [CHAN]: HOOK_URL });
+      // And the failure was said out loud, naming the file and the reason -- but not the secret.
+      expect(error).toHaveBeenCalledTimes(1);
+      const message = String(error.mock.calls[0]?.[0]);
+      expect(message).toContain(secretsPath(dir));
+      expect(message).toContain("EPERM");
+      expect(message).not.toContain("SECRET-TOKEN");
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
