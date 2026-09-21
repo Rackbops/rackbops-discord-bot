@@ -489,6 +489,7 @@ describe("guildJoined / guildLeft (#259)", () => {
       channels: { cache: new Map([["2001", textChannel("2001", "spotify", 1)], ["2002", textChannel("2002", "chat", 2)]]) },
     });
   const OTHER_GUILD = { id: OTHER, name: "Other" };
+  const HOME_GUILD = { id: HOME, name: "Home" };
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
   /** A promise the test opens by hand, so a registration can be held in flight. */
   const latch = () => {
@@ -498,6 +499,21 @@ describe("guildJoined / guildLeft (#259)", () => {
     });
     return { closed, open };
   };
+  /**
+   * Fails a test that would otherwise never end. A join that waits on the chain it is itself queued on
+   * (the deadlock the mode-outside-the-chain rule exists to prevent) is a promise that never settles, and
+   * a test awaiting it with nothing else pending neither times out nor exits: the suite hangs.
+   */
+  const withinDeadline = <T>(p: Promise<T>, what: string, ms = 3000): Promise<T> =>
+    Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${what} did not settle within ${ms} ms: is it waiting on the chain it is queued on?`)), ms);
+        void p.then(() => clearTimeout(timer), () => clearTimeout(timer));
+      }),
+    ]);
+  const handleJoin = (guild: { id: string; name: string }) => withinDeadline(guildJoined(guild), `guildJoined(${guild.name})`);
+  const handleLeave = (guild: { id: string; name: string }) => withinDeadline(guildLeft(guild), `guildLeft(${guild.name})`);
 
   test("a join in routed mode registers again, the new server included, and discovery lists it with its outcome", async () => {
     await placeMusicInOther();
@@ -510,7 +526,7 @@ describe("guildJoined / guildLeft (#259)", () => {
 
     h.puts.length = 0;
     joinOther(h);
-    await guildJoined(OTHER_GUILD);
+    await handleJoin(OTHER_GUILD);
 
     // One run, the whole registration: every server, in name order, the new one with its commands.
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
@@ -531,24 +547,59 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME]);
 
     joinOther(h);
-    await guildJoined(OTHER_GUILD);
-    // The one guild-or-global call already covers a new server, as it always has: nothing more is sent ...
+    await handleJoin(OTHER_GUILD);
+    // Single mode registers to ONE place (here the home server) and a join of another server does not change
+    // where: nothing more is sent ...
     expect(h.puts).toHaveLength(1);
-    // ... and discovery now lists it, with nothing registered there by this run.
+    // ... and discovery now lists it, with nothing registered there, as before.
     const file = readDiscovery();
     expect(file.guilds.map((g) => g.id)).toEqual([HOME, OTHER]);
     expect(file.guilds.find((g) => g.id === OTHER)!.commands).toBeNull();
 
     // A routing.json that exists but places nobody is single mode too.
     await mutateRouting(dir, (c) => ({ ...c, plugins: {} }));
-    await guildJoined(OTHER_GUILD);
+    await handleJoin(OTHER_GUILD);
     expect(h.puts).toHaveLength(1);
+  });
+
+  test("a join of the home server in single mode registers again: the bot re-invited with the scope it lacked", async () => {
+    // The boot registration was refused (50001, the bot lacks the applications.commands scope there), the
+    // operator re-invites the bot, and the join must put the commands there; single mode's one call is that.
+    const failures: Record<string, unknown> = { [guildRoute(HOME)]: new Error("Missing Access (50001)") };
+    const h = harness({ failures });
+    initRouting(h.ctx);
+    await expect(applyRouting("boot")).rejects.toThrow("Missing Access");
+    const refused = readDiscovery().guilds.find((g) => g.id === HOME)!.commands;
+    expect(refused?.registered).toBe(0);
+    expect(refused?.error).toContain("Missing Access (50001)");
+
+    delete failures[guildRoute(HOME)];
+    await handleJoin(HOME_GUILD);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(HOME)]);
+    // Exactly the call it always made in single mode: the full body, to the home server.
+    expect(names(h.puts[1]!.body)).toEqual([...CORE, ...MUSIC, ...WOW]);
+    const home = readDiscovery().guilds.find((g) => g.id === HOME)!;
+    expect(home.commands).toMatchObject({ registered: CORE.length + MUSIC.length + WOW.length });
+    expect(home.commands?.error).toBeUndefined();
+  });
+
+  test("a join in single mode with no home server registers nothing: the global list already reaches a new server", async () => {
+    const h = harness({ homeGuildId: undefined });
+    leaveOther(h);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([`/applications/${APP}/commands`]);
+    joinOther(h);
+    await handleJoin(OTHER_GUILD);
+    await handleJoin(HOME_GUILD);
+    expect(h.puts).toHaveLength(1);
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME, OTHER]);
   });
 
   test("a join before initRouting does nothing", async () => {
     const h = harness();
     await placeMusicInOther();
-    await expect(guildJoined(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
     // The boot registration that follows snapshots a cache that already holds the server.
     expect(h.puts).toEqual([]);
     expect(h.logs.log).toEqual([]);
@@ -558,6 +609,7 @@ describe("guildJoined / guildLeft (#259)", () => {
   test("a join while the boot registration is running queues behind it", async () => {
     await placeMusicInOther();
     const held = latch();
+    const reached = latch();
     const sawDiscovery: boolean[] = [];
     let first = true;
     const h = harness({
@@ -565,15 +617,18 @@ describe("guildJoined / guildLeft (#259)", () => {
         sawDiscovery.push(existsSync(discoveryPath(dir)));
         if (first) {
           first = false;
+          reached.open();
           await held.closed;
         }
       },
     });
     initRouting(h.ctx);
     const boot = applyRouting("boot");
-    const joined = guildJoined(OTHER_GUILD);
+    const joined = handleJoin(OTHER_GUILD);
+    // Wait for the boot's first put to be reached (no guessing at how long that takes), then give the join every
+    // chance to run its own: it must not, being queued behind the boot on the chain.
+    await withinDeadline(reached.closed, "the boot registration's first put");
     await sleep(30);
-    // Only the boot's first put has happened; the join has read routing and is waiting on the chain.
     expect(sawDiscovery).toEqual([false]);
     held.open();
     await Promise.all([boot, joined]);
@@ -591,38 +646,52 @@ describe("guildJoined / guildLeft (#259)", () => {
       },
     });
     initRouting(h.ctx);
-    await Promise.all([guildJoined(OTHER_GUILD), guildJoined({ id: HOME, name: "Home" })]);
+    await Promise.all([handleJoin(OTHER_GUILD), handleJoin(HOME_GUILD)]);
     // Each run puts to two servers; the second run's first put comes after the first run's discovery write.
     expect(sawDiscovery).toEqual([false, false, true, true]);
     expect(h.puts).toHaveLength(4);
   });
 
   test("a join whose registration fails is logged, not thrown", async () => {
-    // The join reads routing (placements: routed mode), queues behind a registration in flight, and the last
-    // placement is removed while it waits. Its run is then a single-mode one, and single mode rethrows a
-    // failed registration -- which must not escape into the listener.
+    // Single mode rethrows a failed registration (once discovery has recorded it), and a join of the home
+    // server in single mode is a registration: the rejection must not escape into the listener.
+    const h = harness({ failures: { [guildRoute(HOME)]: new Error("Missing Access") } });
+    initRouting(h.ctx);
+    await applyRouting("boot").catch(() => {});
+    h.logs.error.length = 0;
+    await expect(handleJoin(HOME_GUILD)).resolves.toBeUndefined();
+    expect(h.logs.error.some((line) => line.includes(`[routing] handling the join of Home (${HOME}) failed`))).toBe(true);
+    expect(h.logs.error.some((line) => line.includes("Missing Access"))).toBe(true);
+  });
+
+  test("a join whose registration rejects in routed mode is logged, not thrown", async () => {
+    // Routed mode does not throw either -- unless something around it does: here the logger throws while the
+    // run reports what it registered, which rejects applyRouting. Nothing depends on timing.
     await placeMusicInOther();
-    const held = latch();
-    let first = true;
+    const errors: string[] = [];
     const h = harness({
-      failures: { [guildRoute(HOME)]: new Error("Missing Access") }, // single mode's one PUT goes to the home server
-      onPut: async () => {
-        if (first) {
-          first = false;
-          await held.closed;
-        }
+      log: {
+        log: (line: unknown) => {
+          if (String(line).startsWith("Registered commands")) throw new Error("the logger broke");
+        },
+        warn: () => {},
+        error: (...a: unknown[]) => void errors.push(a.map(String).join(" ")),
       },
     });
     initRouting(h.ctx);
-    const boot = applyRouting("boot");
-    const joined = guildJoined(OTHER_GUILD);
-    await sleep(30);
-    await mutateRouting(dir, (c) => ({ ...c, plugins: {} }));
-    held.open();
-    await boot;
-    await expect(joined).resolves.toBeUndefined();
-    expect(h.logs.error.some((line) => line.includes(`[routing] handling the join of Other (${OTHER}) failed`))).toBe(true);
-    expect(h.logs.error.some((line) => line.includes("Missing Access"))).toBe(true);
+    await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
+    expect(errors.some((line) => line.includes(`[routing] handling the join of Other (${OTHER}) failed`))).toBe(true);
+    expect(errors.some((line) => line.includes("the logger broke"))).toBe(true);
+  });
+
+  test("a logger that always throws does not make a join or a leave reject", async () => {
+    const broken = () => {
+      throw new Error("the logger broke");
+    };
+    const h = harness({ log: { log: broken, warn: broken, error: broken } });
+    initRouting(h.ctx);
+    await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
   });
 
   test("a join's discovery write failure is logged, and names the join", async () => {
@@ -630,7 +699,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     mkdirSync(discoveryPath(dir)); // a directory where the file goes: the write fails
     const h = harness();
     initRouting(h.ctx);
-    await expect(guildJoined(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
     expect(h.logs.error.some((line) => line.includes("writing discovery.json failed (joined Other)"))).toBe(true);
     // The registration itself still happened: a panel that cannot be told is no reason to skip the commands.
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
@@ -646,7 +715,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     const putsBefore = h.puts.length;
 
     leaveOther(h);
-    await guildLeft(OTHER_GUILD);
+    await handleLeave(OTHER_GUILD);
 
     // The server stops being offered ...
     expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME]);
@@ -662,7 +731,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     await applyRouting("boot");
     expect(existsSync(routingPath(dir))).toBe(false);
     leaveOther(h);
-    await guildLeft(OTHER_GUILD);
+    await handleLeave(OTHER_GUILD);
     expect(existsSync(routingPath(dir))).toBe(false);
     expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME]);
   });
@@ -671,7 +740,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     const h = harness();
     await placeMusicInOther();
     const before = readFileSync(routingPath(dir));
-    await expect(guildLeft(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
     expect(existsSync(discoveryPath(dir))).toBe(false);
     expect(readFileSync(routingPath(dir)).equals(before)).toBe(true);
     expect(h.puts).toEqual([]);
@@ -684,7 +753,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     writeFileSync(file, "x");
     const failing = harness({ dataDir: join(file, "data") });
     initRouting(failing.ctx);
-    await expect(guildLeft(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
     expect(failing.logs.error.some((line) => line.includes("writing discovery.json failed (refresh)"))).toBe(true);
     resetRoutingForTest();
 
@@ -713,7 +782,7 @@ describe("guildJoined / guildLeft (#259)", () => {
       },
     });
     initRouting(h.ctx);
-    await expect(guildLeft(OTHER_GUILD)).resolves.toBeUndefined();
+    await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
     expect(errors.some((line) => line.includes(`[routing] handling the departure from Other (${OTHER}) failed`))).toBe(true);
   });
 });

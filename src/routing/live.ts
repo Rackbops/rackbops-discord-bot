@@ -9,7 +9,8 @@
 // the first.
 //
 // A server the bot joins or leaves after boot (#259) goes through the same chain: `guildJoined`
-// registers again (routed mode) or only refreshes discovery (single mode), `guildLeft` refreshes discovery.
+// registers again (routed mode, or a join of the home server) or only refreshes discovery (single mode),
+// `guildLeft` refreshes discovery.
 //
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
 // `single` mode (today's behaviour) the error is rethrown once `discovery.json` has been written (it
@@ -188,11 +189,30 @@ export function refreshDiscovery(): Promise<void> {
 }
 
 /**
+ * Reports a failure through the context's logger. A logger that throws must not turn a join or a leave
+ * into a rejection, so this is where that is swallowed: there is nothing left to tell it to.
+ */
+function reportFailure(c: RoutingContext, message: string, err: unknown): void {
+  try {
+    c.log.error(message, err);
+  } catch {
+    /* the logger is broken too */
+  }
+}
+
+/**
  * The bot has joined a server (discord.js `guildCreate`). In routed mode the new server has no commands
  * until something registers there, so this registers again -- the whole run, through `applyRouting`, the
  * one path that is already serialized, recorded and tested -- which also rewrites `discovery.json`, so the
- * panel lists the server within seconds. In single mode there is nothing to register (the one
- * guild-or-global call already covers a new server, as it always has) and only discovery is refreshed.
+ * file the panel reads lists the server within seconds.
+ *
+ * In single mode registration goes to ONE place, the home server's guild (or everywhere, when there is no
+ * home server), and a join does not change where; only discovery is refreshed. The exception is a join OF
+ * the home server: a bot that is added back to it (after being kicked, or with the applications.commands
+ * scope it lacked when a 50001 refused the boot registration, which is what `index.ts`'s start-up message
+ * asks for) has nothing registered there until that is done again, and single mode's one call is exactly
+ * that, so this runs it. A joined server that is not the home server gets no commands in single mode, as
+ * before.
  *
  * The mode is decided HERE, from a fresh read of routing.json, and NOT inside the chain: `applyRouting`
  * and `refreshDiscovery` each queue themselves on it, so calling either from inside a queued job would
@@ -201,27 +221,28 @@ export function refreshDiscovery(): Promise<void> {
  * already holds the new server.
  *
  * Never rejects. It is called from an event listener, where a rejection is a process-level event, and
- * `applyRouting` CAN reject here: between the read and the call the last placement may have been removed,
- * which makes that run a single-mode one, and single mode rethrows a failed registration.
+ * `applyRouting` CAN reject here: single mode rethrows a failed registration (a join of the home server,
+ * or a last placement removed between the read and the call, makes that run a single-mode one).
  */
 export async function guildJoined(guild: { id: string; name: string }): Promise<void> {
   const c = context;
   if (c === undefined) return;
   try {
     c.log.log(`[routing] joined ${guild.name} (${guild.id})`);
-    if (hasPlacements(await readRouting(c.dataDir))) await applyRouting(`joined ${guild.name}`);
+    const routing = await readRouting(c.dataDir);
+    if (hasPlacements(routing) || guild.id === c.homeGuildId) await applyRouting(`joined ${guild.name}`);
     else await refreshDiscovery();
   } catch (err) {
-    c.log.error(`[routing] handling the join of ${guild.name} (${guild.id}) failed`, err);
+    reportFailure(c, `[routing] handling the join of ${guild.name} (${guild.id}) failed`, err);
   }
 }
 
 /**
  * The bot has left a server (discord.js `guildDelete`: kicked, or the server is gone -- an outage is a
  * different event). The server stops being offered because discovery is rewritten from what the bot can
- * see now. routing.json is NOT touched: being kicked and re-invited must not lose a placement, and the
- * panel already shows a server that is in routing but not in discovery as unavailable (#246). Before
- * `initRouting` it does nothing. Never rejects, for the reason `guildJoined` gives.
+ * see now. routing.json is NOT touched: being kicked and re-invited must not lose a placement (a server
+ * that is in routing but not in discovery is what #246, the panel's Servers tab, is to show as
+ * unavailable). Before `initRouting` it does nothing. Never rejects, for the reason `guildJoined` gives.
  */
 export async function guildLeft(guild: { id: string; name: string }): Promise<void> {
   const c = context;
@@ -230,7 +251,7 @@ export async function guildLeft(guild: { id: string; name: string }): Promise<vo
     c.log.log(`[routing] left ${guild.name} (${guild.id})`);
     await refreshDiscovery();
   } catch (err) {
-    c.log.error(`[routing] handling the departure from ${guild.name} (${guild.id}) failed`, err);
+    reportFailure(c, `[routing] handling the departure from ${guild.name} (${guild.id}) failed`, err);
   }
 }
 
