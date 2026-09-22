@@ -441,8 +441,8 @@ export interface BotOpsResult {
 /**
  * Pure: maps a request's method/path/query/body onto a bot-ops.sh invocation, or `undefined`
  * for a route this panel doesn't recognise. No new bot-ops.sh capability is introduced here —
- * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`env-get`/
- * `env-set`/`env-schema`/`routing-get`). The `plugin-request` subcommand (#105) is deliberately NOT
+ * every branch maps 1:1 onto the read/mutate subcommands (`status`/`logs`/`restart`/`recreate`/
+ * `env-get`/`env-set`/`env-schema`/`routing-get`). The `plugin-request` subcommand (#105) is deliberately NOT
  * dispatched here: it's a server-native route (`POST /api/plugins/request`) so `requestedBy` can be set
  * from the verified identity, so it never reaches buildInvocation -- and neither do the four routing
  * writes (#242: `POST /api/routing`, `POST /api/webhooks`, `DELETE /api/webhooks/<channel id>`,
@@ -464,6 +464,9 @@ export function buildInvocation(
   }
   if (method === "POST" && pathname === "/api/restart") {
     return { args: ["restart"], contentType: "text/plain" };
+  }
+  if (method === "POST" && pathname === "/api/recreate") {
+    return { args: ["recreate"], contentType: "application/json" };
   }
   if (method === "GET" && pathname === "/api/env") {
     return { args: ["env-get"], contentType: "application/json" };
@@ -670,8 +673,9 @@ export const HOST_API_VERSION = 1;
  *  on the deployed copy).
  *  2 = env-schema (#205).
  *  3 = routing-get, the routing / webhook plugin-request actions, write-only plugin secrets (#240).
- *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256). */
-export const REQUIRED_BOT_OPS_SCHEMA = 4;
+ *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256).
+ *  5 = recreate (#277). */
+export const REQUIRED_BOT_OPS_SCHEMA = 5;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed
@@ -1467,17 +1471,20 @@ export function describeAction(invocation: BotOpsInvocation, stdout: string): st
   return action;
 }
 
-/** The audit line for a *successful mutating* action (restart/env-set), for a *failed* env-set
- * that still changed something, or `null` for a read or a no-op failure (reads aren't logged —
- * they're low-value and re-fetched on demand). Pure and exported so which actions get attributed
- * is test-pinned. */
+/** The audit line for a *successful mutating* action (restart/recreate/env-set), for a *failed*
+ * env-set that still changed something, or `null` for a read or a no-op failure (reads aren't
+ * logged — they're low-value and re-fetched on demand). Pure and exported so which actions get
+ * attributed is test-pinned. A non-timeout FAILED recreate gets no line of its own here (#277):
+ * unlike env-set it changes no keys to report, and handleRequest's own console.error already
+ * names the action, the exit code and the actor for every failure this function returns `null`
+ * for — logging it twice would be a duplicate, not new information. */
 export function auditLogLine(
   invocation: BotOpsInvocation,
   result: BotOpsResult,
   auth: Authorization,
 ): string | null {
   const action = invocation.args[0];
-  if (action !== "restart" && action !== "env-set") return null;
+  if (action !== "restart" && action !== "env-set" && action !== "recreate") return null;
   if (result.exitCode === 0) {
     return `[admin] ${describeAction(invocation, result.stdout)} by ${describeActor(auth)}`;
   }

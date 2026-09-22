@@ -1101,15 +1101,21 @@
 
   // RESTART:begin
   async function doRestart() {
-    if (!confirm("Restart the bot? It will be briefly unavailable.")) return;
+    // #277: this recreates (up -d --force-recreate), not a plain in-place restart -- so it always
+    // comes back with whatever is currently saved in .env, including a recreate a previous Apply
+    // started but this page never saw finish (a kill, a 504). POST /api/restart still exists on the
+    // server (SSH-only now) but nothing here calls it any more.
+    if (!confirm("Restart the bot? It comes back with the saved settings and is offline for about 20 seconds.")) return;
     const msg = document.getElementById("restart-msg");
     msg.textContent = "Restarting…";
     msg.className = "msg";
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     try {
-      const res = await api("/api/restart", { method: "POST", signal });
+      const res = await api("/api/recreate", { method: "POST", signal });
       const text = await res.text();
-      msg.textContent = res.ok ? text : "Failed: " + text;
+      let result = null;
+      try { result = JSON.parse(text); } catch (e3) { result = null; }
+      msg.textContent = res.ok ? "Restarted. The bot is back with the saved settings." : "Failed: " + ((result && result.log) || text);
       msg.className = "msg " + (res.ok ? "ok" : "error");
       loadStatus();
     } catch (e2) {
