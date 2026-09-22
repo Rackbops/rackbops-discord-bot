@@ -5435,6 +5435,193 @@ describe("the page's stylesheets", () => {
   });
 });
 
+// #300 (part B2, std-lib #211): showToast, the settle points that fire it, and nowhere else. The
+// field-hint / rb-field__help / rb-field__error / rb-label__required sweep is #305's scope, not this
+// PR's -- this file touches only the TOAST block and the five settle-point call sites.
+describe("outcomes toast exactly once at their settle points (#300, source pin)", () => {
+  const html300 = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("outcomes toast exactly once at their settle points (source pin)", () => {
+    const slice = (start: string, end: string) => html300.slice(html300.indexOf(start), html300.indexOf(end));
+    const sites = [
+      ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive(")],
+      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus(")],
+      ["addWebhook", slice("async function addWebhook(", "async function removeWebhook(")],
+      ["removeWebhook", slice("async function removeWebhook(", "async function pollForResult(")],
+      ["refreshDiscoveryAll", slice("async function refreshDiscoveryAll(", "async function copyInviteLink(")],
+    ] as const;
+    for (const [name, src] of sites) {
+      expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: true });
+    }
+    // Never in the Apply bar, the inline update-action messages, or retryRegistration's own body (it
+    // reuses sendRouting -> awaitRequestResult, whose toast already covers it -- a second one here would
+    // double-fire on every retry).
+    const applySrc = slice("// APPLY:begin", "// APPLY:end");
+    const pluginRequestSendSrc = slice("// PLUGIN_REQUEST_SEND:begin", "// PLUGIN_REQUEST_SEND:end");
+    const updateBlockSrc = slice("function buildPluginUpdateBlock(", "const FIELD_META = {");
+    const retryRegistrationSrc = slice("async function retryRegistration(", "function appendRetryControls(");
+    for (const [name, src] of [
+      ["APPLY", applySrc],
+      ["PLUGIN_REQUEST_SEND", pluginRequestSendSrc],
+      ["buildPluginUpdateBlock", updateBlockSrc],
+      ["retryRegistration", retryRegistrationSrc],
+    ] as const) {
+      expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: false });
+    }
+  });
+});
+
+// #300 (part B2): showToast, tested against the real TOAST:begin/:end block via the same
+// synthetic-DOM mini-harness shape the rest of this file already uses.
+describe("showToast (#300, mini-harness)", () => {
+  // Reads index.html and extracts a lifted block by its own begin/end markers, exactly like the real
+  // applyBlock() further down this file -- duplicated (not imported) here on purpose: applyBlock is a
+  // module-top-level const declared LATER in this file, and this describe block's own callback body
+  // runs synchronously during Bun's collection pass, in file order -- referencing applyBlock from here
+  // would hit its temporal dead zone and throw before any test ever ran.
+  const toastHtmlSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const applyBlockEarly = (name: string): string =>
+    toastHtmlSrc.match(new RegExp(`// ${name}:begin\\n([\\s\\S]*?)\\n\\s*// ${name}:end`))?.[1] ?? "";
+  const toastSrc = applyBlockEarly("TOAST");
+
+  test("toastRole: danger and warning are alert, success and info are status", () => {
+    const fn = new Function(`"use strict";\n${toastSrc}\nreturn { toastRole };`);
+    const { toastRole } = fn() as { toastRole: (kind: string) => string };
+    expect(toastRole("danger")).toBe("alert");
+    expect(toastRole("warning")).toBe("alert");
+    expect(toastRole("success")).toBe("status");
+    expect(toastRole("info")).toBe("status");
+  });
+
+  interface FakeToastEl {
+    tagName: string;
+    className: string;
+    textContent: string;
+    attrs: Record<string, string>;
+    children: FakeToastEl[];
+    parentNode: FakeToastEl | null;
+    appendChild: (c: FakeToastEl) => FakeToastEl;
+    removeChild: (c: FakeToastEl) => void;
+    setAttribute: (n: string, v: string) => void;
+    removeAttribute: (n: string) => void;
+    addEventListener: (type: string, fn: (e: unknown) => void) => void;
+    _listeners: Record<string, ((e: unknown) => void)[]>;
+  }
+  function makeToastEl(tag: string): FakeToastEl {
+    const el: FakeToastEl = {
+      tagName: tag.toUpperCase(), className: "", textContent: "", attrs: {}, children: [], parentNode: null,
+      _listeners: {},
+      appendChild: (c) => { c.parentNode = el; el.children.push(c); return c; },
+      removeChild: (c) => { const i = el.children.indexOf(c); if (i !== -1) el.children.splice(i, 1); c.parentNode = null; },
+      setAttribute: (n, v) => { el.attrs[n] = v; },
+      removeAttribute: (n) => { delete el.attrs[n]; },
+      addEventListener: (type, fn) => { (el._listeners[type] ??= []).push(fn); },
+    };
+    return el;
+  }
+  function toastHarness() {
+    const app = makeToastEl("main");
+    const docListeners: Record<string, ((e: unknown) => void)[]> = {};
+    let rafQueue: (() => void)[] = [];
+    const timers: { id: number; fn: () => void; ms: number }[] = [];
+    let nextTimerId = 1;
+    const document = {
+      createElement: (tag: string) => makeToastEl(tag),
+      getElementById: (id: string) => (id === "app" ? app : null),
+      addEventListener: (type: string, fn: (e: unknown) => void) => { (docListeners[type] ??= []).push(fn); },
+    };
+    const requestAnimationFrame = (fn: () => void) => { rafQueue.push(fn); return rafQueue.length; };
+    const setTimeout = (fn: () => void, ms: number) => { const id = nextTimerId++; timers.push({ id, fn, ms }); return id; };
+    const clearTimeout = (id: number) => { const i = timers.findIndex((t) => t.id === id); if (i !== -1) timers.splice(i, 1); };
+    const fn = new Function(
+      "document", "requestAnimationFrame", "setTimeout", "clearTimeout",
+      `"use strict";\n${toastSrc}\nreturn { showToast, dismissToast: (el) => dismissToast(el), getActiveToasts: () => activeToasts, getRegion: () => toastRegion };`,
+    );
+    const run = fn(document, requestAnimationFrame, setTimeout, clearTimeout) as {
+      showToast: (kind: string, text: string) => void;
+      dismissToast: (el: FakeToastEl) => void;
+      getActiveToasts: () => FakeToastEl[];
+      getRegion: () => FakeToastEl | null;
+    };
+    return {
+      run, app,
+      fireEscape: () => { for (const fn of docListeners.keydown ?? []) fn({ key: "Escape" }); },
+      flushRaf: () => { const q = rafQueue; rafQueue = []; for (const fn of q) fn(); },
+      fireTimer: (id: number) => { const t = timers.find((x) => x.id === id); if (t) t.fn(); },
+      timerMs: (id: number) => timers.find((x) => x.id === id)?.ms,
+      pendingTimerIds: () => timers.map((t) => t.id),
+    };
+  }
+
+  test("a toast mounts with its class, role, text and a close button; data-rb-enter is cleared next frame", () => {
+    const h = toastHarness();
+    h.run.showToast("success", "Saved.");
+    const toasts = h.run.getActiveToasts();
+    expect(toasts.length).toBe(1);
+    const toast = toasts[0]!;
+    expect(toast.className).toBe("rb-toast rb-toast--success");
+    expect(toast.attrs.role).toBe("status");
+    expect(toast.attrs["data-rb-enter"]).toBe("");
+    expect(toast.children.some((c) => c.textContent === "Saved.")).toBe(true);
+    const closeBtn = toast.children.find((c) => c.className === "rb-toast__close");
+    expect(closeBtn).toBeTruthy();
+    expect(closeBtn!.attrs["aria-label"]).toBe("Dismiss");
+    expect(closeBtn!.textContent).toBe("×");
+    // The region is mounted under #app, not appended elsewhere.
+    expect(h.app.children.some((c) => c.className === "rb-toast-region")).toBe(true);
+    h.flushRaf();
+    expect(toast.attrs["data-rb-enter"]).toBeUndefined();
+  });
+
+  test("danger/warning toasts carry role=alert; a danger/warning kind never sets an auto-dismiss timer", () => {
+    const h = toastHarness();
+    h.run.showToast("danger", "Refused.");
+    expect(h.run.getActiveToasts()[0]!.attrs.role).toBe("alert");
+    expect(h.pendingTimerIds().length).toBe(0);
+    h.run.showToast("warning", "Timed out.");
+    expect(h.run.getActiveToasts()[1]!.attrs.role).toBe("alert");
+    expect(h.pendingTimerIds().length).toBe(0);
+  });
+
+  test("success/info auto-dismiss after TOAST_MS, warning/danger stay; the close button and Escape dismiss; the fifth toast evicts the oldest", () => {
+    const h = toastHarness();
+    h.run.showToast("success", "one");
+    const id = h.pendingTimerIds()[0]!;
+    expect(h.timerMs(id)).toBe(8000);
+    h.fireTimer(id);
+    expect(h.run.getActiveToasts().length).toBe(0); // auto-dismissed
+    expect(h.app.children.find((c) => c.className === "rb-toast-region")!.children.length).toBe(0);
+
+    // Close button dismisses.
+    h.run.showToast("danger", "stays until dismissed");
+    const toDismiss = h.run.getActiveToasts()[0]!;
+    const closeBtn = toDismiss.children.find((c) => c.className === "rb-toast__close")!;
+    (closeBtn as unknown as { _listeners: Record<string, (() => void)[]> })._listeners.click![0]!();
+    expect(h.run.getActiveToasts().length).toBe(0);
+
+    // Escape dismisses the newest.
+    h.run.showToast("info", "older");
+    h.run.showToast("warning", "newer");
+    expect(h.run.getActiveToasts().length).toBe(2);
+    h.fireEscape();
+    expect(h.run.getActiveToasts().length).toBe(1);
+    expect(h.run.getActiveToasts()[0]!.textContent === "older" || h.run.getActiveToasts()[0]!.children.some((c) => c.textContent === "older")).toBe(true);
+
+    // A fifth toast evicts the oldest (TOAST_MAX = 4).
+    const h2 = toastHarness();
+    h2.run.showToast("info", "t1");
+    h2.run.showToast("info", "t2");
+    h2.run.showToast("info", "t3");
+    h2.run.showToast("info", "t4");
+    expect(h2.run.getActiveToasts().length).toBe(4);
+    h2.run.showToast("info", "t5");
+    expect(h2.run.getActiveToasts().length).toBe(4);
+    const texts = h2.run.getActiveToasts().map((t) => t.children.find((c) => c.tagName === "SPAN")?.textContent);
+    expect(texts).not.toContain("t1");
+    expect(texts).toContain("t5");
+  });
+});
+
 // rb-theme.css is GENERATED by ops/admin/theme/build-theme.ts from the pinned @rackbops/styles and
 // committed. Its first line names the version it came from; this fails when the pin moves without a
 // rebuild (or the file is hand-edited), with no need for node_modules (CI does not install the theme
@@ -6056,8 +6243,9 @@ describe("page skeleton", () => {
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
       "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
+      "TOAST", // #300 (part B2)
     ];
-    expect(names.length).toBe(23);
+    expect(names.length).toBe(24);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -9321,6 +9509,13 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // turning a real ReferenceError into a misleading "posted-error" outcome -- caught once, fixed here).
     let refreshRoutingStepsCalls = 0;
     const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    // #300 (part B2): not part of this slice (the real showToast touches document.getElementById("app")
+    // and requestAnimationFrame, neither available in this harness) -- injected as a call-tracked stub,
+    // same reasoning as refreshRoutingSteps just above: an unstubbed reference would throw a
+    // ReferenceError that sendRouting's own catch swallows silently, turning a real success into a
+    // misleading "posted-error" outcome.
+    const toasts: { kind: string; text: string }[] = [];
+    const showToast = (kind: string, text: string) => { toasts.push({ kind, text }); };
     // A real Date subclass (so `new Date(x)`/`.toLocaleString()` elsewhere in the slice keep working)
     // whose `now()` is independently controllable -- the fake setTimeout/clearTimeout clock never
     // advances real wall-clock time, so a real 30s wait is otherwise the only way to reach a timeout path.
@@ -9329,10 +9524,10 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       static now() { return fakeNow; }
     }
     const run = new Function(
-      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date",
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date", "showToast",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
         "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
-    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate) as {
+    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate, showToast) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
       sendRouting: (plugin: string) => Promise<void>;
@@ -9372,6 +9567,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed,
       refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
       advanceFakeNow: (ms: number) => { fakeNow += ms; },
+      toasts: () => toasts,
     };
   }
 
@@ -10494,13 +10690,18 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     // which only works for a real closed-over binding, never a parameter or an expando property.
     const routingDataInit = opts.routingDataInit ?? { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    // #300 (part B2): not part of this slice (the real showToast touches document.getElementById("app")
+    // and requestAnimationFrame, neither available here) -- injected as a call-tracked stub, same
+    // reasoning as renderServers/renderNeedsAttention/loadRouting/refreshRoutingSteps just above.
+    const toasts: { kind: string; text: string }[] = [];
+    const showToast = (kind: string, text: string) => { toasts.push({ kind, text }); };
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
-      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps", "showToast",
       `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
         "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
     )(
-      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps,
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps, showToast,
     ) as {
       addWebhook: (guildId: string) => Promise<void>;
       pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>;
@@ -10520,6 +10721,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
       renderNeedsAttentionCalls: () => renderNeedsAttentionCalls,
       loadRoutingCalls: () => loadRoutingCalls,
       refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
+      toasts: () => toasts,
     };
   }
 

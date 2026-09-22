@@ -88,3 +88,73 @@ Branch `claude/theme-0-2-42` from `origin/main` (at or after `585ce4b`), isolate
   nothing (exit 1) — and that is the real form of the acceptance bullet's intent ("the card switch is
   `class="rb-switch"` alone"). Both the literal command's real output and the scoped, genuinely-empty
   form are pasted in the PR body rather than silently substituting one for the other.
+
+## Part B2 — the toast only
+
+Split from the plan's original single "Part B" after roshne resolved a same-scope collision with
+`Rackbops/rackbops-discord-bot#305` (a Codex opus session's earlier, in-flight attempt at the
+`field-hint` → `rb-field__help`/`rb-field__error`/`rb-label__required` sweep, stalled after round 3
+NOT SOUND but preserved in draft and re-assigned to keep that half): #305 owns the field-hint sweep,
+the required-marker glyph, the `required`-on-controls change, and the `admin.css` `[aria-invalid]`
+deletion; this PR (part B2) is scoped down to **only** decision 4 of the original Part B plan (comment
+[#300#issuecomment-5779383602](https://github.com/Rackbops/rackbops-discord-bot/issues/300#issuecomment-5779383602)) — the `showToast` toast component and its five settle-point call sites — plus tests 6-10 of
+that same plan. `admin.css` is not touched at all in this PR: the theme (0.2.42, vendored in Part A)
+already ships every `.rb-toast*` rule this needs.
+
+**Decision 4 (verbatim from the original Part B plan, unchanged):** `showToast(kind, text)`, vanilla,
+in a lifted block `TOAST:begin` / `:end`. One `<div class="rb-toast-region">` appended to `<main
+id="app">` on first use; each toast `<div class="rb-toast rb-toast--<kind>" role="<toastRole(kind)>">`
+with a `<span>` for the text and `<button type="button" class="rb-toast__close" aria-label="Dismiss">×</button>`;
+`data-rb-enter` set on mount and removed in `requestAnimationFrame`; `success` and `info` dismiss
+themselves after `TOAST_MS = 8000`, `warning` and `danger` stay until dismissed; Escape (one `keydown`
+listener on `document`, added with the region) dismisses the newest; text through `textContent`; at
+most `TOAST_MAX = 4` on screen (the oldest goes). `toastRole(kind)` is pure: `danger`/`warning` →
+`alert`, else `status`. **Where it fires**, and nowhere else: the settle points of #245's
+`awaitRequestResult` (applied → `success` *"<plugin>: live in <n> server(s)"* / *"<plugin>: saved,
+applies once it is running"*; refused → `danger` *"<plugin>: the bot refused it — <reason>"*; timeout
+→ `warning` the 30 s sentence), #245's `refreshDiscovery` and #246's `refreshDiscoveryAll` (landed →
+`success` *"Read from Discord again."*; refused → `danger`; timeout → `warning`), #246's `addWebhook` /
+`removeWebhook` (landed → `success` *"Webhook added for #<channel>."* / *"Webhook removed."*; refused →
+`danger`; timeout → `warning`), and `retryRegistration`'s settle (the plugin's own toast covers it —
+no second one). Never for the Apply bar (sticky, already a live region) and never for the inline
+update-action messages (they sit beside their own button). The per-step / per-card status lines stay:
+a toast is never the only place an outcome is reported.
+
+**Tests (6-10 of the original plan):** `toastRole` mapping; `showToast` mount (class, role, text, close
+button, `data-rb-enter` cleared next frame, mini-harness with an rAF stub); auto-dismiss + stacking +
+eviction (manual clock); the settle-point source pin (`showToast(` present in all five call sites,
+absent from the Apply bar, `PLUGIN_REQUEST_SEND`, `buildPluginUpdateBlock`, and `retryRegistration`);
+the lifted-block-present test (`TOAST` makes it 24).
+
+**Files:** `ops/admin/public/index.html` (the new `TOAST` block plus the five settle-point call
+sites — no field builders, no label builders), `ops/admin/server.test.ts` (the lifted-block count, the
+toast mini-harness, the settle-point source pin, and `showToast` stubs added to the two existing
+mini-harnesses whose sliced source now calls it), `CONTEXT.md` (the lifted-block list plus a toast
+gotcha). **`ops/admin/public/admin.css` is not in this PR's file list at all.**
+
+### Deviations from the plan (Part B2)
+
+- **The two existing mini-harnesses that slice through `awaitRequestResult`/`refreshDiscovery`
+  (`describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)")`) and through
+  `addWebhook`/`refreshDiscoveryAll` (`describe("addWebhook / pollForResult (#246, mini-harness)")`)
+  needed `showToast` injected as a call-tracked stub parameter**, the same shape those harnesses
+  already use for `refreshRoutingSteps`/`renderServers`/etc.: the real `showToast` touches
+  `document.getElementById("app")` and `requestAnimationFrame`, neither available in those sandboxes,
+  and an unstubbed reference would throw a `ReferenceError` that the surrounding `try`/`catch` swallows
+  silently, turning a real success into a misleading `"posted-error"` outcome — exactly the failure
+  mode these harnesses already document for `refreshRoutingSteps`. Fixed by adding `showToast` (and a
+  `toasts` accessor) to both harnesses' injected-parameter list and return object.
+- **The new `describe("showToast (#300, mini-harness)")` block cannot use the real, module-level
+  `applyBlock()` helper** this file declares much further down (`const applyBlock = (name) =>
+  ...`, used by dozens of other mini-harnesses) — Bun's `describe()` callbacks run synchronously in
+  file order during collection, and this describe block is positioned earlier in the file than that
+  `const` declaration, so referencing it would hit its temporal dead zone and throw before any test in
+  this file ran. Fixed with a small local `applyBlockEarly` helper duplicating `applyBlock`'s own
+  extraction regex, scoped to this describe block alone, rather than moving either declaration (moving
+  `applyBlock` earlier risks breaking every one of its other callers' own assumptions about what has
+  already been declared by that point in the file).
+- **The settle-point source-pin test and the toast mini-harness were written once already**, for the
+  original (unscoped) Part B attempt, then re-created here nearly verbatim after that PR (`#306`) was
+  closed and this branch started fresh from `origin/main` — the test bodies are unchanged from that
+  first pass; only the surrounding field-hint/required-marker tests from that attempt were dropped, per
+  the scope split.

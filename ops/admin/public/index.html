@@ -855,6 +855,60 @@
   }
   // PLUGIN_REQUEST_HELPERS:end
 
+  // TOAST:begin
+  // #300 (std-lib #211's shared .rb-toast): fired only at the settle points named in the plan -- never
+  // the Apply bar (already its own live region) and never the inline update-action messages (they sit
+  // beside their own button). The per-step/per-card status line is never replaced by a toast; a toast
+  // is reinforcement, never the only place an outcome is reported.
+  const TOAST_MS = 8000;
+  const TOAST_MAX = 4;
+  // Complete literal class names, never built by concatenation -- so the page's own "every class is
+  // styled" coverage scan (which reads quoted rb-* string literals) sees real, checkable names.
+  const TOAST_KIND_CLASS = { info: "rb-toast--info", success: "rb-toast--success", warning: "rb-toast--warning", danger: "rb-toast--danger" };
+  let toastRegion = null;
+  const activeToasts = [];
+  function toastRole(kind) {
+    return kind === "danger" || kind === "warning" ? "alert" : "status";
+  }
+  function dismissToast(el) {
+    const i = activeToasts.indexOf(el);
+    if (i !== -1) activeToasts.splice(i, 1);
+    if (el.parentNode) el.parentNode.removeChild(el);
+  }
+  function showToast(kind, text) {
+    if (!toastRegion) {
+      toastRegion = document.createElement("div");
+      toastRegion.className = "rb-toast-region";
+      document.getElementById("app").appendChild(toastRegion);
+      // One listener, added the first time the region exists: Escape dismisses the NEWEST toast.
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && activeToasts.length > 0) dismissToast(activeToasts[activeToasts.length - 1]);
+      });
+    }
+    while (activeToasts.length >= TOAST_MAX) dismissToast(activeToasts[0]);
+    const toast = document.createElement("div");
+    toast.className = "rb-toast " + (TOAST_KIND_CLASS[kind] || TOAST_KIND_CLASS.info);
+    toast.setAttribute("role", toastRole(kind));
+    toast.setAttribute("data-rb-enter", "");
+    const span = document.createElement("span");
+    span.textContent = text;
+    toast.appendChild(span);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "rb-toast__close";
+    close.setAttribute("aria-label", "Dismiss");
+    close.textContent = "×";
+    close.addEventListener("click", () => dismissToast(toast));
+    toast.appendChild(close);
+    toastRegion.appendChild(toast);
+    activeToasts.push(toast);
+    // Entrance from-state is cleared one frame after mount so the transition plays (rb-theme.css); under
+    // prefers-reduced-motion the transition itself collapses to 0s and the toast simply appears.
+    requestAnimationFrame(() => toast.removeAttribute("data-rb-enter"));
+    if (kind === "success" || kind === "info") setTimeout(() => dismissToast(toast), TOAST_MS);
+  }
+  // TOAST:end
+
   // #244: renderPlugins() clears and rebuilds #plugins-list from pluginsData -- one buildPluginCard per
   // plugin -- the same shape loadPlugins used to build, minus the fetch (reloadConfig owns that) and
   // minus the separate Plugin Settings section (a plugin's bundle now mounts inside its own card).
@@ -1407,6 +1461,16 @@
       // status-only update is correct there.
       if (outcome.phase === "applied") refreshRoutingSteps();
       else renderRouteStatus(plugin, routingStepEls.get(plugin));
+      if (outcome.phase === "applied") {
+        showToast(
+          "success",
+          outcome.live ? plugin + ": live in " + sentServers.length + (sentServers.length === 1 ? " server" : " servers") : plugin + ": saved, applies once it is running",
+        );
+      } else if (outcome.phase === "refused") {
+        showToast("danger", plugin + ": the bot refused it — " + outcome.reason);
+      } else if (outcome.phase === "timeout") {
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
+      }
       return;
     }
   }
@@ -1491,8 +1555,10 @@
               // message is enough; another click on "Refresh from Discord" is the real retry.
               now2.outcome = { phase: "posted-error", message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." };
               renderRouteStatus(plugin, routingStepEls.get(plugin));
+              showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
             } else {
               refreshRoutingSteps();
+              showToast("success", "Read from Discord again.");
             }
             // Same fix as checkAgain, same reason: a routing edit made while a discovery refresh is in
             // flight sets held (sendRouting sees this loop's own st.inflight and defers), and this is the
@@ -1509,12 +1575,14 @@
         // so a failed discovery-refresh POST was invisible -- same visibility the routing-set send uses.
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + text);
       }
     } catch (e) {
       const message = e && e.message ? e.message : String(e);
       if (message !== "unauthorized") {
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + message);
       }
     } finally {
       cancel();
@@ -2023,6 +2091,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2036,14 +2105,19 @@
       }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
       } else if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
       } else {
         serverActionState.delete(key);
         // #246 orchestrator follow-up (minor 7): a successful Add changes what buildWhereItLivesStep
         // shows on the Plugins tab (the "· webhook" suffix) -- refresh it now rather than waiting for
         // the next unrelated loadRouting.
         refreshRoutingSteps();
+        const guild = routingData && routingData.discovery && routingData.discovery.guilds && routingData.discovery.guilds.find((g) => g.id === guildId);
+        const ch = guild && guild.channels.find((c) => c.id === outcome.result.channelId);
+        showToast("success", "Webhook added for #" + (ch ? ch.name : outcome.result.channelId) + ".");
       }
       renderServers();
       renderNeedsAttention();
@@ -2052,6 +2126,7 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
@@ -2077,6 +2152,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2090,13 +2166,16 @@
       }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
       } else if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
       } else {
         serverActionState.delete(key);
         // #246 orchestrator follow-up (minor 7): same reasoning as addWebhook's own call -- a successful
         // Remove also changes the Plugins tab's webhook suffix.
         refreshRoutingSteps();
+        showToast("success", "Webhook removed.");
       }
       renderServers();
       renderNeedsAttention();
@@ -2105,6 +2184,7 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
@@ -2174,6 +2254,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2186,6 +2267,7 @@
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
         renderServers();
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
         return;
       }
       // A completed request is not necessarily a successful refresh. The bot records a rejected
@@ -2195,15 +2277,18 @@
       if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
         renderServers();
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
         return;
       }
       serverActionState.delete(key);
       await loadRouting(); // re-renders the tab itself (renderServers is part of loadRouting's own tail)
+      showToast("success", "Read from Discord again.");
     } catch (e) {
       const message = e && e.message ? e.message : String(e);
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
