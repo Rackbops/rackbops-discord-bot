@@ -86,23 +86,12 @@
     <section id="plugins-section" class="rb-card">
       <h2>Plugins</h2>
       <p class="adm-sub">
-        Choose which plugins this instance runs. Ticking or unticking a plugin is collected, with every
-        other change that needs a restart, in the bar at the bottom of the page: nothing happens until
-        you press <strong>Apply and restart</strong>. This never installs code from the browser — only
-        plugins offered by the Plugin Index can be enabled. A disabled plugin's stored data is left
+        One card per plugin: turn it on, fill in its settings, then press <strong>Apply and
+        restart</strong> once for everything that changed. This never installs code from the browser —
+        only plugins offered by the Plugin Index can be enabled. A disabled plugin's stored data is left
         untouched.
       </p>
       <div id="plugins-list">Loading…</div>
-    </section>
-
-    <section id="plugin-admin-section" class="rb-card" hidden>
-      <h2>Plugin Settings</h2>
-      <p class="adm-sub">
-        Settings contributed by installed plugins. Each plugin renders its own controls here; a plugin's
-        Save goes through the same guarded write (and bot restart) as the Apply bar, scoped to that plugin's
-        own keys.
-      </p>
-      <div id="plugin-admin-list"></div>
     </section>
   </div>
 
@@ -441,51 +430,97 @@
   // PLUGINS value and reuse the manifest order without a second fetch.
   let pluginsData = null;
 
-  async function loadPlugins() {
-    const container = document.getElementById("plugins-list");
-    try {
-      const data = await (await api("/api/plugins")).json();
-      pluginsData = data;
-      // #124: render each installed plugin's own admin tab from the same response (independent of the
-      // add/remove list below, and of a stateError — env editing still works when state is unreadable).
-      renderPluginAdmin(data);
-      container.innerHTML = "";
-      if (data.stateError) {
-        const notice = document.createElement("div");
-        notice.className = "field-hint field-hint--danger";
-        notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
-        container.appendChild(notice);
+  // #244: which secret keys are showing their password input (Replace pressed) rather than the "Saved on
+  // the server" summary -- remembered the same way, so a background reload (an update button, Unlock)
+  // does not silently drop the user back into the summary view mid-paste.
+  let secretsReplacing = new Set();
+
+  // #244: the ONE place the panel fetches its config -- /api/plugins, /api/env and /api/env-schema
+  // together, since a card needs all three at once. Stores them, renders the plugin cards AND the
+  // Config editor from that one consistent snapshot, then refreshes the bar. loadPlugins/loadEnv below
+  // are aliases: calling both (as showApp does, and as rereadFromServer's
+  // Promise.allSettled([loadPlugins, loadEnv]...) does) shares the ONE in-flight fetch -- the second
+  // call joins the promise the first already started, synchronously, before either returns control.
+  // `opts.keepEdits` (2026-09-21 patch to #244's plan, following #275): defaults to `!applyRereading` --
+  // a re-read the Apply bar itself started (Discard, an apply outcome) is about to drop the edits it
+  // replaces, so it must not try to keep them; every OTHER reload (an update button's success, Unlock)
+  // keeps them, captured from the live controls before the fetch and re-applied once the new baseline
+  // has rendered. A control that no longer exists after the reload is dropped silently.
+  let reloadConfigPromise = null;
+  async function reloadConfig(opts) {
+    if (reloadConfigPromise) return reloadConfigPromise;
+    const keepEdits = opts && opts.keepEdits !== undefined ? opts.keepEdits : !applyRereading;
+    reloadConfigPromise = (async () => {
+      try {
+        const captured = keepEdits
+          ? diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, captureCardControls())
+          : null;
+        await loadBranches();
+        const [plugins, env, schema] = await Promise.all([
+          api("/api/plugins").then((r) => r.json()),
+          api("/api/env").then((r) => r.json()),
+          api("/api/env-schema")
+            .then((r) => (r.ok ? r.json() : {}))
+            .catch(() => ({})),
+        ]);
+        pluginsData = plugins;
+        loadedEnv = env;
+        loadedSchema = schema && typeof schema === "object" ? schema : {};
+        renderPlugins();
+        renderEnvFields();
+        if (captured) reapplyCardEdits(captured);
+      } catch (e) {
+        if (e.message !== "unauthorized") {
+          const msg = "Error: " + e.message;
+          const pl = document.getElementById("plugins-list");
+          if (pl) pl.textContent = msg;
+          const ef = document.getElementById("env-fields");
+          if (ef) ef.textContent = msg;
+        }
+      } finally {
+        reloadConfigPromise = null;
+        // The baseline moved (or the fetch failed): what is pending is read from the controls again.
+        refreshApplyBar();
       }
-      if (data.indexError) {
-        const notice = document.createElement("div");
-        notice.className = "field-hint";
-        notice.textContent = "Plugin Index unavailable (" + data.indexError + ") — showing installed plugins only.";
-        container.appendChild(notice);
-      }
-      if (!data.plugins || data.plugins.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "field-hint";
-        empty.textContent = "No plugins available or installed.";
-        container.appendChild(empty);
-        return;
-      }
-      const indexAvailable = !data.indexError;
-      // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every box
-      // is disabled, so a change can't be made against a false-empty selection (the plan for it is also
-      // refused, in collectPending / planApply, as the belt to this brace).
-      for (const p of data.plugins) container.appendChild(buildPluginRow(p, indexAvailable, !!data.stateError));
-      const note = document.createElement("div");
-      note.className = "field-hint";
-      note.style.marginTop = "8px";
-      note.textContent = "Changes apply when the bot restarts: they are collected in the bar below until you apply them.";
-      container.appendChild(note);
-    } catch (e) {
-      // The boxes are gone but pluginsData still holds the previous answer: collectPending plans no PLUGINS
-      // change while no box is rendered, so this cannot read as "everything unticked".
-      if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
-    } finally {
-      // The baseline moved (or the list failed to load): what is pending is read from the controls again.
-      refreshApplyBar();
+    })();
+    return reloadConfigPromise;
+  }
+  let loadPlugins = () => reloadConfig();
+  let loadEnv = () => reloadConfig();
+
+  // Live-DOM capture/reapply for reloadConfig's keepEdits, over the SAME four selectors collectPending
+  // uses (never a page-wide one) -- a plugin's own bundle renders arbitrary DOM inside #plugins-list, so
+  // both filter with !el.closest(".plug__admin"). captureCardControls reads everything currently on
+  // screen (diffEdits below does the "only what changed" filtering); reapplyCardEdits writes only the
+  // keys diffEdits kept, onto whichever matching controls the fresh render still has -- one that no
+  // longer exists (the plugin left the index, the card is no longer open) is silently skipped.
+  function captureCardControls() {
+    const on = {};
+    for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
+      if (!el.closest(".plug__admin")) on[el.dataset.plugin] = el.checked;
+    }
+    const settings = {};
+    for (const el of document.querySelectorAll("#plugins-list [data-setting-key]")) {
+      if (!el.closest(".plug__admin")) settings[el.dataset.settingKey] = el.value;
+    }
+    const secrets = {};
+    for (const el of document.querySelectorAll("#plugins-list [data-secret-key]")) {
+      if (!el.closest(".plug__admin")) secrets[el.dataset.secretKey] = el.value;
+    }
+    return { on, settings, secrets };
+  }
+  function reapplyCardEdits(captured) {
+    for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
+      if (el.closest(".plug__admin")) continue;
+      if (Object.prototype.hasOwnProperty.call(captured.on, el.dataset.plugin)) el.checked = captured.on[el.dataset.plugin];
+    }
+    for (const el of document.querySelectorAll("#plugins-list [data-setting-key]")) {
+      if (el.closest(".plug__admin")) continue;
+      if (Object.prototype.hasOwnProperty.call(captured.settings, el.dataset.settingKey)) el.value = captured.settings[el.dataset.settingKey];
+    }
+    for (const el of document.querySelectorAll("#plugins-list [data-secret-key]")) {
+      if (el.closest(".plug__admin")) continue;
+      if (Object.prototype.hasOwnProperty.call(captured.secrets, el.dataset.secretKey)) el.value = captured.secrets[el.dataset.secretKey];
     }
   }
 
@@ -605,45 +640,9 @@
   // Cleanup fns from the tabs the last render mounted — called before a re-render replaces them. The
   // render generation counter guards the async-import race: a mount whose import resolves after a newer
   // render started is dropped (its root is already detached), so no stale cleanup or double-mount leaks.
+  // #244: driven by renderPlugins now (one bundle mount per OPEN card), not a separate per-render pass.
   let mountedAdminCleanups = [];
   let adminRenderGen = 0;
-  function renderPluginAdmin(data) {
-    const gen = ++adminRenderGen;
-    for (const cleanup of mountedAdminCleanups) { try { cleanup(); } catch (e) {} }
-    mountedAdminCleanups = [];
-    const section = document.getElementById("plugin-admin-section");
-    const list = document.getElementById("plugin-admin-list");
-    if (!section || !list) return;
-    list.innerHTML = "";
-    const panelVer = data && data.adminApiVersion;
-    const tabs = ((data && data.plugins) || []).filter((p) => adminTabState(p, panelVer).kind !== "none");
-    section.hidden = tabs.length === 0;
-    for (const p of tabs) {
-      const state = adminTabState(p, panelVer);
-      const wrap = document.createElement("div");
-      wrap.className = "plugin-admin-tab";
-      const h = document.createElement("h3");
-      h.textContent = p.name;
-      wrap.appendChild(h);
-      if (state.kind === "mismatch") {
-        const note = document.createElement("div");
-        note.className = "field-hint";
-        note.textContent = "This plugin's settings target admin API v" + state.declared + ", but this panel is v" + state.panel + " — they can't be shown until the versions match.";
-        wrap.appendChild(note);
-      } else if (state.kind === "pending") {
-        const note = document.createElement("div");
-        note.className = "field-hint";
-        note.textContent = "Settings appear once the plugin is installed (next restart).";
-        wrap.appendChild(note);
-      } else {
-        const root = document.createElement("div");
-        root.id = "plugin-admin-root-" + p.name;
-        wrap.appendChild(root);
-        mountPluginAdmin(p, root, gen, panelVer);
-      }
-      list.appendChild(wrap);
-    }
-  }
 
   // Dynamically import the plugin's own admin bundle (served same-origin from
   // /plugin-admin/<name>.js?v=<installedVersion>, #165) and mount it. Fully isolated: an import
@@ -679,9 +678,9 @@
   }
 
   // PLUGIN_BADGE_CLASSES:begin
-  // The badge DECISION ({text, kind}, from PLUGIN_BADGES below) keeps its own kind vocabulary; this
+  // The badge DECISION ({text, kind}, from PLUGIN_CARD_STATE below) keeps its own kind vocabulary; this
   // maps it onto the library's semantic badge modifiers. `kind` stays on the element as before.
-  const BADGE_MODIFIERS = new Map([["active", "rb-badge--success"], ["warn", "rb-badge--warning"], ["update", "rb-badge--info"]]);
+  const BADGE_MODIFIERS = new Map([["active", "rb-badge--success"], ["warn", "rb-badge--warning"], ["update", "rb-badge--info"], ["danger", "rb-badge--danger"]]);
   function makeBadge(text, kind) {
     const b = document.createElement("span");
     const modifier = BADGE_MODIFIERS.get(kind);
@@ -691,18 +690,64 @@
   }
   // PLUGIN_BADGE_CLASSES:end
 
-  // PLUGIN_BADGES:begin
-  // Pure badge DECISIONS ({text, kind}), split from DOM rendering so ops/admin/server.test.ts can
-  // lift and pin them — the index-outage suppression and the newer-release check live here.
-  function pluginStateBadge(p, indexAvailable) {
-    // Only claim "not in index" when the index actually loaded — during an outage EVERY row is
+  // PLUGIN_SETTING_LABEL:begin
+  // Pure label derivation for a plugin's settings step (#244) -- no Plugin Index `label` field yet, so
+  // a key's display name is derived from its own spelling: drop a leading `<PLUGIN>_` when something is
+  // left, split the rest on `_`, lower-case each word except a kept acronym, capitalise the first word.
+  // settingOwners answers "which card owns this key" so a key two plugins both declare renders on
+  // exactly one (the first, in manifest order) -- see Step 3's "Set on the `<first>` card" rule.
+  const SETTING_LABEL_KEEP_UPPER = new Set(["API", "ID", "URI", "URL", "DMF", "TTL", "IP"]);
+  function settingLabel(key, pluginName) {
+    const prefix = String(pluginName || "").toUpperCase().replace(/-/g, "_") + "_";
+    const rest = key.length > prefix.length && key.startsWith(prefix) ? key.slice(prefix.length) : key;
+    const words = rest.split("_").filter(Boolean).map((w) => (SETTING_LABEL_KEEP_UPPER.has(w.toUpperCase()) ? w.toUpperCase() : w.toLowerCase()));
+    if (words.length === 0) return rest;
+    words[0] = words[0][0].toUpperCase() + words[0].slice(1);
+    return words.join(" ");
+  }
+  function settingOwners(plugins) {
+    const owners = new Map();
+    for (const p of plugins) {
+      for (const e of p.env || []) {
+        if (!owners.has(e.key)) owners.set(e.key, p.name);
+      }
+    }
+    return owners;
+  }
+  // PLUGIN_SETTING_LABEL:end
+
+  // PLUGIN_CARD_STATE:begin
+  // Replaces PLUGIN_BADGES; pluginUpdateBadge moves in unchanged.
+  // Pure card-header DECISIONS ({badge: {text, kind}, summary}), split from DOM rendering so
+  // ops/admin/server.test.ts can lift and pin them. ctx: { indexAvailable, pendingOn: true|false|undefined,
+  // pendingSettings: number, labelOf: (key) => string }. FIRST MATCH WINS -- pending (rows 1-3) outranks
+  // everything, including an error, since a restart is already promised to fix what is showing.
+  function pluginCardState(p, ctx) {
+    if (ctx.pendingOn === true) return { badge: { text: "Restart to apply", kind: "warn" }, summary: "Turned on, not running yet" };
+    if (ctx.pendingOn === false) return { badge: { text: "Restart to apply", kind: "warn" }, summary: "Turned off, still running until you apply" };
+    if (ctx.pendingSettings > 0) {
+      return {
+        badge: { text: "Restart to apply", kind: "warn" },
+        summary: ctx.pendingSettings === 1 ? "1 setting changed" : ctx.pendingSettings + " settings changed",
+      };
+    }
+    // Only claim "not in index" when the index actually loaded -- during an outage EVERY row is
     // inIndex:false, so labelling them all "not in index" would contradict the outage notice.
-    if (indexAvailable && !p.inIndex) return { text: "not in index", kind: "warn" };
-    if (p.error) return { text: "failed: " + p.error, kind: "warn" };
-    if (p.enabled && p.missingEnv && p.missingEnv.length) return { text: "needs config: " + p.missingEnv.join(", "), kind: "warn" };
-    if (p.active) return { text: "active", kind: "active" };
-    if (p.enabled) return { text: "enabled, not active", kind: null };
-    return { text: "disabled", kind: null };
+    if (ctx.indexAvailable && !p.inIndex) return { badge: { text: "Not in the index", kind: "warn" }, summary: "The Plugin Index no longer lists this plugin" };
+    if (p.error) return { badge: { text: "Error", kind: "danger" }, summary: "Couldn't start. Open for the reason" };
+    if (p.enabled && p.missingEnv && p.missingEnv.length) {
+      return { badge: { text: "Needs setup", kind: "warn" }, summary: "Missing: " + p.missingEnv.map(ctx.labelOf).join(", ") };
+    }
+    // #225: an update is offered only for a plugin that is ON -- an off plugin keeps its installed
+    // version (the row below) but is never nudged to update code that is not currently running.
+    const upd = p.enabled && pluginUpdateBadge(p);
+    if (upd) return { badge: upd, summary: p.active ? "Running · " + p.installedVersion + " installed" : p.installedVersion + " installed" };
+    if (p.active) {
+      const n = (p.commands || []).length;
+      return { badge: { text: "Running", kind: "active" }, summary: n === 0 ? "No commands" : n === 1 ? "1 command" : n + " commands" };
+    }
+    if (p.enabled) return { badge: { text: "Not running", kind: null }, summary: "Turned on, but not running. The log on Overview says why" };
+    return { badge: { text: "Off", kind: null }, summary: p.installedVersion ? p.installedVersion + " installed" : "Not running" };
   }
   // "update to X" only when a NEWER release exists — guard on latest !== installed too, since a
   // dev/pruned installedVersion that isn't in the release list makes releasesNewerThan return all.
@@ -712,7 +757,7 @@
     }
     return null;
   }
-  // PLUGIN_BADGES:end
+  // PLUGIN_CARD_STATE:end
 
   // PLUGIN_REQUEST_HELPERS:begin
   // Pure helpers for the #105 update-action buttons, lifted + pinned by ops/admin/server.test.ts.
@@ -744,58 +789,429 @@
   }
   // PLUGIN_REQUEST_HELPERS:end
 
-  // One card per plugin. All server-sourced text goes through textContent / createElement — never
-  // innerHTML — so a plugin name or description can't inject markup.
-  function buildPluginRow(p, indexAvailable, stateError) {
-    const row = document.createElement("div");
-    row.className = "plugin-row";
+  // #244: renderPlugins() clears and rebuilds #plugins-list from pluginsData -- one buildPluginCard per
+  // plugin -- the same shape loadPlugins used to build, minus the fetch (reloadConfig owns that) and
+  // minus the separate Plugin Settings section (a plugin's bundle now mounts inside its own card).
+  function renderPlugins() {
+    const gen = ++adminRenderGen;
+    for (const cleanup of mountedAdminCleanups) { try { cleanup(); } catch (e) {} }
+    mountedAdminCleanups = [];
+    cardHeaderEls = new Map();
+    const container = document.getElementById("plugins-list");
+    container.innerHTML = "";
+    const data = pluginsData;
+    if (data && data.stateError) {
+      const notice = document.createElement("div");
+      notice.className = "field-hint field-hint--danger";
+      notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
+      container.appendChild(notice);
+    }
+    if (data && data.indexError) {
+      const notice = document.createElement("div");
+      notice.className = "field-hint";
+      notice.textContent = "Plugin Index unavailable (" + data.indexError + ") — showing installed plugins only.";
+      container.appendChild(notice);
+    }
+    if (!data || !data.plugins || data.plugins.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "field-hint";
+      empty.textContent = "No plugins available or installed.";
+      container.appendChild(empty);
+      return;
+    }
+    // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every switch
+    // is disabled, so a change can't be made against a false-empty selection (the plan for it is also
+    // refused, in collectPending / planApply, as the belt to this brace).
+    const ctx = {
+      indexAvailable: !data.indexError,
+      stateError: !!data.stateError,
+      owners: settingOwners(data.plugins),
+      panelVer: data.adminApiVersion,
+      gen,
+    };
+    for (const p of data.plugins) container.appendChild(buildPluginCard(p, ctx));
+    const note = document.createElement("div");
+    note.className = "field-hint";
+    note.style.marginTop = "8px";
+    note.textContent = "Changes apply when the bot restarts: they are collected in the bar below until you apply them.";
+    container.appendChild(note);
+  }
 
+  // A card's "Version X" / "not installed" line, browser-only text (no acceptance bullet cites its exact
+  // wording, unlike the badges pluginCardState pins) -- "up to date" only when installed AND no newer
+  // release exists, since an available update is already announced by the header's own badge.
+  function versionLine(p) {
+    if (!p.installedVersion) return p.enabled ? "Enabled, not yet installed" : "Not installed";
+    return "Version " + p.installedVersion + (pluginUpdateBadge(p) ? "" : " · up to date");
+  }
+
+  function buildChevron(isOpen) {
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("class", "plug__chev" + (isOpen ? " plug__chev--open" : ""));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS(NS, "path");
+    path.setAttribute("d", "m6 9 6 6 6-6");
+    svg.appendChild(path);
+    return svg;
+  }
+
+  // Step 1, always present: the switch, its On/Off text (kept live by its own change listener -- a
+  // toggle doesn't wait for the next full refreshCardHeaders to say the right thing), the version line,
+  // and (#225: only while ON) the #105 update block, unchanged.
+  function buildTurnItOnStep(p, ctx) {
+    const step = document.createElement("div");
+    step.className = "step";
+    const head = document.createElement("div");
+    const title = document.createElement("h4");
+    title.className = "step__title";
+    title.appendChild(Object.assign(document.createElement("span"), { className: "step__num" }));
+    title.appendChild(document.createTextNode("Turn it on"));
+    head.appendChild(title);
+    const hint = document.createElement("p");
+    hint.className = "field-hint";
+    hint.textContent = "Off keeps everything it has stored. Nothing is deleted.";
+    head.appendChild(hint);
+    step.appendChild(head);
+
+    const body = document.createElement("div");
+    const choice = document.createElement("label");
+    choice.className = "rb-choice";
     const check = document.createElement("input");
     check.type = "checkbox";
-    check.className = "rb-checkbox";
+    check.setAttribute("role", "switch");
+    check.className = "rb-switch adm-switch";
     check.checked = !!p.enabled;
     check.dataset.plugin = p.name;
     check.id = "plugin-" + p.name;
-    // Only index-listed plugins can be enabled; one the index doesn't offer and that isn't already
-    // on stays unticked and locked. An already-enabled one the index dropped stays editable so it
-    // can still be removed. While the bot's state is unreadable every box is locked (see loadPlugins).
-    if (stateError || (!p.inIndex && !p.enabled)) check.disabled = true;
-    row.appendChild(check);
+    // Only index-listed plugins can be enabled; one the index doesn't offer and that isn't already on
+    // stays unticked and locked. An already-enabled one the index dropped stays editable so it can
+    // still be removed. While the bot's state is unreadable every switch is locked (see renderPlugins).
+    if (ctx.stateError || (!p.inIndex && !p.enabled)) check.disabled = true;
+    choice.appendChild(check);
+    const onOff = document.createElement("span");
+    onOff.textContent = p.enabled ? "On" : "Off";
+    check.addEventListener("change", () => { onOff.textContent = check.checked ? "On" : "Off"; });
+    choice.appendChild(onOff);
+    body.appendChild(choice);
 
-    const info = document.createElement("div");
-    info.className = "plugin-info";
+    const verHint = document.createElement("p");
+    verHint.className = "field-hint";
+    verHint.textContent = versionLine(p);
+    body.appendChild(verHint);
 
-    const name = document.createElement("label");
-    name.className = "plugin-name";
-    name.htmlFor = check.id;
-    name.textContent = p.name;
-    info.appendChild(name);
+    if (p.enabled) {
+      const updateBlock = buildPluginUpdateBlock(p);
+      if (updateBlock) body.appendChild(updateBlock);
+    }
+    step.appendChild(body);
+    return step;
+  }
 
-    if (p.description) {
-      const desc = document.createElement("div");
-      desc.className = "plugin-desc";
-      desc.textContent = p.description;
-      info.appendChild(desc);
+  // Step 2, present whenever there is something to show: a declared setting, an admin bundle, or (with
+  // the index down) the note explaining why neither can be shown yet. Omitted otherwise -- #245 can
+  // insert a step between the two, since numbering is by POSITION AMONG STEPS PRESENT (renderPlugins).
+  function buildSettingsStep(p, ctx, isOpen) {
+    const hasEnv = p.env && p.env.length > 0;
+    const bundleState = adminTabState(p, ctx.panelVer);
+    const hasBundle = bundleState.kind !== "none";
+    if (!hasEnv && !hasBundle && ctx.indexAvailable) return null;
+
+    const step = document.createElement("div");
+    step.className = "step";
+    const head = document.createElement("div");
+    const title = document.createElement("h4");
+    title.className = "step__title";
+    title.appendChild(Object.assign(document.createElement("span"), { className: "step__num" }));
+    title.appendChild(document.createTextNode("Fill in its settings"));
+    head.appendChild(title);
+    const hint = document.createElement("p");
+    hint.className = "field-hint";
+    hint.textContent = "Secrets can be replaced but never shown again.";
+    head.appendChild(hint);
+    step.appendChild(head);
+
+    const body = document.createElement("div");
+    if (!ctx.indexAvailable && !hasEnv) {
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      note.textContent = "Settings can't be shown while the Plugin Index is unavailable.";
+      body.appendChild(note);
+      step.appendChild(body);
+      return step;
     }
 
-    const meta = document.createElement("div");
-    meta.className = "plugin-meta";
-    const version = document.createElement("span");
-    version.textContent = p.installedVersion
-      ? "installed " + p.installedVersion
-      : p.enabled ? "enabled, not yet installed" : "not installed";
-    meta.appendChild(version);
-    const upd = pluginUpdateBadge(p);
-    if (upd) meta.appendChild(makeBadge(upd.text, upd.kind));
-    const state = pluginStateBadge(p, indexAvailable);
-    if (state) meta.appendChild(makeBadge(state.text, state.kind));
-    info.appendChild(meta);
+    if (hasEnv) {
+      const fields = document.createElement("div");
+      fields.className = "fields";
+      for (const e of p.env) fields.appendChild(buildSettingField(p, e, ctx));
+      body.appendChild(fields);
+    }
 
-    const updateBlock = buildPluginUpdateBlock(p);
-    if (updateBlock) info.appendChild(updateBlock);
+    if (hasBundle && isOpen) {
+      if (bundleState.kind === "mismatch") {
+        const note = document.createElement("p");
+        note.className = "field-hint";
+        note.textContent =
+          "This plugin's settings target admin API v" + (bundleState.declared === undefined ? "unknown" : bundleState.declared) +
+          ", but this panel is v" + ctx.panelVer + " — they can't be shown until the versions match.";
+        body.appendChild(note);
+      } else if (bundleState.kind === "pending") {
+        const note = document.createElement("p");
+        note.className = "field-hint";
+        note.textContent = "Settings appear once the plugin is installed (next restart).";
+        body.appendChild(note);
+      } else {
+        const root = document.createElement("div");
+        root.className = "plug__admin";
+        body.appendChild(root);
+        mountPluginAdmin(p, root, ctx.gen, ctx.panelVer); // checks its own gen against a stale render
+      }
+    }
+    step.appendChild(body);
+    return step;
+  }
 
-    row.appendChild(info);
-    return row;
+  // One field in "Fill in its settings", for one of p.env's declared keys. First match wins: a core key
+  // is edited on Settings, a key another (earlier) card already owns points there, a key with no schema
+  // row yet cannot be edited from here at all (#256's index-vs-cache lag), a secret gets the secret
+  // control, everything else is a plain rb-input seeded from the loaded value.
+  function buildSettingField(p, e, ctx) {
+    const key = e.key;
+    const schemaRow = loadedSchema[key];
+    const addKeyTag = (wrap) => {
+      const tag = document.createElement("span");
+      tag.className = "adm-key";
+      tag.textContent = key;
+      wrap.appendChild(tag);
+    };
+    const stub = (message) => {
+      const wrap = document.createElement("div");
+      wrap.className = "rb-field";
+      const label = document.createElement("label");
+      label.className = "rb-label";
+      label.textContent = settingLabel(key, p.name);
+      wrap.appendChild(label);
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      note.textContent = message;
+      wrap.appendChild(note);
+      addKeyTag(wrap);
+      return wrap;
+    };
+
+    if (schemaRow && schemaRow.source === "core") return stub("Set under Settings.");
+    const owner = ctx.owners.get(key);
+    if (owner && owner !== p.name) return stub("Set on the " + owner + " card.");
+    if (!schemaRow) return stub("This can't be edited right now — the bot hasn't published this setting yet.");
+
+    if (schemaRow.secret) return buildSecretField(key, settingLabel(key, p.name) + (schemaRow.required ? " *" : ""), schemaRow);
+
+    const wrap = document.createElement("div");
+    wrap.className = "rb-field";
+    const controlId = "set-" + key;
+    const label = document.createElement("label");
+    label.className = "rb-label";
+    label.htmlFor = controlId;
+    label.textContent = settingLabel(key, p.name) + (schemaRow.required ? " *" : "");
+    wrap.appendChild(label);
+    const input = document.createElement("input");
+    input.className = "rb-input";
+    input.id = controlId;
+    input.dataset.settingKey = key;
+    input.value = loadedEnv[key] ?? "";
+    wrap.appendChild(input);
+    if (e.description) {
+      const desc = document.createElement("span");
+      desc.className = "field-hint";
+      desc.id = controlId + "-hint";
+      desc.textContent = e.description;
+      input.setAttribute("aria-describedby", desc.id);
+      wrap.appendChild(desc);
+    }
+    addKeyTag(wrap);
+    return wrap;
+  }
+
+  // The secret control: "Saved on the server" + Replace once it holds a value (unless mid-replace);
+  // otherwise the password field itself. Toggling either way re-renders (through diffEdits/reapplyCardEdits,
+  // the same as an open/close), so no OTHER card's in-progress typing is lost by the switch.
+  function buildSecretField(key, displayLabel, schemaRow) {
+    const wrap = document.createElement("div");
+    wrap.className = "rb-field";
+    const label = document.createElement("span");
+    label.className = "rb-label";
+    label.textContent = displayLabel;
+    wrap.appendChild(label);
+
+    const rerenderKeeping = (mutate) => {
+      const captured = diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, captureCardControls());
+      mutate(captured);
+      renderPlugins();
+      reapplyCardEdits(captured);
+      refreshApplyBar();
+    };
+
+    if (schemaRow.isSet && !secretsReplacing.has(key)) {
+      const box = document.createElement("div");
+      box.className = "secret";
+      const dots = document.createElement("span");
+      dots.className = "secret__dots";
+      dots.setAttribute("aria-hidden", "true");
+      dots.textContent = "••••••••";
+      box.appendChild(dots);
+      const said = document.createElement("span");
+      said.textContent = "Saved on the server";
+      box.appendChild(said);
+      const replace = document.createElement("button");
+      replace.type = "button";
+      replace.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      replace.textContent = "Replace";
+      replace.addEventListener("click", () => {
+        rerenderKeeping(() => secretsReplacing.add(key));
+        const fresh = document.getElementById("secret-" + key);
+        if (fresh) fresh.focus();
+      });
+      box.appendChild(replace);
+      wrap.appendChild(box);
+    } else {
+      const input = document.createElement("input");
+      input.type = "password";
+      input.className = "rb-input";
+      input.id = "secret-" + key;
+      input.autocomplete = "new-password";
+      input.placeholder = "Paste the value";
+      input.dataset.secretKey = key;
+      wrap.appendChild(input);
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      if (schemaRow.isSet) {
+        const keep = document.createElement("button");
+        keep.type = "button";
+        keep.className = "rb-btn rb-btn--sm rb-btn--ghost";
+        keep.textContent = "Keep the saved value";
+        // "never shown again": the abandoned keystrokes are dropped, not carried into the next render.
+        keep.addEventListener("click", () => rerenderKeeping((captured) => {
+          delete captured.secrets[key];
+          secretsReplacing.delete(key);
+        }));
+        note.appendChild(keep);
+      } else {
+        note.textContent = "Not set yet. Once saved it can be replaced, never shown.";
+      }
+      wrap.appendChild(note);
+    }
+    const tag = document.createElement("span");
+    tag.className = "adm-key";
+    tag.textContent = key;
+    wrap.appendChild(tag);
+    return wrap;
+  }
+
+  // One card per plugin. All server-sourced text goes through textContent / createElement — never
+  // innerHTML — so a plugin name or description can't inject markup.
+  function buildPluginCard(p, ctx) {
+    const isOpen = openCards.has(p.name);
+    const card = document.createElement("section");
+    card.className = "rb-card plug";
+    card.dataset.plugin = p.name;
+
+    const h = document.createElement("h3");
+    h.className = "plug__h";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "plug__head";
+    head.id = "plug-head-" + p.name;
+    const bodyId = "plug-body-" + p.name;
+    head.setAttribute("aria-expanded", String(isOpen));
+    head.setAttribute("aria-controls", bodyId);
+
+    const idWrap = document.createElement("span");
+    idWrap.className = "plug__id";
+    const nameEl = document.createElement("span");
+    nameEl.className = "plug__name";
+    nameEl.textContent = p.name;
+    idWrap.appendChild(nameEl);
+    if (p.description) {
+      const descEl = document.createElement("span");
+      descEl.className = "plug__desc";
+      descEl.textContent = p.description;
+      idWrap.appendChild(descEl);
+    }
+    head.appendChild(idWrap);
+
+    const metaWrap = document.createElement("span");
+    metaWrap.className = "plug__meta";
+    const summaryEl = document.createElement("span");
+    summaryEl.className = "plug__summary";
+    metaWrap.appendChild(summaryEl);
+    const badgeEl = document.createElement("span");
+    badgeEl.className = "rb-badge plugin-badge";
+    metaWrap.appendChild(badgeEl);
+    const chevEl = buildChevron(isOpen);
+    metaWrap.appendChild(chevEl);
+    head.appendChild(metaWrap);
+    h.appendChild(head);
+    card.appendChild(h);
+
+    const body = document.createElement("div");
+    body.className = "plug__body";
+    body.id = bodyId;
+    body.setAttribute("role", "region");
+    body.setAttribute("aria-labelledby", head.id);
+    body.hidden = !isOpen;
+
+    // The header's OWN initial state assumes nothing pending; refreshApplyBar (called by every path that
+    // reaches renderPlugins, in the same synchronous stretch) corrects it via refreshCardHeaders before
+    // anything paints, from THIS SAME map -- never re-created except by the next renderPlugins. #244
+    // round-1: head/body are carried too, so refuseApply can force a closed card open without a full
+    // re-render -- buildSettingsStep builds every field regardless of isOpen, but the body itself stays
+    // [hidden] (display:none, unfocusable) until something opens it.
+    cardHeaderEls.set(p.name, { badge: badgeEl, summary: summaryEl, head, body, chev: chevEl });
+    const initial = pluginCardState(p, { indexAvailable: ctx.indexAvailable, pendingOn: undefined, pendingSettings: 0, labelOf: (key) => settingLabel(key, p.name) });
+    const modifier = BADGE_MODIFIERS.get(initial.badge.kind);
+    badgeEl.className = "rb-badge plugin-badge" + (initial.badge.kind ? " " + initial.badge.kind : "") + (modifier ? " " + modifier : "");
+    badgeEl.textContent = initial.badge.text;
+    summaryEl.textContent = initial.summary;
+
+    if (p.error) {
+      const alert = document.createElement("div");
+      alert.className = "rb-alert rb-alert--danger";
+      alert.textContent = p.error;
+      body.appendChild(alert);
+    }
+    const steps = [buildTurnItOnStep(p, ctx)];
+    const settingsStep = buildSettingsStep(p, ctx, isOpen);
+    if (settingsStep) steps.push(settingsStep);
+    steps.forEach((s, i) => {
+      const numEl = s.querySelector(".step__num");
+      if (numEl) numEl.textContent = String(i + 1);
+      body.appendChild(s);
+    });
+    card.appendChild(body);
+
+    // Toggling is a LOCAL re-render (no fetch), but renderPlugins rebuilds every card's DOM -- capture
+    // and reapply, exactly like a background reload, so opening this one card cannot drop a setting
+    // being typed into another. Refocuses the (new) header button: re-rendering discards the one the
+    // click landed on, and losing focus on every toggle would be its own accessibility regression.
+    head.addEventListener("click", () => {
+      const captured = diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, captureCardControls());
+      if (openCards.has(p.name)) openCards.delete(p.name);
+      else openCards.add(p.name);
+      renderPlugins();
+      reapplyCardEdits(captured);
+      refreshApplyBar();
+      const fresh = document.getElementById("plug-head-" + p.name);
+      if (fresh) fresh.focus();
+    });
+
+    return card;
   }
 
   // A human-readable local timestamp for an ISO string (browser-only rendering — the pure ISO
@@ -1400,50 +1816,38 @@
   // Field order follows the response's own key order (not re-sorted) — bot-ops.sh's env-get
   // emits keys in its own deliberate whitelist order, not alphabetically, so the most relevant
   // fields can be placed first.
-  async function loadEnv() {
+  // #244: renderEnvFields() is loadEnv's old body minus the fetch (reloadConfig owns that, alongside
+  // /api/plugins and /api/env-schema together) plus one more skip: a key a card already shows -- either
+  // the schema says so (loadedSchema[key].source === "plugin") or the fetch that built loadedSchema is
+  // degraded ({} on an old bot-ops.sh or a transient failure) and a plugin's OWN manifest still declares
+  // it -- never appears in the Config editor too. #257's PLUGINS skip is unchanged.
+  function renderEnvFields() {
     const container = document.getElementById("env-fields");
-    try {
-      // Fetch the branch list up front so buildEnvControl can render BOT_BRANCH as a chooser.
-      await loadBranches();
-      // GET /api/env-schema alongside GET /api/env — an old deployed bot-ops.sh (pre-#205) or a
-      // transient 5xx resolves to {} rather than failing the whole load, degrading to no
-      // client-side validation (the server, via env-set, stays the authority either way).
-      const [env, schema] = await Promise.all([
-        api("/api/env").then((r) => r.json()),
-        api("/api/env-schema")
-          .then((r) => (r.ok ? r.json() : {}))
-          .catch(() => ({})),
-      ]);
-      loadedEnv = env;
-      loadedSchema = schema && typeof schema === "object" ? schema : {};
-      container.innerHTML = "";
-      for (const key of Object.keys(env)) {
-        // #257: PLUGINS is chosen on the Plugins tab (the ticks), and two controls for one key in one
-        // form is a conflict with no good answer. A name@version pin is set in .env.
-        if (key === "PLUGINS") continue;
-        const value = env[key] ?? "";
-        const control = buildEnvControl(key, value);
-        const label = document.createElement("label");
-        label.className = "rb-label";
-        label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
-        // Clicking the label focuses the field; a composite control (tags) points at its nested
-        // input via dataset.focusId, since the wrapper itself isn't focusable.
-        label.htmlFor = control.dataset.focusId || control.id;
-        container.appendChild(label);
-        const meta = FIELD_META[key];
-        if (meta && meta.hint) {
-          const hint = document.createElement("div");
-          hint.className = "field-hint";
-          hint.textContent = meta.hint;
-          container.appendChild(hint);
-        }
-        container.appendChild(control);
+    const pluginKeys = new Set();
+    for (const p of (pluginsData && pluginsData.plugins) || []) {
+      for (const e of p.env || []) pluginKeys.add(e.key);
+    }
+    container.innerHTML = "";
+    for (const key of Object.keys(loadedEnv)) {
+      if (key === "PLUGINS") continue;
+      if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
+      const value = loadedEnv[key] ?? "";
+      const control = buildEnvControl(key, value);
+      const label = document.createElement("label");
+      label.className = "rb-label";
+      label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
+      // Clicking the label focuses the field; a composite control (tags) points at its nested
+      // input via dataset.focusId, since the wrapper itself isn't focusable.
+      label.htmlFor = control.dataset.focusId || control.id;
+      container.appendChild(label);
+      const meta = FIELD_META[key];
+      if (meta && meta.hint) {
+        const hint = document.createElement("div");
+        hint.className = "field-hint";
+        hint.textContent = meta.hint;
+        container.appendChild(hint);
       }
-    } catch (e) {
-      if (e.message !== "unauthorized") container.textContent = "Error: " + e.message;
-    } finally {
-      // The baseline moved (or the form failed to load): what is pending is read from the controls again.
-      refreshApplyBar();
+      container.appendChild(control);
     }
   }
 
@@ -1502,16 +1906,19 @@
   // ENV_SAVE_PLAN:end
 
   // APPLY_PLAN:begin
-  // #257: everything that needs a restart, as ONE plan -- the plugin on/off choices (planPluginsSave) and
-  // every edited config field (planEnvSave), composed; one POST /api/env, one restart. Pure.
-  //   input: { loadedEnv, fields: {KEY: value}, plugins: { checkedNames, currentValue, manifestOrder } | null }
+  // #257: everything that needs a restart, as ONE plan -- the plugin on/off choices (planPluginsSave), every
+  // edited config field (planEnvSave) and (#244) every typed secret, composed; one POST /api/env, one restart. Pure.
+  //   input: { loadedEnv, fields: {KEY: value}, plugins: { checkedNames, currentValue, manifestOrder } | null,
+  //            secrets: {KEY: value} }
   //   `plugins` is null when the bot's state could not be read: nothing may be planned against an
   //   untrusted baseline (a ticked subset diffed against a false-empty PLUGINS would wipe the real selection).
-  //   -> { changes: [{ key, before, now }], body, count, error? }
+  //   -> { changes: [{ key, before, now, secret? }], body, count, error? }
   // PLUGINS comes first (only when planPluginsSave says it changed; `before` is the raw current value), then
   // the changed fields in field order -- minus any PLUGINS key among them (the Config editor no longer
-  // renders one; this is the belt to that brace). A value with a line break is refused: bot-ops.sh reads
-  // stdin line by line, so "8080\nANNOUNCE_CHANNEL_ID=1" would smuggle a second assignment.
+  // renders one; this is the belt to that brace) -- then (#244) every non-empty typed secret, each
+  // { key, before: "", now, secret: true } (a secret is never diffed against a baseline: the server never
+  // sends its value, so "changed" just means "typed"). A value with a line break is refused: bot-ops.sh
+  // reads stdin line by line, so "8080\nANNOUNCE_CHANNEL_ID=1" would smuggle a second assignment.
   function planApply(input) {
     const changes = [];
     if (input.plugins) {
@@ -1521,12 +1928,56 @@
     for (const c of planEnvSave(input.loadedEnv, input.fields).changes) {
       if (c.key !== "PLUGINS") changes.push(c);
     }
+    for (const key of Object.keys(input.secrets || {})) {
+      const now = input.secrets[key];
+      if (now !== "") changes.push({ key, before: "", now, secret: true });
+    }
     const plan = { changes, body: changes.map((c) => c.key + "=" + c.now).join("\n"), count: changes.length };
     const smuggling = changes.find((c) => /[\r\n]/.test(c.now));
     if (smuggling) return { ...plan, body: "", error: smuggling.key + " must not contain a line break." };
     return plan;
   }
   // APPLY_PLAN:end
+
+  // PLUGIN_EDITS:begin
+  // Pure parts of #244's card editing. diffEdits captures only what a user has actually TYPED, relative
+  // to the baseline the controls were last rendered from -- reloadConfig calls it before a re-render (to
+  // carry pending edits across it) and after (nothing left to re-apply, since the new baseline IS what's
+  // rendered). `baseline`: { plugins: [{name, enabled}, ...], env: {KEY: value} } (the OLD pluginsData /
+  // loadedEnv, before this reload). `controls`: { on: {name: bool}, settings: {KEY: value}, secrets:
+  // {KEY: value} } (read live from the DOM). A secret is never diffed against a baseline value (the
+  // server never sends one) -- "changed" means "non-empty".
+  function diffEdits(baseline, controls) {
+    const enabledByName = {};
+    for (const p of baseline.plugins || []) enabledByName[p.name] = !!p.enabled;
+    const on = {};
+    for (const name of Object.keys(controls.on)) {
+      if (controls.on[name] !== !!enabledByName[name]) on[name] = controls.on[name];
+    }
+    const settings = {};
+    for (const key of Object.keys(controls.settings)) {
+      if (controls.settings[key] !== (baseline.env[key] ?? "")) settings[key] = controls.settings[key];
+    }
+    const secrets = {};
+    for (const key of Object.keys(controls.secrets)) {
+      if (controls.secrets[key] !== "") secrets[key] = controls.secrets[key];
+    }
+    return { on, settings, secrets };
+  }
+  // A typed secret can't go through validateEnvChanges: it echoes the value it rejects in the message,
+  // which is right for a plain setting and wrong for a secret. schema is GET /api/env-schema's object;
+  // changes is the SECRET subset of a plan's changes (applyPending filters by `c.secret`); labelOf maps a
+  // key to its display label (settingLabel bound to the owning plugin). Message NEVER contains c.now.
+  function validateSecretChanges(schema, changes, labelOf) {
+    for (const c of changes) {
+      const s = schema[c.key];
+      if (!s) continue;
+      const re = compilePattern(s.pattern);
+      if (re && !re.test(c.now)) return { key: c.key, message: labelOf(c.key) + " doesn't look right — check what you pasted." };
+    }
+    return null;
+  }
+  // PLUGIN_EDITS:end
 
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
@@ -1630,20 +2081,44 @@
   // re-baselining failure (the bar offered Apply for the length of the re-read). While the flag is set the bar's
   // Discard and Apply are busy and applyPending / discardPending return, as they do while a request is in flight.
   let applyRereading = false;
+  // #244: name -> { badge, summary, head, body } elements for the currently-rendered cards, populated by
+  // buildPluginCard (outside this block) and read by refreshCardHeaders and refuseApply, below --
+  // declared here (not beside secretsReplacing) because both readers are part of this marked block and
+  // the harness lifts blocks in isolation, by name; it is still one shared top-level `let` either way.
+  let cardHeaderEls = new Map();
+  // #244: which cards are open, remembered across a re-render (in memory only, like every other piece of
+  // page state -- lost on a full reload). A name with no matching plugin after a reload is simply unused.
+  // Declared here (not beside secretsReplacing either) for the same reason as cardHeaderEls above:
+  // refuseApply, below, forces a card open on a validation failure and needs it in the lifted scope.
+  let openCards = new Set();
 
-  // The planner's input, read from EXACTLY two places: the config controls (a chip field's hidden carrier
-  // included) and the plugin tick boxes. Never a page-wide [data-key]: a plugin's own settings bundle
-  // renders arbitrary DOM inside this page.
+  // The planner's input, read from EXACTLY four places: the config controls (a chip field's hidden
+  // carrier included), a card's plain settings, a card's typed secrets, and the plugin tick boxes. Never
+  // a page-wide [data-key]/[data-setting-key]/[data-secret-key]: a plugin's own settings bundle renders
+  // arbitrary DOM inside #plugins-list (in .plug__admin), and its controls must never be read as the
+  // panel's own -- every #plugins-list selector below is additionally filtered with
+  // !el.closest(".plug__admin"). A plain plugin setting diffs exactly like a Config field (folded into
+  // `fields`); a secret never diffs against a baseline the server never sends -- non-empty is the only
+  // "changed" (#244).
   function collectPending() {
     const fields = {};
     for (const c of document.querySelectorAll("#env-fields [data-key]")) fields[c.dataset.key] = c.value;
+    for (const c of document.querySelectorAll("#plugins-list [data-setting-key]")) {
+      if (!c.closest(".plug__admin")) fields[c.dataset.settingKey] = c.value;
+    }
+    const secrets = {};
+    for (const c of document.querySelectorAll("#plugins-list [data-secret-key]")) {
+      if (!c.closest(".plug__admin") && c.value !== "") secrets[c.dataset.secretKey] = c.value;
+    }
     let plugins = null;
     // Never plan against an untrusted baseline, in two ways. (1) A failed STATE read (an empty PLUGINS) could
     // be diffed against a ticked subset and wipe the real selection. (2) A list that is NOT RENDERED: a failed
     // /api/plugins reload swaps the boxes for an error line while pluginsData still holds the previous
     // answer, and "nothing ticked" diffed against that would post PLUGINS= and switch every plugin off.
     if (pluginsData && !pluginsData.stateError) {
-      const boxes = [...document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")];
+      const boxes = [...document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")].filter(
+        (c) => !c.closest(".plug__admin"),
+      );
       if (boxes.length > 0) {
         plugins = {
           checkedNames: boxes.filter((c) => c.checked).map((c) => c.dataset.plugin),
@@ -1652,7 +2127,15 @@
         };
       }
     }
-    return { loadedEnv, fields, plugins };
+    return { loadedEnv, fields, plugins, secrets };
+  }
+
+  // #244: a key's display label, for a refusal message and for refuseApply's card lookup -- the first
+  // plugin (in manifest order) that declares the key owns its label; a key no current plugin declares
+  // (stale schema row, a core key routed here by mistake) falls back to the raw key name.
+  function cardSettingLabel(key) {
+    const owners = settingOwners((pluginsData && pluginsData.plugins) || []);
+    return settingLabel(key, owners.get(key) || "");
   }
 
   // The bar's words are a live region and this runs on every keystroke: write a line only when it CHANGED, so
@@ -1691,7 +2174,38 @@
   }
 
   function refreshApplyBar() {
-    writeApplyBar(planApply(collectPending()));
+    const pending = collectPending();
+    writeApplyBar(planApply(pending));
+    refreshCardHeaders(pending);
+  }
+
+  // #244: every open-or-closed card's header (badge + summary) is recomputed on every event that
+  // touches the bar -- rows 1-3 of pluginCardState depend on what is pending, which changes on every
+  // keystroke. Never touches the DOM beyond what renderPlugins already built: cardHeaderEls (populated
+  // there, cleared on the next render) is the only lookup, so this is a no-op before the first render
+  // and adds no new document.querySelectorAll selector for collectPending's harness to allow.
+  function refreshCardHeaders(pending) {
+    if (!pluginsData) return;
+    const owners = settingOwners(pluginsData.plugins || []);
+    const indexAvailable = !pluginsData.indexError;
+    for (const p of pluginsData.plugins || []) {
+      const els = cardHeaderEls.get(p.name);
+      if (!els) continue;
+      const checkedNow = pending.plugins ? pending.plugins.checkedNames.includes(p.name) : p.enabled;
+      const pendingOn = pending.plugins && checkedNow !== p.enabled ? checkedNow : undefined;
+      let pendingSettings = 0;
+      for (const key of Object.keys(pending.fields)) {
+        if (owners.get(key) === p.name && pending.fields[key] !== (loadedEnv[key] ?? "")) pendingSettings++;
+      }
+      for (const key of Object.keys(pending.secrets)) {
+        if (owners.get(key) === p.name) pendingSettings++;
+      }
+      const state = pluginCardState(p, { indexAvailable, pendingOn, pendingSettings, labelOf: (key) => settingLabel(key, p.name) });
+      const modifier = BADGE_MODIFIERS.get(state.badge.kind);
+      els.badge.className = "rb-badge plugin-badge" + (state.badge.kind ? " " + state.badge.kind : "") + (modifier ? " " + modifier : "");
+      if (els.badge.textContent !== state.badge.text) els.badge.textContent = state.badge.text;
+      if (els.summary.textContent !== state.summary) els.summary.textContent = state.summary;
+    }
   }
 
   function clearApplyInvalid() {
@@ -1734,10 +2248,13 @@
   // The one delegated handler behind #app's `input` and `change` listeners. Only an edit INSIDE the config
   // fields or the plugin list counts: the logs filter, the admin e-mail box and a plugin's own settings
   // bundle also bubble events to #app. An edit clears a finished (done / failed) message and a refusal,
-  // and re-reads what is pending.
+  // and re-reads what is pending. #244: a plugin's own bundle now lives INSIDE #plugins-list (in
+  // .plug__admin), so its inputs pass the filter above -- excluded separately, since they must not
+  // touch the bar at all (its own AdminApi.setEnv is a different, immediate write).
   function onControlEdited(e) {
     const target = e && e.target;
     if (!target || typeof target.closest !== "function" || !target.closest("#env-fields, #plugins-list")) return;
+    if (target.closest(".plug__admin")) return;
     if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();
@@ -1771,12 +2288,33 @@
   }
 
   // A refusal: the bar says why, the offending control is marked and focused on its own tab, and nothing
-  // is sent. A tag field's control is its typing input (id env-KEY, the one its label points at).
+  // is sent. A tag field's control is its typing input (id env-KEY, the one its label points at). #244: a
+  // plugin-owned key (loadedSchema[key].source === "plugin") lives on the Plugins tab, on its card, as
+  // either a plain setting (id set-KEY) or, in replace mode, a secret input (id secret-KEY) --
+  // buildSettingsStep builds these fields whether or not the card is open, but a closed card's whole
+  // .plug__body stays [hidden] (display:none), so the control exists but is invisible and unfocusable.
+  // Round-1 fix: force the owning card open FIRST, directly (a local DOM toggle via cardHeaderEls' stored
+  // refs, not a full renderPlugins() -- the control the rest of this function is about to focus already
+  // exists; re-rendering would only replace it out from under the focus() call below), so the id is
+  // always there to find AND visible.
   function refuseApply(bad) {
     applyViolation = bad.message;
-    const plugins = bad.key === "PLUGINS";
-    showTab(plugins ? "plugins" : "settings", false);
-    const control = plugins ? null : document.getElementById("env-" + bad.key);
+    const s = loadedSchema[bad.key];
+    const onPluginTab = bad.key === "PLUGINS" || (s && s.source === "plugin");
+    showTab(onPluginTab ? "plugins" : "settings", false);
+    if (s && s.source === "plugin") {
+      const owner = settingOwners((pluginsData && pluginsData.plugins) || []).get(bad.key);
+      const els = owner ? cardHeaderEls.get(owner) : null;
+      if (els && els.body && els.body.hidden) {
+        openCards.add(owner);
+        els.body.hidden = false;
+        els.head.setAttribute("aria-expanded", "true");
+        if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
+      }
+    }
+    const controlId =
+      bad.key === "PLUGINS" ? null : s && s.source === "plugin" ? (s.secret ? "secret-" : "set-") + bad.key : "env-" + bad.key;
+    const control = controlId ? document.getElementById(controlId) : null;
     if (control) {
       control.setAttribute("aria-invalid", "true");
       applyInvalid = control;
@@ -1796,8 +2334,12 @@
     // Block a blank required field or a bad-format value BEFORE anything is sent, not after a failed save
     // (issue #45): one bad key blocks the WHOLE apply, same as bot-ops.sh itself does server-side.
     // loadedSchema is {} when GET /api/env-schema was unavailable, so this degrades to no client-side check
-    // rather than blocking on stale or missing rules -- env-set is still the authority.
-    const bad = validateEnvChanges(loadedSchema, plan.changes);
+    // rather than blocking on stale or missing rules -- env-set is still the authority. #244: a typed
+    // secret goes through validateSecretChanges instead -- validateEnvChanges echoes the value it
+    // rejects, right for a plain setting, wrong for a secret.
+    const bad =
+      validateEnvChanges(loadedSchema, plan.changes.filter((c) => !c.secret)) ||
+      validateSecretChanges(loadedSchema, plan.changes.filter((c) => c.secret), cardSettingLabel);
     if (bad) {
       refuseApply(bad);
       return;
