@@ -6331,6 +6331,10 @@ const formStatesSrc = applyIndexSrc.slice(
   applyIndexSrc.indexOf("function setDescribedByToken("),
   applyIndexSrc.indexOf("// Guarded so a missing tablist"),
 );
+const renderEnvFieldsSrc = applyIndexSrc.slice(
+  applyIndexSrc.indexOf("function renderEnvFields()"),
+  applyIndexSrc.indexOf("// ENV_SCHEMA:begin"),
+);
 
 interface ApplyChange {
   key: string;
@@ -6948,6 +6952,7 @@ interface StubEl {
   contains: (other: unknown) => boolean;
   closest: (selector: string) => unknown;
   insertAdjacentElement?: (position: string, element: StubEl) => StubEl;
+  appendChild?: (element: StubEl) => StubEl;
   remove?: () => void;
 }
 interface ApplySpec {
@@ -7040,8 +7045,10 @@ function runApply(spec: ApplySpec) {
       closest: (selector: string) => {
         if (selector === ".plug__admin" && el.dataset.plugAdmin === "true") return el;
         if (selector === "#plugins-list" && (el.dataset.plugin || el.dataset.settingKey || el.dataset.secretKey)) return el;
+        if (selector === "#env-fields" && el.dataset.key) return el;
         return null;
       },
+      appendChild: (child) => child,
       insertAdjacentElement: (_position, child) => {
         byId.set(child.id, child);
         child.remove = () => void byId.delete(child.id);
@@ -7083,10 +7090,25 @@ function runApply(spec: ApplySpec) {
   bar.contains = (other) => inBar.includes(other);
   const tab = makeEl("tab-settings");
   const body = makeEl("body");
+  let envFieldChildren: StubEl[] = [];
+  const envFields = makeEl("env-fields", {
+    appendChild: (child) => {
+      envFieldChildren.push(child);
+      if (child.id) byId.set(child.id, child);
+      return child;
+    },
+  });
+  Object.defineProperty(envFields, "innerHTML", {
+    set: () => {
+      for (const child of envFieldChildren) if (child.id) byId.delete(child.id);
+      envFieldChildren = [];
+    },
+    configurable: true,
+  });
 
   const baseline = { ...spec.loadedEnv }; // what the server holds: what a re-render restores
   const fieldEntries = Object.entries(spec.fields ?? spec.loadedEnv);
-  byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go].map((e) => [e.id, e]));
+  byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go, envFields].map((e) => [e.id, e]));
   const controls = fieldEntries.map(([key, value]) => {
     const carrier = makeEl(`carrier-${key}`, { value, dataset: { key } });
     // A plain control is its own [data-key] element and carries the id its label points at; a chip
@@ -7094,6 +7116,7 @@ function runApply(spec: ApplySpec) {
     const control = (spec.tags ?? []).includes(key) ? makeEl(`env-${key}`) : carrier;
     if (control === carrier) carrier.id = `env-${key}`;
     byId.set(`env-${key}`, control);
+    envFieldChildren.push(control);
     return carrier;
   });
   const pluginsData = spec.pluginsData === undefined ? APPLY_PLUGINS : spec.pluginsData;
@@ -7124,6 +7147,7 @@ function runApply(spec: ApplySpec) {
   const document = {
     body,
     createElement: () => makeEl(""),
+    createTextNode: (text: string) => ({ ...makeEl(""), textContent: text }),
     get activeElement() { return state.active ?? body; },
     getElementById: (id: string): StubEl | null => {
       const el = byId.get(id);
@@ -7144,6 +7168,8 @@ function runApply(spec: ApplySpec) {
       throw new Error(`harness: unexpected querySelector(${JSON.stringify(selector)})`);
     },
   };
+  const buildEnvControl = (key: string, value: string, required: boolean) =>
+    makeEl(`env-${key}`, { value, dataset: { key }, required } as Partial<StubEl>);
   // The real loaders re-render every control from the persisted state. With `resetOnReload` the stubs do
   // the same to the stub controls (back to the baseline they started from), so Discard is observable end
   // to end; without it they only count (after a real apply the new baseline IS what was typed).
@@ -7201,10 +7227,10 @@ function runApply(spec: ApplySpec) {
   // refreshApplyBar()/discardPending()/applyPending(). openCards is returned for the same reason --
   // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
   const run = new Function(
-    "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
-    `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, capturePluginApplyInvalidForRender, restorePluginApplyInvalidAfterRender, cardHeaderEls, openCards };",
-  )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
+    "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal", "FIELD_META", "buildEnvControl",
+    `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n${renderEnvFieldsSrc}\n` +
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, capturePluginApplyInvalidForRender, captureConfigApplyInvalidForRender, restoreApplyInvalidAfterRender, renderEnvFields, cardHeaderEls, openCards };",
+  )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal, { ANNOUNCE_CHANNEL_ID: { hint: "Where notifications are sent." } }, buildEnvControl) as {
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
     refreshApplyBar: () => void;
@@ -7212,7 +7238,9 @@ function runApply(spec: ApplySpec) {
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
     capturePluginApplyInvalidForRender: () => { id: string; message: string } | null;
-    restorePluginApplyInvalidAfterRender: (saved: { id: string; message: string } | null) => void;
+    captureConfigApplyInvalidForRender: () => { id: string; message: string } | null;
+    restoreApplyInvalidAfterRender: (saved: { id: string; message: string } | null) => void;
+    renderEnvFields: () => void;
     cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl; head?: StubEl; body?: StubEl; chev?: StubEl }>;
     openCards: Set<string>;
   };
@@ -7440,11 +7468,11 @@ describe("applyPending (#257)", () => {
     }
   });
 
-  test("a plugin-card re-render carries inline refusal state to the rebuilt control", async () => {
+  test("plugin and Config re-renders carry inline refusal state to the rebuilt control", async () => {
     const renderPlugins = applyIndexSrc.slice(applyIndexSrc.indexOf("function renderPlugins()"), applyIndexSrc.indexOf("function versionLine("));
     expect(renderPlugins).toContain("const savedApplyInvalid = capturePluginApplyInvalidForRender();");
     expect(renderPlugins.indexOf("capturePluginApplyInvalidForRender();")).toBeLessThan(renderPlugins.indexOf('container.innerHTML = "";'));
-    expect(renderPlugins.split("restorePluginApplyInvalidAfterRender(savedApplyInvalid);")).toHaveLength(3);
+    expect(renderPlugins.split("restoreApplyInvalidAfterRender(savedApplyInvalid);")).toHaveLength(3);
 
     const page = runApply({
       loadedEnv: {},
@@ -7465,7 +7493,7 @@ describe("applyPending (#257)", () => {
     expect(control.getAttribute("aria-invalid")).toBeNull();
     expect(page.element("set-MUSIC_PORT-error")).toBeNull();
     const rebuilt = page.replaceElement("set-MUSIC_PORT", { value: control.value, dataset: { settingKey: "MUSIC_PORT" } });
-    page.run.restorePluginApplyInvalidAfterRender(saved);
+    page.run.restoreApplyInvalidAfterRender(saved);
     page.run.refreshApplyBar();
     expect(rebuilt.getAttribute("aria-invalid")).toBe("true");
     expect(rebuilt.getAttribute("aria-describedby")).toBe("set-MUSIC_PORT-error");
@@ -7478,16 +7506,24 @@ describe("applyPending (#257)", () => {
     const savedAgain = page.run.capturePluginApplyInvalidForRender();
     expect(savedAgain).toEqual(saved);
     const rebuiltAgain = page.replaceElement("set-MUSIC_PORT", { value: rebuilt.value, dataset: { settingKey: "MUSIC_PORT" } });
-    page.run.restorePluginApplyInvalidAfterRender(savedAgain);
+    page.run.restoreApplyInvalidAfterRender(savedAgain);
     expect(rebuiltAgain.getAttribute("aria-invalid")).toBe("true");
     expect(page.element("set-MUSIC_PORT-error")?.textContent).toBe("MUSIC_PORT must not contain a line break.");
 
     const config = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" } });
     await config.run.applyPending();
     expect(config.run.capturePluginApplyInvalidForRender()).toBeNull();
+    const originalConfig = config.control("ANNOUNCE_CHANNEL_ID");
+    config.run.renderEnvFields();
     config.run.refreshApplyBar();
-    expect(config.control("ANNOUNCE_CHANNEL_ID").getAttribute("aria-invalid")).toBe("true");
-    expect(config.element("env-ANNOUNCE_CHANNEL_ID-error")).not.toBeNull();
+    const rebuiltConfig = config.control("ANNOUNCE_CHANNEL_ID");
+    expect(originalConfig.getAttribute("aria-invalid")).toBeNull();
+    expect(rebuiltConfig.getAttribute("aria-invalid")).toBe("true");
+    expect(rebuiltConfig.getAttribute("aria-describedby")).toBe("env-ANNOUNCE_CHANNEL_ID-hint env-ANNOUNCE_CHANNEL_ID-error");
+    expect(config.element("env-ANNOUNCE_CHANNEL_ID-error")).toMatchObject({
+      className: "rb-field__error",
+      textContent: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.",
+    });
     expect(config.view()).toMatchObject({ tone: "danger", hint: "ANNOUNCE_CHANNEL_ID is required and cannot be blank." });
 
     const removed = runApply({
@@ -7500,7 +7536,7 @@ describe("applyPending (#257)", () => {
     const removedSaved = removed.run.capturePluginApplyInvalidForRender();
     removed.element("set-MUSIC_PORT")!.value = "8080";
     removed.removeElement("set-MUSIC_PORT");
-    removed.run.restorePluginApplyInvalidAfterRender(removedSaved);
+    removed.run.restoreApplyInvalidAfterRender(removedSaved);
     removed.run.refreshApplyBar();
     expect(removed.view()).toMatchObject({
       tone: "",

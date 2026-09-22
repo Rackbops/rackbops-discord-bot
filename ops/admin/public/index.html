@@ -885,7 +885,7 @@
       empty.className = "adm-note";
       empty.textContent = "No plugins available or installed.";
       container.appendChild(empty);
-      restorePluginApplyInvalidAfterRender(savedApplyInvalid);
+      restoreApplyInvalidAfterRender(savedApplyInvalid);
       return;
     }
     // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every switch
@@ -904,7 +904,7 @@
     note.style.marginTop = "8px";
     note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
-    restorePluginApplyInvalidAfterRender(savedApplyInvalid);
+    restoreApplyInvalidAfterRender(savedApplyInvalid);
   }
 
   // A card's "Version X" / "not installed" line, browser-only text (no acceptance bullet cites its exact
@@ -2553,6 +2553,9 @@
   // degraded ({} on an old bot-ops.sh or a transient failure) and a plugin's OWN manifest still declares
   // it -- never appears in the Config editor too. #257's PLUGINS skip is unchanged.
   function renderEnvFields() {
+    // A background plugin action reloads and rebuilds Config too. Preserve a refusal attached to a
+    // Config control just as renderPlugins preserves one attached to a plugin setting.
+    const savedApplyInvalid = captureConfigApplyInvalidForRender();
     const container = document.getElementById("env-fields");
     const pluginKeys = new Set();
     for (const p of (pluginsData && pluginsData.plugins) || []) {
@@ -2584,6 +2587,7 @@
         container.appendChild(hint);
       }
     }
+    restoreApplyInvalidAfterRender(savedApplyInvalid);
   }
 
   // ENV_SCHEMA:begin
@@ -3111,7 +3115,14 @@
     return saved;
   }
 
-  function restorePluginApplyInvalidAfterRender(saved) {
+  function captureConfigApplyInvalidForRender() {
+    if (!applyInvalid || !applyInvalid.closest("#env-fields")) return null;
+    const saved = { id: applyInvalid.id, message: applyViolation };
+    clearApplyInvalid();
+    return saved;
+  }
+
+  function restoreApplyInvalidAfterRender(saved) {
     if (!saved) return;
     const control = document.getElementById(saved.id);
     if (!control) {
