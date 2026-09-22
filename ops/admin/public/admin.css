@@ -5,8 +5,8 @@
    tag-field, msg, ...) are kept as they were. Tests pin that every class the page uses is styled
    here or by the theme, the message classes (msg ok|error, plugin-actions-msg ok|error) exactly, and
    which classes the static markup and most script-built elements (buttons, inputs, selects, rows,
-   the chip field ...) carry. The small structural script-built classes (plugin-info, plugin-meta,
-   rel-*, ...) have no such pin and rely on the browser check. */
+   the chip field ...) carry. The small structural script-built classes (plug__*, rel-*, ...) have
+   no such pin and rely on the browser check. */
 
 /* An author `display` rule (.adm, .adm-panel, .rb-alert ...) beats the UA's [hidden] { display: none },
    so a hidden app, tab panel or banner would show. Restate it once, here. */
@@ -277,44 +277,6 @@
 }
 
 /* ---- Plugins ------------------------------------------------------------------------------- */
-.plugin-row {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--rb-space-3);
-  padding: var(--rb-space-3) 0;
-  border-bottom: 1px solid var(--rb-border);
-}
-.plugin-row:last-child {
-  border-bottom: none;
-}
-.plugin-row .rb-checkbox {
-  flex: none;
-  margin-top: var(--rb-space-1);
-}
-.plugin-info {
-  flex: 1;
-  min-width: 0;
-}
-.plugin-name {
-  display: block;
-  color: var(--rb-text);
-  font-weight: var(--rb-font-weight-medium);
-  overflow-wrap: anywhere;
-}
-.plugin-desc {
-  margin-top: 2px;
-  font-size: calc(var(--rb-text-sm) - 1px);
-  color: var(--rb-text-soft);
-}
-.plugin-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--rb-space-2);
-  margin-top: var(--rb-space-1);
-  font-size: calc(var(--rb-text-sm) - 2px);
-  color: var(--rb-text-faint);
-}
 /* A state badge can carry a plugin's own error text or env-key names: show them as written, not
    forced to uppercase, and let a long one wrap. The semantic modifier (rb-badge--success ...) still
    tints the pill, but the words are body text: the light theme's success / warning / info text
@@ -384,29 +346,18 @@
   width: auto;
 }
 
-/* ---- Plugin settings tabs (#124) ------------------------------------------------------------ */
-.plugin-admin-tab {
-  padding: var(--rb-space-3) 0;
-  border-bottom: 1px solid var(--rb-border);
-}
-.plugin-admin-tab:last-child {
-  border-bottom: none;
-}
-.plugin-admin-tab h3 {
-  margin: 0 0 var(--rb-space-2);
-  font-size: var(--rb-text-sm);
-}
-/* A plugin's settings tab is DOM a published bundle builds itself, with bare label / input /
-   select / button elements the host cannot add rb-* classes to. Give those the same look as the
-   library's controls. Each selector below sits ENTIRELY inside :where(), so it has zero specificity
-   and any rule a bundle brings of its own wins (a test pins that shape). */
-:where(.plugin-admin-tab label) {
+/* ---- A plugin's own settings bundle, mounted inside its card (#124, #244) --------------------- */
+/* A plugin's bundle builds bare label / input / select / button elements itself, with no rb-*
+   classes the host could add. Give those the same look as the library's controls. Each selector
+   below sits ENTIRELY inside :where(), so it has zero specificity and any rule a bundle brings of
+   its own wins (a test pins that shape). Mounted into `.plug__admin` -- see the card markup below. */
+:where(.plug__admin label) {
   display: block;
   margin: var(--rb-space-3) 0 var(--rb-space-1);
   color: var(--rb-text-soft);
   font-weight: var(--rb-font-weight-medium);
 }
-:where(.plugin-admin-tab input:not([type="checkbox"], [type="radio"]), .plugin-admin-tab select, .plugin-admin-tab textarea) {
+:where(.plug__admin input:not([type="checkbox"], [type="radio"]), .plug__admin select, .plug__admin textarea) {
   width: 100%;
   padding: var(--rb-space-2) var(--rb-space-3);
   background: var(--rb-surface-sunken);
@@ -416,12 +367,12 @@
   font-family: var(--rb-font-body);
   font-size: var(--rb-text-sm);
 }
-:where(.plugin-admin-tab :is(input, select, textarea):focus-visible) {
+:where(.plug__admin :is(input, select, textarea):focus-visible) {
   border-color: var(--rb-accent);
   box-shadow: 0 0 0 3px var(--rb-accent-wash);
   outline: none;
 }
-:where(.plugin-admin-tab button) {
+:where(.plug__admin button) {
   margin-top: var(--rb-space-3);
   padding: var(--rb-space-2) var(--rb-space-4);
   background: var(--rb-accent);
@@ -433,10 +384,38 @@
   font-weight: var(--rb-font-weight-medium);
   cursor: pointer;
 }
-:where(.plugin-admin-tab button:disabled) {
+:where(.plug__admin button:disabled) {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ---- One card per plugin (#244) --------------------------------------------------------------- */
+.adm-key { font-family: var(--rb-font-mono); font-size: 11px; color: var(--rb-text-faint); }
+.plug { padding: 0; overflow: hidden; }
+.plug__h { margin: 0; }
+.plug__head { all: unset; box-sizing: border-box; width: 100%; display: flex; align-items: center; gap: var(--rb-space-4); padding: var(--rb-space-4) var(--rb-space-5); cursor: pointer; }
+.plug__head:hover { background: var(--rb-surface-2); }
+.plug__head:focus-visible { outline: var(--rb-focus-ring); outline-offset: -2px; }
+.plug__id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.plug__name { font-family: var(--rb-font-display); font-weight: var(--rb-font-weight-medium); font-size: 16px; letter-spacing: var(--rb-heading-tracking); }
+.plug__desc { color: var(--rb-text-soft); font-size: 13px; }
+.plug__meta { margin-left: auto; display: flex; align-items: center; gap: var(--rb-space-3); color: var(--rb-text-faint); font-size: 13px; white-space: nowrap; }
+.plug__summary { overflow-wrap: anywhere; }
+.plug__chev { width: 16px; height: 16px; flex: none; color: var(--rb-text-faint); transition: transform var(--rb-transition) var(--rb-ease); }
+.plug__chev--open { transform: rotate(180deg); }
+.plug__body { border-top: 1px solid var(--rb-border); display: flex; flex-direction: column; }
+.step { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: var(--rb-space-5); padding: var(--rb-space-5); border-bottom: 1px solid var(--rb-border); }
+.step:last-child { border-bottom: none; }
+.step__title { display: flex; align-items: center; gap: var(--rb-space-2); font-family: var(--rb-font-display); font-weight: var(--rb-font-weight-medium); font-size: 14px; margin: 0 0 var(--rb-space-1); }
+.step__num { display: inline-grid; place-items: center; width: 22px; height: 22px; flex: none; border-radius: var(--rb-radius-pill); background: var(--rb-accent-wash); color: var(--rb-accent); font-family: var(--rb-font-mono); font-size: 12px; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--rb-space-4) var(--rb-space-5); }
+.secret { display: flex; align-items: center; gap: var(--rb-space-3); padding: 5px var(--rb-space-2) 5px var(--rb-space-3); background: var(--rb-surface-sunken); border: 1px solid var(--rb-border); border-radius: var(--rb-radius); font-size: var(--rb-text-sm); }
+.secret__dots { font-family: var(--rb-font-mono); color: var(--rb-text-faint); letter-spacing: 0.2em; }
+.rb-switch.adm-switch { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: none; margin: 0; border-radius: var(--rb-radius-pill); background: var(--rb-surface-sunken); border: 1px solid var(--rb-border-strong); position: relative; cursor: pointer; transition: background var(--rb-transition) var(--rb-ease), border-color var(--rb-transition) var(--rb-ease); }
+.rb-switch.adm-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--rb-text-soft); transition: transform var(--rb-transition) var(--rb-ease), background var(--rb-transition) var(--rb-ease); }
+.rb-switch.adm-switch:checked { background: var(--rb-accent); border-color: var(--rb-accent); }
+.rb-switch.adm-switch:checked::after { transform: translateX(16px); background: var(--rb-accent-fg); }
+.rb-switch.adm-switch:focus-visible { outline: var(--rb-focus-ring); outline-offset: 2px; }
 
 /* ---- The Apply bar (#257) --------------------------------------------------------------------
    Every change that needs a restart collects here, whichever tab it was made on: the last child of
@@ -552,7 +531,22 @@
   .rb-tabstrip__tab,
   .adm .rb-btn,
   .adm-gate .rb-btn,
-  :where(.plugin-admin-tab button) {
+  :where(.plug__admin button) {
     min-height: 44px;
+  }
+  /* A plugin card's settings step: the two columns stack, the fields go single-column, and the
+     header's meta (summary + badge) wraps under the name rather than forcing the card wider. */
+  .step {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .plug__head {
+    flex-wrap: wrap;
+  }
+  .plug__meta {
+    margin-left: 0;
+    white-space: normal;
   }
 }
