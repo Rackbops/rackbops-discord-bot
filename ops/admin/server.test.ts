@@ -6726,12 +6726,14 @@ function runApply(spec: ApplySpec) {
   // #244: cardHeaderEls is returned too -- refreshCardHeaders' per-card owner-filtering logic (which
   // plugin's pendingSettings a changed key counts toward) is otherwise unreachable from any test: the
   // map is empty until buildPluginCard (browser-only, never called here) populates it. A test that wants
-  // to exercise it seeds page.run.cardHeaderEls with its own stub {badge, summary} elements before
-  // calling refreshApplyBar()/discardPending()/applyPending().
+  // to exercise it seeds page.run.cardHeaderEls with its own stub {badge, summary} elements (round-1:
+  // now also head/body/chev, for refuseApply's card-opening) before calling
+  // refreshApplyBar()/discardPending()/applyPending(). openCards is returned for the same reason --
+  // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
     `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls };",
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
@@ -6739,7 +6741,8 @@ function runApply(spec: ApplySpec) {
     onControlEdited: (e: unknown) => void;
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
-    cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl }>;
+    cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl; head?: StubEl; body?: StubEl; chev?: StubEl }>;
+    openCards: Set<string>;
   };
   refreshAfterLoad = () => run.refreshApplyBar();
 
@@ -7367,6 +7370,55 @@ describe("applyPending with a card (#244)", () => {
     // Routed to the Plugins tab, on the card's own secret field -- not Settings, not a bare env- id.
     expect(page.log.tabs).toEqual([["plugins", false]]);
     expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]);
+  });
+
+  // Round-1 review finding: buildSettingsStep builds a card's fields whether or not the card is open, but
+  // buildPluginCard still hides the whole .plug__body ([hidden] is display:none) when it's closed -- so a
+  // refusal that marks and focuses a field on a CLOSED card was silently inert (invisible, unfocusable).
+  // The fix opens the owning card directly (cardHeaderEls' stored head/body/chev refs), which the harness
+  // proves by seeding cardHeaderEls itself -- buildPluginCard (browser-only) is never called here.
+  test("a refusal on a plugin-owned key opens its CLOSED card, so the marked/focused field is not left hidden (round-1 finding)", async () => {
+    const miniEl = (id: string): StubEl =>
+      ({
+        id, hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
+        classes: new Set(), attrs: new Map(), classList: { toggle: () => false },
+        setAttribute(name: string, value: string) { this.attrs.set(name, value); },
+        removeAttribute() {}, getAttribute() { return null; }, focus() {}, contains: () => false, closest: () => null,
+      }) as StubEl;
+    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
+    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
+    const head = miniEl("plug-head-music");
+    const body = miniEl("plug-body-music");
+    const chev = miniEl("chev-music");
+    body.hidden = true; // the card starts closed, as it would after a page load with nothing expanded
+    page.run.cardHeaderEls.set("music", { badge: miniEl("b"), summary: miniEl("s"), head, body, chev });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]); // still refused: this is only about the card becoming reachable
+    expect(body.hidden).toBe(false);
+    expect(head.attrs.get("aria-expanded")).toBe("true");
+    expect(chev.attrs.get("class")).toBe("plug__chev plug__chev--open");
+    expect(page.run.openCards.has("music")).toBe(true);
+    expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]); // the now-visible field still gets focus
+  });
+
+  test("a refusal on a card that is ALREADY open never touches cardHeaderEls (no redundant DOM writes)", async () => {
+    let bodyHiddenWrites = 0;
+    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
+    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
+    const headAttrs = new Map<string, string>();
+    const head = { id: "plug-head-music", attrs: headAttrs, setAttribute: (name: string, value: string) => void headAttrs.set(name, value) } as unknown as StubEl;
+    const body = {
+      id: "plug-body-music",
+      get hidden() { return false; },
+      set hidden(_v: boolean) { bodyHiddenWrites++; },
+    } as unknown as StubEl;
+    page.run.cardHeaderEls.set("music", { badge: {} as StubEl, summary: {} as StubEl, head, body });
+    await page.run.applyPending();
+    expect(bodyHiddenWrites).toBe(0);
+    expect(head.attrs.size).toBe(0);
+    expect(page.run.openCards.has("music")).toBe(false);
   });
 
   test("after a refusal that wrote nothing (#272) nothing is re-rendered and the typed secret is still in its field", async () => {

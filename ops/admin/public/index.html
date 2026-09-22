@@ -430,9 +430,6 @@
   // PLUGINS value and reuse the manifest order without a second fetch.
   let pluginsData = null;
 
-  // #244: which cards are open, remembered across a re-render (in memory only, like every other piece of
-  // page state -- lost on a full reload). A name with no matching plugin after a reload is simply unused.
-  let openCards = new Set();
   // #244: which secret keys are showing their password input (Replace pressed) rather than the "Saved on
   // the server" summary -- remembered the same way, so a background reload (an update button, Unlock)
   // does not silently drop the user back into the summary view mid-paste.
@@ -1157,20 +1154,11 @@
     const badgeEl = document.createElement("span");
     badgeEl.className = "rb-badge plugin-badge";
     metaWrap.appendChild(badgeEl);
-    metaWrap.appendChild(buildChevron(isOpen));
+    const chevEl = buildChevron(isOpen);
+    metaWrap.appendChild(chevEl);
     head.appendChild(metaWrap);
     h.appendChild(head);
     card.appendChild(h);
-
-    // The header's OWN initial state assumes nothing pending; refreshApplyBar (called by every path that
-    // reaches renderPlugins, in the same synchronous stretch) corrects it via refreshCardHeaders before
-    // anything paints, from THIS SAME map -- never re-created except by the next renderPlugins.
-    cardHeaderEls.set(p.name, { badge: badgeEl, summary: summaryEl });
-    const initial = pluginCardState(p, { indexAvailable: ctx.indexAvailable, pendingOn: undefined, pendingSettings: 0, labelOf: (key) => settingLabel(key, p.name) });
-    const modifier = BADGE_MODIFIERS.get(initial.badge.kind);
-    badgeEl.className = "rb-badge plugin-badge" + (initial.badge.kind ? " " + initial.badge.kind : "") + (modifier ? " " + modifier : "");
-    badgeEl.textContent = initial.badge.text;
-    summaryEl.textContent = initial.summary;
 
     const body = document.createElement("div");
     body.className = "plug__body";
@@ -1178,6 +1166,20 @@
     body.setAttribute("role", "region");
     body.setAttribute("aria-labelledby", head.id);
     body.hidden = !isOpen;
+
+    // The header's OWN initial state assumes nothing pending; refreshApplyBar (called by every path that
+    // reaches renderPlugins, in the same synchronous stretch) corrects it via refreshCardHeaders before
+    // anything paints, from THIS SAME map -- never re-created except by the next renderPlugins. #244
+    // round-1: head/body are carried too, so refuseApply can force a closed card open without a full
+    // re-render -- buildSettingsStep builds every field regardless of isOpen, but the body itself stays
+    // [hidden] (display:none, unfocusable) until something opens it.
+    cardHeaderEls.set(p.name, { badge: badgeEl, summary: summaryEl, head, body, chev: chevEl });
+    const initial = pluginCardState(p, { indexAvailable: ctx.indexAvailable, pendingOn: undefined, pendingSettings: 0, labelOf: (key) => settingLabel(key, p.name) });
+    const modifier = BADGE_MODIFIERS.get(initial.badge.kind);
+    badgeEl.className = "rb-badge plugin-badge" + (initial.badge.kind ? " " + initial.badge.kind : "") + (modifier ? " " + modifier : "");
+    badgeEl.textContent = initial.badge.text;
+    summaryEl.textContent = initial.summary;
+
     if (p.error) {
       const alert = document.createElement("div");
       alert.className = "rb-alert rb-alert--danger";
@@ -2079,11 +2081,16 @@
   // re-baselining failure (the bar offered Apply for the length of the re-read). While the flag is set the bar's
   // Discard and Apply are busy and applyPending / discardPending return, as they do while a request is in flight.
   let applyRereading = false;
-  // #244: name -> { badge, summary } elements for the currently-rendered cards, populated by
-  // buildPluginCard (outside this block) and read only by refreshCardHeaders, below -- declared here
-  // (not beside openCards/secretsReplacing) because refreshCardHeaders is part of this marked block and
+  // #244: name -> { badge, summary, head, body } elements for the currently-rendered cards, populated by
+  // buildPluginCard (outside this block) and read by refreshCardHeaders and refuseApply, below --
+  // declared here (not beside secretsReplacing) because both readers are part of this marked block and
   // the harness lifts blocks in isolation, by name; it is still one shared top-level `let` either way.
   let cardHeaderEls = new Map();
+  // #244: which cards are open, remembered across a re-render (in memory only, like every other piece of
+  // page state -- lost on a full reload). A name with no matching plugin after a reload is simply unused.
+  // Declared here (not beside secretsReplacing either) for the same reason as cardHeaderEls above:
+  // refuseApply, below, forces a card open on a validation failure and needs it in the lifted scope.
+  let openCards = new Set();
 
   // The planner's input, read from EXACTLY four places: the config controls (a chip field's hidden
   // carrier included), a card's plain settings, a card's typed secrets, and the plugin tick boxes. Never
@@ -2283,13 +2290,28 @@
   // A refusal: the bar says why, the offending control is marked and focused on its own tab, and nothing
   // is sent. A tag field's control is its typing input (id env-KEY, the one its label points at). #244: a
   // plugin-owned key (loadedSchema[key].source === "plugin") lives on the Plugins tab, on its card, as
-  // either a plain setting (id set-KEY) or, in replace mode, a secret input (id secret-KEY) -- the card
-  // must be open for the field that triggered this to exist, so the id is always there to find.
+  // either a plain setting (id set-KEY) or, in replace mode, a secret input (id secret-KEY) --
+  // buildSettingsStep builds these fields whether or not the card is open, but a closed card's whole
+  // .plug__body stays [hidden] (display:none), so the control exists but is invisible and unfocusable.
+  // Round-1 fix: force the owning card open FIRST, directly (a local DOM toggle via cardHeaderEls' stored
+  // refs, not a full renderPlugins() -- the control the rest of this function is about to focus already
+  // exists; re-rendering would only replace it out from under the focus() call below), so the id is
+  // always there to find AND visible.
   function refuseApply(bad) {
     applyViolation = bad.message;
     const s = loadedSchema[bad.key];
     const onPluginTab = bad.key === "PLUGINS" || (s && s.source === "plugin");
     showTab(onPluginTab ? "plugins" : "settings", false);
+    if (s && s.source === "plugin") {
+      const owner = settingOwners((pluginsData && pluginsData.plugins) || []).get(bad.key);
+      const els = owner ? cardHeaderEls.get(owner) : null;
+      if (els && els.body && els.body.hidden) {
+        openCards.add(owner);
+        els.body.hidden = false;
+        els.head.setAttribute("aria-expanded", "true");
+        if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
+      }
+    }
     const controlId =
       bad.key === "PLUGINS" ? null : s && s.source === "plugin" ? (s.secret ? "secret-" : "set-") + bad.key : "env-" + bad.key;
     const control = controlId ? document.getElementById(controlId) : null;
