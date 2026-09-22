@@ -931,7 +931,7 @@ recreate_bot() {
 cmd_env_set() {
   need docker; need jq
   guard_no_handoff_in_progress
-  lock_config_dir env-set
+  # MUTANT 1 (CI-only): removed the lock call — two concurrent saves should now lose a key
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
   # Every REQUIRED key must also be an ALLOWED one — REQUIRED is a separate, hand-maintained set
