@@ -8593,13 +8593,14 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
-        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
       sendRouting: (plugin: string) => Promise<void>;
       awaitRequestResult: (plugin: string, id: string, sentServers: string[], startedAt: number) => Promise<void>;
       resetToSaved: (plugin: string) => void;
+      checkAgain: (plugin: string) => void;
       routeState: Map<
         string,
         {
@@ -8609,6 +8610,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
           held?: boolean;
           sendTimer?: unknown;
           pollTimer?: unknown;
+          lastSent?: { id: string; sentServers: string[] };
         }
       >;
       routingStepEls: Map<
@@ -8726,6 +8728,48 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await refused.clock.tick();
     expect(refused.routeState.get("music")?.outcome).toMatchObject({ phase: "refused" });
     expect(refused.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  // Round-2 review finding: checkAgain re-polls a request outside sendRouting's own try/finally, which is
+  // the ONLY place that consumed a held edit -- an edit made WHILE a "Check again" poll is running set
+  // held correctly (sendRouting's own in-flight guard fires), but nothing ever re-sent it once checkAgain
+  // settled: the edit was silently and permanently dropped, forever, with no error shown anywhere.
+  test("an edit held while checkAgain's poll is running is still sent once that poll settles (round-2 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    let checkAgainResultReady = false;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-orig" }) };
+        // The GET poll: answers "waiting" (no matching result) until the test flips the flag below,
+        // simulating checkAgain's poll still being genuinely in flight when the held edit is made.
+        const results = checkAgainResultReady ? [{ id: "req-orig", action: "routing-set", ok: false, reason: "still not ready", at: "t" }] : [];
+        const live = { routing: { ...routingDataInit.routing, results }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    // First request: times out (simulated here as "never finds its id", same code path requestOutcome
+    // takes either way) -- stash lastSent directly rather than waiting out a real 30s to reach it, since
+    // the bug is in checkAgain's OWN completion handling, not in how it got a lastSent to retry.
+    h.routeState.get("music")!.lastSent = { id: "req-orig", sentServers: ["100"] };
+    h.run.checkAgain("music");
+    await h.clock.tick(); // checkAgain's poll fires once, sees no matching result yet, loops
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // still in flight -- the held window
+    // An edit arrives while checkAgain's poll is still running.
+    h.run.onRouteChange("music", "200", "on", true);
+    await h.clock.tick(); // the edit's own debounce timer fires -> sendRouting sees inflight -> held=true
+    expect(h.routeState.get("music")?.held).toBe(true);
+    // checkAgain only POLLS the original request (a GET) -- it never POSTs, so nothing has been sent yet.
+    expect(h.posts).toHaveLength(0);
+    // Now let checkAgain's poll actually settle.
+    checkAgainResultReady = true;
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.routeState.get("music")?.held).toBe(false); // consumed, not left dangling
+    expect(h.posts.length).toBeGreaterThanOrEqual(1); // the held edit WAS sent as a follow-up
+    const followUp = JSON.parse(h.posts[h.posts.length - 1]!.body!);
+    expect(followUp.servers["200"]).toBeDefined(); // the server the held edit ticked is actually in it
   });
 
   // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the

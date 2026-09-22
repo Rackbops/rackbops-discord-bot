@@ -1332,7 +1332,17 @@
     st.inflight = { id, sentServers, startedAt };
     st.outcome = null;
     renderRouteStatus(plugin, routingStepEls.get(plugin));
-    awaitRequestResult(plugin, id, sentServers, startedAt);
+    // Round-2 review finding: sendRouting's own held-retry lives in ITS finally block, which this path
+    // never runs through -- an edit made while THIS poll is in flight sets held (sendRouting's own
+    // in-flight guard fires correctly), but nothing ever consumed it once this settled, silently and
+    // permanently dropping that edit. Consumed here, the one other place awaitRequestResult's own outcome
+    // can settle without going through sendRouting.
+    awaitRequestResult(plugin, id, sentServers, startedAt).then(() => {
+      if (st.held) {
+        st.held = false;
+        sendRouting(plugin);
+      }
+    });
   }
   // Decision 6's "Reset to what's saved": a refusal leaves the operator's picks in the controls (nothing
   // is sent), so resetting means dropping the LOCAL selection and redrawing from what's actually on disk.
@@ -1368,6 +1378,13 @@
           if (found || Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) {
             now.inflight = null;
             refreshRoutingSteps();
+            // Same fix as checkAgain, same reason: a routing edit made while a discovery refresh is in
+            // flight sets held (sendRouting sees this loop's own st.inflight and defers), and this is the
+            // only place that settles it -- unconsumed otherwise.
+            if (now.held) {
+              now.held = false;
+              sendRouting(plugin);
+            }
             return;
           }
         }
