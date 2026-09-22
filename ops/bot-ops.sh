@@ -22,6 +22,9 @@
 #   env-set       Read KEY=VALUE lines from stdin, refuse any key outside the whitelist, diff each
 #                 remaining one against the effective value, validate the FORMAT of only the ones
 #                 that change, back up .env, apply those changes, then `up -d --force-recreate`.
+#                 Holds one lock on the config dir for its whole run (#227) — restart and recreate
+#                 hold the same lock, so the three never overlap on one instance; a second mutation
+#                 waits up to BOT_OPS_LOCK_WAIT_SECONDS (default 60), then refuses, writing nothing.
 #   env-schema    Print JSON: each env-get key's validation, plus a plugin's WRITE-ONLY secret keys as
 #                 {secret, isSet} — never a value (#205, #240).
 #   routing-get   Print JSON {routing, discovery}: the bot's per-plugin routing record and what it can
@@ -360,6 +363,22 @@ guard_no_handoff_in_progress() {
   fi
 }
 
+# #227: one exclusive lock per config dir around every mutation of it (env-set's read-modify-write
+# and the recreate that loads it; restart and recreate too, so two `docker compose` mutations of one
+# project never overlap). The lock is on the DIRECTORY's own descriptor, opened read-only — a lock
+# file written by root inside the admin container would be unwritable by the deploy user on the
+# host — and is held until this process exits. Never taken twice in one process (flock is per open
+# file description, so a second descriptor would wait on the first). A bounded wait, then a refusal
+# that has written nothing.
+LOCK_WAIT_SECONDS="${BOT_OPS_LOCK_WAIT_SECONDS:-60}"
+lock_config_dir() {
+  local sub="$1"
+  need flock
+  exec 9<"$CONFIG_DIR" || die "$sub: cannot open $CONFIG_DIR to lock it"
+  flock -w "$LOCK_WAIT_SECONDS" 9 \
+    || die "$sub: another bot-ops.sh mutation is still running on this instance (waited ${LOCK_WAIT_SECONDS}s) — try again"
+}
+
 # One .env definition line: optional indentation, an optional `export ` prefix, the key, `=`, the
 # raw value. Shared by load_env_values (which reads .env) and cmd_env_set's rewrite (which
 # replaces lines in it), so the two can never disagree about which lines define a key.
@@ -609,6 +628,7 @@ cmd_logs() {
 cmd_restart() {
   need docker
   guard_no_handoff_in_progress
+  lock_config_dir restart
   # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
   # different mechanism from the container's own runtime env, which env_file: itself supplies
   # once that interpolation resolves.
@@ -637,6 +657,7 @@ cmd_restart() {
 cmd_recreate() {
   need docker; need jq
   guard_no_handoff_in_progress
+  lock_config_dir recreate
   local rc=0
   recreate_bot || rc=$?
   jq -n --argjson ok "$([ "$rc" -eq 0 ] && echo true || echo false)" --arg log "$RECREATE_LOG" \
@@ -910,6 +931,7 @@ recreate_bot() {
 cmd_env_set() {
   need docker; need jq
   guard_no_handoff_in_progress
+  lock_config_dir env-set
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
   # Every REQUIRED key must also be an ALLOWED one — REQUIRED is a separate, hand-maintained set
@@ -1049,7 +1071,9 @@ cmd_env_set() {
   chown "$target_owner" "$CONFIG_DIR/backups" \
     || echo "bot-ops: warning: couldn't set backups/ ownership to $target_owner" >&2
 
-  local backup="$CONFIG_DIR/backups/.env.bak.$(date +%Y%m%d-%H%M%S)"
+  # #227: the pid suffix means the name can never collide — with the lock two saves can no longer
+  # share a second, but the name is the record of what was replaced and must never depend on timing.
+  local backup="$CONFIG_DIR/backups/.env.bak.$(date +%Y%m%d-%H%M%S)-$$"
   # Pin the backup to 0600 rather than inheriting .env's mode. `cp` would copy that mode, which is
   # only safe while .env is itself owner-only — and a .env recreated by hand or by a fresh deploy
   # picks up the umask (0664 under the usual 002) instead. This file holds DISCORD_TOKEN and
