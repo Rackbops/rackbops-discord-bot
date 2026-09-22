@@ -57,6 +57,24 @@ describe("sweepStaleTestDirs (#252)", () => {
     expect(removedByCallback).toEqual([]);
   });
 
+  test("an entry a concurrent sweep already removed (mtimeOf throws ENOENT) is skipped, not removed again", () => {
+    const name = `${TEST_DATA_PREFIX}12345-abcdef`;
+    const removedByCallback: string[] = [];
+    const removedByReturn = sweepStaleTestDirs({
+      tmp: "/tmp",
+      entries: [name],
+      now: NOW,
+      mtimeOf: () => {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      },
+      isAlive: () => true,
+      maxAgeMs: MAX_AGE_MS,
+      remove: (n) => removedByCallback.push(n),
+    });
+    expect(removedByReturn).toEqual([]);
+    expect(removedByCallback).toEqual([]);
+  });
+
   test("a mix: only the stale ones are removed, the live young one survives", () => {
     const alive = `${TEST_DATA_PREFIX}1-a`;
     const dead = `${TEST_DATA_PREFIX}2-b`;

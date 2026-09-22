@@ -52,8 +52,22 @@ export function sweepStaleTestDirs(opts: {
   for (const entry of opts.entries) {
     if (!entry.startsWith(TEST_DATA_PREFIX)) continue;
     const pid = parsePid(entry);
-    const stale = pid === null || opts.now - opts.mtimeOf(entry) > opts.maxAgeMs || !opts.isAlive(pid);
-    if (stale) {
+    if (pid === null) {
+      opts.remove(entry);
+      removed.push(entry);
+      continue;
+    }
+    // Two sweeps can see the same stale entry in their `readdir` snapshot and race to remove it
+    // (the very concurrent-invocations scenario #252 exists to make safe) — `mtimeOf` reads a path
+    // `remove` may have already deleted, and an injected seam backed by `statSync` throws ENOENT
+    // for a vanished path. That is not staleness, it is nothing left to do.
+    let age: number;
+    try {
+      age = opts.now - opts.mtimeOf(entry);
+    } catch {
+      continue;
+    }
+    if (age > opts.maxAgeMs || !opts.isAlive(pid)) {
       opts.remove(entry);
       removed.push(entry);
     }
