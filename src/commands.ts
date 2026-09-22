@@ -247,6 +247,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
 
         const result: PluginActionResult = planPluginAction(action, {
           name,
+          enabled: stateEntry.enabled,
           installedVersion: stateEntry.installedVersion,
           latestVersion: entry?.version,
           compatible: entry ? entry.hostApiVersion === HOST_API_VERSION : false,

@@ -26,7 +26,8 @@ time, not silently written.
 |---|---|
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
-| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
+| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. **SSH-only since #277**: the admin panel's Restart button calls `recreate` instead. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
+| `recreate` | `up -d --force-recreate` on its own, with no value submitted first — the same recreate `env-set` runs after a save, exposed as its own subcommand (#277) so a recreate a previous `env-set` started but the panel never saw finish (a kill, a 504) can be re-attempted from the panel with one click. `{"ok": bool, "recreated": true, "log": string}`, `log` relayed the same way `restart`'s and `env-set`'s are; exits with compose's status |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every plugin in the cached Plugin Index, whether or not the plugin is in `PLUGINS` (#256) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
 | `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or a plugin's manifest in the cached index, on or off, #256); then one row per plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
@@ -505,7 +506,9 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    leaked token keeps working until that recreate happens.
 
 **What it exposes — `bot-ops.sh`'s operations plus a few read-only or self-contained,
-server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart`, `GET /api/env`,
+server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart` (routed but unused
+by the page since #277 — see below), `POST /api/recreate` (**#277**: what the Overview's Restart
+button actually calls), `GET /api/env`,
 `POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
 they're signed in as, plus the JWT's claims for the panel's Identity view), and
 `GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
@@ -547,7 +550,8 @@ There's no *direct* rebuild/deploy button — that stays Discord's `/update` —
 `BOT_BRANCH` through the mounted docker socket within ~15 minutes. Combined with the read-write
 config-dir mount (the panel reads secrets straight from the mounted `.env` — e.g. `GITHUB_TOKEN` for
 the branch chooser below), **panel access is effectively deploy and root-equivalent access — treat it
-like SSH to the box.** The config form on the
+like SSH to the box.** That includes any plugin admin tab the panel mounts: a bundle runs with the
+panel's own authority, so the Plugin Index is the trust boundary (ADR-0005 decision 6). The config form on the
 page is rendered from whatever `GET /api/env` returns (bar `PLUGINS`, below), so it can never drift from
 this script's own `ALLOWED` whitelist above. **One Apply bar (#257) collects every change that needs a
 restart** — the plugin on/off choices on the Plugins tab and every edited config field — in a bar at the
@@ -570,8 +574,10 @@ unknown), any status the page does not know, and a plain-text 502 with no such l
 after the write, a kill during the recreate, a proxy's own 502, or a refusal before the write that has no
 `env-set` prefix (a failed backup, the self-update guard). A **network error, or the page's own timeout,**
 leaves the controls as they are. After a failed or killed recreate `.env` already holds the new values but
-the running bot may not: the page has re-read, so nothing is pending and Apply is not offered, and Restart
-does not reload the env file (#277 tracks a recreate action). (Where the page kept its edits although the
+the running bot may not: the page has re-read, so nothing is pending and Apply is not offered, but this is
+now recoverable from the panel with one click — since #277 the Overview's Restart button itself recreates
+(`up -d --force-recreate`, the same action Apply's own recreate step runs), so pressing it finishes a
+failed or killed recreate with whatever is currently saved in `.env`. (Where the page kept its edits although the
 write happened, after a network error, a retry is answered "Nothing needed applying.": the saved settings
 already held them.) The raw `PLUGINS` text field is **not** in the Config editor: plugins are chosen on the
 Plugins tab, and two controls for one key would be a conflict with no good answer. Pinning a plugin to a

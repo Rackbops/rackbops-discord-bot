@@ -982,6 +982,20 @@ describe("describeActor / describeAction / parseChangedKeys / auditLogLine", () 
     expect(auditLogLine(okEnvSet, { exitCode: 1, stdout: '{"changed":[]}', stderr: "" }, auth)).toBeNull();
   });
 
+  test("auditLogLine logs a successful recreate with the actor, the timeout line for a killed one, and nothing for a plain failure (#277)", () => {
+    const okRecreate: BotOpsInvocation = { args: ["recreate"], contentType: "application/json" };
+    const auth: Authorization = { via: "jwt", email: "roshne@gmail.com" };
+    expect(auditLogLine(okRecreate, ok('{"ok":true,"recreated":true,"log":""}'), auth)).toBe("[admin] recreate by roshne@gmail.com");
+    const timedOutResult: BotOpsResult = { exitCode: 1, stdout: "", stderr: "", timedOut: true };
+    expect(auditLogLine(okRecreate, timedOutResult, auth)).toBe(
+      "[admin] recreate timed out (killed after running past its limit) — attempted by roshne@gmail.com",
+    );
+    // A non-timeout failed recreate has no "changed" concept (unlike env-set) — nothing to
+    // attribute here; handleRequest's own console.error already names the action, exit code and actor.
+    const failedResult: BotOpsResult = { exitCode: 1, stdout: '{"ok":false,"recreated":true,"log":"no such image"}', stderr: "" };
+    expect(auditLogLine(okRecreate, failedResult, auth)).toBeNull();
+  });
+
   test("auditLogLine attributes a failed env-set recreate when .env was already rewritten (issue #47)", () => {
     const auth: Authorization = { via: "bearer" };
     const result: BotOpsResult = {
@@ -1263,6 +1277,13 @@ describe("buildInvocation", () => {
     expect(buildInvocation("POST", "/api/restart", new URLSearchParams(), noBody)).toEqual({
       args: ["restart"],
       contentType: "text/plain",
+    });
+  });
+
+  test("POST /api/recreate -> recreate, json (#277)", () => {
+    expect(buildInvocation("POST", "/api/recreate", new URLSearchParams(), noBody)).toEqual({
+      args: ["recreate"],
+      contentType: "application/json",
     });
   });
 
@@ -1762,6 +1783,23 @@ describe("handleRequest", () => {
     }
   });
 
+  test("POST /api/recreate: a compose failure's JSON reaches the page as a 502 with that JSON; a timeout is a 504 (#277)", async () => {
+    const stdout = '{"ok":false,"recreated":true,"log":"no such image"}';
+    const failRes = await handleRequest(
+      new Request("http://x/api/recreate", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 1, stdout, stderr: "" }) },
+    );
+    expect(failRes.status).toBe(502);
+    expect(await failRes.text()).toBe(stdout);
+    expect(failRes.headers.get("Content-Type")).toBe("application/json");
+
+    const timeoutRes = await handleRequest(
+      new Request("http://x/api/recreate", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } }),
+      { adminToken: TOKEN, indexHtml: INDEX_HTML, runBotOps: fakeRunBotOps({ exitCode: 1, stdout: "", stderr: "", timedOut: true }) },
+    );
+    expect(timeoutRes.status).toBe(504);
+  });
+
   test("an unrecognised authenticated route is a 404, not silently 200", async () => {
     const res = await handleRequest(
       new Request("http://x/api/nonexistent", { headers: { Authorization: `Bearer ${TOKEN}` } }),
@@ -1986,7 +2024,7 @@ describe("admin panel timeoutSignal (issue #53 item 1/2)", () => {
   });
 });
 
-describe("admin panel doRestart (issue #53 item 2)", () => {
+describe("admin panel doRestart (issue #53 item 2; recreates since #277)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const timeoutSignalSrc = indexSrc.match(/\/\/ TIMEOUT_SIGNAL:begin\n([\s\S]*?)\n\s*\/\/ TIMEOUT_SIGNAL:end/)?.[1];
   const restartSrc = indexSrc.match(/\/\/ RESTART:begin\n([\s\S]*?)\n\s*\/\/ RESTART:end/)?.[1];
@@ -2031,20 +2069,31 @@ describe("admin panel doRestart (issue #53 item 2)", () => {
     expect(page.posts).toEqual([]);
   });
 
-  test("a confirmed restart POSTs with a real AbortSignal, and re-loads status on success", async () => {
-    const page = await runDoRestart();
+  test("the confirm says the bot comes back with the saved settings (#277)", async () => {
+    const page = await runDoRestart({ confirm: false });
+    expect(page.confirms).toEqual(["Restart the bot? It comes back with the saved settings and is offline for about 20 seconds."]);
+  });
+
+  test("a confirmed restart POSTs /api/recreate with a real AbortSignal, shows the sentence, and re-loads status (#277)", async () => {
+    const page = await runDoRestart({ response: { ok: true, text: '{"ok":true,"recreated":true,"log":""}' } });
     expect(page.posts).toHaveLength(1);
     const [post] = page.posts;
-    expect(post?.path).toBe("/api/restart");
+    expect(post?.path).toBe("/api/recreate");
     expect(post?.opts.method).toBe("POST");
     // issue #53 item 2: the POST now carries a real AbortSignal, not none at all.
     expect(post?.opts.signal).toBeInstanceOf(AbortSignal);
     expect(post?.opts.signal?.aborted).toBe(false); // never actually timed out in this test
-    expect(page.msg).toEqual({ textContent: "restarted", className: "msg ok" });
+    // #277: a fixed sentence, never the raw response body.
+    expect(page.msg).toEqual({ textContent: "Restarted. The bot is back with the saved settings.", className: "msg ok" });
     expect(page.statusLoads).toBe(1);
   });
 
-  test("a failed restart surfaces the response text as an error", async () => {
+  test("a JSON failure shows the compose log, never the raw JSON (#277)", async () => {
+    const page = await runDoRestart({ response: { ok: false, text: '{"ok":false,"recreated":true,"log":"no such image"}' } });
+    expect(page.msg).toEqual({ textContent: "Failed: no such image", className: "msg error" });
+  });
+
+  test("a plain-text failure shows the text", async () => {
     const page = await runDoRestart({ response: { ok: false, text: "compose error" } });
     expect(page.msg).toEqual({ textContent: "Failed: compose error", className: "msg error" });
   });
@@ -5682,6 +5731,11 @@ describe("page skeleton", () => {
       expect({ name, begin: indexSrc.split(`// ${name}:begin\n`).length - 1 }).toEqual({ name, begin: 1 });
       expect({ name, end: indexSrc.split(`// ${name}:end\n`).length - 1 }).toEqual({ name, end: 1 });
     }
+  });
+
+  test("the page no longer calls /api/restart (#277)", () => {
+    expect(indexSrc).not.toContain('"/api/restart"');
+    expect(indexSrc.split('"/api/recreate"').length - 1).toBe(1);
   });
 
   // ---- #257: the Apply bar's place in the page ----

@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
@@ -15,6 +15,7 @@ const {
   loadPlugins,
   pluginCommandMap,
   buildCommandBody,
+  autocompleteOptionPaths,
   pluginTicks,
   PLUGIN_TICK_TIMEOUT_MS,
   activatePlugins,
@@ -195,6 +196,79 @@ describe("buildCommandBody", () => {
     }).not.toThrow();
     expect(body.map((c) => c.name)).toEqual(["dmf", "good"]); // boom + nodesc dropped, core + good kept
     expect(calls.filter((l) => l.level === "error")).toHaveLength(2);
+  });
+
+  // #218: a command asking for autocomplete still registers (a live command with a dead picker beats
+  // dropping a working command), but warns once, naming every option path that asked for it.
+  test("a command with an autocomplete option is registered, and the warning names the option", () => {
+    const { log, calls } = makeLog();
+    const withAutocomplete = cmd("search", (b) =>
+      b.setDescription("d").addStringOption((o) => o.setName("q").setDescription("d").setAutocomplete(true)),
+    );
+    const map = pluginCommandMap([loaded(entry(), { commands: [withAutocomplete] })], [], log);
+    const body = buildCommandBody("", coreJson, map, log);
+    expect(body.map((c) => c.name)).toEqual(["dmf", "search"]);
+    const warn = calls.find((l) => l.level === "warn" && l.message.includes("autocomplete"));
+    expect(warn?.message).toContain('"q"');
+  });
+
+  test("an autocomplete option inside a subcommand group is named by its path", () => {
+    const { log, calls } = makeLog();
+    const withGroup = cmd("browse", (b) =>
+      b
+        .setDescription("d")
+        .addSubcommandGroup((g) =>
+          g
+            .setName("g")
+            .setDescription("d")
+            .addSubcommand((s) =>
+              s
+                .setName("s")
+                .setDescription("d")
+                .addStringOption((o) => o.setName("q").setDescription("d").setAutocomplete(true)),
+            ),
+        ),
+    );
+    const map = pluginCommandMap([loaded(entry(), { commands: [withGroup] })], [], log);
+    buildCommandBody("", coreJson, map, log);
+    const warn = calls.find((l) => l.level === "warn" && l.message.includes("autocomplete"));
+    expect(warn?.message).toContain('"g s q"');
+  });
+
+  test("a command without autocomplete options warns nothing", () => {
+    const { log, calls } = makeLog();
+    const map = pluginCommandMap([loaded(entry(), { commands: [cmd("plain")] })], [], log);
+    buildCommandBody("", coreJson, map, log);
+    expect(calls.some((l) => l.message.includes("autocomplete"))).toBe(false);
+  });
+
+  test("autocompleteOptionPaths: no options is [], a non-array options is [], nesting is walked", () => {
+    expect(autocompleteOptionPaths({ name: "x", description: "d", type: 1 } as never)).toEqual([]);
+    expect(autocompleteOptionPaths({ name: "x", description: "d", type: 1, options: "nope" } as never)).toEqual([]);
+    const nested = {
+      name: "x",
+      description: "d",
+      type: 1,
+      options: [
+        {
+          name: "g",
+          description: "d",
+          type: 2,
+          options: [
+            {
+              name: "s",
+              description: "d",
+              type: 1,
+              options: [
+                { name: "q", description: "d", type: 3, autocomplete: true },
+                { name: "r", description: "d", type: 3, autocomplete: false },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(autocompleteOptionPaths(nested as never)).toEqual(["g s q"]);
   });
 });
 
@@ -799,6 +873,148 @@ describe("buildPluginStateFile", () => {
     expect(state.plugins[0]?.targetVersion).toBeUndefined(); // consumed either way — no retry loop
     expect(state.plugins[0]?.error).toContain("integrity mismatch");
   });
+
+  // #225: a plugin taken out of PLUGINS= no longer loses its state.json entry.
+  test("a plugin taken out of PLUGINS keeps its entry as enabled: false, with its pin and its bookkeeping", () => {
+    const prevOff: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [
+        {
+          name: "p",
+          enabled: true,
+          installedVersion: "1.0.0",
+          configured: false,
+          missingEnv: ["P_REQ"],
+          active: true,
+          notifiedVersion: "0.9.0",
+          skippedVersion: "0.8.0",
+          remindAt: "2026-09-10T00:00:00.000Z",
+          scheduled: { version: "1.1.0", at: "2026-09-11T00:00:00.000Z", requestedBy: "u1" },
+        },
+      ],
+    };
+    const state = buildPluginStateFile({
+      selected: [],
+      installed: [],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [],
+      loadErrors: {},
+      processEnv: {},
+      previous: prevOff,
+      now: new Date("2026-09-04T00:00:00.000Z"),
+    });
+    expect(state.plugins).toHaveLength(1);
+    expect(state.plugins[0]).toEqual({
+      name: "p",
+      enabled: false,
+      active: false,
+      configured: false,
+      missingEnv: ["P_REQ"],
+      installedVersion: "1.0.0",
+      notifiedVersion: "0.9.0",
+      skippedVersion: "0.8.0",
+      remindAt: "2026-09-10T00:00:00.000Z",
+      scheduled: { version: "1.1.0", at: "2026-09-11T00:00:00.000Z", requestedBy: "u1" },
+    });
+  });
+
+  test("an off entry drops what only a boot can know: targetVersion, availableVersion and error", () => {
+    const prevWithTransients: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [
+        {
+          name: "p",
+          enabled: true,
+          installedVersion: "1.0.0",
+          targetVersion: "1.1.0",
+          availableVersion: "1.1.0",
+          error: "boom",
+          configured: true,
+          missingEnv: [],
+          active: true,
+        },
+      ],
+    };
+    const state = buildPluginStateFile({
+      selected: [],
+      installed: [],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [],
+      loadErrors: {},
+      processEnv: {},
+      previous: prevWithTransients,
+      now: new Date("2026-09-04T00:00:00.000Z"),
+    });
+    expect(state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(state.plugins[0]?.availableVersion).toBeUndefined();
+    expect(state.plugins[0]?.error).toBeUndefined();
+    expect(state.plugins[0]?.installedVersion).toBe("1.0.0");
+  });
+
+  test("off entries follow the selected ones in the previous file's order, and a plugin in both is written once, as selected", () => {
+    const mkPrev = (name: string) => ({ name, enabled: false, configured: true, missingEnv: [], active: false, installedVersion: "1.0.0" });
+    const prevThree: PluginStateFile = { hostApiVersion: 1, writtenAt: "", plugins: [mkPrev("a"), mkPrev("b"), mkPrev("c")] };
+    const eB = entry({ name: "b", version: "1.0.0" });
+    const state = buildPluginStateFile({
+      selected: [{ name: "b", entry: eB }],
+      installed: [{ entry: eB, version: "1.0.0", bundlePath: "/a" }],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [loaded(eB, { commands: [] }, true)],
+      loadErrors: {},
+      processEnv: {},
+      previous: prevThree,
+      now: new Date("2026-09-04T00:00:00.000Z"),
+    });
+    expect(state.plugins.map((p) => p.name)).toEqual(["b", "a", "c"]);
+    expect(state.plugins).toHaveLength(3);
+    expect(state.plugins[0]?.enabled).toBe(true);
+  });
+
+  test("an entry that was already off is carried again unchanged", () => {
+    const alreadyOff = { name: "p", enabled: false, installedVersion: "1.0.0", configured: true, missingEnv: [], active: false, skippedVersion: "0.8.0" };
+    const prevOff: PluginStateFile = { hostApiVersion: 1, writtenAt: "", plugins: [alreadyOff] };
+    const state = buildPluginStateFile({
+      selected: [],
+      installed: [],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [],
+      loadErrors: {},
+      processEnv: {},
+      previous: prevOff,
+      now: new Date("2026-09-04T00:00:00.000Z"),
+    });
+    expect(state.plugins).toEqual([alreadyOff]);
+  });
+
+  test("a duplicated name in a corrupt previous file is carried once", () => {
+    const prevDup: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [
+        { name: "p", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: false },
+        { name: "p", enabled: true, installedVersion: "2.0.0", configured: true, missingEnv: [], active: false },
+      ],
+    };
+    const state = buildPluginStateFile({
+      selected: [],
+      installed: [],
+      installSkips: {},
+      fallbacks: {},
+      loaded: [],
+      loadErrors: {},
+      processEnv: {},
+      previous: prevDup,
+      now: new Date("2026-09-04T00:00:00.000Z"),
+    });
+    expect(state.plugins).toHaveLength(1);
+    expect(state.plugins[0]?.installedVersion).toBe("1.0.0");
+  });
 });
 
 describe("readPluginState / writePluginState round-trip", () => {
@@ -990,6 +1206,85 @@ describe("readPluginState / writePluginState round-trip", () => {
         }
         expect(kept).toBeGreaterThan(0); // the grid is not vacuous in either direction
         expect(skipped).toBeGreaterThan(0);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // #225's actual scenario, through real files: a plugin turned off for one boot and back on must
+    // come back on its PIN (1.1.0), never the newer cached 1.2.0 a hand-lowered pin moved away from —
+    // the same silent-upgrade guard #104's update-fallback already has, extended to the off/on cycle.
+    // The trap half documents the pre-#225 rule with a hand-written state.json, not by mutating the
+    // code, so this test keeps working as its own regression guard even after the fix is old news.
+    test("a plugin turned off for a boot and on again comes back on its pinned version, not the newest cached one (#225)", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        // two cached version dirs: 1.2.0 is newer on disk, 1.1.0 is the operator's actual pin.
+        mkdirSync(join(dir, "plugins", "p", "1.1.0", "dist"), { recursive: true });
+        writeFileSync(join(dir, "plugins", "p", "1.1.0", "dist", "plugin.js"), "v1.1.0");
+        mkdirSync(join(dir, "plugins", "p", "1.2.0", "dist"), { recursive: true });
+        writeFileSync(join(dir, "plugins", "p", "1.2.0", "dist", "plugin.js"), "v1.2.0");
+
+        const pinsAsIndexTsDoes = (state: PluginStateFile) =>
+          Object.fromEntries(state.plugins.map((p) => [p.name, { installedVersion: p.installedVersion, targetVersion: p.targetVersion }]));
+
+        const e110 = entry({ name: "p", version: "1.1.0" });
+        // Boot 1: p selected, comes up on 1.1.0.
+        await writePluginState({
+          dataDir: dir,
+          storage: realStorage,
+          selected: [{ name: "p", entry: e110 }],
+          installed: [{ entry: e110, version: "1.1.0", bundlePath: "/a" }],
+          installSkips: {},
+          fallbacks: {},
+          loaded: [loaded(e110, { commands: [] }, true)],
+          loadErrors: {},
+          processEnv: {},
+          previous: await readPluginState(dir, realStorage),
+          now: () => new Date("2026-09-01T00:00:00.000Z"),
+        });
+
+        // Boot 2: p taken out of PLUGINS= — nothing selected.
+        await writePluginState({
+          dataDir: dir,
+          storage: realStorage,
+          selected: [],
+          installed: [],
+          installSkips: {},
+          fallbacks: {},
+          loaded: [],
+          loadErrors: {},
+          processEnv: {},
+          previous: await readPluginState(dir, realStorage),
+          now: () => new Date("2026-09-02T00:00:00.000Z"),
+        });
+        const boot2State = await readPluginState(dir, realStorage);
+        expect(boot2State.plugins[0]).toMatchObject({ name: "p", enabled: false, installedVersion: "1.1.0" });
+
+        // Boot 3: p turned back on — pins built exactly as index.ts:137-139 does.
+        const throwingFetch = async (): Promise<Response> => {
+          throw new Error("must not fetch — the pinned version is already cached");
+        };
+        const result = await installPlugins([{ name: "p", entry: e110 }], dir, pinsAsIndexTsDoes(boot2State), {
+          fetch: throwingFetch,
+          extract: async () => {},
+          now: () => 0,
+          log: makeLog().log,
+        });
+        expect(result.installed[0]?.version).toBe("1.1.0");
+        expect(result.skips).toEqual({});
+
+        // The pre-#225 trap: boot 2's state.json had NO entry for p at all (hand-written here, not by
+        // mutating buildPluginStateFile, so this documents the trap independently of the fix above).
+        await writeJsonAtomic(join(dir, "plugins", "state.json"), { hostApiVersion: 1, writtenAt: "old", plugins: [] });
+        const oldRuleState = await readPluginState(dir, realStorage);
+        const trapResult = await installPlugins([{ name: "p", entry: e110 }], dir, pinsAsIndexTsDoes(oldRuleState), {
+          fetch: throwingFetch,
+          extract: async () => {},
+          now: () => 0,
+          log: makeLog().log,
+        });
+        expect(trapResult.installed[0]?.version).toBe("1.2.0"); // newestCachedVersion — the trap
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
