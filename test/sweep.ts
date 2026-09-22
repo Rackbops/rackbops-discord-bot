@@ -64,7 +64,11 @@ export function sweepStaleTestDirs(opts: {
     let age: number;
     try {
       age = opts.now - opts.mtimeOf(entry);
-    } catch {
+    } catch (err) {
+      // Narrowed to ENOENT specifically, matching `isPidAlive`'s error-code check below — any
+      // other error (EACCES, ENOTDIR, ...) is a real problem, not "already gone," and should
+      // surface loudly rather than be swallowed as if a sibling sweep had won the race.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       continue;
     }
     if (age > opts.maxAgeMs || !opts.isAlive(pid)) {

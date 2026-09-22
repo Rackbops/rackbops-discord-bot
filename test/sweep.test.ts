@@ -75,6 +75,25 @@ describe("sweepStaleTestDirs (#252)", () => {
     expect(removedByCallback).toEqual([]);
   });
 
+  test("a non-ENOENT error from mtimeOf is a real problem and propagates, not swallowed as 'already gone'", () => {
+    const name = `${TEST_DATA_PREFIX}12345-abcdef`;
+    expect(() =>
+      sweepStaleTestDirs({
+        tmp: "/tmp",
+        entries: [name],
+        now: NOW,
+        mtimeOf: () => {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        },
+        isAlive: () => true,
+        maxAgeMs: MAX_AGE_MS,
+        remove: () => {
+          throw new Error("should not be reached");
+        },
+      }),
+    ).toThrow("permission denied");
+  });
+
   test("a mix: only the stale ones are removed, the live young one survives", () => {
     const alive = `${TEST_DATA_PREFIX}1-a`;
     const dead = `${TEST_DATA_PREFIX}2-b`;
