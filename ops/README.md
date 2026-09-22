@@ -151,11 +151,15 @@ third argument only if you need to force-install that branch's `bot-ops.sh` into
 current" above, issue #230).
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
-a re-run — fill in secrets there by hand). It always refreshes three things that are deployment
+a re-run — fill in secrets there by hand). It refreshes three things that are deployment
 artifacts, not instance config — `/opt/rackbops-discord-bot/bin/bot-ops.sh` (shared across every
-instance on the host), `/opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml` (Dockge
+instance on the host: refreshed unconditionally from `main`, or from another branch only when that
+branch's own copy is byte-identical to `main`'s, else `install.sh` refuses and names `--force-bin`
+— see "Keeping `bot-ops.sh` and `docker-compose.yml` current" above, issue #230),
+`/opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml` (Dockge
 lists it as a managed stack because it lives under `/opt/stacks/`, the one path Dockge actually
-scans), and `/opt/stacks/rackbops-discord-bot-<instance>/.env` — a **compose-project** env file,
+scans, and — like the stack `.env` below — is always refreshed), and
+`/opt/stacks/rackbops-discord-bot-<instance>/.env` — a **compose-project** env file,
 distinct from the bot's own `.env` above and holding no secrets, that Compose loads automatically
 for `${VAR}` interpolation. It carries this instance's real `BOT_ENV_FILE`/`BOT_OPS_CONTAINER`/
 `BOT_OPS_PROJECT`/`BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`/`BOT_BUILD_CONTEXT`/`GIT_SHA`, so

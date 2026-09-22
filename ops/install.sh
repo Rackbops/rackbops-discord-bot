@@ -169,7 +169,7 @@ install_shared_bin() {
     elif [ "$FORCE_BIN" -eq 1 ]; then
       note=" (--force-bin: differs from main's, schema $(schema_of "$main_copy"))"
     else
-      die "$dest is shared by every instance on this host, and '$BRANCH' ships a different bot-ops.sh from main (schema $(schema_of "$fetched") vs main's $(schema_of "$main_copy")) — a per-instance branch must not replace it silently. Re-run with main, or add --force-bin to install '$BRANCH''s copy for every instance."
+      die "$dest is shared by every instance on this host, and '$BRANCH' ships a different bot-ops.sh from main (schema $(schema_of "$fetched") vs main's $(schema_of "$main_copy")) — a per-instance branch must not replace it silently. Re-run with main, or add --force-bin to install the '$BRANCH' branch's copy for every instance."
     fi
   fi
   mv "$fetched" "$dest"
