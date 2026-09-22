@@ -215,4 +215,57 @@ Read against `claude/apply-bar-rereading` @ `3e467e2` (#275, its PR not yet open
 
 ## Deviations from the plan
 
-(none yet)
+Recorded by the implementer. None widens or narrows what the plan decided; each is a wording, an
+implementation-detail choice the plan left open, or a claim that could not be known until the code was
+written.
+
+1. **`applyPending` was edited, despite the patch's "do NOT edit applyPending, discardPending or
+   rereadFromServer."** Read narrowly: that sentence is about the re-read mechanics specifically ("they
+   already `await rereadFromServer()` exactly where the plan expected..."), which is untouched — every
+   re-read call site is byte-identical to what #275 shipped. Step 2 of the plan separately requires
+   `applyPending` to validate secret changes ("`applyPending` runs it over the non-secret changes and
+   `validateSecretChanges` over the secret ones"), which has nothing to do with the re-read wiring; that
+   one addition was made. If this reading is wrong, it is the first thing round 1 of the gate should
+   flag — the alternative (folding secret validation into `planApply`'s existing `error` field instead)
+   is a small, mechanical change if the orchestrator prefers a true zero-edit reading.
+2. **`refuseApply` was widened**, for the same reason as (1): a plugin-owned key's refusal must route to
+   the Plugins tab and find the card's own control, which the old `env-<KEY>`-only lookup can't do.
+   `loadedSchema[key].source === "plugin"` decides the tab; `s.secret` decides `secret-<KEY>` vs.
+   `set-<KEY>`.
+3. **Card control id scheme:** a plain setting gets `id="set-<KEY>"` (the mock's own example); a secret's
+   password input gets `id="secret-<KEY>"` (the mock's secret markup carries no id — chosen so
+   `refuseApply` and the Replace button can focus it).
+4. **`refreshCardHeaders` is a new function, not named in the plan**, that recomputes every card's
+   badge/summary in place on every bar-refresh event (a keystroke, a tick, a POST outcome) without a
+   full re-render. It exists because Step 4 caps `collectPending`'s selector allowlist at exactly four
+   (`"whose selector allow-list grows from two to four"`) — a fifth selector for card headers would
+   contradict that. Instead, `buildPluginCard` registers each card's badge/summary elements in a
+   module-level `cardHeaderEls` map at render time; `refreshCardHeaders` (called from `refreshApplyBar`,
+   which every existing call site — including the three frozen functions — already calls) only ever
+   reads that map, so it is a no-op before the first render and needs no new selector for the harness
+   to allow.
+5. **Opening/closing a card, or pressing Replace / Keep the saved value on a secret, re-renders the
+   WHOLE plugin list** (`renderPlugins()`) rather than patching one card's DOM — the simplest way to
+   reuse one render path. Since that would otherwise drop whatever the user is mid-typing in every OTHER
+   open card, each of those three actions runs the exact same `diffEdits` / `captureCardControls` /
+   `reapplyCardEdits` sequence `reloadConfig` uses for a background reload, synchronously (no fetch
+   involved) — not spelled out in the plan, but required so opening one card can't silently discard a
+   setting being typed in another. Each also refocuses the (new) element the action was on, since
+   re-rendering discards whichever DOM node originally had focus.
+6. **`versionLine`'s wording is composed, not quoted.** The plan gives one example ("Version 1.3.0 · up
+   to date"); the not-installed / enabled-not-installed / update-available cases are my own text, close
+   to `buildPluginRow`'s old wording ("Version X" without the "up to date" suffix once the header badge
+   already says an update exists, so the two don't repeat the same fact).
+7. **The admin bundle mounts inside the SAME "Fill in its settings" step**, not a separate numbered one.
+   The plan lists it as a bullet under Step 3 without its own step title/hint text, and it is
+   conceptually part of "this plugin's settings" either way.
+8. **The card's badge element keeps the existing `plugin-badge` class** (the AA-contrast override
+   `.plugin-badge { color: var(--rb-text); ... }` already carries) alongside `rb-badge` and the
+   `BADGE_MODIFIERS` tint — the mock's literal markup shows only `rb-badge rb-badge--success`. Dropping
+   `plugin-badge` would regress the same contrast fix #102 shipped for the old row badges.
+9. **The Plugins tab's intro paragraph was reworded** (not itemized in the plan): the old text described
+   a per-section Save-button flow the cards replace.
+10. **Test coverage beyond the plan's Step 4 list:** `pluginCardState`'s "pending outranks an error" (the
+    plan names this case in the pending-vs-error ordering but not as its own test) and a "a call while
+    one is already in flight joins it" test for `reloadConfig`'s shared-promise dedupe (implied by "one
+    in-flight fetch is shared" but not listed as a named test).
