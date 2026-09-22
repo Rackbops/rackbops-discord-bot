@@ -145,7 +145,10 @@ connector-status readout instead of a bare port number.
   validation, then a recreate). It renders as its own tab, but it isn't a separate door.
 
 An admin can also choose which servers get a plugin's commands, and where it posts on its own, right from
-the admin panel — a change here takes effect immediately, with no restart.
+the admin panel — a change here takes effect immediately, with no restart. The panel's **Servers** tab
+shows every server the bot is in, what's registered there, and its webhooks (add or remove one by pasting
+its Discord URL); **Overview** surfaces anything worth attention — a missing setting, a refused or
+unregistered server, a broken webhook — in one list.
 
 The plugin side of shipping one — how to build `dist/admin.js` and what the bridge API offers — is
 the [`rackbops-bot-plugins` authoring guide](https://github.com/Rackbops/rackbops-bot-plugins#admin-tab-optional).
