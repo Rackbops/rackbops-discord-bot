@@ -155,27 +155,43 @@ error plus retained composite outline; and keyboard reachability.
   page's documented 22 lifted test-block markers: the existing Apply and route harnesses execute the
   helper source immediately before their marked blocks.
 - **Acceptance (private `TEMP`/`TMP`, serial):** `bun run --cwd=ops/admin check` exited 0 with
-  `$ bunx tsc --noEmit`. `bun test ops/admin/server.test.ts --timeout 20000` exited 0 with
-  `772 pass`, `5 skip`, `0 fail`, `3339 expect() calls`, `Ran 777 tests across 1 file`.
+  `$ bunx tsc --noEmit`. The final clean `bun test ops/admin/server.test.ts --timeout 20000`
+  exited 0 with `775 pass`, `5 skip`, `0 fail`, `3389 expect() calls`, and
+  `Ran 780 tests across 1 file`.
   `git grep -n "field-hint" -- ops/admin` and
   `git grep -n 'adm \[aria-invalid="true"\]' -- ops/admin/public/admin.css` both printed nothing
   (the expected git-grep exit 1 for no matches).
-- **Mutation matrix:** 19 one-at-a-time mutants in detached worktree
-  `bot-300-form-states-mutations`; every final mutant was killed. They covered a restored legacy hint,
+- **Mutation matrix:** 48 one-at-a-time mutants in detached worktree
+  `bot-300-form-states-mutations`; every final mutant was killed, and each run executed the full
+  focused test file. The first 19 covered a restored legacy hint,
   a control help misclassified as `adm-note`, string-only and exposed required markers, missing native
   `required` on plain/secret/Config/tag controls, overwritten help descriptions, a missing inline
   error, stale error cleanup, route help-token loss, removed route/tag composite rules, restored broad
   invalid CSS, and missing Config/plain/secret help description tokens. The Config help-token mutant
   initially survived; three builder assertions were added, after which that mutant and the equivalent
   plain-plugin and secret mutants all failed. The strengthened clean baseline then returned the
-  acceptance result above.
-- **Real Chrome, canned current-main data:** both `arcane-obsidian` and `arcane-parchment` rendered the
+  acceptance result above. After round 1, 29 further mutants covered all 18 panel-note
+  classifications, both saved/visible secret-label branches, the multiline plan-error key and inline
+  refusal, live required-marker append, and all three route invalid/error DOM writes; all 29 were
+  killed with `Ran 780 tests across 1 file` in every run.
+- **Review gate round 1:** both independent reviewers returned NOT SOUND. Reproduced findings were:
+  multiline `plan.error` could bypass the adjacent inline refusal; the saved-secret branch left an
+  orphaned label; the non-field-note, marker-append and three route invalid/error writes did not all
+  have line-level mutation guards. The implementation and consumer tests were corrected, then the
+  final baseline and 29-mutant follow-up above were run against the complete state. The claims
+  reviewer's screenshot-artifact concern is disclosed below rather than papered over.
+- **Real Chrome, canned current-main data:** the complete pre-review pass in both `arcane-obsidian`
+  and `arcane-parchment` rendered the
   blank required Config refusal with native `required`, focused invalid control, adjacent
   `rb-field__error` (no competing live role), and both help/error ids in `aria-describedby`; typing
   removed only the error node/token. The plugin's required plain and visible secret controls exposed
   the shared marker, native `required`, and shared help token. Chosen-with-no-channels routing exposed
   shared help/error tokens plus the retained `1px solid` composite outline. Keyboard traversal reached
   Config, plugin switch, routing checkbox/radio, plain setting, visible secret and Apply controls.
+  After the round-1 behavior fixes, the dark Config multiline/required refusal was re-run and again
+  showed native `required`, focus, invalid state, both description tokens and an adjacent shared error
+  with no live role. The later fixes did not change the already-verified light-theme CSS or route
+  behavior; the saved-secret label branch is additionally executed in the final browser-DOM test.
   Dark and light screenshots were captured inline by the Chrome automation surface. Environment gap:
   that surface exposes screenshot bytes/display but no documented local-file save API, so no local
   screenshot path could be produced without leaving the required computer-use surface.
