@@ -5806,21 +5806,24 @@ describe("tabs (lifted from index.html)", () => {
   test("a known hash opens its tab", () => {
     expect(tabFromHash("#overview")).toBe("overview");
     expect(tabFromHash("#plugins")).toBe("plugins");
+    expect(tabFromHash("#servers")).toBe("servers");
     expect(tabFromHash("#settings")).toBe("settings");
     expect(tabFromHash("plugins")).toBe("plugins"); // location.hash always has the '#', but the parse shouldn't need it
   });
 
   test("arrow keys wrap in both directions", () => {
     expect(nextTabId("overview", "ArrowRight")).toBe("plugins");
-    expect(nextTabId("plugins", "ArrowRight")).toBe("settings");
+    expect(nextTabId("plugins", "ArrowRight")).toBe("servers");
+    expect(nextTabId("servers", "ArrowRight")).toBe("settings");
     expect(nextTabId("settings", "ArrowRight")).toBe("overview");
-    expect(nextTabId("settings", "ArrowLeft")).toBe("plugins");
+    expect(nextTabId("settings", "ArrowLeft")).toBe("servers");
+    expect(nextTabId("servers", "ArrowLeft")).toBe("plugins");
     expect(nextTabId("plugins", "ArrowLeft")).toBe("overview");
     expect(nextTabId("overview", "ArrowLeft")).toBe("settings");
   });
 
   test("Home and End jump to the ends", () => {
-    for (const from of ["overview", "plugins", "settings"]) {
+    for (const from of ["overview", "plugins", "servers", "settings"]) {
       expect(nextTabId(from, "Home")).toBe("overview");
       expect(nextTabId(from, "End")).toBe("settings");
     }
@@ -5851,8 +5854,8 @@ describe("page skeleton", () => {
   const panels = [...markup.matchAll(/<div\b[^>]*\brole="tabpanel"[^>]*>/g)].map((m) => attrs(m[0]));
 
   test("every tab controls an existing tabpanel", () => {
-    expect(tabs.length).toBe(3);
-    expect(panels.length).toBe(3);
+    expect(tabs.length).toBe(4);
+    expect(panels.length).toBe(4);
     for (const tab of tabs) {
       const panel = panels.find((p) => p.id === tab["aria-controls"]);
       expect({ tab: tab.id, panel: panel?.id }).toEqual({ tab: tab.id, panel: tab["aria-controls"] });
@@ -5881,20 +5884,24 @@ describe("page skeleton", () => {
   test("every original section id still exists exactly once, inside a tabpanel", () => {
     const inPanels = panelOfIds();
     // #244: plugin-admin-section is gone -- a plugin's own bundle mounts inside its card now.
-    for (const id of ["status-section", "plugins-section", "admins-section", "identity-section"]) {
+    // #246: attention-section and servers-section are new sections, pinned separately below.
+    for (const id of ["status-section", "plugins-section", "admins-section", "identity-section", "attention-section", "servers-section"]) {
       expect({ id, total: markup.split(`id="${id}"`).length - 1 }).toEqual({ id, total: 1 });
       expect({ id, inPanel: Boolean(inPanels.get(id)) }).toEqual({ id, inPanel: true });
     }
   });
 
   test("each section sits under the tab the issue names", () => {
-    // Overview: status, restart, logs. Plugins: the plugin list and plugin settings. Settings:
-    // config, admins, identity. (Logs and Config had no id before #238; they got one so this can say so.)
+    // Overview: needs-attention, status, restart, logs. Plugins: the plugin list and plugin settings.
+    // Servers: the Servers tab (#246). Settings: config, admins, identity. (Logs and Config had no id
+    // before #238; they got one so this can say so.)
     const inPanels = panelOfIds();
     const expected: Record<string, string> = {
+      "attention-section": "panel-overview",
       "status-section": "panel-overview",
       "logs-section": "panel-overview",
       "plugins-section": "panel-plugins",
+      "servers-section": "panel-servers",
       "config-section": "panel-settings",
       "admins-section": "panel-settings",
       "identity-section": "panel-settings",
@@ -5921,12 +5928,12 @@ describe("page skeleton", () => {
     expect(markup.split('class="rb-wordmark__spark" aria-hidden="true"').length - 1).toBe(sparks);
   });
 
-  test("the page has exactly one tablist, holding the three tabs, and the script's lookup of it matches", () => {
+  test("the page has exactly one tablist, holding the four tabs, and the script's lookup of it matches", () => {
     expect(markup.split('role="tablist"').length - 1).toBe(1);
     const list = markup.slice(markup.indexOf('role="tablist"'));
     const listEnd = list.indexOf("</nav>");
     const inside = [...list.slice(0, listEnd).matchAll(/\brole="tab"/g)].length;
-    expect(inside).toBe(3);
+    expect(inside).toBe(4);
     expect(indexSrc).toContain(`document.querySelector('[role="tablist"]')`);
   });
 
@@ -5970,9 +5977,11 @@ describe("page skeleton", () => {
       ['<div id="env-fields" class="adm-fields">', 1],
       ['class="banner-warn rb-alert rb-alert--danger"', 1],
       ['class="rb-tabstrip" role="tablist"', 1],
-      ['class="rb-tabpanel adm-panel"', 3],
-      ['class="rb-card"', 6], // six sections (#244: plugin-admin-section is gone -- a plugin's bundle mounts in its card)
-      ['class="rb-tabstrip__tab', 3], // the three tab buttons
+      ['class="rb-tabpanel adm-panel"', 4], // #246: a fourth panel, Servers
+      ['class="rb-card"', 7], // #244: plugin-admin-section is gone; #246 adds attention-section (servers-section carries "rb-card servers", a different fragment)
+      ['class="rb-tabstrip__tab', 4], // #246: the four tab buttons
+      ['class="rb-card servers"', 1], // #246: the Servers tab's own static section
+      ['id="tab-servers" aria-controls="panel-servers"', 1], // #246
       ['<main id="app" class="adm" hidden>', 1],
       ['class="adm-gate"', 1],
       ['class="rb-wordmark"', 2], // the gate's h1 and the app's
@@ -5990,8 +5999,8 @@ describe("page skeleton", () => {
       ['skip.className = "rb-btn rb-btn--sm";', 1],
       ['cancel.className = "rb-btn rb-btn--danger rb-btn--sm";', 1],
       ['add.className = "tag-add rb-input";', 1], // the chip editor's typing field
-      ['label.className = "rb-label";', 4], // a config field's label, plus #244's three card-field builders (stub, plain, secret)
-      ['control.className = "rb-select";', 2], // an enum select and the branch chooser
+      ['label.className = "rb-label";', 5], // a config field's label, #244's three card-field builders (stub, plain, secret), #246's Add-a-webhook label
+      ['control.className = "rb-select";', 3], // an enum select, the branch chooser, #246's server/channel picker
       ['control.className = "rb-input";', 1], // a plain config field
       ['notice.className = "field-hint field-hint--danger";', 1],
       ['row.className = "admin-row";', 1],
@@ -6015,6 +6024,11 @@ describe("page skeleton", () => {
       ['fieldset.className = "route__channels";', 1],
       ['postSelect.className = "rb-select";', 1],
       ['badge.className = "rb-badge rb-badge--success";', 1], // the Live badge
+      // #246: the Servers tab and Needs-attention list.
+      ['card.className = "rb-card server";', 1],
+      ['card.className = "rb-card server route__row--off";', 1], // a server routing/webhooks still names but discovery does not
+      ['wrap.className = "server__add";', 1],
+      ['row.className = "attention__item";', 1],
     ];
     for (const [fragment, count] of expected) {
       expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
@@ -6033,9 +6047,9 @@ describe("page skeleton", () => {
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
-      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING",
+      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
     ];
-    expect(names.length).toBe(22);
+    expect(names.length).toBe(23);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -6084,8 +6098,9 @@ describe("page skeleton", () => {
     for (const gone of ["save-plugins", "save-env", "plugins-msg", "env-msg", "savePlugins", "saveEnv"]) {
       expect({ gone, found: indexSrc.includes(gone) }).toEqual({ gone, found: false });
     }
-    // The confirm() dialogs that stay: removing an admin, an update action, Restart. None is in the bar.
-    expect((indexSrc.match(/\bconfirm\(/g) ?? []).length).toBe(3);
+    // The confirm() dialogs that stay: removing an admin, an update action, Restart, #246's webhook
+    // Remove. None is in the bar.
+    expect((indexSrc.match(/\bconfirm\(/g) ?? []).length).toBe(4);
     expect(applyBlock("APPLY")).not.toContain("confirm(");
     expect(applyBlock("APPLY_PLAN")).not.toContain("confirm(");
   });
@@ -6451,11 +6466,14 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     };
     const src = applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
     const refreshApplyBar = () => {};
+    // #246: reloadConfig calls renderNeedsAttention() after renderEnvFields(); browser-only, out of this
+    // stub page's scope (same reasoning as loadBranches/renderPlugins/renderEnvFields themselves).
+    const renderNeedsAttention = () => {};
     const { reloadConfig, setRereading } = new Function(
-      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema",
+      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderNeedsAttention",
       `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
         "return { reloadConfig, setRereading: (v) => { applyRereading = v; } };",
-    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}) as {
+    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderNeedsAttention) as {
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
       setRereading: (v: boolean) => void;
     };
@@ -8288,7 +8306,7 @@ describe("syncTagValue (#257)", () => {
 
 // The DOM half of the tabs (showTab + the click / keydown / hashchange wiring), lifted from index.html
 // between TABS_DOM markers together with the pure TABS block, and run against a hand-made page:
-// three tab buttons, three panels, and spies for history.replaceState and the listeners.
+// four tab buttons, four panels (#246 adds Servers), and spies for history.replaceState and the listeners.
 describe("tabs DOM wiring (lifted from index.html)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const tabsSrc = indexSrc.match(/\/\/ TABS:begin\n([\s\S]*?)\n\s*\/\/ TABS:end/)?.[1];
@@ -8313,7 +8331,7 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
   type KeyEvent = { key: string; altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; target: Tab; prevented: boolean; preventDefault(): void };
 
   function page(hash = "") {
-    const ids = ["overview", "plugins", "settings"];
+    const ids = ["overview", "plugins", "servers", "settings"];
     const tabs: Tab[] = ids.map((id) => {
       const el: Tab = {
         id: `tab-${id}`,
@@ -8391,10 +8409,10 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
   test("showTab opens exactly one tab and one panel, and writes the hash with replaceState", () => {
     const p = page();
     p.api.showTab("plugins", false);
-    expect(p.tabs.map((t) => t.attrs["aria-selected"])).toEqual(["false", "true", "false"]);
-    expect(p.tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1]); // roving tabindex
-    expect(p.tabs.map((t) => t.classes.has("rb-tabstrip__tab--active"))).toEqual([false, true, false]);
-    expect(p.panels.map((x) => x.hidden)).toEqual([true, false, true]);
+    expect(p.tabs.map((t) => t.attrs["aria-selected"])).toEqual(["false", "true", "false", "false"]);
+    expect(p.tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1, -1]); // roving tabindex
+    expect(p.tabs.map((t) => t.classes.has("rb-tabstrip__tab--active"))).toEqual([false, true, false, false]);
+    expect(p.panels.map((x) => x.hidden)).toEqual([true, false, true, true]);
     // replaceState (no scroll, no history entry), with the bare hash as the URL.
     expect(p.replaced).toEqual([[null, "", "#plugins"]]);
   });
@@ -8404,19 +8422,19 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     p.api.showTab("plugins", false);
     p.api.showTab("overview", false);
     expect(p.shownCalls).toEqual(["plugins", "overview"]);
-    // ... and only once the target panel is shown and the others hidden (overview, plugins, settings).
+    // ... and only once the target panel is shown and the others hidden (overview, plugins, servers, settings).
     expect(p.hiddenAtCall).toEqual([
-      [true, false, true],
-      [false, true, true],
+      [true, false, true, true],
+      [false, true, true, true],
     ]);
   });
 
   test("showTab moves focus only when asked", () => {
     const p = page();
     p.api.showTab("settings", true);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 1]);
     p.api.showTab("plugins", false);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 1]);
   });
 
   test("a click on a tab opens it, without moving focus", () => {
@@ -8424,7 +8442,7 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     p.handlers.click!({ target: p.tabs[1] });
     expect(p.open()).toEqual(["tab-plugins"]);
     expect(p.shown()).toEqual(["panel-plugins"]);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 0]);
     // A click that isn't on a tab (target.closest -> null) does nothing.
     p.handlers.click!({ target: { closest: () => null } });
     expect(p.open()).toEqual(["tab-plugins"]);
@@ -8434,14 +8452,14 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     const p = page();
     expect(p.key(p.tabs[0]!, "ArrowRight").prevented).toBe(true);
     expect(p.open()).toEqual(["tab-plugins"]);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 1, 0]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 1, 0, 0]);
     p.key(p.tabs[1]!, "End");
     expect(p.open()).toEqual(["tab-settings"]);
-    p.key(p.tabs[2]!, "ArrowRight"); // wraps
+    p.key(p.tabs[3]!, "ArrowRight"); // wraps
     expect(p.open()).toEqual(["tab-overview"]);
     p.key(p.tabs[0]!, "ArrowLeft"); // wraps back
     expect(p.open()).toEqual(["tab-settings"]);
-    p.key(p.tabs[2]!, "Home");
+    p.key(p.tabs[3]!, "Home");
     expect(p.open()).toEqual(["tab-overview"]);
     expect(p.replaced.map((r) => r[2])).toEqual(["#plugins", "#settings", "#overview", "#settings", "#overview"]);
   });
@@ -8772,6 +8790,225 @@ describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
 
     const appliedGone = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery };
     expect(fns.requestOutcome(appliedGone, "req1", [GONE], true, started, started + 500)).toMatchObject({ live: false, servers: { [GONE]: { state: "unseen" } } });
+  });
+});
+
+// #246: pure parts of the Servers tab, the Needs-attention list, and the picker fallback.
+describe("SERVERS_TAB (#246): pure parts", () => {
+  const src = applyBlock("SERVERS_TAB");
+  type CommandsState = { state: "live" | "refused" | "unregistered" | "single-mode"; registered?: number; at?: string; error?: string };
+  type PluginHere = { name: string; scope: "all" | string[]; postsTo: string | null; webhook: "none" | "ok" | "broken"; byDefault: boolean };
+  type WebhookRow = { channelId: string; channelName: string | null; addedAt: string; addedBy: string; broken?: string };
+  type ServerCardModel = { id: string; name: string; home: boolean; commands: CommandsState; plugins: PluginHere[]; webhooks: WebhookRow[] };
+  type NeedsAttentionItem = { kind: string; text: string; fix: { label: string; go: string } };
+  type PickerOption = { value: string; label: string; group?: string };
+  const fns = new Function(
+    `"use strict";\n${src}\nreturn { routedMode, serverCardModel, unavailableServers, needsAttention, pickerOptions };`,
+  )() as {
+    routedMode: (routing: unknown) => boolean;
+    serverCardModel: (guild: unknown, routingData: unknown, pluginsData: unknown) => ServerCardModel;
+    unavailableServers: (routingData: unknown) => { id: string; plugins: string[]; webhooks: string[] }[];
+    needsAttention: (input: unknown) => NeedsAttentionItem[];
+    pickerOptions: (key: string, discovery: unknown, value: string) => PickerOption[];
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+    expect(src).toContain("function serverCardModel(");
+  });
+
+  // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed;
+  // see this plan's "What the data says").
+  const HOME = "100", OTHER = "200", THIRD = "300", GONE = "999";
+  const GEN_CH = "10", SP_CH = "11", AN_CH = "12", OTHER_CH = "20", GONE_CH = "30";
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:30:00.000Z",
+    bot: { id: "b1", username: "bot" },
+    inviteUrl: "https://discord.com/invite-url",
+    homeGuildId: HOME,
+    guilds: [
+      {
+        id: HOME,
+        name: "Home",
+        channels: [
+          { id: GEN_CH, name: "general", canSend: true },
+          { id: SP_CH, name: "spotify", canSend: true },
+          { id: AN_CH, name: "announcements", canSend: false },
+        ],
+        commands: { registered: 3, at: "2026-09-22T11:30:00.000Z" },
+      },
+      { id: OTHER, name: "Other", channels: [{ id: OTHER_CH, name: "chat", canSend: true }], commands: { registered: 0, error: "Missing Access (50001)", at: "t" } },
+      { id: THIRD, name: "Third", channels: [], commands: null },
+    ],
+    plugins: { music: { posts: true, commands: ["rsetlist"] }, wow: { posts: false, commands: ["rgear"] } },
+  };
+  const routing = {
+    v: 1 as const,
+    updatedAt: "t",
+    updatedBy: "admin",
+    plugins: {
+      music: { servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [GONE]: { commands: "all" as const } } },
+      wow: { servers: { [OTHER]: { commands: "all" as const } } },
+    },
+    webhooks: {
+      [AN_CH]: { id: AN_CH, guildId: HOME, addedAt: "2026-09-01T00:00:00.000Z", addedBy: "admin@example.com" },
+      [GEN_CH]: { id: GEN_CH, guildId: HOME, addedAt: "2026-09-02T00:00:00.000Z", addedBy: "admin@example.com", broken: "410 Unknown Webhook" },
+      [GONE_CH]: { id: GONE_CH, guildId: GONE, addedAt: "2026-09-03T00:00:00.000Z", addedBy: "admin@example.com" },
+    },
+    results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[],
+  };
+  const routingData = { routing, discovery };
+  const routingDataUnrouted = { routing: { ...routing, plugins: {} }, discovery };
+  const pluginsData = {
+    plugins: [
+      { name: "music", enabled: true, missingEnv: ["SPOTIFY_CLIENT_SECRET"] },
+      { name: "wow", enabled: true, missingEnv: [] as string[] },
+      { name: "warbandeer", enabled: false, missingEnv: [] as string[] },
+    ],
+  };
+
+  test("routedMode: false with no plugins placed, true with one", () => {
+    expect(fns.routedMode(routingDataUnrouted.routing)).toBe(false);
+    expect(fns.routedMode(routing)).toBe(true);
+    expect(fns.routedMode(null)).toBe(false);
+    expect(fns.routedMode({ ...routing, plugins: {} })).toBe(false);
+  });
+
+  test("serverCardModel: commands live / refused / unregistered (routed) / single-mode (unrouted)", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.commands).toEqual({ state: "live", registered: 3, at: "2026-09-22T11:30:00.000Z" });
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.commands).toEqual({ state: "refused", error: "Missing Access (50001)" });
+    const third = fns.serverCardModel(discovery.guilds[2], routingData, pluginsData);
+    expect(third.commands).toEqual({ state: "unregistered" });
+    const thirdUnrouted = fns.serverCardModel(discovery.guilds[2], routingDataUnrouted, pluginsData);
+    expect(thirdUnrouted.commands).toEqual({ state: "single-mode" });
+  });
+
+  test("serverCardModel: plugins here — placed by scope and post target with webhook state, and the home card lists unplaced plugins by default", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.home).toBe(true);
+    const music = home.plugins.find((p) => p.name === "music");
+    expect(music).toEqual({ name: "music", scope: ["spotify"], postsTo: "announcements", webhook: "ok", byDefault: false });
+    const warbandeer = home.plugins.find((p) => p.name === "warbandeer");
+    expect(warbandeer).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
+    expect(home.plugins.find((p) => p.name === "wow")).toBeUndefined(); // placed, but not here, and not byDefault (home only lists UNPLACED plugins that way)
+
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.home).toBe(false);
+    expect(other.plugins).toEqual([{ name: "wow", scope: "all", postsTo: null, webhook: "none", byDefault: false }]);
+    expect(other.plugins.find((p) => p.name === "warbandeer")).toBeUndefined(); // byDefault is home-only
+  });
+
+  test("serverCardModel: webhooks under their server by channel name, a vanished channel by id, broken carried", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.webhooks).toHaveLength(2);
+    expect(home.webhooks.find((w) => w.channelId === AN_CH)).toEqual({ channelId: AN_CH, channelName: "announcements", addedAt: "2026-09-01T00:00:00.000Z", addedBy: "admin@example.com" });
+    expect(home.webhooks.find((w) => w.channelId === GEN_CH)).toEqual({ channelId: GEN_CH, channelName: "general", addedAt: "2026-09-02T00:00:00.000Z", addedBy: "admin@example.com", broken: "410 Unknown Webhook" });
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.webhooks).toEqual([]);
+  });
+
+  test("unavailableServers: a server only routing or a webhook names, with what it still holds", () => {
+    const gone = fns.unavailableServers(routingData);
+    expect(gone).toHaveLength(1);
+    expect(gone[0]!.id).toBe(GONE);
+    expect(gone[0]!.plugins).toEqual(["music"]);
+    expect(gone[0]!.webhooks).toEqual([GONE_CH]);
+    expect(fns.unavailableServers({ routing: null, discovery })).toEqual([]);
+    // routingDataUnrouted drops every PLUGIN placement but keeps the webhooks -- GONE_CH's webhook still
+    // names GONE, so the server itself is still unavailable, just with no plugin still placed there.
+    expect(fns.unavailableServers(routingDataUnrouted)).toEqual([{ id: GONE, plugins: [], webhooks: [GONE_CH] }]);
+  });
+
+  const status = { outdatedFiles: ["bot-ops.sh"] };
+  const statusClean = {};
+  const env = { ANNOUNCE_CHANNEL_ID: AN_CH, DISCORD_SERVER_ID: "" };
+  const schema = {
+    ANNOUNCE_CHANNEL_ID: { required: true },
+    DISCORD_SERVER_ID: { required: false },
+    SPOTIFY_CLIENT_SECRET: { required: false, source: "plugin" },
+  };
+  const discoveryHomeGone = { ...discovery, homeGuildId: "777" };
+
+  test("needsAttention: each kind from canned data, in order, and the empty line from none", () => {
+    const items = fns.needsAttention({
+      status, plugins: pluginsData.plugins, routingData: { routing, discovery: discoveryHomeGone }, env, schema,
+      labelOf: (key: string) => key,
+    });
+    const kinds = items.map((i) => i.kind);
+    expect(kinds).toEqual(["missing-setting", "commands-refused", "commands-unregistered", "webhook-broken", "home-missing", "outdated-files"]);
+    expect(items[0]).toEqual({ kind: "missing-setting", text: "music needs SPOTIFY_CLIENT_SECRET", fix: { label: "Fill it in", go: "plugins-card:music" } });
+    expect(items.find((i) => i.kind === "commands-refused")!.text).toBe("Other: Discord refused the bot's commands (Missing Access (50001))");
+    expect(items.find((i) => i.kind === "commands-unregistered")!.text).toBe("Third: commands were never registered");
+    expect(items.find((i) => i.kind === "webhook-broken")!.text).toBe("#general in Home: its webhook stopped working (410 Unknown Webhook)");
+    expect(items.find((i) => i.kind === "home-missing")!.text).toBe("The home server (777) is not one the bot is in, so every plugin nobody has placed is registered nowhere");
+    expect(items.find((i) => i.kind === "outdated-files")!.text).toBe("bot-ops.sh is out of date on this instance");
+
+    expect(fns.needsAttention({ status: statusClean, plugins: [], routingData: { routing: null, discovery: null }, env: {}, schema: {}, labelOf: (k: string) => k })).toEqual([]);
+  });
+
+  test("needsAttention: commands-unregistered only in routed mode; outdated-files one item per file", () => {
+    const unrouted = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: routingDataUnrouted, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    expect(unrouted.some((i) => i.kind === "commands-unregistered")).toBe(false); // THIRD's null commands is normal single-mode, not a problem
+
+    const twoFiles = fns.needsAttention({
+      status: { outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] }, plugins: [], routingData: { routing: null, discovery: null }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    expect(twoFiles.map((i) => i.text)).toEqual(["bot-ops.sh is out of date on this instance", "docker-compose.yml is out of date on this instance"]);
+  });
+
+  test("pickerOptions: server and channel options, grouping, cannot-post suffix, an unknown stored value kept", () => {
+    const serverOpts = fns.pickerOptions("DISCORD_SERVER_ID", discovery, "");
+    expect(serverOpts[0]).toEqual({ value: "", label: "— none: register globally —" });
+    expect(serverOpts.slice(1)).toEqual([{ value: HOME, label: "Home" }, { value: OTHER, label: "Other" }, { value: THIRD, label: "Third" }]);
+
+    const channelOpts = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, "");
+    expect(channelOpts[0]).toEqual({ value: "", label: "— default —" });
+    expect(channelOpts.find((o) => o.value === GEN_CH)).toEqual({ value: GEN_CH, label: "#general", group: "Home" });
+    expect(channelOpts.find((o) => o.value === AN_CH)).toEqual({ value: AN_CH, label: "#announcements · the bot can't post here", group: "Home" });
+    expect(channelOpts.find((o) => o.value === OTHER_CH)).toEqual({ value: OTHER_CH, label: "#chat", group: "Other" });
+
+    const withUnknown = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, "888888888888888888");
+    expect(withUnknown[withUnknown.length - 1]).toEqual({ value: "888888888888888888", label: "888888888888888888 (not visible to the bot)" });
+    // A stored value that DOES match an option is never duplicated as an extra trailing entry.
+    const withKnown = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, GEN_CH);
+    expect(withKnown.filter((o) => o.value === GEN_CH)).toHaveLength(1);
+  });
+});
+
+// #246: selectionFromModel was extracted out of #245's ensureRouteState (Step 1) -- pinned separately so
+// the extraction is provably behavior-preserving, against the same canned rows #245's own
+// routingStepModel test already established.
+describe("selectionFromModel (#246, extracted from ensureRouteState)", () => {
+  const src = applyBlock("PLUGIN_ROUTING");
+  const fns = new Function(`"use strict";\n${src}\nreturn { selectionFromModel };`)() as {
+    selectionFromModel: (model: { rows: { id: string; on: boolean; commands: "all" | string[]; postTo: string | null }[] }) => Record<string, unknown>;
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toContain("function selectionFromModel(");
+  });
+
+  test("one entry per ticked row; scope/channels from whether commands is a list; postTo carried as-is", () => {
+    const model = {
+      rows: [
+        { id: "1", on: true, commands: "all" as const, postTo: null },
+        { id: "2", on: true, commands: ["a", "b"], postTo: "a" },
+        { id: "3", on: false, commands: "all" as const, postTo: null },
+      ],
+    };
+    expect(fns.selectionFromModel(model)).toEqual({
+      "1": { on: true, scope: "all", channels: [], postTo: null },
+      "2": { on: true, scope: "chosen", channels: ["a", "b"], postTo: "a" },
+    });
+  });
+
+  test("no ticked rows -> an empty selection", () => {
+    expect(fns.selectionFromModel({ rows: [] })).toEqual({});
   });
 });
 
@@ -9354,5 +9591,314 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // id1's own poll must NOT have written an outcome over id2's now-current inflight entry.
     expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
     expect(st.outcome).toBeNull();
+  });
+});
+
+// #246: source-pin tests for the Servers tab, the same discipline as #245's own equivalent block above.
+describe("Servers tab: source pins (#246)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("onControlEdited ignores the Servers tab, right after its .route return (source pin)", () => {
+    const editedSlice = indexSrc.slice(indexSrc.indexOf("function onControlEdited("), indexSrc.indexOf("function onControlEdited(") + 900);
+    expect(editedSlice).toContain('if (target.closest(".route")) return;\n    // #246');
+    expect(editedSlice).toContain('if (target.closest(".servers")) return;');
+    const routeIdx = editedSlice.indexOf('if (target.closest(".route")) return;');
+    const serversIdx = editedSlice.indexOf('if (target.closest(".servers")) return;');
+    expect(serversIdx).toBeGreaterThan(routeIdx);
+  });
+
+  test("the Servers tab holds no Apply-bar control (source pin)", () => {
+    const start = indexSrc.indexOf("function renderServers(");
+    const end = indexSrc.indexOf("async function copyInviteLink(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    // Through the end of copyInviteLink's own body, not just up to its declaration.
+    const afterCopy = indexSrc.indexOf("\n  }\n", end);
+    const slice = indexSrc.slice(start, afterCopy);
+    expect(slice.length).toBeGreaterThan(500); // can't pass vacuously
+    for (const bad of ["dataset.key", "data-key", "dataset.plugin", "dataset.settingKey", "dataset.secretKey", "localStorage", "sessionStorage", "innerHTML"]) {
+      expect({ bad, found: slice.includes(bad) }).toEqual({ bad, found: false });
+    }
+  });
+
+  test("a webhook input is always type=password with autocomplete off (source pin)", () => {
+    const start = indexSrc.indexOf("function buildAddWebhookForm(");
+    const end = indexSrc.indexOf("function buildServerCard(");
+    const slice = indexSrc.slice(start, end);
+    expect(slice).toContain('input.type = "password";');
+    expect(slice).toContain('input.autocomplete = "off";');
+  });
+});
+
+// #246: decision 6's pickers, run against buildEnvControl itself (not just pickerOptions in isolation) --
+// the real FIELD_META, isDiscoveryStale and pickerOptions, concatenated the same way #245's own
+// PLUGIN_ROUTING + routingSrc mini-harness does. A tiny synthetic DOM: enough for createElement to answer
+// select/option/optgroup/input and for .value / .dataset / .id to round-trip.
+describe("buildEnvControl pickers (#246, mini-harness)", () => {
+  interface FakeEl {
+    tagName: string;
+    value: string;
+    id: string;
+    className: string;
+    label: string;
+    dataset: Record<string, string>;
+    children: FakeEl[];
+    appendChild: (c: FakeEl) => FakeEl;
+  }
+  function makeEl(tag: string): FakeEl {
+    const el: FakeEl = { tagName: tag.toUpperCase(), value: "", id: "", className: "", label: "", dataset: {}, children: [], appendChild: (c) => (el.children.push(c), c) };
+    return el;
+  }
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const pluginRoutingSrc = applyBlock("PLUGIN_ROUTING");
+  const serversTabSrc = applyBlock("SERVERS_TAB");
+  const envSrc = indexSrc.slice(indexSrc.indexOf("const FIELD_META = {"), indexSrc.indexOf("function renderEnvFields()"));
+
+  function harness(routingDataInit: unknown) {
+    const document = { createElement: (tag: string) => makeEl(tag) };
+    const fn = new Function(
+      "document", "routingData",
+      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\nreturn { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers: typeof refreshEnvPickers === "function" ? refreshEnvPickers : undefined };`,
+    );
+    return fn(document, routingDataInit) as {
+      buildEnvControl: (key: string, value: string) => FakeEl;
+      FIELD_META: Record<string, { control?: string }>;
+      discoveryReadyForPickers: () => boolean;
+    };
+  }
+
+  const discovery = {
+    v: 1 as const,
+    generatedAt: new Date().toISOString(), // fresh -- "ready" for the picker branch
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: "100",
+    guilds: [{ id: "100", name: "Home", channels: [{ id: "10", name: "general", canSend: true }], commands: { registered: 1, at: "t" } }],
+    plugins: {},
+  };
+  const routingDataReady = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+
+  test("FIELD_META wires the three keys to a server/channel control", () => {
+    const h = harness(routingDataReady);
+    expect(h.FIELD_META.DISCORD_SERVER_ID!.control).toBe("server");
+    expect(h.FIELD_META.ANNOUNCE_CHANNEL_ID!.control).toBe("channel");
+    expect(h.FIELD_META.RELEASE_ANNOUNCE_CHANNEL_ID!.control).toBe("channel");
+  });
+
+  test("with a ready discovery, buildEnvControl returns a <select> whose dataset.key and id match the plain-field convention, and whose value is the stored id", () => {
+    const h = harness(routingDataReady);
+    expect(h.discoveryReadyForPickers()).toBe(true);
+    const control = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+    expect(control.tagName).toBe("SELECT");
+    expect(control.id).toBe("env-DISCORD_SERVER_ID");
+    expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(control.value).toBe("100");
+    // Same common tail as the plain-input branch it replaces -- the Apply bar's #env-fields [data-key]
+    // collector and planEnvSave read this control exactly like it read the id field.
+    const channel = h.buildEnvControl("ANNOUNCE_CHANNEL_ID", "10");
+    expect(channel.id).toBe("env-ANNOUNCE_CHANNEL_ID");
+    expect(channel.dataset.key).toBe("ANNOUNCE_CHANNEL_ID");
+    expect(channel.value).toBe("10");
+  });
+
+  test("without a ready discovery (null, or stale), buildEnvControl degrades to a plain input", () => {
+    for (const rd of [{ routing: null, discovery: null }, { routing: null, discovery: { ...discovery, generatedAt: "2020-01-01T00:00:00.000Z" } }]) {
+      const h = harness(rd);
+      expect(h.discoveryReadyForPickers()).toBe(false);
+      const control = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+      expect(control.tagName).toBe("INPUT");
+      expect(control.id).toBe("env-DISCORD_SERVER_ID");
+      expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
+      expect(control.value).toBe("100");
+    }
+  });
+});
+
+// #246: addWebhook + pollForResult, the same "stub the DOM-refresh call, inject a fake clock" mini-harness
+// shape as #245's scheduleRoutingSend/sendRouting block -- renderServers/renderNeedsAttention are outside
+// this slice (browser-only DOM builders) and are injected as call-tracked no-op stubs.
+describe("addWebhook / pollForResult (#246, mini-harness)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("async function addWebhook("), indexSrc.indexOf("async function removeWebhook("));
+  const pollForResultSrc = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
+
+  test("the marked functions are present", () => {
+    expect(addWebhookSrc).toContain("async function addWebhook(");
+    expect(pollForResultSrc).toContain("async function pollForResult(");
+  });
+
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+
+  function harness(opts: {
+    inputValue: string;
+    routingDataInit?: unknown;
+    apiImpl: (path: string, init?: { method?: string; body?: string }) => Promise<{ ok: boolean; text: () => Promise<string>; json?: () => Promise<unknown> }>;
+  }) {
+    const clock = makeClock();
+    const input = { value: opts.inputValue };
+    const document = { getElementById: (id: string) => (id === "webhook-input-100" ? input : null) };
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    const calls: { path: string; init?: unknown }[] = [];
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      calls.push({ path, init });
+      return opts.apiImpl(path, init);
+    };
+    // routingData is a genuine `let` INSIDE the sandboxed source (like #245's own harness), not an
+    // injected parameter -- addWebhook/pollForResult reassign it directly (`routingData = await res.json()`),
+    // which only works for a real closed-over binding, never a parameter or an expando property.
+    const routingDataInit = opts.routingDataInit ?? { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const run = new Function(
+      "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${pollForResultSrc}\n${addWebhookSrc}\n` +
+        "return { addWebhook, pollForResult, getRoutingData: () => routingData };",
+    )(
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention,
+    ) as { addWebhook: (guildId: string) => Promise<void>; pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean }>; getRoutingData: () => unknown };
+    // serverActionState is the SAME Map instance the sandbox mutates (passed by reference), so reading it
+    // here after an await sees every .set/.delete the sandboxed addWebhook made.
+    return { run, clock, input, calls, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+  }
+
+  test("a pasted webhook URL never survives the click: cleared before api() resolves, sent as { url }, status reads Adding…", async () => {
+    // A never-settling POST -- this test only inspects the state addWebhook writes BEFORE the request
+    // settles, so the dangling promise addWebhook returns is never awaited to completion (the "resolved
+    // poll" and "timeout" paths are their own tests below, with a real apiImpl that answers every call).
+    const apiImpl = () => new Promise<{ ok: boolean; text: () => Promise<string> }>(() => {});
+    const h = harness({ inputValue: "https://discord.com/api/webhooks/1/tok", apiImpl });
+    void h.run.addWebhook("100");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.input.value).toBe(""); // cleared before the request settles
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]!.path).toBe("/api/webhooks");
+    expect(JSON.parse((h.calls[0]!.init as { body: string }).body)).toEqual({ url: "https://discord.com/api/webhooks/1/tok" });
+    expect(h.serverActionState.get("add:100")).toEqual({ busy: true, message: "Adding…" });
+    // No URL anywhere the harness can see -- there is no localStorage/sessionStorage stub at all (the
+    // source-pin test above already establishes the function never references either).
+  });
+
+  test("a resolved poll draws the webhook under the result's channelId; a refusal shows the bot's reason", async () => {
+    const h1 = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req1" }) };
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [{ id: "req1", action: "webhook-add", ok: true, channelId: "10", at: "t" }] } }) };
+      },
+    });
+    const p1 = h1.run.addWebhook("100");
+    await h1.clock.tick(); // the POST resolves synchronously in apiImpl; the poll's setTimeout is what tick() advances
+    await h1.clock.tick();
+    await p1;
+    expect(h1.serverActionState.has("add:100")).toBe(false); // settled clean -- no lingering message
+    expect(h1.renderServersCalls()).toBeGreaterThanOrEqual(2); // once busy, once settled
+    expect(h1.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
+
+    const h2 = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req2" }) };
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [{ id: "req2", action: "webhook-add", ok: false, reason: "server 424242 is not one the bot is in", at: "t" }] } }) };
+      },
+    });
+    const p2 = h2.run.addWebhook("100");
+    await h2.clock.tick();
+    await h2.clock.tick();
+    await p2;
+    expect(h2.serverActionState.get("add:100")).toEqual({ busy: false, message: "The bot refused it: server 424242 is not one the bot is in" });
+  });
+
+  test("pollForResult resolves { result } once routing.results holds the id, and { timeout: true } past the deadline", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async () => ({ ok: true, text: async () => "", json: async () => ({ routing: { results: [] } }) }),
+    });
+    const started = Date.now();
+    const p = h.run.pollForResult("reqX", started - 31000); // already past ROUTING_ANSWER_TIMEOUT_MS
+    await h.clock.tick();
+    expect(await p).toEqual({ timeout: true });
+  });
+});
+
+// #246: decision 4's "Try again" -- retryRegistration re-sends the first PLACED plugin's saved placement,
+// or says restart when nothing is placed. sendRouting/ensureRouteState/routingStepModel are stubbed (each
+// already has its own coverage, #245's and this file's SERVERS_TAB block) so this test is only about
+// firstPlacedPlugin's own selection and the no-plugin-placed early return.
+describe("retryRegistration (#246, mini-harness)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.slice(indexSrc.indexOf("function firstPlacedPlugin("), indexSrc.indexOf("function appendRetryControls("));
+
+  test("the marked functions are present", () => {
+    expect(src).toContain("function firstPlacedPlugin(");
+    expect(src).toContain("async function retryRegistration(");
+  });
+
+  function harness(routingDataInit: unknown, pluginsData: unknown) {
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const sendRoutingCalls: string[] = [];
+    const ensureRouteStateCalls: string[] = [];
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); };
+    const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); };
+    const routingStepModel = () => ({ mode: "ready", rows: [] });
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const run = new Function(
+      "pluginsData", "serverActionState", "renderServers", "renderNeedsAttention", "ensureRouteState", "routingStepModel", "sendRouting",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { firstPlacedPlugin, retryRegistration };`,
+    )(pluginsData, serverActionState, renderServers, renderNeedsAttention, ensureRouteState, routingStepModel, sendRouting) as {
+      firstPlacedPlugin: () => string | null;
+      retryRegistration: () => Promise<void>;
+    };
+    return { run, serverActionState, sendRoutingCalls, ensureRouteStateCalls, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+  }
+
+  const routed = { routing: { plugins: { music: { servers: {} }, wow: { servers: {} } } } };
+  const unrouted = { routing: { plugins: {} } };
+  const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "music" }, { name: "wow" }] };
+
+  test("firstPlacedPlugin: the first PLACED plugin in pluginsData's own order, not manifest order alone", () => {
+    const h = harness(routed, pluginsData);
+    // warbandeer is first in pluginsData but unplaced; music is placed and comes next.
+    expect(h.run.firstPlacedPlugin()).toBe("music");
+    const h2 = harness(unrouted, pluginsData);
+    expect(h2.run.firstPlacedPlugin()).toBeNull();
+  });
+
+  test("retryRegistration re-sends the first placed plugin's saved placement via sendRouting", async () => {
+    const h = harness(routed, pluginsData);
+    await h.run.retryRegistration();
+    expect(h.ensureRouteStateCalls).toEqual(["music"]);
+    expect(h.sendRoutingCalls).toEqual(["music"]);
+    expect(h.serverActionState.has("retry")).toBe(false); // settled clean
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // once busy, once settled
+    expect(h.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
+  });
+
+  test("retryRegistration is a no-op when nothing is placed (the restart sentence is drawn instead, by appendRetryControls)", async () => {
+    const h = harness(unrouted, pluginsData);
+    await h.run.retryRegistration();
+    expect(h.sendRoutingCalls).toEqual([]);
+    expect(h.ensureRouteStateCalls).toEqual([]);
+    expect(h.renderServersCalls()).toBe(0);
   });
 });

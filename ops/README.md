@@ -689,6 +689,34 @@ of showing fields it can't validate. If the bot's own state can't be read (`stat
 e.g. a docker hiccup), the route sets a `stateError` instead and every switch is **disabled**, since an
 empty selection read back under failure would otherwise let an apply wipe the real `PLUGINS`.
 
+**A Servers tab, a Needs-attention list, and pickers instead of pasted ids (#246).** The page has four
+tabs: Overview, Plugins, **Servers**, and Settings. The **Servers tab** shows one card per server the bot
+is currently in: whether its commands are live (with the count and when), refused by Discord (with a
+**Re-invite the bot** link and a **Try again**), never registered there yet (**Try again**), or — outside
+routed mode — the quiet single-mode line that isn't a problem; which plugins live there, placed or "lives
+here by default"; and its webhooks, each with a **Remove**. An **Add a webhook** field pastes a Discord
+webhook URL — it is cleared from the field the instant you press Add, whatever happens next, and never
+shown again; the bot asks Discord which channel it actually posts to, and that channel is where the
+webhook shows up. **Try again** re-sends whichever plugin is placed first — a no-op change that makes the
+bot re-register every server — and is replaced by a note to restart the bot when nothing is placed yet.
+A toolbar **Refresh from Discord** re-reads what the bot can currently see, and **Copy invite link** puts
+the bot's own invite URL on your clipboard (or shows it in a field to copy by hand). One card per server
+routing or a webhook still names but the bot has since left stays listed, read-only, until its placement
+next changes. The **Needs-attention list**, first on Overview, is a standing summary of what's worth
+looking at: a plugin missing a required setting, a required core setting left blank, a server that refused
+the bot's commands, a server whose commands never registered, a webhook that stopped working, a home
+server the bot isn't in, or a deployment file out of date — each with a button to the right tab or card,
+or "Nothing needs attention." when there's nothing to say. It's derived fresh every time, never stored.
+**`DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID` and `RELEASE_ANNOUNCE_CHANNEL_ID` are pickers, not pasted
+ids**, once the panel has a recent-enough picture of what the bot can see: a server or channel dropdown by
+name (`DISCORD_SERVER_ID` is the **home server** — where a plugin nobody has placed lives and registers
+its commands; blank registers those commands globally, which can take about an hour to appear) instead of
+a raw snowflake, grouped by server for a channel picker, and a channel the bot can't post in says so right
+in its own option. They write the exact same key and value a pasted id would, so nothing about the Apply
+bar changes. Without a recent picture of the bot's servers (or before the panel has one at all), all three
+fall back to the plain id field, upgrading to the picker in place — keeping whatever you'd already typed —
+once discovery is ready.
+
 **Driving an available update (#105).** A card whose plugin is ON and has a newer release than the one
 installed grows an update-action area (#225: an off plugin's card still shows its installed version,
 never an update badge or these actions — it isn't running, so there's nothing to nudge): a **What

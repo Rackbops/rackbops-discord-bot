@@ -54,11 +54,17 @@
     <div class="rb-tabstrip" role="tablist">
       <button type="button" class="rb-tabstrip__tab rb-tabstrip__tab--active" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0">Overview</button>
       <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-plugins" aria-controls="panel-plugins" aria-selected="false" tabindex="-1">Plugins</button>
+      <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-servers" aria-controls="panel-servers" aria-selected="false" tabindex="-1">Servers</button>
       <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
     </div>
   </nav>
 
   <div id="panel-overview" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+    <section id="attention-section" class="rb-card">
+      <h2>Needs attention</h2>
+      <div id="attention-list" class="attention">Loading…</div>
+    </section>
+
     <section id="status-section" class="rb-card">
       <h2>Status</h2>
       <dl class="status-grid" id="status-grid"><dt>Loading…</dt></dl>
@@ -92,6 +98,24 @@
         untouched.
       </p>
       <div id="plugins-list">Loading…</div>
+    </section>
+  </div>
+
+  <div id="panel-servers" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-servers" tabindex="0" hidden>
+    <section id="servers-section" class="rb-card servers">
+      <h2>Servers</h2>
+      <p class="adm-sub">
+        Every server the bot is in, what it can do there, and its webhooks. Placement itself is set from
+        each plugin's own card on the Plugins tab.
+      </p>
+      <div class="servers__toolbar row adm-actions">
+        <button id="refresh-discovery" type="button" class="rb-btn rb-btn--sm">Refresh from Discord</button>
+        <button id="copy-invite" type="button" class="rb-btn rb-btn--sm rb-btn--ghost">Copy invite link</button>
+        <span id="servers-meta" class="servers__meta"></span>
+      </div>
+      <input id="invite-fallback" class="rb-input" type="text" readonly hidden />
+      <p id="servers-status" class="field-hint" role="status"></p>
+      <div id="servers-list">Loading…</div>
     </section>
   </div>
 
@@ -221,7 +245,7 @@
   // Pure tab decisions, lifted so ops/admin/server.test.ts can pin them: which tab a URL hash names
   // (anything unknown or empty opens Overview), and which tab an arrow / Home / End key moves to
   // (arrows wrap; any other key leaves the current tab). The DOM half is showTab, below.
-  const TAB_IDS = ["overview", "plugins", "settings"];
+  const TAB_IDS = ["overview", "plugins", "servers", "settings"];
   function tabFromHash(hash) {
     const id = String(hash || "").replace(/^#/, "");
     return TAB_IDS.includes(id) ? id : "overview";
@@ -440,6 +464,16 @@
   let routingData = null;
   let routingStepEls = new Map();
 
+  // #246: the last GET /api/status response, kept so needsAttention (Overview's Needs-attention list) can
+  // read outdatedFiles without loadStatus and renderNeedsAttention sharing a return value across a fetch.
+  let lastStatus = null;
+
+  // #246: per-subject state for the Servers tab's own actions (add:<guildId>, remove:<channelId>,
+  // "retry", "discovery") -- the same shape and reason as #245's routeState: survives a renderServers()
+  // rebuild (never a closure over a DOM node that render just replaced), read fresh at every render so a
+  // busy control or a settled message is never lost mid-flight. { busy: boolean, message: string|null }.
+  let serverActionState = new Map();
+
   // #244: which secret keys are showing their password input (Replace pressed) rather than the "Saved on
   // the server" summary -- remembered the same way, so a background reload (an update button, Unlock)
   // does not silently drop the user back into the summary view mid-paste.
@@ -478,6 +512,7 @@
         loadedSchema = schema && typeof schema === "object" ? schema : {};
         renderPlugins();
         renderEnvFields();
+        renderNeedsAttention();
         if (captured) reapplyCardEdits(captured);
       } catch (e) {
         if (e.message !== "unauthorized") {
@@ -1061,18 +1096,7 @@
       routeState.set(plugin, st);
     }
     if (!st.seeded && model.mode === "ready") {
-      const selection = {};
-      for (const row of model.rows) {
-        if (row.on) {
-          selection[row.id] = {
-            on: true,
-            scope: Array.isArray(row.commands) ? "chosen" : "all",
-            channels: Array.isArray(row.commands) ? row.commands.slice() : [],
-            postTo: row.postTo,
-          };
-        }
-      }
-      st.selection = selection;
+      st.selection = selectionFromModel(model);
       st.seeded = true;
     }
     return st;
@@ -1565,6 +1589,9 @@
       routingData = { routing: null, discovery: null, loadError: e && e.message ? e.message : String(e) };
     }
     refreshRoutingSteps();
+    renderServers();
+    refreshEnvPickers();
+    renderNeedsAttention();
   }
 
   // Redraws every card's step FRESH from the latest routingData (routingStepEls is rebuilt each time,
@@ -1577,6 +1604,515 @@
       if (!mount) continue;
       mount.replaceWith(buildWhereItLivesStep(p, {}));
     }
+  }
+
+  // #246: never innerHTML (a server or channel name is Discord-supplied text; decision 4/7 and the
+  // Servers-tab source pin both require textContent only) -- this is the innerHTML = "" replacement.
+  function clearChildren(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  // The first plugin (in pluginsData's own manifest order) that has a routing.plugins entry at all, even
+  // an empty one -- "placed", not "posting" or "active". null when nothing is placed (decision 4: no
+  // button in that state, a restart is the only retry).
+  function firstPlacedPlugin() {
+    const routing = routingData && routingData.routing;
+    if (!routing || !routing.plugins) return null;
+    for (const p of (pluginsData && pluginsData.plugins) || []) {
+      if (routing.plugins[p.name]) return p.name;
+    }
+    return null;
+  }
+
+  // Decision 4's "Try again": re-sends the first placed plugin's OWN saved placement (a no-op change --
+  // ensureRouteState seeds routeState from the ready model when it doesn't already exist; sendRouting
+  // reads that selection and posts it back unchanged) to every server, re-running applyRouting. Shares
+  // the "retry" subject key with the Overview fix button (decision 5's `go: "retry"`), so a click from
+  // either place is the same in-flight action.
+  async function retryRegistration() {
+    const key = "retry";
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    const name = firstPlacedPlugin();
+    if (!name) return; // no button is drawn in that state -- see appendRetryControls
+    serverActionState.set(key, { busy: true, message: "Applying…" });
+    renderServers();
+    ensureRouteState(name, routingStepModel(name, routingData, Date.now()));
+    await sendRouting(name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
+    serverActionState.delete(key);
+    renderServers();
+    renderNeedsAttention();
+  }
+
+  // Appended to a card wherever decision 3 calls for "+ Try again": the button when a plugin is placed
+  // somewhere, the restart sentence when nothing is (retryRegistration would have nothing to resend).
+  function appendRetryControls(container) {
+    if (firstPlacedPlugin()) {
+      const st = serverActionState.get("retry");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      btn.textContent = "Try again";
+      btn.disabled = !!(st && st.busy);
+      btn.addEventListener("click", retryRegistration);
+      container.appendChild(btn);
+      if (st && st.message) {
+        const msg = document.createElement("p");
+        msg.className = "field-hint";
+        msg.setAttribute("role", "status");
+        msg.textContent = st.message;
+        container.appendChild(msg);
+      }
+    } else {
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      note.textContent = "Nothing is placed yet, so there is nothing to re-send. Restart the bot (Overview) to retry.";
+      container.appendChild(note);
+    }
+  }
+
+  // Decision 3's commands line, in order: the state sentence, then (refused) the invite link, then
+  // (refused/unregistered) the retry controls.
+  function buildCommandsSection(card, model) {
+    const line = document.createElement("p");
+    line.className = "server__line";
+    card.appendChild(line);
+    if (model.commands.state === "live") {
+      line.textContent = "Commands live — " + model.commands.registered + " registered " + new Date(model.commands.at).toLocaleString();
+    } else if (model.commands.state === "single-mode") {
+      line.textContent = "No commands here: only the home server registers commands until a plugin is placed.";
+    } else if (model.commands.state === "refused") {
+      line.textContent = "Discord refused the commands here: " + model.commands.error;
+      const invite = discoveryInviteUrl();
+      if (invite) {
+        const a = document.createElement("a");
+        a.href = invite;
+        a.rel = "noopener";
+        a.target = "_blank";
+        a.textContent = "Re-invite the bot";
+        card.appendChild(a);
+      }
+      appendRetryControls(card);
+    } else {
+      line.textContent = "Commands were never registered here.";
+      appendRetryControls(card);
+    }
+  }
+
+  // scope/postsTo/webhook are serverCardModel's own data fields (channel NAMES, never ids, when
+  // resolvable) -- this is presentation only.
+  function pluginPlacementText(p) {
+    const scope = p.scope === "all" ? "anywhere" : p.scope.map((n) => "#" + n).join(", ");
+    if (!p.postsTo) return scope;
+    if (p.webhook === "ok") return scope + " · posts to #" + p.postsTo + " (webhook)";
+    if (p.webhook === "broken") return scope + " · posts to #" + p.postsTo + " (webhook stopped working)";
+    return scope + " · posts to #" + p.postsTo + " as the bot";
+  }
+
+  function buildWebhookRow(wh) {
+    const row = document.createElement("div");
+    row.className = "server__webhook";
+    const label = document.createElement("span");
+    label.textContent = wh.channelName ? "#" + wh.channelName : "channel " + wh.channelId + " (no longer visible)";
+    row.appendChild(label);
+    const meta = document.createElement("span");
+    meta.className = "field-hint";
+    meta.textContent =
+      "added " + new Date(wh.addedAt).toLocaleDateString() + " by " + wh.addedBy + (wh.broken ? " · stopped working: " + wh.broken : "");
+    row.appendChild(meta);
+    const key = "remove:" + wh.channelId;
+    const st = serverActionState.get(key);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rb-btn rb-btn--sm rb-btn--ghost";
+    btn.textContent = "Remove";
+    btn.disabled = !!(st && st.busy);
+    btn.addEventListener("click", () => removeWebhook(wh.channelId, wh.channelName || wh.channelId));
+    row.appendChild(btn);
+    if (st && st.message) {
+      const msg = document.createElement("p");
+      msg.className = "field-hint";
+      msg.setAttribute("role", "status");
+      msg.textContent = st.message;
+      row.appendChild(msg);
+    }
+    return row;
+  }
+
+  // Decision 3's "Add a webhook": a password field so the pasted URL never shows on screen, cleared by
+  // addWebhook itself the moment the click handler runs -- this builder only draws whatever
+  // serverActionState currently holds for this subject.
+  function buildAddWebhookForm(guildId) {
+    const wrap = document.createElement("div");
+    wrap.className = "server__add";
+    const label = document.createElement("label");
+    label.className = "rb-label";
+    label.htmlFor = "webhook-input-" + guildId;
+    label.textContent = "Add a webhook";
+    wrap.appendChild(label);
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.className = "rb-input";
+    input.id = "webhook-input-" + guildId;
+    input.placeholder = "Paste the webhook URL";
+    wrap.appendChild(input);
+    const key = "add:" + guildId;
+    const st = serverActionState.get(key);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rb-btn rb-btn--sm";
+    btn.textContent = "Add";
+    btn.disabled = !!(st && st.busy);
+    btn.addEventListener("click", () => addWebhook(guildId));
+    wrap.appendChild(btn);
+    const hint = document.createElement("p");
+    hint.className = "field-hint";
+    hint.textContent = "The bot asks Discord which channel it posts to. If that channel already has a webhook, this one replaces it.";
+    wrap.appendChild(hint);
+    if (st && st.message) {
+      const msg = document.createElement("p");
+      msg.className = "field-hint";
+      msg.setAttribute("role", "status");
+      msg.textContent = st.message;
+      wrap.appendChild(msg);
+    }
+    return wrap;
+  }
+
+  function buildServerCard(model) {
+    const card = document.createElement("section");
+    card.className = "rb-card server";
+    const h = document.createElement("h3");
+    h.className = "server__h";
+    h.textContent = model.name + (model.home ? " (home)" : "");
+    card.appendChild(h);
+
+    buildCommandsSection(card, model);
+
+    const pluginsHead = document.createElement("p");
+    pluginsHead.className = "server__line";
+    pluginsHead.textContent = "Plugins here";
+    card.appendChild(pluginsHead);
+    const pluginsList = document.createElement("div");
+    pluginsList.className = "server__plugins";
+    if (model.plugins.length === 0) {
+      const none = document.createElement("p");
+      none.className = "field-hint";
+      none.textContent = "No plugin lives here.";
+      pluginsList.appendChild(none);
+    }
+    for (const p of model.plugins) {
+      const row = document.createElement("p");
+      row.className = "server__line";
+      row.textContent = p.name + " — " + (p.byDefault ? "lives here by default" : pluginPlacementText(p));
+      pluginsList.appendChild(row);
+    }
+    card.appendChild(pluginsList);
+
+    const whHead = document.createElement("p");
+    whHead.className = "server__line";
+    whHead.textContent = "Webhooks";
+    card.appendChild(whHead);
+    const whList = document.createElement("div");
+    whList.className = "server__webhooks";
+    if (model.webhooks.length === 0) {
+      const none = document.createElement("p");
+      none.className = "field-hint";
+      none.textContent = "None.";
+      whList.appendChild(none);
+    }
+    for (const wh of model.webhooks) whList.appendChild(buildWebhookRow(wh));
+    card.appendChild(whList);
+
+    card.appendChild(buildAddWebhookForm(model.id));
+    return card;
+  }
+
+  // Decision 2's "below the last real card": one per server routing/webhooks still names but discovery
+  // does not, read-only, in the #245 route__row--off style.
+  function buildUnavailableServerCard(gone) {
+    const card = document.createElement("section");
+    card.className = "rb-card server route__row--off";
+    const h = document.createElement("h3");
+    h.className = "server__h";
+    h.textContent = "Server " + gone.id + " — the bot is no longer in it";
+    card.appendChild(h);
+    if (gone.plugins.length > 0) {
+      const p = document.createElement("p");
+      p.className = "server__line";
+      p.textContent = "Still placed: " + gone.plugins.join(", ") + ". Dropped the next time each plugin's placement changes.";
+      card.appendChild(p);
+    }
+    if (gone.webhooks.length > 0) {
+      const p = document.createElement("p");
+      p.className = "server__line";
+      p.textContent = (gone.webhooks.length === 1 ? "1 webhook" : gone.webhooks.length + " webhooks") + " still recorded here.";
+      card.appendChild(p);
+    }
+    return card;
+  }
+
+  // Redraws #servers-list FRESH from the latest routingData/pluginsData/serverActionState -- the same
+  // rule as refreshRoutingSteps: never a closure over a control a previous render already replaced.
+  function renderServers() {
+    const list = document.getElementById("servers-list");
+    if (!list) return;
+    const discovery = routingData && routingData.discovery;
+    const meta = document.getElementById("servers-meta");
+    if (meta) meta.textContent = discovery && discovery.generatedAt ? "Last read from Discord " + new Date(discovery.generatedAt).toLocaleString() : "";
+    const discoveryState = serverActionState.get("discovery");
+    const refreshBtn = document.getElementById("refresh-discovery");
+    if (refreshBtn) refreshBtn.disabled = !!(discoveryState && discoveryState.busy);
+    const status = document.getElementById("servers-status");
+    if (status) setApplyText(status, (discoveryState && discoveryState.message) || "");
+
+    clearChildren(list);
+    if (!discovery) {
+      const p = document.createElement("p");
+      p.className = "field-hint";
+      p.textContent = "The bot hasn't published what it can see yet.";
+      list.appendChild(p);
+      return;
+    }
+    for (const guild of discovery.guilds) list.appendChild(buildServerCard(serverCardModel(guild, routingData, pluginsData)));
+    for (const gone of unavailableServers(routingData)) list.appendChild(buildUnavailableServerCard(gone));
+  }
+  const refreshServers = renderServers;
+
+  async function addWebhook(guildId) {
+    const key = "add:" + guildId;
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    const input = document.getElementById("webhook-input-" + guildId);
+    const url = input ? input.value : "";
+    // #246: cleared BEFORE the request is awaited, whatever the outcome -- a refusal means paste again.
+    if (input) input.value = "";
+    if (!url) return;
+    serverActionState.set(key, { busy: true, message: "Adding…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/webhooks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }), signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+      } else if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+      } else {
+        serverActionState.delete(key);
+      }
+      renderServers();
+      renderNeedsAttention();
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  async function removeWebhook(channelId, channelName) {
+    const key = "remove:" + channelId;
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    if (!confirm("Remove the webhook for #" + channelName + "? The bot posts there as itself afterwards.")) return;
+    serverActionState.set(key, { busy: true, message: "Removing…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/webhooks/" + encodeURIComponent(channelId), { method: "DELETE", signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+      } else if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+      } else {
+        serverActionState.delete(key);
+      }
+      renderServers();
+      renderNeedsAttention();
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  // Decision 4's one poller behind Add/Remove/Try again/Refresh from Discord: re-reads GET /api/routing
+  // every ROUTING_POLL_MS until routing.results holds `id` or ROUTING_ANSWER_TIMEOUT_MS has passed.
+  // Never throws -- a transient read failure just tries again next tick; a 401 ends the wait the same way
+  // a timeout does (api() has already shown the gate by the time this returns). The fresh routingData is
+  // stored on every successful read, exactly like #245's own two pollers.
+  async function pollForResult(id, startedAt) {
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
+      try {
+        const res = await api("/api/routing");
+        routingData = await res.json();
+      } catch (e) {
+        if (e && e.message === "unauthorized") return { timeout: true };
+        // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+      }
+      const result = routingData && routingData.routing && routingData.routing.results && routingData.routing.results.find((r) => r.id === id);
+      if (result) return { result };
+      if (Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) return { timeout: true };
+    }
+  }
+
+  async function refreshDiscoveryAll() {
+    const key = "discovery";
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    serverActionState.set(key, { busy: true, message: "Refreshing…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/discovery/refresh", { method: "POST", signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        renderServers();
+        return;
+      }
+      serverActionState.delete(key);
+      await loadRouting(); // re-renders the tab itself (renderServers is part of loadRouting's own tail)
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  async function copyInviteLink() {
+    const url = discoveryInviteUrl();
+    if (!url) return;
+    const status = document.getElementById("servers-status");
+    const fallback = document.getElementById("invite-fallback");
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(url);
+      if (fallback) fallback.hidden = true;
+      if (status) setApplyText(status, "Copied.");
+    } catch {
+      if (fallback) {
+        fallback.value = url;
+        fallback.hidden = false;
+        fallback.focus();
+        fallback.select();
+      }
+      if (status) setApplyText(status, "Couldn't copy automatically — select and copy the link below.");
+    }
+  }
+  // Not withBusy: refreshDiscoveryAll manages #refresh-discovery's own disabled state through
+  // serverActionState/renderServers (surviving a rebuild mid-flight, unlike a plain closure over `el`).
+  document.getElementById("refresh-discovery").addEventListener("click", refreshDiscoveryAll);
+  document.getElementById("copy-invite").addEventListener("click", copyInviteLink);
+
+  // #246: decision 5's Needs-attention list, drawn from the page's own current state -- never stored,
+  // recomputed at every render. `settingLabel` has needsAttention's own (key, pluginName) => string
+  // shape (PLUGIN_SETTING_LABEL, above), so it is passed straight through as labelOf.
+  function renderNeedsAttention() {
+    const list = document.getElementById("attention-list");
+    if (!list) return;
+    const items = needsAttention({
+      status: lastStatus,
+      plugins: (pluginsData && pluginsData.plugins) || [],
+      routingData,
+      env: loadedEnv,
+      schema: loadedSchema,
+      labelOf: settingLabel,
+    });
+    clearChildren(list);
+    if (items.length === 0) {
+      const p = document.createElement("p");
+      p.className = "field-hint";
+      p.textContent = "Nothing needs attention.";
+      list.appendChild(p);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "attention__item";
+      const text = document.createElement("span");
+      text.textContent = item.text;
+      row.appendChild(text);
+      if (item.fix.go !== "none") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "rb-btn rb-btn--sm rb-btn--ghost attention__fix";
+        btn.textContent = item.fix.label;
+        btn.addEventListener("click", () => goToFix(item.fix.go));
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    }
+  }
+
+  // Where a Needs-attention fix button sends the operator (decision 5's `fix.go`).
+  function goToFix(go) {
+    if (go === "settings") { showTab("settings", true); return; }
+    if (go === "servers") { showTab("servers", true); return; }
+    if (go === "retry") { showTab("servers", true); retryRegistration(); return; }
+    if (go === "restart") {
+      showTab("overview", true);
+      const btn = document.getElementById("restart");
+      if (btn) btn.focus();
+      return;
+    }
+    if (go.indexOf("plugins-card:") === 0) {
+      showTab("plugins", false);
+      openPluginCard(go.slice("plugins-card:".length));
+    }
+  }
+
+  // Same open-and-focus sequence refuseApply already uses for a plugin-owned key (#244) -- forces the
+  // card open directly via cardHeaderEls' stored refs rather than a full renderPlugins, then focuses it.
+  function openPluginCard(name) {
+    const els = cardHeaderEls.get(name);
+    if (!els) return;
+    if (els.body && els.body.hidden) {
+      openCards.add(name);
+      els.body.hidden = false;
+      els.head.setAttribute("aria-expanded", "true");
+      if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
+    }
+    if (els.head && els.head.focus) els.head.focus();
   }
 
   // Step 2, present whenever there is something to show: a declared setting, an admin bundle, or (with
@@ -2174,9 +2710,11 @@
         "<dt>Container</dt><dd>" + escapeHtml(s.status || "") + "</dd>" +
         "<dt>Image</dt><dd>" + escapeHtml(s.image || "") + "</dd>" +
         "<dt>Realm</dt><dd>" + (dot ? '<span class="dot ' + dot + '"></span>' : "") + escapeHtml(s.realmStatus || "unknown") + "</dd>";
+      lastStatus = s;
     } catch (e) {
       if (e.message !== "unauthorized") grid.innerHTML = "<dt>Error</dt><dd>" + escapeHtml(e.message) + "</dd>";
     }
+    renderNeedsAttention();
   }
   document.getElementById("refresh-status").addEventListener("click", (e) => withBusy(e.currentTarget, loadStatus));
 
@@ -2298,9 +2836,18 @@
   // GET /api/env-schema (#207), not from anything hardcoded here. A blank option is always offered
   // for a select since an empty value clears a key back to its documented default.
   const FIELD_META = {
-    DISCORD_SERVER_ID: { hint: "Which Discord server slash commands register to. Blank registers globally (can take ~1h to appear)." },
-    ANNOUNCE_CHANNEL_ID: { hint: "Required — the bot won't start without it. The default announcement channel: releases (unless the field below is set), plus whatever the installed plugins post here (e.g. the wow plugin's Darkmoon Faire, weekly-reset, and server up/down notices)." },
-    RELEASE_ANNOUNCE_CHANNEL_ID: { hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank." },
+    DISCORD_SERVER_ID: {
+      control: "server",
+      hint: "The home server: where a plugin nobody has placed lives and registers its commands. Blank registers those commands globally (can take about an hour to appear).",
+    },
+    ANNOUNCE_CHANNEL_ID: {
+      control: "channel",
+      hint: "Required — the bot won't start without it. The default announcement channel: releases (unless the field below is set), plus whatever the installed plugins post here (e.g. the wow plugin's Darkmoon Faire, weekly-reset, and server up/down notices).",
+    },
+    RELEASE_ANNOUNCE_CHANNEL_ID: {
+      control: "channel",
+      hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank.",
+    },
     REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
     ADMIN_USER_IDS: { control: "tags", hint: "Discord user IDs allowed to run /update. Add one per chip.", placeholder: "Discord user ID" },
     AUTO_UPDATE: { control: "select", options: ["true", "false"] },
@@ -2439,6 +2986,58 @@
     return wrapper;
   }
 
+  // #246: discovery is "ready to trust" for a picker under the exact same rule #245's routing step
+  // already uses for its own controls (DISCOVERY_STALE_MS) -- never a guess of its own.
+  function discoveryReadyForPickers() {
+    return !!(routingData && routingData.discovery && !isDiscoveryStale(routingData.discovery.generatedAt, Date.now()));
+  }
+
+  // A <select> from pickerOptions, grouped into <optgroup>s by each option's own `group` (channel
+  // options only -- the server picker has none). data-key/id are NOT set here: buildEnvControl's common
+  // tail sets them on every branch alike, so a picker's stored key/value round-trip through the Apply
+  // bar exactly like the plain id field it replaces.
+  function buildPickerSelect(key, discovery, value) {
+    const control = document.createElement("select");
+    control.className = "rb-select";
+    let currentGroup;
+    let target = control;
+    for (const opt of pickerOptions(key, discovery, value)) {
+      if (opt.group !== currentGroup) {
+        currentGroup = opt.group;
+        if (opt.group) {
+          target = document.createElement("optgroup");
+          target.label = opt.group;
+          control.appendChild(target);
+        } else {
+          target = control;
+        }
+      }
+      const o = document.createElement("option");
+      o.value = opt.value;
+      o.textContent = opt.label;
+      target.appendChild(o);
+    }
+    control.value = value;
+    return control;
+  }
+
+  // Upgrades a plain id field to its picker in place, once discovery becomes ready -- carrying the
+  // control's CURRENT value (an in-progress edit survives), never the other way: a picker is never
+  // downgraded back to a plain field once discovery has gone stale again, since a control the operator
+  // may be mid-edit on must not be replaced out from under them.
+  function refreshEnvPickers() {
+    if (!discoveryReadyForPickers()) return;
+    for (const key of ["DISCORD_SERVER_ID", "ANNOUNCE_CHANNEL_ID", "RELEASE_ANNOUNCE_CHANNEL_ID"]) {
+      const existing = document.getElementById("env-" + key);
+      if (!existing || existing.tagName === "SELECT") continue;
+      const value = existing.value;
+      const control = buildPickerSelect(key, routingData.discovery, value);
+      control.id = "env-" + key;
+      control.dataset.key = key;
+      existing.replaceWith(control);
+    }
+  }
+
   function buildEnvControl(key, value) {
     const meta = FIELD_META[key] || {};
     // Self-contained composite (its own nested id/data-key/focusId) — return before the common
@@ -2466,6 +3065,10 @@
       control.className = "rb-select";
       const re = compilePattern(loadedSchema.BOT_BRANCH && loadedSchema.BOT_BRANCH.pattern);
       populateBranchSelect(control, branchesData, value, re);
+    } else if ((meta.control === "server" || meta.control === "channel") && discoveryReadyForPickers()) {
+      // #246: a <select> of live servers/channels (decision 6) -- degrades to the plain input below
+      // whenever discovery isn't ready to trust (null, or stale by #245's own DISCOVERY_STALE_MS rule).
+      control = buildPickerSelect(key, routingData.discovery, value);
     } else {
       control = document.createElement("input");
       control.className = "rb-input";
@@ -2785,7 +3388,220 @@
     }
     return { phase: "applied", live: active && live, at: result.at, servers };
   }
+
+  // #246: the seed ensureRouteState builds from a "ready" model's OWN saved placement -- moved out of
+  // ensureRouteState (browser-only, DOM-adjacent) into this pure block so retryRegistration (Servers tab)
+  // can build the SAME no-op selection without duplicating the shape. Behaviour unchanged: one entry per
+  // ticked row, scope/channels from whether commands is an array, postTo carried as-is (ensureRouteState's
+  // own comment on routingSetBody explains why postTo is re-validated at SEND time, not here).
+  function selectionFromModel(model) {
+    const selection = {};
+    for (const row of model.rows) {
+      if (row.on) {
+        selection[row.id] = {
+          on: true,
+          scope: Array.isArray(row.commands) ? "chosen" : "all",
+          channels: Array.isArray(row.commands) ? row.commands.slice() : [],
+          postTo: row.postTo,
+        };
+      }
+    }
+    return selection;
+  }
   // PLUGIN_ROUTING:end
+
+  // SERVERS_TAB:begin
+  // #246: pure parts of the Servers tab, the Needs-attention list, and the picker fallback -- no DOM, no
+  // fetch, same split as #244's PLUGIN_CARD_STATE / buildPluginCard and #245's PLUGIN_ROUTING /
+  // buildWhereItLivesStep. Reuses routingData's shape and PLUGIN_ROUTING's own reading of it (that block
+  // sits directly above this one in the page, and server.test.ts's harnesses concatenate the two).
+
+  // "Routed" once at least one plugin has a placement entry (even an empty one, servers: {}) -- outside
+  // routed mode every non-home server's commands are null by DESIGN (single mode), never a problem.
+  function routedMode(routing) {
+    return !!(routing && routing.plugins && Object.keys(routing.plugins).length > 0);
+  }
+
+  // One server card's whole picture, decided purely from the raw files plus the plugin list --
+  // commands.state first (what discovery.guilds[].commands says, folded with routed/single mode), then
+  // which plugins live here (routing.plugins[*].servers[guild.id], plus every UNPLACED plugin on the
+  // home card only, byDefault: true), then which webhooks post here. scope/postsTo carry channel NAMES
+  // (falling back to the id when discovery no longer has that channel) -- buildServerCard adds the "#"
+  // and the sentence shape; this is data only.
+  function serverCardModel(guild, routingData, pluginsData) {
+    const routing = (routingData && routingData.routing) || null;
+    const discovery = (routingData && routingData.discovery) || null;
+    const homeId = discovery && discovery.homeGuildId;
+    const home = homeId === guild.id;
+    const routed = routedMode(routing);
+
+    let commands;
+    if (guild.commands && guild.commands.error) {
+      commands = { state: "refused", error: guild.commands.error };
+    } else if (guild.commands) {
+      commands = { state: "live", registered: guild.commands.registered, at: guild.commands.at };
+    } else if (!routed) {
+      commands = { state: "single-mode" };
+    } else {
+      commands = { state: "unregistered" };
+    }
+
+    const pluginList = (pluginsData && pluginsData.plugins) || [];
+    const routingPlugins = (routing && routing.plugins) || {};
+    const webhooksByChannel = (routing && routing.webhooks) || {};
+    const plugins = [];
+    for (const p of pluginList) {
+      const pr = routingPlugins[p.name];
+      const entry = pr && pr.servers && pr.servers[guild.id];
+      if (!entry) continue;
+      const scope =
+        entry.commands === "all"
+          ? "all"
+          : entry.commands.map((chId) => {
+              const ch = guild.channels.find((c) => c.id === chId);
+              return ch ? ch.name : chId;
+            });
+      let postsTo = null;
+      let webhook = "none";
+      if (entry.postTo) {
+        const ch = guild.channels.find((c) => c.id === entry.postTo);
+        postsTo = ch ? ch.name : entry.postTo;
+        const wh = webhooksByChannel[entry.postTo];
+        webhook = !wh ? "none" : wh.broken ? "broken" : "ok";
+      }
+      plugins.push({ name: p.name, scope, postsTo, webhook, byDefault: false });
+    }
+    if (home) {
+      for (const p of pluginList) {
+        if (!routingPlugins[p.name]) plugins.push({ name: p.name, scope: "all", postsTo: null, webhook: "none", byDefault: true });
+      }
+    }
+
+    const webhooks = [];
+    for (const [channelId, wh] of Object.entries(webhooksByChannel)) {
+      if (wh.guildId !== guild.id) continue;
+      const ch = guild.channels.find((c) => c.id === channelId);
+      webhooks.push({ channelId, channelName: ch ? ch.name : null, addedAt: wh.addedAt, addedBy: wh.addedBy, broken: wh.broken });
+    }
+
+    return { id: guild.id, name: guild.name, home, commands, plugins, webhooks };
+  }
+
+  // Servers routing.plugins or routing.webhooks still names but discovery no longer sees -- what each
+  // still holds, so the tab can say what is dropped the next time it changes (#245's same sentence, one
+  // level up: per SERVER rather than per plugin's own unavailable list).
+  function unavailableServers(routingData) {
+    const routing = (routingData && routingData.routing) || null;
+    if (!routing) return [];
+    const discovery = (routingData && routingData.discovery) || null;
+    const knownIds = new Set(((discovery && discovery.guilds) || []).map((g) => g.id));
+    const ids = [];
+    const seen = new Set();
+    const note = (id) => {
+      if (!knownIds.has(id) && !seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+    };
+    for (const pr of Object.values(routing.plugins || {})) {
+      for (const guildId of Object.keys(pr.servers || {})) note(guildId);
+    }
+    for (const wh of Object.values(routing.webhooks || {})) note(wh.guildId);
+    return ids.map((id) => ({
+      id,
+      plugins: Object.keys(routing.plugins || {}).filter((name) => routing.plugins[name].servers && routing.plugins[name].servers[id]),
+      webhooks: Object.keys(routing.webhooks || {}).filter((channelId) => routing.webhooks[channelId].guildId === id),
+    }));
+  }
+
+  // Decision 5's six kinds, in this fixed order, each kind at most once per SUBJECT (a plugin+key, a
+  // server, a channel, a file) -- never a duplicate of the drift banner's own wording beyond the file
+  // name. `labelOf` has settingLabel's own signature, (key, pluginName) => string -- the real caller
+  // passes settingLabel itself; this stays a pure function of its input either way.
+  function needsAttention(input) {
+    const status = input.status;
+    const plugins = input.plugins || [];
+    const routingData = input.routingData;
+    const env = input.env || {};
+    const schema = input.schema || {};
+    const labelOf = input.labelOf;
+    const routing = (routingData && routingData.routing) || null;
+    const discovery = (routingData && routingData.discovery) || null;
+    const out = [];
+
+    for (const p of plugins) {
+      if (p.enabled && p.missingEnv && p.missingEnv.length) {
+        for (const key of p.missingEnv) {
+          out.push({ kind: "missing-setting", text: p.name + " needs " + labelOf(key, p.name), fix: { label: "Fill it in", go: "plugins-card:" + p.name } });
+        }
+      }
+    }
+    for (const key of Object.keys(schema)) {
+      const s = schema[key];
+      if (s && s.required && s.source !== "plugin" && !env[key]) {
+        out.push({ kind: "missing-setting", text: key + " is required and blank", fix: { label: "Set it", go: "settings" } });
+      }
+    }
+
+    const routed = routedMode(routing);
+    for (const g of (discovery && discovery.guilds) || []) {
+      if (g.commands && g.commands.error) {
+        out.push({ kind: "commands-refused", text: g.name + ": Discord refused the bot's commands (" + g.commands.error + ")", fix: { label: "Re-invite, then try again", go: "servers" } });
+      } else if (!g.commands && routed) {
+        out.push({ kind: "commands-unregistered", text: g.name + ": commands were never registered", fix: { label: "Try again", go: "retry" } });
+      }
+    }
+
+    for (const [channelId, wh] of Object.entries((routing && routing.webhooks) || {})) {
+      if (!wh.broken) continue;
+      const guild = discovery && discovery.guilds && discovery.guilds.find((g) => g.id === wh.guildId);
+      const channel = guild && guild.channels.find((c) => c.id === channelId);
+      const where = guild ? guild.name : wh.guildId;
+      out.push({ kind: "webhook-broken", text: "#" + (channel ? channel.name : channelId) + " in " + where + ": its webhook stopped working (" + wh.broken + ")", fix: { label: "Add it again", go: "servers" } });
+    }
+
+    if (discovery && discovery.homeGuildId) {
+      const homeSeen = discovery.guilds.some((g) => g.id === discovery.homeGuildId);
+      if (!homeSeen) {
+        out.push({
+          kind: "home-missing",
+          text: "The home server (" + discovery.homeGuildId + ") is not one the bot is in, so every plugin nobody has placed is registered nowhere",
+          fix: { label: "Set the home server", go: "settings" },
+        });
+      }
+    }
+
+    for (const file of (status && status.outdatedFiles) || []) {
+      out.push({ kind: "outdated-files", text: file + " is out of date on this instance", fix: { label: "Re-run ops/install.sh", go: "none" } });
+    }
+
+    return out;
+  }
+
+  // Decision 6: options for a server/channel picker, in the shape buildEnvControl's new branch consumes
+  // ({ value, label, group? }[]). A stored value with no matching option (a since-left server, a deleted
+  // channel) is kept as its own trailing option instead of silently dropped -- same rule the plain
+  // select branch already applies to an out-of-enum value.
+  function pickerOptions(key, discovery, value) {
+    const guilds = (discovery && discovery.guilds) || [];
+    const options = [];
+    if (key === "DISCORD_SERVER_ID") {
+      options.push({ value: "", label: "— none: register globally —" });
+      for (const g of guilds) options.push({ value: g.id, label: g.name });
+    } else {
+      options.push({ value: "", label: "— default —" });
+      for (const g of guilds) {
+        for (const c of g.channels) {
+          options.push({ value: c.id, label: "#" + c.name + (c.canSend ? "" : " · the bot can't post here"), group: g.name });
+        }
+      }
+    }
+    if (value !== "" && !options.some((o) => o.value === value)) {
+      options.push({ value, label: value + " (not visible to the bot)" });
+    }
+    return options;
+  }
+  // SERVERS_TAB:end
 
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
@@ -3072,6 +3888,10 @@
     if (!target || typeof target.closest !== "function" || !target.closest("#env-fields, #plugins-list")) return;
     if (target.closest(".plug__admin")) return;
     if (target.closest(".route")) return;
+    // #246: the Servers tab has no [data-key]/data-plugin/data-setting-key/data-secret-key control at
+    // all (a webhook paste is never a config edit), so this is defensive -- the "#env-fields, #plugins-list"
+    // check above already excludes it in practice -- but it is a source pin the tests hold it to.
+    if (target.closest(".servers")) return;
     if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();
