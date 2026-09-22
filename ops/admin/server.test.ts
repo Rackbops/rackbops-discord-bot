@@ -6094,6 +6094,14 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
   // reloadConfig's OWN stub page, the patch's "a reloadConfig run on the stub page".
   interface RC { value: string; checked: boolean; dataset: Record<string, string>; closest: () => null }
   const el = (over: Partial<RC>): RC => ({ value: "", checked: false, dataset: {}, closest: () => null, ...over });
+  // A real element, not null: reloadConfig's own catch writes an error MESSAGE into these two containers
+  // when something inside the try throws (a loader failure, or -- the point of this stub being real
+  // rather than a null-returning shortcut -- an unguarded reapplyCardEdits(null) on a keepEdits:false
+  // run). A stub that answers every id with null makes that write invisible and the guard's own mutant
+  // (RC4) look equivalent when it is not: a real browser's #plugins-list is never null, and the guard's
+  // absence would silently replace the just-rendered cards with the literal string "Error: ...".
+  interface ErrEl { textContent: string }
+  const errEl = (): ErrEl => ({ textContent: "" });
 
   function harness(oldEnv: Record<string, string>, oldPlugins: { name: string; enabled: boolean }[], freshEnv: Record<string, string>, freshPlugins: { name: string; enabled: boolean }[]) {
     // "Current" controls: what's on screen right now (possibly edited). A real render REPLACES these
@@ -6103,6 +6111,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     let boxEls: RC[] = oldPlugins.map((p) => el({ checked: p.enabled, dataset: { plugin: p.name } }));
     const secretEls: RC[] = [];
     const calls = { renderPlugins: 0, renderEnvFields: 0 };
+    const plugsListEl = errEl();
+    const envFieldsEl = errEl();
     const document = {
       querySelectorAll: (selector: string) => {
         if (selector === "#plugins-list input[type=checkbox][data-plugin]") return boxEls;
@@ -6110,7 +6120,7 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
         if (selector === "#plugins-list [data-secret-key]") return secretEls;
         throw new Error("unexpected selector " + selector);
       },
-      getElementById: () => null,
+      getElementById: (id: string) => (id === "plugins-list" ? plugsListEl : id === "env-fields" ? envFieldsEl : null),
     };
     const api = async (path: string) => {
       if (path === "/api/plugins") return { json: async () => ({ plugins: freshPlugins }) };
@@ -6136,7 +6146,7 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
       setRereading: (v: boolean) => void;
     };
-    return { reloadConfig, setRereading, settingEls: () => settingEls, boxEls: () => boxEls, calls };
+    return { reloadConfig, setRereading, settingEls: () => settingEls, boxEls: () => boxEls, calls, plugsListEl, envFieldsEl };
   }
 
   test("an edit typed in a card survives an update button's reload, and is dropped by a Discard", async () => {
@@ -6153,6 +6163,18 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     dropped.setRereading(true);
     await dropped.reloadConfig();
     expect(dropped.settingEls()[0]!.value).toBe("1"); // dropped: back to the fresh baseline
+  });
+
+  test("a dropped-edits (Discard-like) run never writes an error message: nothing is null to reapply onto", async () => {
+    // Round-1 finding: an unguarded reapplyCardEdits(captured) on a keepEdits:false run (captured is
+    // null) throws reading .on off null -- caught by reloadConfig's own catch, which would overwrite
+    // the just-rendered #plugins-list/#env-fields with the literal string "Error: ...". Pins that the
+    // guard (`if (captured) reapplyCardEdits(captured);`) keeps that from ever happening.
+    const dropped = harness({ A: "1" }, [{ name: "music", enabled: false }], { A: "1" }, [{ name: "music", enabled: false }]);
+    dropped.setRereading(true);
+    await dropped.reloadConfig();
+    expect(dropped.plugsListEl.textContent).toBe("");
+    expect(dropped.envFieldsEl.textContent).toBe("");
   });
 
   test("a call while one is already in flight joins it (one fetch, one render), never doubling up", async () => {
