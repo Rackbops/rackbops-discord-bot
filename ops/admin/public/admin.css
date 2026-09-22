@@ -103,14 +103,14 @@
 .adm-fields > .rb-label:first-child {
   margin-top: 0;
 }
-.field-hint {
+.adm-note {
   margin: 0 0 var(--rb-space-1);
   font-size: calc(var(--rb-text-sm) - 1px);
   color: var(--rb-text-faint);
 }
 /* Semantic colour is a bar or a tint, never small text: a danger notice keeps the body text
    colour and carries the severity on a left bar, like .rb-alert. */
-.field-hint--danger,
+.adm-note--danger,
 .plugin-incompat {
   padding: var(--rb-space-2) var(--rb-space-3);
   background: var(--rb-surface-2);
@@ -494,7 +494,7 @@
   max-height: 30vh;
   overflow-y: auto;
 }
-.adm-apply__text .field-hint {
+.adm-apply__text .adm-note {
   margin: 0;
   font-size: var(--rb-text-sm);
   color: var(--rb-text-soft);
@@ -506,11 +506,8 @@
   flex-wrap: wrap;
   gap: var(--rb-space-2);
 }
-/* A control the bar refused (aria-invalid, set by the page script): its border says so too, not only the bar.
-   A chip field's typing input is borderless, so the field around it carries the mark. */
-.adm [aria-invalid="true"] {
-  border-color: var(--rb-danger);
-}
+/* A chip field's typing input is borderless, so its composite wrapper retains the local invalid mark.
+   Shared .rb-input / .rb-select / .rb-textarea invalid borders come from the vendored theme. */
 .tag-field:has([aria-invalid="true"]) {
   border-color: var(--rb-danger);
 }

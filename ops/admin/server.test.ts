@@ -5647,7 +5647,7 @@ describe("admin.css uses tokens only", () => {
     expect(phone).toMatch(/\.adm \.rb-btn[\s\S]*min-height:\s*44px;/);
   });
 
-  test("the Apply bar (#257): sticky at the bottom, stacks on a phone, pads focus scrolling, bounds its text, marks a refused control", () => {
+  test("the Apply bar (#257): sticky at the bottom, stacks on a phone, pads focus scrolling, bounds its text, and keeps only composite invalid styling local", () => {
     const bare = css.replace(/\/\*[\s\S]*?\*\//g, "");
     const rule = (selector: string) => new RegExp(`(^|\\})\\s*${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^{}]*)\\}`).exec(bare)?.[2] ?? "";
     expect(rule(".adm-apply")).toMatch(/position:\s*sticky;[\s\S]*bottom:\s*0;/);
@@ -5676,13 +5676,15 @@ describe("admin.css uses tokens only", () => {
     // 300-line log would push it out of view), while a pasted 3000-character value in a refusal cannot make
     // the bar taller than the bound either.
     expect(rule(".adm-apply__text > strong")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
-    expect(rule(".adm-apply__text .field-hint")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    expect(rule(".adm-apply__text .adm-note")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
     expect(rule(".adm-apply__text")).not.toMatch(/max-height|overflow-y/);
     // The bar takes focus while a request is in flight and shows no ring of its own: the theme's covers it.
     expect(themeCss).toMatch(/:where\(:focus-visible\)\s*\{\s*outline:\s*var\(--rb-focus-ring\);/);
-    // A control the bar refused (the page sets aria-invalid on it) and a chip field around one.
-    expect(rule('.adm [aria-invalid="true"]')).toMatch(/border-color:\s*var\(--rb-danger\);/);
+    // Shared controls get their invalid border from the vendored theme; only the two composite wrappers
+    // remain local because neither is itself a shared .rb-input/.rb-select/.rb-textarea.
+    expect(rule('.adm [aria-invalid="true"]')).toBe("");
     expect(rule('.tag-field:has([aria-invalid="true"])')).toMatch(/border-color:\s*var\(--rb-danger\);/);
+    expect(rule('.route__channels[aria-invalid="true"]')).toMatch(/outline:\s*1px solid var\(--rb-danger\);/);
   });
 
   test("the rules for a plugin's own bare controls sit wholly inside :where(), so a bundle's styling wins", () => {
@@ -6001,7 +6003,7 @@ describe("page skeleton", () => {
       ['label.className = "rb-label";', 4], // a config field's label, plus #244's three card-field builders (stub, plain, secret)
       ['control.className = "rb-select";', 2], // an enum select and the branch chooser
       ['control.className = "rb-input";', 1], // a plain config field
-      ['notice.className = "field-hint field-hint--danger";', 1],
+      ['notice.className = "adm-note adm-note--danger";', 1],
       ['row.className = "admin-row";', 1],
       ['wrapper.className = "tag-field";', 1],
       ['sched.className = "sched";', 1],
@@ -6131,9 +6133,43 @@ describe("page skeleton", () => {
     const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
     expect(renderEnvFields.length).toBeGreaterThan(500);
     expect(renderEnvFields).toContain('if (key === "PLUGINS") continue;');
-    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value)"));
+    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, required)"));
     expect(renderEnvFields).toContain('source === "plugin"');
     expect(renderEnvFields).toContain("pluginKeys.has(key)");
+  });
+
+  test("shared form classes replace the legacy hint class and required semantics reach every builder (#300)", () => {
+    expect(indexSrc).not.toContain("field" + "-hint");
+    expect(indexSrc).toContain('marker.className = "rb-label__required";');
+    expect(indexSrc).toContain('marker.setAttribute("aria-hidden", "true");');
+    expect(indexSrc.split('desc.className = "rb-field__help";').length - 1).toBe(1);
+    expect(indexSrc.split('note.className = "rb-field__help";').length - 1).toBe(1);
+    expect(indexSrc.split('hint.className = "rb-field__help";').length - 1).toBe(1);
+    expect(indexSrc.split('channelHint.className = "rb-field__help";').length - 1).toBe(1);
+    expect(indexSrc.split('channelErr.className = "rb-field__error";').length - 1).toBe(1);
+
+    const setting = indexSrc.slice(indexSrc.indexOf("function buildSettingField("), indexSrc.indexOf("function buildSecretField("));
+    expect(setting).toContain("setRequiredLabel(label, settingLabel(key, p.name), !!schemaRow.required);");
+    expect(setting).toContain("input.required = !!schemaRow.required;");
+    const secret = indexSrc.slice(indexSrc.indexOf("function buildSecretField("), indexSrc.indexOf("function buildPluginCard("));
+    expect(secret).toContain("setRequiredLabel(label, displayLabel, visibleInput && !!schemaRow.required);");
+    expect(secret).toContain("input.required = !!schemaRow.required;");
+    const config = indexSrc.slice(indexSrc.indexOf("function buildTagControl("), indexSrc.indexOf("// ENV_SCHEMA:begin"));
+    expect(config).toContain("add.required = required;");
+    expect(config).toContain("control.required = required;");
+    expect(config).toContain("setRequiredLabel(label, key, required);");
+  });
+
+  test("route field help/error ids preserve the help token while validation comes and goes (#300)", () => {
+    const routeRow = indexSrc.slice(indexSrc.indexOf("function buildRouteRow("), indexSrc.indexOf("function onRouteChange("));
+    expect(routeRow).toContain('channelHint.id = fieldset.id + "-hint";');
+    expect(routeRow).toContain("setDescribedByToken(fieldset, channelHint.id, true);");
+    expect(routeRow).toContain('channelErr.id = fieldset.id + "-error";');
+    const change = indexSrc.slice(indexSrc.indexOf("function onRouteChange("), indexSrc.indexOf("function scheduleRoutingSend("));
+    expect(change).toContain('refs.fieldset.removeAttribute("aria-invalid");');
+    expect(change).toContain("setDescribedByToken(refs.fieldset, refs.channelErr.id, false);");
+    const send = indexSrc.slice(indexSrc.indexOf("async function sendRouting("), indexSrc.indexOf("async function awaitRequestResult("));
+    expect(send).toContain("setDescribedByToken(refs.fieldset, refs.channelErr.id, true);");
   });
 
   test("the bar is wired: the buttons through withBusy, and ONE delegated input and change listener on #app", () => {
@@ -6201,6 +6237,10 @@ describe("page skeleton", () => {
 const applyIndexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
 const applyBlock = (name: string): string =>
   applyIndexSrc.match(new RegExp(`// ${name}:begin\\n([\\s\\S]*?)\\n\\s*// ${name}:end`))?.[1] ?? "";
+const formStatesSrc = applyIndexSrc.slice(
+  applyIndexSrc.indexOf("function setDescribedByToken("),
+  applyIndexSrc.indexOf("// Guarded so a missing tablist"),
+);
 
 interface ApplyChange {
   key: string;
@@ -6798,6 +6838,7 @@ describe("bot-ops.sh's env-set refusals all precede the write (#272: what keeps 
 // bundle renders arbitrary DOM inside this page, so a page-wide [data-key] would be a bug, not a convenience.
 interface StubEl {
   id: string;
+  className?: string;
   hidden: boolean;
   disabled: boolean;
   textContent: string;
@@ -6813,6 +6854,8 @@ interface StubEl {
   focus: (options?: { preventScroll?: boolean }) => void;
   contains: (other: unknown) => boolean;
   closest: (selector: string) => unknown;
+  insertAdjacentElement?: (position: string, element: StubEl) => StubEl;
+  remove?: () => void;
 }
 interface ApplySpec {
   loadedEnv: Record<string, string>;
@@ -6881,6 +6924,7 @@ function runApply(spec: ApplySpec) {
     selectors: [] as string[],
   };
   const state: { active: StubEl | null } = { active: null };
+  let byId: Map<string, StubEl>;
   const makeEl = (id: string, over: Partial<StubEl> = {}): StubEl => {
     let hidden = false;
     let disabled = false;
@@ -6900,6 +6944,11 @@ function runApply(spec: ApplySpec) {
       // dataset.plugAdmin so a spec can prove the panel's own selectors exclude it, without needing a
       // real DOM tree of ancestors.
       closest: (selector: string) => (selector === ".plug__admin" && el.dataset.plugAdmin === "true" ? el : null),
+      insertAdjacentElement: (_position, child) => {
+        byId.set(child.id, child);
+        child.remove = () => void byId.delete(child.id);
+        return child;
+      },
       ...over,
     };
     // The browser drops focus to <body> when the focused element (or one inside it) is hidden -- and, in
@@ -6939,7 +6988,7 @@ function runApply(spec: ApplySpec) {
 
   const baseline = { ...spec.loadedEnv }; // what the server holds: what a re-render restores
   const fieldEntries = Object.entries(spec.fields ?? spec.loadedEnv);
-  const byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go].map((e) => [e.id, e]));
+  byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go].map((e) => [e.id, e]));
   const controls = fieldEntries.map(([key, value]) => {
     const carrier = makeEl(`carrier-${key}`, { value, dataset: { key } });
     // A plain control is its own [data-key] element and carries the id its label points at; a chip
@@ -6976,9 +7025,11 @@ function runApply(spec: ApplySpec) {
 
   const document = {
     body,
+    createElement: () => makeEl(""),
     get activeElement() { return state.active ?? body; },
-    getElementById: (id: string): StubEl => {
+    getElementById: (id: string): StubEl | null => {
       const el = byId.get(id);
+      if (!el && id.endsWith("-error")) return null;
       if (!el) throw new Error(`harness: the page asked for an element it was not given: #${id}`);
       return el;
     },
@@ -7053,7 +7104,7 @@ function runApply(spec: ApplySpec) {
   // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
-    `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
+    `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
       "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
     applyPending: () => Promise<void>;
@@ -7073,6 +7124,7 @@ function runApply(spec: ApplySpec) {
     els: { bar, title, hint, ok, discard, go, tab, body },
     controls,
     boxes,
+    element: (id: string) => byId.get(id) ?? null,
     /** The control the page marks / focuses for `key` (a chip editor's typing input, else the field itself). */
     control: (key: string) => byId.get(`env-${key}`)!,
     edit(key: string, value: string) {
@@ -7146,6 +7198,7 @@ describe("applyPending (#257)", () => {
   test("a blank required field blocks the whole apply, names the key, marks the control invalid, shows its tab, and posts nothing (#45)", async () => {
     // A plugin tick and an unrelated valid change ride along: they are not posted either.
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" }, checked: ticked });
+    page.control("ANNOUNCE_CHANNEL_ID").setAttribute("aria-describedby", "env-ANNOUNCE_CHANNEL_ID-hint");
     await page.run.applyPending();
     expect(page.log.posts).toEqual([]);
     expect(page.view()).toMatchObject({
@@ -7158,6 +7211,12 @@ describe("applyPending (#257)", () => {
     });
     const control = page.control("ANNOUNCE_CHANNEL_ID");
     expect(control.attrs.get("aria-invalid")).toBe("true");
+    expect(control.attrs.get("aria-describedby")).toBe("env-ANNOUNCE_CHANNEL_ID-hint env-ANNOUNCE_CHANNEL_ID-error");
+    expect(page.element("env-ANNOUNCE_CHANNEL_ID-error")).toMatchObject({
+      className: "rb-field__error",
+      textContent: "ANNOUNCE_CHANNEL_ID is required and cannot be blank.",
+    });
+    expect(page.element("env-ANNOUNCE_CHANNEL_ID-error")?.attrs.has("role")).toBe(false);
     expect(page.log.tabs).toEqual([["settings", false]]);
     expect(page.log.focused).toEqual(["env-ANNOUNCE_CHANNEL_ID"]);
     expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 });
@@ -7624,12 +7683,15 @@ describe("Apply bar events (#257)", () => {
 
   test("an edit dismisses a finished message and a refusal, and clears aria-invalid", async () => {
     const refused = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" } });
+    refused.control("ANNOUNCE_CHANNEL_ID").setAttribute("aria-describedby", "env-ANNOUNCE_CHANNEL_ID-hint");
     await refused.run.applyPending();
     const control = refused.control("ANNOUNCE_CHANNEL_ID");
     expect(control.attrs.has("aria-invalid")).toBe(true);
     refused.edit("ANNOUNCE_CHANNEL_ID", "22222");
     refused.run.onControlEdited({ target: inside });
     expect(control.attrs.has("aria-invalid")).toBe(false);
+    expect(control.attrs.get("aria-describedby")).toBe("env-ANNOUNCE_CHANNEL_ID-hint");
+    expect(refused.element("env-ANNOUNCE_CHANNEL_ID-error")).toBeNull();
     expect(refused.view()).toMatchObject({ tone: "", hint: "The bot goes offline for about 20 seconds while it restarts." });
 
     for (const response of [undefined, { ok: false, text: "nope" }]) {
@@ -8838,23 +8900,26 @@ describe("Choose where it lives: source pins (#245)", () => {
 // clearTimeout as plain arrays, advanced by `tick()`) so a debounce/poll never depends on wall-clock time.
 describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => {
   const routingSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function ensureRouteState("), applyIndexSrc.indexOf("async function loadRouting("));
-  const src = applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc;
+  const src = formStatesSrc + "\n" + applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc;
 
   interface FakeEl {
+    id?: string;
     textContent: string;
     hidden?: boolean;
     disabled?: boolean;
     attrs?: Map<string, string>;
     setAttribute?: (n: string, v: string) => void;
     removeAttribute?: (n: string) => void;
+    getAttribute?: (n: string) => string | null;
     appendChild?: (c: unknown) => void;
   }
-  const makeEl = (): FakeEl => {
+  const makeEl = (id?: string): FakeEl => {
     const attrs = new Map<string, string>();
     return {
-      textContent: "", hidden: false, disabled: false, attrs,
+      id, textContent: "", hidden: false, disabled: false, attrs,
       setAttribute: (n, v) => void attrs.set(n, v),
       removeAttribute: (n) => void attrs.delete(n),
+      getAttribute: (n) => attrs.get(n) ?? null,
       appendChild: () => {},
     };
   };
@@ -9292,7 +9357,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     });
     h.seed("music");
     const bodyEl = makeEl();
-    const rowEls = { box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset: makeEl(), channelChecks: new Map([["10", makeEl()], ["11", makeEl()]]), channelErr: makeEl(), postSelect: makeEl(), note: makeEl() };
+    const rowEls = { box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset: makeEl("route-music-100-channels"), channelChecks: new Map([["10", makeEl()], ["11", makeEl()]]), channelErr: makeEl("route-music-100-channels-error"), postSelect: makeEl(), note: makeEl() };
     h.routingStepEls.set("music", { status: makeEl(), statusActions: makeEl(), body: bodyEl, rows: new Map([["100", rowEls]]) });
 
     h.run.onRouteChange("music", "100", "on", true);

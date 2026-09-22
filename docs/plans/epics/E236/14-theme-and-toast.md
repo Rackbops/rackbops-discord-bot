@@ -2,9 +2,9 @@
 Source: the orchestrating session's implementation-plan comment on
 https://github.com/Rackbops/rackbops-discord-bot/issues/300#issuecomment-5771513661 (2026-09-22),
 headed "Implementation plan, part A — written by the orchestrating session, to be executed as
-written." Committed verbatim as the plan, per that heading. Part B (the field-hint sweep and the
-toast adoption) gets its own plan after #246 merges, appended below this Part A section when it
-lands. The "Deviations from the plan" section at the end is this implementing session's own record,
+written." Committed verbatim as the plan, per that heading. Part B1's focused form-state plan is
+appended below Part A; Part B2 retains the toast work after #246. Each "Deviations" section is the
+implementing session's own record,
 not part of the source plan.
 -->
 
@@ -88,3 +88,66 @@ Branch `claude/theme-0-2-42` from `origin/main` (at or after `585ce4b`), isolate
   nothing (exit 1) — and that is the real form of the acceptance bullet's intent ("the card switch is
   `class="rb-switch"` alone"). Both the literal command's real output and the scoped, genuinely-empty
   form are pasted in the PR body rather than silently substituting one for the other.
+
+## Part B1 — adopt shared form states and complete std-lib #210
+
+Written by the orchestrating session against `main` at `a754487` (`@rackbops/styles` 0.2.42 was
+already vendored by Part A). This deliberately separates #210's form-state adoption from Part B2's
+toast work and from #246's Servers behavior.
+
+### Decided scope
+
+1. This PR is form states only: no toast helper, routing outcome change, Servers tab change, or #246 code.
+2. Every old `field-hint` is classified. Help for an editable control becomes `rb-field__help`;
+   non-field panel copy becomes `adm-note` (and `adm-note--danger` for danger copy).
+3. Required Config, plugin plain-setting and visible secret labels use a structured
+   `<span class="rb-label__required" aria-hidden="true">*</span>` and their native controls carry
+   `required` (the tag composite's focus input is its native control).
+4. Rejected Config/plugin fields gain a stable adjacent `rb-field__error`, `aria-invalid="true"`,
+   and an error id appended to `aria-describedby`. Clearing removes only that error and token,
+   preserving help. The Apply bar remains the single live announcement surface.
+5. Route validation uses the same shared help/error classes and stable description ids. The local
+   `.route__channels[aria-invalid="true"]` and `.tag-field:has([aria-invalid="true"])` composite
+   rules remain; the broad `.adm [aria-invalid="true"]` rule is deleted.
+
+### Implementation steps
+
+1. `ops/admin/public/index.html`: add required-marker, token-safe description and inline-error
+   helpers; classify all old hints; add native required semantics; wire refusal/edit/apply/Discard
+   error lifecycle; give route help/error stable ids and preserve help while errors appear/clear.
+2. `ops/admin/public/admin.css`: rename panel notes, delete the broad local invalid rule, retain the
+   tag and route composite rules.
+3. `ops/admin/server.test.ts`: update class/CSS pins and exercise required semantics, the inline
+   error consumer boundary, token preservation, route help/error wiring, and local composite rules.
+4. `CONTEXT.md` and `ops/README.md`: state the shared-vs-local styling ownership.
+
+### Coverage table
+
+| Acceptance outcome | Steps | Test | Mutation that must fail it |
+|---|---|---|---|
+| typecheck and panel tests green | 1–3 | acceptance commands | — |
+| no `field-hint`; true control help/errors use shared classes, other copy uses `adm-note` | 1–3 | source pins plus Apply harness | restore one `field-hint`; classify a control description as `adm-note` |
+| required labels use the shared marker and native controls carry `required` | 1, 3 | Config/plain/secret/tag builder pins | restore string-concatenated `" *"`; omit `required` from one native control |
+| validation is inline, invalid, and described without losing help | 1, 3 | Apply refusal/edit/Discard harness | replace `aria-describedby` instead of adding a token; omit the inline error node |
+| route validation adopts shared help/error and preserves its composite outline | 1–3 | route source/harness pins | remove the help id while adding the error; remove the route composite rule |
+| broad local invalid CSS is gone; tag composite remains | 2, 3 | CSS rule/source test | restore `.adm [aria-invalid]`; delete `.tag-field:has(...)` |
+| browser behavior works in both schemes | 1–2 | manual Chrome acceptance | — |
+
+### Acceptance
+
+```text
+bun run --cwd ops/admin check
+bun test ops/admin/server.test.ts --timeout 20000
+git grep -n "field-hint" -- ops/admin
+git grep -n 'adm \[aria-invalid="true"\]' -- ops/admin/public/admin.css
+```
+
+The two greps must print nothing. The test file runs once at a time with private `TEMP`/`TMP`.
+Mutation-test each behavior-changing line, at minimum the coverage-table mutations. In real Chrome
+with canned current-main data and both schemes: verify Config required/help/error behavior and
+error clearing; required plugin plain and visible secret controls; chosen-with-no-channels route
+error plus retained composite outline; and keyboard reachability.
+
+### Deviations and evidence
+
+To be completed by the implementing session after acceptance, mutation and browser verification.

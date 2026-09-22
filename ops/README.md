@@ -552,7 +552,9 @@ failure's stderr is redacted before it is logged or returned), and (**#123/#165*
 proxied same-origin from that plugin's own published package on the allowlisted CDN host — see
 "Plugin admin tabs" below), and (**#238**) `GET /rb-theme.css` + `GET /admin.css` (the page's two
 stylesheets, read once at startup from `ops/admin/public/` and served by exact path, public at this
-layer like the page itself). The
+layer like the page itself). Vendored `@rackbops/styles` owns form help, error, required-marker and
+ordinary invalid-control styling; `admin.css`'s `.adm-note` is only non-field panel copy, while the
+tag editor and route fieldset retain local invalid outlines because they are composite wrappers. The
 `/api/whoami`, `/api/admins`, `/api/branches`, `/plugin-admin/<name>.js`,
 `/api/plugin-proxy/<name>`, `/rb-theme.css` and `/admin.css` routes never shell out to `bot-ops.sh`;
 `/api/plugins` reads installed state via `status` + `env-get` and fetches the index server-side, and

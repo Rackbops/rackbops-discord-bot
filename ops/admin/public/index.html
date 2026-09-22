@@ -77,7 +77,7 @@
         <input id="logs-filter" class="rb-input" type="text" placeholder="Filter loaded lines…" autocomplete="off" aria-label="Filter loaded log lines" />
         <label class="inline-check rb-label"><input type="checkbox" id="logs-wrap" class="rb-checkbox" checked /> Wrap</label>
       </div>
-      <div id="logs-meta" class="field-hint" style="margin-top: 6px"></div>
+      <div id="logs-meta" class="adm-note" style="margin-top: 6px"></div>
       <pre id="logs-out" class="rb-pre rb-log" style="margin-top: 6px">(not loaded)</pre>
     </section>
   </div>
@@ -134,7 +134,7 @@
   <div id="apply-bar" class="adm-apply" tabindex="-1" hidden>
     <div class="adm-apply__text" role="status">
       <strong id="apply-title"></strong>
-      <span id="apply-hint" class="field-hint"></span>
+      <span id="apply-hint" class="adm-note"></span>
     </div>
     <div class="adm-apply__actions">
       <button id="apply-ok" type="button" class="rb-btn rb-btn--ghost" hidden>OK</button>
@@ -278,6 +278,48 @@
     window.addEventListener("hashchange", () => showTab(tabFromHash(location.hash), false));
   }
   // TABS_DOM:end
+
+  // Shared form-state semantics. aria-describedby is a token list: adding an error must preserve
+  // help, and clearing that error must remove only its own token.
+  function setDescribedByToken(control, id, present) {
+    const tokens = (control.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean);
+    const next = tokens.filter((token) => token !== id);
+    if (present) next.push(id);
+    if (next.length) control.setAttribute("aria-describedby", next.join(" "));
+    else control.removeAttribute("aria-describedby");
+  }
+
+  function setRequiredLabel(label, text, required) {
+    label.textContent = text;
+    if (!required) return;
+    label.appendChild(document.createTextNode(" "));
+    const marker = document.createElement("span");
+    marker.className = "rb-label__required";
+    marker.setAttribute("aria-hidden", "true");
+    marker.textContent = "*";
+    label.appendChild(marker);
+  }
+
+  function clearFieldError(control) {
+    if (!control || !control.id) return;
+    const errorId = control.id + "-error";
+    const error = document.getElementById(errorId);
+    if (error) error.remove();
+    control.removeAttribute("aria-invalid");
+    setDescribedByToken(control, errorId, false);
+  }
+
+  function showFieldError(control, message) {
+    clearFieldError(control);
+    const error = document.createElement("p");
+    error.className = "rb-field__error";
+    error.id = control.id + "-error";
+    error.textContent = message;
+    const anchor = control.closest(".tag-field") || control;
+    anchor.insertAdjacentElement("afterend", error);
+    control.setAttribute("aria-invalid", "true");
+    setDescribedByToken(control, error.id, true);
+  }
   // Guarded so a missing tablist can only cost the tabs, never the token gate (this line runs before
   // the boot code at the bottom of the script, and a throw here would leave the page blank).
   const tablist = document.querySelector('[role="tablist"]');
@@ -825,19 +867,19 @@
     const data = pluginsData;
     if (data && data.stateError) {
       const notice = document.createElement("div");
-      notice.className = "field-hint field-hint--danger";
+      notice.className = "adm-note adm-note--danger";
       notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
       container.appendChild(notice);
     }
     if (data && data.indexError) {
       const notice = document.createElement("div");
-      notice.className = "field-hint";
+      notice.className = "adm-note";
       notice.textContent = "Plugin Index unavailable (" + data.indexError + ") — showing installed plugins only.";
       container.appendChild(notice);
     }
     if (!data || !data.plugins || data.plugins.length === 0) {
       const empty = document.createElement("div");
-      empty.className = "field-hint";
+      empty.className = "adm-note";
       empty.textContent = "No plugins available or installed.";
       container.appendChild(empty);
       return;
@@ -854,7 +896,7 @@
     };
     for (const p of data.plugins) container.appendChild(buildPluginCard(p, ctx));
     const note = document.createElement("div");
-    note.className = "field-hint";
+    note.className = "adm-note";
     note.style.marginTop = "8px";
     note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
@@ -898,7 +940,7 @@
     title.appendChild(document.createTextNode("Turn it on"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Off keeps everything it has stored. Nothing is deleted.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -925,7 +967,7 @@
     body.appendChild(choice);
 
     const verHint = document.createElement("p");
-    verHint.className = "field-hint";
+    verHint.className = "adm-note";
     verHint.textContent = versionLine(p);
     body.appendChild(verHint);
 
@@ -958,7 +1000,7 @@
     title.appendChild(document.createTextNode("Choose where it lives"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Its commands appear only in the servers you tick. Changes here apply at once — no restart.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -974,7 +1016,7 @@
 
     if (model.mode !== "ready") {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent =
         model.mode === "missing"
           ? "The bot hasn't published what it can see yet."
@@ -986,7 +1028,7 @@
         const named = model.rows.filter((r) => r.on).map((r) => r.name);
         const shown = named.concat(model.unavailable);
         const list = document.createElement("p");
-        list.className = "field-hint";
+        list.className = "adm-note";
         list.textContent = shown.length ? "Currently placed in: " + shown.join(", ") + "." : "Currently placed nowhere.";
         body.appendChild(list);
       }
@@ -1025,7 +1067,7 @@
         rows.appendChild(row);
       }
       const gone = document.createElement("p");
-      gone.className = "field-hint";
+      gone.className = "adm-note";
       gone.textContent =
         (model.unavailable.length === 1 ? "1 server" : model.unavailable.length + " servers") +
         " the bot has left are still in this plugin's placement. They are dropped the next time you change it.";
@@ -1134,6 +1176,7 @@
 
     const fieldset = document.createElement("fieldset");
     fieldset.className = "route__channels";
+    fieldset.id = "route-" + plugin + "-" + row.id + "-channels";
     fieldset.hidden = sel.scope !== "chosen";
     const legend = document.createElement("legend");
     legend.className = "rb-label";
@@ -1156,12 +1199,15 @@
       chBox.addEventListener("change", () => onRouteChange(plugin, row.id, "channel", { id: ch.id, checked: chBox.checked }));
     }
     const channelHint = document.createElement("p");
-    channelHint.className = "field-hint";
+    channelHint.className = "rb-field__help";
+    channelHint.id = fieldset.id + "-hint";
     channelHint.textContent =
       "The bot enforces this: a command used elsewhere gets a private reply naming these channels. A thread counts as its parent channel.";
     fieldset.appendChild(channelHint);
+    setDescribedByToken(fieldset, channelHint.id, true);
     const channelErr = document.createElement("p");
-    channelErr.className = "field-hint field-hint--danger";
+    channelErr.className = "rb-field__error";
+    channelErr.id = fieldset.id + "-error";
     channelErr.hidden = true;
     fieldset.appendChild(channelErr);
     controls.appendChild(fieldset);
@@ -1197,7 +1243,7 @@
 
     wrap.appendChild(controls);
     const rowNote = document.createElement("p");
-    rowNote.className = "field-hint";
+    rowNote.className = "adm-note";
     rowNote.hidden = true;
     wrap.appendChild(rowNote);
 
@@ -1233,6 +1279,8 @@
       refs.controls.hidden = !next.on;
       refs.fieldset.hidden = next.scope !== "chosen";
       refs.channelErr.hidden = true;
+      refs.fieldset.removeAttribute("aria-invalid");
+      setDescribedByToken(refs.fieldset, refs.channelErr.id, false);
     }
     scheduleRoutingSend(plugin);
   }
@@ -1265,6 +1313,7 @@
             refs.fieldset.setAttribute("aria-invalid", "true");
             refs.channelErr.textContent = planned.error;
             refs.channelErr.hidden = false;
+            setDescribedByToken(refs.fieldset, refs.channelErr.id, true);
           }
         }
       }
@@ -1597,7 +1646,7 @@
     title.appendChild(document.createTextNode("Fill in its settings"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Secrets can be replaced but never shown again.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -1605,7 +1654,7 @@
     const body = document.createElement("div");
     if (!ctx.indexAvailable && !hasEnv) {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = "Settings can't be shown while the Plugin Index is unavailable.";
       body.appendChild(note);
       step.appendChild(body);
@@ -1622,14 +1671,14 @@
     if (hasBundle && isOpen) {
       if (bundleState.kind === "mismatch") {
         const note = document.createElement("p");
-        note.className = "field-hint";
+        note.className = "adm-note";
         note.textContent =
           "This plugin's settings target admin API v" + (bundleState.declared === undefined ? "unknown" : bundleState.declared) +
           ", but this panel is v" + ctx.panelVer + " — they can't be shown until the versions match.";
         body.appendChild(note);
       } else if (bundleState.kind === "pending") {
         const note = document.createElement("p");
-        note.className = "field-hint";
+        note.className = "adm-note";
         note.textContent = "Settings appear once the plugin is installed (next restart).";
         body.appendChild(note);
       } else {
@@ -1664,7 +1713,7 @@
       label.textContent = settingLabel(key, p.name);
       wrap.appendChild(label);
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = message;
       wrap.appendChild(note);
       addKeyTag(wrap);
@@ -1676,7 +1725,7 @@
     if (owner && owner !== p.name) return stub("Set on the " + owner + " card.");
     if (!schemaRow) return stub("This can't be edited right now — the bot hasn't published this setting yet.");
 
-    if (schemaRow.secret) return buildSecretField(key, settingLabel(key, p.name) + (schemaRow.required ? " *" : ""), schemaRow);
+    if (schemaRow.secret) return buildSecretField(key, settingLabel(key, p.name), schemaRow);
 
     const wrap = document.createElement("div");
     wrap.className = "rb-field";
@@ -1684,20 +1733,21 @@
     const label = document.createElement("label");
     label.className = "rb-label";
     label.htmlFor = controlId;
-    label.textContent = settingLabel(key, p.name) + (schemaRow.required ? " *" : "");
+    setRequiredLabel(label, settingLabel(key, p.name), !!schemaRow.required);
     wrap.appendChild(label);
     const input = document.createElement("input");
     input.className = "rb-input";
     input.id = controlId;
     input.dataset.settingKey = key;
     input.value = loadedEnv[key] ?? "";
+    input.required = !!schemaRow.required;
     wrap.appendChild(input);
     if (e.description) {
       const desc = document.createElement("span");
-      desc.className = "field-hint";
+      desc.className = "rb-field__help";
       desc.id = controlId + "-hint";
       desc.textContent = e.description;
-      input.setAttribute("aria-describedby", desc.id);
+      setDescribedByToken(input, desc.id, true);
       wrap.appendChild(desc);
     }
     addKeyTag(wrap);
@@ -1710,9 +1760,11 @@
   function buildSecretField(key, displayLabel, schemaRow) {
     const wrap = document.createElement("div");
     wrap.className = "rb-field";
-    const label = document.createElement("span");
+    const visibleInput = !schemaRow.isSet || secretsReplacing.has(key);
+    const label = document.createElement("label");
     label.className = "rb-label";
-    label.textContent = displayLabel;
+    label.htmlFor = "secret-" + key;
+    setRequiredLabel(label, displayLabel, visibleInput && !!schemaRow.required);
     wrap.appendChild(label);
 
     const rerenderKeeping = (mutate) => {
@@ -1753,9 +1805,12 @@
       input.autocomplete = "new-password";
       input.placeholder = "Paste the value";
       input.dataset.secretKey = key;
+      input.required = !!schemaRow.required;
       wrap.appendChild(input);
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "rb-field__help";
+      note.id = input.id + "-hint";
+      setDescribedByToken(input, note.id, true);
       if (schemaRow.isSet) {
         const keep = document.createElement("button");
         keep.type = "button";
@@ -2374,7 +2429,7 @@
   // list — seeded with the RAW loaded value so an untouched field records no diff, and recomputed
   // (normalized, no spaces) only once the user actually edits. Per-token validation is left to
   // bot-ops.sh (the enforcing backstop); this just splits on commas, trims, and de-dupes.
-  function buildTagControl(key, value, meta) {
+  function buildTagControl(key, value, meta, required) {
     const wrapper = document.createElement("div");
     wrapper.className = "tag-field";
 
@@ -2389,6 +2444,7 @@
     add.id = "env-" + key; // the field the <label> focuses (wrapper carries dataset.focusId)
     add.placeholder = meta.placeholder || "add…";
     add.autocomplete = "off";
+    add.required = required;
 
     // De-duped so removing a chip (filter-by-value) can't drop two identical entries; the hidden
     // carrier still holds the raw value until an edit, so a de-duped display alone records no diff.
@@ -2439,11 +2495,11 @@
     return wrapper;
   }
 
-  function buildEnvControl(key, value) {
+  function buildEnvControl(key, value, required) {
     const meta = FIELD_META[key] || {};
     // Self-contained composite (its own nested id/data-key/focusId) — return before the common
     // id/dataset tail below, which would otherwise put a second data-key on the wrapper.
-    if (meta.control === "tags") return buildTagControl(key, value, meta);
+    if (meta.control === "tags") return buildTagControl(key, value, meta, required);
     let control;
     if (meta.control === "select") {
       control = document.createElement("select");
@@ -2473,6 +2529,7 @@
     }
     control.id = "env-" + key;
     control.dataset.key = key;
+    control.required = required;
     return control;
   }
 
@@ -2497,22 +2554,26 @@
       if (key === "PLUGINS") continue;
       if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
       const value = loadedEnv[key] ?? "";
-      const control = buildEnvControl(key, value);
+      const required = !!(loadedSchema[key] && loadedSchema[key].required);
+      const control = buildEnvControl(key, value, required);
       const label = document.createElement("label");
       label.className = "rb-label";
-      label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
+      setRequiredLabel(label, key, required);
       // Clicking the label focuses the field; a composite control (tags) points at its nested
       // input via dataset.focusId, since the wrapper itself isn't focusable.
       label.htmlFor = control.dataset.focusId || control.id;
       container.appendChild(label);
+      container.appendChild(control);
       const meta = FIELD_META[key];
       if (meta && meta.hint) {
         const hint = document.createElement("div");
-        hint.className = "field-hint";
+        hint.className = "rb-field__help";
+        hint.id = label.htmlFor + "-hint";
         hint.textContent = meta.hint;
+        const describedControl = document.getElementById(label.htmlFor);
+        if (describedControl) setDescribedByToken(describedControl, hint.id, true);
         container.appendChild(hint);
       }
-      container.appendChild(control);
     }
   }
 
@@ -3025,7 +3086,7 @@
   }
 
   function clearApplyInvalid() {
-    if (applyInvalid) applyInvalid.removeAttribute("aria-invalid");
+    if (applyInvalid) clearFieldError(applyInvalid);
     applyInvalid = null;
   }
 
@@ -3133,7 +3194,7 @@
       bad.key === "PLUGINS" ? null : s && s.source === "plugin" ? (s.secret ? "secret-" : "set-") + bad.key : "env-" + bad.key;
     const control = controlId ? document.getElementById(controlId) : null;
     if (control) {
-      control.setAttribute("aria-invalid", "true");
+      showFieldError(control, bad.message);
       applyInvalid = control;
       control.focus();
     }
