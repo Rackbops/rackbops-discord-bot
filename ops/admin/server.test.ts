@@ -8711,4 +8711,29 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
     expect(st.outcome).toBeNull();
   });
+
+  // The FIRST guard above (before the GET) catches a supersede that already happened by the time the
+  // poll wakes up; this is the SECOND, separate guard (right after the GET resolves) for a supersede that
+  // happens WHILE the read is in flight -- id1 is still the current inflight.id when awaitRequestResult
+  // wakes up and starts its GET, but by the time that GET resolves something else has become inflight.
+  test("a supersede that happens WHILE the GET is in flight is caught by the second guard, not just the first", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [{ id: "id1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async () => {
+        // Simulate a second request superseding this one WHILE this GET is "in flight" -- the mutation
+        // this test targets (RS4) removes exactly the check that must catch this.
+        h.routeState.get("music")!.inflight = { id: "id2", sentServers: ["200"], startedAt: Date.now() };
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.routeState.set("music", { selection: {}, inflight: { id: "id1", sentServers: ["100"], startedAt: Date.now() - 5000 }, outcome: null } as never);
+    const pending = h.run.awaitRequestResult("music", "id1", ["100"], Date.now() - 5000);
+    await h.clock.tick();
+    await pending;
+    const st = h.routeState.get("music")!;
+    // id1's own poll must NOT have written an outcome over id2's now-current inflight entry.
+    expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
+    expect(st.outcome).toBeNull();
+  });
 });
