@@ -14,18 +14,29 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { isPidAlive, MAX_AGE_MS, sweepStaleTestDirs, TEST_DATA_PREFIX } from "./sweep";
 
 // Sweep PREVIOUS runs' dirs before making this one, rather than removing our own on the way out:
 // bun's test runner does not run `process.on("exit")` or `"beforeExit"` handlers (measured on Bun
 // 1.3.14 — neither fired), so an exit hook here would be dead code claiming a cleanup that never
-// happens. Sweeping on entry runs for certain and bounds accumulation at one directory.
-const TEST_DATA_PREFIX = "rackbops-bot-test-data-";
-for (const entry of readdirSync(tmpdir())) {
-  if (entry.startsWith(TEST_DATA_PREFIX)) {
-    rmSync(join(tmpdir(), entry), { recursive: true, force: true });
-  }
-}
-process.env.BOT_DATA_DIR = mkdtempSync(join(tmpdir(), TEST_DATA_PREFIX));
+// happens. Sweeping on entry runs for certain.
+//
+// #252: bounded by LIVENESS AND AGE, not "at one directory" — a directory whose embedded pid is
+// still alive and under an hour old is a concurrently running suite's own `BOT_DATA_DIR`, not a
+// leftover, and sweeping it out from under that run (two `bun test` invocations on one machine,
+// routine with several agent sessions working this repo) silently corrupted whatever it did next in
+// a test that had nothing to do with the cause. See `test/sweep.ts` for the pure decision logic.
+const tmp = tmpdir();
+sweepStaleTestDirs({
+  tmp,
+  entries: readdirSync(tmp),
+  now: Date.now(),
+  mtimeOf: (name) => statSync(join(tmp, name)).mtimeMs,
+  isAlive: isPidAlive,
+  maxAgeMs: MAX_AGE_MS,
+  remove: (name) => rmSync(join(tmp, name), { recursive: true, force: true }),
+});
+process.env.BOT_DATA_DIR = mkdtempSync(join(tmp, `${TEST_DATA_PREFIX}${process.pid}-`));
 
 // Snapshot the checkout's real data files BEFORE anything can read or write them, so the guard
 // test can prove they were left byte-identical. `null` means "absent", which is a valid snapshot

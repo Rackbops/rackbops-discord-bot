@@ -380,7 +380,13 @@ _Avoid_: server list, guild cache
   silently revert the whole protection. Note the preload is rooted at the repo — `bunfig.toml` is
   not walked up to, so `ops/admin`'s own package does not get it. Harmless today (no `ops/**` test
   imports `src/`), and the `NODE_ENV=test` refusal makes it fail loudly rather than corrupt if one
-  ever does — but **run the suite from the repo root**.
+  ever does — but **run the suite from the repo root**. **#252:** the preload's cleanup of a
+  previous run's `rackbops-bot-test-data-*` directory is bounded by LIVENESS AND AGE (a directory
+  whose embedded pid — the name is now `<prefix><pid>-<random>` — is still alive and under an hour
+  old is left alone), not "at most one directory" as it used to claim: sweeping every same-prefixed
+  directory unconditionally deleted a CONCURRENTLY running suite's own `BOT_DATA_DIR` out from under
+  it (two agent sessions' `bun test` runs on one machine is routine, not a corner case). See
+  `test/sweep.ts` for the pure decision logic and its own tests.
 - **A promise that never settles does not fail a Bun test on Windows: it hangs the run (#259).** With
   nothing else pending, Bun 1.3.14 on Windows neither applies the per-test timeout nor exits — a control
   with a live timer beside it fails cleanly at 5 s, the lone never-settling promise does not — so a
@@ -793,17 +799,30 @@ _Avoid_: server list, guild cache
   chance to run. Concurrent dispose makes N plugins cost the same worst case as one, so the outer
   bound stays a fixed, small backstop regardless of how many plugins are installed — not a value
   that would need to grow with the plugin count.
-- **`writeJsonAtomic`'s temp name is per-process-unique (`${path}.${pid}.${counter}.tmp`) since
-  #154, not the earlier fixed `${path}.tmp`.** The concrete hazard: the replacement's boot-time
-  `loadPluginIndex` cache write (`index.ts`, before `takeOver` — so before the "the standby writes
-  nothing until it has taken over" invariant `state.json` relies on even applies) and the
-  original's still-running `pluginUpdates` tick re-fetching the same manifest are two DIFFERENT
-  PROCESSES that can both write `data/plugins/index.json` during a handoff — a fixed temp name let
-  either process's rename fail with `ENOENT` out from under the other. `src/plugins/index.ts` keeps
-  its own deliberate copy of the atomic-write pattern (see that file's header — dependency-light on
-  purpose) rather than importing `storage.ts`, so it needed the identical fix applied twice, by
-  hand; the two must be kept in sync. In-process races are unaffected — `createJsonWriter`/
-  `createKeyedJsonMutator` still own that, unchanged.
+- **`writeJsonAtomic`'s temp name is unique per (process TOKEN, call) since #253 — a pid+counter
+  name ALONE (#154's original fix, `${path}.${pid}.${counter}.tmp`) is not enough, and #253 found
+  the gap `#154` left.** The concrete hazard: the replacement's boot-time `loadPluginIndex` cache
+  write (`index.ts`, before `takeOver` — so before the "the standby writes nothing until it has
+  taken over" invariant `state.json` relies on even applies) and the original's still-running
+  `pluginUpdates` tick re-fetching the same manifest are two DIFFERENT PROCESSES that can both write
+  `data/plugins/index.json` during a handoff — a fixed temp name let either process's rename fail
+  with `ENOENT` out from under the other. #154's per-(process, call) name fixed that for two
+  processes in different pid namespaces, but the bot runs under an init (`docker-compose.yml`'s
+  `init: true`), so the original and its replacement — two DIFFERENT containers, each its own pid
+  namespace — are very likely the SAME small pid, both starting their own in-memory `tmpCounter` at
+  zero: their first writes to a shared path picked the identical "unique" name, the exact collision
+  #154 was supposed to rule out. `TMP_TOKEN` (`storage.ts`, `randomBytes(4).toString("hex")`, chosen
+  once per process at module load) is what actually separates two processes whose pid AND counter
+  both happen to match — `tmpPathFor(path, pid, token, counter)` is the one exported pure function
+  the guarantee runs through, testable without two real processes. `src/plugins/index.ts` keeps its
+  own deliberate copy of the atomic-write pattern (see that file's header — dependency-light on
+  purpose) rather than importing `storage.ts`, so it needed the identical #154 fix applied twice, by
+  hand, and **still carries only the pid+counter shape #253 found insufficient** — #253's PR
+  deliberately left it as-is (`src/storage.ts`/`writeJsonAtomic` only; see the issue's own scope
+  note), so the same handoff-collision risk this bullet describes still applies to
+  `data/plugins/index.json` specifically, unlike every other file `writeJsonAtomic` itself writes.
+  In-process races are unaffected either way — `createJsonWriter`/`createKeyedJsonMutator` still own
+  that, unchanged.
 - **A second `/update` mid-swap answers `busy`** — the guard sits at the top of
   `checkForUpdate`, before any state write or network call, because interaction handling does
   not quiesce during a handoff (only the scheduler does) and `/update`'s `force: true` bypasses
