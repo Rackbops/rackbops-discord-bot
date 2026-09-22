@@ -161,7 +161,7 @@ error plus retained composite outline; and keyboard reachability.
   `git grep -n "field-hint" -- ops/admin` and
   `git grep -n -F '.adm [aria-invalid="true"]' -- ops/admin/public/admin.css` both printed nothing
   (the expected git-grep exit 1 for no matches).
-- **Mutation matrix:** 59 one-at-a-time mutants in detached/disposable worktrees;
+- **Mutation matrix through round 2:** 59 one-at-a-time mutants in detached/disposable worktrees;
   `bot-300-form-states-mutations`; every final mutant was killed, and each run executed the full
   focused test file. The first 19 covered a restored legacy hint,
   a control help misclassified as `adm-note`, string-only and exposed required markers, missing native
@@ -233,6 +233,21 @@ error plus retained composite outline; and keyboard reachability.
   mutation categories without their exact failing test names. The grep is now literal and was executed
   empty; the builder now renders `p` and has the executed rendered-builder/mutation guard above; and
   every mutant is mapped to its exact failing test above. These fixes require a fresh whole-state round.
+- **Review gate round 3, correctness lens:** NOT SOUND. A Config refusal survived in the Apply bar but
+  lost its inline error and ARIA state when a successful plugin request ran the keep-edits reload:
+  `renderEnvFields()` replaced `#env-fields`, while the existing transfer helper covered only
+  `#plugins-list`. The reproduced fix now captures Config invalid state before that replacement,
+  clears the detached control, and restores the error/message/description tokens onto the rebuilt
+  control. The test executes the production `renderEnvFields()` boundary and passed as
+  `1 pass`, `0 fail`, `24 expect() calls`; `bunx tsc --noEmit` also passed. A full run on this Windows
+  shell reached `777 pass`, `1 skip`, `4 fail`, `3415 expect() calls`, and `Ran 782 tests across 1 file`;
+  all four failures are the known host inability to spawn `bash` (`uv_spawn 'bash' EPERM`), not product
+  assertions. The earlier clean-suite count above predates this round-3 fix and must not be represented
+  as a clean run of current HEAD.
+- **Paused handoff (2026-09-22):** the user explicitly stopped the process before round 4 and directed
+  that no issue be closed on a failed review. The round-3 fix is committed, but its new lines still need
+  one-at-a-time mutation runs and the whole merged state still needs the fresh two-lens round required
+  after a behavior fix. Keep the PR draft and keep #210/#300 open until that round is SOUND.
 - **Real Chrome, canned current-main data:** the complete pre-review pass in both `arcane-obsidian`
   and `arcane-parchment` rendered the
   blank required Config refusal with native `required`, focused invalid control, adjacent
