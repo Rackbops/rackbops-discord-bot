@@ -6260,8 +6260,11 @@ describe("page skeleton", () => {
   });
 
   test("every non-field note remains panel copy, not shared field help (#300)", () => {
-    expect(indexSrc.split('class="adm-note"').length - 1).toBe(2);
-    expect(indexSrc.split('className = "adm-note";').length - 1).toBe(15);
+    // Static markup notes: #244's logs-meta and apply-hint, plus #246's servers-status.
+    expect(indexSrc.split('class="adm-note"').length - 1).toBe(3);
+    // Scripted panel notes: #300's original set, plus the 12 #246 Servers/Needs-attention/webhook
+    // notices reclassified off the legacy hint class when this branch merged #246 (all panel copy).
+    expect(indexSrc.split('className = "adm-note";').length - 1).toBe(27);
     expect(indexSrc.split('className = "adm-note adm-note--danger";').length - 1).toBe(1);
   });
 
@@ -7258,7 +7261,10 @@ function runApply(spec: ApplySpec) {
   // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal", "FIELD_META", "buildEnvControl",
-    `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n${renderEnvFieldsSrc}\n` +
+    `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
+      // #246 module-level Set that renderEnvFields reads/writes; no picker keys exist in this Config
+      // harness, so it stays empty and buildEnvControl's preservePicker is always false here.
+      "let pickerKeysShown = new Set();\n" + `${renderEnvFieldsSrc}\n` +
       "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, capturePluginApplyInvalidForRender, captureConfigApplyInvalidForRender, restoreApplyInvalidAfterRender, renderEnvFields, cardHeaderEls, openCards };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal, { ANNOUNCE_CHANNEL_ID: { hint: "Where notifications are sent." } }, buildEnvControl) as {
     applyPending: () => Promise<void>;
@@ -10593,7 +10599,15 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     };
     const fn = new Function(
       "document", "routingData", "pluginsData",
-      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\n` +
+      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n` +
+        // #300's form-state helpers decorate each rebuilt Config field (required marker, describedby
+        // token) and its Config-refusal capture/restore. All are irrelevant to what this harness asserts
+        // -- picker preservation across renders -- and setDescribedByToken/setRequiredLabel need DOM
+        // methods this tiny synthetic element does not implement. Neutral stubs keep renderEnvFields's
+        // decoration calls no-ops here; those helpers are exercised for real in the applyPending harness
+        // and the #300 builder tests.
+        "const setRequiredLabel = () => {};\nconst setDescribedByToken = () => {};\nconst captureConfigApplyInvalidForRender = () => null;\nconst restoreApplyInvalidAfterRender = () => {};\n" +
+        `${envSrc}\n` +
         "return { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers, renderEnvFields, setRoutingData: (next) => { routingData = next; }, setConfig: (env, schema) => { loadedEnv = env; loadedSchema = schema; } };",
     );
     const result = fn(document, routingDataInit, config.pluginsData ?? null) as {
