@@ -6003,6 +6003,18 @@ describe("page skeleton", () => {
       ['card.className = "rb-card plug";', 1],
       ['body.className = "plug__body";', 1],
       ['root.className = "plug__admin";', 1], // a plugin's own bundle mount point, inside its card
+      // #245: "Choose where it lives" -- label.className stays 4 above (this step's labels are
+      // legend.className / postLabel.className, deliberately not "label", so as not to move that count).
+      ['step.className = "step route";', 1],
+      ['status.className = "route__status";', 1],
+      ['summary.className = "route__summary";', 1],
+      ['rows.className = "route__rows";', 1],
+      ['wrap.className = "route__row";', 1], // a placed-server row
+      ['row.className = "route__row route__row--off";', 1], // a server the bot has left
+      ['controls.className = "route__controls";', 1],
+      ['fieldset.className = "route__channels";', 1],
+      ['postSelect.className = "rb-select";', 1],
+      ['badge.className = "rb-badge rb-badge--success";', 1], // the Live badge
     ];
     for (const [fragment, count] of expected) {
       expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
@@ -6014,16 +6026,16 @@ describe("page skeleton", () => {
     // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES), minus the two save blocks #257 deleted
     // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC).
     // #244: PLUGIN_BADGES is gone (replaced by PLUGIN_CARD_STATE), plus PLUGIN_SETTING_LABEL and
-    // PLUGIN_EDITS. A rename or a deleted marker would otherwise leave a lifted `new Function`
-    // evaluating an empty string.
+    // PLUGIN_EDITS. #245 adds PLUGIN_ROUTING. A rename or a deleted marker would otherwise leave a
+    // lifted `new Function` evaluating an empty string.
     const names = [
       "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
-      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS",
+      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING",
     ];
-    expect(names.length).toBe(21);
+    expect(names.length).toBe(22);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -7249,7 +7261,7 @@ describe("applyPending (#257)", () => {
       expect({ body, title: real.view().title }).toEqual({ body, title: "Applied. The bot restarted with your changes." });
     }
     // ... and a later apply on the same page (the edit is still pending) is not stuck on the earlier answer.
-    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
     expect(page.view().title).toBe("1 change needs a restart");
     spec.response = { ok: true, text: '{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}' };
     await page.run.applyPending();
@@ -8054,7 +8066,7 @@ describe("the bar while the page re-reads (#275)", () => {
     expect(page.view()).toMatchObject({ hidden: true, ...BUTTONS_FREE });
     // ... and a new edit is applied normally
     page.edit("WATCHED_REPOS", "ap");
-    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
     expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, ...BUTTONS_FREE });
     await page.run.applyPending();
     expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=ap"]);
@@ -8566,5 +8578,781 @@ describe("plugin badge classes (lifted from index.html)", () => {
   test("a badge with no kind (or one it doesn't know) is the plain badge", () => {
     expect(makeBadge("disabled", null).className).toBe("rb-badge plugin-badge");
     expect(makeBadge("x", "constructor").className).toBe("rb-badge plugin-badge constructor"); // a Map, not an object lookup
+  });
+});
+
+// #245: "Choose where it lives" -- pure parts, lifted the same way #244's blocks are (the
+// PLUGIN_CARD_STATE describe, above, is the model).
+describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
+  const src = applyBlock("PLUGIN_ROUTING");
+  type Channel = { id: string; name: string; canSend: boolean; webhook: "none" | "ok" | "broken" };
+  type Row = { id: string; name: string; on: boolean; commands: "all" | string[]; postTo: string | null; channels: Channel[] };
+  type Model = { mode: "missing" | "stale" | "ready"; generatedAt: string | null; home: { id: string; name: string | null } | null; placed: boolean; posts: boolean; rows: Row[]; unavailable: string[] };
+  type Outcome =
+    | { phase: "waiting" }
+    | { phase: "timeout" }
+    | { phase: "refused"; reason: string }
+    | { phase: "applied"; live: boolean; at: string; servers: Record<string, { state: string; error?: string }> };
+  const fns = new Function(`"use strict";\n${src}\nreturn { isDiscoveryStale, routingStepModel, placementSummary, channelOptionLabel, routingSetBody, requestOutcome };`)() as {
+    isDiscoveryStale: (generatedAt: unknown, now: number) => boolean;
+    routingStepModel: (pluginName: string, routingData: unknown, now: number) => Model;
+    placementSummary: (model: Model) => string;
+    channelOptionLabel: (channel: Channel) => string;
+    routingSetBody: (pluginName: string, selection: Record<string, unknown>, model: Model) => { body: { plugin: string; servers: Record<string, unknown> } } | { error: string };
+    requestOutcome: (routingData: unknown, id: string, sentServers: string[], active: boolean, startedAt: number, now: number) => Outcome;
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+    expect(src).toContain("function routingStepModel(");
+  });
+
+  // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed).
+  const HOME = "100", OTHER = "200", GONE = "999";
+  const GEN_CH = "10", SP_CH = "11", AN_CH = "12", OTHER_CH = "20";
+  const NOW = Date.parse("2026-09-22T12:00:00.000Z");
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:30:00.000Z",
+    bot: { id: "b1", username: "bot" },
+    inviteUrl: "https://discord.com/invite-url",
+    homeGuildId: HOME,
+    guilds: [
+      {
+        id: HOME,
+        name: "Home",
+        channels: [
+          { id: GEN_CH, name: "general", canSend: true },
+          { id: SP_CH, name: "spotify", canSend: true },
+          { id: AN_CH, name: "announcements", canSend: false },
+        ],
+        commands: { registered: 3, at: "2026-09-22T11:30:00.000Z" },
+      },
+      { id: OTHER, name: "Other", channels: [{ id: OTHER_CH, name: "chat", canSend: true }], commands: null },
+    ],
+    plugins: { music: { posts: true, commands: ["rsetlist"] }, warbandeer: { posts: false, commands: ["rgear"] } },
+  };
+  const routing = {
+    v: 1 as const,
+    updatedAt: "2026-09-22T11:00:00.000Z",
+    updatedBy: "admin",
+    plugins: {
+      music: { servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [GONE]: { commands: "all" as const } } },
+      nowhere: { servers: {} },
+    },
+    webhooks: {
+      [AN_CH]: { id: AN_CH, guildId: HOME, addedAt: "t", addedBy: "a" },
+      [GEN_CH]: { id: GEN_CH, guildId: HOME, addedAt: "t", addedBy: "a", broken: "410" },
+    },
+    results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[],
+  };
+  const routingData = { routing, discovery };
+
+  test("routingStepModel: missing, stale and ready", () => {
+    expect(fns.routingStepModel("music", { routing, discovery: null }, NOW).mode).toBe("missing");
+    const stale = { ...discovery, generatedAt: new Date(NOW - 61 * 60 * 1000).toISOString() };
+    expect(fns.routingStepModel("music", { routing, discovery: stale }, NOW).mode).toBe("stale");
+    const fresh = { ...discovery, generatedAt: new Date(NOW - 59 * 60 * 1000).toISOString() };
+    expect(fns.routingStepModel("music", { routing, discovery: fresh }, NOW).mode).toBe("ready");
+    const badDate = { ...discovery, generatedAt: "not a date" };
+    expect(fns.routingStepModel("music", { routing, discovery: badDate }, NOW).mode).toBe("stale");
+  });
+
+  test("routingStepModel: rows follow discovery order with the saved placement folded in; a placed server the bot has left is unavailable; posts comes from discovery", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    expect(m.rows.map((r) => r.id)).toEqual([HOME, OTHER]);
+    expect(m.rows[0]).toMatchObject({ id: HOME, on: true, commands: [SP_CH], postTo: AN_CH });
+    expect(m.rows[1]).toMatchObject({ id: OTHER, on: false, commands: "all", postTo: null });
+    expect(m.unavailable).toEqual([GONE]);
+    expect(m.posts).toBe(true);
+    expect(fns.routingStepModel("warbandeer", routingData, NOW).posts).toBe(false);
+    expect(fns.routingStepModel("no-such-plugin", routingData, NOW).posts).toBe(false);
+    expect(m.rows[0]!.channels).toEqual([
+      { id: GEN_CH, name: "general", canSend: true, webhook: "broken" },
+      { id: SP_CH, name: "spotify", canSend: true, webhook: "none" },
+      { id: AN_CH, name: "announcements", canSend: false, webhook: "ok" },
+    ]);
+  });
+
+  test("placementSummary: the five sentences", () => {
+    const unplacedHome = fns.routingStepModel("never-placed-1", routingData, NOW);
+    expect(fns.placementSummary(unplacedHome)).toBe("Lives in the home server (Home) by default and posts to the default channel. Tick a server to place it.");
+
+    const discHomeGone = { ...discovery, homeGuildId: "777" };
+    const unplacedHomeGone = fns.routingStepModel("never-placed-2", { routing, discovery: discHomeGone }, NOW);
+    expect(fns.placementSummary(unplacedHomeGone)).toBe(
+      "Lives in the home server by default, but the bot is not in it, so its commands are registered nowhere. Tick a server to place it.",
+    );
+
+    const discNoHome = { ...discovery, homeGuildId: null };
+    const unplacedNoHome = fns.routingStepModel("never-placed-3", { routing, discovery: discNoHome }, NOW);
+    expect(fns.placementSummary(unplacedNoHome)).toBe("Lives in every server by default (no home server is set). Tick a server to place it.");
+
+    const routing1 = { ...routing, plugins: { ...routing.plugins, one: { servers: { [HOME]: { commands: "all" as const } } } } };
+    expect(fns.placementSummary(fns.routingStepModel("one", { routing: routing1, discovery }, NOW))).toBe("In 1 server.");
+
+    const routing3 = { ...routing, plugins: { ...routing.plugins, three: { servers: { [HOME]: { commands: "all" as const }, [OTHER]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } } } };
+    expect(fns.placementSummary(fns.routingStepModel("three", { routing: routing3, discovery }, NOW))).toBe("In 3 servers.");
+
+    expect(fns.placementSummary(fns.routingStepModel("nowhere", routingData, NOW))).toBe(
+      "Nowhere: its commands appear in no server. There is no way back to the default. Tick a server instead.",
+    );
+  });
+
+  test("channelOptionLabel: plain, webhook, broken webhook, cannot post", () => {
+    expect(fns.channelOptionLabel({ id: "1", name: "general", canSend: true, webhook: "none" })).toBe("#general");
+    expect(fns.channelOptionLabel({ id: "1", name: "announcements", canSend: true, webhook: "ok" })).toBe("#announcements · webhook");
+    expect(fns.channelOptionLabel({ id: "1", name: "announcements", canSend: true, webhook: "broken" })).toBe("#announcements · webhook stopped working");
+    expect(fns.channelOptionLabel({ id: "1", name: "mod-only", canSend: false, webhook: "none" })).toBe("#mod-only · the bot can't post here");
+  });
+
+  test("routingSetBody: the whole map, all-or-list, postTo only when the plugin posts, unavailable servers dropped, an empty chosen list refused", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    const sel = {
+      [HOME]: { on: true, scope: "chosen", channels: [SP_CH], postTo: AN_CH },
+      [OTHER]: { on: true, scope: "all", channels: [], postTo: null },
+    };
+    expect(fns.routingSetBody("music", sel, m)).toEqual({
+      body: { plugin: "music", servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [OTHER]: { commands: "all" } } },
+    });
+    const selWithGone = { ...sel, [GONE]: { on: true, scope: "all", channels: [], postTo: null } };
+    const planned = fns.routingSetBody("music", selWithGone, m) as { body: { servers: Record<string, unknown> } };
+    expect(planned.body.servers[GONE]).toBeUndefined();
+
+    const wb = fns.routingStepModel("warbandeer", routingData, NOW);
+    const selPost = { [HOME]: { on: true, scope: "all", channels: [], postTo: AN_CH } };
+    expect((fns.routingSetBody("warbandeer", selPost, wb) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all" });
+
+    const bad = { [OTHER]: { on: true, scope: "chosen", channels: [], postTo: null } };
+    expect(fns.routingSetBody("music", bad, m)).toEqual({ error: "Pick at least one channel for Other." });
+  });
+
+  // Round-1 review finding: ensureRouteState seeds postTo once, like channels, but unlike channels it was
+  // never re-checked against row.channels at send time -- a channel deleted (or the bot losing visibility
+  // into it) after the selection was seeded would still be sent verbatim, and the bot refuses the WHOLE
+  // request the first time it hits an invalid postTo (validatePluginRouting, src/routing/resolve.ts), for
+  // a channel the operator never touched on this send.
+  test("routingSetBody: a postTo pointing at a channel that is no longer this row's is silently dropped, not sent stale (round-1 finding)", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    // OTHER_CH belongs to the OTHER guild, not HOME -- exactly the shape a stale/moved channel takes.
+    const staleSel = { [HOME]: { on: true, scope: "all", channels: [], postTo: OTHER_CH } };
+    const planned = fns.routingSetBody("music", staleSel, m) as { body: { servers: Record<string, { commands: unknown; postTo?: string }> } };
+    expect(planned.body.servers[HOME]).toEqual({ commands: "all" }); // no postTo field at all
+    // A genuinely valid postTo for the row is still included, unaffected by the fix.
+    const validSel = { [HOME]: { on: true, scope: "all", channels: [], postTo: AN_CH } };
+    const plannedValid = fns.routingSetBody("music", validSel, m) as { body: { servers: Record<string, { commands: unknown; postTo?: string }> } };
+    expect(plannedValid.body.servers[HOME]).toEqual({ commands: "all", postTo: AN_CH });
+  });
+
+  test("requestOutcome: waiting, timeout, refused with the bot's reason, applied-live, applied with a refusing server, applied for an inactive plugin, a sent server discovery lost", () => {
+    const started = NOW - 1000;
+    const emptyResults = { routing: { ...routing, results: [] }, discovery };
+    expect(fns.requestOutcome(emptyResults, "req1", [HOME], true, started, started + 1000)).toEqual({ phase: "waiting" });
+    expect(fns.requestOutcome(emptyResults, "req1", [HOME], true, started, started + 31000)).toEqual({ phase: "timeout" });
+
+    const refused = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: false, reason: "server 999 is not one the bot is in", at: "t" }] }, discovery };
+    expect(fns.requestOutcome(refused, "req1", [HOME], true, started, started + 500)).toEqual({ phase: "refused", reason: "server 999 is not one the bot is in" });
+
+    const liveDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: { registered: 5, at: "t" } } : g)) };
+    const applied = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "2026-09-22T12:05:00.000Z" }] }, discovery: liveDisc };
+    expect(fns.requestOutcome(applied, "req1", [HOME], true, started, started + 500)).toEqual({
+      phase: "applied", live: true, at: "2026-09-22T12:05:00.000Z", servers: { [HOME]: { state: "live" } },
+    });
+    expect((fns.requestOutcome(applied, "req1", [HOME], false, started, started + 500) as { live: boolean }).live).toBe(false);
+
+    const refusingDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: { registered: 0, error: "Missing Access", at: "t" } } : g)) };
+    const appliedRefusing = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery: refusingDisc };
+    expect(fns.requestOutcome(appliedRefusing, "req1", [HOME], true, started, started + 500)).toMatchObject({
+      phase: "applied", live: false, servers: { [HOME]: { state: "refused", error: "Missing Access" } },
+    });
+
+    const unregDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: null } : g)) };
+    const appliedUnreg = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery: unregDisc };
+    expect(fns.requestOutcome(appliedUnreg, "req1", [HOME], true, started, started + 500)).toMatchObject({ live: false, servers: { [HOME]: { state: "unregistered" } } });
+
+    const appliedGone = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    expect(fns.requestOutcome(appliedGone, "req1", [GONE], true, started, started + 500)).toMatchObject({ live: false, servers: { [GONE]: { state: "unseen" } } });
+  });
+});
+
+// #245: source-pin tests -- what #244's equivalent pins do (see "a secret's value stays in one password
+// field", earlier), for the properties no data-level test can see: which DOM attributes a control carries,
+// and where one function's call sits relative to another's.
+describe("Choose where it lives: source pins (#245)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("the routing step's controls are invisible to the Apply bar (source pin)", () => {
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    for (const bad of ["dataset.plugin =", "dataset.settingKey", "dataset.secretKey", "data-plugin", "data-setting-key", "data-secret-key"]) {
+      expect(stepSlice).not.toContain(bad);
+    }
+    const rowSlice = indexSrc.slice(indexSrc.indexOf("function buildRouteRow("), indexSrc.indexOf("function onRouteChange("));
+    expect(rowSlice).toContain("dataset.routeServer");
+    const editedSlice = indexSrc.slice(indexSrc.indexOf("function onControlEdited("), indexSrc.indexOf("function onControlEdited(") + 900);
+    expect(editedSlice).toContain('if (target.closest(".route")) return;');
+  });
+
+  test("the step sits between Turn it on and Fill in its settings (source pin)", () => {
+    const cardStart = indexSrc.indexOf("function buildPluginCard(");
+    const cardSlice = indexSrc.slice(cardStart, indexSrc.indexOf("\n    return card;\n", cardStart));
+    const onIdx = cardSlice.indexOf("buildTurnItOnStep(p, ctx)");
+    const liveIdx = cardSlice.indexOf("buildWhereItLivesStep(");
+    const settingsIdx = cardSlice.indexOf("buildSettingsStep(");
+    expect(onIdx).toBeGreaterThan(-1);
+    expect(liveIdx).toBeGreaterThan(onIdx);
+    expect(settingsIdx).toBeGreaterThan(liveIdx);
+  });
+
+  test("loadRouting is its own path (source pin)", () => {
+    const reloadSlice = indexSrc.slice(indexSrc.indexOf("async function reloadConfig("), indexSrc.indexOf("let loadPlugins ="));
+    expect(reloadSlice).not.toContain("/api/routing");
+    const showAppSlice = indexSrc.slice(indexSrc.indexOf("function showApp("), indexSrc.indexOf("function showApp(") + 400);
+    expect(showAppSlice).toContain("loadRouting();");
+  });
+
+  test("the footnote says where a plugin lives applies at once", () => {
+    expect(indexSrc).toContain("Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.");
+    expect(indexSrc).not.toContain("Changes apply when the bot restarts: they are collected in the bar below until you apply them.");
+  });
+
+  test("the step's own number is hardcoded, not left to buildPluginCard's numbering loop (source pin)", () => {
+    // refreshRoutingSteps replaces this step's DOM standalone, outside buildPluginCard's steps.forEach
+    // numbering loop -- an unset span here goes visibly blank on every routing-only refresh (caught in
+    // real-Chrome verification: the badge showed no digit at all once loadRouting's first poll landed).
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    expect(stepSlice).toContain('className: "step__num", textContent: "2"');
+  });
+});
+
+// #245: the debounce/held/poll state machine -- a dedicated mini-harness (the reloadConfig keepEdits
+// harness, earlier, is the precedent) since these functions touch the DOM and real timers, not the
+// APPLY-style lifted-block shape. Slices its own source directly and injects a manual clock (setTimeout/
+// clearTimeout as plain arrays, advanced by `tick()`) so a debounce/poll never depends on wall-clock time.
+describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => {
+  const routingSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function ensureRouteState("), applyIndexSrc.indexOf("async function loadRouting("));
+  const src = applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc;
+
+  interface FakeEl {
+    textContent: string;
+    hidden?: boolean;
+    disabled?: boolean;
+    attrs?: Map<string, string>;
+    setAttribute?: (n: string, v: string) => void;
+    removeAttribute?: (n: string) => void;
+    appendChild?: (c: unknown) => void;
+  }
+  const makeEl = (): FakeEl => {
+    const attrs = new Map<string, string>();
+    return {
+      textContent: "", hidden: false, disabled: false, attrs,
+      setAttribute: (n, v) => void attrs.set(n, v),
+      removeAttribute: (n) => void attrs.delete(n),
+      appendChild: () => {},
+    };
+  };
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+  function harness(opts: {
+    routingDataInit: unknown;
+    pluginsData?: unknown;
+    apiImpl?: (path: string, init?: { method?: string; body?: string }) => Promise<{ ok: boolean; status?: number; text: () => Promise<string> }>;
+  }) {
+    const posts: { path: string; body?: string }[] = [];
+    const clock = makeClock();
+    const document = { createElement: makeEl, createTextNode: () => ({}) };
+    const setApplyText = (el: FakeEl, text: string) => { if (el.textContent !== text) el.textContent = text; };
+    const pluginsData = opts.pluginsData ?? { plugins: [{ name: "music", active: true }] };
+    const apiImpl = opts.apiImpl;
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      if (init && init.method === "POST") {
+        posts.push({ path, body: init.body });
+        if (apiImpl) return apiImpl(path, init);
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-" + posts.length }) };
+      }
+      if (apiImpl) return apiImpl(path, init);
+      return { ok: true, status: 200, text: async () => "" };
+    };
+    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    // Not part of this slice (buildWhereItLivesStep and friends are browser-only DOM builders, out of
+    // scope for this mini-harness) -- injected as a call-tracked stub so awaitRequestResult's reference
+    // to it resolves instead of throwing (which sendRouting's own catch would otherwise swallow silently,
+    // turning a real ReferenceError into a misleading "posted-error" outcome -- caught once, fixed here).
+    let refreshRoutingStepsCalls = 0;
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    // A real Date subclass (so `new Date(x)`/`.toLocaleString()` elsewhere in the slice keep working)
+    // whose `now()` is independently controllable -- the fake setTimeout/clearTimeout clock never
+    // advances real wall-clock time, so a real 30s wait is otherwise the only way to reach a timeout path.
+    let fakeNow = Date.now();
+    class FakeDate extends Date {
+      static now() { return fakeNow; }
+    }
+    const run = new Function(
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date",
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate) as {
+      onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
+      scheduleRoutingSend: (plugin: string) => void;
+      sendRouting: (plugin: string) => Promise<void>;
+      awaitRequestResult: (plugin: string, id: string, sentServers: string[], startedAt: number) => Promise<void>;
+      resetToSaved: (plugin: string) => void;
+      checkAgain: (plugin: string) => void;
+      refreshDiscovery: (plugin: string) => Promise<void>;
+      ensureRouteState: (plugin: string, model: { mode: string; rows: { id: string; on: boolean; commands: unknown; postTo: string | null }[] }) => { selection: Record<string, unknown>; seeded?: boolean };
+      routeState: Map<
+        string,
+        {
+          inflight: { id: string; sentServers: string[]; startedAt: number } | null;
+          outcome: unknown;
+          selection: Record<string, unknown>;
+          held?: boolean;
+          sendTimer?: unknown;
+          pollTimer?: unknown;
+          lastSent?: { id: string; sentServers: string[] };
+          seeded?: boolean;
+        }
+      >;
+      routingStepEls: Map<
+        string,
+        { status: FakeEl; statusActions: FakeEl; body: FakeEl; rows: Map<string, { box: FakeEl; controls: FakeEl; anyRadio: FakeEl; chosenRadio: FakeEl; fieldset: FakeEl; channelChecks: Map<string, FakeEl>; channelErr: FakeEl; postSelect: FakeEl; note: FakeEl }> }
+      >;
+      setRoutingData: (v: unknown) => void;
+    };
+    // onRouteChange requires a routeState entry to already exist (real usage: ensureRouteState seeds it
+    // on the step's first render, inside buildWhereItLivesStep -- browser-only, not part of this slice).
+    // Every test here drives a plugin already ticked into no servers, matching a freshly-opened card.
+    // seeded: true -- simulates a plugin whose card has already been normally rendered/seeded once
+    // (the realistic precondition for every existing test here), so ensureRouteState's round-3 re-seed
+    // fix (seed once the model first reaches "ready", not once per plugin regardless of mode) never
+    // fires a surprise reseed over a selection a test built by hand via onRouteChange.
+    const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null, seeded: true });
+    return {
+      run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed,
+      refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
+      advanceFakeNow: (ms: number) => { fakeNow += ms; },
+    };
+  }
+
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:59:00.000Z",
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: null,
+    guilds: [
+      { id: "100", name: "Home", channels: [{ id: "10", name: "general", canSend: true }, { id: "11", name: "mod", canSend: true }], commands: { registered: 1, at: "t" } },
+      { id: "200", name: "Other", channels: [{ id: "20", name: "chat", canSend: true }], commands: { registered: 1, at: "t" } },
+    ],
+    plugins: { music: { posts: false, commands: [] } },
+  };
+
+  test("scheduleRoutingSend coalesces a burst into one POST and never sends an unsendable selection", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({ routingDataInit });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    h.run.onRouteChange("music", "100", "scope", "chosen");
+    h.run.onRouteChange("music", "100", "channel", { id: "10", checked: true });
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.posts).toHaveLength(1);
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: ["10"] } } });
+
+    const h2 = harness({ routingDataInit });
+    h2.seed("music");
+    h2.run.onRouteChange("music", "100", "on", true);
+    h2.run.onRouteChange("music", "100", "scope", "chosen"); // no channel ticked -> unsendable
+    await h2.clock.tick();
+    await h2.clock.tick();
+    expect(h2.posts).toHaveLength(0);
+  });
+
+  test("a change made while a request is in flight is held and sent once when the result lands", async () => {
+    let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let n = 0;
+    const apiImpl = async (path: string, init?: { method?: string }) => {
+      if (init && init.method === "POST") {
+        n++;
+        const id = "req" + n;
+        live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id, action: "routing-set", ok: true, at: "t" + n }] } };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify(live), json: async () => live } as unknown as { ok: boolean; text: () => Promise<string> };
+    };
+    // sendRouting's POST reads its response via .text() + JSON.parse; awaitRequestResult's GET poll reads
+    // its own via .json() directly -- both stubbed above, matching each call site exactly (a stub missing
+    // either one fails silently: awaitRequestResult's own try/catch around the GET treats a thrown
+    // "res.json is not a function" as a transient read failure and just loops again, never resolving).
+    const h = harness({ routingDataInit: live, apiImpl: apiImpl as never });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> sendRouting -> POST #1 -> inflight -> poll scheduled
+    expect(h.posts).toHaveLength(1);
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    h.run.onRouteChange("music", "200", "on", true); // arrives while #1 is in flight
+    h.run.onRouteChange("music", "200", "scope", "all"); // a second edit, same held window
+    await h.clock.tick(); // fires: the poll (lands #1) AND a stray debounce this test doesn't rely on
+    await h.clock.tick(); // lets the held follow-up (scheduled from sendRouting's finally) actually run
+    await h.clock.tick();
+    expect(h.posts.length).toBeGreaterThanOrEqual(2);
+    expect(h.posts.length).toBeLessThanOrEqual(2);
+    const secondBody = JSON.parse(h.posts[1]!.body!);
+    expect(secondBody).toEqual({ plugin: "music", servers: { "100": { commands: "all" }, "200": { commands: "all" } } });
+    // Both requests landed ok:true -- each is an "applied" outcome, which must rebuild the whole step
+    // (placementSummary's "unplaced"/"in N servers" sentence goes stale otherwise; caught in real-Chrome
+    // verification, not by a unit test, until this assertion was added).
+    expect(h.refreshRoutingStepsCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an applied outcome rebuilds the whole step (stale summary fix); a refusal only updates the status line", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    const applied = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-a" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-a", action: "routing-set", ok: true, at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    applied.seed("music");
+    applied.run.onRouteChange("music", "100", "on", true);
+    await applied.clock.tick(); // debounce -> POST
+    await applied.clock.tick(); // poll lands ok:true
+    expect(applied.routeState.get("music")?.outcome).toMatchObject({ phase: "applied" });
+    expect(applied.refreshRoutingStepsCalls()).toBe(1);
+
+    const refused = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-b" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-b", action: "routing-set", ok: false, reason: "server 1 is not one the bot is in", at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    refused.seed("music");
+    refused.run.onRouteChange("music", "100", "on", true);
+    await refused.clock.tick();
+    await refused.clock.tick();
+    expect(refused.routeState.get("music")?.outcome).toMatchObject({ phase: "refused" });
+    expect(refused.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  // Round-2 review finding: checkAgain re-polls a request outside sendRouting's own try/finally, which is
+  // the ONLY place that consumed a held edit -- an edit made WHILE a "Check again" poll is running set
+  // held correctly (sendRouting's own in-flight guard fires), but nothing ever re-sent it once checkAgain
+  // settled: the edit was silently and permanently dropped, forever, with no error shown anywhere.
+  test("an edit held while checkAgain's poll is running is still sent once that poll settles (round-2 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    let checkAgainResultReady = false;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-orig" }) };
+        // The GET poll: answers "waiting" (no matching result) until the test flips the flag below,
+        // simulating checkAgain's poll still being genuinely in flight when the held edit is made.
+        const results = checkAgainResultReady ? [{ id: "req-orig", action: "routing-set", ok: false, reason: "still not ready", at: "t" }] : [];
+        const live = { routing: { ...routingDataInit.routing, results }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    // First request: times out (simulated here as "never finds its id", same code path requestOutcome
+    // takes either way) -- stash lastSent directly rather than waiting out a real 30s to reach it, since
+    // the bug is in checkAgain's OWN completion handling, not in how it got a lastSent to retry.
+    h.routeState.get("music")!.lastSent = { id: "req-orig", sentServers: ["100"] };
+    h.run.checkAgain("music");
+    await h.clock.tick(); // checkAgain's poll fires once, sees no matching result yet, loops
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // still in flight -- the held window
+    // An edit arrives while checkAgain's poll is still running.
+    h.run.onRouteChange("music", "200", "on", true);
+    await h.clock.tick(); // the edit's own debounce timer fires -> sendRouting sees inflight -> held=true
+    expect(h.routeState.get("music")?.held).toBe(true);
+    // checkAgain only POLLS the original request (a GET) -- it never POSTs, so nothing has been sent yet.
+    expect(h.posts).toHaveLength(0);
+    // Now let checkAgain's poll actually settle.
+    checkAgainResultReady = true;
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.routeState.get("music")?.held).toBe(false); // consumed, not left dangling
+    expect(h.posts.length).toBeGreaterThanOrEqual(1); // the held edit WAS sent as a follow-up
+    const followUp = JSON.parse(h.posts[h.posts.length - 1]!.body!);
+    expect(followUp.servers["200"]).toBeDefined(); // the server the held edit ticked is actually in it
+  });
+
+  // Same finding, the second place awaitRequestResult's own completion is reached without going through
+  // sendRouting: refreshDiscovery runs its OWN poll loop (not awaitRequestResult, but the same
+  // inflight/held shape), and its completion never checked held either.
+  test("an edit held while refreshDiscovery is in flight is still sent once it settles (round-2 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let discoveryLanded = false;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-1" }) };
+        const results = discoveryLanded ? [{ id: "disco-1", action: "discovery-refresh", ok: true, at: "t" }] : [];
+        const live = { routing: { ...routingDataInit.routing, results }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // the POST fires -> inflight set -> the poll's own wait is scheduled
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // the edit's debounce fires -> sendRouting sees inflight (from the refresh) -> held=true
+    expect(h.routeState.get("music")?.held).toBe(true);
+    discoveryLanded = true;
+    await h.clock.tick();
+    await h.clock.tick();
+    await pending;
+    expect(h.routeState.get("music")?.held).toBe(false); // consumed, not left dangling
+    expect(h.posts.some((p) => { try { return JSON.parse(p.body!).servers?.["100"]; } catch { return false; } })).toBe(true);
+  });
+
+  // Round-3 review finding: ensureRouteState used to seed on the first CALL, not the first READY model.
+  // refreshDiscovery calls it too (to track its own inflight/held) -- and in missing/stale mode
+  // model.rows is always [] (nothing has a name yet), so clicking "Refresh from Discord" from missing
+  // mode (routeState has no entry yet, since buildWhereItLivesStep never seeds in that mode) seeded an
+  // EMPTY selection FOREVER, before the real placement was ever known. The next render (discovery now
+  // landed, ready) reused that empty selection: every row showed unticked while placementSummary (reads
+  // the model, not the selection) still said "In 1 server." -- and the operator's next tick sent
+  // routingSetBody over the empty selection, silently dropping the plugin's real, existing placement.
+  test("ensureRouteState seeds once the model first reaches ready, not on the first call regardless of mode (round-3 finding)", () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
+    const h = harness({ routingDataInit });
+    // First call: missing mode (rows always [] -- nothing has a name yet), the real precondition when
+    // "Refresh from Discord" is clicked on a card whose routeState has never been touched.
+    const missingModel = { mode: "missing", rows: [] };
+    const st1 = h.run.ensureRouteState("music", missingModel);
+    expect(st1.selection).toEqual({});
+    expect(st1.seeded).toBe(false);
+    // Discovery lands: the SAME plugin's model is now ready, with a real saved placement.
+    const readyModel = { mode: "ready", rows: [{ id: "100", on: true, commands: "all" as const, postTo: null }] };
+    const st2 = h.run.ensureRouteState("music", readyModel);
+    expect(st2).toBe(st1); // same routeState entry, not a fresh one
+    expect(st2.selection["100"]).toMatchObject({ on: true, scope: "all" });
+    expect(st2.seeded).toBe(true);
+    // A LATER ready model must not re-seed again (an in-progress pick survives a background refresh).
+    const laterReadyModel = { mode: "ready", rows: [{ id: "200", on: true, commands: "all" as const, postTo: null }] };
+    const st3 = h.run.ensureRouteState("music", laterReadyModel);
+    expect(st3.selection["100"]).toBeDefined(); // untouched
+    expect(st3.selection["200"]).toBeUndefined(); // NOT re-seeded from the later model
+  });
+
+  // Round-3 review finding: refreshDiscovery's own GET/json() pair inside its poll loop was unguarded,
+  // unlike awaitRequestResult's identical poll -- one transient failure threw out of the WHOLE loop to
+  // the outer catch, which left inflight set forever (the step stuck on "Applying…", every control
+  // disabled, until a full page reload). Fixed by wrapping it the same way awaitRequestResult already is.
+  test("refreshDiscovery survives one transient read failure mid-poll instead of getting stuck forever (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let getCalls = 0;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-2" }) };
+        getCalls++;
+        if (getCalls === 1) throw new Error("transient network failure");
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "disco-2", action: "discovery-refresh", ok: true, at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set
+    await h.clock.tick(); // first poll -> GET throws -> must NOT propagate out
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // still recovering, not stuck with no outcome path
+    await h.clock.tick(); // second poll -> GET succeeds -> lands
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // settled, not stuck forever
+    expect(getCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  // Round-3 review finding: a genuine 30s timeout on a discovery-refresh fell through to the SAME branch
+  // as a normal landing (a silent refreshRoutingSteps, no message at all) -- the operator saw nothing.
+  // advanceFakeNow moves the harness's own injected Date.now() past ROUTING_ANSWER_TIMEOUT_MS without a
+  // real 30s wait.
+  test("refreshDiscovery shows a visible message on a genuine 30s timeout, distinct from landing (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-3" }) };
+        // The id never lands in results -- the only way this settles is the timeout path.
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set, startedAt captured at the current fakeNow
+    h.advanceFakeNow(31000); // past ROUTING_ANSWER_TIMEOUT_MS (30000), no real wait
+    await h.clock.tick(); // the poll's own wait fires -> GET (never found) -> timedOut true
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull();
+    expect(h.routeState.get("music")?.outcome).toMatchObject({
+      phase: "posted-error",
+      message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.",
+    });
+    // The timeout path must NOT be confused with a normal landing (which calls refreshRoutingSteps
+    // instead of setting a visible outcome).
+    expect(h.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  // Round-3 review finding: a failed discovery-refresh POST (non-ok response) rendered nothing at all.
+  test("refreshDiscovery shows a visible message when the POST itself fails (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: false, status: 502, text: async () => "bot-ops: plugin-request failed" };
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.seed("music");
+    await h.run.refreshDiscovery("music");
+    expect(h.routeState.get("music")?.outcome).toEqual({ phase: "posted-error", message: "Couldn't send it: bot-ops: plugin-request failed" });
+  });
+
+  // Round-3 review finding (a second finding, on top of the round-3 fixes above): a 401 mid-poll returned
+  // WITHOUT clearing inflight, in both awaitRequestResult (shared by sendRouting and checkAgain) and
+  // refreshDiscovery's own loop -- routeState is a module-level Map that survives a 401/re-login (api()
+  // only clears the token and shows the gate; showApp/loadRouting never touch routeState), so logging back
+  // in rebuilt the step from the SAME stuck inflight: permanently "Applying…", every control disabled,
+  // until a hard page reload. Matches the Apply bar's OWN established pattern (it resets its busy state on
+  // "unauthorized") which the routing code just didn't follow.
+  test("a 401 mid-poll clears inflight instead of leaving the step stuck forever (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-401" }) };
+        throw new Error("unauthorized"); // every poll GET hits an expired/rotated token
+      }) as never,
+    });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> POST -> inflight set -> poll scheduled
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    await h.clock.tick(); // the poll fires -> GET throws "unauthorized"
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // cleared, not stuck
+  });
+
+  test("refreshDiscovery clears inflight on a 401 mid-poll too (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-401" }) };
+        throw new Error("unauthorized");
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    await h.clock.tick(); // the poll fires -> GET throws "unauthorized"
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // cleared, not stuck
+  });
+
+  // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the
+  // step's controls are disabled") was never implemented -- renderRouteStatus wrote status text but never
+  // touched aria-busy or any control's .disabled. Seeds routingStepEls directly (buildWhereItLivesStep
+  // itself is out of this mini-harness's slice) with one row's worth of stub controls, the way a real
+  // render would populate it, and drives a full send-then-refuse cycle to see both the "busy" and
+  // "cleared" ends of it.
+  test("while a request is in flight the step is aria-busy and its controls are disabled; both clear once it settles (round-1 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-busy" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-busy", action: "routing-set", ok: false, reason: "refused for the test", at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const bodyEl = makeEl();
+    const rowEls = { box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset: makeEl(), channelChecks: new Map([["10", makeEl()], ["11", makeEl()]]), channelErr: makeEl(), postSelect: makeEl(), note: makeEl() };
+    h.routingStepEls.set("music", { status: makeEl(), statusActions: makeEl(), body: bodyEl, rows: new Map([["100", rowEls]]) });
+
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> POST -> inflight -> renderRouteStatus(busy=true)
+    expect(bodyEl.attrs!.get("aria-busy")).toBe("true");
+    expect(rowEls.box.disabled).toBe(true);
+    expect(rowEls.anyRadio.disabled).toBe(true);
+    expect(rowEls.chosenRadio.disabled).toBe(true);
+    expect([...rowEls.channelChecks.values()].every((c) => c.disabled)).toBe(true);
+    expect(rowEls.postSelect.disabled).toBe(true);
+
+    await h.clock.tick(); // poll lands ok:false -> refused, inflight cleared
+    expect(bodyEl.attrs!.has("aria-busy")).toBe(false);
+    expect(rowEls.box.disabled).toBe(false);
+    expect(rowEls.anyRadio.disabled).toBe(false);
+    expect(rowEls.chosenRadio.disabled).toBe(false);
+    expect([...rowEls.channelChecks.values()].every((c) => !c.disabled)).toBe(true);
+    expect(rowEls.postSelect.disabled).toBe(false);
+  });
+
+  // Round-1 review finding: resetToSaved deleted the routeState entry without clearing its pending
+  // sendTimer, so an edit made just before the click (still inside the 1200ms debounce window) fired
+  // later anyway and sent an unrequested POST built from whatever state existed by then.
+  test("resetToSaved clears a pending debounce timer -- an edit right before the click never sends afterward (round-1 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({ routingDataInit });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true); // schedules a debounce timer, does not fire yet
+    h.run.resetToSaved("music");
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.posts).toHaveLength(0); // the orphaned timer must never fire
+  });
+
+  test("a superseded poll stops without writing", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [{ id: "id1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const h = harness({ routingDataInit });
+    h.routeState.set("music", { selection: {}, inflight: { id: "id2", sentServers: ["200"], startedAt: Date.now() }, outcome: null } as never);
+    const pending = h.run.awaitRequestResult("music", "id1", ["100"], Date.now() - 5000);
+    await h.clock.tick();
+    await pending;
+    const st = h.routeState.get("music")!;
+    expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
+    expect(st.outcome).toBeNull();
+  });
+
+  // The FIRST guard above (before the GET) catches a supersede that already happened by the time the
+  // poll wakes up; this is the SECOND, separate guard (right after the GET resolves) for a supersede that
+  // happens WHILE the read is in flight -- id1 is still the current inflight.id when awaitRequestResult
+  // wakes up and starts its GET, but by the time that GET resolves something else has become inflight.
+  test("a supersede that happens WHILE the GET is in flight is caught by the second guard, not just the first", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [{ id: "id1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async () => {
+        // Simulate a second request superseding this one WHILE this GET is "in flight" -- the mutation
+        // this test targets (RS4) removes exactly the check that must catch this.
+        h.routeState.get("music")!.inflight = { id: "id2", sentServers: ["200"], startedAt: Date.now() };
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.routeState.set("music", { selection: {}, inflight: { id: "id1", sentServers: ["100"], startedAt: Date.now() - 5000 }, outcome: null } as never);
+    const pending = h.run.awaitRequestResult("music", "id1", ["100"], Date.now() - 5000);
+    await h.clock.tick();
+    await pending;
+    const st = h.routeState.get("music")!;
+    // id1's own poll must NOT have written an outcome over id2's now-current inflight entry.
+    expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
+    expect(st.outcome).toBeNull();
   });
 });
