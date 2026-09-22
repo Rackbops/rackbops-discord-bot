@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, writeJsonAtomic } from "./storage";
+import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, tmpPathFor, writeJsonAtomic } from "./storage";
 
 describe("resolveDataDir", () => {
   // The default is still one hop up from src/ — the mutation this guards is a wrong hop count.
@@ -145,5 +145,31 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     for (const r of results) expect(r.status).toBe("fulfilled"); // neither rename failed with ENOENT
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     expect(["a", "b"]).toContain(parsed.writer); // last-rename-wins is fine; a torn/missing file is not
+  });
+});
+
+// #253: a pid+counter name alone collides when two DIFFERENT processes (two containers in a
+// handoff, same pid under the bot's init) agree on both — TMP_TOKEN, chosen once per process, is
+// what actually separates them. Pure, so the no-collision guarantee is testable without two
+// processes.
+describe("tmpPathFor (#253)", () => {
+  test("the same pid and counter with different tokens give different paths, and the token is in the name", () => {
+    const a = tmpPathFor("/data/x.json", 100, "aaaa1111", 1);
+    const b = tmpPathFor("/data/x.json", 100, "bbbb2222", 1);
+    expect(a).not.toBe(b);
+    expect(a).toContain("aaaa1111");
+    expect(b).toContain("bbbb2222");
+    expect(a).toBe("/data/x.json.100.aaaa1111.1.tmp");
+  });
+});
+
+// writeJsonAtomic's own temp-path construction is source-pinned rather than driven through two real
+// processes (which would need two real pids) — the no-collision guarantee itself is on tmpPathFor
+// above, already proven pure; this just confirms writeJsonAtomic actually calls it, with the
+// module's real TMP_TOKEN and the shared tmpCounter, not a hand-rolled template that dropped one.
+describe("writeJsonAtomic uses tmpPathFor with the module token (#253, source pin)", () => {
+  test("the temp-path line calls tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter)", () => {
+    const src = readFileSync(new URL("./storage.ts", import.meta.url), "utf8");
+    expect(src).toContain("tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter)");
   });
 });
