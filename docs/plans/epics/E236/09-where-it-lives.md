@@ -102,3 +102,11 @@ byte for byte where an editor's word-wrap would make that duplication drift sile
    behavior; a fresh POST would be a second, redundant routing-set. `routeState.lastSent` (the id and sent-
    server list) is stashed once `awaitRequestResult` settles, precisely so the button has something to
    retry after `inflight` is cleared.
+7. **Every routing control carries `dataset.routeServer` (the guild id), not the per-kind names decision 3
+   lists** (`dataset.routeChannel` for a channel checkbox, `dataset.routePost` for the post select) —
+   round-1 review caught this as undisclosed. Harmless: nothing reads these attributes for behavior (every
+   handler is wired via a direct closure over the built element, never a delegated dataset lookup), and
+   the isolation guarantee that actually matters (decision 7: routing controls invisible to the Apply
+   bar's collector) only depends on `dataset.routeServer` existing and `data-plugin`/`data-setting-key`/
+   `data-secret-key` never appearing, which still holds and is what the source-pin test checks. Declined
+   as a rename with no functional difference, disclosed here instead of silently left unstated.

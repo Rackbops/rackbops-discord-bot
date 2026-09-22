@@ -957,7 +957,7 @@
     status.setAttribute("role", "status");
     const statusActions = document.createElement("div");
     statusActions.className = "route__status-actions";
-    const els = { status, statusActions, rows: new Map() };
+    const els = { status, statusActions, body, rows: new Map() };
     routingStepEls.set(p.name, els);
 
     if (model.mode !== "ready") {
@@ -1337,6 +1337,11 @@
   // Decision 6's "Reset to what's saved": a refusal leaves the operator's picks in the controls (nothing
   // is sent), so resetting means dropping the LOCAL selection and redrawing from what's actually on disk.
   function resetToSaved(plugin) {
+    // A pending debounce timer from an edit made just before this click would otherwise outlive the
+    // entry it belongs to and fire later, sending an unrequested POST built from whatever state exists
+    // by then (routeState.delete does not itself stop a scheduled setTimeout).
+    const st = routeState.get(plugin);
+    if (st && st.sendTimer) clearTimeout(st.sendTimer);
     routeState.delete(plugin);
     refreshRoutingSteps();
   }
@@ -1384,6 +1389,23 @@
     const st = routeState.get(plugin);
     const el = els.status;
     const setPlain = (text) => setApplyText(el, text);
+    // Decision 6: in flight, the step body carries aria-busy and its controls are disabled -- every row's
+    // checkbox/radios/channel checkboxes/post select, so a re-tick mid-flight can't be mistaken for
+    // taking effect immediately (the held/coalesced request it would actually become is invisible without
+    // this). Applied unconditionally on every call, not just the "Applying..." branch below, so it clears
+    // the moment inflight does (a timeout/refusal/applied outcome all fall through to here first).
+    const busy = !!(st && st.inflight);
+    if (els.body && els.body.setAttribute) {
+      if (busy) els.body.setAttribute("aria-busy", "true");
+      else els.body.removeAttribute("aria-busy");
+    }
+    for (const refs of els.rows.values()) {
+      refs.box.disabled = busy;
+      refs.anyRadio.disabled = busy;
+      refs.chosenRadio.disabled = busy;
+      for (const chBox of refs.channelChecks.values()) chBox.disabled = busy;
+      if (refs.postSelect) refs.postSelect.disabled = busy;
+    }
     els.statusActions.textContent = "";
     const addAction = (text, onClick) => {
       const btn = document.createElement("button");
@@ -2623,8 +2645,14 @@
   // selection: { [guildId]: { on, scope: "all"|"chosen", channels: string[], postTo: string|null } }.
   // Walks model.rows (discovery order), so an unavailable id (not a row) can never be sent -- the bot
   // would refuse the whole request over one server it can no longer see (#259). postTo is included only
-  // when the plugin posts on its own AND one is chosen; "chosen" with nothing ticked refuses the whole
-  // plan rather than silently sending "all" or an empty list.
+  // when the plugin posts on its own AND one is chosen AND it is still one of THIS row's channels --
+  // ensureRouteState seeds postTo once and (like channels) never re-validates it, so a channel deleted
+  // (or the bot losing visibility into it) after the selection was seeded must be re-checked here, same
+  // as "chosen channels" already is on the line above: sending a stale postTo would make the bot refuse
+  // the WHOLE request (validatePluginRouting fails on the first bad field, every server included), for a
+  // channel the operator never touched. "chosen" with nothing ticked refuses the whole plan rather than
+  // silently sending "all" or an empty list; a stale postTo instead silently drops (no post target for
+  // that server), matching how an unavailable server itself is silently dropped, never refused over.
   function routingSetBody(pluginName, selection, model) {
     const servers = {};
     for (const row of model.rows) {
@@ -2639,7 +2667,7 @@
         commands = "all";
       }
       const entry = { commands };
-      if (model.posts && sel.postTo) entry.postTo = sel.postTo;
+      if (model.posts && sel.postTo && row.channels.some((c) => c.id === sel.postTo)) entry.postTo = sel.postTo;
       servers[row.id] = entry;
     }
     return { body: { plugin: pluginName, servers } };

@@ -8426,6 +8426,23 @@ describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
     expect(fns.routingSetBody("music", bad, m)).toEqual({ error: "Pick at least one channel for Other." });
   });
 
+  // Round-1 review finding: ensureRouteState seeds postTo once, like channels, but unlike channels it was
+  // never re-checked against row.channels at send time -- a channel deleted (or the bot losing visibility
+  // into it) after the selection was seeded would still be sent verbatim, and the bot refuses the WHOLE
+  // request the first time it hits an invalid postTo (validatePluginRouting, src/routing/resolve.ts), for
+  // a channel the operator never touched on this send.
+  test("routingSetBody: a postTo pointing at a channel that is no longer this row's is silently dropped, not sent stale (round-1 finding)", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    // OTHER_CH belongs to the OTHER guild, not HOME -- exactly the shape a stale/moved channel takes.
+    const staleSel = { [HOME]: { on: true, scope: "all", channels: [], postTo: OTHER_CH } };
+    const planned = fns.routingSetBody("music", staleSel, m) as { body: { servers: Record<string, { commands: unknown; postTo?: string }> } };
+    expect(planned.body.servers[HOME]).toEqual({ commands: "all" }); // no postTo field at all
+    // A genuinely valid postTo for the row is still included, unaffected by the fix.
+    const validSel = { [HOME]: { on: true, scope: "all", channels: [], postTo: AN_CH } };
+    const plannedValid = fns.routingSetBody("music", validSel, m) as { body: { servers: Record<string, { commands: unknown; postTo?: string }> } };
+    expect(plannedValid.body.servers[HOME]).toEqual({ commands: "all", postTo: AN_CH });
+  });
+
   test("requestOutcome: waiting, timeout, refused with the bot's reason, applied-live, applied with a refusing server, applied for an inactive plugin, a sent server discovery lost", () => {
     const started = NOW - 1000;
     const emptyResults = { routing: { ...routing, results: [] }, discovery };
@@ -8517,13 +8534,20 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   interface FakeEl {
     textContent: string;
     hidden?: boolean;
+    disabled?: boolean;
     attrs?: Map<string, string>;
     setAttribute?: (n: string, v: string) => void;
+    removeAttribute?: (n: string) => void;
     appendChild?: (c: unknown) => void;
   }
   const makeEl = (): FakeEl => {
     const attrs = new Map<string, string>();
-    return { textContent: "", hidden: false, attrs, setAttribute: (n, v) => void attrs.set(n, v), appendChild: () => {} };
+    return {
+      textContent: "", hidden: false, disabled: false, attrs,
+      setAttribute: (n, v) => void attrs.set(n, v),
+      removeAttribute: (n) => void attrs.delete(n),
+      appendChild: () => {},
+    };
   };
   function makeClock() {
     let pending: { id: number; fn: () => void }[] = [];
@@ -8569,12 +8593,13 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
-        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
       sendRouting: (plugin: string) => Promise<void>;
       awaitRequestResult: (plugin: string, id: string, sentServers: string[], startedAt: number) => Promise<void>;
+      resetToSaved: (plugin: string) => void;
       routeState: Map<
         string,
         {
@@ -8586,14 +8611,17 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
           pollTimer?: unknown;
         }
       >;
-      routingStepEls: Map<string, unknown>;
+      routingStepEls: Map<
+        string,
+        { status: FakeEl; statusActions: FakeEl; body: FakeEl; rows: Map<string, { box: FakeEl; controls: FakeEl; anyRadio: FakeEl; chosenRadio: FakeEl; fieldset: FakeEl; channelChecks: Map<string, FakeEl>; channelErr: FakeEl; postSelect: FakeEl; note: FakeEl }> }
+      >;
       setRoutingData: (v: unknown) => void;
     };
     // onRouteChange requires a routeState entry to already exist (real usage: ensureRouteState seeds it
     // on the step's first render, inside buildWhereItLivesStep -- browser-only, not part of this slice).
     // Every test here drives a plugin already ticked into no servers, matching a freshly-opened card.
     const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null });
-    return { run, posts, clock, routeState: run.routeState, setRoutingData: run.setRoutingData, seed, refreshRoutingStepsCalls: () => refreshRoutingStepsCalls };
+    return { run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed, refreshRoutingStepsCalls: () => refreshRoutingStepsCalls };
   }
 
   const discovery = {
@@ -8698,6 +8726,59 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await refused.clock.tick();
     expect(refused.routeState.get("music")?.outcome).toMatchObject({ phase: "refused" });
     expect(refused.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the
+  // step's controls are disabled") was never implemented -- renderRouteStatus wrote status text but never
+  // touched aria-busy or any control's .disabled. Seeds routingStepEls directly (buildWhereItLivesStep
+  // itself is out of this mini-harness's slice) with one row's worth of stub controls, the way a real
+  // render would populate it, and drives a full send-then-refuse cycle to see both the "busy" and
+  // "cleared" ends of it.
+  test("while a request is in flight the step is aria-busy and its controls are disabled; both clear once it settles (round-1 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-busy" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-busy", action: "routing-set", ok: false, reason: "refused for the test", at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const bodyEl = makeEl();
+    const rowEls = { box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset: makeEl(), channelChecks: new Map([["10", makeEl()], ["11", makeEl()]]), channelErr: makeEl(), postSelect: makeEl(), note: makeEl() };
+    h.routingStepEls.set("music", { status: makeEl(), statusActions: makeEl(), body: bodyEl, rows: new Map([["100", rowEls]]) });
+
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> POST -> inflight -> renderRouteStatus(busy=true)
+    expect(bodyEl.attrs!.get("aria-busy")).toBe("true");
+    expect(rowEls.box.disabled).toBe(true);
+    expect(rowEls.anyRadio.disabled).toBe(true);
+    expect(rowEls.chosenRadio.disabled).toBe(true);
+    expect([...rowEls.channelChecks.values()].every((c) => c.disabled)).toBe(true);
+    expect(rowEls.postSelect.disabled).toBe(true);
+
+    await h.clock.tick(); // poll lands ok:false -> refused, inflight cleared
+    expect(bodyEl.attrs!.has("aria-busy")).toBe(false);
+    expect(rowEls.box.disabled).toBe(false);
+    expect(rowEls.anyRadio.disabled).toBe(false);
+    expect(rowEls.chosenRadio.disabled).toBe(false);
+    expect([...rowEls.channelChecks.values()].every((c) => !c.disabled)).toBe(true);
+    expect(rowEls.postSelect.disabled).toBe(false);
+  });
+
+  // Round-1 review finding: resetToSaved deleted the routeState entry without clearing its pending
+  // sendTimer, so an edit made just before the click (still inside the 1200ms debounce window) fired
+  // later anyway and sent an unrequested POST built from whatever state existed by then.
+  test("resetToSaved clears a pending debounce timer -- an edit right before the click never sends afterward (round-1 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({ routingDataInit });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true); // schedules a debounce timer, does not fire yet
+    h.run.resetToSaved("music");
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.posts).toHaveLength(0); // the orphaned timer must never fire
   });
 
   test("a superseded poll stops without writing", async () => {
