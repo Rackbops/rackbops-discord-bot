@@ -1911,6 +1911,13 @@
   }
   const refreshServers = renderServers;
 
+  // A first-request 401 occurs before the poller can settle a subject.  Clear its durable busy state so
+  // the rebuilt tab is usable after sign-in again, rather than leaving its action disabled until reload.
+  function clearUnauthorizedServerAction(key) {
+    serverActionState.delete(key);
+    renderServers();
+  }
+
   async function addWebhook(guildId) {
     const key = "add:" + guildId;
     const existing = serverActionState.get(key);
@@ -1948,6 +1955,8 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
       }
     } finally {
       cancel();
@@ -1987,6 +1996,8 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
       }
     } finally {
       cancel();
@@ -2044,6 +2055,8 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
       }
     } finally {
       cancel();
@@ -3502,7 +3515,14 @@
       }
       plugins.push({ name: p.name, scope, postsTo, webhook, byDefault: false });
     }
-    if (home) {
+    // Round-1 review finding: an unplaced plugin lives in the home server ONLY when one is configured --
+    // with DISCORD_SERVER_ID unset (homeId falsy), src/routing/resolve.ts's pluginsForGuild registers an
+    // unplaced plugin in EVERY guild instead (CONTEXT.md: "With DISCORD_SERVER_ID unset there is no home
+    // server and an unplaced plugin lives in every server"; #245's own placementSummary sentence: "Lives
+    // in every server by default (no home server is set)"). `home` alone (`homeId === guild.id`) is false
+    // for every guild when homeId is null, so this used to never draw byDefault anywhere in that case --
+    // silently contradicting what the bot actually registers.
+    if (home || !homeId) {
       for (const p of pluginList) {
         if (!routingPlugins[p.name]) plugins.push({ name: p.name, scope: "all", postsTo: null, webhook: "none", byDefault: true });
       }

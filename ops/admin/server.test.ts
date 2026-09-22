@@ -8918,13 +8918,27 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
     expect(other.home).toBe(false);
     expect(other.plugins).toEqual([{ name: "wow", scope: "all", postsTo: null, webhook: "none", byDefault: false }]);
-    expect(other.plugins.find((p) => p.name === "warbandeer")).toBeUndefined(); // byDefault is home-only
+    expect(other.plugins.find((p) => p.name === "warbandeer")).toBeUndefined(); // byDefault is home-only WHEN a home server is configured
 
     // A plugin whose postTo points at the BROKEN webhook (GEN_CH) reads webhook: "broken", not "ok" --
     // distinguishes the broken-webhook case from a healthy one (mutation M4 of this plan's own testing).
     const brokenPostRouting = { ...routing, plugins: { ...routing.plugins, music: { servers: { [HOME]: { commands: [SP_CH], postTo: GEN_CH } } } } };
     const homeBrokenPost = fns.serverCardModel(discovery.guilds[0], { routing: brokenPostRouting, discovery }, pluginsData);
     expect(homeBrokenPost.plugins.find((p) => p.name === "music")).toEqual({ name: "music", scope: ["spotify"], postsTo: "general", webhook: "broken", byDefault: false });
+  });
+
+  // Round-1 review finding: with NO home server configured (DISCORD_SERVER_ID unset, homeGuildId null),
+  // src/routing/resolve.ts's pluginsForGuild registers an unplaced plugin in EVERY guild, not nowhere --
+  // `home` alone (homeId === guild.id) is false for every guild when homeId is null, so byDefault plugins
+  // used to never appear on ANY card in that configuration.
+  test("serverCardModel: with no home server configured, every card lists unplaced plugins by default, not just one", () => {
+    const noHomeDiscovery = { ...discovery, homeGuildId: null };
+    const noHomeData = { routing, discovery: noHomeDiscovery };
+    const homeCard = fns.serverCardModel(noHomeDiscovery.guilds[0], noHomeData, pluginsData);
+    expect(homeCard.home).toBe(false); // this guild is no longer THE home -- there isn't one
+    expect(homeCard.plugins.find((p) => p.name === "warbandeer")).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
+    const otherCard = fns.serverCardModel(noHomeDiscovery.guilds[1], noHomeData, pluginsData);
+    expect(otherCard.plugins.find((p) => p.name === "warbandeer")).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
   });
 
   test("serverCardModel: webhooks under their server by channel name, a vanished channel by id, broken carried", () => {
@@ -9723,7 +9737,14 @@ describe("Servers tab: source pins (#246)", () => {
   });
 
   test("the Servers tab holds no Apply-bar control (source pin)", () => {
-    const start = indexSrc.indexOf("function renderServers(");
+    // Round-1 claims-vs-code finding: this used to start at renderServers, which put every DOM BUILDER
+    // (buildServerCard, buildWebhookRow, buildCommandsSection, buildAddWebhookForm,
+    // buildUnavailableServerCard, appendRetryControls, retryRegistration, firstPlacedPlugin -- the
+    // functions that actually interpolate server/channel names and webhook/error text into the DOM)
+    // OUTSIDE the pinned slice, since they're all declared BEFORE renderServers in source order. A
+    // regression rewriting one of them to use innerHTML would have passed this test untouched. Starts at
+    // clearChildren instead -- the first of this whole group.
+    const start = indexSrc.indexOf("function clearChildren(");
     const end = indexSrc.indexOf("async function copyInviteLink(");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
@@ -9731,6 +9752,9 @@ describe("Servers tab: source pins (#246)", () => {
     const afterCopy = indexSrc.indexOf("\n  }\n", end);
     const slice = indexSrc.slice(start, afterCopy);
     expect(slice.length).toBeGreaterThan(500); // can't pass vacuously
+    expect(slice).toContain("function buildServerCard(");
+    expect(slice).toContain("function buildWebhookRow(");
+    expect(slice).toContain("function firstPlacedPlugin(");
     for (const bad of ["dataset.key", "data-key", "dataset.plugin", "dataset.settingKey", "dataset.secretKey", "localStorage", "sessionStorage", "innerHTML"]) {
       expect({ bad, found: slice.includes(bad) }).toEqual({ bad, found: false });
     }
@@ -9742,6 +9766,21 @@ describe("Servers tab: source pins (#246)", () => {
     const slice = indexSrc.slice(start, end);
     expect(slice).toContain('input.type = "password";');
     expect(slice).toContain('input.autocomplete = "off";');
+  });
+
+  test("each durable Servers action clears its busy state after a first-request 401", () => {
+    for (const [start, end] of [
+      ["async function addWebhook(", "async function removeWebhook("],
+      ["async function removeWebhook(", "async function pollForResult("],
+      ["async function refreshDiscoveryAll(", "function renderNeedsAttention("],
+    ]) {
+      const slice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
+      expect(slice).toContain('message !== "unauthorized"');
+      expect(slice).toContain("clearUnauthorizedServerAction(key);");
+    }
+    const helper = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
+    expect(helper).toContain("serverActionState.delete(key);");
+    expect(helper).toContain("renderServers();");
   });
 });
 
@@ -9759,6 +9798,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     dataset: Record<string, string>;
     children: FakeEl[];
     appendChild: (c: FakeEl) => FakeEl;
+    replaceWith?: (next: FakeEl) => void;
   }
   function makeEl(tag: string): FakeEl {
     const el: FakeEl = { tagName: tag.toUpperCase(), value: "", id: "", className: "", label: "", dataset: {}, children: [], appendChild: (c) => (el.children.push(c), c) };
@@ -9769,16 +9809,30 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
   const serversTabSrc = applyBlock("SERVERS_TAB");
   const envSrc = indexSrc.slice(indexSrc.indexOf("const FIELD_META = {"), indexSrc.indexOf("function renderEnvFields()"));
 
-  function harness(routingDataInit: unknown) {
-    const document = { createElement: (tag: string) => makeEl(tag) };
+  // `registry`: id -> the element document.getElementById(id) currently answers. refreshEnvPickers calls
+  // existing.replaceWith(control) on an upgrade -- each registered element's own replaceWith swaps the
+  // registry entry under ITS OWN id, so a later getElementById(id) sees the upgraded control.
+  function harness(routingDataInit: unknown, registry: Map<string, FakeEl> = new Map()) {
+    for (const [id, el] of registry) {
+      el.id = id;
+      el.replaceWith = (next: FakeEl) => {
+        next.id = id;
+        registry.set(id, next);
+      };
+    }
+    const document = {
+      createElement: (tag: string) => makeEl(tag),
+      getElementById: (id: string) => registry.get(id) ?? null,
+    };
     const fn = new Function(
       "document", "routingData",
-      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\nreturn { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers: typeof refreshEnvPickers === "function" ? refreshEnvPickers : undefined };`,
+      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\nreturn { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers };`,
     );
     return fn(document, routingDataInit) as {
       buildEnvControl: (key: string, value: string) => FakeEl;
       FIELD_META: Record<string, { control?: string }>;
       discoveryReadyForPickers: () => boolean;
+      refreshEnvPickers: () => void;
     };
   }
 
@@ -9827,6 +9881,38 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
       expect(control.value).toBe("100");
     }
   });
+
+  // Round-1 claims-vs-code finding: refreshEnvPickers itself had no direct test (only buildEnvControl's
+  // OWN picker branch was exercised) -- decision 6's "upgrade in place, carrying the typed value across,
+  // never downgrade" guarantee was unverified. Covers loadRouting finishing AFTER reloadConfig already
+  // rendered plain fields (the one ordering refreshEnvPickers exists for -- see the source-pin test below
+  // for why the other ordering never needs it).
+  test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
+    const plain = makeEl("input");
+    plain.value = "100"; // an in-progress edit, not yet applied
+    const registry = new Map([["env-DISCORD_SERVER_ID", plain]]);
+    const h = harness(routingDataReady, registry);
+    h.refreshEnvPickers();
+    const upgraded = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(upgraded.tagName).toBe("SELECT");
+    expect(upgraded.id).toBe("env-DISCORD_SERVER_ID");
+    expect(upgraded.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(upgraded.value).toBe("100"); // the typed value survived the upgrade
+
+    // A control that is ALREADY a picker (tagName === "SELECT") is left alone -- never rebuilt/replaced.
+    const already = registry.get("env-DISCORD_SERVER_ID")!;
+    h.refreshEnvPickers();
+    expect(registry.get("env-DISCORD_SERVER_ID")).toBe(already); // same object, not a new one
+
+    // Without a ready discovery, refreshEnvPickers is a no-op -- a plain field is never touched.
+    const stillPlain = makeEl("input");
+    stillPlain.value = "200";
+    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", stillPlain]]);
+    const notReady = harness({ routing: null, discovery: null }, notReadyRegistry);
+    notReady.refreshEnvPickers();
+    expect(notReadyRegistry.get("env-DISCORD_SERVER_ID")).toBe(stillPlain);
+    expect(stillPlain.tagName).toBe("INPUT");
+  });
 });
 
 // #246: addWebhook + pollForResult, the same "stub the DOM-refresh call, inject a fake clock" mini-harness
@@ -9834,6 +9920,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
 // this slice (browser-only DOM builders) and are injected as call-tracked no-op stubs.
 describe("addWebhook / pollForResult (#246, mini-harness)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const clearUnauthorizedServerActionSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
   const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("async function addWebhook("), indexSrc.indexOf("async function removeWebhook("));
   const pollForResultSrc = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
 
@@ -9883,7 +9970,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
       "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention",
-      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${pollForResultSrc}\n${addWebhookSrc}\n` +
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n` +
         "return { addWebhook, pollForResult, getRoutingData: () => routingData };",
     )(
       document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention,
@@ -9950,6 +10037,20 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const p = h.run.pollForResult("reqX", started - 31000); // already past ROUTING_ANSWER_TIMEOUT_MS
     await h.clock.tick();
     expect(await p).toEqual({ timeout: true });
+  });
+
+  // Round-1 review finding: unlike sendRouting/refreshDiscovery (#245), whose busy state is DERIVED from
+  // st.inflight (set only once a POST already succeeded), addWebhook marks itself busy BEFORE the
+  // request -- a 401 on that FIRST call (api() throws Error("unauthorized")) used to leave
+  // serverActionState stuck at { busy: true } forever, since the catch's `if (message !== "unauthorized")`
+  // guard skipped clearing it on exactly that path, and serverActionState is never reset by a re-login.
+  test("a 401 on the initial POST clears the busy state instead of leaving the button stuck forever", async () => {
+    const h = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async () => { throw new Error("unauthorized"); },
+    });
+    await h.run.addWebhook("100");
+    expect(h.serverActionState.has("add:100")).toBe(false);
   });
 });
 
