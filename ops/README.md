@@ -107,11 +107,15 @@ artifacts** — fetched once by `install.sh`, never touched by hand, never preci
 is — but nothing re-fetches either of them on its own. **After a merge that changes either file in
 a way an instance needs to pick up — a new `bot-ops.sh` subcommand or `ALLOWED_SPEC`
 row, or a compose change like a new `environment:` entry, an image pin, a volume — re-run
-`install.sh` on each instance** (it always refreshes both files) — otherwise the admin panel image
-(rebuilt from the same merge) ships a feature, or a runtime setting, the deployed files don't have
-yet, and the only symptom might be as subtle as a setting that's silently not in effect (the #178
-incident: `#168`'s `BOT_ENV_FILE` and `#140`'s `cloudflared` pin were both merged, both images
-rebuilt, but the deployed compose file was still the pre-merge copy).
+`install.sh` on each instance.** From `main`, this always refreshes both files, same as before. From
+another branch, the compose file is still always refreshed, but the host-shared `bin/bot-ops.sh` is
+refreshed only when that branch's own copy is byte-identical to `main`'s — otherwise `install.sh`
+refuses and names `--force-bin` as the override (issue #230; `bin/bot-ops.sh` is shared by every
+instance on the host, so a per-instance branch can't silently swap it out from under the others).
+Otherwise the admin panel image (rebuilt from the same merge) ships a feature, or a runtime setting,
+the deployed files don't have yet, and the only symptom might be as subtle as a setting that's
+silently not in effect (the #178 incident: `#168`'s `BOT_ENV_FILE` and `#140`'s `cloudflared` pin
+were both merged, both images rebuilt, but the deployed compose file was still the pre-merge copy).
 
 You don't have to remember to check: both files stamp a schema integer (`bot-ops.sh`'s own
 `BOT_OPS_SCHEMA`; the compose file's top-level `x-rackbops-schema:`, a key Compose itself ignores),
@@ -139,6 +143,12 @@ directly from the public repo:
 curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh \
   | bash -s -- debug
 ```
+
+Full usage: `install.sh <instance> [branch] [--force-bin]`. Pass a branch as the second argument
+(`bash -s -- debug my-branch`) to build from something other than `main`; add `--force-bin` as a
+third argument only if you need to force-install that branch's `bot-ops.sh` into the host-shared
+`bin/` despite it differing from `main`'s (see "Keeping `bot-ops.sh` and `docker-compose.yml`
+current" above, issue #230).
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
 a re-run — fill in secrets there by hand). It always refreshes three things that are deployment
