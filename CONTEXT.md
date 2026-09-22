@@ -1527,7 +1527,21 @@ _Avoid_: server list, guild cache
   matches the one it started with, returns without writing anything — a stale poll can never clobber a
   request that has since superseded it. A server the routing entry names but `discovery.guilds` no longer
   lists is never sent (would make the bot refuse the WHOLE request, #259, over one server it already left)
-  and is drawn as its own read-only row instead.
+  and is drawn as its own read-only row instead. **Placement is only ever seeded from a `ready`
+  `routingStepModel`, once (`ensureRouteState`'s `st.seeded` flag), never re-seeded from a later one — an
+  in-progress pick a background poll brought in must survive it.** This matters because `refreshDiscovery`
+  ("Refresh from Discord", the button `missing`/`stale` mode shows in place of any row) calls
+  `ensureRouteState` too, purely to track its own `inflight`/`held`, and in `missing`/`stale` mode
+  `model.rows` is always `[]` — a round-3 review catch: seeding on first CALL rather than first READY
+  model meant clicking that button on a card never opened while discovery was ready permanently locked in
+  an EMPTY selection, before the real saved placement was ever known, and the next edit silently dropped
+  it. **`routeState` is a module-level `Map` that survives a 401 → re-login cycle** (`api()` only clears
+  the token and shows the gate; `showApp`/`loadRouting` never touch it) — so both poll loops
+  (`awaitRequestResult`, shared by `sendRouting`/`checkAgain`, and `refreshDiscovery`'s own) must clear
+  `inflight` on an `"unauthorized"` catch, not just return, or re-logging in rebuilds the step from a
+  permanently stuck `inflight`: "Applying…" forever, every control disabled, until a hard reload — the
+  same pattern the pre-existing Apply bar already follows for its own 401 handling (`applyPhase = "idle";
+  // the gate is showing`), which this code simply didn't at first.
   **After a failed apply the controls are re-read from the bot unless the failure IS one of `env-set`'s own
   refusals (#272).** `failureWroteNothing(status, result, text)` (`APPLY_VIEW`) is true only for a 502 whose
   body is not JSON and has a line that starts `bot-ops: env-set: ` (`die()` prints `bot-ops: ` + its
