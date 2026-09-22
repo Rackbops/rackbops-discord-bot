@@ -58,4 +58,38 @@ Branch `claude/install-force-bin-usage` from `origin/main`, isolated worktree. T
 
 ## Deviations from the plan (recorded at implementation)
 
-(none yet)
+- **Coverage table row 3 (compose-schema mutation), observed failure mode:** the plan step 3 test
+  is a new `extractLine`-anchored slice (same discipline as `STACK_ENV_WRITE_SEQUENCE`/
+  `BRANCH_GUARD_TO_FETCH`), and its regex requires the literal `{ grep ... || true; }` grouping the
+  fix introduces. Restoring the bare `grep | cut | tr` pipeline (the named mutation) therefore
+  doesn't fail one assertion in isolation — it makes `extractLine` itself throw at module load
+  ("couldn't find the compose_schema read-and-summary lines"), which fails the *entire* test file's
+  run, not just the two tests in that describe. This is the same fail-loud convention the file
+  already uses elsewhere (`BRANCH_GUARD_LINES`'s own comment: "removing either fails the extract
+  loudly") — not a design gap, just naming the actual failure shape observed instead of a narrower
+  one.
+- **`schema_of()`'s mutation didn't reproduce the "aborts the script" half of the issue's own
+  description, only the "prints an empty schema" half — for the specific call sites tested.**
+  Reverting to the bare `grep -m1 ... | cut` pipeline made all three `issue #295` schema_of tests
+  fail, but by producing an *empty* schema value (`"...schema )"`, `"...schema  vs main's 5"`)
+  rather than aborting the script outright. Traced to where `$(schema_of ...)` is actually used: at
+  every call site in `install_shared_bin` it's embedded inside a larger string (an `echo`/`die`
+  argument, or a `note="... $(...)"` assignment concatenated with literal text) rather than being
+  the *entire* right-hand side of a bare `var=$(schema_of ...)` assignment — and bash's `errexit`
+  only inspects the exit status of the command actually being run (`echo`, `die`, the assignment
+  statement), not a command substitution's exit status when it's just one piece of a larger
+  expansion. The abort path the issue describes is real (and is exactly what the *unfixed*
+  `compose_schema="$(grep ... | cut ...)"` line does, confirmed separately: that one — a plain
+  `var=$(cmd | cmd)` assignment with nothing else on the right-hand side — does abort the script
+  under the old code, per #291's own review-gate note declining this exact finding). Either failure
+  mode is a defect the fix corrects and the test still catches; not a change to which lines were
+  fixed or which tests exist, just a correction to the mutation table's stated failure mode for this
+  one row.
+- **Manual acceptance runs (paste-the-real-output bullets) used the same stubs `runBranchGate`/
+  `runSharedBin` use (`fetch`, `curl`, `chown`, `mkdir`, `sed` faked; `resolve_deploy_identity`
+  faked to avoid a real `id`), not a live `curl | bash` against a real host** — `install.sh`
+  hardcodes real `/opt/...` paths, needs real `sudo`/`docker`, and fetches over the network per its
+  own header comment and `03-install-shared-bin.md`'s own acceptance section, which took the same
+  approach ("no real `install.sh` run against nucbox here"). The extracted source slices are pulled
+  from the real, committed `ops/install.sh` (not hand-copied), so the output below is the real
+  script's real behaviour on that slice, just without a live host underneath it.
