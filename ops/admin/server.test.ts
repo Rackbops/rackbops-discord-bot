@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
@@ -17,6 +17,7 @@ import {
   describeAction,
   describeActor,
   effectiveAllowlist,
+  ENV_KEY_RE,
   escapeHtml,
   extractAccessJwt,
   extractBearerToken,
@@ -56,8 +57,10 @@ import {
   resolveAdminStorePaths,
   resolveAdminStorePathsOrExit,
   renderIndexHtml,
+  serializeAdminMutations,
   SUBPROCESS_TIMEOUT_MS,
   tokensMatch,
+  writeAdminsFile,
   type AdminStore,
   type Authorization,
   type BotOpsInvocation,
@@ -75,17 +78,27 @@ import { composeThemeCss } from "./theme/build-theme";
 // #242 (panel routing API): its own import statement, like the one above, so it adds lines and removes none.
 import { parseRoutingSetInput, parseWebhookAddInput, redactWebhookUrls } from "./server";
 
-/** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set. */
-function makeStore(opts: { bootstrap?: string[]; dynamic?: string[] } = {}): AdminStore & { dynamic: Set<string> } {
+/** An in-memory AdminStore for tests — a real bootstrap set plus a mutable dynamic set.
+ *  `holdReads`, when given, is awaited on every `readDynamic` call — a test uses it to keep a read
+ *  open so two `mutateDynamic`/`handleAdmins` calls can be proven to queue rather than race. */
+function makeStore(
+  opts: { bootstrap?: string[]; dynamic?: string[]; holdReads?: () => Promise<void> } = {},
+): AdminStore & { dynamic: Set<string> } {
   const dynamic = new Set(opts.dynamic ?? []);
+  const readDynamic = async () => {
+    if (opts.holdReads) await opts.holdReads();
+    return new Set(dynamic);
+  };
+  const writeDynamic = async (emails: Set<string>) => {
+    dynamic.clear();
+    for (const e of emails) dynamic.add(e);
+  };
   return {
     bootstrap: new Set(opts.bootstrap ?? []),
     dynamic,
-    readDynamic: async () => new Set(dynamic),
-    writeDynamic: async (emails) => {
-      dynamic.clear();
-      for (const e of emails) dynamic.add(e);
-    },
+    readDynamic,
+    writeDynamic,
+    mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
   };
 }
 
@@ -626,36 +639,45 @@ describe("handleAdmins", () => {
   });
 
   test("a store write failure surfaces as a 502, not an unhandled throw", async () => {
+    const readDynamic = async () => new Set<string>();
+    const writeDynamic = async (): Promise<void> => {
+      throw new Error("no config dir");
+    };
     const store: AdminStore = {
       bootstrap: new Set(["boss@x.com"]),
-      readDynamic: async () => new Set(),
-      writeDynamic: async () => {
-        throw new Error("no config dir");
-      },
+      readDynamic,
+      writeDynamic,
+      mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
     };
     const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
     expect(res.status).toBe(502);
   });
 
   test("a store read failure (broken admins.json) surfaces as a 502 on GET, not an unhandled throw", async () => {
+    const readDynamic = async (): Promise<Set<string>> => {
+      throw new Error("admins.json: unexpected token");
+    };
+    const writeDynamic = async () => {};
     const store: AdminStore = {
       bootstrap: new Set(["boss@x.com"]),
-      readDynamic: async () => {
-        throw new Error("admins.json: unexpected token");
-      },
-      writeDynamic: async () => {},
+      readDynamic,
+      writeDynamic,
+      mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
     };
     const res = await handleAdmins(req("GET"), store, bearer);
     expect(res.status).toBe(502);
   });
 
   test("a store read failure (broken admins.json) surfaces as a 502 on POST, not an unhandled throw", async () => {
+    const readDynamic = async (): Promise<Set<string>> => {
+      throw new Error("admins.json: unexpected token");
+    };
+    const writeDynamic = async () => {};
     const store: AdminStore = {
       bootstrap: new Set(["boss@x.com"]),
-      readDynamic: async () => {
-        throw new Error("admins.json: unexpected token");
-      },
-      writeDynamic: async () => {},
+      readDynamic,
+      writeDynamic,
+      mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
     };
     const res = await handleAdmins(req("POST", { email: "new@x.com" }), store, bearer);
     expect(res.status).toBe(502);
@@ -693,6 +715,201 @@ describe("handleAdmins", () => {
     } finally {
       logSpy.mockRestore();
     }
+  });
+
+  // #228: these three prove the decision runs INSIDE mutateDynamic's serialized turn, against a
+  // FRESH read each time — never against a set captured before the queue, which two concurrent
+  // requests could each decide against independently and silently lose one's outcome. `holdReads`
+  // holds the FIRST readDynamic call open (a real Promise, settled once — later calls simply see it
+  // already resolved), so both requests are genuinely in flight together before either's turn
+  // resolves; `await Promise.resolve()` lets both `handleAdmins` calls register their turn on the
+  // queue before asserting only one read has started.
+  test("two POSTs of different emails at once both persist (#228)", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    let readCount = 0;
+    const store = makeStore({
+      holdReads: async () => {
+        readCount++;
+        if (readCount === 1) await hold;
+      },
+    });
+    const p1 = handleAdmins(req("POST", { email: "a@x.com" }), store, admin);
+    const p2 = handleAdmins(req("POST", { email: "b@x.com" }), store, admin);
+    await Bun.sleep(0); // handleAdmins awaits req.json() before reaching mutateDynamic — one microtask isn't enough
+    // Mutation: an unserialized mutateDynamic (read/fn/write called directly, no queue) would have
+    // p2's turn call readDynamic immediately too, instead of waiting behind p1's still-held read.
+    expect(readCount).toBe(1);
+    release();
+    const [res1, res2] = await Promise.all([p1, p2]);
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    // Mutation: an unserialized read-modify-write would have both requests read the SAME empty
+    // dynamic set and each write only their own email — the loser's add silently dropped.
+    expect(((await res1.json()) as { dynamic: string[] }).dynamic).toEqual(["a@x.com", "b@x.com"]);
+    expect(((await res2.json()) as { dynamic: string[] }).dynamic).toEqual(["a@x.com", "b@x.com"]);
+    expect(store.dynamic.has("a@x.com")).toBe(true);
+    expect(store.dynamic.has("b@x.com")).toBe(true);
+  });
+
+  test("two DELETEs of the last two dynamic admins at once end with exactly one refusal and one admin left (#228)", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    let readCount = 0;
+    const store = makeStore({
+      dynamic: ["a@x.com", "b@x.com"], // no bootstrap — the floor check is what's under test
+      holdReads: async () => {
+        readCount++;
+        if (readCount === 1) await hold;
+      },
+    });
+    const p1 = handleAdmins(req("DELETE", { email: "a@x.com" }), store, bearer);
+    const p2 = handleAdmins(req("DELETE", { email: "b@x.com" }), store, bearer);
+    await Bun.sleep(0); // handleAdmins awaits req.json() before reaching mutateDynamic — one microtask isn't enough
+    expect(readCount).toBe(1);
+    release();
+    const [res1, res2] = await Promise.all([p1, p2]);
+    // Mutation: moving the floor check back outside `fn` (reading `dynamic.size` before the queue)
+    // would have BOTH requests see size===2 and let both removals through, leaving zero admins.
+    expect([res1.status, res2.status].sort()).toEqual([200, 400]);
+    expect(store.dynamic.size).toBe(1);
+  });
+
+  test("the POST no-op check runs inside the serialised turn (#228)", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    let readCount = 0;
+    const store = makeStore({
+      holdReads: async () => {
+        readCount++;
+        if (readCount === 1) await hold;
+      },
+    });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const p1 = handleAdmins(req("POST", { email: "same@x.com" }), store, admin);
+      const p2 = handleAdmins(req("POST", { email: "same@x.com" }), store, admin);
+      await Bun.sleep(0); // handleAdmins awaits req.json() before reaching mutateDynamic — one microtask isn't enough
+      expect(readCount).toBe(1);
+      release();
+      await Promise.all([p1, p2]);
+      // Mutation: checking `!dynamic.has(email)` against a set read BEFORE the queue (outside `fn`)
+      // would have both requests see it absent and both add + audit-log it.
+      expect(logSpy).toHaveBeenCalledTimes(1);
+      expect(store.dynamic.size).toBe(1);
+      expect(store.dynamic.has("same@x.com")).toBe(true);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+});
+
+describe("serializeAdminMutations (#228)", () => {
+  test("two mutations started at once are applied in order, the second seeing the first's write", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const dynamic = new Set<string>();
+    let readCount = 0;
+    const readDynamic = async () => {
+      readCount++;
+      if (readCount === 1) await hold;
+      return new Set(dynamic);
+    };
+    const writeDynamic = async (emails: Set<string>) => {
+      dynamic.clear();
+      for (const e of emails) dynamic.add(e);
+    };
+    const mutateDynamic = serializeAdminMutations({ readDynamic, writeDynamic });
+
+    const p1 = mutateDynamic((current: Set<string>) => {
+      current.add("a@x.com");
+      return { next: current, result: "a" };
+    });
+    const p2 = mutateDynamic((current: Set<string>) => {
+      current.add("b@x.com");
+      return { next: current, result: "b" };
+    });
+    await Promise.resolve();
+    // Mutation: running fn without queueing (calling read/fn/write directly) would have p2's turn
+    // call readDynamic immediately too, instead of waiting behind p1's still-held read.
+    expect(readCount).toBe(1);
+    release();
+
+    expect(await p1).toBe("a");
+    expect(await p2).toBe("b");
+    expect(readCount).toBe(2);
+    expect(dynamic.has("a@x.com")).toBe(true);
+    // The second turn's readDynamic ran AFTER the first turn's write, so it saw "a@x.com" already
+    // present in `current` — proving the queue serializes the READ too, not just the write.
+    expect(dynamic.has("b@x.com")).toBe(true);
+  });
+
+  test("a rejected turn rejects its caller and the next turn still runs", async () => {
+    const dynamic = new Set<string>(["seed@x.com"]);
+    let calls = 0;
+    const readDynamic = async () => new Set(dynamic);
+    const writeDynamic = async (emails: Set<string>) => {
+      dynamic.clear();
+      for (const e of emails) dynamic.add(e);
+    };
+    const mutateDynamic = serializeAdminMutations({ readDynamic, writeDynamic });
+
+    const p1 = mutateDynamic(() => {
+      calls++;
+      throw new Error("boom");
+    });
+    const p2 = mutateDynamic((current: Set<string>) => {
+      calls++;
+      current.add("ok@x.com");
+      return { next: current, result: "ok" };
+    });
+
+    await expect(p1).rejects.toThrow("boom");
+    expect(await p2).toBe("ok");
+    expect(calls).toBe(2);
+    // Mutation: `chain = turn` without the `.then(ok, ok)` catch would leave `chain` itself a
+    // REJECTED promise, and every subsequent `.then()` on it (p2's turn) would short-circuit
+    // straight to rejection without ever calling fn — p2 would reject too, and calls would stay at 1.
+    expect(dynamic.has("ok@x.com")).toBe(true);
+  });
+});
+
+describe("writeAdminsFile (#228)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "admin-store-test-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("two concurrent writes both resolve, the file is valid JSON holding the last write, and no temp file remains", async () => {
+    const file = join(dir, "admins.json");
+    await Promise.all([writeAdminsFile(file, new Set(["a@x.com"])), writeAdminsFile(file, new Set(["b@x.com"]))]);
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    // Mutation: a fixed `${adminsFile}.tmp` temp path (the pre-#228 shape) would have one call's
+    // rename land on a file the other was still writing, corrupting the JSON — this asserts it
+    // parses AND holds exactly one call's complete result, never a torn mix of both.
+    expect(Array.isArray(parsed.emails)).toBe(true);
+    expect(parsed.emails.length).toBe(1);
+    expect(["a@x.com", "b@x.com"]).toContain(parsed.emails[0]);
+    expect(readdirSync(dir)).toEqual(["admins.json"]); // no leftover .tmp file
+  });
+
+  test("the temp name carries the pid and a counter, so two calls never share it", async () => {
+    const file = join(dir, "admins.json");
+    const seenPaths: string[] = [];
+    const write = async (path: string, data: string) => {
+      seenPaths.push(path);
+      writeFileSync(path, data);
+    };
+    await writeAdminsFile(file, new Set(["a@x.com"]), write);
+    await writeAdminsFile(file, new Set(["b@x.com"]), write);
+    expect(seenPaths).toHaveLength(2);
+    expect(seenPaths[0]).toMatch(/\.\d+\.\d+\.tmp$/);
+    expect(seenPaths[1]).toMatch(/\.\d+\.\d+\.tmp$/);
+    // Mutation: a fixed `${adminsFile}.tmp` (no pid/counter) would make these two paths equal.
+    expect(seenPaths[0]).not.toBe(seenPaths[1]);
   });
 });
 
@@ -1110,12 +1327,15 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
   // any verified identity in. These three tests pin: the fix (fails closed), the regression guard
   // (absent file is unaffected), and that the fail-closed path doesn't over-reach into bootstrap.
   test("a broken admins.json + empty bootstrap fails CLOSED: a verified JWT for any email is unauthorized", async () => {
+    const readDynamic = async (): Promise<Set<string>> => {
+      throw new Error("admins.json: unexpected token");
+    };
+    const writeDynamic = async () => {};
     const brokenStore: AdminStore = {
       bootstrap: new Set(),
-      readDynamic: async () => {
-        throw new Error("admins.json: unexpected token");
-      },
-      writeDynamic: async () => {},
+      readDynamic,
+      writeDynamic,
+      mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
     };
     const jwt = await signToken({ email: "anyone@example.com" });
     const res = await handleRequest(
@@ -1134,12 +1354,15 @@ describe("handleRequest — real Cloudflare Access JWT", () => {
   });
 
   test("a broken admins.json doesn't lock out a bootstrap-pinned admin's JWT", async () => {
+    const readDynamic = async (): Promise<Set<string>> => {
+      throw new Error("admins.json: unexpected token");
+    };
+    const writeDynamic = async () => {};
     const brokenStore: AdminStore = {
       bootstrap: new Set(["roshne@gmail.com"]),
-      readDynamic: async () => {
-        throw new Error("admins.json: unexpected token");
-      },
-      writeDynamic: async () => {},
+      readDynamic,
+      writeDynamic,
+      mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }),
     };
     const jwt = await signToken({ email: "roshne@gmail.com" });
     const res = await handleRequest(
@@ -2734,6 +2957,24 @@ describe("mergePluginsView surfaces #124 admin fields", () => {
     } as unknown as PluginIndex;
     expect(mergePluginsView(malformed, [], "warbandeer").plugins[0]!.envKeys).toEqual(["OK"]);
   });
+
+  test("drops an env key that is not ^[A-Z][A-Z0-9_]*$, from envKeys and from env (#226)", () => {
+    const idxWithBadKeys: PluginIndex = {
+      schemaVersion: 1,
+      plugins: [
+        {
+          name: "warbandeer",
+          version: "1.1.0",
+          env: [{ key: "GOOD_KEY" }, { key: "bad key" }, { key: "X\nY=1" }, { key: "lower" }, { key: "_UNDER" }],
+        },
+      ],
+    };
+    const wb = mergePluginsView(idxWithBadKeys, [], "warbandeer").plugins[0]!;
+    // Mutation: dropping ENV_KEY_RE.test(...) from either filter would let a malformed key reach
+    // the admin bridge's own-keys-only scope, or draw a settings field for it.
+    expect(wb.envKeys).toEqual(["GOOD_KEY"]);
+    expect(wb.env.map((e) => e.key)).toEqual(["GOOD_KEY"]);
+  });
 });
 
 describe("mergePluginsView surfaces #244 card fields", () => {
@@ -3022,8 +3263,15 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
     schemaVersion: 1,
     plugins: [{ name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: 1 }],
   };
-  const okAsset = (body: string, contentType = "text/javascript"): AdminAssetResult => ({ ok: true, status: 200, contentType, body });
-  const failAsset: AdminAssetResult = { ok: false, status: 502, contentType: "", body: "", error: "boom" };
+  // #229: AdminAssetResult.body is bytes — encoded here so every existing text-asset test (the JS
+  // bundle, JSON responses) keeps working unchanged against the new shape.
+  const okAsset = (body: string, contentType = "text/javascript"): AdminAssetResult => ({
+    ok: true,
+    status: 200,
+    contentType,
+    body: new TextEncoder().encode(body),
+  });
+  const failAsset: AdminAssetResult = { ok: false, status: 502, contentType: "", body: new Uint8Array(0), error: "boom" };
   function cfg(over: Partial<HandlerConfig> = {}): HandlerConfig {
     return {
       adminToken: TOKEN,
@@ -3062,7 +3310,7 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
   // flat 502, so the client's describeBundleFailure renders its "no settings tab at this version"
   // note instead of the generic "couldn't load" one.
   test("a genuine upstream 404 (asset.status===404) propagates as 404, distinct from a 502 error", async () => {
-    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: "", error: "upstream 404" };
+    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: new Uint8Array(0), error: "upstream 404" };
     const res = await serveAdminBundle(bundleReq("/plugin-admin/warbandeer.js"), cfg({ fetchAdminAsset: async () => upstream404 }));
     // Mutation: collapsing every !asset.ok to 502 (the pre-fix bug) would return 502 here instead.
     expect(res.status).toBe(404);
@@ -3110,6 +3358,21 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("application/json");
   });
+
+  test("serves a binary asset byte for byte with the upstream content type (#229)", async () => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]); // PNG signature
+    const proxied = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/icon.png";
+    const c = cfg({
+      fetchAdminAsset: async (url) =>
+        url === proxied ? { ok: true, status: 200, contentType: "image/png", body: bytes } : failAsset,
+    });
+    const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/icon.png"), c);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("image/png");
+    // Mutation: decoding the body as text anywhere in the proxy path (the pre-#229 bug) would
+    // corrupt these non-UTF-8 bytes instead of round-tripping them exactly.
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(bytes);
+  });
   test("400 for a traversal path — refused before any fetch", async () => {
     let fetched = false;
     const c = cfg({ fetchAdminAsset: async () => { fetched = true; return okAsset("x"); } });
@@ -3120,7 +3383,7 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
   // #165: same status-propagation fix as serveAdminBundle — a genuine upstream 404 for a data asset
   // (e.g. missing at this pinned version) surfaces as 404, not a flat 502.
   test("a genuine upstream 404 (asset.status===404) propagates as 404, distinct from a 502 error", async () => {
-    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: "", error: "upstream 404" };
+    const upstream404: AdminAssetResult = { ok: false, status: 404, contentType: "", body: new Uint8Array(0), error: "upstream 404" };
     const res = await servePluginProxy(new URL("http://x/api/plugin-proxy/warbandeer?path=dist/realms.json"), cfg({ fetchAdminAsset: async () => upstream404 }));
     // Mutation: collapsing every !asset.ok to 502 (the pre-fix bug) would return 502 here instead.
     expect(res.status).toBe(404);
@@ -3191,6 +3454,24 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
   test("a non-ok upstream is an error", async () => {
     const fetcher = makeAdminAssetFetcher(async () => res({ ok: false, status: 404 }), 100);
     expect((await fetcher("https://cdn.jsdelivr.net/x")).ok).toBe(false);
+  });
+
+  test("returns the bytes unchanged, including bytes that are not UTF-8 (#229)", async () => {
+    const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe]);
+    const fetcher = makeAdminAssetFetcher(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        arrayBuffer: async () => bytes.buffer,
+      }),
+      100,
+    );
+    const out = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(out.ok).toBe(true);
+    // Mutation: decoding with `new TextDecoder().decode(buf)` (the pre-#229 bug) would turn every
+    // non-UTF-8 byte here into U+FFFD instead of preserving them.
+    expect(out.body).toEqual(bytes);
   });
 });
 
@@ -3266,6 +3547,9 @@ describe("plugin admin helpers (lifted from index.html)", () => {
     changes: Record<string, unknown>,
     keys: string[],
   ) => { body?: string; error?: string };
+  // #226: lifted the same way as every other symbol here, so the source-pin test below compares
+  // the page's ACTUAL regex (evaluated), not a hand-copied text fragment.
+  const liftedEnvKeyRe = new Function(`"use strict";\n${src ?? ""}\nreturn ENV_KEY_RE;`)() as RegExp;
   const viewToState = new Function(`"use strict";\n${src ?? ""}\nreturn viewToState;`)() as (
     p: unknown,
   ) => Record<string, unknown> | null;
@@ -3332,6 +3616,23 @@ describe("plugin admin helpers (lifted from index.html)", () => {
     // A \n or \r in a value would smuggle a second env-set line past the key scope — refused.
     expect(buildSetEnvBody({ WARBANDEER_INGEST_PORT: "8080\nANNOUNCE_CHANNEL_ID=1" }, ["WARBANDEER_INGEST_PORT"]).error).toBeTruthy();
     expect(buildSetEnvBody({ WARBANDEER_INGEST_PORT: "8080\rX=1" }, ["WARBANDEER_INGEST_PORT"]).error).toBeTruthy();
+  });
+
+  test("buildSetEnvBody refuses a key that is not a valid setting name, naming it only when printable (#226)", () => {
+    // A newline is never printable-safe under bot-ops.sh's echo_key rule — never shown.
+    expect(buildSetEnvBody({ "X\nY=1": "v" }, ["X\nY=1"])).toEqual({ error: "key (not shown) is not a valid setting name" });
+    // A space + lowercase ALSO fails echo_key's own character-class rule — also not shown (a key
+    // that fails ENV_KEY_RE, the char-class it shares with the printability check, always does).
+    expect(buildSetEnvBody({ "bad key": "v" }, ["bad key"])).toEqual({ error: "key (not shown) is not a valid setting name" });
+    // A valid key passes straight through to the value/body path, unaffected.
+    expect(buildSetEnvBody({ GOOD_KEY: "v" }, ["GOOD_KEY"])).toEqual({ body: "GOOD_KEY=v" });
+  });
+
+  test("the page's key regex is the server's ENV_KEY_RE (source pin) (#226)", () => {
+    // Mutation: editing either literal without the other (a rename, a tightened/loosened class)
+    // would drift the two guards apart — the page could then refuse a key the server accepts, or
+    // the reverse.
+    expect(liftedEnvKeyRe.source).toBe(ENV_KEY_RE.source);
   });
 
   test("viewToState maps a /api/plugins row to the PluginStateEntry shape (availableVersion when newer)", () => {

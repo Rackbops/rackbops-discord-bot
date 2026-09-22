@@ -3330,11 +3330,24 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
 describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
   const script = readFileSync(BOT_OPS_SH, "utf8");
   const block = script.match(/declare -A RESERVED_KEYS=\(([\s\S]*?)\n\)/)?.[1] ?? "";
-  const reserved = new Set([...block.matchAll(/\[([A-Z][A-Z0-9_]*)\]=1/g)].map((m) => m[1]!));
+  // #280: widened from [A-Z][A-Z0-9_]* so the lower-case http_proxy (group 4) is counted too — the only
+  // lower-case entry RESERVED_KEYS carries, and the reason group 4 exists at all: most tools consult it
+  // before the upper-case form.
+  const reserved = new Set([...block.matchAll(/\[([A-Za-z_][A-Za-z0-9_]*)\]=1/g)].map((m) => m[1]!));
 
   test("the block is found and non-empty (can't pass vacuously)", () => {
     expect(reserved.size).toBeGreaterThanOrEqual(15);
     expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
+  });
+
+  // #280: none of the pins below (credential-shaped, .env.example-documented, compose-interpolated,
+  // src/-scanned) can see group 4 -- the behaviour table is what proves each of the seven is actually
+  // refused. This test guards the regex widening itself: reverting it to upper-case-only would silently
+  // drop the three lower-case spellings from `reserved` with nothing here to say so.
+  test("group 4 (both spellings of the proxy variables, and TAR_OPTIONS, #280) is present", () => {
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "TAR_OPTIONS"]) {
+      expect(reserved.has(key), key).toBe(true);
+    }
   });
 
   // Credentials a first-party plugin owns are NOT reserved, on purpose (ADR-0006 decision 8): the panel
@@ -3473,8 +3486,11 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
 // index entry needs no enabled plugin to make a key listable and editable, so these are reserved; the table
 // below is the behaviour, and the RESERVED_KEYS describe above pins that the set stays complete.
 describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel does not edit (#278)", () => {
-  // The last four are read by discord.js's Client (src/client.ts builds it with no shard options), not by the
-  // core's own source, so the src/ scan above cannot see them: this table is what pins them.
+  // The four SHARD* settings are read by discord.js's Client (src/client.ts builds it with no shard
+  // options), not by the core's own source, so the src/ scan above cannot see them. The seven #280
+  // settings (both spellings of the proxy variables, and TAR_OPTIONS) act on the core's own outbound
+  // calls or a tool it spawns, not on anything src/ names by a form the scan knows either. This table is
+  // what pins all eleven.
   const CORE_SETTINGS = [
     "GITHUB_REPO",
     "PLUGIN_REGISTRY_URL",
@@ -3487,17 +3503,29 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
     "SHARD_COUNT",
     "SHARDING_MANAGER",
     "SHARDING_MANAGER_MODE",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "TAR_OPTIONS",
   ];
-  // Two plugins claim every one of them, one plain and one `secret: true` -- except HOSTNAME, which only
-  // `plain-claim` claims. Claiming every key both ways would let the secret-wins rule in load_plugin_keys
-  // (ops/bot-ops.sh) mask a forgotten RESERVED_KEYS entry from env-get on every key (env-get never lists a
-  // secret row, so it would only ever fail via env-schema); one plain-only key gives env-get its own
-  // first-failing case for that same regression. Each plugin also declares a benign key, so a dropped claim
-  // is told apart from a dropped entry.
+  // Two plugins claim every one of them, one plain and one `secret: true` -- except HOSTNAME and (#280)
+  // http_proxy, which only `plain-claim` claims. Claiming every key both ways would let the secret-wins
+  // rule in load_plugin_keys (ops/bot-ops.sh) mask a forgotten RESERVED_KEYS entry from env-get on every
+  // key (env-get never lists a secret row, so it would only ever fail via env-schema); a plain-only key
+  // gives env-get its own first-failing case for that same regression. http_proxy is the plain-only
+  // example for group 4 on purpose: none of the "RESERVED_KEYS covers" pins above name any of group 4
+  // specifically (none is credential-shaped, documented in .env.example, a compose interpolation, or
+  // read through a form the src/ scan knows), so THIS table is the only thing that fails if any of the
+  // seven drops out of RESERVED_KEYS, and http_proxy being plain-only makes ITS failure the direct way,
+  // via env-get, rather than only through the secret-wins path the other six share. Each
+  // plugin also declares a benign key, so a dropped claim is told apart from a dropped entry.
   const CLAIMS = wrapIndex([
     pluginEntry("plain-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$")), envKey("PLAIN_CLAIM_PORT", PORT_RE)]),
     pluginEntry("secret-claim", [
-      ...CORE_SETTINGS.filter((k) => k !== "HOSTNAME").map((k) => envKey(k, "^.+$", { secret: true })),
+      ...CORE_SETTINGS.filter((k) => k !== "HOSTNAME" && k !== "http_proxy").map((k) => envKey(k, "^.+$", { secret: true })),
       envKey("SECRET_CLAIM_PORT", PORT_RE),
     ]),
   ]);
@@ -3527,7 +3555,12 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
       for (const key of CORE_SETTINGS) {
         const run = await botOps(fx, ["env-set"], `${key}=some-value-1\n`);
         expect(run.exitCode, key).toBe(1);
-        expect(run.stderr, key).toContain(`'${key}' is not an editable key`);
+        // echo_key (ops/bot-ops.sh) only echoes a refused key shaped like a real env var name --
+        // upper-case, <= 40 chars -- so http_proxy (#280's one lower-case reserved key) is scrubbed to
+        // "(not shown)" like any other non-conforming "key" (e.g. a multi-line secret's stray line).
+        // That is echo_key's own existing, deliberate behavior, not something this PR changes.
+        const echoed = /^[A-Z][A-Z0-9_]{0,39}$/.test(key) ? key : "(not shown)";
+        expect(run.stderr, key).toContain(`'${echoed}' is not an editable key`);
       }
       expect(envText(fx)).toBe(env); // .env untouched
       expect(dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"))).toBe(false); // nothing recreated
