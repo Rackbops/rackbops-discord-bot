@@ -126,8 +126,8 @@ toast work and from #246's Servers behavior.
 | Acceptance outcome | Steps | Test | Mutation that must fail it |
 |---|---|---|---|
 | typecheck and panel tests green | 1–3 | acceptance commands | — |
-| no `field-hint`; true control help/errors use shared classes, other copy uses `adm-note` | 1–3 | source pins plus Apply harness | restore one `field-hint`; classify a control description as `adm-note` |
-| required labels use the shared marker and native controls carry `required` | 1, 3 | Config/plain/secret/tag builder pins | restore string-concatenated `" *"`; omit `required` from one native control |
+| no `field-hint`; true control help/errors use shared classes, other copy uses `adm-note` | 1–3 | rendered plain-setting builder, class/note pins and Apply harness | restore one `field-hint`; classify a control description as `adm-note`; render plain help as inline `span` |
+| required labels use the shared marker and native controls carry `required` | 1, 3 | Config/tag pins plus rendered plain/secret builders | restore string-concatenated `" *"`; omit `required` from one native control |
 | validation is inline, invalid, and described without losing help | 1, 3 | Apply refusal/edit/Discard harness | replace `aria-describedby` instead of adding a token; omit the inline error node |
 | route validation adopts shared help/error and preserves its composite outline | 1–3 | route source/harness pins | remove the help id while adding the error; remove the route composite rule |
 | broad local invalid CSS is gone; tag composite remains | 2, 3 | CSS rule/source test | restore `.adm [aria-invalid]`; delete `.tag-field:has(...)` |
@@ -139,7 +139,7 @@ toast work and from #246's Servers behavior.
 bun run --cwd ops/admin check
 bun test ops/admin/server.test.ts --timeout 20000
 git grep -n "field-hint" -- ops/admin
-git grep -n 'adm \[aria-invalid="true"\]' -- ops/admin/public/admin.css
+git grep -n -F '.adm [aria-invalid="true"]' -- ops/admin/public/admin.css
 ```
 
 The two greps must print nothing. The test file runs once at a time with private `TEMP`/`TMP`.
@@ -156,12 +156,12 @@ error plus retained composite outline; and keyboard reachability.
   helper source immediately before their marked blocks.
 - **Acceptance (private `TEMP`/`TMP`, serial):** `bun run --cwd=ops/admin check` exited 0 with
   `$ bunx tsc --noEmit`. The final clean `bun test ops/admin/server.test.ts --timeout 20000`
-  exited 0 with `776 pass`, `5 skip`, `0 fail`, `3411 expect() calls`, and
-  `Ran 781 tests across 1 file`.
+  exited 0 with `777 pass`, `5 skip`, `0 fail`, `3414 expect() calls`, and
+  `Ran 782 tests across 1 file`.
   `git grep -n "field-hint" -- ops/admin` and
-  `git grep -n 'adm \[aria-invalid="true"\]' -- ops/admin/public/admin.css` both printed nothing
+  `git grep -n -F '.adm [aria-invalid="true"]' -- ops/admin/public/admin.css` both printed nothing
   (the expected git-grep exit 1 for no matches).
-- **Mutation matrix:** 58 one-at-a-time mutants in detached worktree
+- **Mutation matrix:** 59 one-at-a-time mutants in detached/disposable worktrees;
   `bot-300-form-states-mutations`; every final mutant was killed, and each run executed the full
   focused test file. The first 19 covered a restored legacy hint,
   a control help misclassified as `adm-note`, string-only and exposed required markers, missing native
@@ -173,7 +173,46 @@ error plus retained composite outline; and keyboard reachability.
   acceptance result above. After round 1, 29 further mutants covered all 18 panel-note
   classifications, both saved/visible secret-label branches, the multiline plan-error key and inline
   refusal, live required-marker append, and all three route invalid/error DOM writes; all 29 were
-  killed with `Ran 780 tests across 1 file` in every run.
+  killed with `Ran 780 tests across 1 file` in every run. Ten round-2 state-transfer mutants and the
+  final inline-`span` help mutant were also killed. The final help mutant ran all 782 tests and failed
+  `page skeleton > plugin plain-setting help renders the shared block-level help element (#300)`.
+- **Exact mutation failures (required by #300):** the 19 initial mutants were re-run on the final
+  state; every run reported `Ran 782 tests across 1 file`. That Windows-only runner also had baseline
+  `uv_spawn 'bash'`/`EPERM` environment failures, so a kill is the additional named
+  assertion failure below, not merely exit 1. Logs and `mutation-summary.tsv` are in
+  `bot-300-initial-mutation-logs-rerun` under this task's visualization directory.
+  1. legacy Config help -> `the page's stylesheets > every class the page uses is styled by admin.css or the theme`; `page skeleton > shared form classes replace the legacy hint class and required semantics reach every builder (#300)`
+  2. plugin help as `adm-note` -> the shared-form test above; `page skeleton > plugin plain-setting help renders the shared block-level help element (#300)`; `page skeleton > every non-field note remains panel copy, not shared field help (#300)`
+  3. marker not appended -> `page skeleton > the required helper appends the visible, aria-hidden marker (#300)`; `a secret's value stays in one password field (#244) > a visible secret has a real required label; a saved secret has neutral text with no orphaned for`
+  4. plugin plain native `required` removed -> the shared-form and rendered plain-setting tests above
+  5. error description overwrites help -> `applyPending (#257) > a blank required field blocks the whole apply, names the key, marks the control invalid, shows its tab, and posts nothing (#45)`; `Apply bar events (#257) > an edit dismisses a finished message and a refusal, and clears aria-invalid`
+  6. inline error omitted -> the blank-required test above; `a refusal on a chip field marks and focuses its typing input, not the hidden carrier`; `a bad format blocks the whole apply the same way (#207)`; `line breaks in Config, plugin plain, and secret values use the inline refusal path before sending`; `a plugin-card re-render carries inline refusal state to the rebuilt control`; `a refusal is over once an apply goes: its message and its aria-invalid mark do not outlive it`; and the edit/clear test above
+  7. route help token removed -> `page skeleton > route field help/error ids preserve the help token while validation comes and goes (#300)`
+  8–10. route composite removed / broad invalid restored / tag composite removed -> `admin.css uses tokens only > the Apply bar (#257): sticky at the bottom, stacks on a phone, pads focus scrolling, bounds its text, and keeps only composite invalid styling local`
+  11. marker `aria-hidden` removed -> the shared-form and required-helper tests above
+  12. visible-secret native `required` removed -> the shared-form and visible/saved-secret tests above
+  13–14. Config plain/tag native `required` removed -> the shared-form test above
+  15. edit-path error cleanup removed -> the edit/clear test above
+  16. saved secret forced through visible-input branch -> the visible/saved-secret test above
+  17. Config help token removed -> the shared-form test above
+  18. plugin help token removed -> the shared-form and rendered plain-setting tests above
+  19. visible-secret help token removed -> the shared-form test above
+- **Round-1 mutation logs:** all 29 logs under this task's
+  `bot-300-round1-mutation-logs` directory report `Ran 780 tests across 1 file`. Static note 1–2 and
+  dynamic note 1–2/5/8–10 failed `every non-field note remains panel copy`; dynamic note
+  3–4/6–7/11–15 also failed `shared form classes replace the legacy hint class`; the danger note also
+  failed `the controls carry the design-system classes the restyle gave them`. The plan-error bypass
+  failed `line breaks in Config, plugin plain, and secret values use the inline refusal path`; the
+  plan-error key also failed the two `planApply` line-break tests. Marker append failed the
+  required-helper and visible/saved-secret tests. All three route DOM mutants failed
+  `scheduleRoutingSend coalesces a burst into one POST and never sends an unsendable selection`.
+  All five saved/visible-secret-label mutants failed the visible/saved-secret test and the shared-form
+  source test.
+- **Round-2 mutation names:** all ten state-transfer mutants failed
+  `applyPending (#257) > a plugin-card re-render carries inline refusal state to the rebuilt control`:
+  deleted capture; deleted owner reopen; either deleted restore site; blank captured message; deleted
+  `showFieldError`; deleted restored-control pointer; deleted missing-control cleanup; weakened the
+  plugin-ancestry predicate; and deleted old-control cleanup.
 - **Review gate round 1:** both independent reviewers returned NOT SOUND. Reproduced findings were:
   multiline `plan.error` could bypass the adjacent inline refusal; the saved-secret branch left an
   orphaned label; the non-field-note, marker-append and three route invalid/error writes did not all
@@ -189,6 +228,11 @@ error plus retained composite outline; and keyboard reachability.
   either deleted restore site; blank message; deleted error restore; deleted restored-control pointer;
   deleted missing-control cleanup; deleted plugin-ancestry predicate; and deleted old-control cleanup.
   The final correctness re-review returned SOUND.
+- **Review gate round 2, claims lens:** NOT SOUND. It found the non-portable regex grep claim, the
+  plugin plain-setting help rendered as an inline `span` despite the shared contract's block `p`, and
+  mutation categories without their exact failing test names. The grep is now literal and was executed
+  empty; the builder now renders `p` and has the executed rendered-builder/mutation guard above; and
+  every mutant is mapped to its exact failing test above. These fixes require a fresh whole-state round.
 - **Real Chrome, canned current-main data:** the complete pre-review pass in both `arcane-obsidian`
   and `arcane-parchment` rendered the
   blank required Config refusal with native `required`, focused invalid control, adjacent

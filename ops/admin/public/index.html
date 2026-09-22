@@ -1748,7 +1748,7 @@
     input.required = !!schemaRow.required;
     wrap.appendChild(input);
     if (e.description) {
-      const desc = document.createElement("span");
+      const desc = document.createElement("p");
       desc.className = "rb-field__help";
       desc.id = controlId + "-hint";
       desc.textContent = e.description;

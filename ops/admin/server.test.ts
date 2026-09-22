@@ -6189,6 +6189,61 @@ describe("page skeleton", () => {
     expect(children[1]?.attrs?.get("aria-hidden")).toBe("true");
   });
 
+  test("plugin plain-setting help renders the shared block-level help element (#300)", () => {
+    interface SettingEl {
+      tagName: string;
+      id?: string;
+      htmlFor?: string;
+      textContent: string;
+      className: string;
+      value?: string;
+      required?: boolean;
+      dataset: Record<string, string>;
+      attrs: Map<string, string>;
+      children: SettingEl[];
+      appendChild: (child: SettingEl) => SettingEl;
+      setAttribute: (name: string, value: string) => void;
+      getAttribute: (name: string) => string | null;
+      removeAttribute: (name: string) => void;
+    }
+    const element = (tagName: string): SettingEl => {
+      const attrs = new Map<string, string>();
+      const children: SettingEl[] = [];
+      return {
+        tagName, textContent: "", className: "", dataset: {}, attrs, children,
+        appendChild: (child) => (children.push(child), child),
+        setAttribute: (name, value) => void attrs.set(name, value),
+        getAttribute: (name) => attrs.get(name) ?? null,
+        removeAttribute: (name) => void attrs.delete(name),
+      };
+    };
+    const document = {
+      createElement: element,
+      createTextNode: (text: string) => ({ ...element("#text"), textContent: text }),
+    };
+    const settingSrc = indexSrc.slice(indexSrc.indexOf("function buildSettingField("), indexSrc.indexOf("function buildSecretField("));
+    const makeSetting = new Function(
+      "document", "loadedSchema", "loadedEnv", "settingLabel",
+      `"use strict";\n${formStatesSrc}\n${settingSrc}\nreturn buildSettingField;`,
+    )(
+      document,
+      { MUSIC_PORT: { source: "plugin", required: true, secret: false } },
+      { MUSIC_PORT: "8080" },
+      () => "Port",
+    ) as (plugin: { name: string }, env: { key: string; description: string }, ctx: { owners: Map<string, string> }) => SettingEl;
+
+    const field = makeSetting(
+      { name: "music" },
+      { key: "MUSIC_PORT", description: "The service port." },
+      { owners: new Map([["MUSIC_PORT", "music"]]) },
+    );
+    const input = field.children.find((child) => child.id === "set-MUSIC_PORT")!;
+    const help = field.children.find((child) => child.id === "set-MUSIC_PORT-hint")!;
+    expect(input).toMatchObject({ tagName: "input", required: true });
+    expect(input.getAttribute("aria-describedby")).toBe("set-MUSIC_PORT-hint");
+    expect(help).toMatchObject({ tagName: "p", className: "rb-field__help", textContent: "The service port." });
+  });
+
   test("every non-field note remains panel copy, not shared field help (#300)", () => {
     expect(indexSrc.split('class="adm-note"').length - 1).toBe(2);
     expect(indexSrc.split('className = "adm-note";').length - 1).toBe(15);
