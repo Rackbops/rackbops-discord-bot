@@ -3340,6 +3340,16 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
     expect(reserved.has("DISCORD_TOKEN") && reserved.has("GITHUB_TOKEN") && reserved.has("ADMIN_TOKEN")).toBe(true);
   });
 
+  // #280: none of the pins below (credential-shaped, .env.example-documented, compose-interpolated,
+  // src/-scanned) can see group 4 -- the behaviour table is what proves each of the five is actually
+  // refused. This test guards the regex widening itself: reverting it to upper-case-only would silently
+  // drop http_proxy from `reserved` with nothing here to say so.
+  test("group 4 (the proxy variables and TAR_OPTIONS, #280) is present, including the lower-case http_proxy", () => {
+    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "TAR_OPTIONS"]) {
+      expect(reserved.has(key), key).toBe(true);
+    }
+  });
+
   // Credentials a first-party plugin owns are NOT reserved, on purpose (ADR-0006 decision 8): the panel
   // sets them write-only. Add a key here only when a plugin's Plugin Index entry declares it and nothing
   // in the bot core (src/) reads it. Each entry is checked below against .env.example's "Used by the
