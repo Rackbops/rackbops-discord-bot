@@ -6009,7 +6009,7 @@ describe("page skeleton", () => {
       ['add.className = "tag-add rb-input";', 1], // the chip editor's typing field
       ['label.className = "rb-label";', 5], // a config field's label, #244's three card-field builders (stub, plain, secret), #246's Add-a-webhook label
       ['control.className = "rb-select";', 3], // an enum select, the branch chooser, #246's server/channel picker
-      ['control.className = "rb-input";', 1], // a plain config field
+      ['control.className = "rb-input";', 2], // a plain config field, plus #246's picker-branch stale/never-a-picker fallback
       ['notice.className = "field-hint field-hint--danger";', 1],
       ['row.className = "admin-row";', 1],
       ['wrapper.className = "tag-field";', 1],
@@ -9901,7 +9901,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     expect(channel.value).toBe("10");
   });
 
-  test("without a ready discovery (null, or stale), buildEnvControl degrades to a plain input", () => {
+  test("without a ready discovery (null, or stale), buildEnvControl degrades to a plain input -- but only when nothing was already a picker", () => {
     for (const rd of [{ routing: null, discovery: null }, { routing: null, discovery: { ...discovery, generatedAt: "2020-01-01T00:00:00.000Z" } }]) {
       const h = harness(rd);
       expect(h.discoveryReadyForPickers()).toBe(false);
@@ -9911,6 +9911,33 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
       expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
       expect(control.value).toBe("100");
     }
+  });
+
+  // Round-4 review finding: renderEnvFields() wipes and rebuilds EVERY Config field from scratch on every
+  // reload (any Apply success, Discard, Unlock, or update-button reload) via buildEnvControl -- which used
+  // to decide server/channel vs. plain-input FRESH each call from discoveryReadyForPickers() alone, with
+  // no memory of the control already on screen. So once discovery went stale, a picker already showing
+  // silently reverted to a plain id input on the very next reload -- the exact "never downgrade" violation
+  // round 3 fixed in refreshEnvPickers, through a sibling path that fix never touched (refreshEnvPickers
+  // only upgrades/preserves an EXISTING element in place; it is never in the loop when renderEnvFields
+  // rebuilds the whole container from scratch).
+  test("buildEnvControl never rebuilds an EXISTING picker back into a plain input, even once discovery has gone stale", () => {
+    const existingPicker = makeEl("select");
+    existingPicker.value = "999999999";
+    const registry = new Map([["env-DISCORD_SERVER_ID", existingPicker]]);
+    for (const rd of [{ routing: null, discovery: null }, { routing: null, discovery: { ...discovery, generatedAt: "2020-01-01T00:00:00.000Z" } }]) {
+      const h = harness(rd, registry);
+      expect(h.discoveryReadyForPickers()).toBe(false); // discovery is NOT ready/fresh right now
+      const control = h.buildEnvControl("DISCORD_SERVER_ID", "999999999"); // renderEnvFields passes the loaded value
+      expect(control.tagName).toBe("SELECT"); // still a picker -- never downgraded
+      expect(control.id).toBe("env-DISCORD_SERVER_ID");
+      expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
+      expect(control.value).toBe("999999999"); // the stored value survives, even with an empty/stale guild list
+    }
+    // A key that was NEVER a picker (nothing registered under its id) still degrades normally -- this
+    // fix only preserves a picker that already exists, it doesn't force one into existence.
+    const freshH = harness({ routing: null, discovery: null });
+    expect(freshH.buildEnvControl("DISCORD_SERVER_ID", "100").tagName).toBe("INPUT");
   });
 
   test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {

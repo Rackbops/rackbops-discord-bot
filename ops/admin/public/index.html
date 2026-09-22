@@ -3181,10 +3181,31 @@
       control.className = "rb-select";
       const re = compilePattern(loadedSchema.BOT_BRANCH && loadedSchema.BOT_BRANCH.pattern);
       populateBranchSelect(control, branchesData, value, re);
-    } else if ((meta.control === "server" || meta.control === "channel") && discoveryReadyForPickers()) {
+    } else if (meta.control === "server" || meta.control === "channel") {
       // #246: a <select> of live servers/channels (decision 6) -- degrades to the plain input below
-      // whenever discovery isn't ready to trust (null, or stale by #245's own DISCOVERY_STALE_MS rule).
-      control = buildPickerSelect(key, routingData.discovery, value);
+      // whenever discovery isn't ready to trust (null, or stale by #245's own DISCOVERY_STALE_MS rule)
+      // AND no picker is already showing.
+      //
+      // Round-4 review finding: renderEnvFields() wipes and rebuilds EVERY Config field from scratch on
+      // every reload (any Apply success, Discard, Unlock, or update-button reload all route through
+      // reloadConfig() -> renderEnvFields()) -- and this branch used to decide fresh each call from
+      // discoveryReadyForPickers() ALONE, with no memory of the control that was already there. So once
+      // discovery went stale (DISCOVERY_STALE_MS, ~1h) a picker already on screen silently reverted to a
+      // plain id input on the very next reload -- the same "never downgrade" violation round 3 fixed in
+      // refreshEnvPickers, through a sibling path that fix never touched (refreshEnvPickers only
+      // upgrades/preserves an EXISTING element in place; it is never in the loop when renderEnvFields
+      // rebuilds the whole container). Once a picker for this key exists, it stays a picker even if
+      // discovery has since gone stale -- pickerOptions/buildPickerSelect already handle a null/stale
+      // discovery gracefully (an empty guild list, the stored value kept as its own fallback option), the
+      // same degrade-gracefully rule an out-of-enum plain-select value already gets, above.
+      const existing = document.getElementById("env-" + key);
+      if ((existing && existing.tagName === "SELECT") || discoveryReadyForPickers()) {
+        control = buildPickerSelect(key, routingData.discovery, value);
+      } else {
+        control = document.createElement("input");
+        control.className = "rb-input";
+        control.value = value;
+      }
     } else {
       control = document.createElement("input");
       control.className = "rb-input";
