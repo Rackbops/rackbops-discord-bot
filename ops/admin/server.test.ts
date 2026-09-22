@@ -5444,6 +5444,10 @@ describe("outcomes toast exactly once at their settle points (#300, source pin)"
   test("outcomes toast exactly once at their settle points (source pin)", () => {
     const slice = (start: string, end: string) => html300.slice(html300.indexOf(start), html300.indexOf(end));
     const sites = [
+      // sendRouting's OWN initiating-POST failures (never-ok, unparseable body, network catch) are a
+      // sixth site alongside the plan's original five: the same failure class every sibling mutation
+      // below already toasts on, so parity, not scope creep (round-1 review finding, #307).
+      ["sendRouting", slice("async function sendRouting(", "async function awaitRequestResult(")],
       ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive(")],
       ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus(")],
       ["addWebhook", slice("async function addWebhook(", "async function removeWebhook(")],
@@ -5453,9 +5457,15 @@ describe("outcomes toast exactly once at their settle points (#300, source pin)"
     for (const [name, src] of sites) {
       expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: true });
     }
+    // sendRouting's three posted-error exits must ALL toast, not just one -- a mutation clearing only
+    // one of the three would otherwise slip through the loop above (which only checks "some showToast
+    // call exists somewhere in the whole function").
+    const sendRoutingSrc = slice("async function sendRouting(", "async function awaitRequestResult(");
+    expect((sendRoutingSrc.match(/showToast\(/g) ?? []).length).toBe(3);
     // Never in the Apply bar, the inline update-action messages, or retryRegistration's own body (it
-    // reuses sendRouting -> awaitRequestResult, whose toast already covers it -- a second one here would
-    // double-fire on every retry).
+    // reuses sendRouting -> awaitRequestResult: the outcomes that reach awaitRequestResult -- applied,
+    // refused, timeout -- toast from there; sendRouting's own posted-error exits, above, now toast too,
+    // so retryRegistration's own call to sendRouting needs no separate toast of its own either way).
     const applySrc = slice("// APPLY:begin", "// APPLY:end");
     const pluginRequestSendSrc = slice("// PLUGIN_REQUEST_SEND:begin", "// PLUGIN_REQUEST_SEND:end");
     const updateBlockSrc = slice("function buildPluginUpdateBlock(", "const FIELD_META = {");
@@ -9621,6 +9631,9 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     hFail.run.onRouteChange("music", "100", "on", true); // "all" scope -> a sendable body
     const failOutcome = await (hFail.run.sendRouting("music") as unknown as Promise<string | undefined>);
     expect(failOutcome).toBe("posted-error");
+    // #307 round-1 finding: sendRouting's own POST failure now toasts, matching every sibling
+    // mutation's parity on the identical failure class.
+    expect(hFail.toasts()).toEqual([{ kind: "danger", text: "Couldn't send it: boom" }]);
 
     const id = "req-ok";
     const withResult = { routing: { ...routingDataInit.routing, results: [{ id, action: "routing-set", ok: true, at: "t" }] }, discovery };
@@ -10124,16 +10137,21 @@ describe("retryRegistration end-to-end: the real routingSetBody never drops an u
     let renderNeedsAttentionCalls = 0;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    // #300 (part B2, round-1 finding): sendRouting (reached via retryRegistration) now calls showToast
+    // on its own posted-error exits -- not part of this slice, injected as a call-tracked stub, same
+    // reasoning as refreshRoutingSteps/renderServers/renderNeedsAttention just above.
+    const toasts: { kind: string; text: string }[] = [];
+    const showToast = (kind: string, text: string) => { toasts.push({ kind, text }); };
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
-      "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention",
+      "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention", "showToast",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
         "return { retryablePlacement, retryRegistration };",
     )(
       document, api, timeoutSignal, setApplyText, opts.pluginsData, 110000, clock.setTimeout, clock.clearTimeout,
-      refreshRoutingSteps, serverActionState, renderServers, renderNeedsAttention,
+      refreshRoutingSteps, serverActionState, renderServers, renderNeedsAttention, showToast,
     ) as { retryablePlacement: () => RetryablePlacement; retryRegistration: () => Promise<void> };
-    return { run, posts, clock, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+    return { run, posts, clock, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls, toasts: () => toasts };
   }
 
   const HOME = "100", OTHER = "200", GONE = "999";

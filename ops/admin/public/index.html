@@ -1390,6 +1390,7 @@
         if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + text);
         return "posted-error";
       }
       let result = null;
@@ -1398,6 +1399,7 @@
         if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + text);
         return "posted-error";
       }
       const startedAt = Date.now();
@@ -1412,6 +1414,7 @@
       if (message === "unauthorized") return "unauthorized";
       st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
       renderRouteStatus(plugin, routingStepEls.get(plugin));
+      showToast("danger", "Couldn't send it: " + message);
       return "posted-error";
     } finally {
       cancel();

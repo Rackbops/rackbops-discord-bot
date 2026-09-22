@@ -158,3 +158,19 @@ gotcha). **`ops/admin/public/admin.css` is not in this PR's file list at all.**
   closed and this branch started fresh from `origin/main` — the test bodies are unchanged from that
   first pass; only the surrounding field-hint/required-marker tests from that attempt were dropped, per
   the scope split.
+- **Round-1 review finding (Reviewer A), verified and fixed: a sixth settle point, not named in the
+  original plan's five.** `sendRouting`'s own initiating-POST failure (its `"posted-error"` outcome —
+  a non-`ok` response, an unparseable body, or a network exception; three separate exit points) never
+  reached `awaitRequestResult`, so it never toasted, unlike the identical failure class in
+  `addWebhook`/`removeWebhook`/`refreshDiscovery`/`refreshDiscoveryAll`, which all toast `danger` on
+  their own initiating-POST failure. `retryRegistration` calls `sendRouting` directly and can hit this
+  exact path, so the claim that its toast is "already covered" by `sendRouting → awaitRequestResult`
+  was only true for the outcomes that actually reach `awaitRequestResult` (`applied`/`refused`/
+  `timeout`), not for `posted-error`, which short-circuits before that call. Fixed: all three of
+  `sendRouting`'s `posted-error` exits now call `showToast("danger", "Couldn't send it: " + …)`,
+  matching the sibling functions' own wording exactly. The settle-point source-pin test gained
+  `sendRouting` as a sixth checked site plus a count assertion (exactly 3 `showToast(` calls within it,
+  so a mutation clearing only one of the three can't slip through); the `sendRouting` mini-harness test
+  gained a direct assertion on the injected `toasts()` stub. `CONTEXT.md`'s toast gotcha paragraph is
+  corrected to name six sites and state precisely which of `retryRegistration`'s two paths each toast
+  covers, rather than the previous unqualified "already covers it."
