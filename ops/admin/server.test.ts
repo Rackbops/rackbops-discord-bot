@@ -6082,6 +6082,10 @@ describe("diffEdits (#244)", () => {
     const controls: DiffCaptured = { on: { unknown: true }, settings: { NEW_KEY: "x" }, secrets: {} };
     expect(diffEdits(baseline, controls)).toEqual({ on: { unknown: true }, settings: { NEW_KEY: "x" }, secrets: {} });
   });
+  test("a still-blank setting for a key the baseline never mentions is NOT captured (compared against the implicit \"\" default, not undefined)", () => {
+    const controls: DiffCaptured = { on: {}, settings: { NEW_KEY: "" }, secrets: {} };
+    expect(diffEdits(baseline, controls)).toEqual({ on: {}, settings: {}, secrets: {} });
+  });
 });
 
 describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, same edit)", () => {
@@ -6157,6 +6161,72 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     const second = h.reloadConfig();
     await Promise.all([first, second]);
     expect(h.calls.renderEnvFields).toBe(1);
+  });
+});
+
+// #244: refreshCardHeaders' per-card owner-filtering is otherwise unreachable from any test (the map it
+// reads, cardHeaderEls, is only populated by buildPluginCard, browser-only) -- runApply's harness returns
+// it so a test can seed its own stub {badge, summary} elements before triggering a bar refresh.
+describe("refreshCardHeaders (#244): a changed key counts only toward the card that owns it", () => {
+  const miniEl = (): StubEl =>
+    ({
+      id: "x", hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
+      classes: new Set(), attrs: new Map(), classList: { toggle: () => false }, setAttribute: () => {},
+      removeAttribute: () => {}, getAttribute: () => null, focus: () => {}, contains: () => false, closest: () => null,
+    }) as StubEl;
+  const twoPluginPluginsData = {
+    plugins: [
+      { name: "music", enabled: true, env: [{ key: "MUSIC_PORT" }] },
+      { name: "raidhelper", enabled: true, env: [{ key: "RAID_WEBHOOK" }] },
+    ],
+    pluginsValue: "music,raidhelper",
+  };
+
+  test("editing one card's setting shows 'N settings changed' on ITS card only", () => {
+    const page = runApply({
+      loadedEnv: { MUSIC_PORT: "1234", RAID_WEBHOOK: "https://old" },
+      pluginsData: twoPluginPluginsData,
+      settings: { MUSIC_PORT: "9999", RAID_WEBHOOK: "https://old" }, // only MUSIC_PORT edited
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).toBe("1 setting changed");
+    expect(music.badge.textContent).toBe("Restart to apply");
+    expect(raidhelper.summary.textContent).not.toBe("1 setting changed");
+    expect(raidhelper.badge.textContent).not.toBe("Restart to apply");
+  });
+
+  test("a secret typed for one card's key counts toward that card only", () => {
+    const page = runApply({
+      loadedEnv: { MUSIC_PORT: "1234", RAID_WEBHOOK: "https://old" },
+      pluginsData: twoPluginPluginsData,
+      secrets: { MUSIC_PORT: "shh" }, // pretend MUSIC_PORT were secret-shaped, for the owner check alone
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).toBe("1 setting changed");
+    expect(raidhelper.summary.textContent).not.toBe("1 setting changed");
+  });
+
+  test("pendingOn is only set for the plugin whose checked state actually changed", () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      pluginsData: twoPluginPluginsData,
+      checked: ["music"], // raidhelper (enabled:true on the server) is being turned OFF; music stays on
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).not.toBe("Turned on, not running yet");
+    expect(raidhelper.summary.textContent).toBe("Turned off, still running until you apply");
   });
 });
 
@@ -6631,10 +6701,15 @@ function runApply(spec: ApplySpec) {
   // BADGE_MODIFIERS, so their blocks join the lift too -- PLUGIN_EDITS (diffEdits, validateSecretChanges)
   // is what applyPending's secret-validation branch and reloadConfig's capture/reapply call, and
   // cardSettingLabel (inside APPLY) needs settingOwners/settingLabel as well.
+  // #244: cardHeaderEls is returned too -- refreshCardHeaders' per-card owner-filtering logic (which
+  // plugin's pendingSettings a changed key counts toward) is otherwise unreachable from any test: the
+  // map is empty until buildPluginCard (browser-only, never called here) populates it. A test that wants
+  // to exercise it seeds page.run.cardHeaderEls with its own stub {badge, summary} elements before
+  // calling refreshApplyBar()/discardPending()/applyPending().
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
     `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending };",
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
@@ -6642,6 +6717,7 @@ function runApply(spec: ApplySpec) {
     onControlEdited: (e: unknown) => void;
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
+    cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl }>;
   };
   refreshAfterLoad = () => run.refreshApplyBar();
 
@@ -7247,6 +7323,18 @@ describe("applyPending with a card (#244)", () => {
     expect(page.log.posts[0]?.opts.body).toBe("PLUGINS=warbandeer,raidhelper\nMUSIC_CALLBACK_PORT=8080\nSPOTIFY_CLIENT_SECRET=shh");
   });
 
+  test("a blank, non-required plain field alongside a valid secret is not refused (validateSecretChanges sees only the secret changes)", async () => {
+    // ANNOUNCE_CHANNEL_ID's pattern (APPLY_SCHEMA) does not match "": validateEnvChanges's own blank/required
+    // check already lets this through (not required), but validateSecretChanges has no such check at all --
+    // if it ever saw this NON-secret change too, it would run the blank value straight through
+    // compilePattern and refuse the whole apply for the wrong reason.
+    const schema = { ...APPLY_SCHEMA, ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: false, source: "core" }, SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" }, secrets: { SPOTIFY_CLIENT_SECRET: "abcdefghij0123" }, schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(1);
+    expect(page.log.posts[0]?.opts.body).toContain("SPOTIFY_CLIENT_SECRET=abcdefghij0123");
+  });
+
   test("a secret that fails validation posts nothing and its value is in no message", async () => {
     const schema = { ...APPLY_SCHEMA, SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
     const page = runApply({ loadedEnv: APPLY_ENV, secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
@@ -7286,6 +7374,13 @@ describe("applyPending with a card (#244)", () => {
         plugins: { checkedNames: ["warbandeer"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] },
       });
     }
+  });
+
+  test("an untyped (empty) secret field is not collected as a pending change", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, secrets: { SPOTIFY_CLIENT_SECRET: "" } });
+    expect(page.run.collectPending().secrets).toEqual({});
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]); // nothing pending at all: the empty secret plans no change
   });
 });
 
