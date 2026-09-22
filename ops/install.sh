@@ -147,7 +147,17 @@ fetch() {
 # The BOT_OPS_SCHEMA a bot-ops.sh file declares — read back from disk rather than trusted from
 # memory, so this can never itself drift from what a fetch actually wrote. Shared by the "wrote …
 # schema" summary line and install_shared_bin's refusal message below, so the two can't disagree.
-schema_of() { grep -m1 '^readonly BOT_OPS_SCHEMA=' "$1" | cut -d= -f2; }
+# #295: total, not partial — a fetched file missing the BOT_OPS_SCHEMA line makes the bare `grep |
+# cut` pipeline exit non-zero under `set -o pipefail`, which either aborts the whole script with no
+# diagnostic (when this runs as the right-hand side of a plain assignment) or silently prints
+# nothing (when it's embedded in a die/echo argument — errexit isn't checked inside those). The
+# `|| true` makes the pipeline itself always succeed; a missing line then just yields an empty $v,
+# printed as "unknown" rather than blank.
+schema_of() {
+  local v
+  v="$({ grep -m1 '^readonly BOT_OPS_SCHEMA=' "$1" || true; } | cut -d= -f2)"
+  [ -n "$v" ] && printf '%s' "$v" || printf 'unknown'
+}
 
 # #230: BIN_DIR is per HOST, not per instance — docker-compose.yml's admin service mounts this one
 # directory read-only into EVERY instance's admin container, so `install.sh <instance> <branch>`
@@ -203,6 +213,14 @@ validate_stack_env() {
 main() {
   INSTANCE="${1:-}"
   BRANCH="${2:-main}"
+  # #295: a second argument starting with '-' is never a real branch name (no branch begins with a
+  # dash) — almost always a mistyped `--force-bin` with the branch itself omitted, e.g.
+  # `install.sh debug --force-bin`. Left unchecked it would pass the #232 branch-name regex below
+  # (which permits '-') and only fail deep inside fetch(), well after other setup, with nothing
+  # more than a raw curl 404 against raw.githubusercontent.com/.../--force-bin/... Checked against
+  # the raw "${2:-}" positional, not $BRANCH (already defaulted to "main" by here), so an omitted
+  # branch is never mistaken for one that starts with '-'.
+  [[ "${2:-}" != -* ]] || die "usage: install.sh <instance> [branch] [--force-bin] ('--force-bin' needs a branch; from main it changes nothing)"
   # #230: the only accepted third argument. A per-instance branch cannot silently overwrite the
   # host-shared bin/bot-ops.sh (see install_shared_bin below) unless it's explicitly forced.
   FORCE_BIN=0
@@ -265,8 +283,11 @@ main() {
   fetch "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
   # #178: same pattern as bot-ops.sh's schema line above — read back from the file just written, so
   # an operator can compare this against the panel's own "docker-compose.yml schema <got> (panel
-  # needs <want>)" startup log line after a re-run.
-  compose_schema="$(grep -m1 '^x-rackbops-schema:' "$STACK_DIR/docker-compose.yml" | cut -d: -f2 | tr -d '[:space:]')"
+  # needs <want>)" startup log line after a re-run. #295: `|| true` makes the read total the same
+  # way schema_of() is now total — a compose file missing the line would otherwise abort this
+  # assignment under `set -o pipefail` before the ${compose_schema:-unknown} fallback below ever
+  # gets a chance.
+  compose_schema="$({ grep -m1 '^x-rackbops-schema:' "$STACK_DIR/docker-compose.yml" || true; } | cut -d: -f2 | tr -d '[:space:]')"
   echo "install: wrote $STACK_DIR/docker-compose.yml from $BRANCH (Dockge will list this as a managed stack; compose schema ${compose_schema:-unknown})"
 
   # Split from the emptiness check (rather than one combined `cmd || die`-free line) so a genuine

@@ -763,21 +763,36 @@ describe("disposePlugins (#184)", () => {
   // LATER plugin's dispose, never having given it a real chance to run at all. Disposing
   // concurrently (Promise.allSettled, not a sequential loop) is what keeps N plugins' worst case
   // the SAME as one plugin's — this is the direct regression guard for that.
+  //
+  // #255: this used to prove concurrency by WALL CLOCK — three wedged plugins raced against a
+  // hand-tuned window between "concurrent" (~100ms) and "sequential" (~300ms), an 80-120ms margin a
+  // loaded machine slips past (observed failing at 237ms isolated and 550ms under load, then
+  // passing 57 times in a row — a flake that cost a review round every time it appeared, with
+  // nothing in the actual diff to explain it). Proved STRUCTURALLY instead: each fake dispose
+  // records when it was CALLED, and every plugin's dispose must have been called within one turn of
+  // the event loop — a sequential implementation calls only the first plugin's dispose in that
+  // window, and cannot reach the second before the first plugin's own timeout fires. No elapsed-time
+  // assertion anywhere, so no machine speed can fail this test the property doesn't depend on.
+  // timeoutMs is 500 (not 100) so that even a badly starved `Bun.sleep(0)` cannot resume after a
+  // sequential loop's first 100ms-scale timeout would already have fired.
   test("multiple wedged plugins are disposed CONCURRENTLY — total time is one timeout, not the sum", async () => {
     const { log } = makeLog();
-    const a = loaded(entry({ name: "a" }), { dispose: () => new Promise<void>(() => {}) }, true);
-    const b = loaded(entry({ name: "b" }), { dispose: () => new Promise<void>(() => {}) }, true);
-    const c = loaded(entry({ name: "c" }), { dispose: () => new Promise<void>(() => {}) }, true);
-    const startedAt = Date.now();
+    const calls: string[] = [];
+    const wedge = (name: string): Plugin["dispose"] => () => {
+      calls.push(name);
+      return new Promise<void>(() => {}); // never settles — "wedged"
+    };
+    const a = loaded(entry({ name: "a" }), { dispose: wedge("a") }, true);
+    const b = loaded(entry({ name: "b" }), { dispose: wedge("b") }, true);
+    const c = loaded(entry({ name: "c" }), { dispose: wedge("c") }, true);
+    const disposePromise = disposePlugins([a, b, c], log, 500);
+    await Bun.sleep(0); // one turn of the event loop — enough for every CONCURRENT dispose to start
+    expect([...calls].sort()).toEqual(["a", "b", "c"]); // a sequential loop could only have reached "a" by now
     const settled = await Promise.race([
-      disposePlugins([a, b, c], log, 100).then(() => "settled" as const),
-      // A sequential implementation would take ~300ms (3 * 100ms) for three wedged plugins;
-      // concurrent takes ~100ms. This bound sits between the two, so it separates them.
-      Bun.sleep(220).then(() => "hung" as const),
+      disposePromise.then(() => "settled" as const),
+      Bun.sleep(5_000).then(() => "hung" as const), // a generous hang guard, not a timing assertion
     ]);
-    const elapsedMs = Date.now() - startedAt;
     expect(settled).toBe("settled");
-    expect(elapsedMs).toBeLessThan(220);
     expect(a.running).toBe(false);
     expect(b.running).toBe(false);
     expect(c.running).toBe(false);

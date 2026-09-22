@@ -706,8 +706,9 @@ export interface PluginIndexEntry {
   releases?: PluginRelease[];
   hostApiVersion?: number;
   /** #124: the plugin's declared env keys (from the manifest `env` block) — the panel uses the KEY
-   *  names to scope an admin tab's env reads/writes to this plugin's own keys. */
-  env?: { key: string; secret?: boolean }[];
+   *  names to scope an admin tab's env reads/writes to this plugin's own keys. #244 widens each
+   *  element with `description`/`required` so a plugin card can draw and label its settings step. */
+  env?: { key: string; description?: string; required?: boolean; secret?: boolean }[];
   /** #124: a jsDelivr URL of the plugin's admin bundle (`dist/admin.js`), present only when the
    *  plugin ships an admin tab. Derived by the plugins repo's generate-index; the panel fetches it
    *  (host-allowlisted, size-capped) and serves it same-origin. */
@@ -772,6 +773,10 @@ export interface PluginView {
   /** #124: this plugin's declared env KEY names (from the manifest) — the admin bridge scopes the
    *  tab's env reads/writes to exactly these, so a tab can only ever touch its own plugin's keys. */
   envKeys: string[];
+  /** #244: the plugin's declared settings, in manifest order — what the card's settings step draws. */
+  env: { key: string; description: string; required: boolean; secret: boolean }[];
+  /** #244: the plugin's command names, for the closed card's summary line. */
+  commands: string[];
 }
 export interface PluginsView {
   plugins: PluginView[];
@@ -886,6 +891,20 @@ export function mergePluginsView(
       envKeys: (entry?.env ?? [])
         .filter((e): e is { key: string } => !!e && typeof (e as { key?: unknown }).key === "string")
         .map((e) => e.key),
+      // #244: the same env block, widened for the card's settings step. Guarded the same way envKeys
+      // is (untrusted manifest JSON): an element without a string `key` is skipped; `description` is a
+      // string or ""; `required`/`secret` are true only for a literal `true`.
+      env: (entry?.env ?? [])
+        .filter((e): e is { key: string; description?: string; required?: boolean; secret?: boolean } => !!e && typeof (e as { key?: unknown }).key === "string")
+        .map((e) => ({
+          key: e.key,
+          description: typeof e.description === "string" ? e.description : "",
+          required: e.required === true,
+          secret: e.secret === true,
+        })),
+      // #244: the plugin's declared command names, for the closed card's summary line. Untrusted
+      // manifest JSON — keep strings only.
+      commands: (entry?.commands ?? []).filter((c): c is string => typeof c === "string"),
       ...(typeof entry?.adminUrl === "string" ? { adminUrl: entry.adminUrl } : {}),
       ...(typeof entry?.adminApiVersion === "number" ? { adminApiVersion: entry.adminApiVersion } : {}),
     };

@@ -537,7 +537,7 @@ button actually calls), `GET /api/env`,
 they're signed in as, plus the JWT's claims for the panel's Identity view), and
 `GET/POST/DELETE /api/admins` (the panel-managed dynamic admin list — see the narrowing note
 above), `GET /api/branches` (the configured repo's branches, for the `BOT_BRANCH` chooser), and
-`GET /api/plugins` (the Modify Plugins view — the Plugin Index merged with this instance's installed
+`GET /api/plugins` (the Plugins tab's cards — the Plugin Index merged with this instance's installed
 state and current `PLUGINS`; see below), and (**#105**) `POST /api/plugins/request` (an update-action
 button → a request file the bot consumes), and (**#242**) the routing routes: `GET /api/routing`
 (`bot-ops.sh routing-get`: the bot's `routing.json` and `discovery.json` as `{ routing, discovery }`) and
@@ -639,31 +639,49 @@ branch names `bot-ops.sh` accepts (`^[A-Za-z0-9._/-]{1,100}$`); a stored value t
 branch (a since-deleted branch) is still shown as its own option. If the lookup fails, `BOT_BRANCH`
 falls back to a plain text input.
 
-**The Modify Plugins section** lists every plugin the Plugin Index offers alongside what this
-instance has installed, and lets you add or remove one by ticking its checkbox and pressing Save.
-`GET /api/plugins` builds the view server-side: it merges the raw Plugin Index (fetched from
-`PLUGIN_INDEX_URL` — read on demand from the mounted `.env` like `GITHUB_REPO`, defaulting to the
-bot's own index when unset — so an edit is picked up without recreating the admin service, cached
-~5 min) with the bot's installed state (`bot-ops.sh status`'s `plugins`) and the current `PLUGINS`
-value (`env-get`). Each row shows the installed version, an "update to X" badge when the index
-carries a newer release, and a state tag (active / needs config / failed / not in index). **This
-never installs code from the browser** — ticking a plugin only adds its name to `PLUGINS`; the code
-is fetched and installed by the bot on its next boot exactly as it is for a hand-edited `PLUGINS`.
-You can never newly-*enable* a plugin the index doesn't list (its checkbox is disabled), but an
-already-enabled plugin the index has since dropped stays editable so you can still remove it. Save is
-the ordinary config Save under the hood: it computes the new `PLUGINS` string — preserving any
-`name@version` pin a still-ticked plugin already had, ordered by the manifest — and `POST`s **only**
-`PLUGINS` through `/api/env`, so the same Origin guard, auth, `bot-ops.sh` validation, and recreate
-apply as any other config change. The recreate it triggers is the restart that loads the change; a
-removed plugin's stored data files are left untouched. If the Plugin Index can't be fetched, the
-section shows an "index unavailable" notice and still lists the installed plugins (so you can still
-remove one) rather than failing — the `/api/plugins` route degrades to a `200` with an `indexError`,
-never a hard error. If the bot's own state can't be read (`status`/`env-get` failed — e.g. a docker
-hiccup), the route sets a `stateError` instead and the panel **disables Save**, since an empty
-selection read back under failure would otherwise let a save wipe the real `PLUGINS`.
+**The Plugins tab (one accordion card per plugin, #244)** lists every plugin the Plugin Index offers
+alongside what this instance has installed. `GET /api/plugins` builds the view server-side: it merges
+the raw Plugin Index (fetched from `PLUGIN_INDEX_URL` — read on demand from the mounted `.env` like
+`GITHUB_REPO`, defaulting to the bot's own index when unset — so an edit is picked up without
+recreating the admin service, cached ~5 min) with the bot's installed state (`bot-ops.sh status`'s
+`plugins`) and the current `PLUGINS` value (`env-get`). A card's header shows a badge and a one-line
+summary from a fixed priority order: a pending change (turning it on/off, or an edited setting) always
+wins, ahead of even an error; then "not in the index", an error, "needs setup" (a missing required
+setting), an available update (only while the plugin is ON — an off plugin never gets nudged to update
+code that isn't running), running with its command count, enabled-but-not-running, or off.
 
-**Driving an available update (#105).** A card whose plugin has a newer release than the one
-installed grows an update-action area: a **What changed** block (the release notes for each version
+Opening a card shows two steps. **Turn it on** is the switch — ticking it only adds the plugin's name
+to `PLUGINS`; the code is fetched and installed by the bot on its next boot exactly as for a
+hand-edited `PLUGINS`, and **this never installs code from the browser**. You can never newly-*enable*
+a plugin the index doesn't list (the switch is disabled), but an already-enabled plugin the index has
+since dropped stays editable so you can still turn it off. **Fill in its settings** draws one field per
+setting the plugin's manifest declares: a setting owned by the core config (or, if two plugins declare
+the same key, by whichever is first in the index) points you at where it's actually edited instead of
+duplicating the field; a secret shows only `•••••••• Saved on the server` and a **Replace** button once
+one is set (its value is never shown again, never sent anywhere but the one save, and can be replaced
+but not blanked from here); a setting the bot hasn't published a validation rule for yet (it can lag
+the index by up to ~15 minutes after a fresh install) can't be edited from the card until it has.
+
+**Nothing on a card saves on its own** — nothing has since #257 replaced the plugin/config Save
+buttons with one bar. The switch, the settings and the secrets are all just controls the **Apply bar**
+at the bottom of the page reads: it collects every pending change across every card and the Config
+editor and sends them as **one** `POST /api/env` (`PLUGINS` first, preserving any `name@version` pin a
+still-ticked plugin already had, ordered by the manifest, then every changed setting and secret), so
+one restart covers everything you touched. The recreate it triggers is the restart that loads the
+change; a removed plugin's stored data files are left untouched. Typing in one card survives opening or
+closing another, or an update button's own reload elsewhere on the tab — only **Discard**, or an Apply
+attempt that actually lands (a success, or a failure that re-baselines), drops what you typed. If the
+Plugin Index can't be fetched, the tab shows an "index unavailable" notice and still lists the
+installed plugins (so you can still turn one off) rather than failing — the `/api/plugins` route
+degrades to a `200` with an `indexError`, never a hard error, and a card's settings step says so instead
+of showing fields it can't validate. If the bot's own state can't be read (`status`/`env-get` failed —
+e.g. a docker hiccup), the route sets a `stateError` instead and every switch is **disabled**, since an
+empty selection read back under failure would otherwise let an apply wipe the real `PLUGINS`.
+
+**Driving an available update (#105).** A card whose plugin is ON and has a newer release than the one
+installed grows an update-action area (#225: an off plugin's card still shows its installed version,
+never an update badge or these actions — it isn't running, so there's nothing to nudge): a **What
+changed** block (the release notes for each version
 newer than installed, from the index), **Update now** and **Schedule** (a date/time picker) *when the
 update is host-API-compatible with this bot*, and **Remind me in 7 days** and **Skip this version**
 *always* (you can still silence or snooze a version you can't yet install); a **Cancel scheduled
