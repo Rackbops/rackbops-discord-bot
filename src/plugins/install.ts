@@ -9,9 +9,22 @@ import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
+
+/** #281: a blank (or whitespace-only) `PLUGIN_REGISTRY_URL` is unset, the same rule `src/config.ts`'s
+ *  `optional()` already applies to `PLUGIN_INDEX_URL` — compose's `env_file:` sets a bare `KEY=` line to
+ *  the empty string, and `.env.example` ships PLUGIN_REGISTRY_URL blank, so `??` alone (falling back only
+ *  on undefined/null) let a shipped-as-documented instance resolve every plugin metadata URL against a
+ *  relative path instead of the registry. Exported so install.test.ts drives it directly rather than only
+ *  through the module-level constant below. */
+export function resolveRegistryBase(env: Record<string, string | undefined>): string {
+  return (env.PLUGIN_REGISTRY_URL?.trim() || DEFAULT_REGISTRY).replace(/\/$/, "");
+}
+
 // Development-only override so the end-to-end fixture-plugin flow can point at a local registry
-// stub (see .env.example). Production leaves it unset and resolves against npm.
-const REGISTRY_BASE = (process.env.PLUGIN_REGISTRY_URL ?? DEFAULT_REGISTRY).replace(/\/$/, "");
+// stub (see .env.example). Production leaves it unset and resolves against npm. Exported (constant
+// export only, nothing else changes) so install.test.ts can pin that THIS constant, not just
+// resolveRegistryBase in isolation, is actually resolved through it in a fresh process.
+export const REGISTRY_BASE = resolveRegistryBase(process.env);
 const FETCH_TIMEOUT_MS = 30_000;
 
 interface InstallLog {

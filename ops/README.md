@@ -247,9 +247,14 @@ itself owns (a core credential, or a variable `docker-compose.yml` interpolates)
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
 `HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
 `Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE` — all
-`RESERVED_KEYS`, #278) stays out of every plugin path even if a manifest declares it, on or off.
-Variables the runtime or a spawned tool reads (`NODE_OPTIONS`, `PATH`, the proxy variables,
-`TAR_OPTIONS`) are not in it. If the bot isn't running (no cached index),
+`RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
+spellings of each proxy variable, since Bun's `fetch` honours upper- and lower-case alike
+(`HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`), and `TAR_OPTIONS`
+(also `RESERVED_KEYS`, #280) —
+stays out of every plugin path even if a manifest declares it, on or off. Variables that configure the
+runtime in general instead (`NODE_OPTIONS`, `PATH`, `LD_PRELOAD`, `BUN_*`, `TZ`, and a bare
+`ALL_PROXY`/`all_proxy`, which Bun's `fetch` does not honour) are not in it. If the
+bot isn't running (no cached index),
 `env-get` shows the static keys only and notes `plugins: index unavailable` on **stderr** (also on an
 instance with no `PLUGINS`, since the index is read regardless) — never
 an error (the JSON stays a flat map of editable keys, so the panel round-trips it unchanged) — and
@@ -310,10 +315,13 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   rule), so a stored value that holds one never blocks an unrelated save; a submitted secret always
   counts as a change, so it is always judged. (4) A key the
   deployment or the bot core owns — the core credentials, the access and admin settings, every variable
-  `docker-compose.yml` interpolates, and the settings the core reads that the panel does not edit
+  `docker-compose.yml` interpolates, the settings the core reads that the panel does not edit
   (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
   `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
-  `SHARDING_MANAGER_MODE`, #278) — is dropped from every plugin path whatever the manifest says, on or off
+  `SHARDING_MANAGER_MODE`, #278), and the variables that act on the core's own outbound calls or on a
+  tool it spawns — both spellings of each proxy variable (`HTTP_PROXY`/`http_proxy`,
+  `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`) and `TAR_OPTIONS` (#280) — is
+  dropped from every plugin path whatever the manifest says, on or off
   (`RESERVED_KEYS` in the script, pinned by tests against `.env.example`, the compose file, a scan of the
   variables the core's source reads and a behaviour table over the reserved core settings), so a manifest
   that names `DISCORD_TOKEN` cannot make the panel able to overwrite it. (5) The script fails

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installPlugins, reconcileManifest, tarExtract, type InstallDeps } from "./install";
+import { installPlugins, reconcileManifest, resolveRegistryBase, tarExtract, type InstallDeps } from "./install";
 import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
@@ -530,6 +530,51 @@ describe("installPlugins", () => {
       expect(readFileSync(join(dest, "dist", "plugin.js"), "utf8")).toContain("createPlugin");
       expect(existsSync(join(dest, "package.json"))).toBe(true);
     });
+  });
+});
+
+// #281: PLUGIN_REGISTRY_URL="" (what compose's env_file: delivers a bare `KEY=` line as, and what
+// .env.example ships) must resolve like unset, the same rule src/config.ts's optional() already applies
+// to PLUGIN_INDEX_URL. REGISTRY_BASE itself is a module-level constant computed once at import from the
+// real process.env, so it can't be driven per test; resolveRegistryBase is the pure seam that can.
+describe("resolveRegistryBase", () => {
+  test("a blank value falls back to the default registry", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "" })).toBe("https://registry.npmjs.org");
+  });
+  test("a whitespace-only value falls back to the default registry", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "   " })).toBe("https://registry.npmjs.org");
+  });
+  test("an unset value falls back to the default registry", () => {
+    expect(resolveRegistryBase({})).toBe("https://registry.npmjs.org");
+  });
+  test("a real value is used, with its trailing slash stripped", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "http://localhost:4873/" })).toBe("http://localhost:4873");
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "http://localhost:4873" })).toBe("http://localhost:4873");
+  });
+});
+
+// The tests above pin resolveRegistryBase in isolation -- they say nothing about whether install.ts's
+// own module-level REGISTRY_BASE constant is actually WIRED to it. `const REGISTRY_BASE =
+// resolveRegistryBase(process.env)` and `const REGISTRY_BASE = process.env.PLUGIN_REGISTRY_URL ??
+// DEFAULT_REGISTRY` (the pre-#281 form) both leave every test above green, since neither line is
+// exercised by them -- the consumer boundary, not the predicate, is what a regression would actually
+// hit. A fresh `bun -e` subprocess is the only seam: process.env at Bun's own startup is what
+// REGISTRY_BASE captures, and it can't be swapped inside this already-running test process.
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+describe("REGISTRY_BASE is resolved through resolveRegistryBase: a blank PLUGIN_REGISTRY_URL in a fresh process is the default registry (#281)", () => {
+  const runInFreshProcess = (registryUrl: string): string => {
+    const proc = Bun.spawnSync(
+      [process.execPath, "-e", 'import { REGISTRY_BASE } from "./src/plugins/install.ts"; console.log(REGISTRY_BASE)'],
+      { cwd: REPO_ROOT, env: { ...process.env, PLUGIN_REGISTRY_URL: registryUrl } },
+    );
+    return new TextDecoder().decode(proc.stdout).trim();
+  };
+
+  test("a blank PLUGIN_REGISTRY_URL", () => {
+    expect(runInFreshProcess("")).toBe("https://registry.npmjs.org");
+  });
+  test("a real PLUGIN_REGISTRY_URL, trailing slash stripped", () => {
+    expect(runInFreshProcess("http://localhost:4873/")).toBe("http://localhost:4873");
   });
 });
 

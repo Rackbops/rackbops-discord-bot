@@ -252,7 +252,7 @@ declare -A REQUIRED=(
 )
 
 # Keys the DEPLOYMENT and the bot CORE own, that a Plugin Index manifest may never make editable or
-# listable, whether it declares the key secret or not. Three groups:
+# listable, whether it declares the key secret or not. Four groups:
 #   1. core credentials and access control (#240): a plugin-declared secret key became writable, and a
 #      manifest that named DISCORD_TOKEN (by mistake, or through a compromised index entry) would
 #      otherwise have made the panel able to overwrite it — the one thing "core secrets stay
@@ -264,6 +264,14 @@ declare -A REQUIRED=(
 #      #256 an index entry needs no enabled plugin to do that. Some are set by the bot's own redeploy
 #      machinery or by docker, and four are read by the discord.js Client the core builds with no shard
 #      options, but every one is read from the environment, so a `.env` line would reach it.
+#   4. variables that act on the core's OWN outbound calls, or on a tool the core spawns, rather than on
+#      the runtime in general (#280): the proxy variables, both spellings of each (Bun's fetch honours
+#      HTTP_PROXY/http_proxy, HTTPS_PROXY/https_proxy and NO_PROXY/no_proxy alike, so a manifest-claimed
+#      value could redirect the core's requests to GitHub, the Plugin Index and the registry — a bare
+#      ALL_PROXY/all_proxy is NOT honoured, so it is not reserved), and TAR_OPTIONS (tarExtract spawns
+#      tar with the inherited environment, and tar reads it). By contrast, NODE_OPTIONS/PATH/LD_PRELOAD/
+#      BUN_*/TZ stay claimable (#240 item 22): they configure the runtime generally, and a plugin already
+#      in the index gains no new authority from them.
 # load_plugin_keys drops these on the way in. Pinned by ops/bot-ops.test.ts against .env.example's
 # credential-shaped keys, every ${VAR} docker-compose.yml interpolates, every key documented in
 # .env.example (each is editable, reserved, or a named plugin-owned setting) and the variables the bot
@@ -305,6 +313,19 @@ declare -A RESERVED_KEYS=(
   [SHARD_COUNT]=1              # discord.js Client: the shard count
   [SHARDING_MANAGER]=1         # discord.js Client: makes client.shard a ShardClientUtil
   [SHARDING_MANAGER_MODE]=1    # discord.js Client: that util's mode
+  # Group 4 (#280): act on the core's own outbound calls or on a tool it spawns, not on the runtime
+  # in general — unlike NODE_OPTIONS/PATH/LD_PRELOAD/BUN_*/TZ, which stay claimable (#240 item 22).
+  # Bun's fetch honours both the upper- and lower-case spelling of each proxy variable (reproduced
+  # against a real https:// target for the *_PROXY pair; a bare ALL_PROXY/all_proxy is NOT honoured,
+  # so it stays out), so both spellings of all three are reserved -- RESERVED_KEYS[$key] is a literal,
+  # case-sensitive lookup, so the upper-case entry alone would leave the lower-case spelling claimable.
+  [HTTP_PROXY]=1                # Bun's fetch: proxies src/plugins/index.ts's and install.ts's requests
+  [http_proxy]=1                # same, lower-case; see the test pin's widened regex
+  [HTTPS_PROXY]=1               # Bun's fetch: same, for https:// targets (GitHub, the registry)
+  [https_proxy]=1               # same, lower-case
+  [NO_PROXY]=1                  # Bun's fetch: exempts hosts from the proxy above
+  [no_proxy]=1                  # same, lower-case
+  [TAR_OPTIONS]=1               # src/plugins/install.ts's tarExtract spawns tar with the inherited environment
 )
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
