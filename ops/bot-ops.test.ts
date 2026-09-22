@@ -857,10 +857,10 @@ describe.skipIf(!runnable || !REAL_FLOCK)("bot-ops.sh env-set/restart/recreate s
       composeUp: { output: "Container probe-container  Started", delayMs: 1500 },
       composeRestart: { output: "Container probe-container  Started" },
     });
-    const [envSet, restart] = await Promise.all([
-      botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n"),
-      botOps(fx, ["restart"]),
-    ]);
+    const envSetPromise = botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    await Bun.sleep(300); // let env-set win the lock race before restart even starts
+    const restartPromise = botOps(fx, ["restart"]);
+    const [envSet, restart] = await Promise.all([envSetPromise, restartPromise]);
     expect(envSet.exitCode).toBe(0);
     expect(restart.exitCode).toBe(0);
     const lines = readFileSync(join(fx.bin, "docker.log"), "utf8").split("\n").filter(Boolean);
