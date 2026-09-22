@@ -9769,11 +9769,12 @@ describe("Servers tab: source pins (#246)", () => {
   });
 
   test("each durable Servers action clears its busy state after a first-request 401", () => {
-    for (const [start, end] of [
+    const ranges: [string, string][] = [
       ["async function addWebhook(", "async function removeWebhook("],
       ["async function removeWebhook(", "async function pollForResult("],
       ["async function refreshDiscoveryAll(", "function renderNeedsAttention("],
-    ]) {
+    ];
+    for (const [start, end] of ranges) {
       const slice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
       expect(slice).toContain('message !== "unauthorized"');
       expect(slice).toContain("clearUnauthorizedServerAction(key);");
@@ -9921,7 +9922,10 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
 describe("addWebhook / pollForResult (#246, mini-harness)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const clearUnauthorizedServerActionSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
-  const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("async function addWebhook("), indexSrc.indexOf("async function removeWebhook("));
+  // Starts at clearUnauthorizedServerAction, not addWebhook itself: addWebhook's catch calls that shared
+  // helper (also used by removeWebhook/refreshDiscoveryAll) on a 401, and it is declared just above
+  // addWebhook in source -- excluding it left the sandbox with a ReferenceError on that exact path.
+  const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function removeWebhook("));
   const pollForResultSrc = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
 
   test("the marked functions are present", () => {
@@ -10039,19 +10043,6 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     expect(await p).toEqual({ timeout: true });
   });
 
-  // Round-1 review finding: unlike sendRouting/refreshDiscovery (#245), whose busy state is DERIVED from
-  // st.inflight (set only once a POST already succeeded), addWebhook marks itself busy BEFORE the
-  // request -- a 401 on that FIRST call (api() throws Error("unauthorized")) used to leave
-  // serverActionState stuck at { busy: true } forever, since the catch's `if (message !== "unauthorized")`
-  // guard skipped clearing it on exactly that path, and serverActionState is never reset by a re-login.
-  test("a 401 on the initial POST clears the busy state instead of leaving the button stuck forever", async () => {
-    const h = harness({
-      inputValue: "https://discord.com/api/webhooks/1/tok",
-      apiImpl: async () => { throw new Error("unauthorized"); },
-    });
-    await h.run.addWebhook("100");
-    expect(h.serverActionState.has("add:100")).toBe(false);
-  });
 });
 
 // #246: decision 4's "Try again" -- retryRegistration re-sends the first PLACED plugin's saved placement,

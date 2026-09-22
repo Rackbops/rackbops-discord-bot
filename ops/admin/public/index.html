@@ -1660,6 +1660,12 @@
   // reads that selection and posts it back unchanged) to every server, re-running applyRouting. Shares
   // the "retry" subject key with the Overview fix button (decision 5's `go: "retry"`), so a click from
   // either place is the same in-flight action.
+  // Round-1 review finding, declined: clicking this within sendRouting's ~1.2s debounce window of an
+  // UNSENT edit on the Plugins tab resends that in-progress selection, not strictly the last-saved one --
+  // the debounce would send it within that same window regardless, so the net effect is the edit landing
+  // slightly earlier. Forcing routeState back to selectionFromModel(model) here would risk silently
+  // DISCARDING a real in-progress edit unless the debounce timer were also cancelled/re-armed, trading a
+  // narrow self-resolving timing quirk for a real data-loss risk -- left as-is (docs/plans/epics/E236/10-servers-and-pickers.md).
   async function retryRegistration() {
     const key = "retry";
     const existing = serverActionState.get(key);
@@ -2008,7 +2014,12 @@
   // every ROUTING_POLL_MS until routing.results holds `id` or ROUTING_ANSWER_TIMEOUT_MS has passed.
   // Never throws -- a transient read failure just tries again next tick; a 401 ends the wait the same way
   // a timeout does (api() has already shown the gate by the time this returns). The fresh routingData is
-  // stored on every successful read, exactly like #245's own two pollers.
+  // stored on every successful read, exactly like #245's own two pollers. Round-1 review finding,
+  // declined: two independent calls (e.g. Add on one server, Refresh from Discord) each reassign the
+  // shared routingData on their own timer, so an out-of-order response could cause a transient render
+  // flicker -- self-healing (the next tick on either one re-fetches and corrects), and the exact same
+  // shared-variable pattern #245's own awaitRequestResult/refreshDiscovery already use, not a risk this
+  // function introduces.
   async function pollForResult(id, startedAt) {
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
