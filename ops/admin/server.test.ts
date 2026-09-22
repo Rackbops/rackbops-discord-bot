@@ -5730,6 +5730,14 @@ describe("admin.css uses tokens only", () => {
     for (const name of used) expect({ name, defined: defined.has(name) }).toEqual({ name, defined: true });
     expect(decls.filter((d) => d.prop.startsWith("--"))).toEqual([]);
   });
+
+  // #300: the local switch override is gone -- the shared @rackbops/styles .rb-switch renders
+  // acceptably as-is, so there is no second local class anywhere in the panel's own CSS or markup.
+  test("carries no local switch override (#300)", () => {
+    const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+    expect(indexSrc).not.toContain("adm-switch");
+    expect(css).not.toContain("adm-switch");
+  });
 });
 
 // The page follows the viewer's colour scheme with no toggle: an inline script in <head>, ahead of the
@@ -5982,7 +5990,7 @@ describe("page skeleton", () => {
       ['class="msg"', 2], // restart, admins (#257: the config and plugins message lines went with the Save buttons)
       // built by the page script
       ['btn.className = "rb-btn rb-btn--danger rb-btn--sm";', 1], // Remove admin
-      ['check.className = "rb-switch adm-switch";', 1], // #244: a plugin's card switch
+      ['check.className = "rb-switch";', 1], // #244: a plugin's card switch (#300: the shared switch, local override dropped)
       ['now.className = "rb-btn rb-btn--primary rb-btn--sm";', 1], // Update now
       ['when.className = "rb-input";', 1], // the schedule picker
       ['schedBtn.className = "rb-btn rb-btn--sm";', 1],

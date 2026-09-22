@@ -411,11 +411,6 @@
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--rb-space-4) var(--rb-space-5); }
 .secret { display: flex; align-items: center; gap: var(--rb-space-3); padding: 5px var(--rb-space-2) 5px var(--rb-space-3); background: var(--rb-surface-sunken); border: 1px solid var(--rb-border); border-radius: var(--rb-radius); font-size: var(--rb-text-sm); }
 .secret__dots { font-family: var(--rb-font-mono); color: var(--rb-text-faint); letter-spacing: 0.2em; }
-.rb-switch.adm-switch { appearance: none; -webkit-appearance: none; width: 36px; height: 20px; flex: none; margin: 0; border-radius: var(--rb-radius-pill); background: var(--rb-surface-sunken); border: 1px solid var(--rb-border-strong); position: relative; cursor: pointer; transition: background var(--rb-transition) var(--rb-ease), border-color var(--rb-transition) var(--rb-ease); }
-.rb-switch.adm-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--rb-text-soft); transition: transform var(--rb-transition) var(--rb-ease), background var(--rb-transition) var(--rb-ease); }
-.rb-switch.adm-switch:checked { background: var(--rb-accent); border-color: var(--rb-accent); }
-.rb-switch.adm-switch:checked::after { transform: translateX(16px); background: var(--rb-accent-fg); }
-.rb-switch.adm-switch:focus-visible { outline: var(--rb-focus-ring); outline-offset: 2px; }
 
 /* ---- #245: "Choose where it lives" ------------------------------------------------------------
    The step reuses .step's own label/content grid; only its own inner layout is added here. .route
