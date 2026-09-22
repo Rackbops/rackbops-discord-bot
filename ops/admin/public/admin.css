@@ -417,6 +417,25 @@
 .rb-switch.adm-switch:checked::after { transform: translateX(16px); background: var(--rb-accent-fg); }
 .rb-switch.adm-switch:focus-visible { outline: var(--rb-focus-ring); outline-offset: 2px; }
 
+/* ---- #245: "Choose where it lives" ------------------------------------------------------------
+   The step reuses .step's own label/content grid; only its own inner layout is added here. .route
+   itself carries no declarations of its own -- it exists as a class so onControlEdited's
+   target.closest(".route") has something to match; the coverage test below requires every class
+   token the page uses to appear as a selector somewhere, this included. */
+.route {
+}
+.route__summary { margin: 0 0 var(--rb-space-2); }
+.route__status { margin: 0; font-size: var(--rb-text-sm); color: var(--rb-text-soft); min-height: 1em; }
+.route__status:empty { display: none; }
+.route__status-actions { margin: 0 0 var(--rb-space-3); display: flex; gap: var(--rb-space-2); }
+.route__status-actions:empty { display: none; margin: 0; }
+.route__rows { display: flex; flex-direction: column; gap: var(--rb-space-4); }
+.route__row { padding: var(--rb-space-3); border: 1px solid var(--rb-border); border-radius: var(--rb-radius); }
+.route__row--off { color: var(--rb-text-faint); font-size: var(--rb-text-sm); }
+.route__controls { margin-top: var(--rb-space-3); padding-left: var(--rb-space-5); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--rb-space-3) var(--rb-space-5); }
+.route__channels { margin: 0; padding: var(--rb-space-2) 0 0; border: none; display: flex; flex-direction: column; gap: var(--rb-space-1); }
+.route__channels[aria-invalid="true"] { outline: 1px solid var(--rb-danger); border-radius: var(--rb-radius); padding: var(--rb-space-2); }
+
 /* ---- The Apply bar (#257) --------------------------------------------------------------------
    Every change that needs a restart collects here, whichever tab it was made on: the last child of
    <main>, outside every tab panel, sticky at the bottom of the viewport, shown only while something is
@@ -540,6 +559,9 @@
     grid-template-columns: minmax(0, 1fr);
   }
   .fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .route__controls {
     grid-template-columns: minmax(0, 1fr);
   }
   .plug__head {

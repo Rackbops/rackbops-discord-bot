@@ -642,11 +642,20 @@ wins, ahead of even an error; then "not in the index", an error, "needs setup" (
 setting), an available update (only while the plugin is ON — an off plugin never gets nudged to update
 code that isn't running), running with its command count, enabled-but-not-running, or off.
 
-Opening a card shows two steps. **Turn it on** is the switch — ticking it only adds the plugin's name
+Opening a card shows three steps. **Turn it on** is the switch — ticking it only adds the plugin's name
 to `PLUGINS`; the code is fetched and installed by the bot on its next boot exactly as for a
 hand-edited `PLUGINS`, and **this never installs code from the browser**. You can never newly-*enable*
 a plugin the index doesn't list (the switch is disabled), but an already-enabled plugin the index has
-since dropped stays editable so you can still turn it off. **Fill in its settings** draws one field per
+since dropped stays editable so you can still turn it off. **Choose where it lives (#245)** is placement
+— which servers get the plugin's commands, and where it posts on its own — and unlike everything else on
+the card it **applies at once, with no restart and no Apply bar**: ticking a server, picking channels or
+a post target sends `POST /api/routing` a couple of seconds after you stop typing (several quick changes
+in a row become one request, not several), and the step shows *Applying…* then either *Live* or the
+reason it wasn't (the bot's own refusal, verbatim; or, once the request landed, whichever of the ticked
+servers Discord didn't actually register commands in, and why). This step is read-only, and says so,
+whenever the panel's picture of what servers the bot is in is missing or more than an hour old — better
+than guessing. A server the bot has since left stays listed (so you can see it was there) but is dropped
+from anything you send. **Fill in its settings** draws one field per
 setting the plugin's manifest declares: a setting owned by the core config (or, if two plugins declare
 the same key, by whichever is first in the index) points you at where it's actually edited instead of
 duplicating the field; a secret shows only `•••••••• Saved on the server` and a **Replace** button once
@@ -654,8 +663,10 @@ one is set (its value is never shown again, never sent anywhere but the one save
 but not blanked from here); a setting the bot hasn't published a validation rule for yet (it can lag
 the index by up to ~15 minutes after a fresh install) can't be edited from the card until it has.
 
-**Nothing on a card saves on its own** — nothing has since #257 replaced the plugin/config Save
-buttons with one bar. The switch, the settings and the secrets are all just controls the **Apply bar**
+**Nothing on a card saves on its own, except where it lives** — nothing else has since #257 replaced the
+plugin/config Save buttons with one bar; where a plugin lives is the one deliberate exception (#245),
+since it takes effect immediately and there's nothing to restart into. The switch, the settings and the
+secrets are all just controls the **Apply bar**
 at the bottom of the page reads: it collects every pending change across every card and the Config
 editor and sends them as **one** `POST /api/env` (`PLUGINS` first, preserving any `name@version` pin a
 still-ticked plugin already had, ordered by the manifest, then every changed setting and secret), so

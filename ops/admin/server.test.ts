@@ -5702,6 +5702,18 @@ describe("page skeleton", () => {
       ['card.className = "rb-card plug";', 1],
       ['body.className = "plug__body";', 1],
       ['root.className = "plug__admin";', 1], // a plugin's own bundle mount point, inside its card
+      // #245: "Choose where it lives" -- label.className stays 4 above (this step's labels are
+      // legend.className / postLabel.className, deliberately not "label", so as not to move that count).
+      ['step.className = "step route";', 1],
+      ['status.className = "route__status";', 1],
+      ['summary.className = "route__summary";', 1],
+      ['rows.className = "route__rows";', 1],
+      ['wrap.className = "route__row";', 1], // a placed-server row
+      ['row.className = "route__row route__row--off";', 1], // a server the bot has left
+      ['controls.className = "route__controls";', 1],
+      ['fieldset.className = "route__channels";', 1],
+      ['postSelect.className = "rb-select";', 1],
+      ['badge.className = "rb-badge rb-badge--success";', 1], // the Live badge
     ];
     for (const [fragment, count] of expected) {
       expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
@@ -5713,16 +5725,16 @@ describe("page skeleton", () => {
     // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES), minus the two save blocks #257 deleted
     // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC).
     // #244: PLUGIN_BADGES is gone (replaced by PLUGIN_CARD_STATE), plus PLUGIN_SETTING_LABEL and
-    // PLUGIN_EDITS. A rename or a deleted marker would otherwise leave a lifted `new Function`
-    // evaluating an empty string.
+    // PLUGIN_EDITS. #245 adds PLUGIN_ROUTING. A rename or a deleted marker would otherwise leave a
+    // lifted `new Function` evaluating an empty string.
     const names = [
       "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
-      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS",
+      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING",
     ];
-    expect(names.length).toBe(21);
+    expect(names.length).toBe(22);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -6948,7 +6960,7 @@ describe("applyPending (#257)", () => {
       expect({ body, title: real.view().title }).toEqual({ body, title: "Applied. The bot restarted with your changes." });
     }
     // ... and a later apply on the same page (the edit is still pending) is not stuck on the earlier answer.
-    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
     expect(page.view().title).toBe("1 change needs a restart");
     spec.response = { ok: true, text: '{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}' };
     await page.run.applyPending();
@@ -7753,7 +7765,7 @@ describe("the bar while the page re-reads (#275)", () => {
     expect(page.view()).toMatchObject({ hidden: true, ...BUTTONS_FREE });
     // ... and a new edit is applied normally
     page.edit("WATCHED_REPOS", "ap");
-    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
     expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, ...BUTTONS_FREE });
     await page.run.applyPending();
     expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=ap"]);
@@ -8265,5 +8277,438 @@ describe("plugin badge classes (lifted from index.html)", () => {
   test("a badge with no kind (or one it doesn't know) is the plain badge", () => {
     expect(makeBadge("disabled", null).className).toBe("rb-badge plugin-badge");
     expect(makeBadge("x", "constructor").className).toBe("rb-badge plugin-badge constructor"); // a Map, not an object lookup
+  });
+});
+
+// #245: "Choose where it lives" -- pure parts, lifted the same way #244's blocks are (the
+// PLUGIN_CARD_STATE describe, above, is the model).
+describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
+  const src = applyBlock("PLUGIN_ROUTING");
+  type Channel = { id: string; name: string; canSend: boolean; webhook: "none" | "ok" | "broken" };
+  type Row = { id: string; name: string; on: boolean; commands: "all" | string[]; postTo: string | null; channels: Channel[] };
+  type Model = { mode: "missing" | "stale" | "ready"; generatedAt: string | null; home: { id: string; name: string | null } | null; placed: boolean; posts: boolean; rows: Row[]; unavailable: string[] };
+  type Outcome =
+    | { phase: "waiting" }
+    | { phase: "timeout" }
+    | { phase: "refused"; reason: string }
+    | { phase: "applied"; live: boolean; at: string; servers: Record<string, { state: string; error?: string }> };
+  const fns = new Function(`"use strict";\n${src}\nreturn { isDiscoveryStale, routingStepModel, placementSummary, channelOptionLabel, routingSetBody, requestOutcome };`)() as {
+    isDiscoveryStale: (generatedAt: unknown, now: number) => boolean;
+    routingStepModel: (pluginName: string, routingData: unknown, now: number) => Model;
+    placementSummary: (model: Model) => string;
+    channelOptionLabel: (channel: Channel) => string;
+    routingSetBody: (pluginName: string, selection: Record<string, unknown>, model: Model) => { body: { plugin: string; servers: Record<string, unknown> } } | { error: string };
+    requestOutcome: (routingData: unknown, id: string, sentServers: string[], active: boolean, startedAt: number, now: number) => Outcome;
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+    expect(src).toContain("function routingStepModel(");
+  });
+
+  // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed).
+  const HOME = "100", OTHER = "200", GONE = "999";
+  const GEN_CH = "10", SP_CH = "11", AN_CH = "12", OTHER_CH = "20";
+  const NOW = Date.parse("2026-09-22T12:00:00.000Z");
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:30:00.000Z",
+    bot: { id: "b1", username: "bot" },
+    inviteUrl: "https://discord.com/invite-url",
+    homeGuildId: HOME,
+    guilds: [
+      {
+        id: HOME,
+        name: "Home",
+        channels: [
+          { id: GEN_CH, name: "general", canSend: true },
+          { id: SP_CH, name: "spotify", canSend: true },
+          { id: AN_CH, name: "announcements", canSend: false },
+        ],
+        commands: { registered: 3, at: "2026-09-22T11:30:00.000Z" },
+      },
+      { id: OTHER, name: "Other", channels: [{ id: OTHER_CH, name: "chat", canSend: true }], commands: null },
+    ],
+    plugins: { music: { posts: true, commands: ["rsetlist"] }, warbandeer: { posts: false, commands: ["rgear"] } },
+  };
+  const routing = {
+    v: 1 as const,
+    updatedAt: "2026-09-22T11:00:00.000Z",
+    updatedBy: "admin",
+    plugins: {
+      music: { servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [GONE]: { commands: "all" as const } } },
+      nowhere: { servers: {} },
+    },
+    webhooks: {
+      [AN_CH]: { id: AN_CH, guildId: HOME, addedAt: "t", addedBy: "a" },
+      [GEN_CH]: { id: GEN_CH, guildId: HOME, addedAt: "t", addedBy: "a", broken: "410" },
+    },
+    results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[],
+  };
+  const routingData = { routing, discovery };
+
+  test("routingStepModel: missing, stale and ready", () => {
+    expect(fns.routingStepModel("music", { routing, discovery: null }, NOW).mode).toBe("missing");
+    const stale = { ...discovery, generatedAt: new Date(NOW - 61 * 60 * 1000).toISOString() };
+    expect(fns.routingStepModel("music", { routing, discovery: stale }, NOW).mode).toBe("stale");
+    const fresh = { ...discovery, generatedAt: new Date(NOW - 59 * 60 * 1000).toISOString() };
+    expect(fns.routingStepModel("music", { routing, discovery: fresh }, NOW).mode).toBe("ready");
+    const badDate = { ...discovery, generatedAt: "not a date" };
+    expect(fns.routingStepModel("music", { routing, discovery: badDate }, NOW).mode).toBe("stale");
+  });
+
+  test("routingStepModel: rows follow discovery order with the saved placement folded in; a placed server the bot has left is unavailable; posts comes from discovery", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    expect(m.rows.map((r) => r.id)).toEqual([HOME, OTHER]);
+    expect(m.rows[0]).toMatchObject({ id: HOME, on: true, commands: [SP_CH], postTo: AN_CH });
+    expect(m.rows[1]).toMatchObject({ id: OTHER, on: false, commands: "all", postTo: null });
+    expect(m.unavailable).toEqual([GONE]);
+    expect(m.posts).toBe(true);
+    expect(fns.routingStepModel("warbandeer", routingData, NOW).posts).toBe(false);
+    expect(fns.routingStepModel("no-such-plugin", routingData, NOW).posts).toBe(false);
+    expect(m.rows[0]!.channels).toEqual([
+      { id: GEN_CH, name: "general", canSend: true, webhook: "broken" },
+      { id: SP_CH, name: "spotify", canSend: true, webhook: "none" },
+      { id: AN_CH, name: "announcements", canSend: false, webhook: "ok" },
+    ]);
+  });
+
+  test("placementSummary: the five sentences", () => {
+    const unplacedHome = fns.routingStepModel("never-placed-1", routingData, NOW);
+    expect(fns.placementSummary(unplacedHome)).toBe("Lives in the home server (Home) by default and posts to the default channel. Tick a server to place it.");
+
+    const discHomeGone = { ...discovery, homeGuildId: "777" };
+    const unplacedHomeGone = fns.routingStepModel("never-placed-2", { routing, discovery: discHomeGone }, NOW);
+    expect(fns.placementSummary(unplacedHomeGone)).toBe(
+      "Lives in the home server by default, but the bot is not in it, so its commands are registered nowhere. Tick a server to place it.",
+    );
+
+    const discNoHome = { ...discovery, homeGuildId: null };
+    const unplacedNoHome = fns.routingStepModel("never-placed-3", { routing, discovery: discNoHome }, NOW);
+    expect(fns.placementSummary(unplacedNoHome)).toBe("Lives in every server by default (no home server is set). Tick a server to place it.");
+
+    const routing1 = { ...routing, plugins: { ...routing.plugins, one: { servers: { [HOME]: { commands: "all" as const } } } } };
+    expect(fns.placementSummary(fns.routingStepModel("one", { routing: routing1, discovery }, NOW))).toBe("In 1 server.");
+
+    const routing3 = { ...routing, plugins: { ...routing.plugins, three: { servers: { [HOME]: { commands: "all" as const }, [OTHER]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } } } };
+    expect(fns.placementSummary(fns.routingStepModel("three", { routing: routing3, discovery }, NOW))).toBe("In 3 servers.");
+
+    expect(fns.placementSummary(fns.routingStepModel("nowhere", routingData, NOW))).toBe(
+      "Nowhere: its commands appear in no server. There is no way back to the default. Tick a server instead.",
+    );
+  });
+
+  test("channelOptionLabel: plain, webhook, broken webhook, cannot post", () => {
+    expect(fns.channelOptionLabel({ id: "1", name: "general", canSend: true, webhook: "none" })).toBe("#general");
+    expect(fns.channelOptionLabel({ id: "1", name: "announcements", canSend: true, webhook: "ok" })).toBe("#announcements · webhook");
+    expect(fns.channelOptionLabel({ id: "1", name: "announcements", canSend: true, webhook: "broken" })).toBe("#announcements · webhook stopped working");
+    expect(fns.channelOptionLabel({ id: "1", name: "mod-only", canSend: false, webhook: "none" })).toBe("#mod-only · the bot can't post here");
+  });
+
+  test("routingSetBody: the whole map, all-or-list, postTo only when the plugin posts, unavailable servers dropped, an empty chosen list refused", () => {
+    const m = fns.routingStepModel("music", routingData, NOW);
+    const sel = {
+      [HOME]: { on: true, scope: "chosen", channels: [SP_CH], postTo: AN_CH },
+      [OTHER]: { on: true, scope: "all", channels: [], postTo: null },
+    };
+    expect(fns.routingSetBody("music", sel, m)).toEqual({
+      body: { plugin: "music", servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [OTHER]: { commands: "all" } } },
+    });
+    const selWithGone = { ...sel, [GONE]: { on: true, scope: "all", channels: [], postTo: null } };
+    const planned = fns.routingSetBody("music", selWithGone, m) as { body: { servers: Record<string, unknown> } };
+    expect(planned.body.servers[GONE]).toBeUndefined();
+
+    const wb = fns.routingStepModel("warbandeer", routingData, NOW);
+    const selPost = { [HOME]: { on: true, scope: "all", channels: [], postTo: AN_CH } };
+    expect((fns.routingSetBody("warbandeer", selPost, wb) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all" });
+
+    const bad = { [OTHER]: { on: true, scope: "chosen", channels: [], postTo: null } };
+    expect(fns.routingSetBody("music", bad, m)).toEqual({ error: "Pick at least one channel for Other." });
+  });
+
+  test("requestOutcome: waiting, timeout, refused with the bot's reason, applied-live, applied with a refusing server, applied for an inactive plugin, a sent server discovery lost", () => {
+    const started = NOW - 1000;
+    const emptyResults = { routing: { ...routing, results: [] }, discovery };
+    expect(fns.requestOutcome(emptyResults, "req1", [HOME], true, started, started + 1000)).toEqual({ phase: "waiting" });
+    expect(fns.requestOutcome(emptyResults, "req1", [HOME], true, started, started + 31000)).toEqual({ phase: "timeout" });
+
+    const refused = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: false, reason: "server 999 is not one the bot is in", at: "t" }] }, discovery };
+    expect(fns.requestOutcome(refused, "req1", [HOME], true, started, started + 500)).toEqual({ phase: "refused", reason: "server 999 is not one the bot is in" });
+
+    const liveDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: { registered: 5, at: "t" } } : g)) };
+    const applied = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "2026-09-22T12:05:00.000Z" }] }, discovery: liveDisc };
+    expect(fns.requestOutcome(applied, "req1", [HOME], true, started, started + 500)).toEqual({
+      phase: "applied", live: true, at: "2026-09-22T12:05:00.000Z", servers: { [HOME]: { state: "live" } },
+    });
+    expect((fns.requestOutcome(applied, "req1", [HOME], false, started, started + 500) as { live: boolean }).live).toBe(false);
+
+    const refusingDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: { registered: 0, error: "Missing Access", at: "t" } } : g)) };
+    const appliedRefusing = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery: refusingDisc };
+    expect(fns.requestOutcome(appliedRefusing, "req1", [HOME], true, started, started + 500)).toMatchObject({
+      phase: "applied", live: false, servers: { [HOME]: { state: "refused", error: "Missing Access" } },
+    });
+
+    const unregDisc = { ...discovery, guilds: discovery.guilds.map((g) => (g.id === HOME ? { ...g, commands: null } : g)) };
+    const appliedUnreg = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery: unregDisc };
+    expect(fns.requestOutcome(appliedUnreg, "req1", [HOME], true, started, started + 500)).toMatchObject({ live: false, servers: { [HOME]: { state: "unregistered" } } });
+
+    const appliedGone = { routing: { ...routing, results: [{ id: "req1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    expect(fns.requestOutcome(appliedGone, "req1", [GONE], true, started, started + 500)).toMatchObject({ live: false, servers: { [GONE]: { state: "unseen" } } });
+  });
+});
+
+// #245: source-pin tests -- what #244's equivalent pins do (see "a secret's value stays in one password
+// field", earlier), for the properties no data-level test can see: which DOM attributes a control carries,
+// and where one function's call sits relative to another's.
+describe("Choose where it lives: source pins (#245)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("the routing step's controls are invisible to the Apply bar (source pin)", () => {
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    for (const bad of ["dataset.plugin =", "dataset.settingKey", "dataset.secretKey", "data-plugin", "data-setting-key", "data-secret-key"]) {
+      expect(stepSlice).not.toContain(bad);
+    }
+    const rowSlice = indexSrc.slice(indexSrc.indexOf("function buildRouteRow("), indexSrc.indexOf("function onRouteChange("));
+    expect(rowSlice).toContain("dataset.routeServer");
+    const editedSlice = indexSrc.slice(indexSrc.indexOf("function onControlEdited("), indexSrc.indexOf("function onControlEdited(") + 900);
+    expect(editedSlice).toContain('if (target.closest(".route")) return;');
+  });
+
+  test("the step sits between Turn it on and Fill in its settings (source pin)", () => {
+    const cardStart = indexSrc.indexOf("function buildPluginCard(");
+    const cardSlice = indexSrc.slice(cardStart, indexSrc.indexOf("\n    return card;\n", cardStart));
+    const onIdx = cardSlice.indexOf("buildTurnItOnStep(p, ctx)");
+    const liveIdx = cardSlice.indexOf("buildWhereItLivesStep(");
+    const settingsIdx = cardSlice.indexOf("buildSettingsStep(");
+    expect(onIdx).toBeGreaterThan(-1);
+    expect(liveIdx).toBeGreaterThan(onIdx);
+    expect(settingsIdx).toBeGreaterThan(liveIdx);
+  });
+
+  test("loadRouting is its own path (source pin)", () => {
+    const reloadSlice = indexSrc.slice(indexSrc.indexOf("async function reloadConfig("), indexSrc.indexOf("let loadPlugins ="));
+    expect(reloadSlice).not.toContain("/api/routing");
+    const showAppSlice = indexSrc.slice(indexSrc.indexOf("function showApp("), indexSrc.indexOf("function showApp(") + 400);
+    expect(showAppSlice).toContain("loadRouting();");
+  });
+
+  test("the footnote says where a plugin lives applies at once", () => {
+    expect(indexSrc).toContain("Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.");
+    expect(indexSrc).not.toContain("Changes apply when the bot restarts: they are collected in the bar below until you apply them.");
+  });
+
+  test("the step's own number is hardcoded, not left to buildPluginCard's numbering loop (source pin)", () => {
+    // refreshRoutingSteps replaces this step's DOM standalone, outside buildPluginCard's steps.forEach
+    // numbering loop -- an unset span here goes visibly blank on every routing-only refresh (caught in
+    // real-Chrome verification: the badge showed no digit at all once loadRouting's first poll landed).
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    expect(stepSlice).toContain('className: "step__num", textContent: "2"');
+  });
+});
+
+// #245: the debounce/held/poll state machine -- a dedicated mini-harness (the reloadConfig keepEdits
+// harness, earlier, is the precedent) since these functions touch the DOM and real timers, not the
+// APPLY-style lifted-block shape. Slices its own source directly and injects a manual clock (setTimeout/
+// clearTimeout as plain arrays, advanced by `tick()`) so a debounce/poll never depends on wall-clock time.
+describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => {
+  const routingSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function ensureRouteState("), applyIndexSrc.indexOf("async function loadRouting("));
+  const src = applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc;
+
+  interface FakeEl {
+    textContent: string;
+    hidden?: boolean;
+    attrs?: Map<string, string>;
+    setAttribute?: (n: string, v: string) => void;
+    appendChild?: (c: unknown) => void;
+  }
+  const makeEl = (): FakeEl => {
+    const attrs = new Map<string, string>();
+    return { textContent: "", hidden: false, attrs, setAttribute: (n, v) => void attrs.set(n, v), appendChild: () => {} };
+  };
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+  function harness(opts: {
+    routingDataInit: unknown;
+    pluginsData?: unknown;
+    apiImpl?: (path: string, init?: { method?: string; body?: string }) => Promise<{ ok: boolean; status?: number; text: () => Promise<string> }>;
+  }) {
+    const posts: { path: string; body?: string }[] = [];
+    const clock = makeClock();
+    const document = { createElement: makeEl, createTextNode: () => ({}) };
+    const setApplyText = (el: FakeEl, text: string) => { if (el.textContent !== text) el.textContent = text; };
+    const pluginsData = opts.pluginsData ?? { plugins: [{ name: "music", active: true }] };
+    const apiImpl = opts.apiImpl;
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      if (init && init.method === "POST") {
+        posts.push({ path, body: init.body });
+        if (apiImpl) return apiImpl(path, init);
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-" + posts.length }) };
+      }
+      if (apiImpl) return apiImpl(path, init);
+      return { ok: true, status: 200, text: async () => "" };
+    };
+    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    // Not part of this slice (buildWhereItLivesStep and friends are browser-only DOM builders, out of
+    // scope for this mini-harness) -- injected as a call-tracked stub so awaitRequestResult's reference
+    // to it resolves instead of throwing (which sendRouting's own catch would otherwise swallow silently,
+    // turning a real ReferenceError into a misleading "posted-error" outcome -- caught once, fixed here).
+    let refreshRoutingStepsCalls = 0;
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    const run = new Function(
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
+      onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
+      scheduleRoutingSend: (plugin: string) => void;
+      sendRouting: (plugin: string) => Promise<void>;
+      awaitRequestResult: (plugin: string, id: string, sentServers: string[], startedAt: number) => Promise<void>;
+      routeState: Map<
+        string,
+        {
+          inflight: { id: string; sentServers: string[]; startedAt: number } | null;
+          outcome: unknown;
+          selection: Record<string, unknown>;
+          held?: boolean;
+          sendTimer?: unknown;
+          pollTimer?: unknown;
+        }
+      >;
+      routingStepEls: Map<string, unknown>;
+      setRoutingData: (v: unknown) => void;
+    };
+    // onRouteChange requires a routeState entry to already exist (real usage: ensureRouteState seeds it
+    // on the step's first render, inside buildWhereItLivesStep -- browser-only, not part of this slice).
+    // Every test here drives a plugin already ticked into no servers, matching a freshly-opened card.
+    const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null });
+    return { run, posts, clock, routeState: run.routeState, setRoutingData: run.setRoutingData, seed, refreshRoutingStepsCalls: () => refreshRoutingStepsCalls };
+  }
+
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:59:00.000Z",
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: null,
+    guilds: [
+      { id: "100", name: "Home", channels: [{ id: "10", name: "general", canSend: true }, { id: "11", name: "mod", canSend: true }], commands: { registered: 1, at: "t" } },
+      { id: "200", name: "Other", channels: [{ id: "20", name: "chat", canSend: true }], commands: { registered: 1, at: "t" } },
+    ],
+    plugins: { music: { posts: false, commands: [] } },
+  };
+
+  test("scheduleRoutingSend coalesces a burst into one POST and never sends an unsendable selection", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({ routingDataInit });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    h.run.onRouteChange("music", "100", "scope", "chosen");
+    h.run.onRouteChange("music", "100", "channel", { id: "10", checked: true });
+    await h.clock.tick();
+    await h.clock.tick();
+    expect(h.posts).toHaveLength(1);
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: ["10"] } } });
+
+    const h2 = harness({ routingDataInit });
+    h2.seed("music");
+    h2.run.onRouteChange("music", "100", "on", true);
+    h2.run.onRouteChange("music", "100", "scope", "chosen"); // no channel ticked -> unsendable
+    await h2.clock.tick();
+    await h2.clock.tick();
+    expect(h2.posts).toHaveLength(0);
+  });
+
+  test("a change made while a request is in flight is held and sent once when the result lands", async () => {
+    let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let n = 0;
+    const apiImpl = async (path: string, init?: { method?: string }) => {
+      if (init && init.method === "POST") {
+        n++;
+        const id = "req" + n;
+        live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id, action: "routing-set", ok: true, at: "t" + n }] } };
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+      }
+      return { ok: true, status: 200, text: async () => JSON.stringify(live), json: async () => live } as unknown as { ok: boolean; text: () => Promise<string> };
+    };
+    // sendRouting's POST reads its response via .text() + JSON.parse; awaitRequestResult's GET poll reads
+    // its own via .json() directly -- both stubbed above, matching each call site exactly (a stub missing
+    // either one fails silently: awaitRequestResult's own try/catch around the GET treats a thrown
+    // "res.json is not a function" as a transient read failure and just loops again, never resolving).
+    const h = harness({ routingDataInit: live, apiImpl: apiImpl as never });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> sendRouting -> POST #1 -> inflight -> poll scheduled
+    expect(h.posts).toHaveLength(1);
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    h.run.onRouteChange("music", "200", "on", true); // arrives while #1 is in flight
+    h.run.onRouteChange("music", "200", "scope", "all"); // a second edit, same held window
+    await h.clock.tick(); // fires: the poll (lands #1) AND a stray debounce this test doesn't rely on
+    await h.clock.tick(); // lets the held follow-up (scheduled from sendRouting's finally) actually run
+    await h.clock.tick();
+    expect(h.posts.length).toBeGreaterThanOrEqual(2);
+    expect(h.posts.length).toBeLessThanOrEqual(2);
+    const secondBody = JSON.parse(h.posts[1]!.body!);
+    expect(secondBody).toEqual({ plugin: "music", servers: { "100": { commands: "all" }, "200": { commands: "all" } } });
+    // Both requests landed ok:true -- each is an "applied" outcome, which must rebuild the whole step
+    // (placementSummary's "unplaced"/"in N servers" sentence goes stale otherwise; caught in real-Chrome
+    // verification, not by a unit test, until this assertion was added).
+    expect(h.refreshRoutingStepsCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an applied outcome rebuilds the whole step (stale summary fix); a refusal only updates the status line", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[] }, discovery };
+    const applied = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-a" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-a", action: "routing-set", ok: true, at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    applied.seed("music");
+    applied.run.onRouteChange("music", "100", "on", true);
+    await applied.clock.tick(); // debounce -> POST
+    await applied.clock.tick(); // poll lands ok:true
+    expect(applied.routeState.get("music")?.outcome).toMatchObject({ phase: "applied" });
+    expect(applied.refreshRoutingStepsCalls()).toBe(1);
+
+    const refused = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-b" }) };
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "req-b", action: "routing-set", ok: false, reason: "server 1 is not one the bot is in", at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    refused.seed("music");
+    refused.run.onRouteChange("music", "100", "on", true);
+    await refused.clock.tick();
+    await refused.clock.tick();
+    expect(refused.routeState.get("music")?.outcome).toMatchObject({ phase: "refused" });
+    expect(refused.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  test("a superseded poll stops without writing", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [{ id: "id1", action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const h = harness({ routingDataInit });
+    h.routeState.set("music", { selection: {}, inflight: { id: "id2", sentServers: ["200"], startedAt: Date.now() }, outcome: null } as never);
+    const pending = h.run.awaitRequestResult("music", "id1", ["100"], Date.now() - 5000);
+    await h.clock.tick();
+    await pending;
+    const st = h.routeState.get("music")!;
+    expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
+    expect(st.outcome).toBeNull();
   });
 });

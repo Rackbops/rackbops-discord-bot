@@ -144,6 +144,9 @@ connector-status readout instead of a bare port number.
   the Config section uses (an Origin check, Cloudflare Access, `bot-ops.sh env-set`'s own
   validation, then a recreate). It renders as its own tab, but it isn't a separate door.
 
+An admin can also choose which servers get a plugin's commands, and where it posts on its own, right from
+the admin panel — a change here takes effect immediately, with no restart.
+
 The plugin side of shipping one — how to build `dist/admin.js` and what the bridge API offers — is
 the [`rackbops-bot-plugins` authoring guide](https://github.com/Rackbops/rackbops-bot-plugins#admin-tab-optional).
 Design: [`docs/adr/0005`](docs/adr/0005-plugins-ship-their-own-admin-ui.md).

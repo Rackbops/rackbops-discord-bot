@@ -213,6 +213,7 @@
     loadEnv();
     loadPlugins();
     loadAdmins();
+    loadRouting();
     showTab(tabFromHash(location.hash), false);
   }
 
@@ -429,6 +430,15 @@
   // The last /api/plugins response, kept so the Apply bar can diff the ticked plugins against the raw
   // PLUGINS value and reuse the manifest order without a second fetch.
   let pluginsData = null;
+
+  // #245: the last GET /api/routing response ({ routing, discovery }, both nullable), loaded on its OWN
+  // path (loadRouting, below) -- never folded into reloadConfig's Promise.all, so #275's rereadFromServer
+  // never waits on it and a routing-only refresh never touches pluginsData/loadedEnv. name -> { status,
+  // rows: Map<guildId, {...}> } element refs for each card's step, populated by buildWhereItLivesStep,
+  // cleared by renderPlugins exactly like cardHeaderEls (so a routing-only poll patches the DOM in place
+  // without a full re-render).
+  let routingData = null;
+  let routingStepEls = new Map();
 
   // #244: which secret keys are showing their password input (Replace pressed) rather than the "Saved on
   // the server" summary -- remembered the same way, so a background reload (an update button, Unlock)
@@ -797,6 +807,7 @@
     for (const cleanup of mountedAdminCleanups) { try { cleanup(); } catch (e) {} }
     mountedAdminCleanups = [];
     cardHeaderEls = new Map();
+    routingStepEls = new Map();
     const container = document.getElementById("plugins-list");
     container.innerHTML = "";
     const data = pluginsData;
@@ -833,7 +844,7 @@
     const note = document.createElement("div");
     note.className = "field-hint";
     note.style.marginTop = "8px";
-    note.textContent = "Changes apply when the bot restarts: they are collected in the bar below until you apply them.";
+    note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
   }
 
@@ -912,6 +923,556 @@
     }
     step.appendChild(body);
     return step;
+  }
+
+  // #245: "Choose where it lives", inserted between Turn it on and Fill in its settings -- always
+  // present. In missing/stale mode it is a read-only listing plus a Refresh from Discord button; in ready
+  // mode, one row per discovery.guilds entry with the tick/scope/channels/post-to controls. Routing
+  // controls carry data-route-* only (never data-plugin / data-setting-key / data-secret-key), so
+  // collectPending, captureCardControls, reapplyCardEdits and diffEdits never see them.
+  function buildWhereItLivesStep(p, ctx) {
+    const model = routingStepModel(p.name, routingData, Date.now());
+    const step = document.createElement("div");
+    step.className = "step route";
+    step.id = "route-step-" + p.name;
+    const head = document.createElement("div");
+    const title = document.createElement("h4");
+    title.className = "step__title";
+    // Hardcoded "2", not left for buildPluginCard's steps.forEach numbering loop to fill in: this step's
+    // position is invariant (Turn it on is always #1, Fill in its settings, if present, is always #3),
+    // and refreshRoutingSteps replaces this step's DOM on its OWN, standalone, outside that loop -- so an
+    // unset span here goes visibly blank on every routing-only refresh (loadRouting's first call included).
+    title.appendChild(Object.assign(document.createElement("span"), { className: "step__num", textContent: "2" }));
+    title.appendChild(document.createTextNode("Choose where it lives"));
+    head.appendChild(title);
+    const hint = document.createElement("p");
+    hint.className = "field-hint";
+    hint.textContent = "Its commands appear only in the servers you tick. Changes here apply at once — no restart.";
+    head.appendChild(hint);
+    step.appendChild(head);
+
+    const body = document.createElement("div");
+    const status = document.createElement("p");
+    status.className = "route__status";
+    status.setAttribute("role", "status");
+    const statusActions = document.createElement("div");
+    statusActions.className = "route__status-actions";
+    const els = { status, statusActions, rows: new Map() };
+    routingStepEls.set(p.name, els);
+
+    if (model.mode !== "ready") {
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      note.textContent =
+        model.mode === "missing"
+          ? "The bot hasn't published what it can see yet."
+          : "Last read from Discord " + new Date(model.generatedAt).toLocaleString() + ". Too old to trust.";
+      body.appendChild(note);
+      if (model.placed) {
+        // by name when a row resolved one (a stale-but-present discovery still has names); by id
+        // otherwise (missing discovery, or a server discovery has genuinely lost).
+        const named = model.rows.filter((r) => r.on).map((r) => r.name);
+        const shown = named.concat(model.unavailable);
+        const list = document.createElement("p");
+        list.className = "field-hint";
+        list.textContent = shown.length ? "Currently placed in: " + shown.join(", ") + "." : "Currently placed nowhere.";
+        body.appendChild(list);
+      }
+      const refresh = document.createElement("button");
+      refresh.type = "button";
+      refresh.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      refresh.textContent = "Refresh from Discord";
+      refresh.addEventListener("click", () => refreshDiscovery(p.name));
+      body.appendChild(refresh);
+      body.appendChild(status);
+      body.appendChild(statusActions);
+      step.appendChild(body);
+      return step;
+    }
+
+    const summary = document.createElement("p");
+    summary.className = "route__summary";
+    summary.textContent = placementSummary(model);
+    body.appendChild(summary);
+    body.appendChild(status);
+    body.appendChild(statusActions);
+
+    const st = ensureRouteState(p.name, model);
+    const rows = document.createElement("div");
+    rows.className = "route__rows";
+    for (const row of model.rows) rows.appendChild(buildRouteRow(p.name, row, model, st, els));
+    body.appendChild(rows);
+
+    if (model.unavailable.length > 0) {
+      for (const id of model.unavailable) {
+        const row = document.createElement("div");
+        row.className = "route__row route__row--off";
+        const text = document.createElement("p");
+        text.textContent = "Server " + id + " — the bot is no longer in it.";
+        row.appendChild(text);
+        rows.appendChild(row);
+      }
+      const gone = document.createElement("p");
+      gone.className = "field-hint";
+      gone.textContent =
+        (model.unavailable.length === 1 ? "1 server" : model.unavailable.length + " servers") +
+        " the bot has left are still in this plugin's placement. They are dropped the next time you change it.";
+      body.appendChild(gone);
+      const dropNow = document.createElement("button");
+      dropNow.type = "button";
+      dropNow.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      dropNow.textContent = "Drop now";
+      dropNow.addEventListener("click", () => sendRouting(p.name, model));
+      body.appendChild(dropNow);
+    }
+
+    step.appendChild(body);
+    renderRouteStatus(p.name, els);
+    return step;
+  }
+
+  // Lazily seeds routeState from the model's OWN saved placement, once per plugin -- never re-seeded from
+  // a later model, so an in-progress pick a background loadRouting/poll brought in survives it.
+  function ensureRouteState(plugin, model) {
+    let st = routeState.get(plugin);
+    if (!st) {
+      const selection = {};
+      for (const row of model.rows) {
+        if (row.on) {
+          selection[row.id] = {
+            on: true,
+            scope: Array.isArray(row.commands) ? "chosen" : "all",
+            channels: Array.isArray(row.commands) ? row.commands.slice() : [],
+            postTo: row.postTo,
+          };
+        }
+      }
+      st = { selection, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null };
+      routeState.set(plugin, st);
+    }
+    return st;
+  }
+  function rowSelection(st, guildId) {
+    return st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null };
+  }
+
+  function buildRouteRow(plugin, row, model, st, els) {
+    const wrap = document.createElement("div");
+    wrap.className = "route__row";
+    const sel = rowSelection(st, row.id);
+
+    const choice = document.createElement("label");
+    choice.className = "rb-choice";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "rb-checkbox";
+    box.id = "route-" + plugin + "-" + row.id;
+    box.checked = sel.on;
+    box.dataset.routeServer = row.id;
+    choice.appendChild(box);
+    const label = document.createElement("span");
+    label.textContent = row.name;
+    choice.appendChild(label);
+    wrap.appendChild(choice);
+
+    const controls = document.createElement("div");
+    controls.className = "route__controls";
+    controls.hidden = !sel.on;
+
+    // Commands work: Anywhere in this server / Only in chosen channels.
+    const scopeName = "route-scope-" + plugin + "-" + row.id;
+    const anyLabel = document.createElement("label");
+    anyLabel.className = "rb-choice";
+    const anyRadio = document.createElement("input");
+    anyRadio.type = "radio";
+    anyRadio.className = "rb-radio";
+    anyRadio.name = scopeName;
+    anyRadio.id = "route-" + plugin + "-" + row.id + "-all";
+    anyRadio.checked = sel.scope === "all";
+    anyRadio.dataset.routeServer = row.id;
+    anyLabel.appendChild(anyRadio);
+    anyLabel.appendChild(document.createTextNode("Anywhere in this server"));
+    controls.appendChild(anyLabel);
+
+    const chosenLabel = document.createElement("label");
+    chosenLabel.className = "rb-choice";
+    const chosenRadio = document.createElement("input");
+    chosenRadio.type = "radio";
+    chosenRadio.className = "rb-radio";
+    chosenRadio.name = scopeName;
+    chosenRadio.id = "route-" + plugin + "-" + row.id + "-chosen";
+    chosenRadio.checked = sel.scope === "chosen";
+    chosenRadio.dataset.routeServer = row.id;
+    chosenLabel.appendChild(chosenRadio);
+    chosenLabel.appendChild(document.createTextNode("Only in chosen channels"));
+    controls.appendChild(chosenLabel);
+
+    const fieldset = document.createElement("fieldset");
+    fieldset.className = "route__channels";
+    fieldset.hidden = sel.scope !== "chosen";
+    const legend = document.createElement("legend");
+    legend.className = "rb-label";
+    legend.textContent = "Channels";
+    fieldset.appendChild(legend);
+    const channelChecks = new Map();
+    for (const ch of row.channels) {
+      const chLabel = document.createElement("label");
+      chLabel.className = "rb-choice";
+      const chBox = document.createElement("input");
+      chBox.type = "checkbox";
+      chBox.className = "rb-checkbox";
+      chBox.id = "route-" + plugin + "-" + row.id + "-ch-" + ch.id;
+      chBox.checked = sel.channels.includes(ch.id);
+      chBox.dataset.routeServer = row.id;
+      chLabel.appendChild(chBox);
+      chLabel.appendChild(document.createTextNode("#" + ch.name));
+      fieldset.appendChild(chLabel);
+      channelChecks.set(ch.id, chBox);
+      chBox.addEventListener("change", () => onRouteChange(plugin, row.id, "channel", { id: ch.id, checked: chBox.checked }));
+    }
+    const channelHint = document.createElement("p");
+    channelHint.className = "field-hint";
+    channelHint.textContent =
+      "The bot enforces this: a command used elsewhere gets a private reply naming these channels. A thread counts as its parent channel.";
+    fieldset.appendChild(channelHint);
+    const channelErr = document.createElement("p");
+    channelErr.className = "field-hint field-hint--danger";
+    channelErr.hidden = true;
+    fieldset.appendChild(channelErr);
+    controls.appendChild(fieldset);
+
+    anyRadio.addEventListener("change", () => onRouteChange(plugin, row.id, "scope", "all"));
+    chosenRadio.addEventListener("change", () => onRouteChange(plugin, row.id, "scope", "chosen"));
+
+    let postSelect = null;
+    if (model.posts) {
+      const postLabel = document.createElement("label");
+      postLabel.className = "rb-label";
+      postLabel.htmlFor = "route-" + plugin + "-" + row.id + "-post";
+      postLabel.textContent = "Posts to";
+      controls.appendChild(postLabel);
+      postSelect = document.createElement("select");
+      postSelect.className = "rb-select";
+      postSelect.id = "route-" + plugin + "-" + row.id + "-post";
+      postSelect.dataset.routeServer = row.id;
+      const none = document.createElement("option");
+      none.value = "";
+      none.textContent = "Doesn't post here";
+      postSelect.appendChild(none);
+      for (const ch of row.channels) {
+        const opt = document.createElement("option");
+        opt.value = ch.id;
+        opt.textContent = channelOptionLabel(ch);
+        postSelect.appendChild(opt);
+      }
+      postSelect.value = sel.postTo || "";
+      postSelect.addEventListener("change", () => onRouteChange(plugin, row.id, "postTo", postSelect.value || null));
+      controls.appendChild(postSelect);
+    }
+
+    wrap.appendChild(controls);
+    const rowNote = document.createElement("p");
+    rowNote.className = "field-hint";
+    rowNote.hidden = true;
+    wrap.appendChild(rowNote);
+
+    box.addEventListener("change", () => onRouteChange(plugin, row.id, "on", box.checked));
+
+    els.rows.set(row.id, { box, controls, anyRadio, chosenRadio, fieldset, channelChecks, channelErr, postSelect, note: rowNote });
+    return wrap;
+  }
+
+  // Updates routeState's selection for one server, patches just that row's DOM in place (never a full
+  // renderPlugins -- the collector/edit-preserving machinery is #244's, not this step's), then schedules
+  // a send. `what`/`value`: "on" boolean, "scope" "all"|"chosen", "channel" {id, checked}, "postTo"
+  // string|null.
+  function onRouteChange(plugin, guildId, what, value) {
+    const st = routeState.get(plugin);
+    if (!st) return;
+    const current = st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null };
+    let next = current;
+    if (what === "on") next = { ...current, on: value };
+    else if (what === "scope") next = { ...current, on: true, scope: value };
+    else if (what === "channel") {
+      const set = new Set(current.channels);
+      if (value.checked) set.add(value.id);
+      else set.delete(value.id);
+      next = { ...current, channels: [...set] };
+    } else if (what === "postTo") next = { ...current, postTo: value };
+    if (next.on) st.selection[guildId] = next;
+    else delete st.selection[guildId];
+
+    const rowEls = routingStepEls.get(plugin);
+    const refs = rowEls && rowEls.rows.get(guildId);
+    if (refs) {
+      refs.controls.hidden = !next.on;
+      refs.fieldset.hidden = next.scope !== "chosen";
+      refs.channelErr.hidden = true;
+    }
+    scheduleRoutingSend(plugin);
+  }
+
+  function scheduleRoutingSend(plugin) {
+    const st = routeState.get(plugin);
+    if (!st) return;
+    if (st.sendTimer) clearTimeout(st.sendTimer);
+    st.sendTimer = setTimeout(() => {
+      st.sendTimer = null;
+      sendRouting(plugin);
+    }, ROUTING_SEND_DEBOUNCE_MS);
+  }
+
+  async function sendRouting(plugin) {
+    const st = routeState.get(plugin);
+    if (!st) return;
+    if (st.sendTimer) { clearTimeout(st.sendTimer); st.sendTimer = null; }
+    const model = routingStepModel(plugin, routingData, Date.now());
+    const planned = routingSetBody(plugin, st.selection, model);
+    const rowEls = routingStepEls.get(plugin);
+    if (planned.error) {
+      // Pick at least one channel for <server>. -- find which row is the culprit (the one in "chosen"
+      // scope with nothing ticked) and mark it, rather than a bare bar-level message.
+      for (const row of model.rows) {
+        const sel = rowSelection(st, row.id);
+        if (sel.on && sel.scope === "chosen" && sel.channels.length === 0) {
+          const refs = rowEls && rowEls.rows.get(row.id);
+          if (refs) {
+            refs.fieldset.setAttribute("aria-invalid", "true");
+            refs.channelErr.textContent = planned.error;
+            refs.channelErr.hidden = false;
+          }
+        }
+      }
+      return;
+    }
+    if (st.inflight) { st.held = true; return; }
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    const sentServers = Object.keys(planned.body.servers);
+    try {
+      const res = await api("/api/routing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(planned.body), signal });
+      const text = await res.text();
+      if (!res.ok) {
+        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
+        return;
+      }
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* treated as a failure below */ }
+      if (!result || !result.id) {
+        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
+        return;
+      }
+      const startedAt = Date.now();
+      st.inflight = { id: result.id, sentServers, startedAt };
+      st.outcome = null;
+      renderRouteStatus(plugin, routingStepEls.get(plugin));
+      await awaitRequestResult(plugin, result.id, sentServers, startedAt);
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
+      }
+    } finally {
+      cancel();
+      if (st.held) {
+        st.held = false;
+        sendRouting(plugin);
+      }
+    }
+  }
+
+  // Polls GET /api/routing every ROUTING_POLL_MS until routing.results holds `id` or
+  // ROUTING_ANSWER_TIMEOUT_MS has passed. A poll that finds its own inflight.id no longer matches (a
+  // newer request superseded it) stops silently -- never writes an outcome for a request that is not the
+  // newest.
+  async function awaitRequestResult(plugin, id, sentServers, startedAt) {
+    for (;;) {
+      await new Promise((resolve) => { routeState.get(plugin) ? (routeState.get(plugin).pollTimer = setTimeout(resolve, ROUTING_POLL_MS)) : resolve(); });
+      const st = routeState.get(plugin);
+      if (!st || !st.inflight || st.inflight.id !== id) return; // superseded
+      try {
+        const res = await api("/api/routing");
+        routingData = await res.json();
+      } catch (e) {
+        if (e && e.message === "unauthorized") return;
+        // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+      }
+      const st2 = routeState.get(plugin);
+      if (!st2 || !st2.inflight || st2.inflight.id !== id) return; // superseded mid-fetch
+      const outcome = requestOutcome(routingData, id, sentServers, isPluginActive(plugin), startedAt, Date.now());
+      if (outcome.phase === "waiting") continue;
+      st2.inflight = null;
+      st2.outcome = outcome;
+      // Kept for "Reset to what's saved" (a refusal) and "Check again" (a timeout) -- both need the id
+      // and sent-server list of the request they're reacting to, after inflight has been cleared.
+      st2.lastSent = { id, sentServers };
+      // An "applied" outcome means routing.json was actually WRITTEN (regardless of whether Discord then
+      // registered commands on every server) -- placementSummary's "unplaced"/"in N servers"/"nowhere"
+      // sentence is now stale and needs the WHOLE step rebuilt from the fresh routingData, not just its
+      // status line. refreshRoutingSteps also re-renders the status (buildWhereItLivesStep's own last
+      // line), so this covers both. A refusal or a timeout changed nothing on disk -- the cheaper
+      // status-only update is correct there.
+      if (outcome.phase === "applied") refreshRoutingSteps();
+      else renderRouteStatus(plugin, routingStepEls.get(plugin));
+      return;
+    }
+  }
+  function isPluginActive(plugin) {
+    const p = pluginsData && pluginsData.plugins && pluginsData.plugins.find((x) => x.name === plugin);
+    return !!(p && p.active);
+  }
+  // Decision 6's "Check again": one more 30-second poll window on the same request id, not a new POST.
+  function checkAgain(plugin) {
+    const st = routeState.get(plugin);
+    if (!st || !st.lastSent) return;
+    const { id, sentServers } = st.lastSent;
+    const startedAt = Date.now();
+    st.inflight = { id, sentServers, startedAt };
+    st.outcome = null;
+    renderRouteStatus(plugin, routingStepEls.get(plugin));
+    awaitRequestResult(plugin, id, sentServers, startedAt);
+  }
+  // Decision 6's "Reset to what's saved": a refusal leaves the operator's picks in the controls (nothing
+  // is sent), so resetting means dropping the LOCAL selection and redrawing from what's actually on disk.
+  function resetToSaved(plugin) {
+    routeState.delete(plugin);
+    refreshRoutingSteps();
+  }
+
+  async function refreshDiscovery(plugin) {
+    const st = ensureRouteState(plugin, routingStepModel(plugin, routingData, Date.now()));
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/discovery/refresh", { method: "POST", signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (res.ok && result && result.id) {
+        const startedAt = Date.now();
+        st.inflight = { id: result.id, sentServers: [], startedAt };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
+        for (;;) {
+          await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
+          const now = routeState.get(plugin);
+          if (!now || !now.inflight || now.inflight.id !== result.id) return;
+          const r = await api("/api/routing");
+          routingData = await r.json();
+          const found = routingData.routing && routingData.routing.results && routingData.routing.results.find((x) => x.id === result.id);
+          if (found || Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) {
+            now.inflight = null;
+            refreshRoutingSteps();
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      if (!e || e.message !== "unauthorized") { /* the step stays as it was; a retry is just another click */ }
+    } finally {
+      cancel();
+    }
+  }
+
+  // The overall status line is a plain, live-region-updated sentence for every phase except one: once
+  // every sent server actually registered, "Live"/"Saved..." (decision 6) is a real rb-badge plus text,
+  // not a sentence -- so that one case rebuilds el's children instead of using setApplyText's plain-text
+  // shortcut. Per-row notes (Discord refused it / not registered yet / the bot no longer sees this
+  // server) are written independently of the overall line, since they can differ per server.
+  function renderRouteStatus(plugin, els) {
+    if (!els) return;
+    const st = routeState.get(plugin);
+    const el = els.status;
+    const setPlain = (text) => setApplyText(el, text);
+    els.statusActions.textContent = "";
+    const addAction = (text, onClick) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      btn.textContent = text;
+      btn.addEventListener("click", onClick);
+      els.statusActions.appendChild(btn);
+    };
+    if (!st || (!st.inflight && !st.outcome)) { setPlain(""); return; }
+    if (st.inflight) { setPlain("Applying…"); return; }
+    const o = st.outcome;
+    if (o.phase === "posted-error") { setPlain(o.message); return; }
+    if (o.phase === "timeout") {
+      setPlain("The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
+      addAction("Check again", () => checkAgain(plugin));
+      return;
+    }
+    if (o.phase === "refused") {
+      setPlain("The bot refused it: " + o.reason);
+      addAction("Reset to what's saved", () => resetToSaved(plugin));
+      return;
+    }
+    if (o.phase === "applied") {
+      for (const [guildId, info] of Object.entries(o.servers)) {
+        const refs = els.rows.get(guildId);
+        if (!refs) continue;
+        if (info.state === "live") { refs.note.hidden = true; refs.note.textContent = ""; continue; }
+        refs.note.hidden = false;
+        refs.note.textContent =
+          info.state === "refused" ? "Discord refused the commands here: " + info.error :
+          info.state === "unregistered" ? "Not registered yet." :
+          "The bot no longer sees this server.";
+        if (info.state === "refused") {
+          const invite = discoveryInviteUrl();
+          if (invite) {
+            refs.note.appendChild(document.createTextNode(" "));
+            const link = document.createElement("a");
+            link.href = invite;
+            link.rel = "noopener";
+            link.textContent = "Re-invite the bot";
+            refs.note.appendChild(link);
+          }
+        }
+      }
+      // Decision 6 gives the Live/Saved sentence only once EVERY sent server registered -- otherwise the
+      // per-row notes above are the whole story and the overall line stays empty.
+      const allRegistered = Object.values(o.servers).every((s) => s.state === "live");
+      if (!allRegistered) { setPlain(""); return; }
+      if (o.live) {
+        el.textContent = "";
+        const badge = document.createElement("span");
+        badge.className = "rb-badge rb-badge--success";
+        badge.textContent = "Live";
+        el.appendChild(badge);
+        el.appendChild(document.createTextNode(" Applied at " + new Date(o.at).toLocaleString()));
+      } else {
+        setPlain("Saved. Applies once the plugin is running.");
+      }
+      return;
+    }
+  }
+  function discoveryInviteUrl() {
+    const url = routingData && routingData.discovery && routingData.discovery.inviteUrl;
+    return typeof url === "string" && url.startsWith("https://discord.com/") ? url : null;
+  }
+
+  // #245's own load path -- never folded into reloadConfig (see routingData's declaration comment).
+  async function loadRouting() {
+    try {
+      const res = await api("/api/routing");
+      routingData = await res.json();
+    } catch (e) {
+      if (e && e.message === "unauthorized") return;
+      routingData = { routing: null, discovery: null, loadError: e && e.message ? e.message : String(e) };
+    }
+    refreshRoutingSteps();
+  }
+
+  // Redraws every card's step FRESH from the latest routingData (routingStepEls is rebuilt each time,
+  // like renderPlugins does for cardHeaderEls) -- never a full renderPlugins, so opening/closing an
+  // unrelated card or an Apply-bar reload is untouched by a routing-only refresh.
+  function refreshRoutingSteps() {
+    if (!pluginsData || !pluginsData.plugins) return;
+    for (const p of pluginsData.plugins) {
+      const mount = document.getElementById("route-step-" + p.name);
+      if (!mount) continue;
+      mount.replaceWith(buildWhereItLivesStep(p, {}));
+    }
   }
 
   // Step 2, present whenever there is something to show: a declared setting, an admin bundle, or (with
@@ -1186,7 +1747,7 @@
       alert.textContent = p.error;
       body.appendChild(alert);
     }
-    const steps = [buildTurnItOnStep(p, ctx)];
+    const steps = [buildTurnItOnStep(p, ctx), buildWhereItLivesStep(p, ctx)];
     const settingsStep = buildSettingsStep(p, ctx, isOpen);
     if (settingsStep) steps.push(settingsStep);
     steps.forEach((s, i) => {
@@ -1979,6 +2540,143 @@
   }
   // PLUGIN_EDITS:end
 
+  // PLUGIN_ROUTING:begin
+  // #245: pure parts of "Choose where it lives" -- deciding what the step shows and what it sends, from
+  // GET /api/routing's { routing, discovery } (both nullable) and the operator's in-progress picks. No
+  // DOM, no fetch: the DOM half (buildWhereItLivesStep and friends, below) is browser-only, same split as
+  // #244's PLUGIN_CARD_STATE / buildPluginCard.
+  const DISCOVERY_STALE_MS = 60 * 60 * 1000;
+  const ROUTING_SEND_DEBOUNCE_MS = 1200;
+  const ROUTING_POLL_MS = 2000;
+  const ROUTING_ANSWER_TIMEOUT_MS = 30000;
+
+  // Missing/unparseable is stale too (never "ready" on a guess); an hour is four missed 15-minute
+  // discovery refreshes -- long enough that the bot is down or stuck, short enough that clock skew
+  // between this browser and the server rarely crosses it by accident.
+  function isDiscoveryStale(generatedAt, now) {
+    const t = Date.parse(generatedAt);
+    return !Number.isFinite(t) || now - t > DISCOVERY_STALE_MS;
+  }
+
+  // The step's whole picture for one plugin, decided purely from the raw files: which mode to draw, the
+  // home-server fallback, whether it's placed (an entry exists, even an empty one) and whether it posts on
+  // its own, one row per discovery.guilds entry (placement folded in, webhook state resolved per channel),
+  // and which placed server ids discovery no longer sees at all.
+  function routingStepModel(pluginName, routingData, now) {
+    const routing = (routingData && routingData.routing) || null;
+    const pluginRouting = routing && routing.plugins && routing.plugins[pluginName];
+    const placed = !!pluginRouting;
+    const servers = (pluginRouting && pluginRouting.servers) || {};
+    const discovery = routingData && routingData.discovery;
+    // No discovery at all: nothing has a name, so the saved placement (if any) can only be listed by id --
+    // every server this plugin names is "unavailable" in the sense of "not resolvable right now", same
+    // field a stale-but-present discovery uses for a server it has genuinely lost.
+    if (!discovery) return { mode: "missing", generatedAt: null, home: null, placed, posts: false, rows: [], unavailable: Object.keys(servers) };
+    const mode = isDiscoveryStale(discovery.generatedAt, now) ? "stale" : "ready";
+    const posts = !!(discovery.plugins && discovery.plugins[pluginName] && discovery.plugins[pluginName].posts === true);
+    const homeId = discovery.homeGuildId;
+    const homeGuild = homeId ? discovery.guilds.find((g) => g.id === homeId) : undefined;
+    const home = homeId ? { id: homeId, name: homeGuild ? homeGuild.name : null } : null;
+    const webhooks = (routing && routing.webhooks) || {};
+    const rows = discovery.guilds.map((g) => {
+      const entry = servers[g.id];
+      const on = !!entry;
+      return {
+        id: g.id,
+        name: g.name,
+        on,
+        commands: on ? entry.commands : "all",
+        postTo: on && entry.postTo ? entry.postTo : null,
+        channels: g.channels.map((c) => {
+          const wh = webhooks[c.id];
+          return { id: c.id, name: c.name, canSend: c.canSend, webhook: !wh ? "none" : wh.broken ? "broken" : "ok" };
+        }),
+      };
+    });
+    const guildIds = new Set(discovery.guilds.map((g) => g.id));
+    const unavailable = Object.keys(servers).filter((id) => !guildIds.has(id));
+    return { mode, generatedAt: discovery.generatedAt, home, placed, posts, rows, unavailable };
+  }
+
+  // Decision 4's five sentences, purely from the model. "In n servers" counts every server the plugin's
+  // routing entry names, including one discovery no longer sees (unavailable) -- it is still part of the
+  // placement until the operator changes it (decision 3's "Drop now").
+  function placementSummary(model) {
+    if (!model.placed) {
+      if (!model.home) return "Lives in every server by default (no home server is set). Tick a server to place it.";
+      if (model.home.name) return "Lives in the home server (" + model.home.name + ") by default and posts to the default channel. Tick a server to place it.";
+      return "Lives in the home server by default, but the bot is not in it, so its commands are registered nowhere. Tick a server to place it.";
+    }
+    const n = model.rows.filter((r) => r.on).length + model.unavailable.length;
+    if (n === 0) return "Nowhere: its commands appear in no server. There is no way back to the default. Tick a server instead.";
+    return "In " + n + (n === 1 ? " server." : " servers.");
+  }
+
+  // channel: one of routingStepModel's row.channels entries (already carries webhook: "none"|"ok"|"broken").
+  function channelOptionLabel(channel) {
+    if (channel.webhook === "ok") return "#" + channel.name + " · webhook";
+    if (channel.webhook === "broken") return "#" + channel.name + " · webhook stopped working";
+    if (!channel.canSend) return "#" + channel.name + " · the bot can't post here";
+    return "#" + channel.name;
+  }
+
+  // selection: { [guildId]: { on, scope: "all"|"chosen", channels: string[], postTo: string|null } }.
+  // Walks model.rows (discovery order), so an unavailable id (not a row) can never be sent -- the bot
+  // would refuse the whole request over one server it can no longer see (#259). postTo is included only
+  // when the plugin posts on its own AND one is chosen; "chosen" with nothing ticked refuses the whole
+  // plan rather than silently sending "all" or an empty list.
+  function routingSetBody(pluginName, selection, model) {
+    const servers = {};
+    for (const row of model.rows) {
+      const sel = selection[row.id];
+      if (!sel || !sel.on) continue;
+      let commands;
+      if (sel.scope === "chosen") {
+        const chosen = new Set(sel.channels || []);
+        commands = row.channels.filter((c) => chosen.has(c.id)).map((c) => c.id);
+        if (commands.length === 0) return { error: "Pick at least one channel for " + row.name + "." };
+      } else {
+        commands = "all";
+      }
+      const entry = { commands };
+      if (model.posts && sel.postTo) entry.postTo = sel.postTo;
+      servers[row.id] = entry;
+    }
+    return { body: { plugin: pluginName, servers } };
+  }
+
+  // What a settled request looks like right now: still waiting, timed out, the bot's own refusal, or
+  // applied -- and, once applied, whether every server that was SENT actually got its commands registered
+  // (discovery.guilds[].commands), since a written routing.json and a Discord-side registration failure
+  // are two different things (#241/#242). `live` also requires the plugin to be active: nothing registers
+  // for a plugin that is off or not yet restarted, so "Live" would be a lie.
+  function requestOutcome(routingData, id, sentServers, active, startedAt, now) {
+    const routing = routingData && routingData.routing;
+    const discovery = routingData && routingData.discovery;
+    const result = routing && routing.results && routing.results.find((r) => r.id === id);
+    if (!result) return now - startedAt >= ROUTING_ANSWER_TIMEOUT_MS ? { phase: "timeout" } : { phase: "waiting" };
+    if (!result.ok) return { phase: "refused", reason: result.reason || "" };
+    const servers = {};
+    let live = true;
+    for (const guildId of sentServers) {
+      const guild = discovery && discovery.guilds && discovery.guilds.find((g) => g.id === guildId);
+      if (!guild) {
+        servers[guildId] = { state: "unseen" };
+        live = false;
+      } else if (guild.commands && guild.commands.error) {
+        servers[guildId] = { state: "refused", error: guild.commands.error };
+        live = false;
+      } else if (!guild.commands) {
+        servers[guildId] = { state: "unregistered" };
+        live = false;
+      } else {
+        servers[guildId] = { state: "live" };
+      }
+    }
+    return { phase: "applied", live: active && live, at: result.at, servers };
+  }
+  // PLUGIN_ROUTING:end
+
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
   // without a DOM. state: { count, phase: "idle"|"applying"|"done"|"failed", error?, detail?, noop?, rereading? }
@@ -2091,6 +2789,14 @@
   // Declared here (not beside secretsReplacing either) for the same reason as cardHeaderEls above:
   // refuseApply, below, forces a card open on a validation failure and needs it in the lifted scope.
   let openCards = new Set();
+  // #245: one plugin's in-progress routing pick and its send/poll state, surviving renderPlugins exactly
+  // like openCards -- a card open/close or a background reloadConfig must lose neither a half-made
+  // selection nor an in-flight "Applying...". `selection` is lazily seeded from routingStepModel on a
+  // plugin's first render and never reset from a fresh model afterward (a successful apply's own fresh
+  // state matches what was just selected, so nothing visibly diverges).
+  // { [plugin]: { selection: { [guildId]: {on, scope, channels, postTo} }, inflight: {id, sentServers,
+  //   startedAt} | null, held: boolean, outcome: object | null, sendTimer, pollTimer } }
+  let routeState = new Map();
 
   // The planner's input, read from EXACTLY four places: the config controls (a chip field's hidden
   // carrier included), a card's plain settings, a card's typed secrets, and the plugin tick boxes. Never
@@ -2255,6 +2961,7 @@
     const target = e && e.target;
     if (!target || typeof target.closest !== "function" || !target.closest("#env-fields, #plugins-list")) return;
     if (target.closest(".plug__admin")) return;
+    if (target.closest(".route")) return;
     if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();
