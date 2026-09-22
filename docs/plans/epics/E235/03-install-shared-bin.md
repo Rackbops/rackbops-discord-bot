@@ -128,4 +128,30 @@ Branch `claude/install-shared-bin-guard` from `origin/main` (`c1e5f42` or later)
   worktree had no `ops/admin/node_modules`) before `bun run check` — the repo's own
   three-typecheck convention (root, `ops/tsconfig.json`, `ops/admin`) — would pass. All three are
   green; see the acceptance output below.
+- **Review gate round 1 (both reviewers verdict SOUND) — one blocker, fixed:** lens A found
+  `ops/README.md`'s "Bootstrapping a fresh instance" section still said install.sh "always
+  refreshes three things ... bin/bot-ops.sh (shared across every instance on the host)" — a false
+  claim about the exact behaviour this PR changes, left uncorrected 45 lines below the already-fixed
+  paragraph. Fixed in the same commit as the round's other change (`9de7511`); no separate re-review
+  round needed (docs-only, matching already-correct code elsewhere in the same file — a wording fix
+  per the personal CLAUDE.md's re-review threshold, not new logic).
+- **Round 1, declined in writing (both minor, non-blocking, explicitly named that way by lens A):**
+  (1) `install.sh debug --force-bin` (branch omitted) silently treats `--force-bin` as the branch
+  name rather than a usage error — fails cleanly downstream (a 404 on the first fetch, nothing
+  installed) rather than bypassing the #230 guard, so not a correctness or security defect, just a
+  confusing error message for an implausible operator typo; flagged as a follow-up rather than fixed
+  in this PR, which the plan scoped `--force-bin` as "third positional argument only." (2)
+  `schema_of()`'s `grep -m1 | cut` pipeline can abort the script with no diagnostic under `pipefail`
+  if a fetched `bot-ops.sh` ever lacked its `BOT_OPS_SCHEMA` line — a pre-existing pattern in this
+  script (the same shape already exists at the `compose_schema=` line), fanned out from one call
+  site to three by this PR but not a new risk shape; theoretical, not reachable by any real deploy
+  of this repo.
+- **Round 1, PR-body documentation fix (not a code fix):** lens B found the mutation table's row 1
+  ("disable the branch-vs-main comparison entirely") under-reported which tests it fails — the PR
+  body originally said "tests 4, 5, 6" but a full untruncated re-run (in a fresh detached worktree)
+  confirmed it also fails test 3 (the byte-identical case, since skipping the comparison block means
+  `note` never gets set to "(identical to main's)" and only one curl call happens instead of two).
+  The mutation was and is still correctly killed either way — this was a transcription gap in the
+  PR body from an earlier truncated `tail` of the test output, not a test-coverage gap. Corrected in
+  the PR body.
 
