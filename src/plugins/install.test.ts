@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installPlugins, reconcileManifest, tarExtract, type InstallDeps } from "./install";
+import { installPlugins, reconcileManifest, resolveRegistryBase, tarExtract, type InstallDeps } from "./install";
 import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
@@ -530,6 +530,26 @@ describe("installPlugins", () => {
       expect(readFileSync(join(dest, "dist", "plugin.js"), "utf8")).toContain("createPlugin");
       expect(existsSync(join(dest, "package.json"))).toBe(true);
     });
+  });
+});
+
+// #281: PLUGIN_REGISTRY_URL="" (what compose's env_file: delivers a bare `KEY=` line as, and what
+// .env.example ships) must resolve like unset, the same rule src/config.ts's optional() already applies
+// to PLUGIN_INDEX_URL. REGISTRY_BASE itself is a module-level constant computed once at import from the
+// real process.env, so it can't be driven per test; resolveRegistryBase is the pure seam that can.
+describe("resolveRegistryBase", () => {
+  test("a blank value falls back to the default registry", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "" })).toBe("https://registry.npmjs.org");
+  });
+  test("a whitespace-only value falls back to the default registry", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "   " })).toBe("https://registry.npmjs.org");
+  });
+  test("an unset value falls back to the default registry", () => {
+    expect(resolveRegistryBase({})).toBe("https://registry.npmjs.org");
+  });
+  test("a real value is used, with its trailing slash stripped", () => {
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "http://localhost:4873/" })).toBe("http://localhost:4873");
+    expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "http://localhost:4873" })).toBe("http://localhost:4873");
   });
 });
 
