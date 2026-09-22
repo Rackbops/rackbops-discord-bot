@@ -2114,6 +2114,15 @@
         renderServers();
         return;
       }
+      // A completed request is not necessarily a successful refresh. The bot records a rejected
+      // discovery-refresh as an ordinary routing result with ok:false and its reason; keep that outcome
+      // visible instead of clearing the action state and presenting the old discovery as a success. Same
+      // wording addWebhook/removeWebhook already use for their own refusal case.
+      if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        renderServers();
+        return;
+      }
       serverActionState.delete(key);
       await loadRouting(); // re-renders the tab itself (renderServers is part of loadRouting's own tail)
     } catch (e) {
@@ -3154,7 +3163,7 @@
     }
   }
 
-  function buildEnvControl(key, value) {
+  function buildEnvControl(key, value, preservePicker) {
     const meta = FIELD_META[key] || {};
     // Self-contained composite (its own nested id/data-key/focusId) — return before the common
     // id/dataset tail below, which would otherwise put a second data-key on the wrapper.
@@ -3184,7 +3193,7 @@
     } else if (meta.control === "server" || meta.control === "channel") {
       // #246: a <select> of live servers/channels (decision 6) -- degrades to the plain input below
       // whenever discovery isn't ready to trust (null, or stale by #245's own DISCOVERY_STALE_MS rule)
-      // AND no picker is already showing.
+      // AND this key wasn't already represented by a picker before renderEnvFields cleared the container.
       //
       // Round-4 review finding: renderEnvFields() wipes and rebuilds EVERY Config field from scratch on
       // every reload (any Apply success, Discard, Unlock, or update-button reload all route through
@@ -3198,9 +3207,11 @@
       // discovery has since gone stale -- pickerOptions/buildPickerSelect already handle a null/stale
       // discovery gracefully (an empty guild list, the stored value kept as its own fallback option), the
       // same degrade-gracefully rule an out-of-enum plain-select value already gets, above.
-      const existing = document.getElementById("env-" + key);
-      if ((existing && existing.tagName === "SELECT") || discoveryReadyForPickers()) {
-        control = buildPickerSelect(key, routingData.discovery, value);
+      if (preservePicker || discoveryReadyForPickers()) {
+        // routingData cannot be null here today (loadRouting always keeps the last good snapshot, never
+        // resets it to null once set) -- guarded anyway so this branch can never throw if that ever
+        // changes; pickerOptions already treats a null discovery as an empty guild list.
+        control = buildPickerSelect(key, routingData && routingData.discovery, value);
       } else {
         control = document.createElement("input");
         control.className = "rb-input";
@@ -3228,6 +3239,10 @@
   // it -- never appears in the Config editor too. #257's PLUGINS skip is unchanged.
   function renderEnvFields() {
     const container = document.getElementById("env-fields");
+    // Capture the picker shape before clearing the container. Looking it up from buildEnvControl would be
+    // too late: innerHTML="" removes the old control before the first replacement is built.
+    const pickerKeys = new Set();
+    for (const control of container.querySelectorAll("select[data-key]")) pickerKeys.add(control.dataset.key);
     const pluginKeys = new Set();
     for (const p of (pluginsData && pluginsData.plugins) || []) {
       for (const e of p.env || []) pluginKeys.add(e.key);
@@ -3237,7 +3252,7 @@
       if (key === "PLUGINS") continue;
       if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
       const value = loadedEnv[key] ?? "";
-      const control = buildEnvControl(key, value);
+      const control = buildEnvControl(key, value, pickerKeys.has(key));
       const label = document.createElement("label");
       label.className = "rb-label";
       label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");

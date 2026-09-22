@@ -6146,7 +6146,7 @@ describe("page skeleton", () => {
     const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
     expect(renderEnvFields.length).toBeGreaterThan(500);
     expect(renderEnvFields).toContain('if (key === "PLUGINS") continue;');
-    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value)"));
+    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, pickerKeys.has(key))"));
     expect(renderEnvFields).toContain('source === "plugin"');
     expect(renderEnvFields).toContain("pluginKeys.has(key)");
   });
@@ -9829,6 +9829,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     dataset: Record<string, string>;
     children: FakeEl[];
     appendChild: (c: FakeEl) => FakeEl;
+    querySelectorAll?: (selector: string) => FakeEl[];
     replaceWith?: (next: FakeEl) => void;
   }
   function makeEl(tag: string): FakeEl {
@@ -9838,12 +9839,16 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const pluginRoutingSrc = applyBlock("PLUGIN_ROUTING");
   const serversTabSrc = applyBlock("SERVERS_TAB");
-  const envSrc = indexSrc.slice(indexSrc.indexOf("const FIELD_META = {"), indexSrc.indexOf("function renderEnvFields()"));
+  const envSrc = indexSrc.slice(indexSrc.indexOf("const FIELD_META = {"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
 
   // `registry`: id -> the element document.getElementById(id) currently answers. refreshEnvPickers calls
   // existing.replaceWith(control) on an upgrade -- each registered element's own replaceWith swaps the
   // registry entry under ITS OWN id, so a later getElementById(id) sees the upgraded control.
-  function harness(routingDataInit: unknown, registry: Map<string, FakeEl> = new Map()) {
+  function harness(
+    routingDataInit: unknown,
+    registry: Map<string, FakeEl> = new Map(),
+    config: { loadedEnv?: Record<string, string>; loadedSchema?: Record<string, unknown>; pluginsData?: unknown } = {},
+  ) {
     for (const [id, el] of registry) {
       el.id = id;
       el.replaceWith = (next: FakeEl) => {
@@ -9856,15 +9861,21 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
       getElementById: (id: string) => registry.get(id) ?? null,
     };
     const fn = new Function(
-      "document", "routingData",
-      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\nreturn { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers };`,
+      "document", "routingData", "pluginsData",
+      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\n` +
+        "return { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers, renderEnvFields, setRoutingData: (next) => { routingData = next; }, setConfig: (env, schema) => { loadedEnv = env; loadedSchema = schema; } };",
     );
-    return fn(document, routingDataInit) as {
+    const result = fn(document, routingDataInit, config.pluginsData ?? null) as {
       buildEnvControl: (key: string, value: string) => FakeEl;
       FIELD_META: Record<string, { control?: string }>;
       discoveryReadyForPickers: () => boolean;
       refreshEnvPickers: () => void;
+      renderEnvFields: () => void;
+      setRoutingData: (next: unknown) => void;
+      setConfig: (env: Record<string, string>, schema: Record<string, unknown>) => void;
     };
+    result.setConfig(config.loadedEnv ?? {}, config.loadedSchema ?? {});
+    return result;
   }
 
   const discovery = {
@@ -9921,23 +9932,40 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
   // round 3 fixed in refreshEnvPickers, through a sibling path that fix never touched (refreshEnvPickers
   // only upgrades/preserves an EXISTING element in place; it is never in the loop when renderEnvFields
   // rebuilds the whole container from scratch).
-  test("buildEnvControl never rebuilds an EXISTING picker back into a plain input, even once discovery has gone stale", () => {
-    const existingPicker = makeEl("select");
-    existingPicker.value = "999999999";
-    const registry = new Map([["env-DISCORD_SERVER_ID", existingPicker]]);
-    for (const rd of [{ routing: null, discovery: null }, { routing: null, discovery: { ...discovery, generatedAt: "2020-01-01T00:00:00.000Z" } }]) {
-      const h = harness(rd, registry);
-      expect(h.discoveryReadyForPickers()).toBe(false); // discovery is NOT ready/fresh right now
-      const control = h.buildEnvControl("DISCORD_SERVER_ID", "999999999"); // renderEnvFields passes the loaded value
-      expect(control.tagName).toBe("SELECT"); // still a picker -- never downgraded
-      expect(control.id).toBe("env-DISCORD_SERVER_ID");
-      expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
-      expect(control.value).toBe("999999999"); // the stored value survives, even with an empty/stale guild list
-    }
-    // A key that was NEVER a picker (nothing registered under its id) still degrades normally -- this
-    // fix only preserves a picker that already exists, it doesn't force one into existence.
-    const freshH = harness({ routing: null, discovery: null });
-    expect(freshH.buildEnvControl("DISCORD_SERVER_ID", "100").tagName).toBe("INPUT");
+  test("renderEnvFields never rebuilds an existing picker back into a plain input after discovery goes stale", () => {
+    const registry = new Map<string, FakeEl>();
+    const container = makeEl("div");
+    container.id = "env-fields";
+    container.querySelectorAll = (selector) => selector === "select[data-key]"
+      ? container.children.filter((child) => child.tagName === "SELECT" && child.dataset.key)
+      : [];
+    container.appendChild = (child) => {
+      container.children.push(child);
+      if (child.id) registry.set(child.id, child);
+      return child;
+    };
+    Object.defineProperty(container, "innerHTML", {
+      get: () => "",
+      set: () => {
+        for (const child of container.children) if (child.id) registry.delete(child.id);
+        container.children = [];
+      },
+    });
+    registry.set(container.id, container);
+    const h = harness(routingDataReady, registry, { loadedEnv: { DISCORD_SERVER_ID: "999999999" } });
+
+    h.renderEnvFields(); // the real rebuild path first creates a ready-discovery picker
+    const ready = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(ready.tagName).toBe("SELECT");
+    expect(ready.value).toBe("999999999");
+
+    h.setRoutingData({ routing: null, discovery: null });
+    h.renderEnvFields(); // the real rebuild clears the container before building the replacement
+    const rebuilt = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(rebuilt).not.toBe(ready);
+    expect(rebuilt.tagName).toBe("SELECT"); // still a picker -- never downgraded
+    expect(rebuilt.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(rebuilt.value).toBe("999999999"); // the stored/operator value survives the stale rebuild
   });
 
   test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
@@ -10002,10 +10030,12 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
   // addWebhook in source -- excluding it left the sandbox with a ReferenceError on that exact path.
   const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function removeWebhook("));
   const pollForResultSrc = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
+  const refreshDiscoveryAllSrc = indexSrc.slice(indexSrc.indexOf("async function refreshDiscoveryAll("), indexSrc.indexOf("async function copyInviteLink("));
 
   test("the marked functions are present", () => {
     expect(addWebhookSrc).toContain("async function addWebhook(");
     expect(pollForResultSrc).toContain("async function pollForResult(");
+    expect(refreshDiscoveryAllSrc).toContain("async function refreshDiscoveryAll(");
   });
 
   function makeClock() {
@@ -10033,8 +10063,10 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const document = { getElementById: (id: string) => (id === "webhook-input-100" ? input : null) };
     let renderServersCalls = 0;
     let renderNeedsAttentionCalls = 0;
+    let loadRoutingCalls = 0;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const loadRouting = async () => { loadRoutingCalls++; };
     const timeoutControllers: AbortController[] = [];
     const timeoutSignal = () => {
       const controller = new AbortController();
@@ -10053,15 +10085,30 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
-      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention",
-      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n` +
-        "return { addWebhook, pollForResult, getRoutingData: () => routingData };",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
+        "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
     )(
-      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention,
-    ) as { addWebhook: (guildId: string) => Promise<void>; pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>; getRoutingData: () => unknown };
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting,
+    ) as {
+      addWebhook: (guildId: string) => Promise<void>;
+      pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>;
+      refreshDiscoveryAll: () => Promise<void>;
+      getRoutingData: () => unknown;
+    };
     // serverActionState is the SAME Map instance the sandbox mutates (passed by reference), so reading it
     // here after an await sees every .set/.delete the sandboxed addWebhook made.
-    return { run, clock, input, calls, serverActionState, abortLatestTimeout: () => timeoutControllers.at(-1)?.abort(), renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+    return {
+      run,
+      clock,
+      input,
+      calls,
+      serverActionState,
+      abortLatestTimeout: () => timeoutControllers.at(-1)?.abort(),
+      renderServersCalls: () => renderServersCalls,
+      renderNeedsAttentionCalls: () => renderNeedsAttentionCalls,
+      loadRoutingCalls: () => loadRoutingCalls,
+    };
   }
 
   test("a pasted webhook URL never survives the click: cleared before api() resolves, sent as { url }, status reads Adding…", async () => {
@@ -10189,6 +10236,36 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     // The whole entry is gone -- never left holding the misleading "may be restarting… queued" message a
     // plain timeout would have written.
     expect(h.serverActionState.has("add:100")).toBe(false);
+  });
+
+  test("Refresh from Discord shows the bot's reason when the completed discovery-refresh result failed", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async (path) => {
+        if (path === "/api/discovery/refresh") {
+          return { ok: true, text: async () => JSON.stringify({ ok: true, id: "refresh-failed" }) };
+        }
+        return {
+          ok: true,
+          text: async () => "",
+          json: async () => ({
+            routing: {
+              results: [{ id: "refresh-failed", action: "discovery-refresh", ok: false, reason: "Discord refused the refresh", at: "t" }],
+            },
+          }),
+        };
+      },
+    });
+    const pending = h.run.refreshDiscoveryAll();
+    await h.clock.tick();
+    await h.clock.tick();
+    await pending;
+    expect(h.serverActionState.get("discovery")).toEqual({
+      busy: false,
+      message: "The bot refused it: Discord refused the refresh",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // busy, then visible failure
+    expect(h.loadRoutingCalls()).toBe(0); // a refused refresh is not treated like success
   });
 
 });
