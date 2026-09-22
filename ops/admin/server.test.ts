@@ -7504,6 +7504,17 @@ describe("applyPending (#257)", () => {
     }
   });
 
+  test("renderEnvFields renders normally when no Config refusal is pending (#300)", () => {
+    // renderEnvFields runs on every reload (Apply success, Discard, Unlock, update-button) far more
+    // often with NO active refusal than with one. captureConfigApplyInvalidForRender's `!applyInvalid`
+    // guard is what keeps that common path from dereferencing a null control: without it,
+    // `applyInvalid.id` throws and the whole Config panel fails to render on every clean reload.
+    const config = runApply({ loadedEnv: APPLY_ENV, fields: APPLY_ENV });
+    expect(() => config.run.renderEnvFields()).not.toThrow(); // no applyPending() => applyInvalid is null
+    const rebuilt = config.control("ANNOUNCE_CHANNEL_ID");
+    expect(rebuilt.getAttribute("aria-invalid")).toBeNull();
+  });
+
   test("plugin and Config re-renders carry inline refusal state to the rebuilt control", async () => {
     const renderPlugins = applyIndexSrc.slice(applyIndexSrc.indexOf("function renderPlugins()"), applyIndexSrc.indexOf("function versionLine("));
     expect(renderPlugins).toContain("const savedApplyInvalid = capturePluginApplyInvalidForRender();");
