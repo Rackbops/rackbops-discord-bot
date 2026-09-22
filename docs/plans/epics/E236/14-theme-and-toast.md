@@ -219,4 +219,50 @@ Branch `claude/theme-classes-toast` from `origin/main` after #246 has merged, is
   sentence describing what `TOAST` actually does — a genuine gap in the first pass, caught while
   reconciling this branch) names all six sites and states precisely which of `retryRegistration`'s two
   reachable paths each toast covers, rather than an unqualified "already covers it."
+- **Round-2 review (the full gate, run on the combined scope after #306 was resumed as the single,
+  sanctioned Part B): two adversarial reviewers, different lenses (correctness/failure-modes;
+  claims-vs-code and acceptance-bullet execution).**
+  - **Finding, MAJOR, confirmed and fixed (claims-vs-code lens):** the settle-point source-pin test
+    (test #9) only ever checked that `showToast(` appears *somewhere* in each of
+    `awaitRequestResult`/`refreshDiscovery`/`addWebhook`/`removeWebhook`/`refreshDiscoveryAll` — never
+    a per-branch kind/text/count, unlike `sendRouting`, which alone got the round-1 fix's exact-count
+    guard. A mutation dropping ONE of several branches, or swapping one branch's `kind`, would pass the
+    whole suite unchanged at every site but `sendRouting` — the same vulnerability class the round-1
+    fix's own comment names, left unpatched everywhere else. Reproduced by mutation test (dropped
+    `removeWebhook`'s success call; swapped `addWebhook`'s success `kind` to `"danger"` — both slipped
+    past the suite before the fix, both caught after). Fixed in two parts: (1) the settle-point test's
+    presence check became an exact `showToast(` call-count check for all six functions (`sendRouting`
+    3, `awaitRequestResult` 3, `refreshDiscovery` 4 — its own count was wrong in the plan's read too,
+    corrected to include the network-catch branch alongside landed/timeout/posted-error — `addWebhook`
+    5, `removeWebhook` 5, `refreshDiscoveryAll` 5), closing the "drop or add a call" mutation class
+    uniformly; (2) a real `.toasts()` content assertion was added to every existing test that already
+    exercises a settle branch cleanly (`awaitRequestResult`'s applied/refused, `refreshDiscovery`'s
+    timeout/posted-error, `addWebhook`'s success/refused, `refreshDiscoveryAll`'s refused), closing the
+    "swap this branch's kind or wording" class for those branches. `removeWebhook` has no behavioural
+    mini-harness at all (a pre-existing, deliberately documented choice — `server.test.ts`'s own
+    comment: "removeWebhook has no equivalent real-chain harness... its only coverage anywhere else is
+    static"), and several branches across `refreshDiscovery`/`addWebhook`/`removeWebhook`/
+    `refreshDiscoveryAll`/`awaitRequestResult`'s timeout have no existing test to hang a content
+    assertion on without building a new harness from scratch — those keep only the exact-count guard.
+    Declined as out of proportion for this fix: building full behavioural harnesses for every remaining
+    branch is a larger, separate undertaking than closing a reviewer-evidenced mutation gap on this
+    PR's own changed lines, and the count guard already closes the most severe mutation class (a
+    silently dropped call) everywhere.
+  - **Finding, moderate, declined in writing (correctness lens):** the routing-channel validation error
+    (`channelErr`, `buildRouteRow`) is never wired via `aria-describedby` to the `<fieldset>` it
+    belongs to, and carries no `role="alert"`/live-region wiring — only the static help text
+    (`channelHint`) is wired in. Confirmed pre-existing (the pre-#300 `field-hint`/`field-hint--danger`
+    version had the identical gap — not a regression this PR introduced) and outside #300's acceptance
+    bullets, which require `channelErr`'s class name (`rb-field__error`) but never mandate
+    describedby/live-region wiring for it (test #2/#3 in this doc's own Tests table only ever checked
+    the class name). Declined for #306 on scope grounds, not correctness grounds: fixing it well is a
+    small design decision of its own (should `channelErr`'s `id` join `channelHint`'s in
+    `aria-describedby`, space-separated, and should it carry `role="alert"` or `aria-live="assertive"`)
+    that belongs in its own reviewed change rather than folded into an already-multiply-rescoped PR.
+    Flagged as a follow-up task (chip spawned in-session, 2026-09-22) rather than lost.
+  - Everything else both reviewers checked — the toast helper's eviction/RAF/timer logic and its
+    idempotent `dismissToast`, all 6 call sites' outcome-phase coverage, the `required`-attribute wiring
+    through the tags-composite's `focusTarget` indirection, the `.adm [aria-invalid]` CSS deletion's
+    safety, the ~37-site sweep's classification, every acceptance-bullet command re-executed for real,
+    and the Part B heading reading as one coherent section — checked out clean.
 

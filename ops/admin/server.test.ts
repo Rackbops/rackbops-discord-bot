@@ -5478,25 +5478,27 @@ describe("form help, error and required states (#300)", () => {
     // double-toast an outcome (the Apply bar, the inline update-action messages, retryRegistration's own
     // body -- it reuses sendRouting/awaitRequestResult, so its toast is that one, not a second).
     const slice = (start: string, end: string) => html300.slice(html300.indexOf(start), html300.indexOf(end));
+    // Round-1 finding (#306): checking only "some showToast call exists somewhere in the function" let a
+    // mutation dropping ONE of several settle-point branches (or a mutation swapping one branch's kind)
+    // slip through unnoticed at every site but sendRouting, which alone had a per-call count guard. Every
+    // site below now gets the same exact-count guard, matching its real number of showToast( call
+    // expressions one-for-one against the branches read in the source (applied/refused/timeout for
+    // awaitRequestResult; landed/timeout/posted-error/network-catch for refreshDiscovery; posted-error/
+    // timeout/refused/success/network-catch for addWebhook, removeWebhook and refreshDiscoveryAll).
     const sites = [
       // sendRouting's OWN initiating-POST failures (never-ok, unparseable body, network catch) are a
       // sixth site alongside the plan's original five: the same failure class every sibling mutation
       // below already toasts on, so parity, not scope creep (round-1 review finding, #306).
-      ["sendRouting", slice("async function sendRouting(", "async function awaitRequestResult(")],
-      ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive(")],
-      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus(")],
-      ["addWebhook", slice("async function addWebhook(", "async function removeWebhook(")],
-      ["removeWebhook", slice("async function removeWebhook(", "async function pollForResult(")],
-      ["refreshDiscoveryAll", slice("async function refreshDiscoveryAll(", "async function copyInviteLink(")],
+      ["sendRouting", slice("async function sendRouting(", "async function awaitRequestResult("), 3],
+      ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive("), 3],
+      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus("), 4],
+      ["addWebhook", slice("async function addWebhook(", "async function removeWebhook("), 5],
+      ["removeWebhook", slice("async function removeWebhook(", "async function pollForResult("), 5],
+      ["refreshDiscoveryAll", slice("async function refreshDiscoveryAll(", "async function copyInviteLink("), 5],
     ] as const;
-    for (const [name, src] of sites) {
-      expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: true });
+    for (const [name, src, count] of sites) {
+      expect({ name, showToastCalls: (src.match(/showToast\(/g) ?? []).length }).toEqual({ name, showToastCalls: count });
     }
-    // sendRouting's three posted-error exits must ALL toast, not just one -- a mutation clearing only
-    // one of the three would otherwise slip through the loop above (which only checks "some showToast
-    // call exists somewhere in the whole function").
-    const sendRoutingSrc = slice("async function sendRouting(", "async function awaitRequestResult(");
-    expect((sendRoutingSrc.match(/showToast\(/g) ?? []).length).toBe(3);
     // Never in the Apply bar, the inline update-action messages, or retryRegistration's own body (it
     // reuses sendRouting -> awaitRequestResult: the outcomes that reach awaitRequestResult -- applied,
     // refused, timeout -- toast from there; sendRouting's own posted-error exits, above, now toast too,
@@ -9925,6 +9927,11 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await applied.clock.tick(); // poll lands ok:true
     expect(applied.routeState.get("music")?.outcome).toMatchObject({ phase: "applied" });
     expect(applied.refreshRoutingStepsCalls()).toBe(1);
+    // #300 round-1 gap (#306): the count guard above only proves a showToast(...) call exists somewhere
+    // per function -- this proves the RIGHT kind/text landed for THIS branch, so a mutation swapping one
+    // branch's kind (e.g. applied -> "danger") or its wording fails here even though it wouldn't move
+    // the count.
+    expect(applied.toasts()).toEqual([{ kind: "success", text: "music: live in 1 server" }]);
 
     const refused = harness({
       routingDataInit,
@@ -9940,6 +9947,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await refused.clock.tick();
     expect(refused.routeState.get("music")?.outcome).toMatchObject({ phase: "refused" });
     expect(refused.refreshRoutingStepsCalls()).toBe(0);
+    expect(refused.toasts()).toEqual([{ kind: "danger", text: "music: the bot refused it — server 1 is not one the bot is in" }]);
   });
 
   // Round-2 review finding: checkAgain re-polls a request outside sendRouting's own try/finally, which is
@@ -10100,6 +10108,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // The timeout path must NOT be confused with a normal landing (which calls refreshRoutingSteps
     // instead of setting a visible outcome).
     expect(h.refreshRoutingStepsCalls()).toBe(0);
+    expect(h.toasts()).toEqual([{ kind: "warning", text: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." }]);
   });
 
   // Round-3 review finding: a failed discovery-refresh POST (non-ok response) rendered nothing at all.
@@ -10115,6 +10124,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     h.seed("music");
     await h.run.refreshDiscovery("music");
     expect(h.routeState.get("music")?.outcome).toEqual({ phase: "posted-error", message: "Couldn't send it: bot-ops: plugin-request failed" });
+    expect(h.toasts()).toEqual([{ kind: "danger", text: "Couldn't send it: bot-ops: plugin-request failed" }]);
   });
 
   // Round-3 review finding (a second finding, on top of the round-3 fixes above): a 401 mid-poll returned
@@ -10971,6 +10981,11 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     expect(h1.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
     // Orchestrator follow-up (minor 7): a landed Add refreshes the Plugins tab's webhook suffix too.
     expect(h1.refreshRoutingStepsCalls()).toBe(1);
+    // #300 round-1 gap (#306): the call-count guard alone can't catch a kind/text swap within a single
+    // branch -- this proves the right one landed, the way sendRouting's own toasts() assertion already
+    // does. No discovery data in this harness's default routingDataInit, so the channel-name lookup
+    // short-circuits to the bare channelId.
+    expect(h1.toasts()).toEqual([{ kind: "success", text: "Webhook added for #10." }]);
 
     const h2 = harness({
       inputValue: "https://discord.com/api/webhooks/1/tok",
@@ -10986,6 +11001,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     // A refusal is not a landed change -- no refresh.
     expect(h2.refreshRoutingStepsCalls()).toBe(0);
     expect(h2.serverActionState.get("add:100")).toEqual({ busy: false, message: "The bot refused it: server 424242 is not one the bot is in" });
+    expect(h2.toasts()).toEqual([{ kind: "danger", text: "The bot refused it: server 424242 is not one the bot is in" }]);
   });
 
   test("pollForResult resolves { result } once routing.results holds the id, and { timeout: true } past the deadline", async () => {
@@ -11093,6 +11109,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
       busy: false,
       message: "The bot refused it: Discord refused the refresh",
     });
+    expect(h.toasts()).toEqual([{ kind: "danger", text: "The bot refused it: Discord refused the refresh" }]);
     expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // busy, then visible failure
     expect(h.loadRoutingCalls()).toBe(0); // a refused refresh is not treated like success
   });
