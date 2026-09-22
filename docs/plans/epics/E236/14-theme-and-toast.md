@@ -199,4 +199,24 @@ Branch `claude/theme-classes-toast` from `origin/main` after #246 has merged, is
   `@media (prefers-reduced-motion: reduce)` block collapses `--rb-transition` to `0s`, and
   `showToast`'s `data-rb-enter` removal is unconditional) rather than emulated live, since the Browser
   pane tool used in this environment has no `prefers-reduced-motion` emulation control.
+- **Round-1 review finding, verified and fixed: a sixth `showToast` site, not named in decision 4's
+  original five.** `sendRouting`'s own initiating-POST failure (its `"posted-error"` outcome — a
+  non-`ok` response, an unparseable body, or a network exception; three separate exit points) never
+  reached `awaitRequestResult`, so it never toasted, unlike the identical failure class in
+  `addWebhook`/`removeWebhook`/`refreshDiscovery`/`refreshDiscoveryAll`, which all toast `danger` on
+  their own initiating-POST failure. `retryRegistration` calls `sendRouting` directly and can hit this
+  exact path, so the claim that its toast is "already covered" by `sendRouting → awaitRequestResult`
+  was only true for the outcomes that actually reach `awaitRequestResult` (`applied`/`refused`/
+  `timeout`), not for `posted-error`, which short-circuits before that call. Fixed: all three of
+  `sendRouting`'s `posted-error` exits now call `showToast("danger", "Couldn't send it: " + …)`,
+  matching the sibling functions' own wording exactly. The settle-point source-pin test gained
+  `sendRouting` as a sixth checked site plus a count assertion (exactly 3 `showToast(` calls within
+  it, so a mutation clearing only one of the three can't slip through — confirmed by mutation test);
+  the existing `sendRouting` mini-harness test gained a direct `toasts()` assertion; a third
+  mini-harness (`retryRegistration end-to-end`) needed the same `showToast` stub injected, since it
+  now reaches this code path too. `CONTEXT.md`'s toast gotcha (also newly added in this round, since
+  the original commit updated the lifted-block *test* count but never added the matching prose
+  sentence describing what `TOAST` actually does — a genuine gap in the first pass, caught while
+  reconciling this branch) names all six sites and states precisely which of `retryRegistration`'s two
+  reachable paths each toast covers, rather than an unqualified "already covers it."
 
