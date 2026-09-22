@@ -5799,6 +5799,12 @@ describe("page skeleton", () => {
     expect(buildPluginCard).toContain('body.setAttribute("aria-labelledby", head.id);');
   });
 
+  test("an off plugin's card offers no update actions (#225, source-pinned like buildPluginCard above)", () => {
+    const buildTurnItOnStep = indexSrc.slice(indexSrc.indexOf("function buildTurnItOnStep("), indexSrc.indexOf("function buildSettingsStep("));
+    expect(buildTurnItOnStep.length).toBeGreaterThan(300);
+    expect(buildTurnItOnStep).toContain("if (p.enabled) {\n      const updateBlock = buildPluginUpdateBlock(p);");
+  });
+
   test("the Config editor does not render a PLUGINS field, or a key a card already shows (#244)", () => {
     // renderEnvFields is far too DOM-heavy to lift; the wiring is pinned in source, the file's idiom.
     const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
