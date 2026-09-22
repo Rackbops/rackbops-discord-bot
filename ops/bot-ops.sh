@@ -375,7 +375,8 @@ lock_config_dir() {
   local sub="$1"
   need flock
   exec 9<"$CONFIG_DIR" || die "$sub: cannot open $CONFIG_DIR to lock it"
-  flock -w "$LOCK_WAIT_SECONDS" 9 \
+  # MUTANT 2 (CI-only): dropped the bounded wait — an unbounded flock blocks forever instead of refusing
+  flock 9 \
     || die "$sub: another bot-ops.sh mutation is still running on this instance (waited ${LOCK_WAIT_SECONDS}s) — try again"
 }
 
