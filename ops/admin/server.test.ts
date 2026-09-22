@@ -9409,6 +9409,40 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(h2.posts).toHaveLength(0);
   });
 
+  // Orchestrator round 2 (minor 2/3): the REAL sendRouting's return value, not just retryRegistration's
+  // stubbed handling of it -- so the wiring "a failed POST returns posted-error, a settled send returns
+  // sent" is guarded end to end, not only in two separate halves.
+  test("sendRouting returns 'posted-error' on a failed POST and 'sent' once a settled result lands", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const hFail = harness({
+      routingDataInit,
+      apiImpl: async (_path, init) =>
+        init && init.method === "POST"
+          ? { ok: false, status: 502, text: async () => "boom" }
+          : ({ ok: true, status: 200, text: async () => "", json: async () => routingDataInit } as unknown as { ok: boolean; text: () => Promise<string> }),
+    });
+    hFail.seed("music");
+    hFail.run.onRouteChange("music", "100", "on", true); // "all" scope -> a sendable body
+    const failOutcome = await (hFail.run.sendRouting("music") as unknown as Promise<string | undefined>);
+    expect(failOutcome).toBe("posted-error");
+
+    const id = "req-ok";
+    const withResult = { routing: { ...routingDataInit.routing, results: [{ id, action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const hOk = harness({
+      routingDataInit,
+      apiImpl: async (_path, init) =>
+        init && init.method === "POST"
+          ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) }
+          : ({ ok: true, status: 200, text: async () => JSON.stringify(withResult), json: async () => withResult } as unknown as { ok: boolean; text: () => Promise<string> }),
+    });
+    hOk.seed("music");
+    hOk.run.onRouteChange("music", "100", "on", true);
+    const okPromise = hOk.run.sendRouting("music") as unknown as Promise<string | undefined>;
+    await hOk.clock.tick(); // awaitRequestResult's first poll fires; the GET returns the landed result
+    await hOk.clock.tick();
+    expect(await okPromise).toBe("sent");
+  });
+
   test("a change made while a request is in flight is held and sent once when the result lands", async () => {
     let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
     let n = 0;
@@ -10671,6 +10705,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     pluginsData: unknown,
     model: StubModel | ((name?: string) => StubModel) = { mode: "ready", rows: [], unavailable: [] },
     sendRoutingOutcome: "held" | "error" | "posted-error" | "sent" | "unauthorized" | undefined = undefined,
+    ensureThrows = false,
   ) {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const sendRoutingCalls: string[] = [];
@@ -10678,7 +10713,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     let renderServersCalls = 0;
     let renderNeedsAttentionCalls = 0;
     const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); return sendRoutingOutcome; };
-    const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); };
+    const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); if (ensureThrows) throw new Error("boom in ensureRouteState"); };
     const routingStepModel = (name: string) => typeof model === "function" ? model(name) : model;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
@@ -10800,6 +10835,14 @@ describe("retryRegistration (#246, mini-harness)", () => {
       await h.run.retryRegistration();
       expect({ outcome, retained: h.serverActionState.has("retry") }).toEqual({ outcome, retained: false });
     }
+  });
+
+  // Orchestrator round 2 (minor 4): the busy state is set OUTSIDE the try, so a throw before any branch
+  // above (e.g. ensureRouteState throwing) must never strand "retry" at busy -- the finally clears it.
+  test("retryRegistration never leaves the retry line wedged busy when a throw escapes before settling", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, undefined, /* ensureThrows */ true);
+    await expect(h.run.retryRegistration()).rejects.toThrow("boom in ensureRouteState");
+    expect(h.serverActionState.has("retry")).toBe(false); // never left busy
   });
 });
 
