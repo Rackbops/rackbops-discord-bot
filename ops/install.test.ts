@@ -625,9 +625,15 @@ interface FetchProbe {
   fetches: string[];
   reachedEnd: boolean;
   stderr: string;
+  /** FORCE_BIN as the slice's own arg-parsing left it — undefined if the slice died before
+   *  reaching the trailing echo that reports it (issue #295's usage-error cases). */
+  forceBin: string | undefined;
 }
 
-async function runBranchGate(branch: string): Promise<FetchProbe> {
+// thirdArg is optional (undefined) rather than "" — install.sh's own "${3:-}" default only ever
+// sees a truly ABSENT $3 when this harness passes exactly two args, matching how a real
+// `install.sh <instance> [branch]` invocation (no third word at all) looks from inside the script.
+async function runBranchGate(branch: string, thirdArg?: string): Promise<FetchProbe> {
   const script = [
     "set -euo pipefail",
     'die() { echo "install: $*" >&2; exit 1; }',
@@ -642,9 +648,12 @@ async function runBranchGate(branch: string): Promise<FetchProbe> {
     'install_shared_bin() { echo "FETCH:ops/bot-ops.sh"; }', // same probe shape, for the #230 call site
     BRANCH_GUARD_TO_FETCH,
     'echo "REACHED_END"',
+    'echo "FORCE_BIN=$FORCE_BIN"', // issue #295: report what the slice's own arg-parsing decided
   ].join("\n");
-  // $1 = INSTANCE (a valid name so its own guard passes), $2 = the BRANCH under test.
-  const proc = Bun.spawn([BASH!, "-c", script, "_", "probe", branch], { stdout: "pipe", stderr: "pipe" });
+  // $1 = INSTANCE (a valid name so its own guard passes), $2 = the BRANCH under test, $3 = the
+  // optional third argument (issue #295's --force-bin-in-branch-position cases).
+  const args = thirdArg !== undefined ? ["_", "probe", branch, thirdArg] : ["_", "probe", branch];
+  const proc = Bun.spawn([BASH!, "-c", script, ...args], { stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -655,6 +664,7 @@ async function runBranchGate(branch: string): Promise<FetchProbe> {
     fetches: stdout.split("\n").filter((l) => l.startsWith("FETCH:")).map((l) => l.slice("FETCH:".length)),
     reachedEnd: stdout.includes("REACHED_END"),
     stderr,
+    forceBin: /^FORCE_BIN=(\d)$/m.exec(stdout)?.[1],
   };
 }
 
@@ -688,6 +698,48 @@ describe.skipIf(!runnable)("install.sh's BRANCH guard runs before the fetches, s
     const r = await runBranchGate("claude/fix-232");
     expect(r.exitCode).toBe(0);
     expect(r.fetches).toContain("ops/bot-ops.sh");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// install.sh's second argument cannot start with '-' (issue #295)
+// ---------------------------------------------------------------------------
+// Follow-up from #291's review gate: `install.sh debug --force-bin` (branch omitted) used to read
+// `--force-bin` as BRANCH -- it passes the #232 char-class regex (which permits '-'), reaches the
+// first fetch, and only dies on curl's own 404 against .../--force-bin/..., well after other setup
+// and with no real diagnostic. The fix dies immediately, before any fetch, on a second argument
+// that starts with '-'. Reuses runBranchGate/BRANCH_GUARD_TO_FETCH above (the new check sits inside
+// that same slice), so a regression here shows up the same way #232's does: a fetch the guard
+// should have prevented.
+describe.skipIf(!runnable)("install.sh's second argument cannot start with '-' (issue #295)", () => {
+  test("--force-bin in the branch position (branch omitted) dies before any fetch, naming the usage message", async () => {
+    const r = await runBranchGate("--force-bin");
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain(
+      "usage: install.sh <instance> [branch] [--force-bin] ('--force-bin' needs a branch; from main it changes nothing)",
+    );
+    expect(r.fetches).toEqual([]); // nothing downloaded
+    expect(r.reachedEnd).toBe(false);
+  });
+
+  // Non-vacuous control: --force-bin as the THIRD argument (branch given) is unaffected -- it is
+  // exactly what the usage line documents, and must still reach install_shared_bin with FORCE_BIN=1.
+  test("main --force-bin (branch given) still reaches install_shared_bin, with FORCE_BIN=1", async () => {
+    const r = await runBranchGate("main", "--force-bin");
+    expect(r.exitCode).toBe(0);
+    expect(r.fetches).toContain("ops/bot-ops.sh");
+    expect(r.reachedEnd).toBe(true);
+    expect(r.forceBin).toBe("1");
+  });
+
+  // Second non-vacuous control: an ordinary branch with no third argument at all still works exactly
+  // as before -- this check must not fire on the common case.
+  test("a plain branch with no third argument is unaffected, FORCE_BIN stays 0", async () => {
+    const r = await runBranchGate("feature-x");
+    expect(r.exitCode).toBe(0);
+    expect(r.fetches).toContain("ops/bot-ops.sh");
+    expect(r.reachedEnd).toBe(true);
+    expect(r.forceBin).toBe("0");
   });
 });
 
@@ -894,6 +946,92 @@ describe.skipIf(!runnable)("install.sh's install_shared_bin guards the host-shar
     });
     expect(r.exitCode).not.toBe(0);
     expect(r.leftovers).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// schema_of() is total (issue #295) — a fetched bot-ops.sh missing its BOT_OPS_SCHEMA line used to
+// either abort the whole script under `set -o pipefail` (schema_of used as a plain assignment) or
+// silently print nothing (schema_of embedded in a die/echo argument, where errexit isn't checked).
+// Reuses the same runSharedBin harness as the #230 describe above — only contentFor changes, to
+// content with no BOT_OPS_SCHEMA line at all.
+// ---------------------------------------------------------------------------
+describe.skipIf(!runnable)("install.sh's schema_of prints 'unknown' instead of aborting on a missing line (issue #295)", () => {
+  test("main's own fetch lacks the schema line: the summary says '(bot-ops schema unknown)' and the run still succeeds", async () => {
+    const r = await runSharedBin({
+      branch: "main",
+      installed: "OLD",
+      contentFor: () => "# no BOT_OPS_SCHEMA line in this file\n",
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.destContent).toBe("# no BOT_OPS_SCHEMA line in this file\n");
+    expect(r.stdout).toContain("from main (bot-ops schema unknown)");
+  });
+
+  test("a differing branch whose OWN copy lacks the schema line: the refusal names 'unknown' for that side, 'main's 5' for the other", async () => {
+    const r = await runSharedBin({
+      branch: "feature",
+      installed: "OLD",
+      contentFor: (b) => (b === "main" ? "readonly BOT_OPS_SCHEMA=5\n" : "# no schema line here\n"),
+    });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("schema unknown vs main's 5");
+    expect(r.destContent).toBe("OLD"); // still refused and untouched, same as the #230 case
+    expect(r.leftovers).toBe(0); // still swept, same as the #230 case
+  });
+
+  test("main's copy lacks the schema line, the differing branch has one: --force-bin's note names 'unknown' for main's side", async () => {
+    const r = await runSharedBin({
+      branch: "feature",
+      forceBin: true,
+      installed: "OLD",
+      contentFor: (b) => (b === "main" ? "# no schema line here\n" : "readonly BOT_OPS_SCHEMA=9\n"),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("--force-bin: differs from main's, schema unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The compose-schema read is total too (issue #295) — same defect shape as schema_of(), one call
+// site, extracted as the two contiguous code lines (the assignment and its echo) rather than a
+// named function, same discipline as STACK_ENV_WRITE_SEQUENCE/BRANCH_GUARD_TO_FETCH above. Anchored
+// on the two live lines only (not the surrounding comments), so a comment-only edit doesn't shrink
+// or break the extraction.
+// ---------------------------------------------------------------------------
+const COMPOSE_SCHEMA_LINES = extractLine(
+  /^ {2}compose_schema="\$\(\{ grep[\s\S]*?\n {2}echo "install: wrote \$STACK_DIR\/docker-compose\.yml from \$BRANCH \(Dockge will list this as a managed stack; compose schema \$\{compose_schema:-unknown\}\)"$/m,
+  "the compose_schema read-and-summary lines",
+);
+
+async function runComposeSchema(composeContent: string): Promise<Run> {
+  const dir = mkdtempSync(join(tmpdir(), "install-composeschema-"));
+  try {
+    writeFileSync(join(dir, "docker-compose.yml"), composeContent);
+    const script = ["set -euo pipefail", `STACK_DIR="${toMsysPath(dir)}"`, "BRANCH=main", COMPOSE_SCHEMA_LINES].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { exitCode, stdout, stderr };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh's compose-schema read is total (issue #295)", () => {
+  test("a compose file WITH x-rackbops-schema: prints its real value, unaffected", async () => {
+    const r = await runComposeSchema("x-rackbops-schema: 4\nservices:\n  bot: {}\n");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("compose schema 4)");
+  });
+
+  test("a compose file WITHOUT x-rackbops-schema: prints 'compose schema unknown' and still succeeds", async () => {
+    const r = await runComposeSchema("services:\n  bot: {}\n");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("compose schema unknown)");
   });
 });
 
