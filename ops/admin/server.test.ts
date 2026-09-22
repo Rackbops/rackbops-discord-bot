@@ -8593,7 +8593,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
-        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
@@ -8601,6 +8601,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       awaitRequestResult: (plugin: string, id: string, sentServers: string[], startedAt: number) => Promise<void>;
       resetToSaved: (plugin: string) => void;
       checkAgain: (plugin: string) => void;
+      refreshDiscovery: (plugin: string) => Promise<void>;
       routeState: Map<
         string,
         {
@@ -8770,6 +8771,36 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(h.posts.length).toBeGreaterThanOrEqual(1); // the held edit WAS sent as a follow-up
     const followUp = JSON.parse(h.posts[h.posts.length - 1]!.body!);
     expect(followUp.servers["200"]).toBeDefined(); // the server the held edit ticked is actually in it
+  });
+
+  // Same finding, the second place awaitRequestResult's own completion is reached without going through
+  // sendRouting: refreshDiscovery runs its OWN poll loop (not awaitRequestResult, but the same
+  // inflight/held shape), and its completion never checked held either.
+  test("an edit held while refreshDiscovery is in flight is still sent once it settles (round-2 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let discoveryLanded = false;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-1" }) };
+        const results = discoveryLanded ? [{ id: "disco-1", action: "discovery-refresh", ok: true, at: "t" }] : [];
+        const live = { routing: { ...routingDataInit.routing, results }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // the POST fires -> inflight set -> the poll's own wait is scheduled
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // the edit's debounce fires -> sendRouting sees inflight (from the refresh) -> held=true
+    expect(h.routeState.get("music")?.held).toBe(true);
+    discoveryLanded = true;
+    await h.clock.tick();
+    await h.clock.tick();
+    await pending;
+    expect(h.routeState.get("music")?.held).toBe(false); // consumed, not left dangling
+    expect(h.posts.some((p) => { try { return JSON.parse(p.body!).servers?.["100"]; } catch { return false; } })).toBe(true);
   });
 
   // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the
