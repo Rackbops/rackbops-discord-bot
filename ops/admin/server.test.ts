@@ -8919,6 +8919,12 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     expect(other.home).toBe(false);
     expect(other.plugins).toEqual([{ name: "wow", scope: "all", postsTo: null, webhook: "none", byDefault: false }]);
     expect(other.plugins.find((p) => p.name === "warbandeer")).toBeUndefined(); // byDefault is home-only
+
+    // A plugin whose postTo points at the BROKEN webhook (GEN_CH) reads webhook: "broken", not "ok" --
+    // distinguishes the broken-webhook case from a healthy one (mutation M4 of this plan's own testing).
+    const brokenPostRouting = { ...routing, plugins: { ...routing.plugins, music: { servers: { [HOME]: { commands: [SP_CH], postTo: GEN_CH } } } } };
+    const homeBrokenPost = fns.serverCardModel(discovery.guilds[0], { routing: brokenPostRouting, discovery }, pluginsData);
+    expect(homeBrokenPost.plugins.find((p) => p.name === "music")).toEqual({ name: "music", scope: ["spotify"], postsTo: "general", webhook: "broken", byDefault: false });
   });
 
   test("serverCardModel: webhooks under their server by channel name, a vanished channel by id, broken carried", () => {
