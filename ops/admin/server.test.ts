@@ -8839,12 +8839,12 @@ describe("SERVERS_TAB (#246): pure parts", () => {
 
   // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed;
   // see this plan's "What the data says").
-  const HOME = "100", OTHER = "200", THIRD = "300", GONE = "999";
-  const GEN_CH = "10", SP_CH = "11", AN_CH = "12", OTHER_CH = "20", GONE_CH = "30";
+  const HOME = "10000", OTHER = "20000", THIRD = "30000", GONE = "99999";
+  const GEN_CH = "10001", SP_CH = "10002", AN_CH = "10003", OTHER_CH = "20001", GONE_CH = "99998";
   const discovery = {
     v: 1 as const,
     generatedAt: "2026-09-22T11:30:00.000Z",
-    bot: { id: "b1", username: "bot" },
+    bot: { id: "40000", username: "bot" },
     inviteUrl: "https://discord.com/invite-url",
     homeGuildId: HOME,
     guilds: [
@@ -8970,7 +8970,7 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     DISCORD_SERVER_ID: { required: false },
     SPOTIFY_CLIENT_SECRET: { required: false, source: "plugin" },
   };
-  const discoveryHomeGone = { ...discovery, homeGuildId: "777" };
+  const discoveryHomeGone = { ...discovery, homeGuildId: "77777" };
 
   test("needsAttention: each kind from canned data, in order, and the empty line from none", () => {
     const items = fns.needsAttention({
@@ -8983,7 +8983,7 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     expect(items.find((i) => i.kind === "commands-refused")!.text).toBe("Other: Discord refused the bot's commands (Missing Access (50001))");
     expect(items.find((i) => i.kind === "commands-unregistered")!.text).toBe("Third: commands were never registered");
     expect(items.find((i) => i.kind === "webhook-broken")!.text).toBe("#general in Home: its webhook stopped working (410 Unknown Webhook)");
-    expect(items.find((i) => i.kind === "home-missing")!.text).toBe("The home server (777) is not one the bot is in, so every plugin nobody has placed is registered nowhere");
+    expect(items.find((i) => i.kind === "home-missing")!.text).toBe("The home server (77777) is not one the bot is in, so every plugin nobody has placed is registered nowhere");
     expect(items.find((i) => i.kind === "outdated-files")!.text).toBe("bot-ops.sh is out of date on this instance");
 
     expect(fns.needsAttention({ status: statusClean, plugins: [], routingData: { routing: null, discovery: null }, env: {}, schema: {}, labelOf: (k: string) => k })).toEqual([]);
@@ -9783,6 +9783,30 @@ describe("Servers tab: source pins (#246)", () => {
     expect(helper).toContain("serverActionState.delete(key);");
     expect(helper).toContain("renderServers();");
   });
+
+  // Round-2 review finding: a 401 midway through pollForResult's own loop (after the initiating request
+  // already succeeded) used to fold into outcome.timeout, writing a stale "may be restarting… queued"
+  // message that survived a re-login. pollForResult now returns a distinct { unauthorized: true }, and
+  // every caller must check it BEFORE outcome.timeout.
+  test("every pollForResult caller checks outcome.unauthorized before outcome.timeout (source pin)", () => {
+    const pollSlice = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
+    expect(pollSlice).toContain("return { unauthorized: true };");
+    const ranges: [string, string][] = [
+      ["async function addWebhook(", "async function removeWebhook("],
+      ["async function removeWebhook(", "async function pollForResult("],
+      ["async function refreshDiscoveryAll(", "async function copyInviteLink("],
+    ];
+    for (const [start, end] of ranges) {
+      const fnSlice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
+      // The literal `if (...)` form, not a bare "outcome.timeout" substring search -- this function's own
+      // explanatory comment mentions "outcome.timeout" in PROSE ahead of the real check, which a naive
+      // substring search would mistake for the code itself.
+      const unauthorizedIdx = fnSlice.indexOf("if (outcome.unauthorized)");
+      const timeoutIdx = fnSlice.indexOf("if (outcome.timeout)");
+      expect({ start, hasUnauthorized: unauthorizedIdx > -1, hasTimeout: timeoutIdx > -1 }).toEqual({ start, hasUnauthorized: true, hasTimeout: true });
+      expect(unauthorizedIdx).toBeLessThan(timeoutIdx);
+    }
+  });
 });
 
 // #246: decision 6's pickers, run against buildEnvControl itself (not just pickerOptions in isolation) --
@@ -9883,14 +9907,14 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     }
   });
 
-  // Round-1 claims-vs-code finding: refreshEnvPickers itself had no direct test (only buildEnvControl's
-  // OWN picker branch was exercised) -- decision 6's "upgrade in place, carrying the typed value across,
-  // never downgrade" guarantee was unverified. Covers loadRouting finishing AFTER reloadConfig already
-  // rendered plain fields (the one ordering refreshEnvPickers exists for -- see the source-pin test below
-  // for why the other ordering never needs it).
-  test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
+  test("refreshEnvPickers swaps in either direction, keeping a typed value as discovery becomes ready or stale", () => {
     const plain = makeEl("input");
-    plain.value = "100"; // an in-progress edit, not yet applied
+    // Round-2 claims-vs-code finding: this used to be "100", which also happens to be the canned
+    // discovery's homeGuildId AND its only guild id -- a plausible bug (seeding the picker from
+    // routingData.discovery.homeGuildId instead of the PREVIOUS control's own .value, an easy mix-up
+    // since DISCORD_SERVER_ID *is* "the home server") would have coincidentally produced the same "100"
+    // and passed anyway. A value that matches no canned id rules that out.
+    plain.value = "999999999"; // an in-progress edit, not yet applied, and not any canned id
     const registry = new Map([["env-DISCORD_SERVER_ID", plain]]);
     const h = harness(routingDataReady, registry);
     h.refreshEnvPickers();
@@ -9898,21 +9922,23 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     expect(upgraded.tagName).toBe("SELECT");
     expect(upgraded.id).toBe("env-DISCORD_SERVER_ID");
     expect(upgraded.dataset.key).toBe("DISCORD_SERVER_ID");
-    expect(upgraded.value).toBe("100"); // the typed value survived the upgrade
+    expect(upgraded.value).toBe("999999999"); // the typed value survived the upgrade, not homeGuildId
 
-    // A control that is ALREADY a picker (tagName === "SELECT") is left alone -- never rebuilt/replaced.
+    // A control already in the needed picker shape is left alone.
     const already = registry.get("env-DISCORD_SERVER_ID")!;
     h.refreshEnvPickers();
     expect(registry.get("env-DISCORD_SERVER_ID")).toBe(already); // same object, not a new one
 
-    // Without a ready discovery, refreshEnvPickers is a no-op -- a plain field is never touched.
-    const stillPlain = makeEl("input");
-    stillPlain.value = "200";
-    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", stillPlain]]);
+    // A later stale/null discovery must fall back to a plain ID input, without discarding the typed id.
+    const staleSelect = makeEl("select");
+    staleSelect.value = "200";
+    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", staleSelect]]);
     const notReady = harness({ routing: null, discovery: null }, notReadyRegistry);
     notReady.refreshEnvPickers();
-    expect(notReadyRegistry.get("env-DISCORD_SERVER_ID")).toBe(stillPlain);
-    expect(stillPlain.tagName).toBe("INPUT");
+    const downgraded = notReadyRegistry.get("env-DISCORD_SERVER_ID")!;
+    expect(downgraded.tagName).toBe("INPUT");
+    expect(downgraded.value).toBe("200");
+    expect(downgraded.dataset.key).toBe("DISCORD_SERVER_ID");
   });
 });
 
@@ -9978,7 +10004,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
         "return { addWebhook, pollForResult, getRoutingData: () => routingData };",
     )(
       document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention,
-    ) as { addWebhook: (guildId: string) => Promise<void>; pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean }>; getRoutingData: () => unknown };
+    ) as { addWebhook: (guildId: string) => Promise<void>; pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>; getRoutingData: () => unknown };
     // serverActionState is the SAME Map instance the sandbox mutates (passed by reference), so reading it
     // here after an await sees every .set/.delete the sandboxed addWebhook made.
     return { run, clock, input, calls, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
@@ -10043,6 +10069,57 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     expect(await p).toEqual({ timeout: true });
   });
 
+  // Round-2 review finding: this class of fix (round 1's clearUnauthorizedServerAction) was previously
+  // guarded ONLY by a static source-pin test (a string-presence check that a swapped/misordered
+  // implementation could still pass) -- these are the missing dynamic proofs, driving a REAL 401 through
+  // the real addWebhook/pollForResult.
+  test("pollForResult resolves { unauthorized: true } on a 401 read, distinct from a plain timeout", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async () => { throw new Error("unauthorized"); },
+    });
+    const p = h.run.pollForResult("reqY", Date.now());
+    await h.clock.tick();
+    expect(await p).toEqual({ unauthorized: true });
+  });
+
+  test("a 401 on the initial POST clears the busy state via clearUnauthorizedServerAction, not left stuck", async () => {
+    const h = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async () => { throw new Error("unauthorized"); },
+    });
+    await h.run.addWebhook("100");
+    expect(h.serverActionState.has("add:100")).toBe(false);
+  });
+
+  // Round-2 review finding (correctness lens): a 401 mid-poll -- AFTER the initiating POST already
+  // succeeded -- used to fold into outcome.timeout, writing "may be restarting… queued" and leaving that
+  // STALE, misleading message in serverActionState across a re-login (never reset by one), potentially
+  // right beside fresh data that already shows the action succeeded. Fixed by pollForResult returning a
+  // distinct { unauthorized: true } outcome that addWebhook/removeWebhook/refreshDiscoveryAll now check
+  // before outcome.timeout, clearing busy state the same way an initial-request 401 already does.
+  test("a 401 mid-poll (after the POST already succeeded) also clears busy state, never the stale timeout message", async () => {
+    let postDone = false;
+    const h = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") {
+          postDone = true;
+          return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req-midpoll" }) };
+        }
+        if (postDone) throw new Error("unauthorized"); // the token expired WHILE polling
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [] } }) };
+      },
+    });
+    const p = h.run.addWebhook("100");
+    await h.clock.tick();
+    await h.clock.tick();
+    await p;
+    // The whole entry is gone -- never left holding the misleading "may be restarting… queued" message a
+    // plain timeout would have written.
+    expect(h.serverActionState.has("add:100")).toBe(false);
+  });
+
 });
 
 // #246: decision 4's "Try again" -- retryRegistration re-sends the first PLACED plugin's saved placement,
@@ -10058,7 +10135,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     expect(src).toContain("async function retryRegistration(");
   });
 
-  function harness(routingDataInit: unknown, pluginsData: unknown) {
+  function harness(routingDataInit: unknown, pluginsData: unknown, model = { mode: "ready", rows: [] }) {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const sendRoutingCalls: string[] = [];
     const ensureRouteStateCalls: string[] = [];
@@ -10066,7 +10143,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     let renderNeedsAttentionCalls = 0;
     const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); };
     const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); };
-    const routingStepModel = () => ({ mode: "ready", rows: [] });
+    const routingStepModel = () => model;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
     const run = new Function(
@@ -10107,5 +10184,13 @@ describe("retryRegistration (#246, mini-harness)", () => {
     expect(h.sendRoutingCalls).toEqual([]);
     expect(h.ensureRouteStateCalls).toEqual([]);
     expect(h.renderServersCalls()).toBe(0);
+  });
+
+  test("retryRegistration is a no-op for stale discovery: it must not serialize a placed plugin as servers: {}", async () => {
+    const h = harness(routed, pluginsData, { mode: "stale", rows: [] });
+    await h.run.retryRegistration();
+    expect(h.ensureRouteStateCalls).toEqual([]);
+    expect(h.sendRoutingCalls).toEqual([]);
+    expect(h.serverActionState.has("retry")).toBe(false);
   });
 });

@@ -1655,6 +1655,14 @@
     return null;
   }
 
+  // A stale snapshot is useful for display but cannot safely seed the selection a retry would send.
+  // Retrying it as `{ servers: {} }` would clear an existing placement, so only a ready model is retryable.
+  function retryablePlacedPlugin() {
+    const name = firstPlacedPlugin();
+    if (!name) return null;
+    return routingStepModel(name, routingData, Date.now()).mode === "ready" ? name : null;
+  }
+
   // Decision 4's "Try again": re-sends the first placed plugin's OWN saved placement (a no-op change --
   // ensureRouteState seeds routeState from the ready model when it doesn't already exist; sendRouting
   // reads that selection and posts it back unchanged) to every server, re-running applyRouting. Shares
@@ -1670,7 +1678,7 @@
     const key = "retry";
     const existing = serverActionState.get(key);
     if (existing && existing.busy) return;
-    const name = firstPlacedPlugin();
+    const name = retryablePlacedPlugin();
     if (!name) return; // no button is drawn in that state -- see appendRetryControls
     serverActionState.set(key, { busy: true, message: "Applying…" });
     renderServers();
@@ -1684,7 +1692,7 @@
   // Appended to a card wherever decision 3 calls for "+ Try again": the button when a plugin is placed
   // somewhere, the restart sentence when nothing is (retryRegistration would have nothing to resend).
   function appendRetryControls(container) {
-    if (firstPlacedPlugin()) {
+    if (retryablePlacedPlugin()) {
       const st = serverActionState.get("retry");
       const btn = document.createElement("button");
       btn.type = "button";
@@ -1700,6 +1708,11 @@
         msg.textContent = st.message;
         container.appendChild(msg);
       }
+    } else if (firstPlacedPlugin()) {
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      note.textContent = "Routing data is stale, so Try again is unavailable until Discord refreshes.";
+      container.appendChild(note);
     } else {
       const note = document.createElement("p");
       note.className = "field-hint";
@@ -1902,7 +1915,7 @@
     const refreshBtn = document.getElementById("refresh-discovery");
     if (refreshBtn) refreshBtn.disabled = !!(discoveryState && discoveryState.busy);
     const status = document.getElementById("servers-status");
-    if (status) setApplyText(status, (discoveryState && discoveryState.message) || "");
+    if (status) setApplyText(status, (discoveryState && discoveryState.message) || (routingData && routingData.loadError ? "Couldn't read where plugins live: " + routingData.loadError : ""));
 
     clearChildren(list);
     if (!discovery) {
@@ -1947,6 +1960,14 @@
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: a 401 mid-poll (AFTER this request already succeeded) used to fold into
+      // outcome.timeout, writing a stale "may be restarting… queued" message that survived a re-login
+      // (serverActionState is never reset by one) -- clearUnauthorizedServerAction instead, matching the
+      // initiating-request 401 case this same function already handles via its own catch below.
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
       } else if (!outcome.result.ok) {
@@ -1988,6 +2009,14 @@
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: a 401 mid-poll (AFTER this request already succeeded) used to fold into
+      // outcome.timeout, writing a stale "may be restarting… queued" message that survived a re-login
+      // (serverActionState is never reset by one) -- clearUnauthorizedServerAction instead, matching the
+      // initiating-request 401 case this same function already handles via its own catch below.
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
       } else if (!outcome.result.ok) {
@@ -2023,12 +2052,28 @@
   async function pollForResult(id, startedAt) {
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
+      const remaining = ROUTING_ANSWER_TIMEOUT_MS - (Date.now() - startedAt);
+      if (remaining <= 0) return { timeout: true };
+      const { signal, cancel } = timeoutSignal(remaining);
       try {
-        const res = await api("/api/routing");
+        const res = await api("/api/routing", { signal });
         routingData = await res.json();
       } catch (e) {
-        if (e && e.message === "unauthorized") return { timeout: true };
+        // Round-2 review finding: this used to fold into { timeout: true }, so a 401 midway through the
+        // poll -- AFTER the initiating request had already succeeded -- surfaced through every caller's
+        // `if (outcome.timeout)` branch as "The bot did not answer within 30 seconds. It may be
+        // restarting; the change is queued and applies when it catches up." api() has already shown the
+        // login gate by the time this throws, so that message is written invisibly behind it; once the
+        // operator signs back in, serverActionState (never reset by re-login) kept showing that stale,
+        // actively misleading text -- possibly right beside fresh data that already shows the action
+        // succeeded -- until the same action was repeated. A distinct `unauthorized` outcome lets every
+        // caller clear its busy state via clearUnauthorizedServerAction instead, the same as a 401 on the
+        // INITIATING request already does.
+        if (e && e.message === "unauthorized") return { unauthorized: true };
+        if (Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) return { timeout: true };
         // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+      } finally {
+        cancel();
       }
       const result = routingData && routingData.routing && routingData.routing.results && routingData.routing.results.find((r) => r.id === id);
       if (result) return { result };
@@ -2054,6 +2099,12 @@
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: see addWebhook's identical comment -- a mid-poll 401 must clear busy
+      // state, not fold into the timeout message (which would otherwise survive a re-login unchanged).
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
         renderServers();
@@ -3076,17 +3127,15 @@
     return control;
   }
 
-  // Upgrades a plain id field to its picker in place, once discovery becomes ready -- carrying the
-  // control's CURRENT value (an in-progress edit survives), never the other way: a picker is never
-  // downgraded back to a plain field once discovery has gone stale again, since a control the operator
-  // may be mid-edit on must not be replaced out from under them.
+  // Swaps a plain id field and its live picker in place as discovery becomes ready or stale -- always
+  // carrying the control's CURRENT value so an in-progress edit survives either transition.
   function refreshEnvPickers() {
-    if (!discoveryReadyForPickers()) return;
+    const ready = discoveryReadyForPickers();
     for (const key of ["DISCORD_SERVER_ID", "ANNOUNCE_CHANNEL_ID", "RELEASE_ANNOUNCE_CHANNEL_ID"]) {
       const existing = document.getElementById("env-" + key);
-      if (!existing || existing.tagName === "SELECT") continue;
+      if (!existing || (ready && existing.tagName === "SELECT") || (!ready && existing.tagName === "INPUT")) continue;
       const value = existing.value;
-      const control = buildPickerSelect(key, routingData.discovery, value);
+      const control = ready ? buildPickerSelect(key, routingData.discovery, value) : buildEnvControl(key, value);
       control.id = "env-" + key;
       control.dataset.key = key;
       existing.replaceWith(control);
