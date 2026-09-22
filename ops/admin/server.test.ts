@@ -2736,6 +2736,78 @@ describe("mergePluginsView surfaces #124 admin fields", () => {
   });
 });
 
+describe("mergePluginsView surfaces #244 card fields", () => {
+  const idx = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
+    schemaVersion: 1,
+    plugins: [{ name: "music", version: "1.3.0", description: "d", ...over }],
+  });
+
+  test("env carries key, description, required, secret in manifest order", () => {
+    const music = mergePluginsView(
+      idx({
+        env: [
+          { key: "MUSIC_CALLBACK_PORT", description: "Where Spotify redirects.", required: true },
+          { key: "SPOTIFY_CLIENT_SECRET", description: "From the Spotify dashboard.", secret: true },
+        ],
+      }),
+      [],
+      "music",
+    ).plugins[0]!;
+    expect(music.env).toEqual([
+      { key: "MUSIC_CALLBACK_PORT", description: "Where Spotify redirects.", required: true, secret: false },
+      { key: "SPOTIFY_CLIENT_SECRET", description: "From the Spotify dashboard.", required: false, secret: true },
+    ]);
+  });
+
+  test("a malformed env element is skipped, a missing description is \"\"", () => {
+    const malformed = {
+      schemaVersion: 1,
+      plugins: [{ name: "music", version: "1.3.0", env: [{ key: "OK" }, null, { notKey: "x" }, { key: 5 }] }],
+    } as unknown as PluginIndex;
+    // Mutation: dropping the `key` guard crashes on the null/wrong-typed elements instead of skipping them.
+    expect(mergePluginsView(malformed, [], "music").plugins[0]!.env).toEqual([
+      { key: "OK", description: "", required: false, secret: false },
+    ]);
+  });
+
+  test("required and secret are true only for a literal true", () => {
+    const strange = {
+      schemaVersion: 1,
+      plugins: [{
+        name: "music",
+        version: "1.3.0",
+        env: [{ key: "A", required: "true" }, { key: "B", required: 1 }, { key: "C", secret: "yes" }, { key: "D", secret: 0 }],
+      }],
+    } as unknown as PluginIndex;
+    // Mutation: `!!e.required` (or similar truthy coercion) would let a non-boolean flip these true.
+    const env = mergePluginsView(strange, [], "music").plugins[0]!.env;
+    expect(env.every((e) => e.required === false && e.secret === false)).toBe(true);
+  });
+
+  test("commands keeps strings only", () => {
+    const mixed = {
+      schemaVersion: 1,
+      plugins: [{ name: "music", version: "1.3.0", commands: ["play", 5, null, "skip"] }],
+    } as unknown as PluginIndex;
+    expect(mergePluginsView(mixed, [], "music").plugins[0]!.commands).toEqual(["play", "skip"]);
+  });
+
+  test("no commands or env on the manifest entry gives empty arrays, not a crash", () => {
+    const music = mergePluginsView(idx(), [], "music").plugins[0]!;
+    expect(music.env).toEqual([]);
+    expect(music.commands).toEqual([]);
+  });
+
+  test("envKeys is unchanged by the #244 widening", () => {
+    const music = mergePluginsView(
+      idx({ env: [{ key: "MUSIC_CALLBACK_PORT" }, { key: "SPOTIFY_CLIENT_SECRET", secret: true }] }),
+      [],
+      "music",
+    ).plugins[0]!;
+    expect(music.envKeys).toEqual(["MUSIC_CALLBACK_PORT", "SPOTIFY_CLIENT_SECRET"]);
+  });
+});
+
 describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => {
   const entry = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
     schemaVersion: 1,
@@ -4556,37 +4628,130 @@ describe("admin panel planPluginsSave (#102)", () => {
 
 });
 
-// The badge DECISIONS are pure {text, kind} functions lifted from index.html's PLUGIN_BADGES markers
-// and pinned here — the render (makeBadge → createElement) stays browser-only, but the two review-fix
-// conditions (index-outage suppression = MODERATE-2, newer-release guard = MINOR-2) are guarded.
-describe("admin panel plugin badge decisions (#102, lifted from index.html)", () => {
+// #244: settingLabel / settingOwners, lifted from index.html's PLUGIN_SETTING_LABEL markers.
+describe("settingLabel / settingOwners (#244)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const badgesSrc = indexSrc.match(/\/\/ PLUGIN_BADGES:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_BADGES:end/)?.[1];
-  type Badge = { text: string; kind: string | null } | null;
-  const fns = new Function(`"use strict";\n${badgesSrc ?? ""}\nreturn { pluginStateBadge, pluginUpdateBadge };`)() as {
-    pluginStateBadge: (p: Record<string, unknown>, indexAvailable: boolean) => Badge;
-    pluginUpdateBadge: (p: Record<string, unknown>) => Badge;
+  const src = indexSrc.match(/\/\/ PLUGIN_SETTING_LABEL:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_SETTING_LABEL:end/)?.[1];
+  const fns = new Function(`"use strict";\n${src ?? ""}\nreturn { settingLabel, settingOwners };`)() as {
+    settingLabel: (key: string, pluginName: string) => string;
+    settingOwners: (plugins: { name: string; env?: { key: string }[] }[]) => Map<string, string>;
   };
 
   test("both marked functions are present in the served page", () => {
-    expect(badgesSrc).toContain("function pluginStateBadge(");
-    expect(badgesSrc).toContain("function pluginUpdateBadge(");
+    expect(src).toContain("function settingLabel(");
+    expect(src).toContain("function settingOwners(");
   });
 
-  describe("pluginStateBadge", () => {
-    test("MODERATE-2: labels 'not in index' only when the index is available", () => {
-      // During an outage every row is inIndex:false — it must NOT be labelled 'not in index'.
-      expect(fns.pluginStateBadge({ inIndex: false, active: true }, false)).toEqual({ text: "active", kind: "active" });
-      // But a genuinely-unknown plugin (index loaded, absent) still is.
-      expect(fns.pluginStateBadge({ inIndex: false, active: true }, true)).toEqual({ text: "not in index", kind: "warn" });
+  describe("settingLabel", () => {
+    test("drops the plugin's own prefix", () => {
+      expect(fns.settingLabel("MUSIC_CALLBACK_PORT", "music")).toBe("Callback port");
     });
-    test("precedence: error > needs-config > active > enabled > disabled", () => {
-      expect(fns.pluginStateBadge({ inIndex: true, error: "boom" }, true)).toEqual({ text: "failed: boom", kind: "warn" });
-      expect(fns.pluginStateBadge({ inIndex: true, enabled: true, missingEnv: ["A"] }, true)).toEqual({ text: "needs config: A", kind: "warn" });
-      expect(fns.pluginStateBadge({ inIndex: true, active: true }, true)).toEqual({ text: "active", kind: "active" });
-      expect(fns.pluginStateBadge({ inIndex: true, enabled: true, missingEnv: [] }, true)).toEqual({ text: "enabled, not active", kind: null });
-      expect(fns.pluginStateBadge({ inIndex: true, enabled: false }, true)).toEqual({ text: "disabled", kind: null });
+    test("a key with no matching prefix is labelled from its own spelling", () => {
+      expect(fns.settingLabel("SPOTIFY_CLIENT_ID", "music")).toBe("Spotify client ID");
     });
+    test("a key that IS the prefix is left whole, not stripped to nothing", () => {
+      expect(fns.settingLabel("MUSIC_", "music")).toBe("Music");
+      expect(fns.settingLabel("MUSIC", "music")).toBe("Music");
+    });
+    test("an acronym stays upper-case wherever it falls: leading, middle, trailing", () => {
+      expect(fns.settingLabel("MUSIC_API_TOKEN", "music")).toBe("API token");
+      expect(fns.settingLabel("MUSIC_CLIENT_URI", "music")).toBe("Client URI");
+    });
+    test("a plugin name with a dash matches the same dash-to-underscore prefix", () => {
+      expect(fns.settingLabel("RAID_HELPER_WEBHOOK_URL", "raid-helper")).toBe("Webhook URL");
+    });
+  });
+
+  describe("settingOwners", () => {
+    test("the first plugin in order owns a shared key", () => {
+      const owners = fns.settingOwners([
+        { name: "a", env: [{ key: "SHARED" }, { key: "A_ONLY" }] },
+        { name: "b", env: [{ key: "SHARED" }] },
+      ]);
+      expect(owners.get("SHARED")).toBe("a");
+      expect(owners.get("A_ONLY")).toBe("a");
+      expect(owners.has("NOWHERE")).toBe(false);
+    });
+    test("a plugin with no env contributes nothing", () => {
+      expect(fns.settingOwners([{ name: "a" }]).size).toBe(0);
+    });
+  });
+});
+
+// #244: pluginCardState, lifted from index.html's PLUGIN_CARD_STATE markers (replaces #102's
+// pluginStateBadge; pluginUpdateBadge is the same function, unchanged, still lifted from here).
+// Old-test mapping: MODERATE-2 (index-outage suppression) -> "an index outage never says 'not in the
+// index'"; the old error/needs-config/active/enabled/disabled precedence chain -> rows 5/6/8/9/10 below.
+describe("pluginCardState (#244)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.match(/\/\/ PLUGIN_CARD_STATE:begin\n([\s\S]*?)\n\s*\/\/ PLUGIN_CARD_STATE:end/)?.[1];
+  type CardState = { badge: { text: string; kind: string | null }; summary: string };
+  const fns = new Function(`"use strict";\n${src ?? ""}\nreturn { pluginCardState, pluginUpdateBadge };`)() as {
+    pluginCardState: (p: Record<string, unknown>, ctx: Record<string, unknown>) => CardState;
+    pluginUpdateBadge: (p: Record<string, unknown>) => { text: string; kind: string } | null;
+  };
+  const labelOf = (key: string) => key.toLowerCase();
+  const ctx = (over: Record<string, unknown> = {}) => ({ indexAvailable: true, pendingOn: undefined, pendingSettings: 0, labelOf, ...over });
+
+  test("both marked functions are present in the served page", () => {
+    expect(src).toContain("function pluginCardState(");
+    expect(src).toContain("function pluginUpdateBadge(");
+  });
+
+  test("BADGE_MODIFIERS: danger maps to rb-badge--danger", () => {
+    const modifiers = new Function(
+      `"use strict";\n${indexSrc.match(/const BADGE_MODIFIERS = new Map\(\[[\s\S]*?\]\);/)?.[0] ?? ""}\nreturn BADGE_MODIFIERS;`,
+    )() as Map<string, string>;
+    expect(modifiers.get("danger")).toBe("rb-badge--danger");
+    expect(modifiers.get("active")).toBe("rb-badge--success");
+    expect(modifiers.get("warn")).toBe("rb-badge--warning");
+    expect(modifiers.get("update")).toBe("rb-badge--info");
+  });
+
+  test("row 1: turning on", () => {
+    expect(fns.pluginCardState({}, ctx({ pendingOn: true }))).toEqual({ badge: { text: "Restart to apply", kind: "warn" }, summary: "Turned on, not running yet" });
+  });
+  test("row 2: turning off", () => {
+    expect(fns.pluginCardState({}, ctx({ pendingOn: false }))).toEqual({ badge: { text: "Restart to apply", kind: "warn" }, summary: "Turned off, still running until you apply" });
+  });
+  test("row 3: pending settings, singular for one", () => {
+    expect(fns.pluginCardState({}, ctx({ pendingSettings: 1 })).summary).toBe("1 setting changed");
+    expect(fns.pluginCardState({}, ctx({ pendingSettings: 3 })).summary).toBe("3 settings changed");
+  });
+  test("pending outranks an error", () => {
+    expect(fns.pluginCardState({ error: "boom" }, ctx({ pendingOn: true })).badge.text).toBe("Restart to apply");
+  });
+  test("row 4 / MODERATE-2: 'not in the index' only when the index actually loaded", () => {
+    expect(fns.pluginCardState({ inIndex: false, active: true }, ctx({ indexAvailable: false }))).toEqual({ badge: { text: "Running", kind: "active" }, summary: "No commands" });
+    expect(fns.pluginCardState({ inIndex: false, active: true }, ctx({ indexAvailable: true }))).toEqual({ badge: { text: "Not in the index", kind: "warn" }, summary: "The Plugin Index no longer lists this plugin" });
+  });
+  test("row 5: an error", () => {
+    expect(fns.pluginCardState({ inIndex: true, error: "boom" }, ctx())).toEqual({ badge: { text: "Error", kind: "danger" }, summary: "Couldn't start. Open for the reason" });
+  });
+  test("row 6: missing settings are named by label, comma-separated", () => {
+    expect(fns.pluginCardState({ inIndex: true, enabled: true, missingEnv: ["A_KEY", "B_KEY"] }, ctx())).toEqual({
+      badge: { text: "Needs setup", kind: "warn" },
+      summary: "Missing: a_key, b_key",
+    });
+  });
+  test("row 7: an update, only while enabled (#225)", () => {
+    const p = { inIndex: true, enabled: true, installedVersion: "1.0.0", latestVersion: "1.1.0", releases: [{ version: "1.1.0" }] };
+    expect(fns.pluginCardState(p, ctx())).toEqual({ badge: { text: "update to 1.1.0", kind: "update" }, summary: "1.0.0 installed" });
+    expect(fns.pluginCardState({ ...p, active: true }, ctx()).summary).toBe("Running · 1.0.0 installed");
+    // #225: the SAME update-eligible plugin, off, never offers row 7 -- falls through to row 10.
+    expect(fns.pluginCardState({ ...p, enabled: false }, ctx())).toEqual({ badge: { text: "Off", kind: null }, summary: "1.0.0 installed" });
+  });
+  test("row 8: running, commands singular/plural/none", () => {
+    expect(fns.pluginCardState({ inIndex: true, active: true, commands: ["a"] }, ctx())).toEqual({ badge: { text: "Running", kind: "active" }, summary: "1 command" });
+    expect(fns.pluginCardState({ inIndex: true, active: true, commands: ["a", "b"] }, ctx())).toEqual({ badge: { text: "Running", kind: "active" }, summary: "2 commands" });
+    expect(fns.pluginCardState({ inIndex: true, active: true, commands: [] }, ctx())).toEqual({ badge: { text: "Running", kind: "active" }, summary: "No commands" });
+  });
+  test("row 9: enabled but not active", () => {
+    expect(fns.pluginCardState({ inIndex: true, enabled: true }, ctx())).toEqual({ badge: { text: "Not running", kind: null }, summary: "Turned on, but not running. The log on Overview says why" });
+  });
+  test("row 10: off, with and without a known installed version", () => {
+    expect(fns.pluginCardState({ inIndex: true, enabled: false }, ctx())).toEqual({ badge: { text: "Off", kind: null }, summary: "Not running" });
+    expect(fns.pluginCardState({ inIndex: true, enabled: false, installedVersion: "1.0.0" }, ctx())).toEqual({ badge: { text: "Off", kind: null }, summary: "1.0.0 installed" });
   });
 
   describe("pluginUpdateBadge", () => {
@@ -5177,7 +5342,7 @@ describe("admin.css uses tokens only", () => {
     // buttons and the panel's are 44px tall.
     expect(rule(".tag-field .tag button")).toMatch(/min-width:\s*1\.5rem;[\s\S]*min-height:\s*1\.5rem;/);
     const phone = /@media \(max-width: 640px\) \{([\s\S]*)\}\s*$/.exec(bare)?.[1] ?? "";
-    expect(phone).toMatch(/:where\(\.plugin-admin-tab button\)\s*\{\s*min-height:\s*44px;/);
+    expect(phone).toMatch(/:where\(\.plug__admin button\)\s*\{\s*min-height:\s*44px;/);
     expect(phone).toMatch(/\.adm \.rb-btn[\s\S]*min-height:\s*44px;/);
   });
 
@@ -5221,8 +5386,9 @@ describe("admin.css uses tokens only", () => {
 
   test("the rules for a plugin's own bare controls sit wholly inside :where(), so a bundle's styling wins", () => {
     // A published plugin bundle builds bare label / input / select / textarea / button elements, so
-    // admin.css styles them by tag name under .plugin-admin-tab. Every such selector must be ONE
-    // :where(...) group -- zero specificity -- or it would beat a rule the bundle brings itself.
+    // admin.css styles them by tag name under .plug__admin (#244: was .plugin-admin-tab). Every such
+    // selector must be ONE :where(...) group -- zero specificity -- or it would beat a rule the bundle
+    // brings itself.
     const topLevelParts = (sel: string) => {
       const parts: string[] = [];
       let depth = 0;
@@ -5247,13 +5413,13 @@ describe("admin.css uses tokens only", () => {
       }
       return false;
     };
-    const bare = selectors.flatMap(topLevelParts).filter((p) => p.includes(".plugin-admin-tab") && /\b(label|input|select|textarea|button)\b/.test(p));
+    const bare = selectors.flatMap(topLevelParts).filter((p) => p.includes(".plug__admin") && /\b(label|input|select|textarea|button)\b/.test(p));
     expect(bare.length).toBeGreaterThanOrEqual(5);
     for (const part of bare) expect({ part, wholly: wholly(part) }).toEqual({ part, wholly: true });
     // the checker itself can tell the difference
-    expect(wholly(".plugin-admin-tab :where(label)")).toBe(false);
-    expect(wholly(":where(.plugin-admin-tab label):focus-visible")).toBe(false);
-    expect(wholly(":where(.plugin-admin-tab label)")).toBe(true);
+    expect(wholly(".plug__admin :where(label)")).toBe(false);
+    expect(wholly(":where(.plug__admin label):focus-visible")).toBe(false);
+    expect(wholly(":where(.plug__admin label)")).toBe(true);
   });
 
   test("only references --rb-* tokens the theme defines, and defines none of its own", () => {
@@ -5413,7 +5579,8 @@ describe("page skeleton", () => {
 
   test("every original section id still exists exactly once, inside a tabpanel", () => {
     const inPanels = panelOfIds();
-    for (const id of ["status-section", "plugins-section", "plugin-admin-section", "admins-section", "identity-section"]) {
+    // #244: plugin-admin-section is gone -- a plugin's own bundle mounts inside its card now.
+    for (const id of ["status-section", "plugins-section", "admins-section", "identity-section"]) {
       expect({ id, total: markup.split(`id="${id}"`).length - 1 }).toEqual({ id, total: 1 });
       expect({ id, inPanel: Boolean(inPanels.get(id)) }).toEqual({ id, inPanel: true });
     }
@@ -5427,7 +5594,6 @@ describe("page skeleton", () => {
       "status-section": "panel-overview",
       "logs-section": "panel-overview",
       "plugins-section": "panel-plugins",
-      "plugin-admin-section": "panel-plugins",
       "config-section": "panel-settings",
       "admins-section": "panel-settings",
       "identity-section": "panel-settings",
@@ -5504,7 +5670,7 @@ describe("page skeleton", () => {
       ['class="banner-warn rb-alert rb-alert--danger"', 1],
       ['class="rb-tabstrip" role="tablist"', 1],
       ['class="rb-tabpanel adm-panel"', 3],
-      ['class="rb-card"', 7], // seven sections (five carry their old id, Logs and Config their new one)
+      ['class="rb-card"', 6], // six sections (#244: plugin-admin-section is gone -- a plugin's bundle mounts in its card)
       ['class="rb-tabstrip__tab', 3], // the three tab buttons
       ['<main id="app" class="adm" hidden>', 1],
       ['class="adm-gate"', 1],
@@ -5515,7 +5681,7 @@ describe("page skeleton", () => {
       ['class="msg"', 2], // restart, admins (#257: the config and plugins message lines went with the Save buttons)
       // built by the page script
       ['btn.className = "rb-btn rb-btn--danger rb-btn--sm";', 1], // Remove admin
-      ['check.className = "rb-checkbox";', 1], // a plugin's tick box
+      ['check.className = "rb-switch adm-switch";', 1], // #244: a plugin's card switch
       ['now.className = "rb-btn rb-btn--primary rb-btn--sm";', 1], // Update now
       ['when.className = "rb-input";', 1], // the schedule picker
       ['schedBtn.className = "rb-btn rb-btn--sm";', 1],
@@ -5523,17 +5689,19 @@ describe("page skeleton", () => {
       ['skip.className = "rb-btn rb-btn--sm";', 1],
       ['cancel.className = "rb-btn rb-btn--danger rb-btn--sm";', 1],
       ['add.className = "tag-add rb-input";', 1], // the chip editor's typing field
-      ['label.className = "rb-label";', 1], // a config field's label
+      ['label.className = "rb-label";', 4], // a config field's label, plus #244's three card-field builders (stub, plain, secret)
       ['control.className = "rb-select";', 2], // an enum select and the branch chooser
       ['control.className = "rb-input";', 1], // a plain config field
       ['notice.className = "field-hint field-hint--danger";', 1],
-      ['row.className = "plugin-row";', 1],
       ['row.className = "admin-row";', 1],
       ['wrapper.className = "tag-field";', 1],
       ['sched.className = "sched";', 1],
       ['actions.className = "plugin-actions";', 1],
       ['wrap.className = "plugin-update";', 1],
-      ['wrap.className = "plugin-admin-tab";', 1],
+      // #244: the card shell and its accordion body
+      ['card.className = "rb-card plug";', 1],
+      ['body.className = "plug__body";', 1],
+      ['root.className = "plug__admin";', 1], // a plugin's own bundle mount point, inside its card
     ];
     for (const [fragment, count] of expected) {
       expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
@@ -5543,15 +5711,18 @@ describe("page skeleton", () => {
   test("every lifted block is still present", () => {
     // The thirteen blocks server.test.ts lifted out of the page before #238, plus the four it added
     // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES), minus the two save blocks #257 deleted
-    // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC). A
-    // rename or a deleted marker would otherwise leave a lifted `new Function` evaluating an empty string.
+    // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC).
+    // #244: PLUGIN_BADGES is gone (replaced by PLUGIN_CARD_STATE), plus PLUGIN_SETTING_LABEL and
+    // PLUGIN_EDITS. A rename or a deleted marker would otherwise leave a lifted `new Function`
+    // evaluating an empty string.
     const names = [
-      "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_BADGES", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
+      "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
+      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS",
     ];
-    expect(names.length).toBe(19);
+    expect(names.length).toBe(21);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -5606,12 +5777,42 @@ describe("page skeleton", () => {
     expect(applyBlock("APPLY_PLAN")).not.toContain("confirm(");
   });
 
-  test("the Config editor does not render a PLUGINS field (loadEnv skips that key)", () => {
-    // loadEnv is far too DOM-heavy to lift; the wiring is pinned in source, the file's idiom for it.
-    const loadEnv = indexSrc.slice(indexSrc.indexOf("async function loadEnv()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
-    expect(loadEnv.length).toBeGreaterThan(500);
-    expect(loadEnv).toContain('if (key === "PLUGINS") continue;');
-    expect(loadEnv.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(loadEnv.indexOf("buildEnvControl(key, value)"));
+  test("the Plugin Settings section is gone (#244: a plugin's bundle mounts in its own card)", () => {
+    for (const gone of ["plugin-admin-section", "plugin-admin-list", "<h2>Plugin Settings</h2>", "renderPluginAdmin", "buildPluginRow", "plugin-row", "plugin-admin-tab"]) {
+      expect({ gone, found: indexSrc.includes(gone) }).toEqual({ gone, found: false });
+    }
+  });
+
+  test("a card header is a button with aria-expanded inside a heading (#244)", () => {
+    // buildPluginCard is DOM-only (browser-side rendering, like buildPluginRow/buildPluginUpdateBlock
+    // before it) -- pinned in source, the file's idiom for what cannot be lifted.
+    const buildPluginCard = indexSrc.slice(indexSrc.indexOf("function buildPluginCard("), indexSrc.indexOf("// PLUGINS_SAVE_PLAN:begin"));
+    expect(buildPluginCard.length).toBeGreaterThan(500);
+    expect(buildPluginCard).toContain('head.className = "plug__head";');
+    expect(buildPluginCard).toContain('head.setAttribute("aria-expanded", String(isOpen));');
+    expect(buildPluginCard).toContain('head.setAttribute("aria-controls", bodyId);');
+    expect(buildPluginCard).toContain('h.className = "plug__h";');
+    // the button sits INSIDE the heading, not beside it
+    expect(buildPluginCard.indexOf("document.createElement(\"h3\")")).toBeLessThan(buildPluginCard.indexOf('head.className = "plug__head";'));
+    expect(buildPluginCard).toContain("h.appendChild(head);");
+    expect(buildPluginCard).toContain('body.setAttribute("role", "region");');
+    expect(buildPluginCard).toContain('body.setAttribute("aria-labelledby", head.id);');
+  });
+
+  test("an off plugin's card offers no update actions (#225, source-pinned like buildPluginCard above)", () => {
+    const buildTurnItOnStep = indexSrc.slice(indexSrc.indexOf("function buildTurnItOnStep("), indexSrc.indexOf("function buildSettingsStep("));
+    expect(buildTurnItOnStep.length).toBeGreaterThan(300);
+    expect(buildTurnItOnStep).toContain("if (p.enabled) {\n      const updateBlock = buildPluginUpdateBlock(p);");
+  });
+
+  test("the Config editor does not render a PLUGINS field, or a key a card already shows (#244)", () => {
+    // renderEnvFields is far too DOM-heavy to lift; the wiring is pinned in source, the file's idiom.
+    const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
+    expect(renderEnvFields.length).toBeGreaterThan(500);
+    expect(renderEnvFields).toContain('if (key === "PLUGINS") continue;');
+    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value)"));
+    expect(renderEnvFields).toContain('source === "plugin"');
+    expect(renderEnvFields).toContain("pluginKeys.has(key)");
   });
 
   test("the bar is wired: the buttons through withBusy, and ONE delegated input and change listener on #app", () => {
@@ -5622,18 +5823,18 @@ describe("page skeleton", () => {
     expect(indexSrc.split('app.addEventListener("change", onControlEdited);').length - 1).toBe(1);
   });
 
-  test("the bar re-reads what is pending whenever a baseline moves: loadEnv and loadPlugins end in refreshApplyBar", () => {
-    const loadEnv = indexSrc.slice(indexSrc.indexOf("async function loadEnv()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
-    const loadPlugins = indexSrc.slice(indexSrc.indexOf("async function loadPlugins()"), indexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
-    for (const [name, src] of [["loadEnv", loadEnv], ["loadPlugins", loadPlugins]] as const) {
-      const finallyBlock = src.slice(src.lastIndexOf("} finally {"));
-      expect({ name, refreshes: finallyBlock.includes("refreshApplyBar();") }).toEqual({ name, refreshes: true });
-    }
+  test("the bar re-reads what is pending whenever a baseline moves: reloadConfig ends in refreshApplyBar, and loadPlugins/loadEnv are its aliases (#244)", () => {
+    const reloadConfig = indexSrc.slice(indexSrc.indexOf("async function reloadConfig("), indexSrc.indexOf("let loadPlugins = () => reloadConfig();"));
+    expect(reloadConfig.length).toBeGreaterThan(500);
+    const finallyBlock = reloadConfig.slice(reloadConfig.lastIndexOf("} finally {"));
+    expect(finallyBlock).toContain("refreshApplyBar();");
+    expect(indexSrc).toContain("let loadPlugins = () => reloadConfig();");
+    expect(indexSrc).toContain("let loadEnv = () => reloadConfig();");
   });
 
-  test("while the bot's state is unreadable every plugin box is rendered disabled", () => {
-    expect(indexSrc).toContain("container.appendChild(buildPluginRow(p, indexAvailable, !!data.stateError))");
-    expect(indexSrc).toContain("if (stateError || (!p.inIndex && !p.enabled)) check.disabled = true;");
+  test("while the bot's state is unreadable every plugin card's switch is rendered disabled (#244)", () => {
+    expect(indexSrc).toContain("for (const p of data.plugins) container.appendChild(buildPluginCard(p, ctx));");
+    expect(indexSrc).toContain("if (ctx.stateError || (!p.inIndex && !p.enabled)) check.disabled = true;");
   });
 
   test("config is POSTed from ONE place: applyPending (a plugin bundle's own setEnv is separate, and unchanged)", () => {
@@ -5684,11 +5885,15 @@ interface ApplyChange {
   key: string;
   before: string;
   now: string;
+  /** #244: set true for a typed secret (planApply's secrets input, appended after the plain changes). */
+  secret?: boolean;
 }
 interface ApplyPlanInput {
   loadedEnv: Record<string, string>;
   fields: Record<string, string>;
   plugins: { checkedNames: string[]; currentValue: string; manifestOrder: string[] } | null;
+  /** #244: typed secrets, {KEY: value}, non-empty only -- never diffed against a baseline the server never sends. */
+  secrets?: Record<string, string>;
 }
 interface ApplyPlan {
   changes: ApplyChange[];
@@ -5718,6 +5923,15 @@ const { applyBarView, describeApplyFailure, failureWroteNothing } = new Function
   applyBarView: (state: { count: number; phase: string; error?: string; detail?: string; noop?: boolean; rereading?: boolean }) => BarView;
   describeApplyFailure: (text: string, result: { log?: string; backup?: string } | null) => { error: string; detail: string };
   failureWroteNothing: (status: number, result: unknown, text: string) => boolean;
+};
+// #244: diffEdits + validateSecretChanges, lifted from PLUGIN_EDITS (validateSecretChanges needs
+// compilePattern, from ENV_SCHEMA, already lifted above for planApply).
+interface DiffCaptured { on: Record<string, boolean>; settings: Record<string, string>; secrets: Record<string, string> }
+const { diffEdits, validateSecretChanges } = new Function(
+  `"use strict";\n${applyBlock("ENV_SCHEMA")}\n${applyBlock("PLUGIN_EDITS")}\nreturn { diffEdits, validateSecretChanges };`,
+)() as {
+  diffEdits: (baseline: { plugins: { name: string; enabled?: boolean }[]; env: Record<string, string> }, controls: DiffCaptured) => DiffCaptured;
+  validateSecretChanges: (schema: Record<string, unknown>, changes: ApplyChange[], labelOf: (key: string) => string) => { key: string; message: string } | null;
 };
 
 describe("planApply (#257)", () => {
@@ -5795,6 +6009,246 @@ describe("planApply (#257)", () => {
     }
     // The FIRST offending key is named.
     expect(planApply({ loadedEnv: {}, fields: { A: "x\ny", B: "x\ny" }, plugins: null }).error).toBe("A must not contain a line break.");
+  });
+});
+
+describe("planApply with secrets (#244)", () => {
+  test("a typed secret is one change marked secret, after the plain ones", () => {
+    const plan = planApply({
+      loadedEnv: { A: "1" },
+      fields: { A: "2" },
+      plugins: null,
+      secrets: { SPOTIFY_CLIENT_SECRET: "shh" },
+    });
+    expect(plan.changes).toEqual([
+      { key: "A", before: "1", now: "2" },
+      { key: "SPOTIFY_CLIENT_SECRET", before: "", now: "shh", secret: true },
+    ]);
+    expect(plan.body).toBe("A=2\nSPOTIFY_CLIENT_SECRET=shh");
+    expect(plan.count).toBe(2);
+  });
+  test("an empty secret field is no change", () => {
+    const plan = planApply({ loadedEnv: {}, fields: {}, plugins: null, secrets: { A_SECRET: "" } });
+    expect(plan).toEqual({ changes: [], body: "", count: 0 });
+  });
+  test("a line break in a secret is an error, the same as any other field", () => {
+    const plan = planApply({ loadedEnv: {}, fields: {}, plugins: null, secrets: { A_SECRET: "x\ny" } });
+    expect(plan.error).toBe("A_SECRET must not contain a line break.");
+    expect(plan.body).toBe("");
+    expect(plan.count).toBe(1);
+  });
+  test("no secrets input at all behaves exactly as #257's planApply (no crash, no phantom change)", () => {
+    const plan = planApply({ loadedEnv: { A: "1" }, fields: { A: "1" }, plugins: null });
+    expect(plan).toEqual({ changes: [], body: "", count: 0 });
+  });
+});
+
+describe("validateSecretChanges (#244)", () => {
+  const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+  const labelOf = (key: string) => "Spotify client secret";
+
+  test("a secret that fails its format is reported by label, and the message does not contain the value", () => {
+    const bad = validateSecretChanges(schema, [{ key: "SPOTIFY_CLIENT_SECRET", before: "", now: "short!!", secret: true }], labelOf);
+    expect(bad).toEqual({ key: "SPOTIFY_CLIENT_SECRET", message: "Spotify client secret doesn't look right — check what you pasted." });
+    expect(bad?.message).not.toContain("short!!");
+  });
+  test("a secret that matches its format passes", () => {
+    expect(validateSecretChanges(schema, [{ key: "SPOTIFY_CLIENT_SECRET", before: "", now: "abcdefghij0123", secret: true }], labelOf)).toBeNull();
+  });
+  test("a secret with no schema row is not checked", () => {
+    expect(validateSecretChanges({}, [{ key: "UNKNOWN_SECRET", before: "", now: "x", secret: true }], labelOf)).toBeNull();
+  });
+  test("no changes at all is fine", () => {
+    expect(validateSecretChanges(schema, [], labelOf)).toBeNull();
+  });
+});
+
+describe("diffEdits (#244)", () => {
+  const baseline = { plugins: [{ name: "music", enabled: true }, { name: "raidhelper", enabled: false }], env: { A: "1", B: "2" } };
+
+  test("only controls that differ from the baseline are captured", () => {
+    const controls: DiffCaptured = { on: { music: true, raidhelper: true }, settings: { A: "1", B: "9" }, secrets: {} };
+    expect(diffEdits(baseline, controls)).toEqual({ on: { raidhelper: true }, settings: { B: "9" }, secrets: {} });
+  });
+  test("a secret is captured only when non-empty", () => {
+    const controls: DiffCaptured = { on: {}, settings: {}, secrets: { S1: "typed", S2: "" } };
+    expect(diffEdits(baseline, controls)).toEqual({ on: {}, settings: {}, secrets: { S1: "typed" } });
+  });
+  test("nothing differing captures nothing", () => {
+    const controls: DiffCaptured = { on: { music: true, raidhelper: false }, settings: { A: "1", B: "2" }, secrets: { S: "" } };
+    expect(diffEdits(baseline, controls)).toEqual({ on: {}, settings: {}, secrets: {} });
+  });
+  test("a plugin/key the baseline never mentions is compared against off / \"\"", () => {
+    const controls: DiffCaptured = { on: { unknown: true }, settings: { NEW_KEY: "x" }, secrets: {} };
+    expect(diffEdits(baseline, controls)).toEqual({ on: { unknown: true }, settings: { NEW_KEY: "x" }, secrets: {} });
+  });
+  test("a still-blank setting for a key the baseline never mentions is NOT captured (compared against the implicit \"\" default, not undefined)", () => {
+    const controls: DiffCaptured = { on: {}, settings: { NEW_KEY: "" }, secrets: {} };
+    expect(diffEdits(baseline, controls)).toEqual({ on: {}, settings: {}, secrets: {} });
+  });
+});
+
+describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, same edit)", () => {
+  // reloadConfig/captureCardControls/reapplyCardEdits are far too DOM-heavy to lift into applyPending's
+  // own harness (whose loadPlugins/loadEnv are injected STUBS, not the real reloadConfig) -- this is
+  // reloadConfig's OWN stub page, the patch's "a reloadConfig run on the stub page".
+  interface RC { value: string; checked: boolean; dataset: Record<string, string>; closest: () => null }
+  const el = (over: Partial<RC>): RC => ({ value: "", checked: false, dataset: {}, closest: () => null, ...over });
+  // A real element, not null: reloadConfig's own catch writes an error MESSAGE into these two containers
+  // when something inside the try throws (a loader failure, or -- the point of this stub being real
+  // rather than a null-returning shortcut -- an unguarded reapplyCardEdits(null) on a keepEdits:false
+  // run). A stub that answers every id with null makes that write invisible and the guard's own mutant
+  // (RC4) look equivalent when it is not: a real browser's #plugins-list is never null, and the guard's
+  // absence would silently replace the just-rendered cards with the literal string "Error: ...".
+  interface ErrEl { textContent: string }
+  const errEl = (): ErrEl => ({ textContent: "" });
+
+  function harness(oldEnv: Record<string, string>, oldPlugins: { name: string; enabled: boolean }[], freshEnv: Record<string, string>, freshPlugins: { name: string; enabled: boolean }[]) {
+    // "Current" controls: what's on screen right now (possibly edited). A real render REPLACES these
+    // with fresh ones seeded from the new fetch -- modelled by swapping the arrays the stub
+    // renderPlugins/renderEnvFields point at, the same way #275's runApply models resetOnReload.
+    let settingEls: RC[] = [el({ value: oldEnv.A ?? "", dataset: { settingKey: "A" } })];
+    let boxEls: RC[] = oldPlugins.map((p) => el({ checked: p.enabled, dataset: { plugin: p.name } }));
+    const secretEls: RC[] = [];
+    const calls = { renderPlugins: 0, renderEnvFields: 0 };
+    const plugsListEl = errEl();
+    const envFieldsEl = errEl();
+    const document = {
+      querySelectorAll: (selector: string) => {
+        if (selector === "#plugins-list input[type=checkbox][data-plugin]") return boxEls;
+        if (selector === "#plugins-list [data-setting-key]") return settingEls;
+        if (selector === "#plugins-list [data-secret-key]") return secretEls;
+        throw new Error("unexpected selector " + selector);
+      },
+      getElementById: (id: string) => (id === "plugins-list" ? plugsListEl : id === "env-fields" ? envFieldsEl : null),
+    };
+    const api = async (path: string) => {
+      if (path === "/api/plugins") return { json: async () => ({ plugins: freshPlugins }) };
+      if (path === "/api/env") return { json: async () => freshEnv };
+      return { ok: true, json: async () => ({}) };
+    };
+    const loadBranches = async () => {};
+    const renderPlugins = () => {
+      calls.renderPlugins++;
+      boxEls = freshPlugins.map((p) => el({ checked: p.enabled, dataset: { plugin: p.name } }));
+    };
+    const renderEnvFields = () => {
+      calls.renderEnvFields++;
+      settingEls = [el({ value: freshEnv.A ?? "", dataset: { settingKey: "A" } })];
+    };
+    const src = applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
+    const refreshApplyBar = () => {};
+    const { reloadConfig, setRereading } = new Function(
+      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema",
+      `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
+        "return { reloadConfig, setRereading: (v) => { applyRereading = v; } };",
+    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}) as {
+      reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
+      setRereading: (v: boolean) => void;
+    };
+    return { reloadConfig, setRereading, settingEls: () => settingEls, boxEls: () => boxEls, calls, plugsListEl, envFieldsEl };
+  }
+
+  test("an edit typed in a card survives an update button's reload, and is dropped by a Discard", async () => {
+    // An update-button run: applyRereading stays false (no re-read the bar itself started) -> keepEdits defaults true.
+    const kept = harness({ A: "1" }, [{ name: "music", enabled: false }], { A: "1" }, [{ name: "music", enabled: false }]);
+    kept.settingEls()[0]!.value = "typed"; // the user edited it
+    await kept.reloadConfig();
+    expect(kept.calls.renderEnvFields).toBe(1);
+    expect(kept.settingEls()[0]!.value).toBe("typed"); // survived the reload
+
+    // A Discard run: applyRereading is true (rereadFromServer set it before calling the aliases) -> keepEdits defaults false.
+    const dropped = harness({ A: "1" }, [{ name: "music", enabled: false }], { A: "1" }, [{ name: "music", enabled: false }]);
+    dropped.settingEls()[0]!.value = "typed";
+    dropped.setRereading(true);
+    await dropped.reloadConfig();
+    expect(dropped.settingEls()[0]!.value).toBe("1"); // dropped: back to the fresh baseline
+  });
+
+  test("a dropped-edits (Discard-like) run never writes an error message: nothing is null to reapply onto", async () => {
+    // Round-1 finding: an unguarded reapplyCardEdits(captured) on a keepEdits:false run (captured is
+    // null) throws reading .on off null -- caught by reloadConfig's own catch, which would overwrite
+    // the just-rendered #plugins-list/#env-fields with the literal string "Error: ...". Pins that the
+    // guard (`if (captured) reapplyCardEdits(captured);`) keeps that from ever happening.
+    const dropped = harness({ A: "1" }, [{ name: "music", enabled: false }], { A: "1" }, [{ name: "music", enabled: false }]);
+    dropped.setRereading(true);
+    await dropped.reloadConfig();
+    expect(dropped.plugsListEl.textContent).toBe("");
+    expect(dropped.envFieldsEl.textContent).toBe("");
+  });
+
+  test("a call while one is already in flight joins it (one fetch, one render), never doubling up", async () => {
+    const h = harness({ A: "1" }, [], { A: "2" }, []);
+    const first = h.reloadConfig();
+    const second = h.reloadConfig();
+    await Promise.all([first, second]);
+    expect(h.calls.renderEnvFields).toBe(1);
+  });
+});
+
+// #244: refreshCardHeaders' per-card owner-filtering is otherwise unreachable from any test (the map it
+// reads, cardHeaderEls, is only populated by buildPluginCard, browser-only) -- runApply's harness returns
+// it so a test can seed its own stub {badge, summary} elements before triggering a bar refresh.
+describe("refreshCardHeaders (#244): a changed key counts only toward the card that owns it", () => {
+  const miniEl = (): StubEl =>
+    ({
+      id: "x", hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
+      classes: new Set(), attrs: new Map(), classList: { toggle: () => false }, setAttribute: () => {},
+      removeAttribute: () => {}, getAttribute: () => null, focus: () => {}, contains: () => false, closest: () => null,
+    }) as StubEl;
+  const twoPluginPluginsData = {
+    plugins: [
+      { name: "music", enabled: true, env: [{ key: "MUSIC_PORT" }] },
+      { name: "raidhelper", enabled: true, env: [{ key: "RAID_WEBHOOK" }] },
+    ],
+    pluginsValue: "music,raidhelper",
+  };
+
+  test("editing one card's setting shows 'N settings changed' on ITS card only", () => {
+    const page = runApply({
+      loadedEnv: { MUSIC_PORT: "1234", RAID_WEBHOOK: "https://old" },
+      pluginsData: twoPluginPluginsData,
+      settings: { MUSIC_PORT: "9999", RAID_WEBHOOK: "https://old" }, // only MUSIC_PORT edited
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).toBe("1 setting changed");
+    expect(music.badge.textContent).toBe("Restart to apply");
+    expect(raidhelper.summary.textContent).not.toBe("1 setting changed");
+    expect(raidhelper.badge.textContent).not.toBe("Restart to apply");
+  });
+
+  test("a secret typed for one card's key counts toward that card only", () => {
+    const page = runApply({
+      loadedEnv: { MUSIC_PORT: "1234", RAID_WEBHOOK: "https://old" },
+      pluginsData: twoPluginPluginsData,
+      secrets: { MUSIC_PORT: "shh" }, // pretend MUSIC_PORT were secret-shaped, for the owner check alone
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).toBe("1 setting changed");
+    expect(raidhelper.summary.textContent).not.toBe("1 setting changed");
+  });
+
+  test("pendingOn is only set for the plugin whose checked state actually changed", () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      pluginsData: twoPluginPluginsData,
+      checked: ["music"], // raidhelper (enabled:true on the server) is being turned OFF; music stays on
+    });
+    const music = { badge: miniEl(), summary: miniEl() };
+    const raidhelper = { badge: miniEl(), summary: miniEl() };
+    page.run.cardHeaderEls.set("music", music);
+    page.run.cardHeaderEls.set("raidhelper", raidhelper);
+    page.run.refreshApplyBar();
+    expect(music.summary.textContent).not.toBe("Turned on, not running yet");
+    expect(raidhelper.summary.textContent).toBe("Turned off, still running until you apply");
   });
 });
 
@@ -6073,6 +6527,13 @@ interface ApplySpec {
   /** The plugin list is not rendered (a failed /api/plugins reload swaps the boxes for an error line) while
    *  `pluginsData` still holds the previous answer. */
   noBoxes?: boolean;
+  /** #244: a card's plain settings, {KEY: value}, as [data-setting-key] controls (id set-KEY) inside #plugins-list. */
+  settings?: Record<string, string>;
+  /** #244: a card's typed secrets, {KEY: value}, as [data-secret-key] controls (id secret-KEY) inside #plugins-list. */
+  secrets?: Record<string, string>;
+  /** #244: one EXTRA control inside .plug__admin (a plugin's own settings bundle, mounted inside #plugins-list) --
+   *  proves collectPending's !el.closest(".plug__admin") filter, not just that the selector exists. */
+  bundleControl?: { kind: "setting" | "secret" | "plugin"; key: string; value?: string };
 }
 type ApplyPost = { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } };
 
@@ -6114,7 +6575,10 @@ function runApply(spec: ApplySpec) {
         state.active = el;
       },
       contains: (other) => other === el,
-      closest: () => null,
+      // #244: a plugin's own bundle mounts inside #plugins-list, in .plug__admin -- marked here with
+      // dataset.plugAdmin so a spec can prove the panel's own selectors exclude it, without needing a
+      // real DOM tree of ancestors.
+      closest: (selector: string) => (selector === ".plug__admin" && el.dataset.plugAdmin === "true" ? el : null),
       ...over,
     };
     // The browser drops focus to <body> when the focused element (or one inside it) is hidden -- and, in
@@ -6170,6 +6634,25 @@ function runApply(spec: ApplySpec) {
   const boxes = spec.noBoxes ? [] : (pluginsData?.plugins ?? []).map((p) => makeEl(`plugin-${p.name}`, { dataset: { plugin: p.name }, checked: tickedNow.includes(p.name) }));
   const boxBaseline = (pluginsData?.plugins ?? []).map((p) => tickedOnServer.includes(p.name));
 
+  // #244: a card's plain settings / secrets, as [data-setting-key] / [data-secret-key] controls (ids
+  // set-KEY / secret-KEY, matching what refuseApply looks up on a validation failure).
+  const settingControls = Object.entries(spec.settings ?? {}).map(([key, value]) => {
+    const el = makeEl(`set-${key}`, { value, dataset: { settingKey: key } });
+    byId.set(el.id, el);
+    return el;
+  });
+  const secretControls = Object.entries(spec.secrets ?? {}).map(([key, value]) => {
+    const el = makeEl(`secret-${key}`, { value, dataset: { secretKey: key } });
+    byId.set(el.id, el);
+    return el;
+  });
+  if (spec.bundleControl) {
+    const { kind, key, value } = spec.bundleControl;
+    if (kind === "setting") settingControls.push(makeEl(`bundle-set-${key}`, { value: value ?? "x", dataset: { settingKey: key, plugAdmin: "true" } }));
+    else if (kind === "secret") secretControls.push(makeEl(`bundle-secret-${key}`, { value: value ?? "x", dataset: { secretKey: key, plugAdmin: "true" } }));
+    else boxes.push(makeEl(`bundle-plugin-${key}`, { dataset: { plugin: key, plugAdmin: "true" }, checked: true }));
+  }
+
   const document = {
     body,
     get activeElement() { return state.active ?? body; },
@@ -6182,7 +6665,9 @@ function runApply(spec: ApplySpec) {
       log.selectors.push(selector);
       if (selector === "#env-fields [data-key]") return controls;
       if (selector === "#plugins-list input[type=checkbox][data-plugin]") return boxes;
-      throw new Error(`harness: the collector may read only its two selectors, not ${JSON.stringify(selector)}`);
+      if (selector === "#plugins-list [data-setting-key]") return settingControls;
+      if (selector === "#plugins-list [data-secret-key]") return secretControls;
+      throw new Error(`harness: the collector may read only its four selectors, not ${JSON.stringify(selector)}`);
     },
     querySelector: (selector: string): StubEl | null => {
       if (selector === '[role="tab"][aria-selected="true"]') return tab;
@@ -6234,10 +6719,21 @@ function runApply(spec: ApplySpec) {
   };
   const showTab = (id: string, moveFocus: boolean) => void log.tabs.push([id, moveFocus]);
 
+  // #244: refreshCardHeaders (inside APPLY) needs pluginCardState + settingOwners/settingLabel +
+  // BADGE_MODIFIERS, so their blocks join the lift too -- PLUGIN_EDITS (diffEdits, validateSecretChanges)
+  // is what applyPending's secret-validation branch and reloadConfig's capture/reapply call, and
+  // cardSettingLabel (inside APPLY) needs settingOwners/settingLabel as well.
+  // #244: cardHeaderEls is returned too -- refreshCardHeaders' per-card owner-filtering logic (which
+  // plugin's pendingSettings a changed key counts toward) is otherwise unreachable from any test: the
+  // map is empty until buildPluginCard (browser-only, never called here) populates it. A test that wants
+  // to exercise it seeds page.run.cardHeaderEls with its own stub {badge, summary} elements (round-1:
+  // now also head/body/chev, for refuseApply's card-opening) before calling
+  // refreshApplyBar()/discardPending()/applyPending(). openCards is returned for the same reason --
+  // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
-    `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending };",
+    `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
@@ -6245,6 +6741,8 @@ function runApply(spec: ApplySpec) {
     onControlEdited: (e: unknown) => void;
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
+    cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl; head?: StubEl; body?: StubEl; chev?: StubEl }>;
+    openCards: Set<string>;
   };
   refreshAfterLoad = () => run.refreshApplyBar();
 
@@ -6450,7 +6948,7 @@ describe("applyPending (#257)", () => {
       expect({ body, title: real.view().title }).toEqual({ body, title: "Applied. The bot restarted with your changes." });
     }
     // ... and a later apply on the same page (the edit is still pending) is not stuck on the earlier answer.
-    page.run.onControlEdited({ target: { closest: () => ({}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
     expect(page.view().title).toBe("1 change needs a restart");
     spec.response = { ok: true, text: '{"ok":true,"changed":["WATCHED_REPOS"],"recreated":true,"backup":"/x","log":""}' };
     await page.run.applyPending();
@@ -6648,13 +7146,19 @@ describe("applyPending (#257)", () => {
     }
   });
 
-  test("the collector reads exactly two selectors, so a plugin bundle's DOM cannot feed the bar", () => {
+  test("the collector reads exactly four selectors, so a plugin bundle's DOM cannot feed the bar (#244)", () => {
     const page = runApply({ loadedEnv: APPLY_ENV });
     const input = page.run.collectPending();
-    expect(page.log.selectors).toEqual(["#env-fields [data-key]", "#plugins-list input[type=checkbox][data-plugin]"]);
+    expect(page.log.selectors).toEqual([
+      "#env-fields [data-key]",
+      "#plugins-list [data-setting-key]",
+      "#plugins-list [data-secret-key]",
+      "#plugins-list input[type=checkbox][data-plugin]",
+    ]);
     expect(Object.keys(input.fields)).toEqual(Object.keys(APPLY_ENV));
     expect(input.plugins).toEqual({ checkedNames: ["warbandeer"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] });
     expect(input.loadedEnv).toBe(APPLY_ENV);
+    expect(input.secrets).toEqual({});
   });
 
   test("while the request is in flight the bar says Restarting the bot..., both buttons are disabled, and a second apply is ignored", async () => {
@@ -6761,6 +7265,18 @@ describe("applyPending (#257)", () => {
 describe("Apply bar events (#257)", () => {
   const inside = { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null), getAttribute: () => null, removeAttribute: () => {} };
   const outside = { closest: () => null, getAttribute: () => null, removeAttribute: () => {} };
+  // #244: a plugin's own bundle mounts INSIDE #plugins-list (in .plug__admin), so it passes the first
+  // closest() check too -- the second, dedicated one is what excludes it.
+  const insideBundle = { closest: (sel: string) => (sel === "#env-fields, #plugins-list" || sel === ".plug__admin" ? {} : null), getAttribute: () => null, removeAttribute: () => {} };
+
+  test("an input event from inside a plugin's own settings bundle does not touch the bar (#244)", () => {
+    const page = runApply({ loadedEnv: APPLY_ENV });
+    page.edit("WATCHED_REPOS", "eu");
+    page.run.onControlEdited({ target: insideBundle });
+    expect(page.view().hidden).toBe(true); // a real change is pending, but the bundle's own edit never shows it
+    page.run.onControlEdited({ target: inside }); // the panel's OWN control still does
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
+  });
 
   test("an edit inside the config fields or the plugin list shows the bar; an event from anywhere else does nothing", () => {
     const page = runApply({ loadedEnv: APPLY_ENV });
@@ -6814,6 +7330,165 @@ describe("Apply bar events (#257)", () => {
     expect(page.view().title).toBe("Restarting the bot…");
     release();
     await pending;
+  });
+});
+
+describe("applyPending with a card (#244)", () => {
+  test("turning on a plugin that was off and filling two settings, one secret, is ONE POST: PLUGINS, then the two keys", async () => {
+    const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "raidhelper" }], pluginsValue: "raidhelper" };
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      pluginsData,
+      checked: ["warbandeer", "raidhelper"],
+      settings: { MUSIC_CALLBACK_PORT: "8080" },
+      secrets: { SPOTIFY_CLIENT_SECRET: "shh" },
+    });
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(1);
+    expect(page.log.posts[0]?.opts.body).toBe("PLUGINS=warbandeer,raidhelper\nMUSIC_CALLBACK_PORT=8080\nSPOTIFY_CLIENT_SECRET=shh");
+  });
+
+  test("a blank, non-required plain field alongside a valid secret is not refused (validateSecretChanges sees only the secret changes)", async () => {
+    // ANNOUNCE_CHANNEL_ID's pattern (APPLY_SCHEMA) does not match "": validateEnvChanges's own blank/required
+    // check already lets this through (not required), but validateSecretChanges has no such check at all --
+    // if it ever saw this NON-secret change too, it would run the blank value straight through
+    // compilePattern and refuse the whole apply for the wrong reason.
+    const schema = { ...APPLY_SCHEMA, ANNOUNCE_CHANNEL_ID: { pattern: "^[0-9]{5,25}$", required: false, source: "core" }, SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" }, secrets: { SPOTIFY_CLIENT_SECRET: "abcdefghij0123" }, schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toHaveLength(1);
+    expect(page.log.posts[0]?.opts.body).toContain("SPOTIFY_CLIENT_SECRET=abcdefghij0123");
+  });
+
+  test("a secret that fails validation posts nothing and its value is in no message", async () => {
+    const schema = { ...APPLY_SCHEMA, SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: APPLY_ENV, secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]);
+    const everyWrittenWord = page.log.textWrites.join("\n") + JSON.stringify(page.view());
+    expect(everyWrittenWord).not.toContain("short!!");
+    // Routed to the Plugins tab, on the card's own secret field -- not Settings, not a bare env- id.
+    expect(page.log.tabs).toEqual([["plugins", false]]);
+    expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]);
+  });
+
+  // Round-1 review finding: buildSettingsStep builds a card's fields whether or not the card is open, but
+  // buildPluginCard still hides the whole .plug__body ([hidden] is display:none) when it's closed -- so a
+  // refusal that marks and focuses a field on a CLOSED card was silently inert (invisible, unfocusable).
+  // The fix opens the owning card directly (cardHeaderEls' stored head/body/chev refs), which the harness
+  // proves by seeding cardHeaderEls itself -- buildPluginCard (browser-only) is never called here.
+  test("a refusal on a plugin-owned key opens its CLOSED card, so the marked/focused field is not left hidden (round-1 finding)", async () => {
+    const miniEl = (id: string): StubEl =>
+      ({
+        id, hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
+        classes: new Set(), attrs: new Map(), classList: { toggle: () => false },
+        setAttribute(name: string, value: string) { this.attrs.set(name, value); },
+        removeAttribute() {}, getAttribute() { return null; }, focus() {}, contains: () => false, closest: () => null,
+      }) as StubEl;
+    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
+    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
+    const head = miniEl("plug-head-music");
+    const body = miniEl("plug-body-music");
+    const chev = miniEl("chev-music");
+    body.hidden = true; // the card starts closed, as it would after a page load with nothing expanded
+    page.run.cardHeaderEls.set("music", { badge: miniEl("b"), summary: miniEl("s"), head, body, chev });
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]); // still refused: this is only about the card becoming reachable
+    expect(body.hidden).toBe(false);
+    expect(head.attrs.get("aria-expanded")).toBe("true");
+    expect(chev.attrs.get("class")).toBe("plug__chev plug__chev--open");
+    expect(page.run.openCards.has("music")).toBe(true);
+    expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]); // the now-visible field still gets focus
+  });
+
+  test("a refusal on a card that is ALREADY open never touches cardHeaderEls (no redundant DOM writes)", async () => {
+    let bodyHiddenWrites = 0;
+    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
+    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
+    const headAttrs = new Map<string, string>();
+    const head = { id: "plug-head-music", attrs: headAttrs, setAttribute: (name: string, value: string) => void headAttrs.set(name, value) } as unknown as StubEl;
+    const body = {
+      id: "plug-body-music",
+      get hidden() { return false; },
+      set hidden(_v: boolean) { bodyHiddenWrites++; },
+    } as unknown as StubEl;
+    page.run.cardHeaderEls.set("music", { badge: {} as StubEl, summary: {} as StubEl, head, body });
+    await page.run.applyPending();
+    expect(bodyHiddenWrites).toBe(0);
+    expect(head.attrs.size).toBe(0);
+    expect(page.run.openCards.has("music")).toBe(false);
+  });
+
+  test("after a refusal that wrote nothing (#272) nothing is re-rendered and the typed secret is still in its field", async () => {
+    const page = runApply({
+      loadedEnv: APPLY_ENV,
+      fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" }, // triggers a plain-text env-set refusal below
+      secrets: { SPOTIFY_CLIENT_SECRET: "shh" },
+      response: { ok: false, text: "bot-ops: env-set: value for 'ANNOUNCE_CHANNEL_ID' is invalid" },
+    });
+    await page.run.applyPending();
+    expect(page.log.reloads).toEqual({ plugins: 0, env: 0, status: 0 }); // nothing re-read: the DOM is untouched
+    expect(page.run.collectPending().secrets).toEqual({ SPOTIFY_CLIENT_SECRET: "shh" }); // still in its field
+  });
+
+  test("a control inside .plug__admin is never collected (#244)", async () => {
+    for (const bundleControl of [
+      { kind: "setting" as const, key: "BUNDLE_OWN_SETTING", value: "x" },
+      { kind: "secret" as const, key: "BUNDLE_OWN_SECRET", value: "y" },
+      { kind: "plugin" as const, key: "bundle-own-plugin" },
+    ]) {
+      const page = runApply({ loadedEnv: APPLY_ENV, bundleControl });
+      const input = page.run.collectPending();
+      expect({ bundleControl, fields: input.fields, secrets: input.secrets, plugins: input.plugins }).toEqual({
+        bundleControl,
+        fields: APPLY_ENV,
+        secrets: {},
+        plugins: { checkedNames: ["warbandeer"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] },
+      });
+    }
+  });
+
+  test("an untyped (empty) secret field is not collected as a pending change", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, secrets: { SPOTIFY_CLIENT_SECRET: "" } });
+    expect(page.run.collectPending().secrets).toEqual({});
+    await page.run.applyPending();
+    expect(page.log.posts).toEqual([]); // nothing pending at all: the empty secret plans no change
+  });
+});
+
+// #244: a secret's value exists only in its one password field, from typing until an Apply attempt
+// ends in a re-render, or Discard -- source-level pins, the file's own idiom for what cannot be lifted
+// (buildSecretField is DOM-only, and "never written anywhere else" is a negative that only source can pin).
+describe("a secret's value stays in one password field (#244)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const buildSecretField = indexSrc.slice(indexSrc.indexOf("function buildSecretField("), indexSrc.indexOf("// One card per plugin."));
+
+  test("localStorage.setItem appears once, for the admin token", () => {
+    expect(indexSrc.split("localStorage.setItem(").length - 1).toBe(1);
+    expect(indexSrc).toContain("function setToken(t) { localStorage.setItem(TOKEN_KEY, t); }");
+  });
+
+  test("no value is written for a [data-secret-key] control -- the builder never assigns .value to it", () => {
+    expect(buildSecretField.length).toBeGreaterThan(300);
+    expect(buildSecretField).toContain('input.dataset.secretKey = key;');
+    expect(buildSecretField).not.toMatch(/\binput\.value\s*=/);
+  });
+
+  test("the secret field is type=password with autocomplete=new-password", () => {
+    expect(buildSecretField).toContain('input.type = "password";');
+    expect(buildSecretField).toContain('input.autocomplete = "new-password";');
+    expect(buildSecretField.indexOf('input.type = "password";')).toBeLessThan(buildSecretField.indexOf("wrap.appendChild(input);"));
+  });
+
+  test("the secret's value is never sent in a GET, never in a message, and the schema route only reports isSet", () => {
+    // The secret CONTROL's value only ever leaves the page as part of the one POST /api/env applyPending
+    // sends (planApply/collectPending, tested elsewhere); nowhere else in the page reads .value off a
+    // [data-secret-key] control.
+    const readers = indexSrc.split("dataset.secretKey").length - 1;
+    // collectPending, captureCardControls, reapplyCardEdits: exactly the three places #244's plan names.
+    expect(readers).toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -7078,7 +7753,7 @@ describe("the bar while the page re-reads (#275)", () => {
     expect(page.view()).toMatchObject({ hidden: true, ...BUTTONS_FREE });
     // ... and a new edit is applied normally
     page.edit("WATCHED_REPOS", "ap");
-    page.run.onControlEdited({ target: { closest: () => ({}) } });
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === ".plug__admin" ? null : {}) } });
     expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", go: true, ...BUTTONS_FREE });
     await page.run.applyPending();
     expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=ap"]);
