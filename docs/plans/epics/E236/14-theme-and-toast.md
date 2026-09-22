@@ -156,12 +156,12 @@ error plus retained composite outline; and keyboard reachability.
   helper source immediately before their marked blocks.
 - **Acceptance (private `TEMP`/`TMP`, serial):** `bun run --cwd=ops/admin check` exited 0 with
   `$ bunx tsc --noEmit`. The final clean `bun test ops/admin/server.test.ts --timeout 20000`
-  exited 0 with `775 pass`, `5 skip`, `0 fail`, `3389 expect() calls`, and
-  `Ran 780 tests across 1 file`.
+  exited 0 with `776 pass`, `5 skip`, `0 fail`, `3411 expect() calls`, and
+  `Ran 781 tests across 1 file`.
   `git grep -n "field-hint" -- ops/admin` and
   `git grep -n 'adm \[aria-invalid="true"\]' -- ops/admin/public/admin.css` both printed nothing
   (the expected git-grep exit 1 for no matches).
-- **Mutation matrix:** 48 one-at-a-time mutants in detached worktree
+- **Mutation matrix:** 58 one-at-a-time mutants in detached worktree
   `bot-300-form-states-mutations`; every final mutant was killed, and each run executed the full
   focused test file. The first 19 covered a restored legacy hint,
   a control help misclassified as `adm-note`, string-only and exposed required markers, missing native
@@ -180,6 +180,15 @@ error plus retained composite outline; and keyboard reachability.
   have line-level mutation guards. The implementation and consumer tests were corrected, then the
   final baseline and 29-mutant follow-up above were run against the complete state. The claims
   reviewer's screenshot-artifact concern is disclosed below rather than papered over.
+- **Review gate round 2, correctness lens:** initially NOT SOUND. A plugin-card re-render replaced the
+  marked field after a refusal but left the danger refusal active. The fix carries the invalid id and
+  message across the rebuild, keeps the owning card open, restores the shared inline error and ARIA
+  state on the rebuilt control, leaves Config errors alone, and drops the refusal only when that
+  plugin control genuinely no longer exists. The strengthened consumer test executes two consecutive
+  rebuilds. Ten further one-at-a-time mutants all failed it: deleted capture; deleted owner reopen;
+  either deleted restore site; blank message; deleted error restore; deleted restored-control pointer;
+  deleted missing-control cleanup; deleted plugin-ancestry predicate; and deleted old-control cleanup.
+  The final correctness re-review returned SOUND.
 - **Real Chrome, canned current-main data:** the complete pre-review pass in both `arcane-obsidian`
   and `arcane-parchment` rendered the
   blank required Config refusal with native `required`, focused invalid control, adjacent

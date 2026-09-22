@@ -857,6 +857,9 @@
   // plugin -- the same shape loadPlugins used to build, minus the fetch (reloadConfig owns that) and
   // minus the separate Plugin Settings section (a plugin's bundle now mounts inside its own card).
   function renderPlugins() {
+    // A refusal points at a specific DOM control. This function replaces every plugin control, so carry
+    // that state across the rebuild instead of leaving only the danger bar behind with an unmarked field.
+    const savedApplyInvalid = capturePluginApplyInvalidForRender();
     const gen = ++adminRenderGen;
     for (const cleanup of mountedAdminCleanups) { try { cleanup(); } catch (e) {} }
     mountedAdminCleanups = [];
@@ -882,6 +885,7 @@
       empty.className = "adm-note";
       empty.textContent = "No plugins available or installed.";
       container.appendChild(empty);
+      restorePluginApplyInvalidAfterRender(savedApplyInvalid);
       return;
     }
     // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every switch
@@ -900,6 +904,7 @@
     note.style.marginTop = "8px";
     note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
+    restorePluginApplyInvalidAfterRender(savedApplyInvalid);
   }
 
   // A card's "Version X" / "not installed" line, browser-only text (no acceptance bullet cites its exact
@@ -3094,6 +3099,27 @@
   function clearApplyInvalid() {
     if (applyInvalid) clearFieldError(applyInvalid);
     applyInvalid = null;
+  }
+
+  function capturePluginApplyInvalidForRender() {
+    if (!applyInvalid || !applyInvalid.closest("#plugins-list")) return null;
+    const saved = { id: applyInvalid.id, message: applyViolation };
+    const key = saved.id.replace(/^(?:set|secret)-/, "");
+    const owner = settingOwners((pluginsData && pluginsData.plugins) || []).get(key);
+    if (owner) openCards.add(owner);
+    clearApplyInvalid();
+    return saved;
+  }
+
+  function restorePluginApplyInvalidAfterRender(saved) {
+    if (!saved) return;
+    const control = document.getElementById(saved.id);
+    if (!control) {
+      applyViolation = "";
+      return;
+    }
+    showFieldError(control, saved.message);
+    applyInvalid = control;
   }
 
   // The ONE place the bar re-reads the server (#275): Discard, a re-baselining failure and a success all call it,

@@ -6963,6 +6963,7 @@ function runApply(spec: ApplySpec) {
   };
   const state: { active: StubEl | null } = { active: null };
   let byId: Map<string, StubEl>;
+  const explicitlyMissingIds = new Set<string>();
   const makeEl = (id: string, over: Partial<StubEl> = {}): StubEl => {
     let hidden = false;
     let disabled = false;
@@ -6981,7 +6982,11 @@ function runApply(spec: ApplySpec) {
       // #244: a plugin's own bundle mounts inside #plugins-list, in .plug__admin -- marked here with
       // dataset.plugAdmin so a spec can prove the panel's own selectors exclude it, without needing a
       // real DOM tree of ancestors.
-      closest: (selector: string) => (selector === ".plug__admin" && el.dataset.plugAdmin === "true" ? el : null),
+      closest: (selector: string) => {
+        if (selector === ".plug__admin" && el.dataset.plugAdmin === "true") return el;
+        if (selector === "#plugins-list" && (el.dataset.plugin || el.dataset.settingKey || el.dataset.secretKey)) return el;
+        return null;
+      },
       insertAdjacentElement: (_position, child) => {
         byId.set(child.id, child);
         child.remove = () => void byId.delete(child.id);
@@ -7067,7 +7072,7 @@ function runApply(spec: ApplySpec) {
     get activeElement() { return state.active ?? body; },
     getElementById: (id: string): StubEl | null => {
       const el = byId.get(id);
-      if (!el && id.endsWith("-error")) return null;
+      if (!el && (id.endsWith("-error") || explicitlyMissingIds.has(id))) return null;
       if (!el) throw new Error(`harness: the page asked for an element it was not given: #${id}`);
       return el;
     },
@@ -7143,7 +7148,7 @@ function runApply(spec: ApplySpec) {
   const run = new Function(
     "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
     `"use strict";\n${formStatesSrc}\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
+      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, capturePluginApplyInvalidForRender, restorePluginApplyInvalidAfterRender, cardHeaderEls, openCards };",
   )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
@@ -7151,6 +7156,8 @@ function runApply(spec: ApplySpec) {
     onControlEdited: (e: unknown) => void;
     dismissApplyResult: () => void;
     collectPending: () => ApplyPlanInput;
+    capturePluginApplyInvalidForRender: () => { id: string; message: string } | null;
+    restorePluginApplyInvalidAfterRender: (saved: { id: string; message: string } | null) => void;
     cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl; head?: StubEl; body?: StubEl; chev?: StubEl }>;
     openCards: Set<string>;
   };
@@ -7163,6 +7170,16 @@ function runApply(spec: ApplySpec) {
     controls,
     boxes,
     element: (id: string) => byId.get(id) ?? null,
+    replaceElement(id: string, over: Partial<StubEl> = {}) {
+      const el = makeEl(id, over);
+      explicitlyMissingIds.delete(id);
+      byId.set(id, el);
+      return el;
+    },
+    removeElement(id: string) {
+      byId.delete(id);
+      explicitlyMissingIds.add(id);
+    },
     /** The control the page marks / focuses for `key` (a chip editor's typing input, else the field itself). */
     control: (key: string) => byId.get(`env-${key}`)!,
     edit(key: string, value: string) {
@@ -7366,6 +7383,75 @@ describe("applyPending (#257)", () => {
       expect(error.textContent, key).toBe(key + " must not contain a line break.");
       expect(page.view(), key).toMatchObject({ hidden: false, tone: "danger", hint: key + " must not contain a line break." });
     }
+  });
+
+  test("a plugin-card re-render carries inline refusal state to the rebuilt control", async () => {
+    const renderPlugins = applyIndexSrc.slice(applyIndexSrc.indexOf("function renderPlugins()"), applyIndexSrc.indexOf("function versionLine("));
+    expect(renderPlugins).toContain("const savedApplyInvalid = capturePluginApplyInvalidForRender();");
+    expect(renderPlugins.indexOf("capturePluginApplyInvalidForRender();")).toBeLessThan(renderPlugins.indexOf('container.innerHTML = "";'));
+    expect(renderPlugins.split("restorePluginApplyInvalidAfterRender(savedApplyInvalid);")).toHaveLength(3);
+
+    const page = runApply({
+      loadedEnv: {},
+      pluginsData: { plugins: [{ name: "music", env: [{ key: "MUSIC_PORT" }] }], pluginsValue: "music" },
+      settings: { MUSIC_PORT: "8080\nADMIN_USER_IDS=1" },
+      schema: { MUSIC_PORT: { source: "plugin", required: false, secret: false } },
+    });
+    await page.run.applyPending();
+    const control = page.element("set-MUSIC_PORT")!;
+    expect(control.getAttribute("aria-invalid")).toBe("true");
+    expect(page.element("set-MUSIC_PORT-error")).not.toBeNull();
+    expect(page.view()).toMatchObject({ tone: "danger", hint: "MUSIC_PORT must not contain a line break." });
+
+    page.run.openCards.delete("music"); // the header click tried to close the card before renderPlugins ran
+    const saved = page.run.capturePluginApplyInvalidForRender();
+    expect(saved).toEqual({ id: "set-MUSIC_PORT", message: "MUSIC_PORT must not contain a line break." });
+    expect(page.run.openCards.has("music")).toBe(true); // the invalid control must remain visible after rebuild
+    expect(control.getAttribute("aria-invalid")).toBeNull();
+    expect(page.element("set-MUSIC_PORT-error")).toBeNull();
+    const rebuilt = page.replaceElement("set-MUSIC_PORT", { value: control.value, dataset: { settingKey: "MUSIC_PORT" } });
+    page.run.restorePluginApplyInvalidAfterRender(saved);
+    page.run.refreshApplyBar();
+    expect(rebuilt.getAttribute("aria-invalid")).toBe("true");
+    expect(rebuilt.getAttribute("aria-describedby")).toBe("set-MUSIC_PORT-error");
+    expect(page.element("set-MUSIC_PORT-error")).toMatchObject({
+      className: "rb-field__error",
+      textContent: "MUSIC_PORT must not contain a line break.",
+    });
+    expect(page.view()).toMatchObject({ tone: "danger", hint: "MUSIC_PORT must not contain a line break." });
+
+    const savedAgain = page.run.capturePluginApplyInvalidForRender();
+    expect(savedAgain).toEqual(saved);
+    const rebuiltAgain = page.replaceElement("set-MUSIC_PORT", { value: rebuilt.value, dataset: { settingKey: "MUSIC_PORT" } });
+    page.run.restorePluginApplyInvalidAfterRender(savedAgain);
+    expect(rebuiltAgain.getAttribute("aria-invalid")).toBe("true");
+    expect(page.element("set-MUSIC_PORT-error")?.textContent).toBe("MUSIC_PORT must not contain a line break.");
+
+    const config = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" } });
+    await config.run.applyPending();
+    expect(config.run.capturePluginApplyInvalidForRender()).toBeNull();
+    config.run.refreshApplyBar();
+    expect(config.control("ANNOUNCE_CHANNEL_ID").getAttribute("aria-invalid")).toBe("true");
+    expect(config.element("env-ANNOUNCE_CHANNEL_ID-error")).not.toBeNull();
+    expect(config.view()).toMatchObject({ tone: "danger", hint: "ANNOUNCE_CHANNEL_ID is required and cannot be blank." });
+
+    const removed = runApply({
+      loadedEnv: {},
+      pluginsData: { plugins: [{ name: "music", env: [{ key: "MUSIC_PORT" }] }], pluginsValue: "music" },
+      settings: { MUSIC_PORT: "bad" },
+      schema: { MUSIC_PORT: { source: "plugin", required: false, secret: false, pattern: "^[0-9]+$" } },
+    });
+    await removed.run.applyPending();
+    const removedSaved = removed.run.capturePluginApplyInvalidForRender();
+    removed.element("set-MUSIC_PORT")!.value = "8080";
+    removed.removeElement("set-MUSIC_PORT");
+    removed.run.restorePluginApplyInvalidAfterRender(removedSaved);
+    removed.run.refreshApplyBar();
+    expect(removed.view()).toMatchObject({
+      tone: "",
+      title: "1 change needs a restart",
+      hint: "The bot goes offline for about 20 seconds while it restarts.",
+    });
   });
 
   test("the POST carries an AbortSignal, and the timer is cancelled when the request settles (#53)", async () => {
