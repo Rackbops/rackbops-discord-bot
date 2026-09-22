@@ -549,4 +549,8 @@
     margin-left: 0;
     white-space: normal;
   }
+  /* The container wraps (above); the badge pill itself must not break mid-word once it does. */
+  .plug__meta .rb-badge {
+    white-space: nowrap;
+  }
 }
