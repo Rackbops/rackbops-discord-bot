@@ -1321,7 +1321,13 @@
         const res = await api("/api/routing");
         routingData = await res.json();
       } catch (e) {
-        if (e && e.message === "unauthorized") return;
+        // Round-3 review finding: this branch returned without clearing inflight -- routeState survives a
+        // 401 (api() only clears the token and shows the gate; showApp/loadRouting never touch routeState),
+        // so re-logging in rebuilt this step from the SAME stuck inflight, permanently showing "Applying…"
+        // with every control disabled (renderRouteStatus's busy rule) until a hard page reload. The
+        // caller's own held-retry (sendRouting's finally, or checkAgain's .then) still runs on a plain
+        // return (only a throw would skip it), so clearing inflight here is the only piece missing.
+        if (e && e.message === "unauthorized") { st.inflight = null; return; }
         // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
       }
       const st2 = routeState.get(plugin);
@@ -1406,7 +1412,9 @@
             const r = await api("/api/routing");
             routingData = await r.json();
           } catch (e) {
-            if (e && e.message === "unauthorized") return;
+            // Same fix as awaitRequestResult's identical branch: a plain return here left inflight stuck
+            // (routeState outlives a 401/re-login), so this specific exit needs to clear it explicitly.
+            if (e && e.message === "unauthorized") { now.inflight = null; return; }
             // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
           }
           const now2 = routeState.get(plugin);

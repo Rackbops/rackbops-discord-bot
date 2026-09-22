@@ -9224,6 +9224,48 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(h.routeState.get("music")?.outcome).toEqual({ phase: "posted-error", message: "Couldn't send it: bot-ops: plugin-request failed" });
   });
 
+  // Round-3 review finding (a second finding, on top of the round-3 fixes above): a 401 mid-poll returned
+  // WITHOUT clearing inflight, in both awaitRequestResult (shared by sendRouting and checkAgain) and
+  // refreshDiscovery's own loop -- routeState is a module-level Map that survives a 401/re-login (api()
+  // only clears the token and shows the gate; showApp/loadRouting never touch routeState), so logging back
+  // in rebuilt the step from the SAME stuck inflight: permanently "Applying…", every control disabled,
+  // until a hard page reload. Matches the Apply bar's OWN established pattern (it resets its busy state on
+  // "unauthorized") which the routing code just didn't follow.
+  test("a 401 mid-poll clears inflight instead of leaving the step stuck forever (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-401" }) };
+        throw new Error("unauthorized"); // every poll GET hits an expired/rotated token
+      }) as never,
+    });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce -> POST -> inflight set -> poll scheduled
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    await h.clock.tick(); // the poll fires -> GET throws "unauthorized"
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // cleared, not stuck
+  });
+
+  test("refreshDiscovery clears inflight on a 401 mid-poll too (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-401" }) };
+        throw new Error("unauthorized");
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set
+    expect(h.routeState.get("music")?.inflight).not.toBeNull();
+    await h.clock.tick(); // the poll fires -> GET throws "unauthorized"
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // cleared, not stuck
+  });
+
   // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the
   // step's controls are disabled") was never implemented -- renderRouteStatus wrote status text but never
   // touched aria-busy or any control's .disabled. Seeds routingStepEls directly (buildWhereItLivesStep
