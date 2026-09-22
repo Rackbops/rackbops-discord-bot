@@ -9913,7 +9913,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     }
   });
 
-  test("refreshEnvPickers swaps in either direction, keeping a typed value as discovery becomes ready or stale", () => {
+  test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
     const plain = makeEl("input");
     // Round-2 claims-vs-code finding: this used to be "100", which also happens to be the canned
     // discovery's homeGuildId AND its only guild id -- a plausible bug (seeding the picker from
@@ -9930,21 +9930,37 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     expect(upgraded.dataset.key).toBe("DISCORD_SERVER_ID");
     expect(upgraded.value).toBe("999999999"); // the typed value survived the upgrade, not homeGuildId
 
-    // A control already in the needed picker shape is left alone.
+    // A control already in the picker shape is left alone -- never rebuilt/replaced.
     const already = registry.get("env-DISCORD_SERVER_ID")!;
     h.refreshEnvPickers();
     expect(registry.get("env-DISCORD_SERVER_ID")).toBe(already); // same object, not a new one
 
-    // A later stale/null discovery must fall back to a plain ID input, without discarding the typed id.
-    const staleSelect = makeEl("select");
-    staleSelect.value = "200";
-    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", staleSelect]]);
+    // Without a ready discovery, refreshEnvPickers is a no-op -- a plain field is never touched.
+    const stillPlain = makeEl("input");
+    stillPlain.value = "200";
+    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", stillPlain]]);
     const notReady = harness({ routing: null, discovery: null }, notReadyRegistry);
     notReady.refreshEnvPickers();
-    const downgraded = notReadyRegistry.get("env-DISCORD_SERVER_ID")!;
-    expect(downgraded.tagName).toBe("INPUT");
-    expect(downgraded.value).toBe("200");
-    expect(downgraded.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(notReadyRegistry.get("env-DISCORD_SERVER_ID")).toBe(stillPlain);
+    expect(stillPlain.tagName).toBe("INPUT");
+  });
+
+  // Round-3 review finding: a prior version of refreshEnvPickers ALSO downgraded an existing picker back
+  // to a plain input once discovery went stale/null on a LATER call -- reverted, since decision 6 was
+  // explicit and marked "Decided": a picker is never downgraded once discovery has gone stale again,
+  // since a control the operator may be mid-edit on must not be replaced out from under them. This test
+  // pins that a SECOND refreshEnvPickers() call, after discovery has gone stale, leaves an
+  // already-upgraded picker untouched -- distinct from the "no ready discovery from the start" no-op case
+  // above, which never had a picker to begin with.
+  test("refreshEnvPickers never downgrades an existing picker once discovery later goes stale", () => {
+    const picker = makeEl("select");
+    picker.value = "999999999"; // whatever the operator had chosen while discovery was ready
+    const registry = new Map([["env-DISCORD_SERVER_ID", picker]]);
+    const h = harness({ routing: null, discovery: null }, registry); // discovery has since gone stale/null
+    h.refreshEnvPickers();
+    expect(registry.get("env-DISCORD_SERVER_ID")).toBe(picker); // untouched -- same object
+    expect(picker.tagName).toBe("SELECT");
+    expect(picker.value).toBe("999999999");
   });
 });
 
@@ -10160,10 +10176,15 @@ describe("retryRegistration (#246, mini-harness)", () => {
 
   test("the marked functions are present", () => {
     expect(src).toContain("function firstPlacedPlugin(");
+    expect(src).toContain("function retryablePlacement(");
     expect(src).toContain("async function retryRegistration(");
   });
 
-  function harness(routingDataInit: unknown, pluginsData: unknown, model = { mode: "ready", rows: [] }) {
+  function harness(
+    routingDataInit: unknown,
+    pluginsData: unknown,
+    model: { mode: string; rows: unknown[] } | (() => { mode: string; rows: unknown[] }) = { mode: "ready", rows: [] },
+  ) {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const sendRoutingCalls: string[] = [];
     const ensureRouteStateCalls: string[] = [];
@@ -10171,7 +10192,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     let renderNeedsAttentionCalls = 0;
     const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); };
     const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); };
-    const routingStepModel = () => model;
+    const routingStepModel = () => typeof model === "function" ? model() : model;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
     const run = new Function(
@@ -10220,5 +10241,72 @@ describe("retryRegistration (#246, mini-harness)", () => {
     expect(h.ensureRouteStateCalls).toEqual([]);
     expect(h.sendRoutingCalls).toEqual([]);
     expect(h.serverActionState.has("retry")).toBe(false);
+  });
+
+  test("retryRegistration captures one ready model before rendering, never rechecking stale and serializing servers: {}", async () => {
+    let modelCalls = 0;
+    const h = harness(routed, pluginsData, () => {
+      modelCalls++;
+      return modelCalls === 1 ? { mode: "ready", rows: [] } : { mode: "stale", rows: [] };
+    });
+    await h.run.retryRegistration();
+    expect(modelCalls).toBe(1);
+    expect(h.ensureRouteStateCalls).toEqual(["music"]);
+    expect(h.sendRoutingCalls).toEqual(["music"]);
+  });
+});
+
+// Round-3 review finding: appendRetryControls' own three-way branch selection (button / "stale, wait for
+// Discord" note / "nothing placed, restart" note) had no dynamic coverage -- only retryablePlacedPlugin's
+// underlying logic was tested via retryRegistration, never the DOM branch this function draws from it.
+describe("appendRetryControls (#246, mini-harness)", () => {
+  interface FakeEl { tagName: string; textContent: string; className: string; type: string; disabled: boolean; children: FakeEl[]; appendChild: (c: FakeEl) => FakeEl; addEventListener: () => void; setAttribute: () => void }
+  function makeEl(tag: string): FakeEl {
+    const el: FakeEl = { tagName: tag.toUpperCase(), textContent: "", className: "", type: "", disabled: false, children: [], appendChild: (c) => (el.children.push(c), c), addEventListener: () => {}, setAttribute: () => {} };
+    return el;
+  }
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.slice(indexSrc.indexOf("function firstPlacedPlugin("), indexSrc.indexOf("// Decision 3's commands line"));
+
+  function harness(routingDataInit: unknown, pluginsData: unknown, model: { mode: string; rows: unknown[] }) {
+    const document = { createElement: (tag: string) => makeEl(tag) };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const routingStepModel = () => model;
+    const run = new Function(
+      "document", "pluginsData", "serverActionState", "routingStepModel", "retryRegistration",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { appendRetryControls };`,
+    )(document, pluginsData, serverActionState, routingStepModel, () => {}) as { appendRetryControls: (container: FakeEl) => void };
+    return run;
+  }
+
+  const pluginsData = { plugins: [{ name: "music" }] };
+  const placed = { routing: { plugins: { music: { servers: {} } } } };
+  const unplaced = { routing: { plugins: {} } };
+
+  test("a ready, placed plugin draws the Try again button", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("BUTTON");
+    expect(container.children[0]!.textContent).toBe("Try again");
+  });
+
+  test("a placed plugin with a stale model draws the 'wait for Discord' note, not the button", () => {
+    const h = harness(placed, pluginsData, { mode: "stale", rows: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Routing data is stale, so Try again is unavailable until Discord refreshes.");
+  });
+
+  test("nothing placed draws the restart sentence", () => {
+    const h = harness(unplaced, pluginsData, { mode: "ready", rows: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Nothing is placed yet, so there is nothing to re-send. Restart the bot (Overview) to retry.");
   });
 });

@@ -1657,10 +1657,11 @@
 
   // A stale snapshot is useful for display but cannot safely seed the selection a retry would send.
   // Retrying it as `{ servers: {} }` would clear an existing placement, so only a ready model is retryable.
-  function retryablePlacedPlugin() {
+  function retryablePlacement() {
     const name = firstPlacedPlugin();
     if (!name) return null;
-    return routingStepModel(name, routingData, Date.now()).mode === "ready" ? name : null;
+    const model = routingStepModel(name, routingData, Date.now());
+    return model.mode === "ready" ? { name, model } : null;
   }
 
   // Decision 4's "Try again": re-sends the first placed plugin's OWN saved placement (a no-op change --
@@ -1678,12 +1679,12 @@
     const key = "retry";
     const existing = serverActionState.get(key);
     if (existing && existing.busy) return;
-    const name = retryablePlacedPlugin();
-    if (!name) return; // no button is drawn in that state -- see appendRetryControls
+    const placement = retryablePlacement();
+    if (!placement) return; // no button is drawn in that state -- see appendRetryControls
     serverActionState.set(key, { busy: true, message: "Applying…" });
     renderServers();
-    ensureRouteState(name, routingStepModel(name, routingData, Date.now()));
-    await sendRouting(name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
+    ensureRouteState(placement.name, placement.model);
+    await sendRouting(placement.name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
     serverActionState.delete(key);
     renderServers();
     renderNeedsAttention();
@@ -1692,7 +1693,7 @@
   // Appended to a card wherever decision 3 calls for "+ Try again": the button when a plugin is placed
   // somewhere, the restart sentence when nothing is (retryRegistration would have nothing to resend).
   function appendRetryControls(container) {
-    if (retryablePlacedPlugin()) {
+    if (retryablePlacement()) {
       const st = serverActionState.get("retry");
       const btn = document.createElement("button");
       btn.type = "button";
@@ -2041,9 +2042,11 @@
 
   // Decision 4's one poller behind Add/Remove/Try again/Refresh from Discord: re-reads GET /api/routing
   // every ROUTING_POLL_MS until routing.results holds `id` or ROUTING_ANSWER_TIMEOUT_MS has passed.
-  // Never throws -- a transient read failure just tries again next tick; a 401 ends the wait the same way
-  // a timeout does (api() has already shown the gate by the time this returns). The fresh routingData is
-  // stored on every successful read, exactly like #245's own two pollers. Round-1 review finding,
+  // Never throws -- a transient read failure just tries again next tick. Round-3 review finding (stale
+  // comment): a 401 does NOT end the wait the same way a timeout does, not since round 2 -- it resolves
+  // { unauthorized: true }, a distinct outcome every caller checks BEFORE outcome.timeout, specifically so
+  // it is never folded into the "may be restarting… queued" timeout message (see that fix, below). The
+  // fresh routingData is stored on every successful read, exactly like #245's own two pollers. Round-1 review finding,
   // declined: two independent calls (e.g. Add on one server, Refresh from Discord) each reassign the
   // shared routingData on their own timer, so an out-of-order response could cause a transient render
   // flicker -- self-healing (the next tick on either one re-fetches and corrects), and the exact same
@@ -3130,13 +3133,21 @@
 
   // Swaps a plain id field and its live picker in place as discovery becomes ready or stale -- always
   // carrying the control's CURRENT value so an in-progress edit survives either transition.
+  // Round-3 review finding: a prior version of this function also downgraded an existing picker back to
+  // a plain input once discovery went stale -- reverted. Decision 6 is explicit and was marked "Decided
+  // -- not open for re-planning": upgrade a plain field to its picker in place once discovery becomes
+  // ready, "carrying the control's current value across ... never the other way: a picker is never
+  // downgraded back to a plain field once discovery has gone stale again, since a control the operator
+  // may be mid-edit on must not be replaced out from under them." Reversing that is a real design
+  // decision (stale picker OPTIONS vs. disrupting an in-progress edit), not a bug fix, and belongs in its
+  // own flagged discussion, not silently inside an unrelated round of review fixes.
   function refreshEnvPickers() {
-    const ready = discoveryReadyForPickers();
+    if (!discoveryReadyForPickers()) return;
     for (const key of ["DISCORD_SERVER_ID", "ANNOUNCE_CHANNEL_ID", "RELEASE_ANNOUNCE_CHANNEL_ID"]) {
       const existing = document.getElementById("env-" + key);
-      if (!existing || (ready && existing.tagName === "SELECT") || (!ready && existing.tagName === "INPUT")) continue;
+      if (!existing || existing.tagName === "SELECT") continue;
       const value = existing.value;
-      const control = ready ? buildPickerSelect(key, routingData.discovery, value) : buildEnvControl(key, value);
+      const control = buildPickerSelect(key, routingData.discovery, value);
       control.id = "env-" + key;
       control.dataset.key = key;
       existing.replaceWith(control);
