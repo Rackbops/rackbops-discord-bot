@@ -5241,7 +5241,7 @@ describe("Dockerfile COPY ratchet: every server.ts local import is copied into t
   });
 });
 
-// ---- #238: the panel shell (Rackbops theme, static assets, three tabs) --------------------------
+// ---- #238: the panel shell (Rackbops theme, static assets, four tabs since #246) ----------------
 
 // The page's stylesheets are served from an exact-match Map (HandlerConfig.assets), built at startup
 // from STATIC_ASSET_FILES -- the request path is only ever a key, never a filesystem path.
@@ -5816,21 +5816,24 @@ describe("tabs (lifted from index.html)", () => {
   test("a known hash opens its tab", () => {
     expect(tabFromHash("#overview")).toBe("overview");
     expect(tabFromHash("#plugins")).toBe("plugins");
+    expect(tabFromHash("#servers")).toBe("servers");
     expect(tabFromHash("#settings")).toBe("settings");
     expect(tabFromHash("plugins")).toBe("plugins"); // location.hash always has the '#', but the parse shouldn't need it
   });
 
   test("arrow keys wrap in both directions", () => {
     expect(nextTabId("overview", "ArrowRight")).toBe("plugins");
-    expect(nextTabId("plugins", "ArrowRight")).toBe("settings");
+    expect(nextTabId("plugins", "ArrowRight")).toBe("servers");
+    expect(nextTabId("servers", "ArrowRight")).toBe("settings");
     expect(nextTabId("settings", "ArrowRight")).toBe("overview");
-    expect(nextTabId("settings", "ArrowLeft")).toBe("plugins");
+    expect(nextTabId("settings", "ArrowLeft")).toBe("servers");
+    expect(nextTabId("servers", "ArrowLeft")).toBe("plugins");
     expect(nextTabId("plugins", "ArrowLeft")).toBe("overview");
     expect(nextTabId("overview", "ArrowLeft")).toBe("settings");
   });
 
   test("Home and End jump to the ends", () => {
-    for (const from of ["overview", "plugins", "settings"]) {
+    for (const from of ["overview", "plugins", "servers", "settings"]) {
       expect(nextTabId(from, "Home")).toBe("overview");
       expect(nextTabId(from, "End")).toBe("settings");
     }
@@ -5843,8 +5846,8 @@ describe("tabs (lifted from index.html)", () => {
   });
 });
 
-// The markup half of the tabs, and the guarantee that moving seven stacked sections under three tabs
-// lost nothing. Parsed from the real index.html (the page markup only -- not the script below it).
+// The markup half of the tabs, and the guarantee that moving the stacked sections under four tabs (#246
+// added Servers) lost nothing. Parsed from the real index.html (the page markup only -- not the script).
 describe("page skeleton", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const bodyStart = indexSrc.indexOf("<body>");
@@ -5861,8 +5864,8 @@ describe("page skeleton", () => {
   const panels = [...markup.matchAll(/<div\b[^>]*\brole="tabpanel"[^>]*>/g)].map((m) => attrs(m[0]));
 
   test("every tab controls an existing tabpanel", () => {
-    expect(tabs.length).toBe(3);
-    expect(panels.length).toBe(3);
+    expect(tabs.length).toBe(4);
+    expect(panels.length).toBe(4);
     for (const tab of tabs) {
       const panel = panels.find((p) => p.id === tab["aria-controls"]);
       expect({ tab: tab.id, panel: panel?.id }).toEqual({ tab: tab.id, panel: tab["aria-controls"] });
@@ -5891,20 +5894,24 @@ describe("page skeleton", () => {
   test("every original section id still exists exactly once, inside a tabpanel", () => {
     const inPanels = panelOfIds();
     // #244: plugin-admin-section is gone -- a plugin's own bundle mounts inside its card now.
-    for (const id of ["status-section", "plugins-section", "admins-section", "identity-section"]) {
+    // #246: attention-section and servers-section are new sections, pinned separately below.
+    for (const id of ["status-section", "plugins-section", "admins-section", "identity-section", "attention-section", "servers-section"]) {
       expect({ id, total: markup.split(`id="${id}"`).length - 1 }).toEqual({ id, total: 1 });
       expect({ id, inPanel: Boolean(inPanels.get(id)) }).toEqual({ id, inPanel: true });
     }
   });
 
   test("each section sits under the tab the issue names", () => {
-    // Overview: status, restart, logs. Plugins: the plugin list and plugin settings. Settings:
-    // config, admins, identity. (Logs and Config had no id before #238; they got one so this can say so.)
+    // Overview: needs-attention, status, restart, logs. Plugins: the plugin list and plugin settings.
+    // Servers: the Servers tab (#246). Settings: config, admins, identity. (Logs and Config had no id
+    // before #238; they got one so this can say so.)
     const inPanels = panelOfIds();
     const expected: Record<string, string> = {
+      "attention-section": "panel-overview",
       "status-section": "panel-overview",
       "logs-section": "panel-overview",
       "plugins-section": "panel-plugins",
+      "servers-section": "panel-servers",
       "config-section": "panel-settings",
       "admins-section": "panel-settings",
       "identity-section": "panel-settings",
@@ -5931,12 +5938,12 @@ describe("page skeleton", () => {
     expect(markup.split('class="rb-wordmark__spark" aria-hidden="true"').length - 1).toBe(sparks);
   });
 
-  test("the page has exactly one tablist, holding the three tabs, and the script's lookup of it matches", () => {
+  test("the page has exactly one tablist, holding the four tabs, and the script's lookup of it matches", () => {
     expect(markup.split('role="tablist"').length - 1).toBe(1);
     const list = markup.slice(markup.indexOf('role="tablist"'));
     const listEnd = list.indexOf("</nav>");
     const inside = [...list.slice(0, listEnd).matchAll(/\brole="tab"/g)].length;
-    expect(inside).toBe(3);
+    expect(inside).toBe(4);
     expect(indexSrc).toContain(`document.querySelector('[role="tablist"]')`);
   });
 
@@ -5980,9 +5987,11 @@ describe("page skeleton", () => {
       ['<div id="env-fields" class="adm-fields">', 1],
       ['class="banner-warn rb-alert rb-alert--danger"', 1],
       ['class="rb-tabstrip" role="tablist"', 1],
-      ['class="rb-tabpanel adm-panel"', 3],
-      ['class="rb-card"', 6], // six sections (#244: plugin-admin-section is gone -- a plugin's bundle mounts in its card)
-      ['class="rb-tabstrip__tab', 3], // the three tab buttons
+      ['class="rb-tabpanel adm-panel"', 4], // #246: a fourth panel, Servers
+      ['class="rb-card"', 7], // #244: plugin-admin-section is gone; #246 adds attention-section (servers-section carries "rb-card servers", a different fragment)
+      ['class="rb-tabstrip__tab', 4], // #246: the four tab buttons
+      ['class="rb-card servers"', 1], // #246: the Servers tab's own static section
+      ['id="tab-servers" aria-controls="panel-servers"', 1], // #246
       ['<main id="app" class="adm" hidden>', 1],
       ['class="adm-gate"', 1],
       ['class="rb-wordmark"', 2], // the gate's h1 and the app's
@@ -6000,10 +6009,10 @@ describe("page skeleton", () => {
       ['skip.className = "rb-btn rb-btn--sm";', 1],
       ['cancel.className = "rb-btn rb-btn--danger rb-btn--sm";', 1],
       ['add.className = "tag-add rb-input";', 1], // the chip editor's typing field
-      ['label.className = "rb-label";', 4], // a config field's label, plus #244's three card-field builders (stub, plain, secret)
-      ['control.className = "rb-select";', 2], // an enum select and the branch chooser
-      ['control.className = "rb-input";', 1], // a plain config field
-      ['notice.className = "adm-note adm-note--danger";', 1],
+      ['label.className = "rb-label";', 5], // a config field's label, #244's three card-field builders (stub, plain, secret), #246's Add-a-webhook label
+      ['control.className = "rb-select";', 3], // an enum select, the branch chooser, #246's server/channel picker
+      ['control.className = "rb-input";', 2], // a plain config field, plus #246's picker-branch stale/never-a-picker fallback
+      ['notice.className = "adm-note adm-note--danger";', 1], // #300 renamed the Config danger notice off the legacy hint class
       ['row.className = "admin-row";', 1],
       ['wrapper.className = "tag-field";', 1],
       ['sched.className = "sched";', 1],
@@ -6025,6 +6034,11 @@ describe("page skeleton", () => {
       ['fieldset.className = "route__channels";', 1],
       ['postSelect.className = "rb-select";', 1],
       ['badge.className = "rb-badge rb-badge--success";', 1], // the Live badge
+      // #246: the Servers tab and Needs-attention list.
+      ['card.className = "rb-card server";', 1],
+      ['card.className = "rb-card server route__row--off";', 1], // a server routing/webhooks still names but discovery does not
+      ['wrap.className = "server__add";', 1],
+      ['row.className = "attention__item";', 1],
     ];
     for (const [fragment, count] of expected) {
       expect({ fragment, found: indexSrc.split(fragment).length - 1 }).toEqual({ fragment, found: count });
@@ -6043,9 +6057,9 @@ describe("page skeleton", () => {
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
-      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING",
+      "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
     ];
-    expect(names.length).toBe(22);
+    expect(names.length).toBe(23);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -6094,8 +6108,9 @@ describe("page skeleton", () => {
     for (const gone of ["save-plugins", "save-env", "plugins-msg", "env-msg", "savePlugins", "saveEnv"]) {
       expect({ gone, found: indexSrc.includes(gone) }).toEqual({ gone, found: false });
     }
-    // The confirm() dialogs that stay: removing an admin, an update action, Restart. None is in the bar.
-    expect((indexSrc.match(/\bconfirm\(/g) ?? []).length).toBe(3);
+    // The confirm() dialogs that stay: removing an admin, an update action, Restart, #246's webhook
+    // Remove. None is in the bar.
+    expect((indexSrc.match(/\bconfirm\(/g) ?? []).length).toBe(4);
     expect(applyBlock("APPLY")).not.toContain("confirm(");
     expect(applyBlock("APPLY_PLAN")).not.toContain("confirm(");
   });
@@ -6133,7 +6148,7 @@ describe("page skeleton", () => {
     const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
     expect(renderEnvFields.length).toBeGreaterThan(500);
     expect(renderEnvFields).toContain('if (key === "PLUGINS") continue;');
-    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, required)"));
+    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, required, pickerKeysShown.has(key))"));
     expect(renderEnvFields).toContain('source === "plugin"');
     expect(renderEnvFields).toContain("pluginKeys.has(key)");
   });
@@ -6568,7 +6583,7 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     let settingEls: RC[] = [el({ value: oldEnv.A ?? "", dataset: { settingKey: "A" } })];
     let boxEls: RC[] = oldPlugins.map((p) => el({ checked: p.enabled, dataset: { plugin: p.name } }));
     const secretEls: RC[] = [];
-    const calls = { renderPlugins: 0, renderEnvFields: 0 };
+    const calls = { renderPlugins: 0, renderEnvFields: 0, renderServers: 0, renderNeedsAttention: 0 };
     const plugsListEl = errEl();
     const envFieldsEl = errEl();
     const document = {
@@ -6596,11 +6611,20 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     };
     const src = applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
     const refreshApplyBar = () => {};
+    // #246: reloadConfig calls renderServers() and renderNeedsAttention() after renderEnvFields();
+    // browser-only, out of this stub page's scope (same reasoning as
+    // loadBranches/renderPlugins/renderEnvFields themselves). Call-COUNTED, not just a no-op stub: a
+    // real-Chrome finding (loadRouting and reloadConfig fire concurrently from showApp; only rendering
+    // the Servers tab from loadRouting's own tail left it drawn against a still-null pluginsData
+    // whenever reloadConfig's fetch was the slower of the two) needs this call pinned here, since no
+    // OTHER test in this file drives reloadConfig with a populated pluginsData/routingData pair.
+    const renderServers = () => { calls.renderServers++; };
+    const renderNeedsAttention = () => { calls.renderNeedsAttention++; };
     const { reloadConfig, setRereading } = new Function(
-      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema",
+      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderServers", "renderNeedsAttention",
       `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
         "return { reloadConfig, setRereading: (v) => { applyRereading = v; } };",
-    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}) as {
+    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderServers, renderNeedsAttention) as {
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
       setRereading: (v: boolean) => void;
     };
@@ -6613,6 +6637,12 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     kept.settingEls()[0]!.value = "typed"; // the user edited it
     await kept.reloadConfig();
     expect(kept.calls.renderEnvFields).toBe(1);
+    // #246: renderServers/renderNeedsAttention run on EVERY reloadConfig, not only loadRouting's own tail
+    // -- real-Chrome verification found the Servers tab rendered "No plugin lives here" on every card
+    // when reloadConfig's own /api/plugins fetch settled AFTER loadRouting's, since only loadRouting
+    // called renderServers() before this fix.
+    expect(kept.calls.renderServers).toBe(1);
+    expect(kept.calls.renderNeedsAttention).toBe(1);
     expect(kept.settingEls()[0]!.value).toBe("typed"); // survived the reload
 
     // A Discard run: applyRereading is true (rereadFromServer set it before calling the aliases) -> keepEdits defaults false.
@@ -8663,7 +8693,7 @@ describe("syncTagValue (#257)", () => {
 
 // The DOM half of the tabs (showTab + the click / keydown / hashchange wiring), lifted from index.html
 // between TABS_DOM markers together with the pure TABS block, and run against a hand-made page:
-// three tab buttons, three panels, and spies for history.replaceState and the listeners.
+// four tab buttons, four panels (#246 adds Servers), and spies for history.replaceState and the listeners.
 describe("tabs DOM wiring (lifted from index.html)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const tabsSrc = indexSrc.match(/\/\/ TABS:begin\n([\s\S]*?)\n\s*\/\/ TABS:end/)?.[1];
@@ -8688,7 +8718,7 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
   type KeyEvent = { key: string; altKey: boolean; ctrlKey: boolean; metaKey: boolean; shiftKey: boolean; target: Tab; prevented: boolean; preventDefault(): void };
 
   function page(hash = "") {
-    const ids = ["overview", "plugins", "settings"];
+    const ids = ["overview", "plugins", "servers", "settings"];
     const tabs: Tab[] = ids.map((id) => {
       const el: Tab = {
         id: `tab-${id}`,
@@ -8766,10 +8796,10 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
   test("showTab opens exactly one tab and one panel, and writes the hash with replaceState", () => {
     const p = page();
     p.api.showTab("plugins", false);
-    expect(p.tabs.map((t) => t.attrs["aria-selected"])).toEqual(["false", "true", "false"]);
-    expect(p.tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1]); // roving tabindex
-    expect(p.tabs.map((t) => t.classes.has("rb-tabstrip__tab--active"))).toEqual([false, true, false]);
-    expect(p.panels.map((x) => x.hidden)).toEqual([true, false, true]);
+    expect(p.tabs.map((t) => t.attrs["aria-selected"])).toEqual(["false", "true", "false", "false"]);
+    expect(p.tabs.map((t) => t.tabIndex)).toEqual([-1, 0, -1, -1]); // roving tabindex
+    expect(p.tabs.map((t) => t.classes.has("rb-tabstrip__tab--active"))).toEqual([false, true, false, false]);
+    expect(p.panels.map((x) => x.hidden)).toEqual([true, false, true, true]);
     // replaceState (no scroll, no history entry), with the bare hash as the URL.
     expect(p.replaced).toEqual([[null, "", "#plugins"]]);
   });
@@ -8779,19 +8809,19 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     p.api.showTab("plugins", false);
     p.api.showTab("overview", false);
     expect(p.shownCalls).toEqual(["plugins", "overview"]);
-    // ... and only once the target panel is shown and the others hidden (overview, plugins, settings).
+    // ... and only once the target panel is shown and the others hidden (overview, plugins, servers, settings).
     expect(p.hiddenAtCall).toEqual([
-      [true, false, true],
-      [false, true, true],
+      [true, false, true, true],
+      [false, true, true, true],
     ]);
   });
 
   test("showTab moves focus only when asked", () => {
     const p = page();
     p.api.showTab("settings", true);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 1]);
     p.api.showTab("plugins", false);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 1]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 1]);
   });
 
   test("a click on a tab opens it, without moving focus", () => {
@@ -8799,7 +8829,7 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     p.handlers.click!({ target: p.tabs[1] });
     expect(p.open()).toEqual(["tab-plugins"]);
     expect(p.shown()).toEqual(["panel-plugins"]);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 0, 0, 0]);
     // A click that isn't on a tab (target.closest -> null) does nothing.
     p.handlers.click!({ target: { closest: () => null } });
     expect(p.open()).toEqual(["tab-plugins"]);
@@ -8809,14 +8839,14 @@ describe("tabs DOM wiring (lifted from index.html)", () => {
     const p = page();
     expect(p.key(p.tabs[0]!, "ArrowRight").prevented).toBe(true);
     expect(p.open()).toEqual(["tab-plugins"]);
-    expect(p.tabs.map((t) => t.focused)).toEqual([0, 1, 0]);
+    expect(p.tabs.map((t) => t.focused)).toEqual([0, 1, 0, 0]);
     p.key(p.tabs[1]!, "End");
     expect(p.open()).toEqual(["tab-settings"]);
-    p.key(p.tabs[2]!, "ArrowRight"); // wraps
+    p.key(p.tabs[3]!, "ArrowRight"); // wraps
     expect(p.open()).toEqual(["tab-overview"]);
     p.key(p.tabs[0]!, "ArrowLeft"); // wraps back
     expect(p.open()).toEqual(["tab-settings"]);
-    p.key(p.tabs[2]!, "Home");
+    p.key(p.tabs[3]!, "Home");
     expect(p.open()).toEqual(["tab-overview"]);
     expect(p.replaced.map((r) => r[2])).toEqual(["#plugins", "#settings", "#overview", "#settings", "#overview"]);
   });
@@ -9150,6 +9180,342 @@ describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
   });
 });
 
+// #246: pure parts of the Servers tab, the Needs-attention list, and the picker fallback.
+describe("SERVERS_TAB (#246): pure parts", () => {
+  const src = applyBlock("SERVERS_TAB");
+  type CommandsState = { state: "live" | "refused" | "unregistered" | "single-mode"; registered?: number; at?: string; error?: string };
+  type PluginHere = { name: string; scope: "all" | string[]; postsTo: string | null; webhook: "none" | "ok" | "broken"; byDefault: boolean };
+  type WebhookRow = { channelId: string; channelName: string | null; addedAt: string; addedBy: string; broken?: string };
+  type ServerCardModel = { id: string; name: string; home: boolean; commands: CommandsState; plugins: PluginHere[]; webhooks: WebhookRow[] };
+  type NeedsAttentionItem = { kind: string; text: string; fix: { label: string; go: string } };
+  type PickerOption = { value: string; label: string; group?: string };
+  const fns = new Function(
+    `"use strict";\n${src}\nreturn { routedMode, serverCardModel, unavailableServers, needsAttention, pickerOptions, serversStatusMessage };`,
+  )() as {
+    routedMode: (routing: unknown) => boolean;
+    serverCardModel: (guild: unknown, routingData: unknown, pluginsData: unknown) => ServerCardModel;
+    unavailableServers: (routingData: unknown) => { id: string; plugins: string[]; webhooks: string[] }[];
+    needsAttention: (input: unknown) => NeedsAttentionItem[];
+    pickerOptions: (key: string, discovery: unknown, value: string) => PickerOption[];
+    serversStatusMessage: (
+      discoveryState: { busy: boolean; message: string | null } | undefined,
+      copyState: { busy: boolean; message: string | null } | undefined,
+      loadError: string | undefined,
+    ) => string;
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toBeTruthy();
+    expect(src).toContain("function serverCardModel(");
+  });
+
+  // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed;
+  // see this plan's "What the data says").
+  const HOME = "10000", OTHER = "20000", THIRD = "30000", GONE = "99999";
+  const GEN_CH = "10001", SP_CH = "10002", AN_CH = "10003", OTHER_CH = "20001", GONE_CH = "99998";
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:30:00.000Z",
+    bot: { id: "40000", username: "bot" },
+    inviteUrl: "https://discord.com/invite-url",
+    homeGuildId: HOME,
+    guilds: [
+      {
+        id: HOME,
+        name: "Home",
+        channels: [
+          { id: GEN_CH, name: "general", canSend: true },
+          { id: SP_CH, name: "spotify", canSend: true },
+          { id: AN_CH, name: "announcements", canSend: false },
+        ],
+        commands: { registered: 3, at: "2026-09-22T11:30:00.000Z" },
+      },
+      { id: OTHER, name: "Other", channels: [{ id: OTHER_CH, name: "chat", canSend: true }], commands: { registered: 0, error: "Missing Access (50001)", at: "t" } },
+      { id: THIRD, name: "Third", channels: [], commands: null },
+    ],
+    plugins: { music: { posts: true, commands: ["rsetlist"] }, wow: { posts: false, commands: ["rgear"] } },
+  };
+  const routing = {
+    v: 1 as const,
+    updatedAt: "t",
+    updatedBy: "admin",
+    plugins: {
+      music: { servers: { [HOME]: { commands: [SP_CH], postTo: AN_CH }, [GONE]: { commands: "all" as const } } },
+      wow: { servers: { [OTHER]: { commands: "all" as const } } },
+    },
+    webhooks: {
+      [AN_CH]: { id: AN_CH, guildId: HOME, addedAt: "2026-09-01T00:00:00.000Z", addedBy: "admin@example.com" },
+      [GEN_CH]: { id: GEN_CH, guildId: HOME, addedAt: "2026-09-02T00:00:00.000Z", addedBy: "admin@example.com", broken: "410 Unknown Webhook" },
+      [GONE_CH]: { id: GONE_CH, guildId: GONE, addedAt: "2026-09-03T00:00:00.000Z", addedBy: "admin@example.com" },
+    },
+    results: [] as { id: string; action: string; ok: boolean; reason?: string; at: string }[],
+  };
+  const routingData = { routing, discovery };
+  const routingDataUnrouted = { routing: { ...routing, plugins: {} }, discovery };
+  const pluginsData = {
+    plugins: [
+      { name: "music", enabled: true, missingEnv: ["SPOTIFY_CLIENT_SECRET"] },
+      { name: "wow", enabled: true, missingEnv: [] as string[] },
+      { name: "warbandeer", enabled: false, missingEnv: [] as string[] },
+    ],
+  };
+
+  test("routedMode: false with no plugins placed, true with one", () => {
+    expect(fns.routedMode(routingDataUnrouted.routing)).toBe(false);
+    expect(fns.routedMode(routing)).toBe(true);
+    expect(fns.routedMode(null)).toBe(false);
+    expect(fns.routedMode({ ...routing, plugins: {} })).toBe(false);
+  });
+
+  test("serverCardModel: commands live / refused / unregistered (routed) / single-mode (unrouted)", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.commands).toEqual({ state: "live", registered: 3, at: "2026-09-22T11:30:00.000Z" });
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.commands).toEqual({ state: "refused", error: "Missing Access (50001)" });
+    const third = fns.serverCardModel(discovery.guilds[2], routingData, pluginsData);
+    expect(third.commands).toEqual({ state: "unregistered" });
+    const thirdUnrouted = fns.serverCardModel(discovery.guilds[2], routingDataUnrouted, pluginsData);
+    expect(thirdUnrouted.commands).toEqual({ state: "single-mode" });
+  });
+
+  test("serverCardModel: plugins here — placed by scope and post target with webhook state, and the home card lists unplaced plugins by default", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.home).toBe(true);
+    const music = home.plugins.find((p) => p.name === "music");
+    expect(music).toEqual({ name: "music", scope: ["spotify"], postsTo: "announcements", webhook: "ok", byDefault: false });
+    const warbandeer = home.plugins.find((p) => p.name === "warbandeer");
+    expect(warbandeer).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
+    expect(home.plugins.find((p) => p.name === "wow")).toBeUndefined(); // placed, but not here, and not byDefault (home only lists UNPLACED plugins that way)
+
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.home).toBe(false);
+    expect(other.plugins).toEqual([{ name: "wow", scope: "all", postsTo: null, webhook: "none", byDefault: false }]);
+    expect(other.plugins.find((p) => p.name === "warbandeer")).toBeUndefined(); // byDefault is home-only WHEN a home server is configured
+
+    // A plugin whose postTo points at the BROKEN webhook (GEN_CH) reads webhook: "broken", not "ok" --
+    // distinguishes the broken-webhook case from a healthy one (mutation M4 of this plan's own testing).
+    const brokenPostRouting = { ...routing, plugins: { ...routing.plugins, music: { servers: { [HOME]: { commands: [SP_CH], postTo: GEN_CH } } } } };
+    const homeBrokenPost = fns.serverCardModel(discovery.guilds[0], { routing: brokenPostRouting, discovery }, pluginsData);
+    expect(homeBrokenPost.plugins.find((p) => p.name === "music")).toEqual({ name: "music", scope: ["spotify"], postsTo: "general", webhook: "broken", byDefault: false });
+  });
+
+  // Round-1 review finding: with NO home server configured (DISCORD_SERVER_ID unset, homeGuildId null),
+  // src/routing/resolve.ts's pluginsForGuild registers an unplaced plugin in EVERY guild, not nowhere --
+  // `home` alone (homeId === guild.id) is false for every guild when homeId is null, so byDefault plugins
+  // used to never appear on ANY card in that configuration.
+  test("serverCardModel: with no home server configured, every card lists unplaced plugins by default, not just one", () => {
+    const noHomeDiscovery = { ...discovery, homeGuildId: null };
+    const noHomeData = { routing, discovery: noHomeDiscovery };
+    const homeCard = fns.serverCardModel(noHomeDiscovery.guilds[0], noHomeData, pluginsData);
+    expect(homeCard.home).toBe(false); // this guild is no longer THE home -- there isn't one
+    expect(homeCard.plugins.find((p) => p.name === "warbandeer")).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
+    const otherCard = fns.serverCardModel(noHomeDiscovery.guilds[1], noHomeData, pluginsData);
+    expect(otherCard.plugins.find((p) => p.name === "warbandeer")).toEqual({ name: "warbandeer", scope: "all", postsTo: null, webhook: "none", byDefault: true });
+  });
+
+  test("serverCardModel: webhooks under their server by channel name, a vanished channel by id, broken carried", () => {
+    const home = fns.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.webhooks).toHaveLength(2);
+    expect(home.webhooks.find((w) => w.channelId === AN_CH)).toEqual({ channelId: AN_CH, channelName: "announcements", addedAt: "2026-09-01T00:00:00.000Z", addedBy: "admin@example.com" });
+    expect(home.webhooks.find((w) => w.channelId === GEN_CH)).toEqual({ channelId: GEN_CH, channelName: "general", addedAt: "2026-09-02T00:00:00.000Z", addedBy: "admin@example.com", broken: "410 Unknown Webhook" });
+    const other = fns.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.webhooks).toEqual([]);
+  });
+
+  test("unavailableServers: a server only routing or a webhook names, with what it still holds", () => {
+    const gone = fns.unavailableServers(routingData);
+    expect(gone).toHaveLength(1);
+    expect(gone[0]!.id).toBe(GONE);
+    expect(gone[0]!.plugins).toEqual(["music"]);
+    expect(gone[0]!.webhooks).toEqual([GONE_CH]);
+    expect(fns.unavailableServers({ routing: null, discovery })).toEqual([]);
+    // routingDataUnrouted drops every PLUGIN placement but keeps the webhooks -- GONE_CH's webhook still
+    // names GONE, so the server itself is still unavailable, just with no plugin still placed there.
+    expect(fns.unavailableServers(routingDataUnrouted)).toEqual([{ id: GONE, plugins: [], webhooks: [GONE_CH] }]);
+  });
+
+  const status = { outdatedFiles: ["bot-ops.sh"] };
+  const statusClean = {};
+  const env = { ANNOUNCE_CHANNEL_ID: AN_CH, DISCORD_SERVER_ID: "" };
+  const schema = {
+    ANNOUNCE_CHANNEL_ID: { required: true },
+    DISCORD_SERVER_ID: { required: false },
+    SPOTIFY_CLIENT_SECRET: { required: false, source: "plugin" },
+  };
+  const discoveryHomeGone = { ...discovery, homeGuildId: "77777" };
+
+  test("needsAttention: each kind from canned data, in order, and the empty line from none", () => {
+    const items = fns.needsAttention({
+      status, plugins: pluginsData.plugins, routingData: { routing, discovery: discoveryHomeGone }, env, schema,
+      labelOf: (key: string) => key,
+    });
+    const kinds = items.map((i) => i.kind);
+    expect(kinds).toEqual(["missing-setting", "commands-refused", "commands-unregistered", "webhook-broken", "home-missing", "outdated-files"]);
+    expect(items[0]).toEqual({ kind: "missing-setting", text: "music needs SPOTIFY_CLIENT_SECRET", fix: { label: "Fill it in", go: "plugins-card:music" } });
+    expect(items.find((i) => i.kind === "commands-refused")!.text).toBe("Other: Discord refused the bot's commands (Missing Access (50001))");
+    expect(items.find((i) => i.kind === "commands-unregistered")!.text).toBe("Third: commands were never registered");
+    expect(items.find((i) => i.kind === "webhook-broken")!.text).toBe("#general in Home: its webhook stopped working (410 Unknown Webhook)");
+    expect(items.find((i) => i.kind === "home-missing")!.text).toBe("The home server (77777) is not one the bot is in, so every plugin nobody has placed is registered nowhere");
+    expect(items.find((i) => i.kind === "outdated-files")!.text).toBe("bot-ops.sh is out of date on this instance");
+
+    expect(fns.needsAttention({ status: statusClean, plugins: [], routingData: { routing: null, discovery: null }, env: {}, schema: {}, labelOf: (k: string) => k })).toEqual([]);
+  });
+
+  test("needsAttention: commands-unregistered only in routed mode; outdated-files one item per file", () => {
+    const unrouted = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: routingDataUnrouted, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    expect(unrouted.some((i) => i.kind === "commands-unregistered")).toBe(false); // THIRD's null commands is normal single-mode, not a problem
+
+    const twoFiles = fns.needsAttention({
+      status: { outdatedFiles: ["bot-ops.sh", "docker-compose.yml"] }, plugins: [], routingData: { routing: null, discovery: null }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    expect(twoFiles.map((i) => i.text)).toEqual(["bot-ops.sh is out of date on this instance", "docker-compose.yml is out of date on this instance"]);
+  });
+
+  // Orchestrator finding: the canned `discovery` above happens to list OTHER (refused) before THIRD
+  // (unregistered) already, so a single guild-order pass and the correct two-pass fix produce the SAME
+  // order there -- this test reverses the guild order specifically so only the two-pass fix (commands-
+  // refused fully emitted before commands-unregistered starts) gets it right; a single pass emits them
+  // interleaved in guild order instead.
+  test("needsAttention: commands-refused precedes commands-unregistered regardless of guild order", () => {
+    const reversedOrder = { ...discovery, guilds: [discovery.guilds[2]!, discovery.guilds[1]!, discovery.guilds[0]!] }; // Third, Other, Home
+    const routedNoWebhooks = { ...routing, webhooks: {} }; // isolate this test to the two commands kinds
+    const items = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: routedNoWebhooks, discovery: reversedOrder }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    const kinds = items.map((i) => i.kind);
+    expect(kinds.indexOf("commands-refused")).toBeLessThan(kinds.indexOf("commands-unregistered"));
+    expect(kinds).toEqual(["commands-refused", "commands-unregistered"]);
+  });
+
+  // Orchestrator finding (minor 8): "Add it again" -> Servers used to be the fix for EVERY broken
+  // webhook, including one whose guild the bot has since left -- that server's card
+  // (buildUnavailableServerCard) draws no add-webhook form, so the fix was a dead end. A vanished-guild
+  // broken webhook now gets its own explanatory, non-actionable item instead.
+  test("needsAttention: a broken webhook whose guild the bot has left gets an explanatory item, not a dead-end fix", () => {
+    const brokenGoneWebhook = { ...routing.webhooks, [GONE_CH]: { ...routing.webhooks[GONE_CH]!, broken: "404 Unknown Channel" } };
+    const items = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: { ...routing, webhooks: brokenGoneWebhook }, discovery }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    const goneItem = items.find((i) => i.kind === "webhook-broken" && i.text.indexOf(GONE) !== -1);
+    expect(goneItem).toEqual({
+      kind: "webhook-broken",
+      text: "A webhook in server 99999 stopped working (404 Unknown Channel); the bot has left that server, so the webhook is removed when the server's dropped placement clears",
+      fix: { label: "Nothing to do here", go: "none" },
+    });
+    // Still-present guild's own broken webhook (GEN_CH, in Home) keeps the original actionable fix.
+    const homeItem = items.find((i) => i.kind === "webhook-broken" && i.text.indexOf("general") !== -1);
+    expect(homeItem).toEqual({
+      kind: "webhook-broken",
+      text: "#general in Home: its webhook stopped working (410 Unknown Webhook)",
+      fix: { label: "Add it again", go: "servers" },
+    });
+  });
+
+  // Orchestrator finding (minor 1): the required-core-key loop (as opposed to a plugin's OWN missingEnv,
+  // already covered above) had no test driving it at all.
+  test("needsAttention: a required core key left blank is its own missing-setting item", () => {
+    const items = fns.needsAttention({
+      status: statusClean,
+      plugins: [],
+      routingData: { routing: null, discovery: null },
+      env: { ANNOUNCE_CHANNEL_ID: "" },
+      schema: { ANNOUNCE_CHANNEL_ID: { required: true, source: "core" } },
+      labelOf: (k: string) => k,
+    });
+    expect(items).toEqual([{ kind: "missing-setting", text: "ANNOUNCE_CHANNEL_ID is required and blank", fix: { label: "Set it", go: "settings" } }]);
+    // A non-blank value, or a plugin-owned key (already surfaced via missingEnv, never duplicated here),
+    // never adds a second item for the same key.
+    const filled = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: null, discovery: null },
+      env: { ANNOUNCE_CHANNEL_ID: "123" }, schema: { ANNOUNCE_CHANNEL_ID: { required: true, source: "core" } }, labelOf: (k: string) => k,
+    });
+    expect(filled).toEqual([]);
+    const pluginOwned = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: null, discovery: null },
+      env: { SPOTIFY_CLIENT_SECRET: "" }, schema: { SPOTIFY_CLIENT_SECRET: { required: true, source: "plugin" } }, labelOf: (k: string) => k,
+    });
+    expect(pluginOwned).toEqual([]);
+  });
+
+  test("pickerOptions: server and channel options, grouping, cannot-post suffix, an unknown stored value kept", () => {
+    // Orchestrator finding: pickerOptions takes the CONTROL KIND ("server"/"channel", FIELD_META[key].control),
+    // never the literal key name -- keeps it pure/testable without FIELD_META in scope, and means a future
+    // control:"channel" key (not just ANNOUNCE_CHANNEL_ID/RELEASE_ANNOUNCE_CHANNEL_ID) gets channel options
+    // automatically. See the buildEnvControl pickers mini-harness for the FIELD_META-driven wiring itself.
+    const serverOpts = fns.pickerOptions("server", discovery, "");
+    expect(serverOpts[0]).toEqual({ value: "", label: "— none: register globally —" });
+    expect(serverOpts.slice(1)).toEqual([{ value: HOME, label: "Home" }, { value: OTHER, label: "Other" }, { value: THIRD, label: "Third" }]);
+
+    const channelOpts = fns.pickerOptions("channel", discovery, "");
+    expect(channelOpts[0]).toEqual({ value: "", label: "— default —" });
+    expect(channelOpts.find((o) => o.value === GEN_CH)).toEqual({ value: GEN_CH, label: "#general", group: "Home" });
+    expect(channelOpts.find((o) => o.value === AN_CH)).toEqual({ value: AN_CH, label: "#announcements · the bot can't post here", group: "Home" });
+    expect(channelOpts.find((o) => o.value === OTHER_CH)).toEqual({ value: OTHER_CH, label: "#chat", group: "Other" });
+
+    const withUnknown = fns.pickerOptions("channel", discovery, "888888888888888888");
+    expect(withUnknown[withUnknown.length - 1]).toEqual({ value: "888888888888888888", label: "888888888888888888 (not visible to the bot)" });
+    // A stored value that DOES match an option is never duplicated as an extra trailing entry.
+    const withKnown = fns.pickerOptions("channel", discovery, GEN_CH);
+    expect(withKnown.filter((o) => o.value === GEN_CH)).toHaveLength(1);
+  });
+
+  // Orchestrator round 2 (MAJOR): the previous status-message chain placed a "Copied." confirmation ABOVE
+  // a settled discovery message, so a Refresh-from-Discord refusal (or timeout, or "Couldn't send it")
+  // was silently masked by a leftover "Copied." from an earlier Copy-invite-link click -- on the very
+  // path the commands-refused fix sends the operator down ("Re-invite, then try again" -> Copy, then
+  // Refresh). A settled discovery outcome must win.
+  test("serversStatusMessage: a settled discovery outcome outranks a leftover Copied.; copy shows only when nothing else has", () => {
+    const copied = { busy: false, message: "Copied." };
+    const refusal = { busy: false, message: "The bot refused it: Discord refused the refresh" };
+    // The regression itself: copy present AND a settled discovery refusal -> the refusal wins.
+    expect(fns.serversStatusMessage(refusal, copied, undefined)).toBe("The bot refused it: Discord refused the refresh");
+    // A busy refresh in flight also wins over copy (unchanged from before).
+    expect(fns.serversStatusMessage({ busy: true, message: "Refreshing…" }, copied, undefined)).toBe("Refreshing…");
+    // The retained-stale-snapshot warning also outranks a leftover copy.
+    expect(fns.serversStatusMessage(undefined, copied, "read failed")).toBe("Couldn't read where plugins live: read failed");
+    // A discovery message outranks the load-error fallback.
+    expect(fns.serversStatusMessage(refusal, undefined, "read failed")).toBe("The bot refused it: Discord refused the refresh");
+    // Copy shows only when there is no discovery message and no load error.
+    expect(fns.serversStatusMessage(undefined, copied, undefined)).toBe("Copied.");
+    // Nothing anywhere -> empty.
+    expect(fns.serversStatusMessage(undefined, undefined, undefined)).toBe("");
+  });
+});
+
+// #246: selectionFromModel was extracted out of #245's ensureRouteState (Step 1) -- pinned separately so
+// the extraction is provably behavior-preserving, against the same canned rows #245's own
+// routingStepModel test already established.
+describe("selectionFromModel (#246, extracted from ensureRouteState)", () => {
+  const src = applyBlock("PLUGIN_ROUTING");
+  const fns = new Function(`"use strict";\n${src}\nreturn { selectionFromModel };`)() as {
+    selectionFromModel: (model: { rows: { id: string; on: boolean; commands: "all" | string[]; postTo: string | null }[] }) => Record<string, unknown>;
+  };
+
+  test("the marked block is present", () => {
+    expect(src).toContain("function selectionFromModel(");
+  });
+
+  test("one entry per ticked row; scope/channels from whether commands is a list; postTo carried as-is", () => {
+    const model = {
+      rows: [
+        { id: "1", on: true, commands: "all" as const, postTo: null },
+        { id: "2", on: true, commands: ["a", "b"], postTo: "a" },
+        { id: "3", on: false, commands: "all" as const, postTo: null },
+      ],
+    };
+    expect(fns.selectionFromModel(model)).toEqual({
+      "1": { on: true, scope: "all", channels: [], postTo: null },
+      "2": { on: true, scope: "chosen", channels: ["a", "b"], postTo: "a" },
+    });
+  });
+
+  test("no ticked rows -> an empty selection", () => {
+    expect(fns.selectionFromModel({ rows: [] })).toEqual({});
+  });
+});
+
 // #245: source-pin tests -- what #244's equivalent pins do (see "a secret's value stays in one password
 // field", earlier), for the properties no data-level test can see: which DOM attributes a control carries,
 // and where one function's call sits relative to another's.
@@ -9196,6 +9562,62 @@ describe("Choose where it lives: source pins (#245)", () => {
     // real-Chrome verification: the badge showed no digit at all once loadRouting's first poll landed).
     const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
     expect(stepSlice).toContain('className: "step__num", textContent: "2"');
+  });
+
+  test("a failed routing read is visible on the retained placement instead of looking freshly loaded (source pin)", () => {
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    expect(stepSlice).toContain("if (routingData && routingData.loadError)");
+    expect(stepSlice).toContain('loadError.textContent = "Couldn\'t read where plugins live: " + routingData.loadError;');
+  });
+});
+
+// #245 follow-up, found after merge: a transient GET /api/routing failure must retain the last good
+// routing/discovery snapshot and mark it with loadError. Replacing it with null/null made every card say
+// the bot had never published discovery, erasing useful stale state and contradicting decision 8.
+describe("loadRouting preserves the last good snapshot (#245 follow-up)", () => {
+  const src = applyIndexSrc.slice(
+    applyIndexSrc.indexOf("async function loadRouting("),
+    applyIndexSrc.indexOf("// Redraws every card's step FRESH", applyIndexSrc.indexOf("async function loadRouting(")),
+  );
+
+  function harness(initial: unknown) {
+    const calls = { steps: 0, servers: 0, pickers: 0, attention: 0 };
+    const api = async () => { throw new Error("temporary routing outage"); };
+    const refreshRoutingSteps = () => { calls.steps++; };
+    const renderServers = () => { calls.servers++; };
+    const refreshEnvPickers = () => { calls.pickers++; };
+    const renderNeedsAttention = () => { calls.attention++; };
+    // loadRouting clears the transient "Copied." confirmation on every load (orchestrator round 2).
+    const serverActionState = new Map<string, unknown>();
+    return {
+      calls,
+      serverActionState,
+      run: new Function(
+        "api", "refreshRoutingSteps", "renderServers", "refreshEnvPickers", "renderNeedsAttention", "serverActionState",
+        `"use strict";\nlet routingData = ${JSON.stringify(initial)};\n${src}\nreturn { loadRouting, getRoutingData: () => routingData };`,
+      )(api, refreshRoutingSteps, renderServers, refreshEnvPickers, renderNeedsAttention, serverActionState) as {
+        loadRouting: () => Promise<void>;
+        getRoutingData: () => unknown;
+      },
+    };
+  }
+
+  test("a transient failure retains prior routing and discovery and marks them stale", async () => {
+    const previous = { routing: { plugins: { music: { servers: {} } }, webhooks: {}, results: [] }, discovery: { generatedAt: "2026-09-22T00:00:00.000Z", guilds: [] } };
+    const h = harness(previous);
+    h.serverActionState.set("copy", { busy: false, message: "Copied." });
+    await h.run.loadRouting();
+    expect(h.run.getRoutingData()).toEqual({ ...previous, loadError: "temporary routing outage" });
+    expect(h.calls).toEqual({ steps: 1, servers: 1, pickers: 1, attention: 1 });
+    // A reload wipes a leftover "Copied." (orchestrator round 2 -- otherwise it could outlive the action).
+    expect(h.serverActionState.has("copy")).toBe(false);
+  });
+
+  test("a first-load failure has no invented routing data and carries the visible reason", async () => {
+    const h = harness(null);
+    await h.run.loadRouting();
+    expect(h.run.getRoutingData()).toEqual({ routing: null, discovery: null, loadError: "temporary routing outage" });
+    expect(h.calls).toEqual({ steps: 1, servers: 1, pickers: 1, attention: 1 });
   });
 });
 
@@ -9375,6 +9797,40 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(channelErr.hidden).toBe(false);
   });
 
+  // Orchestrator round 2 (minor 2/3): the REAL sendRouting's return value, not just retryRegistration's
+  // stubbed handling of it -- so the wiring "a failed POST returns posted-error, a settled send returns
+  // sent" is guarded end to end, not only in two separate halves.
+  test("sendRouting returns 'posted-error' on a failed POST and 'sent' once a settled result lands", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const hFail = harness({
+      routingDataInit,
+      apiImpl: async (_path, init) =>
+        init && init.method === "POST"
+          ? { ok: false, status: 502, text: async () => "boom" }
+          : ({ ok: true, status: 200, text: async () => "", json: async () => routingDataInit } as unknown as { ok: boolean; text: () => Promise<string> }),
+    });
+    hFail.seed("music");
+    hFail.run.onRouteChange("music", "100", "on", true); // "all" scope -> a sendable body
+    const failOutcome = await (hFail.run.sendRouting("music") as unknown as Promise<string | undefined>);
+    expect(failOutcome).toBe("posted-error");
+
+    const id = "req-ok";
+    const withResult = { routing: { ...routingDataInit.routing, results: [{ id, action: "routing-set", ok: true, at: "t" }] }, discovery };
+    const hOk = harness({
+      routingDataInit,
+      apiImpl: async (_path, init) =>
+        init && init.method === "POST"
+          ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) }
+          : ({ ok: true, status: 200, text: async () => JSON.stringify(withResult), json: async () => withResult } as unknown as { ok: boolean; text: () => Promise<string> }),
+    });
+    hOk.seed("music");
+    hOk.run.onRouteChange("music", "100", "on", true);
+    const okPromise = hOk.run.sendRouting("music") as unknown as Promise<string | undefined>;
+    await hOk.clock.tick(); // awaitRequestResult's first poll fires; the GET returns the landed result
+    await hOk.clock.tick();
+    expect(await okPromise).toBe("sent");
+  });
+
   test("a change made while a request is in flight is held and sent once when the result lands", async () => {
     let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
     let n = 0;
@@ -9410,6 +9866,45 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // (placementSummary's "unplaced"/"in N servers" sentence goes stale otherwise; caught in real-Chrome
     // verification, not by a unit test, until this assertion was added).
     expect(h.refreshRoutingStepsCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a slow POST reserves inflight before it resolves, so a later edit waits and sends one follow-up", async () => {
+    let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let releaseFirst!: (value: { ok: boolean; status: number; text: () => Promise<string> }) => void;
+    const firstResponse = new Promise<{ ok: boolean; status: number; text: () => Promise<string> }>((resolve) => { releaseFirst = resolve; });
+    let postNo = 0;
+    const h = harness({
+      routingDataInit: live,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") {
+          postNo++;
+          const id = "slow-" + postNo;
+          if (postNo === 1) return firstResponse;
+          live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id, action: "routing-set", ok: true, at: "t" + postNo }] } };
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+        }
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce starts POST #1, whose response remains unresolved
+    expect(h.posts).toHaveLength(1);
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // reserved before the await
+
+    h.run.onRouteChange("music", "200", "on", true);
+    await h.clock.tick(); // the later edit's debounce sees the reservation and becomes held
+    expect(h.posts).toHaveLength(1); // never a concurrent second POST
+    expect(h.routeState.get("music")?.held).toBe(true);
+
+    live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id: "slow-1", action: "routing-set", ok: true, at: "t1" }] } };
+    releaseFirst({ ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "slow-1" }) });
+    await h.clock.tick(); // let POST #1's response schedule its poll
+    await h.clock.tick(); // poll #1 settles; finally starts the held follow-up
+    await h.clock.tick(); // poll #2 settles
+    expect(h.posts).toHaveLength(2);
+    expect(h.routeState.get("music")?.held).toBe(false);
+    expect(JSON.parse(h.posts[1]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: "all" }, "200": { commands: "all" } } });
   });
 
   test("an applied outcome rebuilds the whole step (stale summary fix); a refusal only updates the status line", async () => {
@@ -9750,5 +10245,1078 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // id1's own poll must NOT have written an outcome over id2's now-current inflight entry.
     expect(st.inflight).toEqual({ id: "id2", sentServers: ["200"], startedAt: expect.any(Number) });
     expect(st.outcome).toBeNull();
+  });
+});
+
+// retryablePlacement's own return shape, shared across every mini-harness that exposes it below: null
+// (nothing placed at all), { blocked: "stale" }, { blocked: "unavailable", names, counts }, or
+// { name, model } (safely retryable).
+interface RetryablePlacement {
+  name?: string;
+  model?: unknown;
+  blocked?: "stale" | "unavailable";
+  names?: string[];
+  counts?: { name: string; count: number }[];
+}
+
+// Orchestrator MAJOR finding: retryRegistration must be proven against the REAL routingStepModel /
+// routingSetBody chain, not a stubbed sendRouting -- the bug was specifically that routingSetBody walks
+// model.rows only (discovery's CURRENT guilds), silently dropping any server routing.json still names
+// that discovery no longer sees. A harness that stubs sendRouting can't see that at all. Same shape as
+// #245's own scheduleRoutingSend/sendRouting harness (PLUGIN_ROUTING + ensureRouteState-through-loadRouting),
+// with the retry slice (retryablePlacement/retryRegistration) added on top.
+describe("retryRegistration end-to-end: the real routingSetBody never drops an unavailable server silently (#246, orchestrator finding)", () => {
+  const routingSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function ensureRouteState("), applyIndexSrc.indexOf("async function loadRouting("));
+  const retrySrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function retryablePlacement("), applyIndexSrc.indexOf("function appendRetryControls("));
+  const src = applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc + "\n" + retrySrc;
+
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+  interface FakeEl { textContent: string; hidden?: boolean; disabled?: boolean; attrs?: Map<string, string>; setAttribute?: (n: string, v: string) => void; removeAttribute?: (n: string) => void; appendChild?: (c: unknown) => void }
+  const makeEl = (): FakeEl => {
+    const attrs = new Map<string, string>();
+    return { textContent: "", hidden: false, disabled: false, attrs, setAttribute: (n, v) => void attrs.set(n, v), removeAttribute: (n) => void attrs.delete(n), appendChild: () => {} };
+  };
+
+  function harness(opts: { routingDataInit: { routing: { results: { id: string; action: string; ok: boolean; at: string }[] }; discovery: unknown }; pluginsData: unknown }) {
+    const posts: { path: string; body?: string }[] = [];
+    const clock = makeClock();
+    const document = { createElement: makeEl, createTextNode: () => ({}) };
+    const setApplyText = (el: FakeEl, text: string) => { if (el.textContent !== text) el.textContent = text; };
+    // The bot lands the POST's own result on the VERY NEXT GET poll -- awaitRequestResult reads its poll
+    // via .json() (not .text(), like the POST response does), so both must be provided correctly, per the
+    // "missing .json() vs .text() mismatch" gotcha this file's own #245 harness comment already documents.
+    const liveResults: { id: string; action: string; ok: boolean; at: string }[] = [];
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      if (init && init.method === "POST") {
+        const id = "req-" + (posts.length + 1);
+        posts.push({ path, body: init.body });
+        liveResults.push({ id, action: "routing-set", ok: true, at: "t" });
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+      }
+      return { ok: true, status: 200, text: async () => "", json: async () => ({ routing: { ...opts.routingDataInit.routing, results: liveResults }, discovery: opts.routingDataInit.discovery }) };
+    };
+    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    let refreshRoutingStepsCalls = 0;
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const run = new Function(
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
+      "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention",
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+        "return { retryablePlacement, retryRegistration };",
+    )(
+      document, api, timeoutSignal, setApplyText, opts.pluginsData, 110000, clock.setTimeout, clock.clearTimeout,
+      refreshRoutingSteps, serverActionState, renderServers, renderNeedsAttention,
+    ) as { retryablePlacement: () => RetryablePlacement; retryRegistration: () => Promise<void> };
+    return { run, posts, clock, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+  }
+
+  const HOME = "100", OTHER = "200", GONE = "999";
+  const discovery = {
+    v: 1 as const,
+    generatedAt: new Date().toISOString(),
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: HOME,
+    guilds: [
+      { id: HOME, name: "Home", channels: [], commands: { registered: 1, at: "t" } },
+      { id: OTHER, name: "Other", channels: [], commands: { registered: 1, at: "t" } },
+    ], // GONE is NOT here -- the bot has left it, but routing.json below still names it
+    plugins: {},
+  };
+  const pluginsData = { plugins: [{ name: "music", active: true }, { name: "wow", active: true }] };
+
+  test("music is placed in HOME+GONE (GONE unavailable), wow in OTHER only: retry SKIPS music and targets wow, POSTing OTHER alone", async () => {
+    const routingDataInit = {
+      routing: {
+        v: 1, updatedAt: "", updatedBy: "",
+        plugins: { music: { servers: { [HOME]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } }, wow: { servers: { [OTHER]: { commands: "all" as const } } } },
+        webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[],
+      },
+      discovery,
+    };
+    const h = harness({ routingDataInit, pluginsData });
+    expect(h.run.retryablePlacement()?.name).toBe("wow"); // music is placed FIRST in pluginsData order, but blocked
+
+    const pending = h.run.retryRegistration();
+    await h.clock.tick(); // the debounced sendRouting path doesn't apply here (no debounce in this call path), but the POST is async
+    await h.clock.tick();
+    await pending;
+
+    expect(h.posts).toHaveLength(1);
+    expect(h.posts[0]!.path).toBe("/api/routing");
+    // The recorded body carries OTHER (wow's own placement) alone -- music was never touched, and GONE
+    // never appears anywhere (this test's own proof that a resend can't silently drop an unavailable
+    // server: it simply never retries the plugin that has one).
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "wow", servers: { [OTHER]: { commands: "all" } } });
+  });
+
+  test("only music is placed, in HOME+GONE: no button (retryablePlacement blocked), no POST sent", async () => {
+    const routingDataInit = {
+      routing: {
+        v: 1, updatedAt: "", updatedBy: "",
+        plugins: { music: { servers: { [HOME]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } } },
+        webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[],
+      },
+      discovery,
+    };
+    const h = harness({ routingDataInit, pluginsData: { plugins: [{ name: "music", active: true }] } });
+    const placement = h.run.retryablePlacement();
+    expect(placement).toEqual({ blocked: "unavailable", names: ["music"], counts: [{ name: "music", count: 1 }] });
+
+    await h.run.retryRegistration(); // a no-op: retryRegistration itself also checks placement.blocked
+    expect(h.posts).toHaveLength(0);
+    expect(h.renderServersCalls()).toBe(0); // never even entered the busy/settle cycle
+  });
+});
+
+// #246: source-pin tests for the Servers tab, the same discipline as #245's own equivalent block above.
+describe("Servers tab: source pins (#246)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+
+  test("onControlEdited ignores the Servers tab, right after its .route return (source pin)", () => {
+    const editedSlice = indexSrc.slice(indexSrc.indexOf("function onControlEdited("), indexSrc.indexOf("function onControlEdited(") + 900);
+    expect(editedSlice).toContain('if (target.closest(".route")) return;\n    // #246');
+    expect(editedSlice).toContain('if (target.closest(".servers")) return;');
+    const routeIdx = editedSlice.indexOf('if (target.closest(".route")) return;');
+    const serversIdx = editedSlice.indexOf('if (target.closest(".servers")) return;');
+    expect(serversIdx).toBeGreaterThan(routeIdx);
+  });
+
+  test("the Servers tab holds no Apply-bar control (source pin)", () => {
+    // Round-1 claims-vs-code finding: this used to start at renderServers, which put every DOM BUILDER
+    // (buildServerCard, buildWebhookRow, buildCommandsSection, buildAddWebhookForm,
+    // buildUnavailableServerCard, appendRetryControls, retryRegistration, retryablePlacement -- the
+    // functions that actually interpolate server/channel names and webhook/error text into the DOM)
+    // OUTSIDE the pinned slice, since they're all declared BEFORE renderServers in source order. A
+    // regression rewriting one of them to use innerHTML would have passed this test untouched. Starts at
+    // clearChildren instead -- the first of this whole group.
+    //
+    // Extended (orchestrator follow-up, second round) through renderNeedsAttention/goToFix/
+    // openPluginCard: the Needs-attention list interpolates the same server/channel/plugin/error text
+    // (via needsAttention's item.text) and was declared just past copyInviteLink, outside the original
+    // slice -- the same blind spot the round-1 finding already named for the builder functions.
+    const start = indexSrc.indexOf("function clearChildren(");
+    const end = indexSrc.indexOf("function buildSettingsStep(");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const slice = indexSrc.slice(start, end);
+    expect(slice.length).toBeGreaterThan(500); // can't pass vacuously
+    expect(slice).toContain("function buildServerCard(");
+    expect(slice).toContain("function buildWebhookRow(");
+    expect(slice).toContain("function retryablePlacement(");
+    expect(slice).toContain("function renderNeedsAttention(");
+    expect(slice).toContain("function goToFix(");
+    expect(slice).toContain("function openPluginCard(");
+    for (const bad of ["dataset.key", "data-key", "dataset.plugin", "dataset.settingKey", "dataset.secretKey", "localStorage", "sessionStorage", "innerHTML"]) {
+      expect({ bad, found: slice.includes(bad) }).toEqual({ bad, found: false });
+    }
+  });
+
+  test("a webhook input is always type=password with autocomplete off (source pin)", () => {
+    const start = indexSrc.indexOf("function buildAddWebhookForm(");
+    const end = indexSrc.indexOf("function buildServerCard(");
+    const slice = indexSrc.slice(start, end);
+    expect(slice).toContain('input.type = "password";');
+    expect(slice).toContain('input.autocomplete = "off";');
+  });
+
+  // Orchestrator follow-up (minor 4): copyInviteLink used to write "Copied." straight into
+  // #servers-status, which renderServers then overwrote (or resurrected a stale discovery message
+  // over) on its very next redraw -- any Add/Remove/Refresh/Try again anywhere on the tab. It now
+  // routes through serverActionState like every other Servers action, and renderServers gives that a
+  // real place in its own status-message priority.
+  test("copyInviteLink routes its message through serverActionState/renderServers, not a direct DOM write (source pin)", () => {
+    const start = indexSrc.indexOf("async function copyInviteLink(");
+    const end = indexSrc.indexOf("document.getElementById(\"refresh-discovery\")", start);
+    const slice = indexSrc.slice(start, end);
+    expect(slice).toContain('serverActionState.set("copy", { busy: false, message: "Copied." });');
+    expect(slice).toContain('serverActionState.set("copy", { busy: false, message: "Couldn\'t copy automatically');
+    expect(slice).toContain("renderServers();");
+    expect(slice).not.toContain('document.getElementById("servers-status")');
+
+    // renderServers delegates the #servers-status precedence to the pure serversStatusMessage, which the
+    // SERVERS_TAB describe pins dynamically (orchestrator round 2 -- a source-pin on the term order used
+    // to pass with the "Copied." masking bug present, since it only checked textual order, not outcome).
+    const renderStart = indexSrc.indexOf("function renderServers() {");
+    const renderEnd = indexSrc.indexOf("clearChildren(list);", renderStart);
+    const renderSlice = indexSrc.slice(renderStart, renderEnd);
+    expect(renderSlice).toContain('serverActionState.get("copy")');
+    expect(renderSlice).toContain("serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError)");
+  });
+
+  // Orchestrator round 2 (MAJOR): "Copied." had unbounded lifetime -- serverActionState.set("copy", …)
+  // with no matching delete anywhere -- so it lingered for the whole page session. It is now cleared at
+  // the top of every durable Servers action and in loadRouting's tail, so a real action or a reload
+  // always supersedes it (the pure-function ordering above is the belt to this brace).
+  test('"copy" is cleared by every durable action and by loadRouting, so a leftover confirmation cannot survive one (source pin)', () => {
+    for (const fn of ["async function addWebhook(", "async function removeWebhook(", "async function refreshDiscoveryAll(", "async function retryRegistration("]) {
+      const start = indexSrc.indexOf(fn);
+      const body = indexSrc.slice(start, indexSrc.indexOf("\n  }\n", start));
+      expect({ fn, clearsCopy: body.includes('serverActionState.delete("copy")') }).toEqual({ fn, clearsCopy: true });
+    }
+    const loadRouting = indexSrc.slice(indexSrc.indexOf("async function loadRouting("), indexSrc.indexOf("function refreshRoutingSteps("));
+    expect(loadRouting).toContain('serverActionState.delete("copy")');
+  });
+
+  test("each durable Servers action clears its busy state after a first-request 401", () => {
+    const ranges: [string, string][] = [
+      ["async function addWebhook(", "async function removeWebhook("],
+      ["async function removeWebhook(", "async function pollForResult("],
+      ["async function refreshDiscoveryAll(", "async function copyInviteLink("],
+    ];
+    for (const [start, end] of ranges) {
+      const slice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
+      expect(slice).toContain('message !== "unauthorized"');
+      expect(slice).toContain("clearUnauthorizedServerAction(key);");
+    }
+    const helper = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
+    expect(helper).toContain("serverActionState.delete(key);");
+    expect(helper).toContain("renderServers();");
+  });
+
+  // Orchestrator follow-up (minor 7): addWebhook's own landed-success call is covered dynamically in the
+  // "addWebhook / pollForResult" mini-harness below; removeWebhook has no equivalent real-chain harness
+  // (its only coverage anywhere else is static), so this pins the call to removeWebhook's own success
+  // branch -- and only that branch, not the timeout/refusal ones next to it.
+  test("removeWebhook refreshes the Plugins tab's routing steps only on a landed success (source pin)", () => {
+    const start = indexSrc.indexOf("async function removeWebhook(");
+    const end = indexSrc.indexOf("async function refreshDiscoveryAll(");
+    const slice = indexSrc.slice(start, end);
+    const successBranch = slice.slice(slice.indexOf("} else {\n        serverActionState.delete(key);"));
+    // indexOf("}", 1): position 0 of successBranch is itself the closing brace of the PRECEDING
+    // else-if -- searching from 0 would match that one instead of the new block's own close.
+    expect(successBranch.slice(0, successBranch.indexOf("}", 1))).toContain("refreshRoutingSteps();");
+    const timeoutBranch = slice.slice(slice.indexOf("if (outcome.timeout) {"), slice.indexOf("} else if (!outcome.result.ok) {"));
+    const refusalBranch = slice.slice(slice.indexOf("} else if (!outcome.result.ok) {"), slice.indexOf("} else {\n        serverActionState.delete(key);"));
+    expect(timeoutBranch).not.toContain("refreshRoutingSteps();");
+    expect(refusalBranch).not.toContain("refreshRoutingSteps();");
+  });
+
+  // Round-2 review finding: a 401 midway through pollForResult's own loop (after the initiating request
+  // already succeeded) used to fold into outcome.timeout, writing a stale "may be restarting… queued"
+  // message that survived a re-login. pollForResult now returns a distinct { unauthorized: true }, and
+  // every caller must check it BEFORE outcome.timeout.
+  test("every pollForResult caller checks outcome.unauthorized before outcome.timeout (source pin)", () => {
+    const pollSlice = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
+    expect(pollSlice).toContain("return { unauthorized: true };");
+    const ranges: [string, string][] = [
+      ["async function addWebhook(", "async function removeWebhook("],
+      ["async function removeWebhook(", "async function pollForResult("],
+      ["async function refreshDiscoveryAll(", "async function copyInviteLink("],
+    ];
+    for (const [start, end] of ranges) {
+      const fnSlice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
+      // The literal `if (...)` form, not a bare "outcome.timeout" substring search -- this function's own
+      // explanatory comment mentions "outcome.timeout" in PROSE ahead of the real check, which a naive
+      // substring search would mistake for the code itself.
+      const unauthorizedIdx = fnSlice.indexOf("if (outcome.unauthorized)");
+      const timeoutIdx = fnSlice.indexOf("if (outcome.timeout)");
+      expect({ start, hasUnauthorized: unauthorizedIdx > -1, hasTimeout: timeoutIdx > -1 }).toEqual({ start, hasUnauthorized: true, hasTimeout: true });
+      expect(unauthorizedIdx).toBeLessThan(timeoutIdx);
+    }
+  });
+
+  test("the Servers tab labels retained routing data as stale after a routing read failure", () => {
+    // renderServers passes routingData.loadError into the pure serversStatusMessage, which owns the
+    // "Couldn't read where plugins live:" wording (orchestrator round 2 -- the SERVERS_TAB describe pins
+    // that a load error outranks a leftover "Copied." dynamically).
+    const render = indexSrc.slice(indexSrc.indexOf("function renderServers("), indexSrc.indexOf("const refreshServers = renderServers;"));
+    expect(render).toContain("serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError)");
+    const helper = applyBlock("SERVERS_TAB").slice(applyBlock("SERVERS_TAB").indexOf("function serversStatusMessage("));
+    expect(helper).toContain("Couldn't read where plugins live: ");
+  });
+});
+
+// #246: decision 6's pickers, run against buildEnvControl itself (not just pickerOptions in isolation) --
+// the real FIELD_META, isDiscoveryStale and pickerOptions, concatenated the same way #245's own
+// PLUGIN_ROUTING + routingSrc mini-harness does. A tiny synthetic DOM: enough for createElement to answer
+// select/option/optgroup/input and for .value / .dataset / .id to round-trip.
+describe("buildEnvControl pickers (#246, mini-harness)", () => {
+  interface FakeEl {
+    tagName: string;
+    value: string;
+    id: string;
+    className: string;
+    label: string;
+    textContent?: string;
+    dataset: Record<string, string>;
+    children: FakeEl[];
+    appendChild: (c: FakeEl) => FakeEl;
+    querySelectorAll?: (selector: string) => FakeEl[];
+    replaceWith?: (next: FakeEl) => void;
+  }
+  function makeEl(tag: string): FakeEl {
+    const el: FakeEl = { tagName: tag.toUpperCase(), value: "", id: "", className: "", label: "", dataset: {}, children: [], appendChild: (c) => (el.children.push(c), c) };
+    return el;
+  }
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const pluginRoutingSrc = applyBlock("PLUGIN_ROUTING");
+  const serversTabSrc = applyBlock("SERVERS_TAB");
+  const envSrc = indexSrc.slice(indexSrc.indexOf("const FIELD_META = {"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
+
+  // `registry`: id -> the element document.getElementById(id) currently answers. refreshEnvPickers calls
+  // existing.replaceWith(control) on an upgrade -- each registered element's own replaceWith swaps the
+  // registry entry under ITS OWN id, so a later getElementById(id) sees the upgraded control.
+  function harness(
+    routingDataInit: unknown,
+    registry: Map<string, FakeEl> = new Map(),
+    config: { loadedEnv?: Record<string, string>; loadedSchema?: Record<string, unknown>; pluginsData?: unknown } = {},
+  ) {
+    for (const [id, el] of registry) {
+      el.id = id;
+      el.replaceWith = (next: FakeEl) => {
+        next.id = id;
+        registry.set(id, next);
+      };
+    }
+    const document = {
+      createElement: (tag: string) => makeEl(tag),
+      getElementById: (id: string) => registry.get(id) ?? null,
+    };
+    const fn = new Function(
+      "document", "routingData", "pluginsData",
+      `"use strict";\n${pluginRoutingSrc}\n${serversTabSrc}\n${envSrc}\n` +
+        "return { buildEnvControl, FIELD_META, discoveryReadyForPickers, refreshEnvPickers, renderEnvFields, setRoutingData: (next) => { routingData = next; }, setConfig: (env, schema) => { loadedEnv = env; loadedSchema = schema; } };",
+    );
+    const result = fn(document, routingDataInit, config.pluginsData ?? null) as {
+      buildEnvControl: (key: string, value: string) => FakeEl;
+      FIELD_META: Record<string, { control?: string }>;
+      discoveryReadyForPickers: () => boolean;
+      refreshEnvPickers: () => void;
+      renderEnvFields: () => void;
+      setRoutingData: (next: unknown) => void;
+      setConfig: (env: Record<string, string>, schema: Record<string, unknown>) => void;
+    };
+    result.setConfig(config.loadedEnv ?? {}, config.loadedSchema ?? {});
+    return result;
+  }
+
+  const discovery = {
+    v: 1 as const,
+    generatedAt: new Date().toISOString(), // fresh -- "ready" for the picker branch
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: "100",
+    guilds: [{ id: "100", name: "Home", channels: [{ id: "10", name: "general", canSend: true }], commands: { registered: 1, at: "t" } }],
+    plugins: {},
+  };
+  const routingDataReady = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+
+  test("FIELD_META wires the three keys to a server/channel control", () => {
+    const h = harness(routingDataReady);
+    expect(h.FIELD_META.DISCORD_SERVER_ID!.control).toBe("server");
+    expect(h.FIELD_META.ANNOUNCE_CHANNEL_ID!.control).toBe("channel");
+    expect(h.FIELD_META.RELEASE_ANNOUNCE_CHANNEL_ID!.control).toBe("channel");
+  });
+
+  test("with a ready discovery, buildEnvControl returns a <select> whose dataset.key and id match the plain-field convention, and whose value is the stored id", () => {
+    const h = harness(routingDataReady);
+    expect(h.discoveryReadyForPickers()).toBe(true);
+    const control = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+    expect(control.tagName).toBe("SELECT");
+    expect(control.id).toBe("env-DISCORD_SERVER_ID");
+    expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(control.value).toBe("100");
+    // Same common tail as the plain-input branch it replaces -- the Apply bar's #env-fields [data-key]
+    // collector and planEnvSave read this control exactly like it read the id field.
+    const channel = h.buildEnvControl("ANNOUNCE_CHANNEL_ID", "10");
+    expect(channel.id).toBe("env-ANNOUNCE_CHANNEL_ID");
+    expect(channel.dataset.key).toBe("ANNOUNCE_CHANNEL_ID");
+    expect(channel.value).toBe("10");
+  });
+
+  // Orchestrator finding (minor 9): pickerOptions' own unit test (below, "server and channel options…")
+  // only ever calls it with a literal "server"/"channel" string, so it could not catch a regression in
+  // buildPickerSelect's DERIVATION of that string from FIELD_META[key].control -- e.g. passing the env
+  // KEY itself through unchanged, which pickerOptions would silently treat as neither "server" (falls to
+  // its channel branch) and would have gone undetected by every other test in this describe block (a
+  // mutation surviving M5 of this plan's own mutation pass surfaced the gap). This drives the real
+  // buildEnvControl -> buildPickerSelect -> FIELD_META chain end to end and inspects the actual <option>
+  // shape, so a wrong-kind derivation fails here even though the control is still a <select>.
+  test("buildEnvControl derives the picker's option SHAPE from FIELD_META's control kind, not the env key", () => {
+    const h = harness(routingDataReady);
+    const server = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+    expect(server.tagName).toBe("SELECT");
+    // Server options are flat (no optgroup) and named after guilds -- the channel branch would instead
+    // group under an optgroup per guild and list "#general", not "Home".
+    const serverLabels = server.children.map((c) => c.textContent);
+    expect(serverLabels).toEqual(["— none: register globally —", "Home"]);
+    expect(server.children.every((c) => c.tagName === "OPTION")).toBe(true);
+
+    const channelField = h.buildEnvControl("ANNOUNCE_CHANNEL_ID", "10");
+    expect(channelField.tagName).toBe("SELECT");
+    // Channel options ARE grouped -- the server branch has no optgroup and would never produce one.
+    expect(channelField.children.some((c) => c.tagName === "OPTGROUP")).toBe(true);
+    const group = channelField.children.find((c) => c.tagName === "OPTGROUP")!;
+    expect(group.label).toBe("Home");
+    expect(group.children.map((c) => c.textContent)).toEqual(["#general"]);
+  });
+
+  test("without a ready discovery (null, or stale), buildEnvControl degrades to a plain input -- but only when nothing was already a picker", () => {
+    for (const rd of [{ routing: null, discovery: null }, { routing: null, discovery: { ...discovery, generatedAt: "2020-01-01T00:00:00.000Z" } }]) {
+      const h = harness(rd);
+      expect(h.discoveryReadyForPickers()).toBe(false);
+      const control = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+      expect(control.tagName).toBe("INPUT");
+      expect(control.id).toBe("env-DISCORD_SERVER_ID");
+      expect(control.dataset.key).toBe("DISCORD_SERVER_ID");
+      expect(control.value).toBe("100");
+    }
+  });
+
+  // Round-4 review finding: renderEnvFields() wipes and rebuilds EVERY Config field from scratch on every
+  // reload (any Apply success, Discard, Unlock, or update-button reload) via buildEnvControl -- which used
+  // to decide server/channel vs. plain-input FRESH each call from discoveryReadyForPickers() alone, with
+  // no memory of the control already on screen. So once discovery went stale, a picker already showing
+  // silently reverted to a plain id input on the very next reload -- the exact "never downgrade" violation
+  // round 3 fixed in refreshEnvPickers, through a sibling path that fix never touched (refreshEnvPickers
+  // only upgrades/preserves an EXISTING element in place; it is never in the loop when renderEnvFields
+  // rebuilds the whole container from scratch).
+  test("renderEnvFields never rebuilds an existing picker back into a plain input after discovery goes stale", () => {
+    const registry = new Map<string, FakeEl>();
+    const container = makeEl("div");
+    container.id = "env-fields";
+    container.querySelectorAll = (selector) => selector === "select[data-key]"
+      ? container.children.filter((child) => child.tagName === "SELECT" && child.dataset.key)
+      : [];
+    container.appendChild = (child) => {
+      container.children.push(child);
+      if (child.id) registry.set(child.id, child);
+      return child;
+    };
+    Object.defineProperty(container, "innerHTML", {
+      get: () => "",
+      set: () => {
+        for (const child of container.children) if (child.id) registry.delete(child.id);
+        container.children = [];
+      },
+    });
+    registry.set(container.id, container);
+    const h = harness(routingDataReady, registry, { loadedEnv: { DISCORD_SERVER_ID: "999999999" } });
+
+    h.renderEnvFields(); // the real rebuild path first creates a ready-discovery picker
+    const ready = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(ready.tagName).toBe("SELECT");
+    expect(ready.value).toBe("999999999");
+
+    h.setRoutingData({ routing: null, discovery: null });
+    h.renderEnvFields(); // the real rebuild clears the container before building the replacement
+    const rebuilt = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(rebuilt).not.toBe(ready);
+    expect(rebuilt.tagName).toBe("SELECT"); // still a picker -- never downgraded
+    expect(rebuilt.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(rebuilt.value).toBe("999999999"); // the stored/operator value survives the stale rebuild
+  });
+
+  // Orchestrator finding (minor 5): the PREVIOUS fix re-derived "was this a picker" from the live DOM
+  // (container.querySelectorAll) each render -- which breaks the moment something ELSE clears #env-fields
+  // in between two renderEnvFields calls, e.g. reloadConfig's own catch (`ef.textContent = msg`) on a
+  // failed reload. pickerKeysShown is a module-level Set that only renderEnvFields/refreshEnvPickers ever
+  // write to, so it survives a wipe from any other code path.
+  test("a picker survives even when something OTHER than renderEnvFields empties #env-fields in between renders", () => {
+    const registry = new Map<string, FakeEl>();
+    const container = makeEl("div");
+    container.id = "env-fields";
+    container.appendChild = (child) => {
+      container.children.push(child);
+      if (child.id) registry.set(child.id, child);
+      return child;
+    };
+    Object.defineProperty(container, "innerHTML", {
+      get: () => "",
+      set: () => {
+        for (const child of container.children) if (child.id) registry.delete(child.id);
+        container.children = [];
+      },
+    });
+    registry.set(container.id, container);
+    const h = harness(routingDataReady, registry, { loadedEnv: { DISCORD_SERVER_ID: "999999999" } });
+
+    h.renderEnvFields();
+    expect(registry.get("env-DISCORD_SERVER_ID")!.tagName).toBe("SELECT");
+
+    // Simulate reloadConfig's OWN catch path (a network error, NOT a renderEnvFields call): it wipes
+    // #env-fields by writing plain error text, wiping the DOM but never touching pickerKeysShown.
+    container.children = [];
+    registry.delete("env-DISCORD_SERVER_ID");
+
+    h.setRoutingData({ routing: null, discovery: null }); // discovery has since gone stale too
+    h.renderEnvFields();
+    const rebuilt = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(rebuilt.tagName).toBe("SELECT"); // pickerKeysShown remembered it, even though the DOM never told it
+    expect(rebuilt.value).toBe("999999999");
+  });
+
+  test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
+    const plain = makeEl("input");
+    // Round-2 claims-vs-code finding: this used to be "100", which also happens to be the canned
+    // discovery's homeGuildId AND its only guild id -- a plausible bug (seeding the picker from
+    // routingData.discovery.homeGuildId instead of the PREVIOUS control's own .value, an easy mix-up
+    // since DISCORD_SERVER_ID *is* "the home server") would have coincidentally produced the same "100"
+    // and passed anyway. A value that matches no canned id rules that out.
+    plain.value = "999999999"; // an in-progress edit, not yet applied, and not any canned id
+    const registry = new Map([["env-DISCORD_SERVER_ID", plain]]);
+    const h = harness(routingDataReady, registry);
+    h.refreshEnvPickers();
+    const upgraded = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(upgraded.tagName).toBe("SELECT");
+    expect(upgraded.id).toBe("env-DISCORD_SERVER_ID");
+    expect(upgraded.dataset.key).toBe("DISCORD_SERVER_ID");
+    expect(upgraded.value).toBe("999999999"); // the typed value survived the upgrade, not homeGuildId
+
+    // A control already in the picker shape is left alone -- never rebuilt/replaced.
+    const already = registry.get("env-DISCORD_SERVER_ID")!;
+    h.refreshEnvPickers();
+    expect(registry.get("env-DISCORD_SERVER_ID")).toBe(already); // same object, not a new one
+
+    // Without a ready discovery, refreshEnvPickers is a no-op -- a plain field is never touched.
+    const stillPlain = makeEl("input");
+    stillPlain.value = "200";
+    const notReadyRegistry = new Map([["env-DISCORD_SERVER_ID", stillPlain]]);
+    const notReady = harness({ routing: null, discovery: null }, notReadyRegistry);
+    notReady.refreshEnvPickers();
+    expect(notReadyRegistry.get("env-DISCORD_SERVER_ID")).toBe(stillPlain);
+    expect(stillPlain.tagName).toBe("INPUT");
+  });
+
+  // Round-3 review finding: a prior version of refreshEnvPickers ALSO downgraded an existing picker back
+  // to a plain input once discovery went stale/null on a LATER call -- reverted, since decision 6 was
+  // explicit and marked "Decided": a picker is never downgraded once discovery has gone stale again,
+  // since a control the operator may be mid-edit on must not be replaced out from under them. This test
+  // pins that a SECOND refreshEnvPickers() call, after discovery has gone stale, leaves an
+  // already-upgraded picker untouched -- distinct from the "no ready discovery from the start" no-op case
+  // above, which never had a picker to begin with.
+  test("refreshEnvPickers never downgrades an existing picker once discovery later goes stale", () => {
+    const picker = makeEl("select");
+    picker.value = "999999999"; // whatever the operator had chosen while discovery was ready
+    const registry = new Map([["env-DISCORD_SERVER_ID", picker]]);
+    const h = harness({ routing: null, discovery: null }, registry); // discovery has since gone stale/null
+    h.refreshEnvPickers();
+    expect(registry.get("env-DISCORD_SERVER_ID")).toBe(picker); // untouched -- same object
+    expect(picker.tagName).toBe("SELECT");
+    expect(picker.value).toBe("999999999");
+  });
+});
+
+// #246: addWebhook + pollForResult, the same "stub the DOM-refresh call, inject a fake clock" mini-harness
+// shape as #245's scheduleRoutingSend/sendRouting block -- renderServers/renderNeedsAttention are outside
+// this slice (browser-only DOM builders) and are injected as call-tracked no-op stubs.
+describe("addWebhook / pollForResult (#246, mini-harness)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const clearUnauthorizedServerActionSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
+  // Starts at clearUnauthorizedServerAction, not addWebhook itself: addWebhook's catch calls that shared
+  // helper (also used by removeWebhook/refreshDiscoveryAll) on a 401, and it is declared just above
+  // addWebhook in source -- excluding it left the sandbox with a ReferenceError on that exact path.
+  const addWebhookSrc = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function removeWebhook("));
+  const pollForResultSrc = indexSrc.slice(indexSrc.indexOf("async function pollForResult("), indexSrc.indexOf("async function refreshDiscoveryAll("));
+  const refreshDiscoveryAllSrc = indexSrc.slice(indexSrc.indexOf("async function refreshDiscoveryAll("), indexSrc.indexOf("async function copyInviteLink("));
+
+  test("the marked functions are present", () => {
+    expect(addWebhookSrc).toContain("async function addWebhook(");
+    expect(pollForResultSrc).toContain("async function pollForResult(");
+    expect(refreshDiscoveryAllSrc).toContain("async function refreshDiscoveryAll(");
+  });
+
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+
+  function harness(opts: {
+    inputValue: string;
+    routingDataInit?: unknown;
+    apiImpl: (path: string, init?: { method?: string; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; text: () => Promise<string>; json?: () => Promise<unknown> }>;
+  }) {
+    const clock = makeClock();
+    const input = { value: opts.inputValue };
+    const document = { getElementById: (id: string) => (id === "webhook-input-100" ? input : null) };
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    let loadRoutingCalls = 0;
+    let refreshRoutingStepsCalls = 0;
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const loadRouting = async () => { loadRoutingCalls++; };
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    const timeoutControllers: AbortController[] = [];
+    const timeoutSignal = () => {
+      const controller = new AbortController();
+      timeoutControllers.push(controller);
+      return { signal: controller.signal, cancel: () => {} };
+    };
+    const calls: { path: string; init?: unknown }[] = [];
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      calls.push({ path, init });
+      return opts.apiImpl(path, init);
+    };
+    // routingData is a genuine `let` INSIDE the sandboxed source (like #245's own harness), not an
+    // injected parameter -- addWebhook/pollForResult reassign it directly (`routingData = await res.json()`),
+    // which only works for a real closed-over binding, never a parameter or an expando property.
+    const routingDataInit = opts.routingDataInit ?? { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const run = new Function(
+      "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
+        "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
+    )(
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps,
+    ) as {
+      addWebhook: (guildId: string) => Promise<void>;
+      pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>;
+      refreshDiscoveryAll: () => Promise<void>;
+      getRoutingData: () => unknown;
+    };
+    // serverActionState is the SAME Map instance the sandbox mutates (passed by reference), so reading it
+    // here after an await sees every .set/.delete the sandboxed addWebhook made.
+    return {
+      run,
+      clock,
+      input,
+      calls,
+      serverActionState,
+      abortLatestTimeout: () => timeoutControllers.at(-1)?.abort(),
+      renderServersCalls: () => renderServersCalls,
+      renderNeedsAttentionCalls: () => renderNeedsAttentionCalls,
+      loadRoutingCalls: () => loadRoutingCalls,
+      refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
+    };
+  }
+
+  test("a pasted webhook URL never survives the click: cleared before api() resolves, sent as { url }, status reads Adding…", async () => {
+    // A never-settling POST -- this test only inspects the state addWebhook writes BEFORE the request
+    // settles, so the dangling promise addWebhook returns is never awaited to completion (the "resolved
+    // poll" and "timeout" paths are their own tests below, with a real apiImpl that answers every call).
+    const apiImpl = () => new Promise<{ ok: boolean; text: () => Promise<string> }>(() => {});
+    const h = harness({ inputValue: "https://discord.com/api/webhooks/1/tok", apiImpl });
+    void h.run.addWebhook("100");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(h.input.value).toBe(""); // cleared before the request settles
+    expect(h.calls).toHaveLength(1);
+    expect(h.calls[0]!.path).toBe("/api/webhooks");
+    expect(JSON.parse((h.calls[0]!.init as { body: string }).body)).toEqual({ url: "https://discord.com/api/webhooks/1/tok" });
+    expect(h.serverActionState.get("add:100")).toEqual({ busy: true, message: "Adding…" });
+    // No URL anywhere the harness can see -- there is no localStorage/sessionStorage stub at all (the
+    // source-pin test above already establishes the function never references either).
+  });
+
+  test("a resolved poll draws the webhook under the result's channelId; a refusal shows the bot's reason", async () => {
+    const h1 = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req1" }) };
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [{ id: "req1", action: "webhook-add", ok: true, channelId: "10", at: "t" }] } }) };
+      },
+    });
+    const p1 = h1.run.addWebhook("100");
+    await h1.clock.tick(); // the POST resolves synchronously in apiImpl; the poll's setTimeout is what tick() advances
+    await h1.clock.tick();
+    await p1;
+    expect(h1.serverActionState.has("add:100")).toBe(false); // settled clean -- no lingering message
+    expect(h1.renderServersCalls()).toBeGreaterThanOrEqual(2); // once busy, once settled
+    expect(h1.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
+    // Orchestrator follow-up (minor 7): a landed Add refreshes the Plugins tab's webhook suffix too.
+    expect(h1.refreshRoutingStepsCalls()).toBe(1);
+
+    const h2 = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req2" }) };
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [{ id: "req2", action: "webhook-add", ok: false, reason: "server 424242 is not one the bot is in", at: "t" }] } }) };
+      },
+    });
+    const p2 = h2.run.addWebhook("100");
+    await h2.clock.tick();
+    await h2.clock.tick();
+    await p2;
+    // A refusal is not a landed change -- no refresh.
+    expect(h2.refreshRoutingStepsCalls()).toBe(0);
+    expect(h2.serverActionState.get("add:100")).toEqual({ busy: false, message: "The bot refused it: server 424242 is not one the bot is in" });
+  });
+
+  test("pollForResult resolves { result } once routing.results holds the id, and { timeout: true } past the deadline", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async () => ({ ok: true, text: async () => "", json: async () => ({ routing: { results: [] } }) }),
+    });
+    const started = Date.now();
+    const p = h.run.pollForResult("reqX", started - 31000); // already past ROUTING_ANSWER_TIMEOUT_MS
+    await h.clock.tick();
+    expect(await p).toEqual({ timeout: true });
+  });
+
+  test("pollForResult aborts a stalled GET at its remaining deadline instead of leaving Servers actions busy", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async (_path, init) => await new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const error = new Error("timed out");
+          error.name = "AbortError";
+          reject(error);
+        });
+      }),
+    });
+    const pending = h.run.pollForResult("req-stalled", Date.now());
+    await h.clock.tick(); // starts the poll GET and its deadline controller
+    h.abortLatestTimeout();
+    expect(await pending).toEqual({ timeout: true });
+  });
+
+  // Round-2 review finding: this class of fix (round 1's clearUnauthorizedServerAction) was previously
+  // guarded ONLY by a static source-pin test (a string-presence check that a swapped/misordered
+  // implementation could still pass) -- these are the missing dynamic proofs, driving a REAL 401 through
+  // the real addWebhook/pollForResult.
+  test("pollForResult resolves { unauthorized: true } on a 401 read, distinct from a plain timeout", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async () => { throw new Error("unauthorized"); },
+    });
+    const p = h.run.pollForResult("reqY", Date.now());
+    await h.clock.tick();
+    expect(await p).toEqual({ unauthorized: true });
+  });
+
+  test("a 401 on the initial POST clears the busy state via clearUnauthorizedServerAction, not left stuck", async () => {
+    const h = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async () => { throw new Error("unauthorized"); },
+    });
+    await h.run.addWebhook("100");
+    expect(h.serverActionState.has("add:100")).toBe(false);
+  });
+
+  // Round-2 review finding (correctness lens): a 401 mid-poll -- AFTER the initiating POST already
+  // succeeded -- used to fold into outcome.timeout, writing "may be restarting… queued" and leaving that
+  // STALE, misleading message in serverActionState across a re-login (never reset by one), potentially
+  // right beside fresh data that already shows the action succeeded. Fixed by pollForResult returning a
+  // distinct { unauthorized: true } outcome that addWebhook/removeWebhook/refreshDiscoveryAll now check
+  // before outcome.timeout, clearing busy state the same way an initial-request 401 already does.
+  test("a 401 mid-poll (after the POST already succeeded) also clears busy state, never the stale timeout message", async () => {
+    let postDone = false;
+    const h = harness({
+      inputValue: "https://discord.com/api/webhooks/1/tok",
+      apiImpl: async (path) => {
+        if (path === "/api/webhooks") {
+          postDone = true;
+          return { ok: true, text: async () => JSON.stringify({ ok: true, id: "req-midpoll" }) };
+        }
+        if (postDone) throw new Error("unauthorized"); // the token expired WHILE polling
+        return { ok: true, text: async () => "", json: async () => ({ routing: { results: [] } }) };
+      },
+    });
+    const p = h.run.addWebhook("100");
+    await h.clock.tick();
+    await h.clock.tick();
+    await p;
+    // The whole entry is gone -- never left holding the misleading "may be restarting… queued" message a
+    // plain timeout would have written.
+    expect(h.serverActionState.has("add:100")).toBe(false);
+  });
+
+  test("Refresh from Discord shows the bot's reason when the completed discovery-refresh result failed", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async (path) => {
+        if (path === "/api/discovery/refresh") {
+          return { ok: true, text: async () => JSON.stringify({ ok: true, id: "refresh-failed" }) };
+        }
+        return {
+          ok: true,
+          text: async () => "",
+          json: async () => ({
+            routing: {
+              results: [{ id: "refresh-failed", action: "discovery-refresh", ok: false, reason: "Discord refused the refresh", at: "t" }],
+            },
+          }),
+        };
+      },
+    });
+    const pending = h.run.refreshDiscoveryAll();
+    await h.clock.tick();
+    await h.clock.tick();
+    await pending;
+    expect(h.serverActionState.get("discovery")).toEqual({
+      busy: false,
+      message: "The bot refused it: Discord refused the refresh",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // busy, then visible failure
+    expect(h.loadRoutingCalls()).toBe(0); // a refused refresh is not treated like success
+  });
+
+});
+
+// #246: decision 4's "Try again" -- retryRegistration re-sends the first PLACED plugin's saved placement,
+// or says restart when nothing is placed. sendRouting/ensureRouteState/routingStepModel are stubbed (each
+// already has its own coverage, #245's and this file's SERVERS_TAB block) so this test is only about
+// firstPlacedPlugin's own selection and the no-plugin-placed early return.
+describe("retryRegistration (#246, mini-harness)", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.slice(indexSrc.indexOf("function retryablePlacement("), indexSrc.indexOf("function appendRetryControls("));
+
+  test("the marked functions are present", () => {
+    expect(src).toContain("function retryablePlacement(");
+    expect(src).toContain("async function retryRegistration(");
+  });
+
+  type StubModel = { mode: string; rows: unknown[]; unavailable?: string[] };
+  function harness(
+    routingDataInit: unknown,
+    pluginsData: unknown,
+    model: StubModel | ((name?: string) => StubModel) = { mode: "ready", rows: [], unavailable: [] },
+    sendRoutingOutcome: "held" | "error" | "posted-error" | "sent" | "unauthorized" | undefined = undefined,
+    ensureThrows = false,
+  ) {
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const sendRoutingCalls: string[] = [];
+    const ensureRouteStateCalls: string[] = [];
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); return sendRoutingOutcome; };
+    const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); if (ensureThrows) throw new Error("boom in ensureRouteState"); };
+    const routingStepModel = (name: string) => typeof model === "function" ? model(name) : model;
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const run = new Function(
+      "pluginsData", "serverActionState", "renderServers", "renderNeedsAttention", "ensureRouteState", "routingStepModel", "sendRouting",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { retryablePlacement, retryRegistration };`,
+    )(pluginsData, serverActionState, renderServers, renderNeedsAttention, ensureRouteState, routingStepModel, sendRouting) as {
+      retryablePlacement: () => RetryablePlacement | null;
+      retryRegistration: () => Promise<void>;
+    };
+    return { run, serverActionState, sendRoutingCalls, ensureRouteStateCalls, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+  }
+
+  const routed = { routing: { plugins: { music: { servers: {} }, wow: { servers: {} } } } };
+  const unrouted = { routing: { plugins: {} } };
+  const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "music" }, { name: "wow" }] };
+
+  test("retryablePlacement: the first PLACED-and-retryable plugin in pluginsData's own order, not manifest order alone", () => {
+    const h = harness(routed, pluginsData);
+    // warbandeer is first in pluginsData but unplaced; music is placed and comes next, and (the stubbed
+    // model being ready+available for every name) qualifies immediately.
+    expect(h.run.retryablePlacement()?.name).toBe("music");
+    const h2 = harness(unrouted, pluginsData);
+    expect(h2.run.retryablePlacement()).toBeNull();
+  });
+
+  // Orchestrator MAJOR finding: retryablePlacement must SKIP a placed-but-blocked plugin and keep looking,
+  // not stop at the first placed one regardless of whether it's actually safe to resend.
+  test("retryablePlacement skips a placed plugin with an unavailable server and selects the next one", () => {
+    const h = harness(routed, pluginsData, (name?: string) =>
+      name === "music" ? { mode: "ready", rows: [], unavailable: ["999"] } : { mode: "ready", rows: [], unavailable: [] },
+    );
+    expect(h.run.retryablePlacement()).toEqual({ name: "wow", model: { mode: "ready", rows: [], unavailable: [] } });
+  });
+
+  test("retryablePlacement reports every ready-but-blocked plugin when NONE qualify", () => {
+    const h = harness(routed, pluginsData, () => ({ mode: "ready", rows: [], unavailable: ["999"] }));
+    expect(h.run.retryablePlacement()).toEqual({ blocked: "unavailable", names: ["music", "wow"], counts: [{ name: "music", count: 1 }, { name: "wow", count: 1 }] });
+  });
+
+  test("retryRegistration re-sends the first placed plugin's saved placement via sendRouting", async () => {
+    const h = harness(routed, pluginsData);
+    await h.run.retryRegistration();
+    expect(h.ensureRouteStateCalls).toEqual(["music"]);
+    expect(h.sendRoutingCalls).toEqual(["music"]);
+    expect(h.serverActionState.has("retry")).toBe(false); // settled clean
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // once busy, once settled
+    expect(h.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
+  });
+
+  test("retryRegistration is a no-op when nothing is placed (the restart sentence is drawn instead, by appendRetryControls)", async () => {
+    const h = harness(unrouted, pluginsData);
+    await h.run.retryRegistration();
+    expect(h.sendRoutingCalls).toEqual([]);
+    expect(h.ensureRouteStateCalls).toEqual([]);
+    expect(h.renderServersCalls()).toBe(0);
+  });
+
+  test("retryRegistration is a no-op for stale discovery: it must not serialize a placed plugin as servers: {}", async () => {
+    const h = harness(routed, pluginsData, { mode: "stale", rows: [] });
+    await h.run.retryRegistration();
+    expect(h.ensureRouteStateCalls).toEqual([]);
+    expect(h.sendRoutingCalls).toEqual([]);
+    expect(h.serverActionState.has("retry")).toBe(false);
+  });
+
+  test("retryRegistration captures one ready model before rendering, never rechecking stale and serializing servers: {}", async () => {
+    let modelCalls = 0;
+    const h = harness(routed, pluginsData, () => {
+      modelCalls++;
+      return modelCalls === 1 ? { mode: "ready", rows: [], unavailable: [] } : { mode: "stale", rows: [], unavailable: [] };
+    });
+    await h.run.retryRegistration();
+    expect(modelCalls).toBe(1);
+    expect(h.ensureRouteStateCalls).toEqual(["music"]);
+    expect(h.sendRoutingCalls).toEqual(["music"]);
+  });
+
+  // Orchestrator finding (minor 3): sendRouting's two early exits (already in flight -> "held"; an
+  // unsendable planned body -> "error") used to leave this subject's "Applying…" message on screen with
+  // no report at all. sendRouting's own return value is checked now; try/finally means renderServers
+  // always runs even on these paths.
+  test("retryRegistration reports 'held' when sendRouting coalesces into an in-flight request", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "held");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({ busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // busy, then the held report
+  });
+
+  test("retryRegistration reports the planned-body error instead of silently leaving 'Applying…' up", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "error");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({
+      busy: false,
+      message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab.",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  // Orchestrator round 2 (minor 3): sendRouting returns "posted-error" when the POST itself failed (a
+  // non-2xx, an unparseable body, a network error). Before this, that fell into the success branch and
+  // blanked the retry line -- the only report then landed on the plugin's own card. Now it is surfaced
+  // here too, with a pointer to the card for the detail.
+  test("retryRegistration surfaces a failed POST instead of clearing the line as if it succeeded", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "posted-error");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({
+      busy: false,
+      message: "Couldn't resend it: the bot didn't accept the request. See the plugin's card on the Plugins tab for the reason.",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  // A genuine send ("sent") and a 401 ("unauthorized") both leave nothing on the retry line -- the
+  // plugin's own card carries any per-server outcome, and a 401 has shown the login gate.
+  test("retryRegistration clears the retry line on a genuine send or a 401", async () => {
+    for (const outcome of ["sent", "unauthorized"] as const) {
+      const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, outcome);
+      await h.run.retryRegistration();
+      expect({ outcome, retained: h.serverActionState.has("retry") }).toEqual({ outcome, retained: false });
+    }
+  });
+
+  // Orchestrator round 2 (minor 4): the busy state is set OUTSIDE the try, so a throw before any branch
+  // above (e.g. ensureRouteState throwing) must never strand "retry" at busy -- the finally clears it.
+  test("retryRegistration never leaves the retry line wedged busy when a throw escapes before settling", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, undefined, /* ensureThrows */ true);
+    await expect(h.run.retryRegistration()).rejects.toThrow("boom in ensureRouteState");
+    expect(h.serverActionState.has("retry")).toBe(false); // never left busy
+  });
+});
+
+// Round-3 review finding: appendRetryControls' own three-way branch selection (button / "stale, wait for
+// Discord" note / "nothing placed, restart" note) had no dynamic coverage -- only retryablePlacedPlugin's
+// underlying logic was tested via retryRegistration, never the DOM branch this function draws from it.
+describe("appendRetryControls (#246, mini-harness)", () => {
+  interface FakeEl { tagName: string; textContent: string; className: string; type: string; disabled: boolean; children: FakeEl[]; appendChild: (c: FakeEl) => FakeEl; addEventListener: () => void; setAttribute: () => void }
+  function makeEl(tag: string): FakeEl {
+    const el: FakeEl = { tagName: tag.toUpperCase(), textContent: "", className: "", type: "", disabled: false, children: [], appendChild: (c) => (el.children.push(c), c), addEventListener: () => {}, setAttribute: () => {} };
+    return el;
+  }
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const src = indexSrc.slice(indexSrc.indexOf("function retryablePlacement("), indexSrc.indexOf("// Decision 3's commands line"));
+
+  function harness(routingDataInit: unknown, pluginsData: unknown, model: { mode: string; rows: unknown[]; unavailable?: string[] }) {
+    const document = { createElement: (tag: string) => makeEl(tag) };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    const routingStepModel = () => model;
+    const run = new Function(
+      "document", "pluginsData", "serverActionState", "routingStepModel", "retryRegistration",
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { appendRetryControls };`,
+    )(document, pluginsData, serverActionState, routingStepModel, () => {}) as { appendRetryControls: (container: FakeEl) => void };
+    return run;
+  }
+
+  const pluginsData = { plugins: [{ name: "music" }] };
+  const placed = { routing: { plugins: { music: { servers: {} } } } };
+  const unplaced = { routing: { plugins: {} } };
+
+  test("a ready, placed plugin with every server still visible draws the Try again button", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("BUTTON");
+    expect(container.children[0]!.textContent).toBe("Try again");
+  });
+
+  // Orchestrator MAJOR finding: routingSetBody walks model.rows only, so retrying a plugin placed in a
+  // server discovery no longer sees would silently DROP that placement from routing.json. No button; an
+  // explanatory note naming the plugin and how many servers would be dropped.
+  test("a ready, placed plugin with an unavailable server draws the blocked note, not the button", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: ["999"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Try again would drop music's placement in 1 server the bot has left. Use Drop now on its card first.");
+  });
+
+  test("a ready, placed plugin with TWO unavailable servers pluralizes the note", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: ["999", "888"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children[0]!.textContent).toBe("Try again would drop music's placement in 2 servers the bot has left. Use Drop now on its card first.");
+  });
+
+  // Orchestrator round 2 (minor 1): the multi-plugin blocked note (two or more placed plugins each with
+  // an unavailable server) had no coverage -- only the single-plugin branch did.
+  test("two placed plugins each blocked draws the multi-plugin note naming both", () => {
+    const twoPlaced = { routing: { plugins: { music: { servers: {} }, wow: { servers: {} } } } };
+    const twoPluginsData = { plugins: [{ name: "music" }, { name: "wow" }] };
+    const h = harness(twoPlaced, twoPluginsData, { mode: "ready", rows: [], unavailable: ["999"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Try again would drop placements in servers the bot has left, for: music, wow. Use Drop now on each card first.");
+  });
+
+  test("a placed plugin with a stale model draws the 'wait for Discord' note, not the button", () => {
+    const h = harness(placed, pluginsData, { mode: "stale", rows: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Routing data is stale, so Try again is unavailable until Discord refreshes.");
+  });
+
+  test("nothing placed draws the restart sentence", () => {
+    const h = harness(unplaced, pluginsData, { mode: "ready", rows: [], unavailable: [] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Nothing is placed yet, so there is nothing to re-send. Restart the bot (Overview) to retry.");
   });
 });

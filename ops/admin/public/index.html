@@ -48,17 +48,23 @@
     <button id="lock" class="rb-btn rb-btn--ghost">Lock</button>
   </div>
 
-  <!-- The three tabs only show and hide: every section below still loads at unlock, exactly as when
-       they were stacked. The open tab lives in the URL hash (#overview / #plugins / #settings). -->
+  <!-- The four tabs only show and hide: every section below still loads at unlock, exactly as when
+       they were stacked. The open tab lives in the URL hash (#overview / #plugins / #servers / #settings). -->
   <nav aria-label="Sections">
     <div class="rb-tabstrip" role="tablist">
       <button type="button" class="rb-tabstrip__tab rb-tabstrip__tab--active" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0">Overview</button>
       <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-plugins" aria-controls="panel-plugins" aria-selected="false" tabindex="-1">Plugins</button>
+      <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-servers" aria-controls="panel-servers" aria-selected="false" tabindex="-1">Servers</button>
       <button type="button" class="rb-tabstrip__tab" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
     </div>
   </nav>
 
   <div id="panel-overview" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+    <section id="attention-section" class="rb-card">
+      <h2>Needs attention</h2>
+      <div id="attention-list" class="attention">Loading…</div>
+    </section>
+
     <section id="status-section" class="rb-card">
       <h2>Status</h2>
       <dl class="status-grid" id="status-grid"><dt>Loading…</dt></dl>
@@ -92,6 +98,24 @@
         untouched.
       </p>
       <div id="plugins-list">Loading…</div>
+    </section>
+  </div>
+
+  <div id="panel-servers" class="rb-tabpanel adm-panel" role="tabpanel" aria-labelledby="tab-servers" tabindex="0" hidden>
+    <section id="servers-section" class="rb-card servers">
+      <h2>Servers</h2>
+      <p class="adm-sub">
+        Every server the bot is in, what it can do there, and its webhooks. Placement itself is set from
+        each plugin's own card on the Plugins tab.
+      </p>
+      <div class="servers__toolbar row adm-actions">
+        <button id="refresh-discovery" type="button" class="rb-btn rb-btn--sm">Refresh from Discord</button>
+        <button id="copy-invite" type="button" class="rb-btn rb-btn--sm rb-btn--ghost">Copy invite link</button>
+        <span id="servers-meta" class="servers__meta"></span>
+      </div>
+      <input id="invite-fallback" class="rb-input" type="text" readonly hidden />
+      <p id="servers-status" class="adm-note" role="status"></p>
+      <div id="servers-list">Loading…</div>
     </section>
   </div>
 
@@ -221,7 +245,7 @@
   // Pure tab decisions, lifted so ops/admin/server.test.ts can pin them: which tab a URL hash names
   // (anything unknown or empty opens Overview), and which tab an arrow / Home / End key moves to
   // (arrows wrap; any other key leaves the current tab). The DOM half is showTab, below.
-  const TAB_IDS = ["overview", "plugins", "settings"];
+  const TAB_IDS = ["overview", "plugins", "servers", "settings"];
   function tabFromHash(hash) {
     const id = String(hash || "").replace(/^#/, "");
     return TAB_IDS.includes(id) ? id : "overview";
@@ -482,6 +506,17 @@
   let routingData = null;
   let routingStepEls = new Map();
 
+  // #246: the last GET /api/status response, kept so needsAttention (Overview's Needs-attention list) can
+  // read outdatedFiles without loadStatus and renderNeedsAttention sharing a return value across a fetch.
+  let lastStatus = null;
+
+  // #246: per-subject state for the Servers tab's own actions (add:<guildId>, remove:<channelId>,
+  // "retry", "discovery", and "copy" -- the transient "Copied." confirmation, always cleared by the next
+  // real action or reload) -- the same shape and reason as #245's routeState: survives a renderServers()
+  // rebuild (never a closure over a DOM node that render just replaced), read fresh at every render so a
+  // busy control or a settled message is never lost mid-flight. { busy: boolean, message: string|null }.
+  let serverActionState = new Map();
+
   // #244: which secret keys are showing their password input (Replace pressed) rather than the "Saved on
   // the server" summary -- remembered the same way, so a background reload (an update button, Unlock)
   // does not silently drop the user back into the summary view mid-paste.
@@ -520,6 +555,15 @@
         loadedSchema = schema && typeof schema === "object" ? schema : {};
         renderPlugins();
         renderEnvFields();
+        // #246: loadRouting() and reloadConfig() fire concurrently from showApp -- whichever finishes
+        // LAST is the one whose renderServers() call actually has both routingData AND pluginsData
+        // populated. Calling it only from loadRouting's own tail (as originally written) left the
+        // Servers tab's cards rendered against pluginsData still null whenever this fetch was the
+        // slower of the two -- "No plugin lives here" on every card, found in real-Chrome verification,
+        // not by any of this file's own mocked-pluginsData tests. Also covers every OTHER reloadConfig
+        // caller (an update button's reload, Unlock) the same way loadRouting's own poll already does.
+        renderServers();
+        renderNeedsAttention();
         if (captured) reapplyCardEdits(captured);
       } catch (e) {
         if (e.message !== "unauthorized") {
@@ -1011,6 +1055,13 @@
     step.appendChild(head);
 
     const body = document.createElement("div");
+    if (routingData && routingData.loadError) {
+      const loadError = document.createElement("p");
+      loadError.className = "route__status";
+      loadError.setAttribute("role", "status");
+      loadError.textContent = "Couldn't read where plugins live: " + routingData.loadError;
+      body.appendChild(loadError);
+    }
     const status = document.createElement("p");
     status.className = "route__status";
     status.setAttribute("role", "status");
@@ -1108,18 +1159,7 @@
       routeState.set(plugin, st);
     }
     if (!st.seeded && model.mode === "ready") {
-      const selection = {};
-      for (const row of model.rows) {
-        if (row.on) {
-          selection[row.id] = {
-            on: true,
-            scope: Array.isArray(row.commands) ? "chosen" : "all",
-            channels: Array.isArray(row.commands) ? row.commands.slice() : [],
-            postTo: row.postTo,
-          };
-        }
-      }
-      st.selection = selection;
+      st.selection = selectionFromModel(model);
       st.seeded = true;
     }
     return st;
@@ -1300,6 +1340,14 @@
     }, ROUTING_SEND_DEBOUNCE_MS);
   }
 
+  // Orchestrator finding: returns a small signal so a caller with its OWN status line
+  // (retryRegistration's "retry" subject) can report the outcome instead of silently leaving a stale
+  // "Applying…" behind -- "held" (something for this plugin was already in flight, this call was
+  // coalesced), "error" (the planned body was unsendable, e.g. an empty channel list), "posted-error"
+  // (the POST itself failed -- a non-2xx, an unparseable body, a network error; the detail is on the
+  // plugin's own card via renderRouteStatus), "unauthorized" (a 401 -- the login gate is already up), or
+  // "sent" once the POST was accepted and its result polled to a settled outcome. Every other caller (the
+  // debounced onRouteChange path, checkAgain) already has its own row-level UI and ignores the return.
   async function sendRouting(plugin) {
     const st = routeState.get(plugin);
     if (!st) return;
@@ -1322,37 +1370,49 @@
           }
         }
       }
-      return;
+      return "error";
     }
-    if (st.inflight) { st.held = true; return; }
+    if (st.inflight) { st.held = true; return "held"; }
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     const sentServers = Object.keys(planned.body.servers);
+    // Reserve the in-flight slot BEFORE the POST. A slow request must disable the controls and hold a
+    // later edit instead of allowing its debounce to start a concurrent second POST. The server id is
+    // filled in once the response arrives; object identity lets error cleanup avoid clearing a newer
+    // operation if another path has superseded this reservation.
+    const reservation = { id: null, sentServers, startedAt: Date.now() };
+    st.inflight = reservation;
+    st.outcome = null;
+    renderRouteStatus(plugin, routingStepEls.get(plugin));
     try {
       const res = await api("/api/routing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(planned.body), signal });
       const text = await res.text();
       if (!res.ok) {
+        if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
-        return;
+        return "posted-error";
       }
       let result = null;
       try { result = JSON.parse(text); } catch { /* treated as a failure below */ }
       if (!result || !result.id) {
+        if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
-        return;
+        return "posted-error";
       }
       const startedAt = Date.now();
-      st.inflight = { id: result.id, sentServers, startedAt };
-      st.outcome = null;
+      reservation.id = result.id;
+      reservation.startedAt = startedAt;
       renderRouteStatus(plugin, routingStepEls.get(plugin));
       await awaitRequestResult(plugin, result.id, sentServers, startedAt);
+      return "sent";
     } catch (e) {
+      if (st.inflight === reservation) st.inflight = null;
       const message = e && e.message ? e.message : String(e);
-      if (message !== "unauthorized") {
-        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
-        renderRouteStatus(plugin, routingStepEls.get(plugin));
-      }
+      if (message === "unauthorized") return "unauthorized";
+      st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
+      renderRouteStatus(plugin, routingStepEls.get(plugin));
+      return "posted-error";
     } finally {
       cancel();
       if (st.held) {
@@ -1616,9 +1676,20 @@
       routingData = await res.json();
     } catch (e) {
       if (e && e.message === "unauthorized") return;
-      routingData = { routing: null, discovery: null, loadError: e && e.message ? e.message : String(e) };
+      const loadError = e && e.message ? e.message : String(e);
+      // Keep the last good snapshot on a transient read failure. The cards remain useful, but every
+      // plugin step visibly says the read failed so the retained data is never presented as fresh.
+      routingData = routingData
+        ? { ...routingData, loadError }
+        : { routing: null, discovery: null, loadError };
     }
+    // A reload is a fresh picture: a leftover "Copied." confirmation from before it must not survive it
+    // (orchestrator round 2 -- otherwise it could outlive every action that cleared its own state).
+    serverActionState.delete("copy");
     refreshRoutingSteps();
+    renderServers();
+    refreshEnvPickers();
+    renderNeedsAttention();
   }
 
   // Redraws every card's step FRESH from the latest routingData (routingStepEls is rebuilt each time,
@@ -1631,6 +1702,667 @@
       if (!mount) continue;
       mount.replaceWith(buildWhereItLivesStep(p, {}));
     }
+  }
+
+  // #246: never innerHTML (a server or channel name is Discord-supplied text; decision 4/7 and the
+  // Servers-tab source pin both require textContent only) -- this is the innerHTML = "" replacement.
+  function clearChildren(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+
+  // A stale snapshot is useful for display but cannot safely seed the selection a retry would send.
+  // Retrying it as `{ servers: {} }` would clear an existing placement, so only a ready model is
+  // retryable. Orchestrator finding (post round-4): a ready model is STILL not safely retryable when it
+  // has any `unavailable` server -- routingSetBody walks model.rows only (discovery's current guilds), so
+  // a routing-set built from it silently DROPS any server routing.json still names that discovery no
+  // longer sees, from a button labelled and documented as a no-op resend.
+  //
+  // Walks every PLACED plugin, in pluginsData order (not just the first, per firstPlacedPlugin) --
+  // returns the first one whose model is ready AND has no unavailable server; for THAT plugin the resend
+  // really is a no-op. `null` when nothing is placed at all. Otherwise always an object with `blocked` set
+  // to why nothing qualified: "stale" when no placed plugin has a ready model yet, or "unavailable" (with
+  // `names`, every ready-but-blocked plugin, and `counts`, `{name, count}` per one) when at least one does
+  // but every one of those has a server the bot has left.
+  function retryablePlacement() {
+    const routing = routingData && routingData.routing;
+    if (!routing || !routing.plugins) return null;
+    const placed = ((pluginsData && pluginsData.plugins) || []).filter((p) => routing.plugins[p.name]);
+    if (placed.length === 0) return null;
+    let anyReady = false;
+    const blockedByUnavailable = [];
+    for (const p of placed) {
+      const model = routingStepModel(p.name, routingData, Date.now());
+      if (model.mode !== "ready") continue;
+      anyReady = true;
+      if (model.unavailable.length === 0) return { name: p.name, model };
+      blockedByUnavailable.push({ name: p.name, count: model.unavailable.length });
+    }
+    if (!anyReady) return { blocked: "stale" };
+    return { blocked: "unavailable", names: blockedByUnavailable.map((b) => b.name), counts: blockedByUnavailable };
+  }
+
+  // Decision 4's "Try again": re-sends the first placed plugin's OWN saved placement (a no-op change --
+  // ensureRouteState seeds routeState from the ready model when it doesn't already exist; sendRouting
+  // reads that selection and posts it back unchanged) to every server, re-running applyRouting. Shares
+  // the "retry" subject key with the Overview fix button (decision 5's `go: "retry"`), so a click from
+  // either place is the same in-flight action.
+  // Round-1 review finding, declined: clicking this within sendRouting's ~1.2s debounce window of an
+  // UNSENT edit on the Plugins tab resends that in-progress selection, not strictly the last-saved one --
+  // the debounce would send it within that same window regardless, so the net effect is the edit landing
+  // slightly earlier. Forcing routeState back to selectionFromModel(model) here would risk silently
+  // DISCARDING a real in-progress edit unless the debounce timer were also cancelled/re-armed, trading a
+  // narrow self-resolving timing quirk for a real data-loss risk -- left as-is (docs/plans/epics/E236/10-servers-and-pickers.md).
+  // Orchestrator finding: sendRouting's two early exits (already in flight -> held; an unsendable
+  // planned.error) used to leave this subject's "Applying…" message on screen with no report at all --
+  // wrapped in try/finally so renderServers/renderNeedsAttention always run, and sendRouting's own return
+  // value (see its own comment) is checked so held/error settle into a visible message here too.
+  async function retryRegistration() {
+    const key = "retry";
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    const placement = retryablePlacement();
+    if (!placement || placement.blocked) return; // no button is drawn in that state -- see appendRetryControls
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
+    serverActionState.set(key, { busy: true, message: "Applying…" });
+    renderServers();
+    try {
+      ensureRouteState(placement.name, placement.model);
+      const outcome = await sendRouting(placement.name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
+      if (outcome === "held") {
+        serverActionState.set(key, { busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
+      } else if (outcome === "error") {
+        serverActionState.set(key, { busy: false, message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab." });
+      } else if (outcome === "posted-error") {
+        // Minor 3: sendRouting used to return undefined on a failed POST, which fell into the success
+        // branch below and blanked this line -- the only report then landed on the plugin's own card.
+        serverActionState.set(key, { busy: false, message: "Couldn't resend it: the bot didn't accept the request. See the plugin's card on the Plugins tab for the reason." });
+      } else {
+        // "sent", "unauthorized", or undefined (no route state) -- nothing to keep on this line; the
+        // plugin's card carries any per-server outcome, and a 401 has already shown the login gate.
+        serverActionState.delete(key);
+      }
+    } finally {
+      // Minor 4: the busy state is set OUTSIDE the try, so a throw (e.g. from ensureRouteState) would
+      // never reach a branch above and would strand this subject at busy forever, disabling the button
+      // until a reload. Never leave it busy on the way out.
+      const s = serverActionState.get(key);
+      if (s && s.busy) serverActionState.delete(key);
+      renderServers();
+      renderNeedsAttention();
+    }
+  }
+
+  // Appended to a card wherever decision 3 calls for "+ Try again": the button when a plugin is placed
+  // somewhere and every server it names is still visible, an explanatory note otherwise (nothing placed,
+  // routing data is stale, or resending would silently drop a server the bot has left).
+  function appendRetryControls(container) {
+    const placement = retryablePlacement();
+    if (placement && !placement.blocked) {
+      const st = serverActionState.get("retry");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rb-btn rb-btn--sm rb-btn--ghost";
+      btn.textContent = "Try again";
+      btn.disabled = !!(st && st.busy);
+      btn.addEventListener("click", retryRegistration);
+      container.appendChild(btn);
+      if (st && st.message) {
+        const msg = document.createElement("p");
+        msg.className = "adm-note";
+        msg.setAttribute("role", "status");
+        msg.textContent = st.message;
+        container.appendChild(msg);
+      }
+    } else if (placement && placement.blocked === "unavailable") {
+      const note = document.createElement("p");
+      note.className = "adm-note";
+      if (placement.counts.length === 1) {
+        const only = placement.counts[0];
+        note.textContent =
+          "Try again would drop " + only.name + "'s placement in " + only.count + (only.count === 1 ? " server" : " servers") +
+          " the bot has left. Use Drop now on its card first.";
+      } else {
+        note.textContent = "Try again would drop placements in servers the bot has left, for: " + placement.names.join(", ") + ". Use Drop now on each card first.";
+      }
+      container.appendChild(note);
+    } else if (placement && placement.blocked === "stale") {
+      const note = document.createElement("p");
+      note.className = "adm-note";
+      note.textContent = "Routing data is stale, so Try again is unavailable until Discord refreshes.";
+      container.appendChild(note);
+    } else {
+      const note = document.createElement("p");
+      note.className = "adm-note";
+      note.textContent = "Nothing is placed yet, so there is nothing to re-send. Restart the bot (Overview) to retry.";
+      container.appendChild(note);
+    }
+  }
+
+  // Decision 3's commands line, in order: the state sentence, then (refused) the invite link, then
+  // (refused/unregistered) the retry controls.
+  function buildCommandsSection(card, model) {
+    const line = document.createElement("p");
+    line.className = "server__line";
+    card.appendChild(line);
+    if (model.commands.state === "live") {
+      line.textContent = "Commands live — " + model.commands.registered + " registered " + new Date(model.commands.at).toLocaleString();
+    } else if (model.commands.state === "single-mode") {
+      line.textContent = "No commands here: only the home server registers commands until a plugin is placed.";
+    } else if (model.commands.state === "refused") {
+      line.textContent = "Discord refused the commands here: " + model.commands.error;
+      const invite = discoveryInviteUrl();
+      if (invite) {
+        const a = document.createElement("a");
+        a.href = invite;
+        a.rel = "noopener";
+        a.target = "_blank";
+        a.textContent = "Re-invite the bot";
+        card.appendChild(a);
+      }
+      appendRetryControls(card);
+    } else {
+      line.textContent = "Commands were never registered here.";
+      appendRetryControls(card);
+    }
+  }
+
+  // scope/postsTo/webhook are serverCardModel's own data fields (channel NAMES, never ids, when
+  // resolvable) -- this is presentation only.
+  function pluginPlacementText(p) {
+    const scope = p.scope === "all" ? "anywhere" : p.scope.map((n) => "#" + n).join(", ");
+    if (!p.postsTo) return scope;
+    if (p.webhook === "ok") return scope + " · posts to #" + p.postsTo + " (webhook)";
+    if (p.webhook === "broken") return scope + " · posts to #" + p.postsTo + " (webhook stopped working)";
+    return scope + " · posts to #" + p.postsTo + " as the bot";
+  }
+
+  function buildWebhookRow(wh) {
+    const row = document.createElement("div");
+    row.className = "server__webhook";
+    const label = document.createElement("span");
+    label.textContent = wh.channelName ? "#" + wh.channelName : "channel " + wh.channelId + " (no longer visible)";
+    row.appendChild(label);
+    const meta = document.createElement("span");
+    meta.className = "adm-note";
+    meta.textContent =
+      "added " + new Date(wh.addedAt).toLocaleDateString() + " by " + wh.addedBy + (wh.broken ? " · stopped working: " + wh.broken : "");
+    row.appendChild(meta);
+    const key = "remove:" + wh.channelId;
+    const st = serverActionState.get(key);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rb-btn rb-btn--sm rb-btn--ghost";
+    btn.textContent = "Remove";
+    btn.disabled = !!(st && st.busy);
+    btn.addEventListener("click", () => removeWebhook(wh.channelId, wh.channelName || wh.channelId));
+    row.appendChild(btn);
+    if (st && st.message) {
+      const msg = document.createElement("p");
+      msg.className = "adm-note";
+      msg.setAttribute("role", "status");
+      msg.textContent = st.message;
+      row.appendChild(msg);
+    }
+    return row;
+  }
+
+  // Decision 3's "Add a webhook": a password field so the pasted URL never shows on screen, cleared by
+  // addWebhook itself the moment the click handler runs -- this builder only draws whatever
+  // serverActionState currently holds for this subject.
+  function buildAddWebhookForm(guildId) {
+    const wrap = document.createElement("div");
+    wrap.className = "server__add";
+    const label = document.createElement("label");
+    label.className = "rb-label";
+    label.htmlFor = "webhook-input-" + guildId;
+    label.textContent = "Add a webhook";
+    wrap.appendChild(label);
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.className = "rb-input";
+    input.id = "webhook-input-" + guildId;
+    input.placeholder = "Paste the webhook URL";
+    wrap.appendChild(input);
+    const key = "add:" + guildId;
+    const st = serverActionState.get(key);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rb-btn rb-btn--sm";
+    btn.textContent = "Add";
+    btn.disabled = !!(st && st.busy);
+    btn.addEventListener("click", () => addWebhook(guildId));
+    wrap.appendChild(btn);
+    const hint = document.createElement("p");
+    hint.className = "adm-note";
+    hint.textContent = "The bot asks Discord which channel it posts to. If that channel already has a webhook, this one replaces it.";
+    wrap.appendChild(hint);
+    if (st && st.message) {
+      const msg = document.createElement("p");
+      msg.className = "adm-note";
+      msg.setAttribute("role", "status");
+      msg.textContent = st.message;
+      wrap.appendChild(msg);
+    }
+    return wrap;
+  }
+
+  function buildServerCard(model) {
+    const card = document.createElement("section");
+    card.className = "rb-card server";
+    const h = document.createElement("h3");
+    h.className = "server__h";
+    h.textContent = model.name + (model.home ? " (home)" : "");
+    card.appendChild(h);
+
+    buildCommandsSection(card, model);
+
+    const pluginsHead = document.createElement("p");
+    pluginsHead.className = "server__line";
+    pluginsHead.textContent = "Plugins here";
+    card.appendChild(pluginsHead);
+    const pluginsList = document.createElement("div");
+    pluginsList.className = "server__plugins";
+    if (model.plugins.length === 0) {
+      const none = document.createElement("p");
+      none.className = "adm-note";
+      none.textContent = "No plugin lives here.";
+      pluginsList.appendChild(none);
+    }
+    for (const p of model.plugins) {
+      const row = document.createElement("p");
+      row.className = "server__line";
+      row.textContent = p.name + " — " + (p.byDefault ? "lives here by default" : pluginPlacementText(p));
+      pluginsList.appendChild(row);
+    }
+    card.appendChild(pluginsList);
+
+    const whHead = document.createElement("p");
+    whHead.className = "server__line";
+    whHead.textContent = "Webhooks";
+    card.appendChild(whHead);
+    const whList = document.createElement("div");
+    whList.className = "server__webhooks";
+    if (model.webhooks.length === 0) {
+      const none = document.createElement("p");
+      none.className = "adm-note";
+      none.textContent = "None.";
+      whList.appendChild(none);
+    }
+    for (const wh of model.webhooks) whList.appendChild(buildWebhookRow(wh));
+    card.appendChild(whList);
+
+    card.appendChild(buildAddWebhookForm(model.id));
+    return card;
+  }
+
+  // Decision 2's "below the last real card": one per server routing/webhooks still names but discovery
+  // does not, read-only, in the #245 route__row--off style.
+  function buildUnavailableServerCard(gone) {
+    const card = document.createElement("section");
+    card.className = "rb-card server route__row--off";
+    const h = document.createElement("h3");
+    h.className = "server__h";
+    h.textContent = "Server " + gone.id + " — the bot is no longer in it";
+    card.appendChild(h);
+    if (gone.plugins.length > 0) {
+      const p = document.createElement("p");
+      p.className = "server__line";
+      p.textContent = "Still placed: " + gone.plugins.join(", ") + ". Dropped the next time each plugin's placement changes.";
+      card.appendChild(p);
+    }
+    if (gone.webhooks.length > 0) {
+      const p = document.createElement("p");
+      p.className = "server__line";
+      p.textContent = (gone.webhooks.length === 1 ? "1 webhook" : gone.webhooks.length + " webhooks") + " still recorded here.";
+      card.appendChild(p);
+    }
+    return card;
+  }
+
+  // Redraws #servers-list FRESH from the latest routingData/pluginsData/serverActionState -- the same
+  // rule as refreshRoutingSteps: never a closure over a control a previous render already replaced.
+  function renderServers() {
+    const list = document.getElementById("servers-list");
+    if (!list) return;
+    const discovery = routingData && routingData.discovery;
+    const meta = document.getElementById("servers-meta");
+    if (meta) meta.textContent = discovery && discovery.generatedAt ? "Last read from Discord " + new Date(discovery.generatedAt).toLocaleString() : "";
+    const discoveryState = serverActionState.get("discovery");
+    const copyState = serverActionState.get("copy");
+    const refreshBtn = document.getElementById("refresh-discovery");
+    if (refreshBtn) refreshBtn.disabled = !!(discoveryState && discoveryState.busy);
+    const status = document.getElementById("servers-status");
+    // The precedence is the pure serversStatusMessage (SERVERS_TAB), so it is pinned without a DOM.
+    if (status) setApplyText(status, serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError));
+
+    clearChildren(list);
+    if (!discovery) {
+      const p = document.createElement("p");
+      p.className = "adm-note";
+      p.textContent = "The bot hasn't published what it can see yet.";
+      list.appendChild(p);
+      return;
+    }
+    for (const guild of discovery.guilds) list.appendChild(buildServerCard(serverCardModel(guild, routingData, pluginsData)));
+    for (const gone of unavailableServers(routingData)) list.appendChild(buildUnavailableServerCard(gone));
+  }
+  const refreshServers = renderServers;
+
+  // A first-request 401 occurs before the poller can settle a subject.  Clear its durable busy state so
+  // the rebuilt tab is usable after sign-in again, rather than leaving its action disabled until reload.
+  function clearUnauthorizedServerAction(key) {
+    serverActionState.delete(key);
+    renderServers();
+  }
+
+  async function addWebhook(guildId) {
+    const key = "add:" + guildId;
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    const input = document.getElementById("webhook-input-" + guildId);
+    const url = input ? input.value : "";
+    // #246: cleared BEFORE the request is awaited, whatever the outcome -- a refusal means paste again.
+    if (input) input.value = "";
+    if (!url) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
+    serverActionState.set(key, { busy: true, message: "Adding…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/webhooks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }), signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: a 401 mid-poll (AFTER this request already succeeded) used to fold into
+      // outcome.timeout, writing a stale "may be restarting… queued" message that survived a re-login
+      // (serverActionState is never reset by one) -- clearUnauthorizedServerAction instead, matching the
+      // initiating-request 401 case this same function already handles via its own catch below.
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+      } else if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+      } else {
+        serverActionState.delete(key);
+        // #246 orchestrator follow-up (minor 7): a successful Add changes what buildWhereItLivesStep
+        // shows on the Plugins tab (the "· webhook" suffix) -- refresh it now rather than waiting for
+        // the next unrelated loadRouting.
+        refreshRoutingSteps();
+      }
+      renderServers();
+      renderNeedsAttention();
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  async function removeWebhook(channelId, channelName) {
+    const key = "remove:" + channelId;
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    if (!confirm("Remove the webhook for #" + channelName + "? The bot posts there as itself afterwards.")) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
+    serverActionState.set(key, { busy: true, message: "Removing…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/webhooks/" + encodeURIComponent(channelId), { method: "DELETE", signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: a 401 mid-poll (AFTER this request already succeeded) used to fold into
+      // outcome.timeout, writing a stale "may be restarting… queued" message that survived a re-login
+      // (serverActionState is never reset by one) -- clearUnauthorizedServerAction instead, matching the
+      // initiating-request 401 case this same function already handles via its own catch below.
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+      } else if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+      } else {
+        serverActionState.delete(key);
+        // #246 orchestrator follow-up (minor 7): same reasoning as addWebhook's own call -- a successful
+        // Remove also changes the Plugins tab's webhook suffix.
+        refreshRoutingSteps();
+      }
+      renderServers();
+      renderNeedsAttention();
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  // Decision 4's one poller behind Add/Remove/Try again/Refresh from Discord: re-reads GET /api/routing
+  // every ROUTING_POLL_MS until routing.results holds `id` or ROUTING_ANSWER_TIMEOUT_MS has passed.
+  // Never throws -- a transient read failure just tries again next tick. Round-3 review finding (stale
+  // comment): a 401 does NOT end the wait the same way a timeout does, not since round 2 -- it resolves
+  // { unauthorized: true }, a distinct outcome every caller checks BEFORE outcome.timeout, specifically so
+  // it is never folded into the "may be restarting… queued" timeout message (see that fix, below). The
+  // fresh routingData is stored on every successful read, exactly like #245's own two pollers. Round-1 review finding,
+  // declined: two independent calls (e.g. Add on one server, Refresh from Discord) each reassign the
+  // shared routingData on their own timer, so an out-of-order response could cause a transient render
+  // flicker -- self-healing (the next tick on either one re-fetches and corrects), and the exact same
+  // shared-variable pattern #245's own awaitRequestResult/refreshDiscovery already use, not a risk this
+  // function introduces.
+  async function pollForResult(id, startedAt) {
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
+      const remaining = ROUTING_ANSWER_TIMEOUT_MS - (Date.now() - startedAt);
+      if (remaining <= 0) return { timeout: true };
+      const { signal, cancel } = timeoutSignal(remaining);
+      try {
+        const res = await api("/api/routing", { signal });
+        routingData = await res.json();
+      } catch (e) {
+        // Round-2 review finding: this used to fold into { timeout: true }, so a 401 midway through the
+        // poll -- AFTER the initiating request had already succeeded -- surfaced through every caller's
+        // `if (outcome.timeout)` branch as "The bot did not answer within 30 seconds. It may be
+        // restarting; the change is queued and applies when it catches up." api() has already shown the
+        // login gate by the time this throws, so that message is written invisibly behind it; once the
+        // operator signs back in, serverActionState (never reset by re-login) kept showing that stale,
+        // actively misleading text -- possibly right beside fresh data that already shows the action
+        // succeeded -- until the same action was repeated. A distinct `unauthorized` outcome lets every
+        // caller clear its busy state via clearUnauthorizedServerAction instead, the same as a 401 on the
+        // INITIATING request already does.
+        if (e && e.message === "unauthorized") return { unauthorized: true };
+        if (e && e.name === "AbortError") return { timeout: true };
+        if (Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) return { timeout: true };
+        // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+      } finally {
+        cancel();
+      }
+      const result = routingData && routingData.routing && routingData.routing.results && routingData.routing.results.find((r) => r.id === id);
+      if (result) return { result };
+      if (Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) return { timeout: true };
+    }
+  }
+
+  async function refreshDiscoveryAll() {
+    const key = "discovery";
+    const existing = serverActionState.get(key);
+    if (existing && existing.busy) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
+    serverActionState.set(key, { busy: true, message: "Refreshing…" });
+    renderServers();
+    const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
+    try {
+      const res = await api("/api/discovery/refresh", { method: "POST", signal });
+      const text = await res.text();
+      let result = null;
+      try { result = JSON.parse(text); } catch { /* falls through to the generic failure below */ }
+      if (!res.ok || !result || !result.id) {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
+        renderServers();
+        return;
+      }
+      const outcome = await pollForResult(result.id, Date.now());
+      // Round-2 review finding: see addWebhook's identical comment -- a mid-poll 401 must clear busy
+      // state, not fold into the timeout message (which would otherwise survive a re-login unchanged).
+      if (outcome.unauthorized) {
+        clearUnauthorizedServerAction(key);
+        return;
+      }
+      if (outcome.timeout) {
+        serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        renderServers();
+        return;
+      }
+      // A completed request is not necessarily a successful refresh. The bot records a rejected
+      // discovery-refresh as an ordinary routing result with ok:false and its reason; keep that outcome
+      // visible instead of clearing the action state and presenting the old discovery as a success. Same
+      // wording addWebhook/removeWebhook already use for their own refusal case.
+      if (!outcome.result.ok) {
+        serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        renderServers();
+        return;
+      }
+      serverActionState.delete(key);
+      await loadRouting(); // re-renders the tab itself (renderServers is part of loadRouting's own tail)
+    } catch (e) {
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
+        renderServers();
+      } else {
+        clearUnauthorizedServerAction(key);
+      }
+    } finally {
+      cancel();
+    }
+  }
+
+  async function copyInviteLink() {
+    const url = discoveryInviteUrl();
+    if (!url) return;
+    const fallback = document.getElementById("invite-fallback");
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(url);
+      if (fallback) fallback.hidden = true;
+      serverActionState.set("copy", { busy: false, message: "Copied." });
+    } catch {
+      if (fallback) {
+        fallback.value = url;
+        fallback.hidden = false;
+        fallback.focus();
+        fallback.select();
+      }
+      serverActionState.set("copy", { busy: false, message: "Couldn't copy automatically — select and copy the link below." });
+    }
+    // Route through serverActionState/renderServers rather than writing #servers-status directly --
+    // renderServers overwrites that element from serverActionState on every redraw (a refresh, an
+    // Add/Remove, a retry), which would otherwise erase or resurrect a stale message under this one.
+    renderServers();
+  }
+  // Not withBusy: refreshDiscoveryAll manages #refresh-discovery's own disabled state through
+  // serverActionState/renderServers (surviving a rebuild mid-flight, unlike a plain closure over `el`).
+  document.getElementById("refresh-discovery").addEventListener("click", refreshDiscoveryAll);
+  document.getElementById("copy-invite").addEventListener("click", copyInviteLink);
+
+  // #246: decision 5's Needs-attention list, drawn from the page's own current state -- never stored,
+  // recomputed at every render. `settingLabel` has needsAttention's own (key, pluginName) => string
+  // shape (PLUGIN_SETTING_LABEL, above), so it is passed straight through as labelOf.
+  function renderNeedsAttention() {
+    const list = document.getElementById("attention-list");
+    if (!list) return;
+    const items = needsAttention({
+      status: lastStatus,
+      plugins: (pluginsData && pluginsData.plugins) || [],
+      routingData,
+      env: loadedEnv,
+      schema: loadedSchema,
+      labelOf: settingLabel,
+    });
+    clearChildren(list);
+    if (items.length === 0) {
+      const p = document.createElement("p");
+      p.className = "adm-note";
+      p.textContent = "Nothing needs attention.";
+      list.appendChild(p);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "attention__item";
+      const text = document.createElement("span");
+      text.textContent = item.text;
+      row.appendChild(text);
+      if (item.fix.go !== "none") {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "rb-btn rb-btn--sm rb-btn--ghost attention__fix";
+        btn.textContent = item.fix.label;
+        btn.addEventListener("click", () => goToFix(item.fix.go));
+        row.appendChild(btn);
+      }
+      list.appendChild(row);
+    }
+  }
+
+  // Where a Needs-attention fix button sends the operator (decision 5's `fix.go`).
+  function goToFix(go) {
+    if (go === "settings") { showTab("settings", true); return; }
+    if (go === "servers") { showTab("servers", true); return; }
+    if (go === "retry") { showTab("servers", true); retryRegistration(); return; }
+    if (go === "restart") {
+      showTab("overview", true);
+      const btn = document.getElementById("restart");
+      if (btn) btn.focus();
+      return;
+    }
+    if (go.indexOf("plugins-card:") === 0) {
+      showTab("plugins", false);
+      openPluginCard(go.slice("plugins-card:".length));
+    }
+  }
+
+  // Same open-and-focus sequence refuseApply already uses for a plugin-owned key (#244) -- forces the
+  // card open directly via cardHeaderEls' stored refs rather than a full renderPlugins, then focuses it.
+  function openPluginCard(name) {
+    const els = cardHeaderEls.get(name);
+    if (!els) return;
+    if (els.body && els.body.hidden) {
+      openCards.add(name);
+      els.body.hidden = false;
+      els.head.setAttribute("aria-expanded", "true");
+      if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
+    }
+    if (els.head && els.head.focus) els.head.focus();
   }
 
   // Step 2, present whenever there is something to show: a declared setting, an admin bundle, or (with
@@ -2238,9 +2970,11 @@
         "<dt>Container</dt><dd>" + escapeHtml(s.status || "") + "</dd>" +
         "<dt>Image</dt><dd>" + escapeHtml(s.image || "") + "</dd>" +
         "<dt>Realm</dt><dd>" + (dot ? '<span class="dot ' + dot + '"></span>' : "") + escapeHtml(s.realmStatus || "unknown") + "</dd>";
+      lastStatus = s;
     } catch (e) {
       if (e.message !== "unauthorized") grid.innerHTML = "<dt>Error</dt><dd>" + escapeHtml(e.message) + "</dd>";
     }
+    renderNeedsAttention();
   }
   document.getElementById("refresh-status").addEventListener("click", (e) => withBusy(e.currentTarget, loadStatus));
 
@@ -2362,9 +3096,18 @@
   // GET /api/env-schema (#207), not from anything hardcoded here. A blank option is always offered
   // for a select since an empty value clears a key back to its documented default.
   const FIELD_META = {
-    DISCORD_SERVER_ID: { hint: "Which Discord server slash commands register to. Blank registers globally (can take ~1h to appear)." },
-    ANNOUNCE_CHANNEL_ID: { hint: "Required — the bot won't start without it. The default announcement channel: releases (unless the field below is set), plus whatever the installed plugins post here (e.g. the wow plugin's Darkmoon Faire, weekly-reset, and server up/down notices)." },
-    RELEASE_ANNOUNCE_CHANNEL_ID: { hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank." },
+    DISCORD_SERVER_ID: {
+      control: "server",
+      hint: "The home server: where a plugin nobody has placed lives and registers its commands. Blank registers those commands globally (can take about an hour to appear).",
+    },
+    ANNOUNCE_CHANNEL_ID: {
+      control: "channel",
+      hint: "Required — the bot won't start without it. The default announcement channel: releases (unless the field below is set), plus whatever the installed plugins post here (e.g. the wow plugin's Darkmoon Faire, weekly-reset, and server up/down notices).",
+    },
+    RELEASE_ANNOUNCE_CHANNEL_ID: {
+      control: "channel",
+      hint: "Gets only new-release announcements; falls back to ANNOUNCE_CHANNEL_ID when blank.",
+    },
     REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
     ADMIN_USER_IDS: { control: "tags", hint: "Discord user IDs allowed to run /update. Add one per chip.", placeholder: "Discord user ID" },
     AUTO_UPDATE: { control: "select", options: ["true", "false"] },
@@ -2421,6 +3164,9 @@
 
   let loadedEnv = {}; // last-loaded values, the baseline the Apply bar diffs the controls against
   let loadedSchema = {}; // last-loaded GET /api/env-schema ({} when unavailable — degrades to no client-side validation, #207)
+  // #246, decision 6: which env keys renderEnvFields has ever shown as a picker -- only ever grows (a
+  // picker is never downgraded), survives #env-fields being wiped by a failed reloadConfig's error text.
+  let pickerKeysShown = new Set();
 
   // TAG_SYNC:begin
   // Setting an input's value from code fires NO event, and the Apply bar learns of an edit only from an
@@ -2504,7 +3250,76 @@
     return wrapper;
   }
 
-  function buildEnvControl(key, value, required) {
+  // #246: discovery is "ready to trust" for a picker under the exact same rule #245's routing step
+  // already uses for its own controls (DISCOVERY_STALE_MS) -- never a guess of its own.
+  function discoveryReadyForPickers() {
+    return !!(routingData && routingData.discovery && !isDiscoveryStale(routingData.discovery.generatedAt, Date.now()));
+  }
+
+  // A <select> from pickerOptions, grouped into <optgroup>s by each option's own `group` (channel
+  // options only -- the server picker has none). data-key/id are NOT set here: buildEnvControl's common
+  // tail sets them on every branch alike, so a picker's stored key/value round-trip through the Apply
+  // bar exactly like the plain id field it replaces.
+  function buildPickerSelect(key, discovery, value) {
+    const control = document.createElement("select");
+    control.className = "rb-select";
+    let currentGroup;
+    let target = control;
+    // pickerOptions takes the CONTROL KIND (FIELD_META[key].control -- "server" or "channel"), not the key
+    // itself: keeps it a pure function of its literal inputs, testable without FIELD_META in scope, and
+    // means any future control: "server"/"channel" key gets the right shape with no code change here.
+    const controlKind = (FIELD_META[key] || {}).control;
+    for (const opt of pickerOptions(controlKind, discovery, value)) {
+      if (opt.group !== currentGroup) {
+        currentGroup = opt.group;
+        if (opt.group) {
+          target = document.createElement("optgroup");
+          target.label = opt.group;
+          control.appendChild(target);
+        } else {
+          target = control;
+        }
+      }
+      const o = document.createElement("option");
+      o.value = opt.value;
+      o.textContent = opt.label;
+      target.appendChild(o);
+    }
+    control.value = value;
+    return control;
+  }
+
+  // Swaps a plain id field and its live picker in place as discovery becomes ready or stale -- always
+  // carrying the control's CURRENT value so an in-progress edit survives either transition.
+  // Round-3 review finding: a prior version of this function also downgraded an existing picker back to
+  // a plain input once discovery went stale -- reverted. Decision 6 is explicit and was marked "Decided
+  // -- not open for re-planning": upgrade a plain field to its picker in place once discovery becomes
+  // ready, "carrying the control's current value across ... never the other way: a picker is never
+  // downgraded back to a plain field once discovery has gone stale again, since a control the operator
+  // may be mid-edit on must not be replaced out from under them." Reversing that is a real design
+  // decision (stale picker OPTIONS vs. disrupting an in-progress edit), not a bug fix, and belongs in its
+  // own flagged discussion, not silently inside an unrelated round of review fixes.
+  function refreshEnvPickers() {
+    if (!discoveryReadyForPickers()) return;
+    // Orchestrator finding: one source of truth for which keys are pickers -- FIELD_META itself, not a
+    // second hardcoded list here that the three-key array in the old version could silently drift from.
+    for (const key of Object.keys(FIELD_META)) {
+      const meta = FIELD_META[key];
+      if (meta.control !== "server" && meta.control !== "channel") continue;
+      const existing = document.getElementById("env-" + key);
+      if (!existing || existing.tagName === "SELECT") continue;
+      const value = existing.value;
+      const control = buildPickerSelect(key, routingData.discovery, value);
+      control.id = "env-" + key;
+      control.dataset.key = key;
+      pickerKeysShown.add(key);
+      existing.replaceWith(control);
+    }
+  }
+
+  // #300: `required` drives the visible required marker and native `required` on the control;
+  // #246: `preservePicker` keeps a server/channel picker rendered across renderEnvFields rebuilds.
+  function buildEnvControl(key, value, required, preservePicker) {
     const meta = FIELD_META[key] || {};
     // Self-contained composite (its own nested id/data-key/focusId) — return before the common
     // id/dataset tail below, which would otherwise put a second data-key on the wrapper.
@@ -2531,6 +3346,33 @@
       control.className = "rb-select";
       const re = compilePattern(loadedSchema.BOT_BRANCH && loadedSchema.BOT_BRANCH.pattern);
       populateBranchSelect(control, branchesData, value, re);
+    } else if (meta.control === "server" || meta.control === "channel") {
+      // #246: a <select> of live servers/channels (decision 6) -- degrades to the plain input below
+      // whenever discovery isn't ready to trust (null, or stale by #245's own DISCOVERY_STALE_MS rule)
+      // AND this key wasn't already represented by a picker before renderEnvFields cleared the container.
+      //
+      // Round-4 review finding: renderEnvFields() wipes and rebuilds EVERY Config field from scratch on
+      // every reload (any Apply success, Discard, Unlock, or update-button reload all route through
+      // reloadConfig() -> renderEnvFields()) -- and this branch used to decide fresh each call from
+      // discoveryReadyForPickers() ALONE, with no memory of the control that was already there. So once
+      // discovery went stale (DISCOVERY_STALE_MS, ~1h) a picker already on screen silently reverted to a
+      // plain id input on the very next reload -- the same "never downgrade" violation round 3 fixed in
+      // refreshEnvPickers, through a sibling path that fix never touched (refreshEnvPickers only
+      // upgrades/preserves an EXISTING element in place; it is never in the loop when renderEnvFields
+      // rebuilds the whole container). Once a picker for this key exists, it stays a picker even if
+      // discovery has since gone stale -- pickerOptions/buildPickerSelect already handle a null/stale
+      // discovery gracefully (an empty guild list, the stored value kept as its own fallback option), the
+      // same degrade-gracefully rule an out-of-enum plain-select value already gets, above.
+      if (preservePicker || discoveryReadyForPickers()) {
+        // routingData cannot be null here today (loadRouting always keeps the last good snapshot, never
+        // resets it to null once set) -- guarded anyway so this branch can never throw if that ever
+        // changes; pickerOptions already treats a null discovery as an empty guild list.
+        control = buildPickerSelect(key, routingData && routingData.discovery, value);
+      } else {
+        control = document.createElement("input");
+        control.className = "rb-input";
+        control.value = value;
+      }
     } else {
       control = document.createElement("input");
       control.className = "rb-input";
@@ -2567,7 +3409,20 @@
       if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
       const value = loadedEnv[key] ?? "";
       const required = !!(loadedSchema[key] && loadedSchema[key].required);
-      const control = buildEnvControl(key, value, required);
+      // Orchestrator finding: capturing "was this a picker" from the CURRENT DOM (querySelectorAll,
+      // right before clearing the container) broke the moment a FAILED reloadConfig ran in between two
+      // renderEnvFields calls -- its catch writes plain error text into #env-fields (see reloadConfig's
+      // own catch, below), wiping every control including the query this relied on, so the NEXT successful
+      // render saw no existing pickers and downgraded every one of them. pickerKeysShown is a
+      // module-level Set renderEnvFields itself adds to whenever it builds a picker (right after this
+      // call), so the memory survives however #env-fields gets clobbered in between.
+      const control = buildEnvControl(key, value, required, pickerKeysShown.has(key));
+      // Record ONLY the server/channel pickers (minor 5): preservePicker is consulted by buildEnvControl
+      // for those keys alone, and LOG_LEVEL's enum select / BOT_BRANCH's branch select are their own
+      // controls every render regardless -- so tracking them here would make the set's meaning ("keys
+      // that have shown a discovery picker") false without changing any behaviour.
+      const controlKind = (FIELD_META[key] || {}).control;
+      if (control.tagName === "SELECT" && (controlKind === "server" || controlKind === "channel")) pickerKeysShown.add(key);
       const label = document.createElement("label");
       label.className = "rb-label";
       setRequiredLabel(label, key, required);
@@ -2861,7 +3716,264 @@
     }
     return { phase: "applied", live: active && live, at: result.at, servers };
   }
+
+  // #246: the seed ensureRouteState builds from a "ready" model's OWN saved placement -- moved out of
+  // ensureRouteState (browser-only, DOM-adjacent) into this pure block so retryRegistration (Servers tab)
+  // can build the SAME no-op selection without duplicating the shape. Behaviour unchanged: one entry per
+  // ticked row, scope/channels from whether commands is an array, postTo carried as-is (ensureRouteState's
+  // own comment on routingSetBody explains why postTo is re-validated at SEND time, not here).
+  function selectionFromModel(model) {
+    const selection = {};
+    for (const row of model.rows) {
+      if (row.on) {
+        selection[row.id] = {
+          on: true,
+          scope: Array.isArray(row.commands) ? "chosen" : "all",
+          channels: Array.isArray(row.commands) ? row.commands.slice() : [],
+          postTo: row.postTo,
+        };
+      }
+    }
+    return selection;
+  }
   // PLUGIN_ROUTING:end
+
+  // SERVERS_TAB:begin
+  // #246: pure parts of the Servers tab, the Needs-attention list, and the picker fallback -- no DOM, no
+  // fetch, same split as #244's PLUGIN_CARD_STATE / buildPluginCard and #245's PLUGIN_ROUTING /
+  // buildWhereItLivesStep. Reuses routingData's shape and PLUGIN_ROUTING's own reading of it (that block
+  // sits directly above this one in the page, and server.test.ts's harnesses concatenate the two).
+
+  // "Routed" once at least one plugin has a placement entry (even an empty one, servers: {}) -- outside
+  // routed mode every non-home server's commands are null by DESIGN (single mode), never a problem.
+  function routedMode(routing) {
+    return !!(routing && routing.plugins && Object.keys(routing.plugins).length > 0);
+  }
+
+  // One server card's whole picture, decided purely from the raw files plus the plugin list --
+  // commands.state first (what discovery.guilds[].commands says, folded with routed/single mode), then
+  // which plugins live here (routing.plugins[*].servers[guild.id], plus every UNPLACED plugin on the
+  // home card only, byDefault: true), then which webhooks post here. scope/postsTo carry channel NAMES
+  // (falling back to the id when discovery no longer has that channel) -- buildServerCard adds the "#"
+  // and the sentence shape; this is data only.
+  function serverCardModel(guild, routingData, pluginsData) {
+    const routing = (routingData && routingData.routing) || null;
+    const discovery = (routingData && routingData.discovery) || null;
+    const homeId = discovery && discovery.homeGuildId;
+    const home = homeId === guild.id;
+    const routed = routedMode(routing);
+
+    let commands;
+    if (guild.commands && guild.commands.error) {
+      commands = { state: "refused", error: guild.commands.error };
+    } else if (guild.commands) {
+      commands = { state: "live", registered: guild.commands.registered, at: guild.commands.at };
+    } else if (!routed) {
+      commands = { state: "single-mode" };
+    } else {
+      commands = { state: "unregistered" };
+    }
+
+    const pluginList = (pluginsData && pluginsData.plugins) || [];
+    const routingPlugins = (routing && routing.plugins) || {};
+    const webhooksByChannel = (routing && routing.webhooks) || {};
+    const plugins = [];
+    for (const p of pluginList) {
+      const pr = routingPlugins[p.name];
+      const entry = pr && pr.servers && pr.servers[guild.id];
+      if (!entry) continue;
+      const scope =
+        entry.commands === "all"
+          ? "all"
+          : entry.commands.map((chId) => {
+              const ch = guild.channels.find((c) => c.id === chId);
+              return ch ? ch.name : chId;
+            });
+      let postsTo = null;
+      let webhook = "none";
+      if (entry.postTo) {
+        const ch = guild.channels.find((c) => c.id === entry.postTo);
+        postsTo = ch ? ch.name : entry.postTo;
+        const wh = webhooksByChannel[entry.postTo];
+        webhook = !wh ? "none" : wh.broken ? "broken" : "ok";
+      }
+      plugins.push({ name: p.name, scope, postsTo, webhook, byDefault: false });
+    }
+    // Round-1 review finding: an unplaced plugin lives in the home server ONLY when one is configured --
+    // with DISCORD_SERVER_ID unset (homeId falsy), src/routing/resolve.ts's pluginsForGuild registers an
+    // unplaced plugin in EVERY guild instead (CONTEXT.md: "With DISCORD_SERVER_ID unset there is no home
+    // server and an unplaced plugin lives in every server"; #245's own placementSummary sentence: "Lives
+    // in every server by default (no home server is set)"). `home` alone (`homeId === guild.id`) is false
+    // for every guild when homeId is null, so this used to never draw byDefault anywhere in that case --
+    // silently contradicting what the bot actually registers.
+    if (home || !homeId) {
+      for (const p of pluginList) {
+        if (!routingPlugins[p.name]) plugins.push({ name: p.name, scope: "all", postsTo: null, webhook: "none", byDefault: true });
+      }
+    }
+
+    const webhooks = [];
+    for (const [channelId, wh] of Object.entries(webhooksByChannel)) {
+      if (wh.guildId !== guild.id) continue;
+      const ch = guild.channels.find((c) => c.id === channelId);
+      webhooks.push({ channelId, channelName: ch ? ch.name : null, addedAt: wh.addedAt, addedBy: wh.addedBy, broken: wh.broken });
+    }
+
+    return { id: guild.id, name: guild.name, home, commands, plugins, webhooks };
+  }
+
+  // Servers routing.plugins or routing.webhooks still names but discovery no longer sees -- what each
+  // still holds, so the tab can say what is dropped the next time it changes (#245's same sentence, one
+  // level up: per SERVER rather than per plugin's own unavailable list).
+  function unavailableServers(routingData) {
+    const routing = (routingData && routingData.routing) || null;
+    if (!routing) return [];
+    const discovery = (routingData && routingData.discovery) || null;
+    const knownIds = new Set(((discovery && discovery.guilds) || []).map((g) => g.id));
+    const ids = [];
+    const seen = new Set();
+    const note = (id) => {
+      if (!knownIds.has(id) && !seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+    };
+    for (const pr of Object.values(routing.plugins || {})) {
+      for (const guildId of Object.keys(pr.servers || {})) note(guildId);
+    }
+    for (const wh of Object.values(routing.webhooks || {})) note(wh.guildId);
+    return ids.map((id) => ({
+      id,
+      plugins: Object.keys(routing.plugins || {}).filter((name) => routing.plugins[name].servers && routing.plugins[name].servers[id]),
+      webhooks: Object.keys(routing.webhooks || {}).filter((channelId) => routing.webhooks[channelId].guildId === id),
+    }));
+  }
+
+  // Decision 5's six kinds, in this fixed order, each kind at most once per SUBJECT (a plugin+key, a
+  // server, a channel, a file) -- never a duplicate of the drift banner's own wording beyond the file
+  // name. `labelOf` has settingLabel's own signature, (key, pluginName) => string -- the real caller
+  // passes settingLabel itself; this stays a pure function of its input either way.
+  function needsAttention(input) {
+    const status = input.status;
+    const plugins = input.plugins || [];
+    const routingData = input.routingData;
+    const env = input.env || {};
+    const schema = input.schema || {};
+    const labelOf = input.labelOf;
+    const routing = (routingData && routingData.routing) || null;
+    const discovery = (routingData && routingData.discovery) || null;
+    const out = [];
+
+    for (const p of plugins) {
+      if (p.enabled && p.missingEnv && p.missingEnv.length) {
+        for (const key of p.missingEnv) {
+          out.push({ kind: "missing-setting", text: p.name + " needs " + labelOf(key, p.name), fix: { label: "Fill it in", go: "plugins-card:" + p.name } });
+        }
+      }
+    }
+    for (const key of Object.keys(schema)) {
+      const s = schema[key];
+      if (s && s.required && s.source !== "plugin" && !env[key]) {
+        out.push({ kind: "missing-setting", text: key + " is required and blank", fix: { label: "Set it", go: "settings" } });
+      }
+    }
+
+    // Orchestrator finding: a single pass over discovery.guilds emitted commands-refused and
+    // commands-unregistered interleaved in GUILD order, not the documented kind order (a guild with null
+    // commands ahead of a refused one put "unregistered" before "refused" in the list). Two passes.
+    const routed = routedMode(routing);
+    const guilds = (discovery && discovery.guilds) || [];
+    for (const g of guilds) {
+      if (g.commands && g.commands.error) {
+        out.push({ kind: "commands-refused", text: g.name + ": Discord refused the bot's commands (" + g.commands.error + ")", fix: { label: "Re-invite, then try again", go: "servers" } });
+      }
+    }
+    for (const g of guilds) {
+      if (!g.commands && routed) {
+        out.push({ kind: "commands-unregistered", text: g.name + ": commands were never registered", fix: { label: "Try again", go: "retry" } });
+      }
+    }
+
+    for (const [channelId, wh] of Object.entries((routing && routing.webhooks) || {})) {
+      if (!wh.broken) continue;
+      const guild = discovery && discovery.guilds && discovery.guilds.find((g) => g.id === wh.guildId);
+      // Orchestrator finding (minor 8): "Add it again" -> Servers sent the operator to a server card
+      // that, once the bot has left, draws no add-webhook form at all (buildUnavailableServerCard is
+      // plain text). That guild is gone from discovery.guilds -- not merely missing a channel lookup --
+      // so there is nothing to fix here; say so instead of pointing at a dead end.
+      if (!guild) {
+        out.push({
+          kind: "webhook-broken",
+          text: "A webhook in server " + wh.guildId + " stopped working (" + wh.broken + "); the bot has left that server, so the webhook is removed when the server's dropped placement clears",
+          fix: { label: "Nothing to do here", go: "none" },
+        });
+        continue;
+      }
+      const channel = guild.channels.find((c) => c.id === channelId);
+      out.push({ kind: "webhook-broken", text: "#" + (channel ? channel.name : channelId) + " in " + guild.name + ": its webhook stopped working (" + wh.broken + ")", fix: { label: "Add it again", go: "servers" } });
+    }
+
+    if (discovery && discovery.homeGuildId) {
+      const homeSeen = discovery.guilds.some((g) => g.id === discovery.homeGuildId);
+      if (!homeSeen) {
+        out.push({
+          kind: "home-missing",
+          text: "The home server (" + discovery.homeGuildId + ") is not one the bot is in, so every plugin nobody has placed is registered nowhere",
+          fix: { label: "Set the home server", go: "settings" },
+        });
+      }
+    }
+
+    for (const file of (status && status.outdatedFiles) || []) {
+      out.push({ kind: "outdated-files", text: file + " is out of date on this instance", fix: { label: "Re-run ops/install.sh", go: "none" } });
+    }
+
+    return out;
+  }
+
+  // Decision 6: options for a server/channel picker, in the shape buildEnvControl's new branch consumes
+  // ({ value, label, group? }[]). A stored value with no matching option (a since-left server, a deleted
+  // channel) is kept as its own trailing option instead of silently dropped -- same rule the plain
+  // select branch already applies to an out-of-enum value.
+  // controlKind: "server" or "channel" (FIELD_META[key].control) -- the CONTROL KIND, never the key name
+  // itself, so a picker for a future control:"server"/"channel" key gets the right options shape for free.
+  function pickerOptions(controlKind, discovery, value) {
+    const guilds = (discovery && discovery.guilds) || [];
+    const options = [];
+    if (controlKind === "server") {
+      options.push({ value: "", label: "— none: register globally —" });
+      for (const g of guilds) options.push({ value: g.id, label: g.name });
+    } else {
+      options.push({ value: "", label: "— default —" });
+      for (const g of guilds) {
+        for (const c of g.channels) {
+          options.push({ value: c.id, label: "#" + c.name + (c.canSend ? "" : " · the bot can't post here"), group: g.name });
+        }
+      }
+    }
+    if (value !== "" && !options.some((o) => o.value === value)) {
+      options.push({ value, label: value + " (not visible to the bot)" });
+    }
+    return options;
+  }
+
+  // The Servers toolbar's one status line (#servers-status), decided purely so its precedence is pinned
+  // without a DOM. Orchestrator round 2: the discovery action's own message -- IN FLIGHT ("Refreshing…")
+  // OR SETTLED (a refusal, a timeout, a "Couldn't send it") -- always wins, since it is the outcome of the
+  // operator's last real action; then the retained-stale-snapshot warning; and a transient "Copied."
+  // confirmation is LAST, so it can never mask a settled refresh outcome (the previous order put copy
+  // ahead of a settled discovery message, which silently re-opened the "keep the refusal visible" fix).
+  // "copy" is also cleared at the top of every durable action and in loadRouting's tail, so it only ever
+  // reaches this function when nothing has happened since Copy was clicked.
+  function serversStatusMessage(discoveryState, copyState, loadError) {
+    return (
+      (discoveryState && discoveryState.message) ||
+      (loadError ? "Couldn't read where plugins live: " + loadError : "") ||
+      (copyState && copyState.message) ||
+      ""
+    );
+  }
+  // SERVERS_TAB:end
 
   // APPLY_VIEW:begin
   // #257: what the bar shows, as a pure decision so the wording and the buttons of every state are pinned
@@ -3176,6 +4288,10 @@
     if (!target || typeof target.closest !== "function" || !target.closest("#env-fields, #plugins-list")) return;
     if (target.closest(".plug__admin")) return;
     if (target.closest(".route")) return;
+    // #246: the Servers tab has no [data-key]/data-plugin/data-setting-key/data-secret-key control at
+    // all (a webhook paste is never a config edit), so this is defensive -- the "#env-fields, #plugins-list"
+    // check above already excludes it in practice -- but it is a source pin the tests hold it to.
+    if (target.closest(".servers")) return;
     if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();
