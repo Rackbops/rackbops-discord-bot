@@ -6153,7 +6153,11 @@ describe("page skeleton", () => {
     expect(setting).toContain("input.required = !!schemaRow.required;");
     expect(setting).toContain("setDescribedByToken(input, desc.id, true);");
     const secret = indexSrc.slice(indexSrc.indexOf("function buildSecretField("), indexSrc.indexOf("function buildPluginCard("));
-    expect(secret).toContain("setRequiredLabel(label, displayLabel, visibleInput && !!schemaRow.required);");
+    expect(secret).toContain('document.createElement(visibleInput ? "label" : "span")');
+    expect(secret).toContain("if (visibleInput) {");
+    expect(secret).toContain('label.htmlFor = "secret-" + key;');
+    expect(secret).toContain("setRequiredLabel(label, displayLabel, !!schemaRow.required);");
+    expect(secret).toContain("label.textContent = displayLabel;");
     expect(secret).toContain("input.required = !!schemaRow.required;");
     expect(secret).toContain("setDescribedByToken(input, note.id, true);");
     const config = indexSrc.slice(indexSrc.indexOf("function buildTagControl("), indexSrc.indexOf("// ENV_SCHEMA:begin"));
@@ -6161,6 +6165,34 @@ describe("page skeleton", () => {
     expect(config).toContain("control.required = required;");
     expect(config).toContain("setRequiredLabel(label, key, required);");
     expect(config).toContain("if (describedControl) setDescribedByToken(describedControl, hint.id, true);");
+  });
+
+  test("the required helper appends the visible, aria-hidden marker (#300)", () => {
+    const children: { textContent?: string; className?: string; attrs?: Map<string, string> }[] = [];
+    const document = {
+      createTextNode: (text: string) => ({ textContent: text }),
+      createElement: () => {
+        const attrs = new Map<string, string>();
+        return { textContent: "", className: "", attrs, setAttribute: (name: string, value: string) => void attrs.set(name, value) };
+      },
+    };
+    const { setRequiredLabel } = new Function(
+      "document",
+      `"use strict";\n${formStatesSrc}\nreturn { setRequiredLabel };`,
+    )(document) as { setRequiredLabel: (label: { textContent: string; appendChild: (child: (typeof children)[number]) => void }, text: string, required: boolean) => void };
+    const label = { textContent: "", appendChild: (child: (typeof children)[number]) => void children.push(child) };
+    setRequiredLabel(label, "Token", true);
+    expect(label.textContent).toBe("Token");
+    expect(children).toHaveLength(2);
+    expect(children[0]?.textContent).toBe(" ");
+    expect(children[1]).toMatchObject({ className: "rb-label__required", textContent: "*" });
+    expect(children[1]?.attrs?.get("aria-hidden")).toBe("true");
+  });
+
+  test("every non-field note remains panel copy, not shared field help (#300)", () => {
+    expect(indexSrc.split('class="adm-note"').length - 1).toBe(2);
+    expect(indexSrc.split('className = "adm-note";').length - 1).toBe(15);
+    expect(indexSrc.split('className = "adm-note adm-note--danger";').length - 1).toBe(1);
   });
 
   test("route field help/error ids preserve the help token while validation comes and goes (#300)", () => {
@@ -6264,6 +6296,7 @@ interface ApplyPlan {
   body: string;
   count: number;
   error?: string;
+  errorKey?: string;
 }
 interface BarView {
   hidden: boolean;
@@ -6368,6 +6401,7 @@ describe("planApply (#257)", () => {
     for (const bad of ["8080\nANNOUNCE_CHANNEL_ID=1", "8080\rX=1", "8080\r\nX=1", "\n"]) {
       const plan = planApply({ loadedEnv: { OK: "1", PORT: "" }, fields: { OK: "2", PORT: bad }, plugins: null });
       expect(plan.error, JSON.stringify(bad)).toBe("PORT must not contain a line break.");
+      expect(plan.errorKey, JSON.stringify(bad)).toBe("PORT");
       expect(plan.body, JSON.stringify(bad)).toBe("");
       expect(plan.count).toBe(2); // the bar still says how many changes are pending
     }
@@ -6398,6 +6432,7 @@ describe("planApply with secrets (#244)", () => {
   test("a line break in a secret is an error, the same as any other field", () => {
     const plan = planApply({ loadedEnv: {}, fields: {}, plugins: null, secrets: { A_SECRET: "x\ny" } });
     expect(plan.error).toBe("A_SECRET must not contain a line break.");
+    expect(plan.errorKey).toBe("A_SECRET");
     expect(plan.body).toBe("");
     expect(plan.count).toBe(1);
   });
@@ -6866,7 +6901,7 @@ interface ApplySpec {
   fields?: Record<string, string>;
   /** Field keys whose control is a chip editor: the [data-key] carrier is a hidden input, the control is a typing input. */
   tags?: string[];
-  pluginsData?: { plugins: { name: string }[]; pluginsValue: string; stateError?: string } | null;
+  pluginsData?: { plugins: { name: string; env?: { key: string }[] }[]; pluginsValue: string; stateError?: string } | null;
   /** The ticked plugin names (default: the names in pluginsValue). */
   checked?: string[];
   schema?: Record<string, unknown>;
@@ -7287,11 +7322,50 @@ describe("applyPending (#257)", () => {
     expect(page.log.posts.map((p) => p.opts.body)).toEqual(["BOT_BRANCH=bad branch!"]);
   });
 
-  test("a line break in a value is refused before anything is sent", async () => {
-    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu\nANNOUNCE_CHANNEL_ID=1" } });
-    await page.run.applyPending();
-    expect(page.log.posts).toEqual([]);
-    expect(page.view()).toMatchObject({ hidden: false, tone: "danger", hint: "WATCHED_REPOS must not contain a line break." });
+  test("line breaks in Config, plugin plain, and secret values use the inline refusal path before sending", async () => {
+    const cases = [
+      {
+        key: "WATCHED_REPOS",
+        controlId: "env-WATCHED_REPOS",
+        page: runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu\nANNOUNCE_CHANNEL_ID=1" } }),
+        tab: "settings",
+      },
+      {
+        key: "MUSIC_PORT",
+        controlId: "set-MUSIC_PORT",
+        page: runApply({
+          loadedEnv: {},
+          pluginsData: { plugins: [{ name: "music", env: [{ key: "MUSIC_PORT" }] }], pluginsValue: "music" },
+          settings: { MUSIC_PORT: "8080\nADMIN_USER_IDS=1" },
+          schema: { MUSIC_PORT: { source: "plugin", required: false, secret: false } },
+        }),
+        tab: "plugins",
+      },
+      {
+        key: "MUSIC_SECRET",
+        controlId: "secret-MUSIC_SECRET",
+        page: runApply({
+          loadedEnv: {},
+          pluginsData: { plugins: [{ name: "music", env: [{ key: "MUSIC_SECRET" }] }], pluginsValue: "music" },
+          secrets: { MUSIC_SECRET: "shh\nADMIN_USER_IDS=1" },
+          schema: { MUSIC_SECRET: { source: "plugin", required: false, secret: true } },
+        }),
+        tab: "plugins",
+      },
+    ];
+    for (const { key, controlId, page, tab } of cases) {
+      await page.run.applyPending();
+      const control = page.element(controlId)!;
+      const error = page.element(controlId + "-error")!;
+      expect(page.log.posts, key).toEqual([]);
+      expect(page.log.tabs.at(-1), key).toEqual([tab, false]);
+      expect(page.log.focused.at(-1), key).toBe(controlId);
+      expect(control.getAttribute("aria-invalid"), key).toBe("true");
+      expect(control.getAttribute("aria-describedby"), key).toBe(controlId + "-error");
+      expect(error.className, key).toBe("rb-field__error");
+      expect(error.textContent, key).toBe(key + " must not contain a line break.");
+      expect(page.view(), key).toMatchObject({ hidden: false, tone: "danger", hint: key + " must not contain a line break." });
+    }
   });
 
   test("the POST carries an AbortSignal, and the timer is cancelled when the request settles (#53)", async () => {
@@ -9048,11 +9122,29 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
 
     const h2 = harness({ routingDataInit });
     h2.seed("music");
+    const helpId = "route-music-100-channels-hint";
+    const fieldset = makeEl("route-music-100-channels");
+    fieldset.setAttribute?.("aria-describedby", helpId);
+    const channelErr = makeEl("route-music-100-channels-error");
+    channelErr.hidden = true;
+    h2.routingStepEls.set("music", {
+      status: makeEl(),
+      statusActions: makeEl(),
+      body: makeEl(),
+      rows: new Map([["100", {
+        box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset,
+        channelChecks: new Map(), channelErr, postSelect: makeEl(), note: makeEl(),
+      }]]),
+    });
     h2.run.onRouteChange("music", "100", "on", true);
     h2.run.onRouteChange("music", "100", "scope", "chosen"); // no channel ticked -> unsendable
     await h2.clock.tick();
     await h2.clock.tick();
     expect(h2.posts).toHaveLength(0);
+    expect(fieldset.getAttribute?.("aria-invalid")).toBe("true");
+    expect(fieldset.getAttribute?.("aria-describedby")).toBe(helpId + " route-music-100-channels-error");
+    expect(channelErr.textContent).toBe("Pick at least one channel for Home.");
+    expect(channelErr.hidden).toBe(false);
   });
 
   test("a change made while a request is in flight is held and sent once when the result lands", async () => {

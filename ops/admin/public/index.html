@@ -1761,10 +1761,14 @@
     const wrap = document.createElement("div");
     wrap.className = "rb-field";
     const visibleInput = !schemaRow.isSet || secretsReplacing.has(key);
-    const label = document.createElement("label");
+    const label = document.createElement(visibleInput ? "label" : "span");
     label.className = "rb-label";
-    label.htmlFor = "secret-" + key;
-    setRequiredLabel(label, displayLabel, visibleInput && !!schemaRow.required);
+    if (visibleInput) {
+      label.htmlFor = "secret-" + key;
+      setRequiredLabel(label, displayLabel, !!schemaRow.required);
+    } else {
+      label.textContent = displayLabel;
+    }
     wrap.appendChild(label);
 
     const rerenderKeeping = (mutate) => {
@@ -2638,7 +2642,7 @@
   //            secrets: {KEY: value} }
   //   `plugins` is null when the bot's state could not be read: nothing may be planned against an
   //   untrusted baseline (a ticked subset diffed against a false-empty PLUGINS would wipe the real selection).
-  //   -> { changes: [{ key, before, now, secret? }], body, count, error? }
+  //   -> { changes: [{ key, before, now, secret? }], body, count, error?, errorKey? }
   // PLUGINS comes first (only when planPluginsSave says it changed; `before` is the raw current value), then
   // the changed fields in field order -- minus any PLUGINS key among them (the Config editor no longer
   // renders one; this is the belt to that brace) -- then (#244) every non-empty typed secret, each
@@ -2660,7 +2664,9 @@
     }
     const plan = { changes, body: changes.map((c) => c.key + "=" + c.now).join("\n"), count: changes.length };
     const smuggling = changes.find((c) => /[\r\n]/.test(c.now));
-    if (smuggling) return { ...plan, body: "", error: smuggling.key + " must not contain a line break." };
+    if (smuggling) {
+      return { ...plan, body: "", error: smuggling.key + " must not contain a line break.", errorKey: smuggling.key };
+    }
     return plan;
   }
   // APPLY_PLAN:end
@@ -3206,7 +3212,7 @@
     const plan = planApply(collectPending());
     if (plan.count === 0) return;
     if (plan.error) {
-      refreshApplyBar(); // shows it
+      refuseApply({ key: plan.errorKey, message: plan.error });
       return;
     }
     // Block a blank required field or a bad-format value BEFORE anything is sent, not after a failed save
