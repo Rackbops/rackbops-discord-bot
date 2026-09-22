@@ -26,10 +26,10 @@ time, not silently written.
 |---|---|
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
-| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. **SSH-only since #277**: the admin panel's Restart button calls `recreate` instead. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted` |
+| `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. **SSH-only since #277**: the admin panel's Restart button calls `recreate` instead. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted`. **#227:** holds the same config-dir lock `env-set`/`recreate` do for its whole run, so it queues behind one already in progress rather than overlapping it |
 | `recreate` | `up -d --force-recreate` on its own, with no value submitted first — the same recreate `env-set` runs after a save, exposed as its own subcommand (#277) so a recreate a previous `env-set` started but the panel never saw finish (a kill, a 504) can be re-attempted from the panel with one click. `{"ok": bool, "recreated": true, "log": string}`, `log` relayed the same way `restart`'s and `env-set`'s are; exits with compose's status |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every plugin in the cached Plugin Index, whether or not the plugin is in `PLUGINS` (#256) |
-| `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them |
+| `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them. **#227:** holds an exclusive lock on the config dir for the whole run (the read, the diff, the backup, the rewrite and the recreate) — a second `env-set`/`restart`/`recreate` on the same instance waits up to `BOT_OPS_LOCK_WAIT_SECONDS` (default 60s), then refuses, having written nothing, rather than racing this one |
 | `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or a plugin's manifest in the cached index, on or off, #256); then one row per plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
 | `routing-get` | JSON `{"routing": …, "discovery": …}` — the bot's per-plugin routing record and what it can see (`data/routing.json`, `data/discovery.json`), read from the container like `status` reads `state.json`. A missing, empty or corrupt file is `null`, never an error. Any webhook URL a hand-edit left in either file is redacted (best effort — the files are not meant to hold one), and the bot's webhook store is never opened (#240, ADR-0006) |
 | `plugin-request` | Read one **request JSON** from stdin (`{action, …, requestedBy}`), validate it per action, and drop it into the bot's **request mailbox** (`data/plugins/requests/`), written `docker exec -u bun` so the bot (which runs as `bun`) owns it. `action` ∈ the five plugin-update actions `update-now`/`schedule`/`remind`/`skip`/`cancel` (`plugin`, `version?`, `at?`, `days?`) or, since #240, `routing-set` (`plugin`, `servers`), `webhook-add` (`url`), `webhook-remove` (`channelId`), `discovery-refresh`. Prints `{queued: "<file>"}`. See "Plugin request mailbox" below |
@@ -364,8 +364,10 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   `no BOT_OPS_CONFIG_DIR — dynamic admin list can't persist`.
 - **`env-set` rebuilds `.env` line-by-line** (no `sed`), so a value can never inject into the
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
-  `<config-dir>/backups/.env.bak.<stamp>` is written before any change; a no-op (new value equals
-  current) does nothing and does **not** restart the bot.
+  `<config-dir>/backups/.env.bak.<stamp>-<pid>` is written before any change (the pid suffix is
+  #227's: with the lock, two saves can no longer land in the same second, but the name is the
+  record of what was replaced and must never depend on timing regardless); a no-op (new value
+  equals current) does nothing and does **not** restart the bot.
 - **`env-set` diffs before it validates, and only what changes is validated** (issue #44). A
   stored value the bot accepts but a whitelist regex rejects — a hand-quoted realm, a CRLF-saved
   file, `1, 2` in `ADMIN_USER_IDS` — used to fail every save that echoed it back, naming a key the
@@ -580,7 +582,13 @@ edit. When an apply fails the bar says why (`Couldn't apply: …`), and what hap
 on the answer (#272). One of `env-set`'s own **refusals** — an HTTP 502 whose plain-text body has a line
 starting `bot-ops: env-set: `, the script's `die "env-set: …"` before it writes — **keeps** the user's
 edits and plugin ticks and leaves **Discard** and **Apply and restart** on the bar, so one refused value
-can be corrected without retyping the rest (a test pins that every such `die` precedes the write). Any
+can be corrected without retyping the rest (a test pins that every such `die` precedes the write).
+**#227:** two admins (or two tabs) applying at once now land one after the other instead of racing —
+`env-set`/`restart`/`recreate` hold one lock on the config dir for their whole run, so a second save
+either queues behind the first or, if it can't get the lock within `BOT_OPS_LOCK_WAIT_SECONDS`, comes
+back as one of `env-set`'s own refusals above (`bot-ops: env-set: another bot-ops.sh mutation is still
+running…`) — which keeps the user's edits exactly like any other `env-set` refusal, the right outcome
+for "try again." Any
 other failure **re-reads** the page's state from the bot, so only OK is left on the bar (nothing is
 pending after the re-read): a **failed recreate** (a 502 with a JSON body: `.env` was already rewritten,
 so the bar shows the compose error and the backup path, issue #47), a **timeout** (504: the outcome is

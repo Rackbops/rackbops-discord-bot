@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -72,6 +73,24 @@ export const DATA_DIR = resolveDataDir();
 // under heavy concurrency; a monotonically increasing counter cannot, by construction.
 let tmpCounter = 0;
 
+// #253: chosen ONCE per process, at module load — not per call, like `tmpCounter` is. A pid alone
+// isn't enough to tell two WRITERS apart: each container in a handoff has its own pid namespace, and
+// the bot runs under an init (`docker-compose.yml`'s `init: true`), so the original and its
+// replacement are very likely the SAME small pid, both starting `tmpCounter` at zero — their first
+// writes to a shared path used to pick the identical temp name, exactly the collision #154's
+// per-process naming was meant to rule out and didn't. This token is what actually distinguishes two
+// processes that agree on both pid and counter.
+const TMP_TOKEN = randomBytes(4).toString("hex");
+
+/** The temp path `writeJsonAtomic` writes to before its rename — one exported pure function so the
+ *  no-collision guarantee is testable without spinning up two processes. `pid`/`token`/`counter` are
+ *  parameters (not read off the module's own `process.pid`/`TMP_TOKEN`/`tmpCounter`) purely so a test
+ *  can hand it two processes' worth of identical pid+counter and prove the token is what separates
+ *  them. */
+export function tmpPathFor(path: string, pid: number, token: string, counter: number): string {
+  return `${path}.${pid}.${token}.${counter}.tmp`;
+}
+
 /**
  * Atomically writes `data` as JSON to `path`: a temp file in the same directory, then a rename —
  * never a bare write, which a crash mid-write could leave unparseable for the next read. Mirrors
@@ -84,21 +103,22 @@ let tmpCounter = 0;
  * caller reaches this only through `createJsonWriter`/`createKeyedJsonMutator`, which serialize
  * that.
  *
- * The temp NAME itself, though, is per-process-unique (`${path}.${pid}.${counter}.tmp`, #154) —
- * unlike the writes it's safe across DIFFERENT processes racing the same `path`, which the
- * in-process serializers above can't help with at all: two containers sharing the state volume
+ * The temp NAME itself is unique per **(process token, call)** — `tmpPathFor`'s
+ * `${path}.${pid}.${TMP_TOKEN}.${counter}.tmp`, #154 + #253. A pid-and-counter name ALONE (#154's
+ * original shape) is not enough across DIFFERENT processes: two containers sharing the state volume
  * during a handoff (the replacement's boot-time `loadPluginIndex` cache write, the original's
- * still-running `pluginUpdates` tick re-fetching the same manifest) used to share one fixed
- * `${path}.tmp`, so either process's rename could fail with `ENOENT` out from under the other, or
- * — worse — one process's in-flight write could be clobbered mid-write by the other reusing the
- * same temp path. A unique name per (process, call) makes that structurally impossible: the two
- * writes now always go to two different temp files, so the only remaining question is which
- * RENAME lands last (last-write-wins on the real path, the same "lost update" the in-process
- * comment above already accepts — never a torn or missing file).
+ * still-running `pluginUpdates` tick re-fetching the same manifest) run under an init and are very
+ * likely the SAME small pid, both starting their own `tmpCounter` at zero — so a pid+counter name
+ * alone lets their first writes collide on the identical temp path, exactly the failure #154 meant to
+ * rule out and didn't (#253). `TMP_TOKEN`, chosen once per process at module load, is what actually
+ * makes two DIFFERENT processes' names diverge even when their pid and counter both happen to match:
+ * the two writes now always go to two different temp files, so the only remaining question is which
+ * RENAME lands last (last-write-wins on the real path, the same "lost update" the in-process comment
+ * above already accepts — never a torn or missing file).
  */
 export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.${++tmpCounter}.tmp`;
+  const tmp = tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter);
   await Bun.write(tmp, JSON.stringify(data, null, 2));
   renameSync(tmp, path);
 }
