@@ -88,3 +88,106 @@ Branch `claude/theme-0-2-42` from `origin/main` (at or after `585ce4b`), isolate
   nothing (exit 1) — and that is the real form of the acceptance bullet's intent ("the card switch is
   `class="rb-switch"` alone"). Both the literal command's real output and the scoped, genuinely-empty
   form are pasted in the PR body rather than silently substituting one for the other.
+
+## Part B — the field-hint sweep, the required marker, and rb-toast
+
+## Implementation plan, part B — written by the orchestrating session, to be executed as written
+
+Part B of #300: the panel adopts the three form-validation classes and the required marker that `@rackbops/styles` 0.2.42 ships (std-lib #210), drops its own `aria-invalid` rule in favour of the theme's, and adopts `rb-toast` (#211) for outcomes that land after the click. Part A (PR #303, `a754487`) already vendored 0.2.42 and removed the switch override. Written 2026-09-22 against `origin/main` **after #246 (PR #304) merges** — cut the branch only then, so one sweep covers #246's code too. Cite by construct, never by line. Panel-only: `ops/admin/public/index.html`, `ops/admin/public/admin.css`, `ops/admin/server.test.ts`, `CONTEXT.md`, `ops/README.md` if it names a class. Nothing under `src/`, nothing in `server.ts`, no theme rebuild (0.2.42 is in). Plan file: append this as "Part B" to `docs/plans/epics/E236/14-theme-and-toast.md`, with its own Deviations section. **Closes #300**; the orchestrator closes std-lib #209, #210 and #211 after the merge.
+
+### What the code says (read from source, not guessed)
+
+- `rb-theme.css` (0.2.42, both arcane themes) now defines `.rb-field__help` (`--rb-text-soft`, `--rb-text-sm`), `.rb-field__error` (ink with a 3px `--rb-danger` left bar), `.rb-label__required` (`--rb-danger` glyph), `.rb-input[aria-invalid="true"]` / `.rb-textarea[…]` / `.rb-select[…]` (`border-color: var(--rb-danger)`), and the `.rb-toast-region` / `.rb-toast` / `--info|--success|--warning|--danger` / `[data-rb-enter]` / `__close` family. The std-lib's `Toast` sets the role in React (info/success `status`, warning/danger `alert`); the region is not itself a live region; the entrance from-state `data-rb-enter` is cleared one frame after mount; under `prefers-reduced-motion` the transition collapses to 0 s.
+- `admin.css` today: `.field-hint` (faint small text, the panel's help/note class), `.field-hint--danger, .plugin-incompat` (the severity-bar notice — the very rule #210 gave back), `.msg` / `.plugin-actions-msg` (inline outcome lines beside a button — stay), `.adm [aria-invalid="true"] { border-color: var(--rb-danger) }` and `.tag-field:has([aria-invalid="true"])`, `.route__channels[aria-invalid="true"]` (composites: keep). `server.test.ts` pins `.adm [aria-invalid="true"]` and `.tag-field:has(…)` in the "admin.css" describe, `['notice.className = "field-hint field-hint--danger";', 1]` in `expected fragments`, and `.adm-apply__text .field-hint`.
+- `index.html` uses `field-hint` in three static places (`#logs-meta`, `#servers-status`, `#apply-hint`) and ~36 builders. They fall into three kinds: **help for a control** (the card's setting description `desc` with `aria-describedby`; `FIELD_META[key].hint` under a config field, currently without `aria-describedby`; the secret field's "Not set yet…" note; the channel checklist's hint; the Add-a-webhook hint), **a refusal about a control** (`notice.className = "field-hint field-hint--danger"` for the stateError notice; `channelErr`), and **a note that describes no control** (empty-list lines, the outage notice, the footnote, version lines, status/outcome lines, `logs-meta`, `apply-hint`, the placement summaries and per-row notes). The required marker is `" *"` appended to label text in three places: `buildSettingField` (plain field), `buildSecretField` (its label is a `<span class="rb-label">`), `renderEnvFields`.
+
+### Decided — not open for re-planning
+
+1. **Three classes, one rule each, and `field-hint` disappears from the repo.** Text that describes a control → `rb-field__help`, and the control names it: `id` on the text, `aria-describedby` on the control (the card's `desc` already does this; the config-editor hint, the secret note, the channel-list hint and the webhook hint gain it). A refusal about a control → `rb-field__error` (the theme's ink-with-bar; `.field-hint--danger` is deleted from `admin.css`, `.plugin-incompat` keeps its own copy of those declarations under its own name). Everything else → a panel class **`adm-note`**, defined in `admin.css` with exactly `.field-hint`'s current declarations. The three static elements move with their kind (`#logs-meta` and `#apply-hint` → `adm-note`; `#servers-status` → `adm-note`). `.adm-apply__text .field-hint` becomes `.adm-apply__text .adm-note`. After this, `git grep -n "field-hint" -- ops/admin` prints nothing — the test literals move too.
+2. **The required marker is the theme's glyph, and the control says so.** In all three places the `" *"` suffix becomes a child `<span class="rb-label__required" aria-hidden="true">*</span>` appended after the label text, and the control gains `required = true` (a `<select>` picker included; the chip composite's inner input included). The Apply bar's own validation (`validateEnvChanges`) is unchanged — the attribute is for assistive tech, not for the browser's form validation (there is no `<form>` submit).
+3. **The theme owns the invalid border on plain controls.** Delete `.adm [aria-invalid="true"]` from `admin.css`; `.rb-input[aria-invalid="true"]` / `.rb-select[…]` from the theme take over. Keep `.tag-field:has([aria-invalid="true"])` and `.route__channels[aria-invalid="true"]` (composites the theme does not know). The test that pins the deleted rule now pins its absence and the theme's rule's presence in `rb-theme.css`.
+4. **`showToast(kind, text)`, vanilla, in a lifted block `TOAST:begin` / `:end`.** One `<div class="rb-toast-region">` appended to `<main id="app">` on first use; each toast `<div class="rb-toast rb-toast--<kind>" role="<toastRole(kind)>">` with a `<span>` for the text and `<button type="button" class="rb-toast__close" aria-label="Dismiss">×</button>`; `data-rb-enter` set on mount and removed in `requestAnimationFrame`; `success` and `info` dismiss themselves after `TOAST_MS = 8000`, `warning` and `danger` stay until dismissed; Escape (one `keydown` listener on `document`, added with the region) dismisses the newest; text through `textContent`; at most `TOAST_MAX = 4` on screen (the oldest goes). `toastRole(kind)` is pure: `danger`/`warning` → `alert`, else `status` (the std-lib's own rule). **Where it fires**, and nowhere else: the settle points of #245's `awaitRequestResult` (applied → `success` *"<plugin>: live in <n> server(s)"* / *"<plugin>: saved, applies once it is running"*; refused → `danger` *"<plugin>: the bot refused it — <reason>"*; timeout → `warning` the 30 s sentence), #245's `refreshDiscovery` and #246's `refreshDiscoveryAll` (landed → `success` *"Read from Discord again."*; refused → `danger`; timeout → `warning`), #246's `addWebhook` / `removeWebhook` (landed → `success` *"Webhook added for #<channel>."* / *"Webhook removed."*; refused → `danger`; timeout → `warning`), and `retryRegistration`'s settle (the plugin's own toast covers it — no second one). Never for the Apply bar (sticky, already a live region) and never for the inline update-action messages (they sit beside their button). The per-step / per-card status lines stay: a toast is never the only place an outcome is reported.
+5. **Nothing else moves.** No wording of an existing status line changes; no new endpoint; no `rb-alert` swaps; the drift banner stays a banner.
+
+### Steps
+
+1. `admin.css`: add `.adm-note { … }` (the old `.field-hint` declarations); delete `.field-hint`, `.field-hint--danger` (fold its declarations into `.plugin-incompat` alone), `.adm [aria-invalid="true"]`; rename `.adm-apply__text .field-hint`. No toast CSS (the theme has it).
+2. `index.html`: the sweep of decision 1 (every `className = "field-hint…"`, the three static `class="field-hint"`), with `id` + `aria-describedby` wiring for every `rb-field__help`; decision 2 in the three label builders; the `TOAST` block and the `showToast` calls of decision 4.
+3. `server.test.ts`: the `expected fragments` entries (the `notice` line becomes `rb-field__error`; add the `adm-note` static count); the admin.css describe (decision 3); the "every class the page uses is styled by admin.css or the theme" test must pass with the new classes (it reads `rb-theme.css` too); the tests below.
+
+### Tests
+
+| # | Test | Pins |
+|---|---|---|
+| 1 | `no field-hint remains in the panel (source pin)` | `index.html`, `admin.css` and this test file's fragment table contain no `field-hint` |
+| 2 | `every rb-field__help is named by its control's aria-describedby (mini-harness)` | `buildSettingField` (plain), `buildSecretField` (unset), `renderEnvFields` with a `FIELD_META` hint, `buildRouteRow`'s checklist, `buildAddWebhookForm`: the help element's `id` appears in the control's `aria-describedby` |
+| 3 | `a refusal about a control is rb-field__error, never rb-field__help (source pin)` | the stateError notice and `channelErr` |
+| 4 | `the required marker is one aria-hidden rb-label__required span and the control carries required (mini-harness)` | the three builders; a non-required key has neither |
+| 5 | `admin.css no longer styles [aria-invalid] on plain controls; the theme does` | rule absent in `admin.css`; `.rb-input[aria-invalid="true"]` present in `rb-theme.css`; the two composite rules still present |
+| 6 | `toastRole: danger and warning are alert, success and info are status` | |
+| 7 | `showToast: a toast mounts with its class, role, text and a close button; data-rb-enter is cleared next frame` (mini-harness with a rAF stub) | |
+| 8 | `showToast: success/info auto-dismiss after TOAST_MS, warning/danger stay; the close button and Escape dismiss; the fifth toast evicts the oldest` (manual clock) | |
+| 9 | `outcomes toast exactly once at their settle points (source pin)` | `showToast(` appears in `awaitRequestResult`, `refreshDiscovery`, `refreshDiscoveryAll`, `addWebhook`, `removeWebhook` slices; not in the `APPLY` block, not in `sendPluginRequest`/`buildPluginUpdateBlock` |
+| 10 | `every lifted block is still present` (24: `TOAST`) | |
+
+### Coverage table
+
+| Acceptance bullet (#300) | Steps | Test | Mutation that must fail it |
+|---|---|---|---|
+| tests + typecheck green; theme stamp 0.2.42 | — | acceptance | — |
+| no `adm-switch` (Part A, unchanged) | — | Part A's pin | — |
+| no `field-hint`; help / error / required from the theme; no own `aria-invalid` rule | 1, 2, 3 | 1, 2, 3, 4, 5 | keep one `field-hint`; drop one `aria-describedby`; use `rb-field__help` for `channelErr`; drop `required`; restore `.adm [aria-invalid]` |
+| `showToast` lifted and pinned: kind → class and role, close, per-kind timer, stacking | 2 | 6, 7, 8 | `danger` → `status`; timer removed; eviction removed |
+| a routing outcome shows in the status line and as a toast; keyboard dismiss; reduced motion | 2 | 9 + manual | drop the `showToast` call in `awaitRequestResult` |
+| screenshots | — | manual | — |
+| std-lib #209/#210/#211 closed | — | the orchestrator, after merge | — |
+
+### Acceptance — execute these, paste the real output
+
+```
+bun run --cwd ops/admin check
+bun test ops/admin/server.test.ts --timeout 20000     # one run at a time on this box; private TEMP/TMP
+git grep -n "field-hint" -- ops/admin                  # must print nothing
+git grep -n "adm-switch" -- ops/admin                  # still only Part A's pin literal
+```
+
+Plus, in the #245/#246 probe harness (headless Chrome, canned data): a refused Apply on a plugin setting shows the themed error bar under the field and the theme's danger border on the control; a required setting's label shows the glyph and `document.getElementById("set-<KEY>").required === true`; a routing outcome shows both the step's status line and a toast; Tab to the toast's × then Enter dismisses it; Escape dismisses the newest; with `prefers-reduced-motion: reduce` emulated, `data-rb-enter` is still cleared and the toast simply appears; screenshots (light/dark: the field help, an error, the required glyph, a success and a danger toast) to roshne directly.
+
+### PR
+
+Branch `claude/theme-classes-toast` from `origin/main` after #246 has merged, isolated worktree under `R:/repos/Scratch/worktrees/`; title `feat(admin): adopt the theme's field help, errors, required marker and toasts (#300)`; body with `Closes #300`, the plan file's Part B section with a Deviations section, the pasted acceptance, the mutation table, the round list. Behaviour change (every notice's rendering, a new notice surface) — the full gate: two adversarial read-only reviewers with different lenses (A: rendering and accessibility in a real browser, both schemes — every kind of note, the error bar's contrast, the glyph, the toast's role/announcement/dismissal/eviction, reduced motion; B: claims-vs-code — the sweep really left no `field-hint`, every `rb-field__help` is wired, every settle point fires exactly one toast, the fragment counts). Mutation-test every changed line in a detached scratch worktree, one mutant at a time. At most four rounds, then stop and tell the orchestrator. **Never merge.**
+
+## Deviations from the plan (Part B)
+
+- **Naming, against the plan's own literal test list:** Test #2 names five sites needing
+  `aria-describedby` wiring (`buildSettingField`, `buildSecretField`, `renderEnvFields`,
+  `buildRouteRow`'s checklist, `buildAddWebhookForm`). Only three of the five (`buildSettingField`,
+  `buildSecretField`, `renderEnvFields`) are covered by a runtime mini-harness; `buildRouteRow` and
+  `buildAddWebhookForm` are covered by source-pin regex checks instead, since reaching them at runtime
+  needs a full routing model/state/els triple or `serverActionState`, disproportionate plumbing for
+  what is, in both cases, straight-line non-conditional wiring code — a regex confirming the help
+  element's assigned `id` and the control's `aria-describedby` sit within the same few lines verifies
+  the same fact a mini-harness would, for code that has no branches to actually execute differently.
+  All five sites are still verified; only the mechanism differs for two of them.
+- **The literal acceptance command `git grep -n "field-hint" -- ops/admin` is not fully empty**, for
+  the identical reason Part A's `adm-switch` pin wasn't: this repo's own new test file necessarily
+  quotes the string "field-hint" to assert its absence (its test title, its own `.not.toContain(...)`
+  assertions). The actually-shipped surfaces are clean —
+  `git grep -n "field-hint" -- ops/admin/public/index.html ops/admin/public/admin.css` returns nothing
+  (exit 1) — pasted alongside the literal form in the PR body, not substituted for it.
+- **Two self-referential `indexOf` bugs surfaced and were fixed while writing test #1's
+  fragments-table check.** The test reads its own source file (`server.test.ts`) to confirm the
+  expected-fragments table never reintroduces `field-hint`; the first two attempts used marker strings
+  (`'describe("page skeleton"'`, `'test("the controls carry the design-system classes...'`) typed out
+  as one contiguous literal, which matched the test's own source **before** the real target further
+  down the file (the test's own code contains those exact search strings). Fixed by building each
+  marker via string concatenation (`"describe(" + '"page skeleton"'`) so the raw source text of this
+  test never contains the joined form, only the real declaration elsewhere does.
+- **The CONTEXT.md `admin.css` row's own prose used to say "the `msg` / `field-hint--danger` notices
+  (a severity bar, never coloured small text)"** — rewritten to name `.plugin-incompat`'s now-standalone
+  copy of those declarations and the new `adm-note` class, plus a note on the deleted
+  `.adm [aria-invalid="true"]` rule and which two composites still keep a local one. A second
+  CONTEXT.md reference (webhook-URL-never-echoed gotcha) named `field-hint` as the element class a
+  refusal message renders as; updated to `adm-note` to match the rename. `ops/README.md` was checked
+  and names none of the changed classes — no edit needed there.
+

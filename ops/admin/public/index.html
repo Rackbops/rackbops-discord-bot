@@ -83,7 +83,7 @@
         <input id="logs-filter" class="rb-input" type="text" placeholder="Filter loaded lines…" autocomplete="off" aria-label="Filter loaded log lines" />
         <label class="inline-check rb-label"><input type="checkbox" id="logs-wrap" class="rb-checkbox" checked /> Wrap</label>
       </div>
-      <div id="logs-meta" class="field-hint" style="margin-top: 6px"></div>
+      <div id="logs-meta" class="adm-note" style="margin-top: 6px"></div>
       <pre id="logs-out" class="rb-pre rb-log" style="margin-top: 6px">(not loaded)</pre>
     </section>
   </div>
@@ -114,7 +114,7 @@
         <span id="servers-meta" class="servers__meta"></span>
       </div>
       <input id="invite-fallback" class="rb-input" type="text" readonly hidden />
-      <p id="servers-status" class="field-hint" role="status"></p>
+      <p id="servers-status" class="adm-note" role="status"></p>
       <div id="servers-list">Loading…</div>
     </section>
   </div>
@@ -158,7 +158,7 @@
   <div id="apply-bar" class="adm-apply" tabindex="-1" hidden>
     <div class="adm-apply__text" role="status">
       <strong id="apply-title"></strong>
-      <span id="apply-hint" class="field-hint"></span>
+      <span id="apply-hint" class="adm-note"></span>
     </div>
     <div class="adm-apply__actions">
       <button id="apply-ok" type="button" class="rb-btn rb-btn--ghost" hidden>OK</button>
@@ -855,6 +855,60 @@
   }
   // PLUGIN_REQUEST_HELPERS:end
 
+  // TOAST:begin
+  // #300 (std-lib #211's shared .rb-toast): fired only at the settle points named in the plan -- never
+  // the Apply bar (already its own live region) and never the inline update-action messages (they sit
+  // beside their own button). The per-step/per-card status line is never replaced by a toast; a toast
+  // is reinforcement, never the only place an outcome is reported.
+  const TOAST_MS = 8000;
+  const TOAST_MAX = 4;
+  // Complete literal class names, never built by concatenation -- so the page's own "every class is
+  // styled" coverage scan (which reads quoted rb-* string literals) sees real, checkable names.
+  const TOAST_KIND_CLASS = { info: "rb-toast--info", success: "rb-toast--success", warning: "rb-toast--warning", danger: "rb-toast--danger" };
+  let toastRegion = null;
+  const activeToasts = [];
+  function toastRole(kind) {
+    return kind === "danger" || kind === "warning" ? "alert" : "status";
+  }
+  function dismissToast(el) {
+    const i = activeToasts.indexOf(el);
+    if (i !== -1) activeToasts.splice(i, 1);
+    if (el.parentNode) el.parentNode.removeChild(el);
+  }
+  function showToast(kind, text) {
+    if (!toastRegion) {
+      toastRegion = document.createElement("div");
+      toastRegion.className = "rb-toast-region";
+      document.getElementById("app").appendChild(toastRegion);
+      // One listener, added the first time the region exists: Escape dismisses the NEWEST toast.
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && activeToasts.length > 0) dismissToast(activeToasts[activeToasts.length - 1]);
+      });
+    }
+    while (activeToasts.length >= TOAST_MAX) dismissToast(activeToasts[0]);
+    const toast = document.createElement("div");
+    toast.className = "rb-toast " + (TOAST_KIND_CLASS[kind] || TOAST_KIND_CLASS.info);
+    toast.setAttribute("role", toastRole(kind));
+    toast.setAttribute("data-rb-enter", "");
+    const span = document.createElement("span");
+    span.textContent = text;
+    toast.appendChild(span);
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "rb-toast__close";
+    close.setAttribute("aria-label", "Dismiss");
+    close.textContent = "×";
+    close.addEventListener("click", () => dismissToast(toast));
+    toast.appendChild(close);
+    toastRegion.appendChild(toast);
+    activeToasts.push(toast);
+    // Entrance from-state is cleared one frame after mount so the transition plays (rb-theme.css); under
+    // prefers-reduced-motion the transition itself collapses to 0s and the toast simply appears.
+    requestAnimationFrame(() => toast.removeAttribute("data-rb-enter"));
+    if (kind === "success" || kind === "info") setTimeout(() => dismissToast(toast), TOAST_MS);
+  }
+  // TOAST:end
+
   // #244: renderPlugins() clears and rebuilds #plugins-list from pluginsData -- one buildPluginCard per
   // plugin -- the same shape loadPlugins used to build, minus the fetch (reloadConfig owns that) and
   // minus the separate Plugin Settings section (a plugin's bundle now mounts inside its own card).
@@ -869,19 +923,19 @@
     const data = pluginsData;
     if (data && data.stateError) {
       const notice = document.createElement("div");
-      notice.className = "field-hint field-hint--danger";
+      notice.className = "rb-field__error";
       notice.textContent = "Couldn't read the bot's current state (" + data.stateError + ") — plugin changes are disabled until it recovers.";
       container.appendChild(notice);
     }
     if (data && data.indexError) {
       const notice = document.createElement("div");
-      notice.className = "field-hint";
+      notice.className = "adm-note";
       notice.textContent = "Plugin Index unavailable (" + data.indexError + ") — showing installed plugins only.";
       container.appendChild(notice);
     }
     if (!data || !data.plugins || data.plugins.length === 0) {
       const empty = document.createElement("div");
-      empty.className = "field-hint";
+      empty.className = "adm-note";
       empty.textContent = "No plugins available or installed.";
       container.appendChild(empty);
       return;
@@ -898,7 +952,7 @@
     };
     for (const p of data.plugins) container.appendChild(buildPluginCard(p, ctx));
     const note = document.createElement("div");
-    note.className = "field-hint";
+    note.className = "adm-note";
     note.style.marginTop = "8px";
     note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
@@ -942,7 +996,7 @@
     title.appendChild(document.createTextNode("Turn it on"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Off keeps everything it has stored. Nothing is deleted.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -969,7 +1023,7 @@
     body.appendChild(choice);
 
     const verHint = document.createElement("p");
-    verHint.className = "field-hint";
+    verHint.className = "adm-note";
     verHint.textContent = versionLine(p);
     body.appendChild(verHint);
 
@@ -1002,7 +1056,7 @@
     title.appendChild(document.createTextNode("Choose where it lives"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Its commands appear only in the servers you tick. Changes here apply at once — no restart.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -1025,7 +1079,7 @@
 
     if (model.mode !== "ready") {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent =
         model.mode === "missing"
           ? "The bot hasn't published what it can see yet."
@@ -1037,7 +1091,7 @@
         const named = model.rows.filter((r) => r.on).map((r) => r.name);
         const shown = named.concat(model.unavailable);
         const list = document.createElement("p");
-        list.className = "field-hint";
+        list.className = "adm-note";
         list.textContent = shown.length ? "Currently placed in: " + shown.join(", ") + "." : "Currently placed nowhere.";
         body.appendChild(list);
       }
@@ -1076,7 +1130,7 @@
         rows.appendChild(row);
       }
       const gone = document.createElement("p");
-      gone.className = "field-hint";
+      gone.className = "adm-note";
       gone.textContent =
         (model.unavailable.length === 1 ? "1 server" : model.unavailable.length + " servers") +
         " the bot has left are still in this plugin's placement. They are dropped the next time you change it.";
@@ -1196,12 +1250,14 @@
       chBox.addEventListener("change", () => onRouteChange(plugin, row.id, "channel", { id: ch.id, checked: chBox.checked }));
     }
     const channelHint = document.createElement("p");
-    channelHint.className = "field-hint";
+    channelHint.className = "rb-field__help";
+    channelHint.id = "route-" + plugin + "-" + row.id + "-channels-help";
     channelHint.textContent =
       "The bot enforces this: a command used elsewhere gets a private reply naming these channels. A thread counts as its parent channel.";
     fieldset.appendChild(channelHint);
+    fieldset.setAttribute("aria-describedby", channelHint.id);
     const channelErr = document.createElement("p");
-    channelErr.className = "field-hint field-hint--danger";
+    channelErr.className = "rb-field__error";
     channelErr.hidden = true;
     fieldset.appendChild(channelErr);
     controls.appendChild(fieldset);
@@ -1237,7 +1293,7 @@
 
     wrap.appendChild(controls);
     const rowNote = document.createElement("p");
-    rowNote.className = "field-hint";
+    rowNote.className = "adm-note";
     rowNote.hidden = true;
     wrap.appendChild(rowNote);
 
@@ -1407,6 +1463,16 @@
       // status-only update is correct there.
       if (outcome.phase === "applied") refreshRoutingSteps();
       else renderRouteStatus(plugin, routingStepEls.get(plugin));
+      if (outcome.phase === "applied") {
+        showToast(
+          "success",
+          outcome.live ? plugin + ": live in " + sentServers.length + (sentServers.length === 1 ? " server" : " servers") : plugin + ": saved, applies once it is running",
+        );
+      } else if (outcome.phase === "refused") {
+        showToast("danger", plugin + ": the bot refused it — " + outcome.reason);
+      } else if (outcome.phase === "timeout") {
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
+      }
       return;
     }
   }
@@ -1491,8 +1557,10 @@
               // message is enough; another click on "Refresh from Discord" is the real retry.
               now2.outcome = { phase: "posted-error", message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." };
               renderRouteStatus(plugin, routingStepEls.get(plugin));
+              showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
             } else {
               refreshRoutingSteps();
+              showToast("success", "Read from Discord again.");
             }
             // Same fix as checkAgain, same reason: a routing edit made while a discovery refresh is in
             // flight sets held (sendRouting sees this loop's own st.inflight and defers), and this is the
@@ -1509,12 +1577,14 @@
         // so a failed discovery-refresh POST was invisible -- same visibility the routing-set send uses.
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + text);
       }
     } catch (e) {
       const message = e && e.message ? e.message : String(e);
       if (message !== "unauthorized") {
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
+        showToast("danger", "Couldn't send it: " + message);
       }
     } finally {
       cancel();
@@ -1754,14 +1824,14 @@
       container.appendChild(btn);
       if (st && st.message) {
         const msg = document.createElement("p");
-        msg.className = "field-hint";
+        msg.className = "adm-note";
         msg.setAttribute("role", "status");
         msg.textContent = st.message;
         container.appendChild(msg);
       }
     } else if (placement && placement.blocked === "unavailable") {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       if (placement.counts.length === 1) {
         const only = placement.counts[0];
         note.textContent =
@@ -1773,12 +1843,12 @@
       container.appendChild(note);
     } else if (placement && placement.blocked === "stale") {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = "Routing data is stale, so Try again is unavailable until Discord refreshes.";
       container.appendChild(note);
     } else {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = "Nothing is placed yet, so there is nothing to re-send. Restart the bot (Overview) to retry.";
       container.appendChild(note);
     }
@@ -1829,7 +1899,7 @@
     label.textContent = wh.channelName ? "#" + wh.channelName : "channel " + wh.channelId + " (no longer visible)";
     row.appendChild(label);
     const meta = document.createElement("span");
-    meta.className = "field-hint";
+    meta.className = "adm-note";
     meta.textContent =
       "added " + new Date(wh.addedAt).toLocaleDateString() + " by " + wh.addedBy + (wh.broken ? " · stopped working: " + wh.broken : "");
     row.appendChild(meta);
@@ -1844,7 +1914,7 @@
     row.appendChild(btn);
     if (st && st.message) {
       const msg = document.createElement("p");
-      msg.className = "field-hint";
+      msg.className = "adm-note";
       msg.setAttribute("role", "status");
       msg.textContent = st.message;
       row.appendChild(msg);
@@ -1880,12 +1950,14 @@
     btn.addEventListener("click", () => addWebhook(guildId));
     wrap.appendChild(btn);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "rb-field__help";
+    hint.id = "webhook-input-" + guildId + "-help";
     hint.textContent = "The bot asks Discord which channel it posts to. If that channel already has a webhook, this one replaces it.";
     wrap.appendChild(hint);
+    input.setAttribute("aria-describedby", hint.id);
     if (st && st.message) {
       const msg = document.createElement("p");
-      msg.className = "field-hint";
+      msg.className = "adm-note";
       msg.setAttribute("role", "status");
       msg.textContent = st.message;
       wrap.appendChild(msg);
@@ -1911,7 +1983,7 @@
     pluginsList.className = "server__plugins";
     if (model.plugins.length === 0) {
       const none = document.createElement("p");
-      none.className = "field-hint";
+      none.className = "adm-note";
       none.textContent = "No plugin lives here.";
       pluginsList.appendChild(none);
     }
@@ -1931,7 +2003,7 @@
     whList.className = "server__webhooks";
     if (model.webhooks.length === 0) {
       const none = document.createElement("p");
-      none.className = "field-hint";
+      none.className = "adm-note";
       none.textContent = "None.";
       whList.appendChild(none);
     }
@@ -1985,7 +2057,7 @@
     clearChildren(list);
     if (!discovery) {
       const p = document.createElement("p");
-      p.className = "field-hint";
+      p.className = "adm-note";
       p.textContent = "The bot hasn't published what it can see yet.";
       list.appendChild(p);
       return;
@@ -2023,6 +2095,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2036,14 +2109,19 @@
       }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
       } else if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
       } else {
         serverActionState.delete(key);
         // #246 orchestrator follow-up (minor 7): a successful Add changes what buildWhereItLivesStep
         // shows on the Plugins tab (the "· webhook" suffix) -- refresh it now rather than waiting for
         // the next unrelated loadRouting.
         refreshRoutingSteps();
+        const guild = routingData && routingData.discovery && routingData.discovery.guilds && routingData.discovery.guilds.find((g) => g.id === guildId);
+        const ch = guild && guild.channels.find((c) => c.id === outcome.result.channelId);
+        showToast("success", "Webhook added for #" + (ch ? ch.name : outcome.result.channelId) + ".");
       }
       renderServers();
       renderNeedsAttention();
@@ -2052,6 +2130,7 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
@@ -2077,6 +2156,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2090,13 +2170,16 @@
       }
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
       } else if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
       } else {
         serverActionState.delete(key);
         // #246 orchestrator follow-up (minor 7): same reasoning as addWebhook's own call -- a successful
         // Remove also changes the Plugins tab's webhook suffix.
         refreshRoutingSteps();
+        showToast("success", "Webhook removed.");
       }
       renderServers();
       renderNeedsAttention();
@@ -2105,6 +2188,7 @@
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
@@ -2174,6 +2258,7 @@
       if (!res.ok || !result || !result.id) {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + text });
         renderServers();
+        showToast("danger", "Couldn't send it: " + text);
         return;
       }
       const outcome = await pollForResult(result.id, Date.now());
@@ -2186,6 +2271,7 @@
       if (outcome.timeout) {
         serverActionState.set(key, { busy: false, message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." });
         renderServers();
+        showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
         return;
       }
       // A completed request is not necessarily a successful refresh. The bot records a rejected
@@ -2195,15 +2281,18 @@
       if (!outcome.result.ok) {
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
         renderServers();
+        showToast("danger", "The bot refused it: " + (outcome.result.reason || ""));
         return;
       }
       serverActionState.delete(key);
       await loadRouting(); // re-renders the tab itself (renderServers is part of loadRouting's own tail)
+      showToast("success", "Read from Discord again.");
     } catch (e) {
       const message = e && e.message ? e.message : String(e);
       if (message !== "unauthorized") {
         serverActionState.set(key, { busy: false, message: "Couldn't send it: " + message });
         renderServers();
+        showToast("danger", "Couldn't send it: " + message);
       } else {
         clearUnauthorizedServerAction(key);
       }
@@ -2257,7 +2346,7 @@
     clearChildren(list);
     if (items.length === 0) {
       const p = document.createElement("p");
-      p.className = "field-hint";
+      p.className = "adm-note";
       p.textContent = "Nothing needs attention.";
       list.appendChild(p);
       return;
@@ -2329,7 +2418,7 @@
     title.appendChild(document.createTextNode("Fill in its settings"));
     head.appendChild(title);
     const hint = document.createElement("p");
-    hint.className = "field-hint";
+    hint.className = "adm-note";
     hint.textContent = "Secrets can be replaced but never shown again.";
     head.appendChild(hint);
     step.appendChild(head);
@@ -2337,7 +2426,7 @@
     const body = document.createElement("div");
     if (!ctx.indexAvailable && !hasEnv) {
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = "Settings can't be shown while the Plugin Index is unavailable.";
       body.appendChild(note);
       step.appendChild(body);
@@ -2354,14 +2443,14 @@
     if (hasBundle && isOpen) {
       if (bundleState.kind === "mismatch") {
         const note = document.createElement("p");
-        note.className = "field-hint";
+        note.className = "adm-note";
         note.textContent =
           "This plugin's settings target admin API v" + (bundleState.declared === undefined ? "unknown" : bundleState.declared) +
           ", but this panel is v" + ctx.panelVer + " — they can't be shown until the versions match.";
         body.appendChild(note);
       } else if (bundleState.kind === "pending") {
         const note = document.createElement("p");
-        note.className = "field-hint";
+        note.className = "adm-note";
         note.textContent = "Settings appear once the plugin is installed (next restart).";
         body.appendChild(note);
       } else {
@@ -2396,7 +2485,7 @@
       label.textContent = settingLabel(key, p.name);
       wrap.appendChild(label);
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "adm-note";
       note.textContent = message;
       wrap.appendChild(note);
       addKeyTag(wrap);
@@ -2408,7 +2497,7 @@
     if (owner && owner !== p.name) return stub("Set on the " + owner + " card.");
     if (!schemaRow) return stub("This can't be edited right now — the bot hasn't published this setting yet.");
 
-    if (schemaRow.secret) return buildSecretField(key, settingLabel(key, p.name) + (schemaRow.required ? " *" : ""), schemaRow);
+    if (schemaRow.secret) return buildSecretField(key, settingLabel(key, p.name), schemaRow);
 
     const wrap = document.createElement("div");
     wrap.className = "rb-field";
@@ -2416,17 +2505,25 @@
     const label = document.createElement("label");
     label.className = "rb-label";
     label.htmlFor = controlId;
-    label.textContent = settingLabel(key, p.name) + (schemaRow.required ? " *" : "");
+    label.textContent = settingLabel(key, p.name);
+    if (schemaRow.required) {
+      const req = document.createElement("span");
+      req.className = "rb-label__required";
+      req.setAttribute("aria-hidden", "true");
+      req.textContent = "*";
+      label.appendChild(req);
+    }
     wrap.appendChild(label);
     const input = document.createElement("input");
     input.className = "rb-input";
     input.id = controlId;
     input.dataset.settingKey = key;
     input.value = loadedEnv[key] ?? "";
+    if (schemaRow.required) input.required = true;
     wrap.appendChild(input);
     if (e.description) {
       const desc = document.createElement("span");
-      desc.className = "field-hint";
+      desc.className = "rb-field__help";
       desc.id = controlId + "-hint";
       desc.textContent = e.description;
       input.setAttribute("aria-describedby", desc.id);
@@ -2445,6 +2542,13 @@
     const label = document.createElement("span");
     label.className = "rb-label";
     label.textContent = displayLabel;
+    if (schemaRow.required) {
+      const req = document.createElement("span");
+      req.className = "rb-label__required";
+      req.setAttribute("aria-hidden", "true");
+      req.textContent = "*";
+      label.appendChild(req);
+    }
     wrap.appendChild(label);
 
     const rerenderKeeping = (mutate) => {
@@ -2485,9 +2589,12 @@
       input.autocomplete = "new-password";
       input.placeholder = "Paste the value";
       input.dataset.secretKey = key;
+      if (schemaRow.required) input.required = true;
       wrap.appendChild(input);
       const note = document.createElement("p");
-      note.className = "field-hint";
+      note.className = "rb-field__help";
+      note.id = "secret-" + key + "-help";
+      input.setAttribute("aria-describedby", note.id);
       if (schemaRow.isSet) {
         const keep = document.createElement("button");
         keep.type = "button";
@@ -3353,17 +3460,31 @@
       if (control.tagName === "SELECT" && (controlKind === "server" || controlKind === "channel")) pickerKeysShown.add(key);
       const label = document.createElement("label");
       label.className = "rb-label";
-      label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
+      label.textContent = key;
+      const required = !!(loadedSchema[key] && loadedSchema[key].required);
+      if (required) {
+        const req = document.createElement("span");
+        req.className = "rb-label__required";
+        req.setAttribute("aria-hidden", "true");
+        req.textContent = "*";
+        label.appendChild(req);
+      }
       // Clicking the label focuses the field; a composite control (tags) points at its nested
-      // input via dataset.focusId, since the wrapper itself isn't focusable.
+      // input via dataset.focusId, since the wrapper itself isn't focusable -- that nested input is
+      // always a direct child (buildTagControl appends it straight onto the wrapper), so a plain child
+      // walk finds it without needing a selector engine.
+      const focusTarget = control.dataset.focusId ? [...control.children].find((c) => c.id === control.dataset.focusId) : control;
       label.htmlFor = control.dataset.focusId || control.id;
+      if (required && focusTarget) focusTarget.required = true;
       container.appendChild(label);
       const meta = FIELD_META[key];
       if (meta && meta.hint) {
         const hint = document.createElement("div");
-        hint.className = "field-hint";
+        hint.className = "rb-field__help";
+        hint.id = "env-" + key + "-help";
         hint.textContent = meta.hint;
         container.appendChild(hint);
+        if (focusTarget) focusTarget.setAttribute("aria-describedby", hint.id);
       }
       container.appendChild(control);
     }

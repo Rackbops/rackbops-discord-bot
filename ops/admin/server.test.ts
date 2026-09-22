@@ -5435,6 +5435,373 @@ describe("the page's stylesheets", () => {
   });
 });
 
+// #300: the field-hint sweep (help/error/required now come from the theme, #210) and the settle-point
+// toast (#211). Source-pin checks first, then a mini-harness for the three form builders decision 2/4
+// name (the same shape every other mini-harness in this file uses -- no jsdom in this package).
+describe("form help, error and required states (#300)", () => {
+  const html300 = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const css300 = readFileSync(new URL("./public/admin.css", import.meta.url), "utf8");
+
+  test("no field-hint remains in the panel (source pin)", () => {
+    expect(html300).not.toContain("field-hint");
+    expect(css300).not.toContain("field-hint");
+    // This file's own expected-fragments table must never reintroduce the string either -- read as
+    // source text, not evaluated, so a reverted rename here is caught the same way. The three marker
+    // strings below are each built by concatenation, not written as one contiguous literal: this very
+    // test's own source would otherwise contain a self-match for whichever marker it typed out in full,
+    // found before the real target further down the file.
+    const selfSrc = readFileSync(new URL("./server.test.ts", import.meta.url), "utf8");
+    const pageSkeletonMarker = "describe(" + '"page skeleton"';
+    const fragmentsTestMarker = "test(" + '"the controls carry the design-system classes the restyle gave them"';
+    const planApplyMarker = "describe(" + '"planApply (#257)"';
+    const pageSkeletonStart = selfSrc.indexOf(pageSkeletonMarker);
+    expect(pageSkeletonStart).toBeGreaterThan(-1); // the anchor itself must exist, or the slice below is meaningless
+    const fragmentsTable = selfSrc.slice(
+      selfSrc.indexOf(fragmentsTestMarker, pageSkeletonStart),
+      selfSrc.indexOf(planApplyMarker, pageSkeletonStart),
+    );
+    expect(fragmentsTable.length).toBeGreaterThan(500); // can't pass vacuously (a bad slice returns "")
+    expect(fragmentsTable).not.toContain("field-hint");
+  });
+
+  test("a refusal about a control is rb-field__error, never rb-field__help (source pin)", () => {
+    // The stateError notice (renderPlugins) and channelErr (buildRouteRow) -- decision 1's two named
+    // "refusal about a control" sites.
+    expect(html300).toMatch(/notice\.className = "rb-field__error";/);
+    expect(html300).toMatch(/channelErr\.className = "rb-field__error";/);
+    expect(html300).not.toMatch(/notice\.className = "rb-field__help"/);
+    expect(html300).not.toMatch(/channelErr\.className = "rb-field__help"/);
+  });
+
+  test("outcomes toast exactly once at their settle points (source pin)", () => {
+    // decision 4: showToast( appears in exactly these five settle points, and nowhere else that would
+    // double-toast an outcome (the Apply bar, the inline update-action messages, retryRegistration's own
+    // body -- it reuses sendRouting/awaitRequestResult, so its toast is that one, not a second).
+    const slice = (start: string, end: string) => html300.slice(html300.indexOf(start), html300.indexOf(end));
+    const sites = [
+      ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive(")],
+      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus(")],
+      ["addWebhook", slice("async function addWebhook(", "async function removeWebhook(")],
+      ["removeWebhook", slice("async function removeWebhook(", "async function pollForResult(")],
+      ["refreshDiscoveryAll", slice("async function refreshDiscoveryAll(", "async function copyInviteLink(")],
+    ] as const;
+    for (const [name, src] of sites) {
+      expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: true });
+    }
+    // Never in the Apply bar, the inline update-action messages, or retryRegistration's own body (it
+    // reuses sendRouting -> awaitRequestResult, whose toast already covers it -- a second one here would
+    // double-fire on every retry).
+    const applySrc = slice("// APPLY:begin", "// APPLY:end");
+    const pluginRequestSendSrc = slice("// PLUGIN_REQUEST_SEND:begin", "// PLUGIN_REQUEST_SEND:end");
+    const updateBlockSrc = slice("function buildPluginUpdateBlock(", "const FIELD_META = {");
+    const retryRegistrationSrc = slice("async function retryRegistration(", "function appendRetryControls(");
+    for (const [name, src] of [
+      ["APPLY", applySrc],
+      ["PLUGIN_REQUEST_SEND", pluginRequestSendSrc],
+      ["buildPluginUpdateBlock", updateBlockSrc],
+      ["retryRegistration", retryRegistrationSrc],
+    ] as const) {
+      expect({ name, hasToast: src.includes("showToast(") }).toEqual({ name, hasToast: false });
+    }
+  });
+
+  test("the two composite [aria-invalid] rules stay; the theme owns the plain-control one", () => {
+    expect(css300).not.toMatch(/\.adm\s*\[aria-invalid="true"\]/);
+    expect(css300).toMatch(/\.tag-field:has\(\[aria-invalid="true"\]\)\s*\{\s*border-color:\s*var\(--rb-danger\);/);
+    expect(css300).toMatch(/\.route__channels\[aria-invalid="true"\]/);
+    const themeCss300 = readFileSync(new URL("./public/rb-theme.css", import.meta.url), "utf8");
+    expect(themeCss300).toMatch(/\.rb-input\[aria-invalid="true"\]/);
+  });
+
+  // The webhook hint (buildAddWebhookForm) and the channel checklist hint (buildRouteRow) are both deep
+  // inside functions a full mini-harness would need a great deal of unrelated plumbing to reach
+  // (serverActionState, a real routing model/state/els triple) -- source-pinned instead, checking the
+  // exact wiring decision 1/2 requires: the id assigned to the help element is the same string handed to
+  // aria-describedby on its control, next to each other in the diff.
+  test("the webhook hint and the channel-checklist hint are wired to their controls (source pin)", () => {
+    expect(html300).toMatch(/hint\.id = "webhook-input-" \+ guildId \+ "-help";[\s\S]{0,400}input\.setAttribute\("aria-describedby", hint\.id\);/);
+    expect(html300).toMatch(/channelHint\.id = "route-" \+ plugin \+ "-" \+ row\.id \+ "-channels-help";[\s\S]{0,400}fieldset\.setAttribute\("aria-describedby", channelHint\.id\);/);
+    expect(html300).toMatch(/hint\.className = "rb-field__help";\s*\n\s*hint\.id = "webhook-input-"/);
+    expect(html300).toMatch(/channelHint\.className = "rb-field__help";/);
+  });
+
+  interface Fake300El {
+    tagName: string;
+    id: string;
+    className: string;
+    textContent: string;
+    htmlFor?: string;
+    required?: boolean;
+    value?: string;
+    dataset: Record<string, string>;
+    attrs: Record<string, string>;
+    children: Fake300El[];
+    appendChild: (c: Fake300El) => Fake300El;
+    setAttribute: (n: string, v: string) => void;
+    querySelector?: (selector: string) => Fake300El | null;
+  }
+  function make300El(tag: string): Fake300El {
+    const el: Fake300El = {
+      tagName: tag.toUpperCase(), id: "", className: "", textContent: "", dataset: {}, attrs: {}, children: [],
+      appendChild: (c) => (el.children.push(c), c),
+      setAttribute: (n, v) => { el.attrs[n] = v; },
+      querySelector: (sel) => { const id = sel.replace(/^#/, ""); return el.children.find((c) => c.id === id) ?? null; },
+    };
+    return el;
+  }
+  function findByClass(root: Fake300El, cls: string): Fake300El | undefined {
+    for (const c of root.children) {
+      if (c.className === cls) return c;
+      const nested = findByClass(c, cls);
+      if (nested) return nested;
+    }
+    return undefined;
+  }
+  function findByTag(root: Fake300El, tag: string): Fake300El | undefined {
+    for (const c of root.children) {
+      if (c.tagName === tag.toUpperCase()) return c;
+      const nested = findByTag(c, tag);
+      if (nested) return nested;
+    }
+    return undefined;
+  }
+
+  const pluginRoutingSrc300 = applyBlock("PLUGIN_ROUTING");
+  const serversTabSrc300 = applyBlock("SERVERS_TAB");
+  const settingLabelSrc300 = applyBlock("PLUGIN_SETTING_LABEL");
+  // Two slices, not one: the range from buildSettingField to ENV_SCHEMA:begin also crosses the page's
+  // top-level init wiring (document.getElementById("add-admin").addEventListener(...) and friends,
+  // right after PLUGIN_REQUEST_SEND:end) -- real top-level code that runs immediately when evaluated,
+  // throwing on a document stub this harness never populates. Slicing around it (ending at
+  // buildPluginCard, the next function after buildSecretField) excludes it; renderEnvFields/buildEnvControl/
+  // FIELD_META live further down, past that wiring, so the second slice picks back up there.
+  const fieldsSrc300 =
+    applyIndexSrc.slice(applyIndexSrc.indexOf("function buildSettingField("), applyIndexSrc.indexOf("function buildPluginCard(")) +
+    "\n" +
+    applyIndexSrc.slice(applyIndexSrc.indexOf("const FIELD_META = {"), applyIndexSrc.indexOf("// ENV_SCHEMA:begin"));
+
+  function fieldsHarness(config: { loadedSchema?: Record<string, unknown> } = {}) {
+    let envFieldsContainer: Fake300El | null = null;
+    const document = {
+      createElement: (tag: string) => make300El(tag),
+      getElementById: (id: string) => {
+        if (id === "env-fields") {
+          if (!envFieldsContainer) envFieldsContainer = make300El("div");
+          return envFieldsContainer;
+        }
+        return null;
+      },
+    };
+    const fn = new Function(
+      "document", "routingData", "pluginsData",
+      `"use strict";\nlet secretsReplacing = new Set();\n${settingLabelSrc300}\n${pluginRoutingSrc300}\n${serversTabSrc300}\n${fieldsSrc300}\n` +
+        "return { buildSettingField, buildSecretField, renderEnvFields, FIELD_META, setConfig: (env, schema) => { loadedEnv = env; loadedSchema = schema; } };",
+    );
+    const result = fn(document, null, null) as {
+      buildSettingField: (p: { name: string }, e: { key: string; description?: string }, ctx: { owners: Map<string, string> }) => Fake300El;
+      buildSecretField: (key: string, displayLabel: string, schemaRow: { isSet?: boolean; required?: boolean }) => Fake300El;
+      renderEnvFields: () => void;
+      FIELD_META: Record<string, { hint?: string; control?: string }>;
+      setConfig: (env: Record<string, string>, schema: Record<string, unknown>) => void;
+    };
+    result.setConfig({}, config.loadedSchema ?? {});
+    return { ...result, envFields: () => envFieldsContainer };
+  }
+
+  test("every rb-field__help is named by its control's aria-describedby (mini-harness)", () => {
+    const h = fieldsHarness({ loadedSchema: { FOO: { source: "plugin", required: false } } });
+    // buildSettingField: e.description -> rb-field__help with aria-describedby wired to the input.
+    const withDesc = h.buildSettingField({ name: "music" }, { key: "FOO", description: "A thing." }, { owners: new Map() });
+    const help1 = findByClass(withDesc, "rb-field__help")!;
+    const input1 = findByTag(withDesc, "input")!;
+    expect(help1.id).toBeTruthy();
+    expect(input1.attrs["aria-describedby"]).toBe(help1.id);
+
+    // buildSecretField, unset: "Not set yet…" note -> rb-field__help wired to the password input.
+    const secret = h.buildSecretField("BAR_TOKEN", "Bar token", { isSet: false, required: false });
+    const help2 = findByClass(secret, "rb-field__help")!;
+    const input2 = findByTag(secret, "input")!;
+    expect(help2.id).toBeTruthy();
+    expect(input2.attrs["aria-describedby"]).toBe(help2.id);
+
+    // renderEnvFields: a FIELD_META[key].hint -> rb-field__help wired to the built control.
+    const withHintKey = Object.keys(h.FIELD_META).find((k) => h.FIELD_META[k]!.hint);
+    expect(withHintKey).toBeTruthy();
+    const h2 = fieldsHarness({ loadedSchema: {} });
+    h2.setConfig({ [withHintKey!]: "" }, {});
+    h2.renderEnvFields();
+    const container = h2.envFields()!;
+    const help3 = findByClass(container, "rb-field__help")!;
+    expect(help3.id).toBeTruthy();
+    const described = container.children.find((c) => c.attrs["aria-describedby"] === help3.id);
+    expect(described).toBeTruthy();
+  });
+
+  test("the required marker is one aria-hidden rb-label__required span and the control carries required (mini-harness)", () => {
+    const h = fieldsHarness({ loadedSchema: { REQ: { source: "plugin", required: true }, OPT: { source: "plugin", required: false } } });
+
+    const reqField = h.buildSettingField({ name: "music" }, { key: "REQ" }, { owners: new Map() });
+    const reqMarker = findByClass(reqField, "rb-label__required")!;
+    expect(reqMarker.attrs["aria-hidden"]).toBe("true");
+    expect(reqMarker.textContent).toBe("*");
+    expect(findByTag(reqField, "input")!.required).toBe(true);
+
+    const optField = h.buildSettingField({ name: "music" }, { key: "OPT" }, { owners: new Map() });
+    expect(findByClass(optField, "rb-label__required")).toBeUndefined();
+    expect(findByTag(optField, "input")!.required).toBeFalsy();
+
+    const reqSecret = h.buildSecretField("REQ_TOKEN", "Req token", { isSet: false, required: true });
+    expect(findByClass(reqSecret, "rb-label__required")).toBeTruthy();
+    expect(findByTag(reqSecret, "input")!.required).toBe(true);
+    const optSecret = h.buildSecretField("OPT_TOKEN", "Opt token", { isSet: false, required: false });
+    expect(findByClass(optSecret, "rb-label__required")).toBeUndefined();
+    expect(findByTag(optSecret, "input")!.required).toBeFalsy();
+  });
+});
+
+// #300 (std-lib #211): showToast, tested against the real TOAST:begin/:end block via the same
+// synthetic-DOM mini-harness shape the rest of this file already uses.
+describe("showToast (#300, mini-harness)", () => {
+  const toastSrc = applyBlock("TOAST");
+
+  test("toastRole: danger and warning are alert, success and info are status", () => {
+    const fn = new Function(`"use strict";\n${toastSrc}\nreturn { toastRole };`);
+    const { toastRole } = fn() as { toastRole: (kind: string) => string };
+    expect(toastRole("danger")).toBe("alert");
+    expect(toastRole("warning")).toBe("alert");
+    expect(toastRole("success")).toBe("status");
+    expect(toastRole("info")).toBe("status");
+  });
+
+  interface FakeToastEl {
+    tagName: string;
+    className: string;
+    textContent: string;
+    attrs: Record<string, string>;
+    children: FakeToastEl[];
+    parentNode: FakeToastEl | null;
+    appendChild: (c: FakeToastEl) => FakeToastEl;
+    removeChild: (c: FakeToastEl) => void;
+    setAttribute: (n: string, v: string) => void;
+    removeAttribute: (n: string) => void;
+    addEventListener: (type: string, fn: (e: unknown) => void) => void;
+    _listeners: Record<string, ((e: unknown) => void)[]>;
+  }
+  function makeToastEl(tag: string): FakeToastEl {
+    const el: FakeToastEl = {
+      tagName: tag.toUpperCase(), className: "", textContent: "", attrs: {}, children: [], parentNode: null,
+      _listeners: {},
+      appendChild: (c) => { c.parentNode = el; el.children.push(c); return c; },
+      removeChild: (c) => { const i = el.children.indexOf(c); if (i !== -1) el.children.splice(i, 1); c.parentNode = null; },
+      setAttribute: (n, v) => { el.attrs[n] = v; },
+      removeAttribute: (n) => { delete el.attrs[n]; },
+      addEventListener: (type, fn) => { (el._listeners[type] ??= []).push(fn); },
+    };
+    return el;
+  }
+  function toastHarness() {
+    const app = makeToastEl("main");
+    const docListeners: Record<string, ((e: unknown) => void)[]> = {};
+    let rafQueue: (() => void)[] = [];
+    const timers: { id: number; fn: () => void; ms: number }[] = [];
+    let nextTimerId = 1;
+    const document = {
+      createElement: (tag: string) => makeToastEl(tag),
+      getElementById: (id: string) => (id === "app" ? app : null),
+      addEventListener: (type: string, fn: (e: unknown) => void) => { (docListeners[type] ??= []).push(fn); },
+    };
+    const requestAnimationFrame = (fn: () => void) => { rafQueue.push(fn); return rafQueue.length; };
+    const setTimeout = (fn: () => void, ms: number) => { const id = nextTimerId++; timers.push({ id, fn, ms }); return id; };
+    const clearTimeout = (id: number) => { const i = timers.findIndex((t) => t.id === id); if (i !== -1) timers.splice(i, 1); };
+    const fn = new Function(
+      "document", "requestAnimationFrame", "setTimeout", "clearTimeout",
+      `"use strict";\n${toastSrc}\nreturn { showToast, dismissToast: (el) => dismissToast(el), getActiveToasts: () => activeToasts, getRegion: () => toastRegion };`,
+    );
+    const run = fn(document, requestAnimationFrame, setTimeout, clearTimeout) as {
+      showToast: (kind: string, text: string) => void;
+      dismissToast: (el: FakeToastEl) => void;
+      getActiveToasts: () => FakeToastEl[];
+      getRegion: () => FakeToastEl | null;
+    };
+    return {
+      run, app,
+      fireEscape: () => { for (const fn of docListeners.keydown ?? []) fn({ key: "Escape" }); },
+      flushRaf: () => { const q = rafQueue; rafQueue = []; for (const fn of q) fn(); },
+      fireTimer: (id: number) => { const t = timers.find((x) => x.id === id); if (t) t.fn(); },
+      timerMs: (id: number) => timers.find((x) => x.id === id)?.ms,
+      pendingTimerIds: () => timers.map((t) => t.id),
+    };
+  }
+
+  test("a toast mounts with its class, role, text and a close button; data-rb-enter is cleared next frame", () => {
+    const h = toastHarness();
+    h.run.showToast("success", "Saved.");
+    const toasts = h.run.getActiveToasts();
+    expect(toasts.length).toBe(1);
+    const toast = toasts[0]!;
+    expect(toast.className).toBe("rb-toast rb-toast--success");
+    expect(toast.attrs.role).toBe("status");
+    expect(toast.attrs["data-rb-enter"]).toBe("");
+    expect(toast.children.some((c) => c.textContent === "Saved.")).toBe(true);
+    const closeBtn = toast.children.find((c) => c.className === "rb-toast__close");
+    expect(closeBtn).toBeTruthy();
+    expect(closeBtn!.attrs["aria-label"]).toBe("Dismiss");
+    expect(closeBtn!.textContent).toBe("×");
+    // The region is mounted under #app, not appended elsewhere.
+    expect(h.app.children.some((c) => c.className === "rb-toast-region")).toBe(true);
+    h.flushRaf();
+    expect(toast.attrs["data-rb-enter"]).toBeUndefined();
+  });
+
+  test("danger/warning toasts carry role=alert; a danger/warning kind never sets an auto-dismiss timer", () => {
+    const h = toastHarness();
+    h.run.showToast("danger", "Refused.");
+    expect(h.run.getActiveToasts()[0]!.attrs.role).toBe("alert");
+    expect(h.pendingTimerIds().length).toBe(0);
+    h.run.showToast("warning", "Timed out.");
+    expect(h.run.getActiveToasts()[1]!.attrs.role).toBe("alert");
+    expect(h.pendingTimerIds().length).toBe(0);
+  });
+
+  test("success/info auto-dismiss after TOAST_MS, warning/danger stay; the close button and Escape dismiss; the fifth toast evicts the oldest", () => {
+    const h = toastHarness();
+    h.run.showToast("success", "one");
+    const id = h.pendingTimerIds()[0]!;
+    expect(h.timerMs(id)).toBe(8000);
+    h.fireTimer(id);
+    expect(h.run.getActiveToasts().length).toBe(0); // auto-dismissed
+    expect(h.app.children.find((c) => c.className === "rb-toast-region")!.children.length).toBe(0);
+
+    // Close button dismisses.
+    h.run.showToast("danger", "stays until dismissed");
+    const toDismiss = h.run.getActiveToasts()[0]!;
+    const closeBtn = toDismiss.children.find((c) => c.className === "rb-toast__close")!;
+    (closeBtn as unknown as { _listeners: Record<string, (() => void)[]> })._listeners.click![0]!();
+    expect(h.run.getActiveToasts().length).toBe(0);
+
+    // Escape dismisses the newest.
+    h.run.showToast("info", "older");
+    h.run.showToast("warning", "newer");
+    expect(h.run.getActiveToasts().length).toBe(2);
+    h.fireEscape();
+    expect(h.run.getActiveToasts().length).toBe(1);
+    expect(h.run.getActiveToasts()[0]!.textContent === "older" || h.run.getActiveToasts()[0]!.children.some((c) => c.textContent === "older")).toBe(true);
+
+    // A fifth toast evicts the oldest (TOAST_MAX = 4).
+    const h2 = toastHarness();
+    h2.run.showToast("info", "t1");
+    h2.run.showToast("info", "t2");
+    h2.run.showToast("info", "t3");
+    h2.run.showToast("info", "t4");
+    expect(h2.run.getActiveToasts().length).toBe(4);
+    h2.run.showToast("info", "t5");
+    expect(h2.run.getActiveToasts().length).toBe(4);
+    const texts = h2.run.getActiveToasts().map((t) => t.children.find((c) => c.tagName === "SPAN")?.textContent);
+    expect(texts).not.toContain("t1");
+    expect(texts).toContain("t5");
+  });
+});
+
 // rb-theme.css is GENERATED by ops/admin/theme/build-theme.ts from the pinned @rackbops/styles and
 // committed. Its first line names the version it came from; this fails when the pin moves without a
 // rebuild (or the file is hand-edited), with no need for node_modules (CI does not install the theme
@@ -5676,12 +6043,12 @@ describe("admin.css uses tokens only", () => {
     // 300-line log would push it out of view), while a pasted 3000-character value in a refusal cannot make
     // the bar taller than the bound either.
     expect(rule(".adm-apply__text > strong")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
-    expect(rule(".adm-apply__text .field-hint")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
+    expect(rule(".adm-apply__text .adm-note")).toMatch(/max-height:\s*30vh;[\s\S]*overflow-y:\s*auto;/);
     expect(rule(".adm-apply__text")).not.toMatch(/max-height|overflow-y/);
     // The bar takes focus while a request is in flight and shows no ring of its own: the theme's covers it.
     expect(themeCss).toMatch(/:where\(:focus-visible\)\s*\{\s*outline:\s*var\(--rb-focus-ring\);/);
-    // A control the bar refused (the page sets aria-invalid on it) and a chip field around one.
-    expect(rule('.adm [aria-invalid="true"]')).toMatch(/border-color:\s*var\(--rb-danger\);/);
+    // #300: a chip field around a refused control keeps its own local rule -- the theme doesn't know
+    // that composite. The plain-control case (.rb-input/.rb-select/.rb-textarea) is the theme's own now.
     expect(rule('.tag-field:has([aria-invalid="true"])')).toMatch(/border-color:\s*var\(--rb-danger\);/);
   });
 
@@ -5997,6 +6364,7 @@ describe("page skeleton", () => {
       ['<label class="inline-check rb-label">', 1], // the Wrap toggle
       ['class="status-grid"', 2], // status and identity
       ['class="msg"', 2], // restart, admins (#257: the config and plugins message lines went with the Save buttons)
+      ['class="adm-note"', 3], // #300: logs-meta, servers-status, apply-hint -- the three static plain-note sites
       // built by the page script
       ['btn.className = "rb-btn rb-btn--danger rb-btn--sm";', 1], // Remove admin
       ['check.className = "rb-switch";', 1], // #244: a plugin's card switch (#300: the shared switch, local override dropped)
@@ -6010,7 +6378,7 @@ describe("page skeleton", () => {
       ['label.className = "rb-label";', 5], // a config field's label, #244's three card-field builders (stub, plain, secret), #246's Add-a-webhook label
       ['control.className = "rb-select";', 3], // an enum select, the branch chooser, #246's server/channel picker
       ['control.className = "rb-input";', 2], // a plain config field, plus #246's picker-branch stale/never-a-picker fallback
-      ['notice.className = "field-hint field-hint--danger";', 1],
+      ['notice.className = "rb-field__error";', 1], // #300: the stateError notice
       ['row.className = "admin-row";', 1],
       ['wrapper.className = "tag-field";', 1],
       ['sched.className = "sched";', 1],
@@ -6056,8 +6424,9 @@ describe("page skeleton", () => {
       "HAS_ACCESS_SESSION", "TABS", "TABS_DOM", "LOGS_SCROLL", "PLUGIN_BADGE_CLASSES",
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
       "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
+      "TOAST", // #300
     ];
-    expect(names.length).toBe(23);
+    expect(names.length).toBe(24);
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -9321,6 +9690,13 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // turning a real ReferenceError into a misleading "posted-error" outcome -- caught once, fixed here).
     let refreshRoutingStepsCalls = 0;
     const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    // #300: not part of this slice (the real showToast touches document.getElementById("app") and
+    // requestAnimationFrame, neither available in this harness) -- injected as a call-tracked stub, same
+    // reasoning as refreshRoutingSteps just above: an unstubbed reference would throw a ReferenceError
+    // that sendRouting's own catch swallows silently, turning a real success into a misleading
+    // "posted-error" outcome.
+    const toasts: { kind: string; text: string }[] = [];
+    const showToast = (kind: string, text: string) => { toasts.push({ kind, text }); };
     // A real Date subclass (so `new Date(x)`/`.toLocaleString()` elsewhere in the slice keep working)
     // whose `now()` is independently controllable -- the fake setTimeout/clearTimeout clock never
     // advances real wall-clock time, so a real 30s wait is otherwise the only way to reach a timeout path.
@@ -9329,10 +9705,10 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       static now() { return fakeNow; }
     }
     const run = new Function(
-      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date",
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date", "showToast",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
         "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
-    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate) as {
+    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate, showToast) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
       sendRouting: (plugin: string) => Promise<void>;
@@ -9372,6 +9748,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed,
       refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
       advanceFakeNow: (ms: number) => { fakeNow += ms; },
+      toasts: () => toasts,
     };
   }
 
@@ -10171,12 +10548,24 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     textContent?: string;
     dataset: Record<string, string>;
     children: FakeEl[];
+    attrs: Record<string, string>;
+    required?: boolean;
     appendChild: (c: FakeEl) => FakeEl;
+    setAttribute: (n: string, v: string) => void;
     querySelectorAll?: (selector: string) => FakeEl[];
+    querySelector?: (selector: string) => FakeEl | null;
     replaceWith?: (next: FakeEl) => void;
   }
   function makeEl(tag: string): FakeEl {
-    const el: FakeEl = { tagName: tag.toUpperCase(), value: "", id: "", className: "", label: "", dataset: {}, children: [], appendChild: (c) => (el.children.push(c), c) };
+    const el: FakeEl = {
+      tagName: tag.toUpperCase(), value: "", id: "", className: "", label: "", dataset: {}, children: [], attrs: {},
+      appendChild: (c) => (el.children.push(c), c),
+      setAttribute: (n, v) => { el.attrs[n] = v; },
+      querySelector: (sel) => {
+        const id = sel.replace(/^#/, "");
+        return el.children.find((c) => c.id === id) ?? null;
+      },
+    };
     return el;
   }
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
@@ -10494,13 +10883,18 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     // which only works for a real closed-over binding, never a parameter or an expando property.
     const routingDataInit = opts.routingDataInit ?? { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    // #300: not part of this slice (the real showToast touches document.getElementById("app") and
+    // requestAnimationFrame, neither available here) -- injected as a call-tracked stub, same reasoning
+    // as renderServers/renderNeedsAttention/loadRouting/refreshRoutingSteps just above.
+    const toasts: { kind: string; text: string }[] = [];
+    const showToast = (kind: string, text: string) => { toasts.push({ kind, text }); };
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
-      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps", "showToast",
       `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
         "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
     )(
-      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps,
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps, showToast,
     ) as {
       addWebhook: (guildId: string) => Promise<void>;
       pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>;
@@ -10520,6 +10914,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
       renderNeedsAttentionCalls: () => renderNeedsAttentionCalls,
       loadRoutingCalls: () => loadRoutingCalls,
       refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
+      toasts: () => toasts,
     };
   }
 
