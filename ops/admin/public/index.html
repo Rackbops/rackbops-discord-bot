@@ -512,6 +512,14 @@
         loadedSchema = schema && typeof schema === "object" ? schema : {};
         renderPlugins();
         renderEnvFields();
+        // #246: loadRouting() and reloadConfig() fire concurrently from showApp -- whichever finishes
+        // LAST is the one whose renderServers() call actually has both routingData AND pluginsData
+        // populated. Calling it only from loadRouting's own tail (as originally written) left the
+        // Servers tab's cards rendered against pluginsData still null whenever this fetch was the
+        // slower of the two -- "No plugin lives here" on every card, found in real-Chrome verification,
+        // not by any of this file's own mocked-pluginsData tests. Also covers every OTHER reloadConfig
+        // caller (an update button's reload, Unlock) the same way loadRouting's own poll already does.
+        renderServers();
         renderNeedsAttention();
         if (captured) reapplyCardEdits(captured);
       } catch (e) {

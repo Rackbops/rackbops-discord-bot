@@ -6446,7 +6446,7 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     let settingEls: RC[] = [el({ value: oldEnv.A ?? "", dataset: { settingKey: "A" } })];
     let boxEls: RC[] = oldPlugins.map((p) => el({ checked: p.enabled, dataset: { plugin: p.name } }));
     const secretEls: RC[] = [];
-    const calls = { renderPlugins: 0, renderEnvFields: 0 };
+    const calls = { renderPlugins: 0, renderEnvFields: 0, renderServers: 0, renderNeedsAttention: 0 };
     const plugsListEl = errEl();
     const envFieldsEl = errEl();
     const document = {
@@ -6474,14 +6474,20 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     };
     const src = applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
     const refreshApplyBar = () => {};
-    // #246: reloadConfig calls renderNeedsAttention() after renderEnvFields(); browser-only, out of this
-    // stub page's scope (same reasoning as loadBranches/renderPlugins/renderEnvFields themselves).
-    const renderNeedsAttention = () => {};
+    // #246: reloadConfig calls renderServers() and renderNeedsAttention() after renderEnvFields();
+    // browser-only, out of this stub page's scope (same reasoning as
+    // loadBranches/renderPlugins/renderEnvFields themselves). Call-COUNTED, not just a no-op stub: a
+    // real-Chrome finding (loadRouting and reloadConfig fire concurrently from showApp; only rendering
+    // the Servers tab from loadRouting's own tail left it drawn against a still-null pluginsData
+    // whenever reloadConfig's fetch was the slower of the two) needs this call pinned here, since no
+    // OTHER test in this file drives reloadConfig with a populated pluginsData/routingData pair.
+    const renderServers = () => { calls.renderServers++; };
+    const renderNeedsAttention = () => { calls.renderNeedsAttention++; };
     const { reloadConfig, setRereading } = new Function(
-      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderNeedsAttention",
+      "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderServers", "renderNeedsAttention",
       `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
         "return { reloadConfig, setRereading: (v) => { applyRereading = v; } };",
-    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderNeedsAttention) as {
+    )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderServers, renderNeedsAttention) as {
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
       setRereading: (v: boolean) => void;
     };
@@ -6494,6 +6500,12 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     kept.settingEls()[0]!.value = "typed"; // the user edited it
     await kept.reloadConfig();
     expect(kept.calls.renderEnvFields).toBe(1);
+    // #246: renderServers/renderNeedsAttention run on EVERY reloadConfig, not only loadRouting's own tail
+    // -- real-Chrome verification found the Servers tab rendered "No plugin lives here" on every card
+    // when reloadConfig's own /api/plugins fetch settled AFTER loadRouting's, since only loadRouting
+    // called renderServers() before this fix.
+    expect(kept.calls.renderServers).toBe(1);
+    expect(kept.calls.renderNeedsAttention).toBe(1);
     expect(kept.settingEls()[0]!.value).toBe("typed"); // survived the reload
 
     // A Discard run: applyRereading is true (rereadFromServer set it before calling the aliases) -> keepEdits defaults false.
