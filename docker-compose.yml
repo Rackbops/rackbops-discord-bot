@@ -81,6 +81,9 @@ services:
     # invoking shell first — see ops/install.sh's printed command), so only those values ever
     # reach this container, not the rest of the file.
     #
+    # Scope, not secrecy: those four still land in the container's Config.Env and docker inspect
+    # prints them; the point is that the rest of .env never does.
+    #
     # BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE/BOT_OPS_PROJECT/BOT_OPS_CONTAINER deliberately use a
     # plain `:-` default here, NOT `:?required` — compose interpolates and validates every service
     # in the file up front, regardless of which --profile is active, so a `:?` on this service

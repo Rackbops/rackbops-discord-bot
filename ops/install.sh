@@ -11,9 +11,11 @@
 # ownership back to); running as root with neither set is refused outright, since there'd be no
 # real user to own the result.
 #
-# Usage: install.sh <instance> [branch]
-#   <instance>   Instance name (lowercase/digits/hyphens), e.g. "debug" or "prod".
-#   [branch]     BOT_BRANCH to build from and fetch templates from (default: main).
+# Usage: install.sh <instance> [branch] [--force-bin]
+#   <instance>    Instance name (lowercase/digits/hyphens), e.g. "debug" or "prod".
+#   [branch]      BOT_BRANCH to build from and fetch templates from (default: main).
+#   [--force-bin] Install `branch`'s bot-ops.sh into the host-shared bin/ even though it differs
+#                 from main's — it is then what EVERY instance on this host runs (see below).
 #
 # Creates, if not already present:
 #   /opt/rackbops-discord-bot/<instance>/.env       from .env.example — fill in secrets by hand
@@ -22,7 +24,14 @@
 # convention this follows; bin/, the compose file, and the compose-project .env below are all
 # scripts/deployment descriptors, shared per host or generated from this run's own values, not
 # instance config):
-#   /opt/rackbops-discord-bot/bin/bot-ops.sh
+#   /opt/rackbops-discord-bot/bin/bot-ops.sh              Refreshed from main; from another branch
+#                                                          only when that branch's own copy is
+#                                                          byte-identical to main's — otherwise
+#                                                          install.sh refuses (#230, --force-bin
+#                                                          overrides). Shared per HOST, not per
+#                                                          instance: docker-compose.yml mounts this
+#                                                          one directory into every instance's admin
+#                                                          container.
 #   /opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml
 #   /opt/stacks/rackbops-discord-bot-<instance>/.env      Compose's own interpolation source (see
 #                                                          below) — NOT the bot's secrets .env above
@@ -109,22 +118,62 @@ bootstrap_dir() {
   sudo chown "$DEPLOY_UID:$DEPLOY_GID" "$dir"
 }
 
-# Fetch $2 from $RAW_BASE/$BRANCH/$1 to a temp file, chmod it $3, then move it into place at $4
-# atomically — a curl failure (network drop, not just a bad HTTP status) aborts under `set -e`
-# right after the curl line, before the mv, so nothing is ever left at the final path but a
-# fully-written file.
-fetch() {
-  local src="$1" mode="$2" dest="$3" tmp
-  # Temp file lives in dest's own directory, not the default /tmp — mv is only a true atomic
-  # rename within one filesystem, and /tmp is commonly a separate tmpfs from /opt. A cross-
-  # filesystem mv falls back to copy-then-unlink, which reopens the exact truncated-file window
-  # this function exists to close.
+# Fetch $1 from $RAW_BASE/${4:-$BRANCH}/$1 to a temp file in $3's own directory, chmod it $2, and
+# leave the temp path in $DOWNLOADED — never move it into place here, so a caller that needs to
+# compare or otherwise inspect the download before committing it (install_shared_bin below) can do
+# so before deciding whether to mv at all. The temp file lives in dest's own directory, not the
+# default /tmp — mv is only a true atomic rename within one filesystem, and /tmp is commonly a
+# separate tmpfs from /opt. A cross-filesystem mv falls back to copy-then-unlink, which reopens the
+# exact truncated-file window atomic placement exists to close. $4 (branch) defaults to $BRANCH so
+# every existing call site is unchanged; install_shared_bin is the one caller that ever passes it.
+download() {
+  local src="$1" mode="$2" dest="$3" branch="${4:-$BRANCH}" tmp
   tmp="$(mktemp -p "$(dirname "$dest")")"
   TMP_FILES+=("$tmp")
-  curl -fsSL "$RAW_BASE/$BRANCH/$src" -o "$tmp"
+  curl -fsSL "$RAW_BASE/$branch/$src" -o "$tmp"
   chmod "$mode" "$tmp"
   chown "$DEPLOY_UID:$DEPLOY_GID" "$tmp"
-  mv "$tmp" "$dest"
+  DOWNLOADED="$tmp"
+}
+
+# The common case: download, then move straight into place — no comparison needed. A curl failure
+# (network drop, not just a bad HTTP status) aborts under `set -e` inside download(), before this
+# mv ever runs, so nothing is ever left at the final path but a fully-written file.
+fetch() {
+  download "$@"
+  mv "$DOWNLOADED" "$3"
+}
+
+# The BOT_OPS_SCHEMA a bot-ops.sh file declares — read back from disk rather than trusted from
+# memory, so this can never itself drift from what a fetch actually wrote. Shared by the "wrote …
+# schema" summary line and install_shared_bin's refusal message below, so the two can't disagree.
+schema_of() { grep -m1 '^readonly BOT_OPS_SCHEMA=' "$1" | cut -d= -f2; }
+
+# #230: BIN_DIR is per HOST, not per instance — docker-compose.yml's admin service mounts this one
+# directory read-only into EVERY instance's admin container, so `install.sh <instance> <branch>`
+# overwriting it unconditionally would let a debug/feature deploy silently replace the script the
+# PRODUCTION panel executes. Compares the branch's copy against MAIN's (never against whatever
+# happens to be installed already) — deliberately so, since that's what lets a stale install still
+# refresh from a branch that ships main's own bot-ops.sh, while refusing exactly the case the issue
+# describes: identical, or BRANCH is main itself, install and say so; different, refuse and name
+# both schemas and the shared path unless --force-bin was passed. The two temps download()
+# registers here are both swept by the script's own EXIT trap on every path out of this function,
+# refusal included, so a refusal strands nothing.
+install_shared_bin() {
+  local dest="$BIN_DIR/bot-ops.sh" fetched main_copy note=""
+  download "ops/bot-ops.sh" 755 "$dest"; fetched="$DOWNLOADED"
+  if [ "$BRANCH" != "main" ]; then
+    download "ops/bot-ops.sh" 755 "$dest" main; main_copy="$DOWNLOADED"
+    if [ "$(sha256sum < "$fetched")" = "$(sha256sum < "$main_copy")" ]; then
+      note=" (identical to main's)"
+    elif [ "$FORCE_BIN" -eq 1 ]; then
+      note=" (--force-bin: differs from main's, schema $(schema_of "$main_copy"))"
+    else
+      die "$dest is shared by every instance on this host, and '$BRANCH' ships a different bot-ops.sh from main (schema $(schema_of "$fetched") vs main's $(schema_of "$main_copy")) — a per-instance branch must not replace it silently. Re-run with main, or add --force-bin to install the '$BRANCH' branch's copy for every instance."
+    fi
+  fi
+  mv "$fetched" "$dest"
+  echo "install: wrote $dest from $BRANCH (bot-ops schema $(schema_of "$dest"))$note"
 }
 
 # 32 random bytes as hex via /dev/urandom + od — available on effectively any Linux host,
@@ -154,7 +203,15 @@ validate_stack_env() {
 main() {
   INSTANCE="${1:-}"
   BRANCH="${2:-main}"
-  [[ "$INSTANCE" =~ ^[a-z0-9-]+$ ]] || die "usage: install.sh <instance> [branch] (instance: lowercase letters/digits/hyphens only)"
+  # #230: the only accepted third argument. A per-instance branch cannot silently overwrite the
+  # host-shared bin/bot-ops.sh (see install_shared_bin below) unless it's explicitly forced.
+  FORCE_BIN=0
+  case "${3:-}" in
+    "") ;;
+    --force-bin) FORCE_BIN=1 ;;
+    *) die "usage: install.sh <instance> [branch] [--force-bin] (unknown argument '${3}')" ;;
+  esac
+  [[ "$INSTANCE" =~ ^[a-z0-9-]+$ ]] || die "usage: install.sh <instance> [branch] [--force-bin] (instance: lowercase letters/digits/hyphens only)"
   [ "$INSTANCE" != "bin" ] || die "'bin' is reserved (it's the shared /opt/rackbops-discord-bot/bin/ scripts dir) — pick a different instance name"
 
   # #232: BRANCH is interpolated into fetch()'s raw.githubusercontent.com URL, and curl collapses
@@ -200,14 +257,11 @@ main() {
 
   # bin/bot-ops.sh and the compose file are generated, not precious — always refresh them to
   # whatever BRANCH ships, same as .env is never touched. This is the "scripts/descriptors are
-  # deployment artifacts, not instance config" split from app-config-deployment-foundation.md.
-  fetch "ops/bot-ops.sh" 755 "$BIN_DIR/bot-ops.sh"
-  # #173: name the schema this fetch just installed, so an operator can see it side by side with
-  # the admin panel's own "bot-ops.sh schema <got> (panel needs <want>)" startup log line. Read
-  # from the file just written (not a hardcoded number here) so this can never itself drift from
-  # what actually landed on disk.
-  bot_ops_schema="$(grep -m1 '^readonly BOT_OPS_SCHEMA=' "$BIN_DIR/bot-ops.sh" | cut -d= -f2)"
-  echo "install: wrote $BIN_DIR/bot-ops.sh from $BRANCH (bot-ops schema ${bot_ops_schema:-unknown})"
+  # deployment artifacts, not instance config" split from app-config-deployment-foundation.md —
+  # with the one exception that bin/bot-ops.sh is shared by every instance on this HOST, so a
+  # per-instance branch cannot silently put non-main content there for all of them to inherit; see
+  # install_shared_bin above (#230).
+  install_shared_bin
   fetch "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
   # #178: same pattern as bot-ops.sh's schema line above — read back from the file just written, so
   # an operator can compare this against the panel's own "docker-compose.yml schema <got> (panel
@@ -278,10 +332,13 @@ install: next steps for '$INSTANCE'
      panel section) — it has no published host port, so until a tunnel routes to it, this
      just starts a sidecar reachable from nothing but the docker network it's on. ADMIN_TOKEN
      and the CLOUDFLARE_ACCESS_*/ADMIN_ALLOWED_EMAILS vars are read out of .env just for this
-     one command (not the whole file), so they aren't baked into the image or shown in docker
-     inspect. This is not a secrets boundary, though: the admin container bind-mounts the config
-     dir read-write (to write admins.json and back up .env), so it can read every secret in .env
-     off the filesystem — panel access is effectively deploy/root-equivalent. Fill
+     one command, so only those four reach the admin container rather than every secret in the
+     file, and nothing is baked into the image. They are still in the container's environment —
+     docker inspect on this host shows them — which is acceptable only because anyone who can
+     run that is already root-equivalent here. This is not a secrets boundary either way: the
+     admin container bind-mounts the config dir read-write (to write admins.json and back up
+     .env), so it can read every secret in .env off the filesystem — panel access is effectively
+     deploy/root-equivalent. Fill
      CLOUDFLARE_ACCESS_TEAM_DOMAIN/CLOUDFLARE_ACCESS_AUD into .env in step 1 to
      have the panel verify Access's own signed JWT directly (ADMIN_TOKEN then becomes a
      fallback, not the only check) — leave them blank to keep ADMIN_TOKEN as the sole door-2
