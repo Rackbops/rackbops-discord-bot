@@ -576,10 +576,22 @@
     }
     return "Couldn't load this plugin's settings (status " + status + ")";
   }
+  // #226: mirrors server.ts's ENV_KEY_RE exactly — the page can't import a server module, so the
+  // two literals are pinned equal by a source-pin test in server.test.ts instead.
+  const ENV_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
   function buildSetEnvBody(changes, envKeys) {
     const scoped = scopeToPluginKeys(changes, envKeys);
     const keys = Object.keys(scoped);
     for (const k of keys) {
+      // #226: a key from the index that isn't ENV_KEY_RE-shaped (a newline, in particular) could
+      // smuggle a second env-set line past the key scope the same way an unsafe VALUE could (below)
+      // — refused the same way, before any value is even looked at.
+      if (!ENV_KEY_RE.test(k)) {
+        // Name the key only when it is itself printable-safe (mirrors bot-ops.sh's echo_key rule) —
+        // never echo a raw newline or arbitrary text back into a server-logged error. A key that
+        // fails ENV_KEY_RE already violates that same character class, so this is always "(not shown)".
+        return { error: "key " + (/^[A-Z][A-Z0-9_]{0,39}$/.test(k) ? k : "(not shown)") + " is not a valid setting name" };
+      }
       // Refuse a newline in a value — "8080\nANNOUNCE_CHANNEL_ID=1" would smuggle a second env-set line
       // past the key scope (bot-ops reads stdin line by line). Env values are single-line by nature.
       if (/[\r\n]/.test(String(scoped[k]))) return { error: "value for " + k + " must not contain a newline" };

@@ -5,6 +5,8 @@
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
 // token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
+import { chownSync, renameSync, statSync } from "node:fs";
+import { dirname } from "node:path";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { ADMIN_API_VERSION } from "./admin-contract";
 
@@ -112,11 +114,56 @@ export function adminRemovalError(
  * management logic test without a real filesystem. `readDynamic` may throw (see
  * `readDynamicAdmins`) when the backing store is present but broken — callers must fail closed
  * on that, never swallow it back into "no dynamic admins" (issue #40's fail-open bug).
+ *
+ * `readDynamic`/`writeDynamic` alone are NOT safe for a read-modify-write caller: two concurrent
+ * callers can each read the same "current" set, decide against it independently, and the second
+ * write silently discards the first's change (#228) — the same lost-update shape `src/storage.ts`
+ * documents for `writeJsonAtomic`. `mutateDynamic` is the one path a caller should use to add or
+ * remove an admin: it reads fresh, hands the caller a COPY to decide against, and writes `next`
+ * only when returned — every call queued behind the previous one on this store, via
+ * `serializeAdminMutations`. `readDynamic` still exists on its own for the one read path that
+ * genuinely can't queue behind a mutation without a real behaviour cost: the per-request auth
+ * check (`handleRequest`), which every request needs and which would otherwise stall behind
+ * in-flight admin-list writes. `handleAdmins`'s own `list()` (GET, and POST/DELETE's response)
+ * reads through `mutateDynamic` too, as a no-op turn — see its own comment for why.
  */
 export interface AdminStore {
   bootstrap: Set<string>;
   readDynamic: () => Promise<Set<string>>;
   writeDynamic: (emails: Set<string>) => Promise<void>;
+  /** Reads the dynamic set fresh, hands `fn` a COPY to decide against, and writes `next` when `fn`
+   *  returns one — this call queued behind whatever mutation is already in flight on this store, so
+   *  the decision always runs against a set no other queued mutation can still change out from under
+   *  it. `fn` deciding to refuse (no `next`) still resolves with `result`, without writing. */
+  mutateDynamic: <R>(fn: (current: Set<string>) => { next?: Set<string>; result: R }) => Promise<R>;
+}
+
+/**
+ * Builds the one `mutateDynamic` implementation `AdminStore` needs, from just `readDynamic` +
+ * `writeDynamic` — the real store (`import.meta.main`) and `server.test.ts`'s `makeStore` both get
+ * it from here, so the queue itself is tested once, not reimplemented per caller. A promise chain,
+ * not a mutex: each call's turn runs only after the previous turn has settled (read → `fn` → write),
+ * so two calls started at once are fully ordered, the second always seeing the first's write.
+ * Mirrors `src/storage.ts`'s `createJsonWriter`/`createKeyedJsonMutator` chain shape — a turn that
+ * throws (a broken `admins.json`, a failed write) rejects only ITS OWN caller; `chain` is advanced
+ * through a `.then(ok, ok)` that never itself rejects, so the next turn still runs rather than the
+ * whole queue wedging on one failure.
+ */
+export function serializeAdminMutations(store: Pick<AdminStore, "readDynamic" | "writeDynamic">): AdminStore["mutateDynamic"] {
+  let chain: Promise<unknown> = Promise.resolve();
+  return <R>(fn: (current: Set<string>) => { next?: Set<string>; result: R }): Promise<R> => {
+    const turn: Promise<R> = chain.then(async () => {
+      const current = await store.readDynamic();
+      const { next, result } = fn(new Set(current));
+      if (next) await store.writeDynamic(next);
+      return result;
+    });
+    chain = turn.then(
+      () => undefined,
+      () => undefined,
+    );
+    return turn;
+  };
 }
 
 /**
@@ -144,6 +191,50 @@ export async function readDynamicAdmins(adminsFile: string): Promise<Set<string>
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean),
   );
+}
+
+// #228: gives every temp file THIS PROCESS creates here a unique name — see writeAdminsFile's own
+// comment for why. One process only ever writes admins.json (the admin panel has no multi-container
+// handoff the way the bot does — contrast src/storage.ts's writeJsonAtomic, which also needs a
+// per-process TMP_TOKEN for exactly that reason, #253), so a pid+counter name is enough here.
+let adminsFileTmpCounter = 0;
+
+/**
+ * Writes `emails` to `adminsFile`: a per-call-unique temp file in the same directory, then an
+ * atomic rename — never a bare write, which two overlapping writers (or a crash mid-write) could
+ * leave the real file torn or truncated. The old shape (`${adminsFile}.tmp`, one fixed name for
+ * every writer) let one writer's rename land on a file another writer was still writing (#228);
+ * the temp name here carries this process's pid and a monotonically increasing counter
+ * (`${adminsFile}.${pid}.${counter}.tmp`), so two overlapping calls can never pick the same path —
+ * mirrors `src/storage.ts`'s `tmpPathFor` shape, minus the cross-process token that file needs and
+ * this one doesn't.
+ *
+ * Exported (not left inline in `import.meta.main`) so the write itself is unit-tested against a
+ * real temp directory, independent of `AdminStore`/`serializeAdminMutations` — **not** a substitute
+ * for serializing concurrent CALLERS: two overlapping calls for the SAME `adminsFile` still each
+ * write then rename, and the loser's rename simply lands last (a lost update, never a corrupt
+ * file) — every real caller reaches this only through `AdminStore.mutateDynamic`, which serializes
+ * that. `write` is injected only so a test can observe the exact temp path a call used without a
+ * real filesystem race; `import.meta.main` gets the real `Bun.write`.
+ */
+export async function writeAdminsFile(
+  adminsFile: string,
+  emails: Set<string>,
+  write: (path: string, data: string) => Promise<unknown> = Bun.write,
+): Promise<void> {
+  const tmp = `${adminsFile}.${process.pid}.${++adminsFileTmpCounter}.tmp`;
+  await write(tmp, JSON.stringify({ emails: [...emails].sort() }, null, 2) + "\n");
+  renameSync(tmp, adminsFile); // atomic replace, so a crash never leaves a half-written list
+  // Preserve deploy-user ownership: the container runs as root, so a fresh admins.json would
+  // otherwise be root-owned — leaving the deploy user unable to edit it over SSH (issue #20's
+  // rationale for bot-ops.sh's own env-set ownership fix). Best-effort: run as the deploy user
+  // directly (e.g. under `bun test`), the file is already correctly owned and this is a no-op.
+  try {
+    const dir = statSync(dirname(adminsFile));
+    chownSync(adminsFile, dir.uid, dir.gid);
+  } catch {
+    /* best-effort */
+  }
 }
 
 /**
@@ -837,6 +928,15 @@ function releasesNewerThan(releases: PluginRelease[], installedVersion: string |
   return i === -1 ? releases : releases.slice(0, i);
 }
 
+/** #226: the only shape an env key read from the Plugin Index is trusted to have. Checked here
+ *  (`mergePluginsView`'s `envKeys` and `env`) and mirrored, as an equal literal pinned by a
+ *  source-pin test, in `index.html`'s `PLUGIN_ADMIN_HELPERS` block (`buildSetEnvBody`) — the page
+ *  can't import a server module. A malformed key from the index (a manifest entry declaring one
+ *  with a newline, say) could otherwise smuggle a second `env-set` line past a plugin's own-keys
+ *  scope (`bot-ops.sh` reads stdin one line at a time) — refused here before it ever reaches the
+ *  bridge or draws a settings field for it. */
+export const ENV_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
+
 /** Pure merge of the Plugin Index, the bot's installed state (`status.plugins`), and the current
  *  `PLUGINS` value into one per-plugin view. `index === null` → `indexError` + state-only entries,
  *  so the panel still renders what's installed. */
@@ -887,15 +987,20 @@ export function mergePluginsView(
       ...(!compatible && typeof entry?.hostApiVersion === "number" ? { neededHostApi: entry.hostApiVersion } : {}),
       // #124: the plugin's declared env key names (for the admin bridge's own-keys-only scoping), plus
       // its admin-bundle URL + version when it ships an admin tab. env is untrusted manifest JSON, so
-      // guard each element before reading `.key`.
+      // guard each element before reading `.key` — and #226: a key not shaped like ENV_KEY_RE is
+      // dropped here too, never reaching the bridge's scope or drawing a card field for it.
       envKeys: (entry?.env ?? [])
-        .filter((e): e is { key: string } => !!e && typeof (e as { key?: unknown }).key === "string")
+        .filter((e): e is { key: string } => !!e && typeof (e as { key?: unknown }).key === "string" && ENV_KEY_RE.test((e as { key: string }).key))
         .map((e) => e.key),
       // #244: the same env block, widened for the card's settings step. Guarded the same way envKeys
-      // is (untrusted manifest JSON): an element without a string `key` is skipped; `description` is a
-      // string or ""; `required`/`secret` are true only for a literal `true`.
+      // is (untrusted manifest JSON, #226's key-shape check): an element without a string `key`
+      // matching ENV_KEY_RE is skipped; `description` is a string or ""; `required`/`secret` are
+      // true only for a literal `true`.
       env: (entry?.env ?? [])
-        .filter((e): e is { key: string; description?: string; required?: boolean; secret?: boolean } => !!e && typeof (e as { key?: unknown }).key === "string")
+        .filter(
+          (e): e is { key: string; description?: string; required?: boolean; secret?: boolean } =>
+            !!e && typeof (e as { key?: unknown }).key === "string" && ENV_KEY_RE.test((e as { key: string }).key),
+        )
         .map((e) => ({
           key: e.key,
           description: typeof e.description === "string" ? e.description : "",
@@ -925,12 +1030,18 @@ export const ADMIN_ASSET_HOST = "cdn.jsdelivr.net";
 export const ADMIN_ASSET_MAX_BYTES = 512 * 1024;
 
 /** The result of fetching an admin asset — injected (`HandlerConfig.fetchAdminAsset`) so the delivery
- *  routes test without a real network call, and so the size cap is enforced at the I/O edge. */
+ *  routes test without a real network call, and so the size cap is enforced at the I/O edge.
+ *  `body` is the raw bytes, never decoded (#229): the only current use was a realm list (JSON,
+ *  UTF-8-safe), which is why the pre-#229 `TextDecoder().decode()` shape latently corrupted any
+ *  OTHER asset a plugin might ship — a PNG, a font, a `.wasm`, gzipped JSON — turning every
+ *  non-UTF-8 byte into U+FFFD while still answering 200 with the right content type, so nothing in
+ *  the plugin could tell. Both delivery routes hand `body` to `new Response(...)` unchanged; decode
+ *  only where something actually needs a string (nothing in this file does). */
 export interface AdminAssetResult {
   ok: boolean;
   status: number;
   contentType: string;
-  body: string;
+  body: Uint8Array;
   /** Set when `ok` is false — a human reason (upstream status, too large, fetch error). */
   error?: string;
 }
@@ -1045,7 +1156,9 @@ export function resolvePluginProxyUrl(
  *  browser never reaches cross-origin for plugin code. 404 when the plugin ships no admin bundle (or
  *  none at the pinned version). #165: an optional `v` pins delivery to the installed version rather
  *  than the manifest's current one — a malformed `v` is 400, never silently treated as absent (a
- *  silent fallback would re-create the installed/current split under a typo). */
+ *  silent fallback would re-create the installed/current split under a typo). #229: `asset.body` is
+ *  bytes, handed to `Response` unchanged — this route always labels them JS regardless (below), so
+ *  it's moot here, but the shape is the same one `servePluginProxy` relies on for a binary asset. */
 export async function serveAdminBundle(url: URL, config: HandlerConfig): Promise<Response> {
   const m = /^\/plugin-admin\/([a-z][a-z0-9-]*)\.js$/.exec(url.pathname);
   if (!m) return new Response("not found", { status: 404 });
@@ -1075,7 +1188,9 @@ export async function serveAdminBundle(url: URL, config: HandlerConfig): Promise
  *  GET a data asset from THIS plugin's own published package (e.g. a realm list), scoped by
  *  `resolvePluginProxyUrl` so a bundle can only reach its own files. Authenticated (an /api/ route).
  *  #165: an optional `v` pins the asset to the installed version, mirroring `serveAdminBundle` — a
- *  malformed `v` is 400, never a silent fallback to the manifest's current version. */
+ *  malformed `v` is 400, never a silent fallback to the manifest's current version. #229: `asset.body`
+ *  is bytes, handed to `Response` unchanged — this is the route a non-text data asset (a PNG, a font,
+ *  gzipped JSON) actually goes through, so decoding it here would be the corrupting step. */
 export async function servePluginProxy(url: URL, config: HandlerConfig): Promise<Response> {
   const m = /^\/api\/plugin-proxy\/([a-z][a-z0-9-]*)$/.exec(url.pathname);
   if (!m) return new Response("not found", { status: 404 });
@@ -1105,26 +1220,29 @@ interface AssetResponse {
 
 /** Builds the injected `fetchAdminAsset`: fetch `url`, reject early on a too-large Content-Length (so a
  *  hostile length can't make us buffer gigabytes), then read bytes with a hard cap and a 5 s abort.
- *  fetch-injected + exported so the size cap is unit-tested; `import.meta.main` passes the real fetch. */
+ *  fetch-injected + exported so the size cap is unit-tested; `import.meta.main` passes the real fetch.
+ *  #229: never decodes — `body` is the raw bytes handed straight to the `AdminAssetResult`, so a
+ *  binary asset (a PNG, a font, `.wasm`) survives the proxy unchanged. */
 export function makeAdminAssetFetcher(
   fetchImpl: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<AssetResponse>,
   maxBytes = ADMIN_ASSET_MAX_BYTES,
 ): (url: string) => Promise<AdminAssetResult> {
+  const EMPTY = new Uint8Array(0);
   return async (assetUrl) => {
     try {
       const res = await fetchImpl(assetUrl, { headers: { "User-Agent": "rackbops-admin-panel" }, signal: AbortSignal.timeout(5000) });
-      if (!res.ok) return { ok: false, status: res.status, contentType: "", body: "", error: `upstream ${res.status}` };
+      if (!res.ok) return { ok: false, status: res.status, contentType: "", body: EMPTY, error: `upstream ${res.status}` };
       const declared = Number(res.headers.get("content-length"));
       if (Number.isFinite(declared) && declared > maxBytes) {
-        return { ok: false, status: 502, contentType: "", body: "", error: `asset exceeds ${maxBytes} bytes (content-length)` };
+        return { ok: false, status: 502, contentType: "", body: EMPTY, error: `asset exceeds ${maxBytes} bytes (content-length)` };
       }
       const buf = await res.arrayBuffer();
       if (buf.byteLength > maxBytes) {
-        return { ok: false, status: 502, contentType: "", body: "", error: `asset exceeds ${maxBytes} bytes` };
+        return { ok: false, status: 502, contentType: "", body: EMPTY, error: `asset exceeds ${maxBytes} bytes` };
       }
-      return { ok: true, status: 200, contentType: res.headers.get("content-type") ?? "", body: new TextDecoder().decode(buf) };
+      return { ok: true, status: 200, contentType: res.headers.get("content-type") ?? "", body: new Uint8Array(buf) };
     } catch (err) {
-      return { ok: false, status: 502, contentType: "", body: "", error: String(err) };
+      return { ok: false, status: 502, contentType: "", body: EMPTY, error: String(err) };
     }
   };
 }
@@ -1618,9 +1736,15 @@ export function isCrossSiteWrite(req: Request): boolean {
  * admin can manage admins".
  */
 export async function handleAdmins(req: Request, store: AdminStore, auth: Authorization): Promise<Response> {
+  // #228: queued through mutateDynamic (a no-op turn — no `next`, just the fresh read as `result`)
+  // rather than a bare store.readDynamic() — so `list()` always waits for anything already queued
+  // ahead of it to finish first. A POST/DELETE's own post-mutation list() call happens strictly
+  // AFTER its sibling's mutateDynamic call was queued (they're both queued before either resolves,
+  // per JS's single-threaded call order), so this is what guarantees each response reflects every
+  // sibling mutation that was in flight alongside it, not just its own.
   const list = () =>
     store
-      .readDynamic()
+      .mutateDynamic<Set<string>>((dynamic) => ({ result: dynamic }))
       .then((dynamic) => jsonResponse({ bootstrap: [...store.bootstrap].sort(), dynamic: [...dynamic].sort() }));
 
   if (req.method === "GET") {
@@ -1638,32 +1762,46 @@ export async function handleAdmins(req: Request, store: AdminStore, auth: Author
     if (!email) return new Response("a valid email is required", { status: 400 });
 
     try {
-      // Reading dynamic is inside this try too — a broken admins.json throws here, not just on
-      // the write below, and must surface as the same clean 502 rather than an unhandled throw.
-      const dynamic = await store.readDynamic();
+      // #228: the decision runs INSIDE mutateDynamic's turn, against the fresh set it reads —
+      // never against a set read before the queue, which two concurrent requests could each
+      // decide against independently and silently lose one's change. Read failures (a broken
+      // admins.json) and write failures (e.g. no config dir to persist to) both surface as a
+      // rejection of this call, caught by the try below as the same clean 502 as before.
       if (req.method === "POST") {
-        if (!store.bootstrap.has(email) && !dynamic.has(email)) {
-          dynamic.add(email);
-          await store.writeDynamic(dynamic);
-          console.log(adminAuditLine("added", email, auth)); // issue #53 item 3
-        }
+        const outcome = await store.mutateDynamic<"added" | "unchanged">((dynamic) => {
+          if (!store.bootstrap.has(email) && !dynamic.has(email)) {
+            dynamic.add(email);
+            return { next: dynamic, result: "added" };
+          }
+          return { result: "unchanged" };
+        });
+        if (outcome === "added") console.log(adminAuditLine("added", email, auth)); // issue #53 item 3
         return await list();
       }
       // DELETE
-      const err = adminRemovalError(email, store.bootstrap, auth.email?.toLowerCase());
-      if (err) return new Response(err, { status: 400 });
-      // Don't let the very last admin be removed with no env floor — that would silently revert the
-      // panel to "anyone Access allows" (effectiveAllowlist → undefined), the opposite of the intent.
-      if (store.bootstrap.size === 0 && dynamic.size === 1 && dynamic.has(email)) {
-        return new Response(
-          "That's the last admin and there's no ADMIN_ALLOWED_EMAILS floor — removing it would open the panel to everyone Access lets in. Add another admin, or set the env var, first.",
-          { status: 400 },
-        );
-      }
-      if (dynamic.delete(email)) {
-        await store.writeDynamic(dynamic);
-        console.log(adminAuditLine("removed", email, auth)); // issue #53 item 3
-      }
+      const outcome = await store.mutateDynamic<
+        { kind: "refused"; message: string } | { kind: "removed" } | { kind: "noop" }
+      >((dynamic) => {
+        const err = adminRemovalError(email, store.bootstrap, auth.email?.toLowerCase());
+        if (err) return { result: { kind: "refused", message: err } };
+        // Don't let the very last admin be removed with no env floor — that would silently revert
+        // the panel to "anyone Access allows" (effectiveAllowlist → undefined), the opposite of
+        // the intent. Checked here (inside the turn) so two concurrent DELETEs of the last two
+        // dynamic admins can never both see size===2 and both go through.
+        if (store.bootstrap.size === 0 && dynamic.size === 1 && dynamic.has(email)) {
+          return {
+            result: {
+              kind: "refused",
+              message:
+                "That's the last admin and there's no ADMIN_ALLOWED_EMAILS floor — removing it would open the panel to everyone Access lets in. Add another admin, or set the env var, first.",
+            },
+          };
+        }
+        if (dynamic.delete(email)) return { next: dynamic, result: { kind: "removed" } };
+        return { result: { kind: "noop" } };
+      });
+      if (outcome.kind === "refused") return new Response(outcome.message, { status: 400 });
+      if (outcome.kind === "removed") console.log(adminAuditLine("removed", email, auth)); // issue #53 item 3
       return await list();
     } catch (err) {
       // A store read failure (broken admins.json) or write failure (e.g. no config dir to
@@ -2032,26 +2170,15 @@ if (import.meta.main) {
   // function still throws (that is what makes it testable without an entry point); the entry point
   // is what turns a misconfiguration into a legible refusal to start.
   const { configDir, adminsFile } = resolveAdminStorePathsOrExit(process.env);
-  const { chownSync, renameSync, statSync } = await import("node:fs");
-  const adminStore: AdminStore = {
-    bootstrap,
-    readDynamic: () => (adminsFile ? readDynamicAdmins(adminsFile) : Promise.resolve(new Set<string>())),
-    writeDynamic: async (emails) => {
-      if (!adminsFile) throw new Error("BOT_OPS_CONFIG_DIR is not set — nowhere to persist admin changes");
-      const tmp = `${adminsFile}.tmp`;
-      await Bun.write(tmp, JSON.stringify({ emails: [...emails].sort() }, null, 2) + "\n");
-      renameSync(tmp, adminsFile); // atomic replace, so a crash never leaves a half-written list
-      // Preserve deploy-user ownership: this container runs as root, so a fresh admins.json would
-      // otherwise be root-owned — leaving the deploy user unable to edit it over SSH (same
-      // rationale as the bot-ops.sh env-set ownership fix, issue #20).
-      try {
-        const dir = statSync(configDir!);
-        chownSync(adminsFile, dir.uid, dir.gid);
-      } catch {
-        /* best-effort: as the deploy user directly, the file is already correctly owned */
-      }
-    },
+  // #228: built once, so the mutation queue (and its ownership of `chain`) is one per process, not
+  // rebuilt — and reused — per call. readDynamic/writeDynamic are still their own properties too:
+  // GET's list() and the per-request auth check read fresh with no write to serialize against.
+  const readDynamic = () => (adminsFile ? readDynamicAdmins(adminsFile) : Promise.resolve(new Set<string>()));
+  const writeDynamic = (emails: Set<string>): Promise<void> => {
+    if (!adminsFile) throw new Error("BOT_OPS_CONFIG_DIR is not set — nowhere to persist admin changes");
+    return writeAdminsFile(adminsFile, emails);
   };
+  const adminStore: AdminStore = { bootstrap, readDynamic, writeDynamic, mutateDynamic: serializeAdminMutations({ readDynamic, writeDynamic }) };
   if (bootstrap.size > 0) {
     console.log(`[admin] ${bootstrap.size} bootstrap admin(s) from ADMIN_ALLOWED_EMAILS; more can be added in the panel`);
   } else {
