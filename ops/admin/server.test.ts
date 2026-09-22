@@ -6151,13 +6151,16 @@ describe("page skeleton", () => {
     const setting = indexSrc.slice(indexSrc.indexOf("function buildSettingField("), indexSrc.indexOf("function buildSecretField("));
     expect(setting).toContain("setRequiredLabel(label, settingLabel(key, p.name), !!schemaRow.required);");
     expect(setting).toContain("input.required = !!schemaRow.required;");
+    expect(setting).toContain("setDescribedByToken(input, desc.id, true);");
     const secret = indexSrc.slice(indexSrc.indexOf("function buildSecretField("), indexSrc.indexOf("function buildPluginCard("));
     expect(secret).toContain("setRequiredLabel(label, displayLabel, visibleInput && !!schemaRow.required);");
     expect(secret).toContain("input.required = !!schemaRow.required;");
+    expect(secret).toContain("setDescribedByToken(input, note.id, true);");
     const config = indexSrc.slice(indexSrc.indexOf("function buildTagControl("), indexSrc.indexOf("// ENV_SCHEMA:begin"));
     expect(config).toContain("add.required = required;");
     expect(config).toContain("control.required = required;");
     expect(config).toContain("setRequiredLabel(label, key, required);");
+    expect(config).toContain("if (describedControl) setDescribedByToken(describedControl, hint.id, true);");
   });
 
   test("route field help/error ids preserve the help token while validation comes and goes (#300)", () => {
