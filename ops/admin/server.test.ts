@@ -9085,6 +9085,56 @@ describe("Choose where it lives: source pins (#245)", () => {
     const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
     expect(stepSlice).toContain('className: "step__num", textContent: "2"');
   });
+
+  test("a failed routing read is visible on the retained placement instead of looking freshly loaded (source pin)", () => {
+    const stepSlice = indexSrc.slice(indexSrc.indexOf("function buildWhereItLivesStep("), indexSrc.indexOf("function ensureRouteState("));
+    expect(stepSlice).toContain("if (routingData && routingData.loadError)");
+    expect(stepSlice).toContain('loadError.textContent = "Couldn\'t read where plugins live: " + routingData.loadError;');
+  });
+});
+
+// #245 follow-up, found after merge: a transient GET /api/routing failure must retain the last good
+// routing/discovery snapshot and mark it with loadError. Replacing it with null/null made every card say
+// the bot had never published discovery, erasing useful stale state and contradicting decision 8.
+describe("loadRouting preserves the last good snapshot (#245 follow-up)", () => {
+  const src = applyIndexSrc.slice(
+    applyIndexSrc.indexOf("async function loadRouting("),
+    applyIndexSrc.indexOf("// Redraws every card's step FRESH", applyIndexSrc.indexOf("async function loadRouting(")),
+  );
+
+  function harness(initial: unknown) {
+    const calls = { steps: 0, servers: 0, pickers: 0, attention: 0 };
+    const api = async () => { throw new Error("temporary routing outage"); };
+    const refreshRoutingSteps = () => { calls.steps++; };
+    const renderServers = () => { calls.servers++; };
+    const refreshEnvPickers = () => { calls.pickers++; };
+    const renderNeedsAttention = () => { calls.attention++; };
+    return {
+      calls,
+      run: new Function(
+        "api", "refreshRoutingSteps", "renderServers", "refreshEnvPickers", "renderNeedsAttention",
+        `"use strict";\nlet routingData = ${JSON.stringify(initial)};\n${src}\nreturn { loadRouting, getRoutingData: () => routingData };`,
+      )(api, refreshRoutingSteps, renderServers, refreshEnvPickers, renderNeedsAttention) as {
+        loadRouting: () => Promise<void>;
+        getRoutingData: () => unknown;
+      },
+    };
+  }
+
+  test("a transient failure retains prior routing and discovery and marks them stale", async () => {
+    const previous = { routing: { plugins: { music: { servers: {} } }, webhooks: {}, results: [] }, discovery: { generatedAt: "2026-09-22T00:00:00.000Z", guilds: [] } };
+    const h = harness(previous);
+    await h.run.loadRouting();
+    expect(h.run.getRoutingData()).toEqual({ ...previous, loadError: "temporary routing outage" });
+    expect(h.calls).toEqual({ steps: 1, servers: 1, pickers: 1, attention: 1 });
+  });
+
+  test("a first-load failure has no invented routing data and carries the visible reason", async () => {
+    const h = harness(null);
+    await h.run.loadRouting();
+    expect(h.run.getRoutingData()).toEqual({ routing: null, discovery: null, loadError: "temporary routing outage" });
+    expect(h.calls).toEqual({ steps: 1, servers: 1, pickers: 1, attention: 1 });
+  });
 });
 
 // #245: the debounce/held/poll state machine -- a dedicated mini-harness (the reloadConfig keepEdits
@@ -9277,6 +9327,45 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // (placementSummary's "unplaced"/"in N servers" sentence goes stale otherwise; caught in real-Chrome
     // verification, not by a unit test, until this assertion was added).
     expect(h.refreshRoutingStepsCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a slow POST reserves inflight before it resolves, so a later edit waits and sends one follow-up", async () => {
+    let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let releaseFirst!: (value: { ok: boolean; status: number; text: () => Promise<string> }) => void;
+    const firstResponse = new Promise<{ ok: boolean; status: number; text: () => Promise<string> }>((resolve) => { releaseFirst = resolve; });
+    let postNo = 0;
+    const h = harness({
+      routingDataInit: live,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") {
+          postNo++;
+          const id = "slow-" + postNo;
+          if (postNo === 1) return firstResponse;
+          live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id, action: "routing-set", ok: true, at: "t" + postNo }] } };
+          return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+        }
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    await h.clock.tick(); // debounce starts POST #1, whose response remains unresolved
+    expect(h.posts).toHaveLength(1);
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // reserved before the await
+
+    h.run.onRouteChange("music", "200", "on", true);
+    await h.clock.tick(); // the later edit's debounce sees the reservation and becomes held
+    expect(h.posts).toHaveLength(1); // never a concurrent second POST
+    expect(h.routeState.get("music")?.held).toBe(true);
+
+    live = { ...live, routing: { ...live.routing, results: [...live.routing.results, { id: "slow-1", action: "routing-set", ok: true, at: "t1" }] } };
+    releaseFirst({ ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "slow-1" }) });
+    await h.clock.tick(); // let POST #1's response schedule its poll
+    await h.clock.tick(); // poll #1 settles; finally starts the held follow-up
+    await h.clock.tick(); // poll #2 settles
+    expect(h.posts).toHaveLength(2);
+    expect(h.routeState.get("music")?.held).toBe(false);
+    expect(JSON.parse(h.posts[1]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: "all" }, "200": { commands: "all" } } });
   });
 
   test("an applied outcome rebuilds the whole step (stale summary fix); a refusal only updates the status line", async () => {

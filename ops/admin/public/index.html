@@ -1007,6 +1007,13 @@
     step.appendChild(head);
 
     const body = document.createElement("div");
+    if (routingData && routingData.loadError) {
+      const loadError = document.createElement("p");
+      loadError.className = "route__status";
+      loadError.setAttribute("role", "status");
+      loadError.textContent = "Couldn't read where plugins live: " + routingData.loadError;
+      body.appendChild(loadError);
+    }
     const status = document.createElement("p");
     status.className = "route__status";
     status.setAttribute("role", "status");
@@ -1305,10 +1312,19 @@
     if (st.inflight) { st.held = true; return; }
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     const sentServers = Object.keys(planned.body.servers);
+    // Reserve the in-flight slot BEFORE the POST. A slow request must disable the controls and hold a
+    // later edit instead of allowing its debounce to start a concurrent second POST. The server id is
+    // filled in once the response arrives; object identity lets error cleanup avoid clearing a newer
+    // operation if another path has superseded this reservation.
+    const reservation = { id: null, sentServers, startedAt: Date.now() };
+    st.inflight = reservation;
+    st.outcome = null;
+    renderRouteStatus(plugin, routingStepEls.get(plugin));
     try {
       const res = await api("/api/routing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(planned.body), signal });
       const text = await res.text();
       if (!res.ok) {
+        if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
         return;
@@ -1316,16 +1332,18 @@
       let result = null;
       try { result = JSON.parse(text); } catch { /* treated as a failure below */ }
       if (!result || !result.id) {
+        if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
         return;
       }
       const startedAt = Date.now();
-      st.inflight = { id: result.id, sentServers, startedAt };
-      st.outcome = null;
+      reservation.id = result.id;
+      reservation.startedAt = startedAt;
       renderRouteStatus(plugin, routingStepEls.get(plugin));
       await awaitRequestResult(plugin, result.id, sentServers, startedAt);
     } catch (e) {
+      if (st.inflight === reservation) st.inflight = null;
       const message = e && e.message ? e.message : String(e);
       if (message !== "unauthorized") {
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
@@ -1594,7 +1612,12 @@
       routingData = await res.json();
     } catch (e) {
       if (e && e.message === "unauthorized") return;
-      routingData = { routing: null, discovery: null, loadError: e && e.message ? e.message : String(e) };
+      const loadError = e && e.message ? e.message : String(e);
+      // Keep the last good snapshot on a transient read failure. The cards remain useful, but every
+      // plugin step visibly says the read failed so the retained data is never presented as fresh.
+      routingData = routingData
+        ? { ...routingData, loadError }
+        : { routing: null, discovery: null, loadError };
     }
     refreshRoutingSteps();
     renderServers();
