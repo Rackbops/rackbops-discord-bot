@@ -9807,6 +9807,12 @@ describe("Servers tab: source pins (#246)", () => {
       expect(unauthorizedIdx).toBeLessThan(timeoutIdx);
     }
   });
+
+  test("the Servers tab labels retained routing data as stale after a routing read failure", () => {
+    const render = indexSrc.slice(indexSrc.indexOf("function renderServers("), indexSrc.indexOf("const refreshServers = renderServers;"));
+    expect(render).toContain("routingData && routingData.loadError");
+    expect(render).toContain("Couldn't read where plugins live: ");
+  });
 });
 
 // #246: decision 6's pickers, run against buildEnvControl itself (not just pickerOptions in isolation) --
@@ -9977,7 +9983,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
   function harness(opts: {
     inputValue: string;
     routingDataInit?: unknown;
-    apiImpl: (path: string, init?: { method?: string; body?: string }) => Promise<{ ok: boolean; text: () => Promise<string>; json?: () => Promise<unknown> }>;
+    apiImpl: (path: string, init?: { method?: string; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; text: () => Promise<string>; json?: () => Promise<unknown> }>;
   }) {
     const clock = makeClock();
     const input = { value: opts.inputValue };
@@ -9986,7 +9992,12 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     let renderNeedsAttentionCalls = 0;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
-    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    const timeoutControllers: AbortController[] = [];
+    const timeoutSignal = () => {
+      const controller = new AbortController();
+      timeoutControllers.push(controller);
+      return { signal: controller.signal, cancel: () => {} };
+    };
     const calls: { path: string; init?: unknown }[] = [];
     const api = async (path: string, init?: { method?: string; body?: string }) => {
       calls.push({ path, init });
@@ -10007,7 +10018,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     ) as { addWebhook: (guildId: string) => Promise<void>; pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>; getRoutingData: () => unknown };
     // serverActionState is the SAME Map instance the sandbox mutates (passed by reference), so reading it
     // here after an await sees every .set/.delete the sandboxed addWebhook made.
-    return { run, clock, input, calls, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+    return { run, clock, input, calls, serverActionState, abortLatestTimeout: () => timeoutControllers.at(-1)?.abort(), renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
   }
 
   test("a pasted webhook URL never survives the click: cleared before api() resolves, sent as { url }, status reads Adding…", async () => {
@@ -10067,6 +10078,23 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const p = h.run.pollForResult("reqX", started - 31000); // already past ROUTING_ANSWER_TIMEOUT_MS
     await h.clock.tick();
     expect(await p).toEqual({ timeout: true });
+  });
+
+  test("pollForResult aborts a stalled GET at its remaining deadline instead of leaving Servers actions busy", async () => {
+    const h = harness({
+      inputValue: "",
+      apiImpl: async (_path, init) => await new Promise<never>((_, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const error = new Error("timed out");
+          error.name = "AbortError";
+          reject(error);
+        });
+      }),
+    });
+    const pending = h.run.pollForResult("req-stalled", Date.now());
+    await h.clock.tick(); // starts the poll GET and its deadline controller
+    h.abortLatestTimeout();
+    expect(await pending).toEqual({ timeout: true });
   });
 
   // Round-2 review finding: this class of fix (round 1's clearUnauthorizedServerAction) was previously

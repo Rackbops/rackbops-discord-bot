@@ -76,7 +76,7 @@ Canned data (matching `model.ts`): `discovery` with HOME (`commands: { registere
 | Needs attention shows each kind from canned data, the empty line from none | 1, 2 | 6, 7 | drop one kind; report `commands: null` in single mode |
 | screenshots | 2 | — manual (f) | — |
 | every mutation fails a test | — | all | the PR's table |
-| decision 4: Try again re-sends a placed plugin, says restart otherwise | 1, 2 | 9, 15 | re-send an unplaced plugin (`servers: {}` — would place it nowhere) |
+| decision 4: Try again re-sends a placed plugin, says restart otherwise | 1, 2 | 9, 15 | let stale discovery serialize the placed plugin as `servers: {}` (which means deliberately placed nowhere) |
 | decision 7: no bar contamination | 2 | 16, 17 | drop the `.servers` return |
 
 ### Step 4 — docs
@@ -128,3 +128,15 @@ Acceptance/mutation/typecheck all re-verified green after every fix in this roun
 - **Mutation pass:** 14/14 killed, one at a time in detached `bot-246-mutate-4`, then the source was verified restored. The mutants cover pre-await route reservation, retained stale routing data and visible error, 401 busy-state cleanup, pre-await webhook clearing, refusal reason, broken-webhook state, routed-only command warning, ready/stale picker behavior, typed picker upgrade, first placed retry target, Apply-bar isolation, server-text `innerHTML`, and `reloadConfig()`'s redraw race. Logs: `C:/Users/roshn/.codex/visualizations/2026/09/21/01a0c644-7cf9-7d62-a112-226bdc1a501f/bot-246-mutation-logs/`.
 - **Full panel test file:** 803 passed, 1 skipped, 4 failed. All four failures are pre-existing `createRunBotOps` child-process tests that require the Linux `bash` process group behavior; they fail on this Windows host before/independent of the #246 sections. Every #245/#246 test in the same run passed. CI is still required to exercise the Linux lane.
 - **Canned Chrome acceptance:** all (a)–(f) checks passed against the local fixture: pre-await URL clear, no DOM/storage URL, right-card webhook and refusal reason, six/zero Needs-attention states, ready/null picker behavior and Apply-bar value, unchanged Try again post, plus light/dark desktop/375px screenshots. Screenshots: `R:/repos/Scratch/tmp/bot-246/probe/out/`. No real bot, Discord webhook, SSH, agent verb, service/config mutation, or live console was used; #247 remains the deploy verification.
+
+### Round 2 — fresh independent reviewers over `0160b64`
+
+Verified and fixed before opening the PR:
+
+- **A stalled `GET /api/routing` inside `pollForResult` could leave Add/Remove/Refresh busy forever.** Each poll now gets a timeout signal for the remaining 30-second answer window and returns the existing timeout outcome on abort; a mini-harness simulates a never-settling GET and aborts its signal.
+- **The Servers tab did not visibly mark a retained routing snapshot stale.** Its status line now shows `Couldn't read where plugins live: <message>` when no action-specific message takes precedence, matching the plugin-step presentation.
+- **Try again could clear a saved placement while discovery was stale.** It now requires a ready routing model; otherwise the card says retry is unavailable until Discord refreshes. The stale regression proves it neither seeds nor posts `{ servers: {} }`.
+- **A picker did not fall back after discovery later became null/stale.** `refreshEnvPickers` now swaps in either direction while retaining the current id, and its mini-harness covers ready-to-stale fallback.
+- **The canned Servers fixture now uses five-digit guild/channel IDs and a five-digit bot id, matching `src/routing/model.ts`'s snowflake floor.**
+
+The initial-401 dynamic regression is present in the `addWebhook / pollForResult` mini-harness (`a 401 on the initial POST clears the busy state…`); the all-call-sites source pin remains its complementary coverage. The plan's `{ servers: {} }` wording is corrected above: it is placed-nowhere, not unplaced.

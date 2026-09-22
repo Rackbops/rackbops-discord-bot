@@ -2070,6 +2070,7 @@
         // caller clear its busy state via clearUnauthorizedServerAction instead, the same as a 401 on the
         // INITIATING request already does.
         if (e && e.message === "unauthorized") return { unauthorized: true };
+        if (e && e.name === "AbortError") return { timeout: true };
         if (Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) return { timeout: true };
         // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
       } finally {
