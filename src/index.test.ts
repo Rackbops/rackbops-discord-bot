@@ -232,6 +232,20 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #218: the host routes no autocomplete to plugins — index.ts can't run under test, so the branch's
+  // shape is pinned in the source, the same idiom as the describes above.
+  describe("an autocomplete interaction is answered with an empty list inside the InteractionCreate handler (#218)", () => {
+    test("the branch exists inside the handler, and respond([]) appears exactly once in the file", () => {
+      const start = source.indexOf("client.on(Events.InteractionCreate");
+      const end = source.indexOf("client.on(Events.GuildCreate");
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(start);
+      const handlerBlock = source.slice(start, end);
+      expect(handlerBlock).toMatch(/else if \(interaction\.isAutocomplete\(\)\)\s*\{[\s\S]*?await interaction\.respond\(\[\]\);/);
+      expect((source.match(/respond\(\[\]\)/g) ?? []).length).toBe(1);
+    });
+  });
+
   // #241: the request mailbox is also drained every few seconds on its own timer. index.ts can't run under
   // test, so the shape of the wiring is pinned in the source: that the timer is started at all, and how.
   describe("the request-mailbox timer is wired (#241)", () => {

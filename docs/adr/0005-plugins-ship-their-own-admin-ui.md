@@ -62,23 +62,22 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    publish `@rackbops/plugin-*` or edit `plugins.json`. Iframe + `postMessage` isolation is a later
    option the contract shape (a bridge object, not direct DOM access to the panel) does not
    foreclose, but it is not built for v1.
-5. **The rule that makes it safe: the plugin owns presentation, the panel keeps authority.** The
-   `AdminApi` bridge handed to `mountAdmin` — `getEnv`/`setEnv`/`getState`/`proxyFetch` — is the
-   *only* door a bundle has. `setEnv` is scoped client-side to the plugin's own declared
+5. **The rule that keeps an honest bundle in bounds: the plugin owns presentation, the panel keeps
+   authority.** The `AdminApi` bridge handed to `mountAdmin` — `getEnv`/`setEnv`/`getState`/`proxyFetch`
+   — is the *only* door a bundle is given. `setEnv` is scoped client-side to the plugin's own declared
    keys (`scopeToPluginKeys`; originally described as "non-secret" keys, which `env-set` enforced by
    refusing every secret — see the amendment below) and always goes through the existing guarded `POST /api/env`: the
    cross-site-write Origin gate (checked first — a forged request must not be actioned no matter
    whose ambient Access session it rides) → Access auth → `bot-ops.sh env-set`'s own
    whitelist/format validation → recreate. An honest bundle cannot reach another plugin's keys, and no
-   bundle can READ a secret back through `env-get` / `getEnv`, or use any route the ordinary
-   config Save doesn't already use — same-origin inline mounting is a convenience, not an added
-   privilege, since the server-side gate is unchanged from before this epic. (That is a property against
-   the panel, its logs and its screens, not against whoever controls the Plugin Index: a caller with the
-   panel's authority — an admin, or a malicious same-origin bundle — can set `PLUGIN_INDEX_URL` to an
+   bundle can READ a secret back through `env-get` / `getEnv`. Neither is a fence around a hostile
+   bundle: the bridge is only the door a bundle is *given*, and one mounted in the panel's own
+   document is not confined to it (decision 6). (The READ guarantee is a property against the panel,
+   its logs and its screens, not against whoever controls the Plugin Index: a caller with the panel's
+   authority — an admin, or a malicious same-origin bundle — can set `PLUGIN_INDEX_URL` to an
    index that declares a key non-secret and then read it back, and can equally make the bot run code of
-   its choosing. That is the trust boundary ADR-0004 already accepts (the isolation question is #226),
-   here documented rather than closed. What a bundle can WRITE changed with #240 — see the amendment
-   that follows.)
+   its choosing. That is the trust boundary ADR-0004 already accepts, stated in decision 6 (#226).
+   What a bundle can WRITE changed with #240 — see the amendment that follows.)
    *(Amended by [ADR-0006](0006-per-plugin-routing.md) decision 8, #240: `env-set` now also accepts an
    enabled plugin's own `secret: true` key, write-only. The client-side scope above is built from every
    key name a plugin declares, secret ones included (`envKeys` in `ops/admin/server.ts`), so an honest
@@ -89,15 +88,50 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    "enabled" no longer limits any of this: `env-set` accepts the keys, secret ones included, of EVERY
    plugin in the bot's cached Plugin Index, on or off, so one save can turn a plugin on and configure it;
    a bundle with the panel's authority could already set `PLUGINS` and then the key in a second save.)*
+6. **The posture, stated plainly (#226): a plugin whose bundle ships an admin tab is granted
+   panel-level, root-equivalent access, and the Plugin Index is the trust boundary.** A mounted bundle
+   is not sandboxed. The panel `import()`s it into its own document (`ops/admin/public/index.html`,
+   `mountAdmin(root, makeAdminApi(plugin))`): no iframe, no worker, and no Content-Security-Policy
+   (`handleRequest` sets only `Content-Type` on the page, and the page carries no `http-equiv` policy).
+   Its requests are indistinguishable from the operator's own: a same-origin `fetch` carries the
+   Cloudflare Access session and passes the cross-site-write gate, which refuses only a mismatched
+   `Origin` (`isCrossSiteWrite`). So a bundle can, for example, `POST /api/admins` to add an admin who
+   stays until someone removes them, and can read the break-glass `ADMIN_TOKEN` out of `localStorage`
+   (`admin-token`) whenever the operator has unlocked the panel with it. **The `env-set` whitelist is
+   not a boundary against a bundle.** It refuses core secrets, but two of the keys it accepts are
+   themselves levers into code execution inside the bot container: `PLUGIN_INDEX_URL` repoints the
+   bot at any manifest — and so at any npm package that manifest names, which the bot downloads,
+   extracts and `import()`s — and `PLUGINS` chooses which of its plugins, at which version, the bot
+   installs. That container mounts the Docker socket, which `docker-compose.yml` itself calls
+   root-equivalent on the host. Whoever can put a plugin in the index — publish `@rackbops/plugin-*`
+   or edit `plugins.json` — therefore holds the panel and, through it, the host. The Plugin Index is
+   the trust boundary, exactly as ADR-0004 decision 4 says, and `ops/README.md`'s "treat it like SSH
+   to the box" for panel access applies to any bundle the panel mounts. This decision accepts that
+   posture and adds no mechanism. Today every plugin in the index is published from
+   `rackbops-bot-plugins` under `@rackbops/`, so every admin bundle the panel mounts is one we
+   publish; the two options that would harden the posture are recorded under Considered Options as
+   not taken.
 
 ## Considered Options
 
 - **A hardcoded per-plugin UI in the panel itself** (the wow plugin's realm chooser, before #107) —
   rejected for the same reason ADR-0004 rejected an in-repo plugin registry: every richer plugin UI
   becomes a panel-repo commit, and the panel can never "just render what's installed."
-- **Iframe + `postMessage` from v1** — deferred, not rejected: real isolation against a malicious
-  bundle, but more machinery (a message-passing bridge, a handshake protocol) than a first-party
-  contract needs yet. The `AdminApi` bridge shape doesn't foreclose it later.
+- **Iframe + `postMessage` from v1** (#226's option 3: a sandboxed iframe per bundle and a narrow
+  `postMessage` API in place of `makeAdminApi`) — deferred, not rejected, and still not taken. It is
+  the only option that would bound a hostile bundle, but it needs more machinery (a message-passing
+  bridge, a handshake protocol) than a first-party contract needs, and it is a substantial rewrite of
+  the tab-mounting path: every bundle written against `mountAdmin(root, api)` has to be ported. The
+  `AdminApi` bridge shape doesn't foreclose it. Not taking it is only honest while every bundle the
+  panel mounts is one the operator trusts like their own code (decision 6); this option is what would
+  change that.
+- **A Content-Security-Policy, and dropping `PLUGIN_INDEX_URL` and `PLUGINS` from the `env-set`
+  whitelist** (#226's option 2) — considered, not taken. It would stop the panel writing the two keys
+  the whitelist admits that are levers into code execution, but only partly: a same-origin bundle
+  still reaches every `/api/*` route (`POST /api/admins` needs neither key), and a policy that lets
+  the page `import()` its own bundle does not stop that bundle using the panel's API. The cost lands
+  on the panel itself: `PLUGINS` is what the Apply bar writes to turn a plugin on or off
+  (`ops/README.md`, #257), so taking it off the whitelist breaks the Plugins tab's own switch.
 - **A generic schema-driven form** (richer than the flat env-key list, short of arbitrary code) —
   rejected for v1: it still couldn't express warbandeer's live ingest-status readout or a
   region-filtered realm dropdown, which need real logic, not just more field types.
@@ -113,10 +147,11 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
 ## Consequences
 
 A plugin's admin UI is optional and additive — a plugin declaring no `botPlugin.adminApiVersion`
-gets exactly today's flat env-key fields, unchanged. The panel gains one new trust statement,
-narrower than ADR-0004's bot-side one: a mounted bundle runs inline same-origin, so an operator who
-installs a plugin is trusting its admin code the same way they already trust its bot code — the
-`AdminApi` scoping and the server-side `env-set` gate are the backstop, not a sandbox. Delivery adds
+gets exactly today's flat env-key fields, unchanged. The panel gains one new trust statement, the
+same class as ADR-0004's bot-side one (decision 6): a mounted bundle runs inline same-origin, so an
+operator who installs a plugin is trusting its admin code the way they already trust its bot code.
+The `AdminApi` scoping keeps an honest bundle to its own keys, and the server-side `env-set` gate
+refuses core secrets; neither bounds a hostile bundle, and neither is a sandbox. Delivery adds
 exactly two new panel routes (`GET /plugin-admin/<name>.js`, `GET /api/plugin-proxy/<name>`), both
 allowlisted to `ADMIN_ASSET_HOST` and size-capped, so a bundle can never make the panel reach an
 arbitrary origin. #165's installed-version pinning means a tab can legitimately show a
@@ -127,4 +162,5 @@ decisions are entirely on the panel side.
 See [ADR-0004](0004-plugins-fetched-from-a-published-manifest.md) for the plugin-delivery contract
 this extends. Design epic:
 [#123](https://github.com/Rackbops/rackbops-discord-bot/issues/123). Installed-version pinning:
-[#165](https://github.com/Rackbops/rackbops-discord-bot/issues/165).
+[#165](https://github.com/Rackbops/rackbops-discord-bot/issues/165). Isolation posture:
+[#226](https://github.com/Rackbops/rackbops-discord-bot/issues/226).

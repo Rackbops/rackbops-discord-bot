@@ -475,6 +475,15 @@ describe("handleCommand — /plugins", () => {
     expect(gate).toBeLessThan(defer); // …and refuses before deferring / doing I/O
     expect(gate).toBeLessThan(mutate);
   });
+
+  // #225: planPluginAction's off-plugin refusal needs the state entry's enabled flag — a source guard
+  // since (like the two above) this handler does real I/O the test harness doesn't drive.
+  test("/plugins passes the state entry's enabled flag into planPluginAction (source guard)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
+    const call = src.slice(src.indexOf("planPluginAction(action, {"));
+    expect(call).toContain("enabled: stateEntry.enabled,");
+  });
 });
 
 // The three editReply failure paths below share the same shape as the ordering guards above
