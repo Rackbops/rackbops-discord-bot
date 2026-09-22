@@ -7942,6 +7942,57 @@ describe("a secret's value stays in one password field (#244)", () => {
     expect(buildSecretField.indexOf('input.type = "password";')).toBeLessThan(buildSecretField.indexOf("wrap.appendChild(input);"));
   });
 
+  test("a visible secret has a real required label; a saved secret has neutral text with no orphaned for", () => {
+    interface SecretEl {
+      tagName: string;
+      id?: string;
+      htmlFor?: string;
+      textContent: string;
+      className: string;
+      required?: boolean;
+      dataset: Record<string, string>;
+      attrs: Map<string, string>;
+      children: SecretEl[];
+      appendChild: (child: SecretEl) => SecretEl;
+      addEventListener: () => void;
+      setAttribute: (name: string, value: string) => void;
+      getAttribute: (name: string) => string | null;
+      removeAttribute: (name: string) => void;
+    }
+    const element = (tagName: string): SecretEl => {
+      const attrs = new Map<string, string>();
+      const children: SecretEl[] = [];
+      return {
+        tagName, textContent: "", className: "", dataset: {}, attrs, children,
+        appendChild: (child) => (children.push(child), child),
+        addEventListener: () => {},
+        setAttribute: (name, value) => void attrs.set(name, value),
+        getAttribute: (name) => attrs.get(name) ?? null,
+        removeAttribute: (name) => void attrs.delete(name),
+      };
+    };
+    const document = { createElement: element, createTextNode: (text: string) => ({ ...element("#text"), textContent: text }), getElementById: () => null };
+    const makeSecret = new Function(
+      "document",
+      "secretsReplacing",
+      `"use strict";\n${formStatesSrc}\n${buildSecretField}\nreturn buildSecretField;`,
+    )(document, new Set<string>()) as (key: string, label: string, schema: { isSet: boolean; required: boolean }) => SecretEl;
+
+    const visible = makeSecret("TOKEN", "Token", { isSet: false, required: true });
+    const visibleLabel = visible.children[0]!;
+    const visibleInput = visible.children.find((child) => child.tagName === "input")!;
+    expect(visibleLabel.tagName).toBe("label");
+    expect(visibleLabel.htmlFor).toBe("secret-TOKEN");
+    expect(visibleLabel.children.at(-1)).toMatchObject({ tagName: "span", className: "rb-label__required", textContent: "*" });
+    expect(visibleInput).toMatchObject({ id: "secret-TOKEN", required: true });
+
+    const saved = makeSecret("TOKEN", "Token", { isSet: true, required: true });
+    const savedLabel = saved.children[0]!;
+    expect(savedLabel).toMatchObject({ tagName: "span", textContent: "Token" });
+    expect(savedLabel.htmlFor).toBeUndefined();
+    expect(saved.children.some((child) => child.id === "secret-TOKEN")).toBe(false);
+  });
+
   test("the secret's value is never sent in a GET, never in a message, and the schema route only reports isSet", () => {
     // The secret CONTROL's value only ever leaves the page as part of the one POST /api/env applyPending
     // sends (planApply/collectPending, tested elsewhere); nowhere else in the page reads .value off a
