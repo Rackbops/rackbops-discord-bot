@@ -190,4 +190,13 @@ Branch `claude/theme-classes-toast` from `origin/main` after #246 has merged, is
   CONTEXT.md reference (webhook-URL-never-echoed gotcha) named `field-hint` as the element class a
   refusal message renders as; updated to `adm-note` to match the rename. `ops/README.md` was checked
   and names none of the changed classes — no edit needed there.
+- **Screenshots for the PR body came from the Browser pane's inline screenshot capture, not a saved
+  file** — the same limitation #209/#210/#300 Part A already hit: that tool returns an image inline
+  with no file path, so `SendUserFile` had nothing to attach. Visual results (both themes: the field
+  help, an error, the required glyph, an invalid border, a success and a danger toast) were inspected
+  directly in-session and described from that inspection plus the matching computed-style checks, not
+  inferred from source alone. Reduced motion specifically was verified by source (the theme's
+  `@media (prefers-reduced-motion: reduce)` block collapses `--rb-transition` to `0s`, and
+  `showToast`'s `data-rb-enter` removal is unconditional) rather than emulated live, since the Browser
+  pane tool used in this environment has no `prefers-reduced-motion` emulation control.
 
