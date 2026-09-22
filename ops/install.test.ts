@@ -142,7 +142,13 @@ describe.skipIf(!runnable)(
 const TMP_FILES_DECL = extractLine(/^TMP_FILES=\(\)$/m, "the TMP_FILES=() declaration");
 const CLEANUP_TMP_FILES = extractFunction("cleanup_tmp_files");
 const CLEANUP_TRAP = extractLine(/^trap cleanup_tmp_files EXIT$/m, "the cleanup_tmp_files EXIT trap");
+// fetch() no longer mktemps itself (issue #230 split it into download() + a plain mv) — any
+// harness that extracts fetch() now needs download() alongside it, or fetch's own body is an
+// undefined-function call away from doing anything.
+const DOWNLOAD = extractFunction("download");
 const FETCH = extractFunction("fetch");
+const SCHEMA_OF = extractFunction("schema_of");
+const INSTALL_SHARED_BIN = extractFunction("install_shared_bin");
 
 interface Sweep {
   exitCode: number;
@@ -168,6 +174,7 @@ async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Swe
       `curl() { return ${o.curlExit}; }`,
       "chown() { :; }",
       'RAW_BASE="http://example.invalid"; BRANCH="typo"; DEPLOY_UID=1000; DEPLOY_GID=1000',
+      DOWNLOAD,
       FETCH,
       'fetch "docker-compose.yml" 644 "./out.yml"',
     ].join("\n");
@@ -604,9 +611,12 @@ describe.skipIf(!runnable)("install.sh's BRANCH guard accepts real branch names 
 // (leaving the predicate itself intact, so the tests above would still pass) shrinks nothing here
 // but makes a `..` branch reach the recording fetch — caught. Every side-effecting call the slice
 // makes is stubbed; the recording `fetch` reports the `src` of each download it was asked to do.
+// Re-anchored on install_shared_bin's call site (issue #230 replaced the bare
+// `fetch "ops/bot-ops.sh" 755 "$BIN_DIR/bot-ops.sh"` line with a call to install_shared_bin) — the
+// slice still ends at the same logical point, immediately before the compose-file fetch.
 const BRANCH_GUARD_TO_FETCH = extractLine(
-  /^ {2}INSTANCE="\$\{1:-\}"[\s\S]*?^ {2}fetch "ops\/bot-ops\.sh" 755 "\$BIN_DIR\/bot-ops\.sh"$/m,
-  "the arg-parse-through-bot-ops-fetch slice",
+  /^ {2}INSTANCE="\$\{1:-\}"[\s\S]*?^ {2}install_shared_bin$/m,
+  "the arg-parse-through-install_shared_bin slice",
 );
 
 interface FetchProbe {
@@ -629,6 +639,7 @@ async function runBranchGate(branch: string): Promise<FetchProbe> {
     "sed() { :; }", // stubbed: the real ADMIN_TOKEN rewrite targets a file that doesn't exist here
     "random_token() { echo faketoken; }",
     'fetch() { echo "FETCH:$1"; }', // the probe: records each download's src instead of doing it
+    'install_shared_bin() { echo "FETCH:ops/bot-ops.sh"; }', // same probe shape, for the #230 call site
     BRANCH_GUARD_TO_FETCH,
     'echo "REACHED_END"',
   ].join("\n");
@@ -678,4 +689,241 @@ describe.skipIf(!runnable)("install.sh's BRANCH guard runs before the fetches, s
     expect(r.exitCode).toBe(0);
     expect(r.fetches).toContain("ops/bot-ops.sh");
   });
+});
+
+// ---------------------------------------------------------------------------
+// install.sh's third argument (issue #230)
+// ---------------------------------------------------------------------------
+// Extracted as a contiguous slice (BRANCH="${2:-main}" through esac) rather than a named
+// function, same discipline as STACK_ENV_WRITE_SEQUENCE/BRANCH_GUARD_TO_FETCH above — main()'s
+// arg-parsing has no function of its own to pull by name.
+const ARG_PARSE_LINES = extractLine(
+  /^ {2}BRANCH="\$\{2:-main\}"[\s\S]*?\n {2}esac$/m,
+  "the BRANCH/FORCE_BIN argument-parse lines",
+);
+
+async function runArgParse(branch: string, thirdArg?: string): Promise<Run> {
+  const script = [
+    "set -euo pipefail",
+    'die() { echo "install: $*" >&2; exit 1; }',
+    ARG_PARSE_LINES,
+    'echo "OK FORCE_BIN=$FORCE_BIN"',
+  ].join("\n");
+  // $1 = INSTANCE (unused by this slice), $2 = BRANCH, $3 = the argument under test.
+  const args = thirdArg !== undefined ? ["_", "probe", branch, thirdArg] : ["_", "probe", branch];
+  const proc = Bun.spawn([BASH!, "-c", script, ...args], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+describe.skipIf(!runnable)("install.sh's third argument (issue #230)", () => {
+  test("a third argument is --force-bin or a usage error; --force-bin sets FORCE_BIN", async () => {
+    const noThird = await runArgParse("main");
+    expect(noThird.exitCode).toBe(0);
+    expect(noThird.stdout).toContain("FORCE_BIN=0");
+
+    const forced = await runArgParse("main", "--force-bin");
+    expect(forced.exitCode).toBe(0);
+    expect(forced.stdout).toContain("FORCE_BIN=1");
+
+    const bad = await runArgParse("main", "--frobnicate");
+    expect(bad.exitCode).not.toBe(0);
+    expect(bad.stderr).toContain("--force-bin");
+    expect(bad.stdout).not.toContain("FORCE_BIN=");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// install_shared_bin (issue #230) — bin/bot-ops.sh is shared by every instance on the host, so a
+// per-instance branch must not silently replace it with content main wouldn't have installed.
+// ---------------------------------------------------------------------------
+interface SharedBinRun {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /** dest's content after the run, or null if dest was never (successfully) written. */
+  destContent: string | null;
+  /** Files still named tmp.* in BIN_DIR after the run — i.e. stranded temp files. */
+  leftovers: number;
+  /** The URL curl was invoked with, in call order — one entry per download() call reached. */
+  curlLog: string[];
+  /** The forward-slash BIN_DIR this run used, so a test can assert the dest path by name. */
+  binDir: string;
+}
+
+async function runSharedBin(o: {
+  branch: string;
+  forceBin?: boolean;
+  /** Pre-existing content at dest before the run, so a refusal's "untouched" claim is checked
+   *  against something other than "the file never existed". */
+  installed?: string;
+  /** The bot-ops.sh content the fake curl serves for a given branch (called with "main" and, if
+   *  different, the branch under test). */
+  contentFor: (branch: string) => string;
+  /** false reproduces the #60 sweep-control idiom: omit the trap and the same failure strands
+   *  its temp files instead of them being swept, proving test 4 (with the trap) isn't vacuous. */
+  withTrap?: boolean;
+}): Promise<SharedBinRun> {
+  const dir = mkdtempSync(join(tmpdir(), "install-sharedbin-"));
+  // Forward-slash form only (not the full toMsysPath drive-letter rewrite) — same as runSweep's
+  // own `cd "${dir.replaceAll("\\", "/")}"` above; nothing here is checked with `[[ == /* ]]`,
+  // which is the only reason toMsysPath's fuller rewrite exists elsewhere in this file.
+  const binDir = dir.replaceAll(/\\/g, "/");
+  try {
+    const dest = join(dir, "bot-ops.sh");
+    if (o.installed !== undefined) writeFileSync(dest, o.installed);
+    const curlLogFile = join(dir, "curl.log").replaceAll(/\\/g, "/");
+    const escape = (s: string) => s.replaceAll("'", "'\\''");
+    const mainContent = escape(o.contentFor("main"));
+    const branchContent = escape(o.contentFor(o.branch));
+    const withTrap = o.withTrap ?? true;
+    const fakeCurl = [
+      "curl() {",
+      '  local url="$2" out="$4"',
+      `  echo "$url" >> "${curlLogFile}"`,
+      '  case "$url" in',
+      `    */main/*) printf '%s' '${mainContent}' > "$out" ;;`,
+      `    *) printf '%s' '${branchContent}' > "$out" ;;`,
+      "  esac",
+      "}",
+    ].join("\n");
+    const script = [
+      "set -euo pipefail",
+      `cd "${binDir}"`,
+      TMP_FILES_DECL,
+      CLEANUP_TMP_FILES,
+      withTrap ? CLEANUP_TRAP : "# trap deliberately omitted (mutation control)",
+      'die() { echo "install: $*" >&2; exit 1; }',
+      "chown() { :; }", // real chown needs privileges this harness doesn't have or need
+      fakeCurl,
+      `RAW_BASE="http://example.invalid"; BRANCH="${o.branch}"; FORCE_BIN=${o.forceBin ? 1 : 0}; DEPLOY_UID=1000; DEPLOY_GID=1000`,
+      `BIN_DIR="${binDir}"`,
+      DOWNLOAD,
+      SCHEMA_OF,
+      INSTALL_SHARED_BIN,
+      "install_shared_bin",
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const entries = readdirSync(dir);
+    return {
+      exitCode,
+      stdout,
+      stderr,
+      destContent: existsSync(dest) ? readFileSync(dest, "utf8") : null,
+      leftovers: entries.filter((f) => f.startsWith("tmp.")).length,
+      curlLog: existsSync(join(dir, "curl.log"))
+        ? readFileSync(join(dir, "curl.log"), "utf8").trim().split("\n").filter(Boolean)
+        : [],
+      binDir,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh's install_shared_bin guards the host-shared bot-ops.sh (issue #230)", () => {
+  test("main refreshes the shared script with one download and no comparison", async () => {
+    const r = await runSharedBin({
+      branch: "main",
+      installed: "OLD",
+      contentFor: () => "readonly BOT_OPS_SCHEMA=5\n",
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.destContent).toBe("readonly BOT_OPS_SCHEMA=5\n");
+    expect(r.curlLog.length).toBe(1);
+    expect(r.stdout).toContain("wrote");
+    expect(r.stdout).toContain("from main (bot-ops schema 5)");
+    expect(r.stdout).not.toContain("identical");
+  });
+
+  test("a branch whose bot-ops.sh is byte-identical to main's refreshes it and says so", async () => {
+    const r = await runSharedBin({
+      branch: "feature-same",
+      installed: "OLD",
+      contentFor: () => "readonly BOT_OPS_SCHEMA=7\n",
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.destContent).toBe("readonly BOT_OPS_SCHEMA=7\n");
+    expect(r.curlLog.length).toBe(2); // branch's copy AND main's, to compare them
+    expect(r.stdout).toContain("from feature-same (bot-ops schema 7)");
+    expect(r.stdout.trim().endsWith("(identical to main's)")).toBe(true);
+  });
+
+  test("a branch whose bot-ops.sh differs from main's is refused: both schemas named, the installed file untouched, no temp file stranded", async () => {
+    const r = await runSharedBin({
+      branch: "feature",
+      installed: "OLD",
+      contentFor: (b) => (b === "main" ? "readonly BOT_OPS_SCHEMA=5\n" : "readonly BOT_OPS_SCHEMA=9\n"),
+    });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.stderr).toContain("schema 9");
+    expect(r.stderr).toContain("main's 5");
+    expect(r.stderr).toContain("--force-bin");
+    expect(r.stderr).toContain(`${r.binDir}/bot-ops.sh`); // names the shared dest path
+    expect(r.destContent).toBe("OLD"); // untouched
+    expect(r.leftovers).toBe(0);
+  });
+
+  test("--force-bin installs the differing copy and says it differs from main", async () => {
+    const r = await runSharedBin({
+      branch: "feature",
+      forceBin: true,
+      installed: "OLD",
+      contentFor: (b) => (b === "main" ? "readonly BOT_OPS_SCHEMA=5\n" : "readonly BOT_OPS_SCHEMA=9\n"),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.destContent).toBe("readonly BOT_OPS_SCHEMA=9\n"); // the branch's own copy, not main's
+    expect(r.stdout).toContain("--force-bin: differs from main's, schema 5");
+  });
+
+  test("without the trap, the refusal WOULD strand the two temps (so test 4 is not vacuous)", async () => {
+    const r = await runSharedBin({
+      branch: "feature",
+      installed: "OLD",
+      withTrap: false,
+      contentFor: (b) => (b === "main" ? "readonly BOT_OPS_SCHEMA=5\n" : "readonly BOT_OPS_SCHEMA=9\n"),
+    });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.leftovers).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// install.sh's step 4 (issue #231) — the printed claim about docker inspect must be true.
+// ---------------------------------------------------------------------------
+describe.skipIf(!runnable)("install.sh's step 4 says docker inspect shows the four admin vars (issue #231)", () => {
+  test("step 4 says docker inspect shows the four vars, and no longer says they are hidden from it", async () => {
+    const out = await renderNextSteps();
+    const step4 = out.slice(out.indexOf("4. Optional: the small web admin panel"), out.indexOf("5. Optional: expose"));
+    expect(step4).toContain("docker inspect on this host shows them");
+    expect(step4).not.toContain("or shown in docker");
+    const step5 = out.slice(out.indexOf("5. Optional: expose"));
+    // Unchanged sentence, not re-asserted verbatim — it spans a real line break in the rendered
+    // heredoc (a plain prose line wrap, not a `\`-continued one), so \s+ stands in for that break.
+    expect(step5).toMatch(/never gets the rest\s+of your secrets/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// docker-compose.yml's admin comment (issue #231) — read directly, not through bash: it's YAML
+// comments, nothing to source.
+// ---------------------------------------------------------------------------
+test("docker-compose.yml's admin comment says scope, not secrecy (issue #231)", () => {
+  const composePath = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
+  const compose = readFileSync(composePath, "utf8");
+  const adminIdx = compose.indexOf("\n  admin:\n");
+  expect(adminIdx).toBeGreaterThan(-1);
+  const envIdx = compose.indexOf("\n    environment:\n", adminIdx);
+  expect(envIdx).toBeGreaterThan(adminIdx);
+  const adminBlock = compose.slice(adminIdx, envIdx);
+  expect(adminBlock).toContain("Scope, not secrecy");
 });
