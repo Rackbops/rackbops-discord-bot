@@ -44,6 +44,13 @@ const runnable = BASH !== null && JQ !== null;
 if (!runnable) {
   console.warn(`[bot-ops.test] SKIPPING: needs bash (${BASH ?? "missing"}) and jq (${JQ ?? "missing"}) on PATH`);
 }
+// #227: whether a REAL flock is on this box's PATH. Windows Git Bash ships none, so the three
+// concurrency tests below (skipIf(!REAL_FLOCK)) run only on CI's Linux — the fixture's own `flock`
+// shim (see setup()) is a no-op that exists only to keep the REST of this suite green here.
+const REAL_FLOCK = Bun.which("flock") !== null;
+if (!REAL_FLOCK) {
+  console.warn("[bot-ops.test] no real flock on PATH — #227's concurrency tests are CI-only here");
+}
 
 /** A path as the spawned bash (MSYS on Windows) should see it: C:\a\b -> /c/a/b. */
 function bashPath(p: string): string {
@@ -95,8 +102,12 @@ function setup(
     routing?: string;
     discovery?: string;
     /** What the fake `docker compose … up -d --force-recreate` prints (the script merges stderr into
-     *  stdout) and exits with — for the tests that check a recreate message can't carry a secret. */
-    composeUp?: { output: string; exitCode?: number };
+     *  stdout) and exits with — for the tests that check a recreate message can't carry a secret.
+     *  #227: an optional `delayMs` makes the fake sleep that long INSIDE the up -d handler, logging
+     *  `compose-up start <epoch-ms>` / `compose-up end <epoch-ms>` to docker.log around the sleep —
+     *  the only way to make two concurrent recreates' overlap (or lack of it) measurable, since the
+     *  shim's own top-of-script call log line is written before any handler's body runs. */
+    composeUp?: { output: string; exitCode?: number; delayMs?: number };
     /** The same for the fake `docker compose … restart` — restart relays compose's output too. */
     composeRestart?: { output: string; exitCode?: number };
     /** Inject a failure into the plugin-request write (see the exec handler in setup()). */
@@ -108,6 +119,12 @@ function setup(
   const bin = join(root, "bin");
   mkdirSync(cfg);
   mkdirSync(bin);
+  // #227: lock_config_dir's `need flock` would otherwise fail EVERY env-set/restart/recreate call
+  // on a box with no real flock (Windows Git Bash) — a pure no-op shim keeps the rest of this suite
+  // green here; the lock's actual behaviour is exercised only where flock is real (REAL_FLOCK above).
+  if (!REAL_FLOCK) {
+    writeFileSync(join(bin, "flock"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+  }
   const originalState = opts.originalState ?? "running";
   // `ps` only answers specially when opts.nextRunning simulates a `<container>-next` (issue #51
   // item 5's guard) — every other invocation (build, create, up -d --force-recreate, ...) never
@@ -149,7 +166,20 @@ function setup(
       ? `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then cat ${JSON.stringify(bashPath(discoveryFile))}; fi`
       : `if [[ "$1" == "exec" ]] && [[ "$*" == *"/app/data/discovery.json"* ]]; then echo "cat: can't open '/app/data/discovery.json': No such file or directory" >&2; exit 1; fi`,
     opts.composeUp !== undefined
-      ? `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}; fi`
+      ? [
+          `if [[ "$1" == "compose" ]] && [[ "$*" == *"up -d --force-recreate"* ]]; then`,
+          opts.composeUp.delayMs !== undefined
+            ? [
+                `  printf 'compose-up start %s\\n' "$(date +%s%3N)" >> "$(dirname "$0")/docker.log"`,
+                `  sleep ${(opts.composeUp.delayMs / 1000).toFixed(3)}`,
+                `  printf 'compose-up end %s\\n' "$(date +%s%3N)" >> "$(dirname "$0")/docker.log"`,
+              ].join("\n")
+            : "",
+          `  cat ${JSON.stringify(bashPath(composeOutFile))}; exit ${opts.composeUp.exitCode ?? 0}`,
+          `fi`,
+        ]
+          .filter(Boolean)
+          .join("\n")
       : "",
     opts.composeRestart !== undefined
       ? `if [[ "$1" == "compose" ]] && [[ "\${@: -1}" == "restart" ]]; then cat ${JSON.stringify(bashPath(composeRestartFile))}; exit ${opts.composeRestart.exitCode ?? 0}; fi`
@@ -771,6 +801,117 @@ describe.skipIf(!runnable)("bot-ops.sh env-set refuses a blank REQUIRED key (iss
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ changed: ["WOW_REGION"] });
     expect(envText(fx)).toBe(wowEnv("ANNOUNCE_CHANNEL_ID=\nWOW_REGION=eu\n"));
+  });
+});
+
+// #227: env-set, restart and recreate hold one flock on the config dir for their whole run, so two
+// `docker compose` mutations of one project never overlap and a concurrent save can't lose the
+// other's keys. The three tests below need a REAL flock to mean anything — this box's Git Bash has
+// none (see REAL_FLOCK above), so they run only on CI's Linux; the fixture's shim keeps every OTHER
+// test in this file green here regardless.
+describe.skipIf(!runnable || !REAL_FLOCK)("bot-ops.sh env-set/restart/recreate serialise concurrent mutations (#227)", () => {
+  test("two env-set saves started at once both land: no key is lost, two distinct backups, the second recreate starts after the first ends", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\nBOT_BRANCH=dev\n", {
+      composeUp: { output: "Container probe-container  Started", delayMs: 1500 },
+    });
+    const [a, b] = await Promise.all([
+      botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n"),
+      botOps(fx, ["env-set"], "BOT_BRANCH=main\n"),
+    ]);
+    expect(a.exitCode).toBe(0);
+    expect(b.exitCode).toBe(0);
+    expect(a.json).toMatchObject({ changed: ["ANNOUNCE_CHANNEL_ID"] }); // each result names only its own key
+    expect(b.json).toMatchObject({ changed: ["BOT_BRANCH"] });
+    expect(envText(fx)).toBe("ANNOUNCE_CHANNEL_ID=22222\nBOT_BRANCH=main\n"); // neither key was lost
+    const backups = readdirSync(join(fx.cfg, "backups"));
+    expect(backups).toHaveLength(2);
+    expect(new Set(backups).size).toBe(2); // distinct names — #227's pid suffix
+    const log = readFileSync(join(fx.bin, "docker.log"), "utf8");
+    const starts = [...log.matchAll(/compose-up start (\d+)/g)].map((m) => Number(m[1])).sort((x, y) => x - y);
+    const ends = [...log.matchAll(/compose-up end (\d+)/g)].map((m) => Number(m[1])).sort((x, y) => x - y);
+    expect(starts).toHaveLength(2);
+    expect(ends).toHaveLength(2);
+    // The lock is held for the WHOLE mutation, not just the recreate — so one save's entire compose-up
+    // window (start..end) must finish before the other's begins, whichever ran first.
+    expect(ends[0]).toBeLessThanOrEqual(starts[1]!);
+  });
+
+  test("a save that cannot take the lock in time is refused before the write: .env untouched, no backup, its own env-set prefix", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\nBOT_BRANCH=dev\n", {
+      composeUp: { output: "Container probe-container  Started", delayMs: 4000 },
+    });
+    const first = botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n", { BOT_OPS_LOCK_WAIT_SECONDS: "1" });
+    await Bun.sleep(300); // let the first call win the lock well before the second even tries
+    const second = await botOps(fx, ["env-set"], "BOT_BRANCH=main\n", { BOT_OPS_LOCK_WAIT_SECONDS: "1" });
+    expect(second.exitCode).not.toBe(0);
+    expect(second.stderr).toContain("bot-ops: env-set: another bot-ops.sh mutation is still running on this instance");
+    expect(envText(fx)).not.toContain("BOT_BRANCH=main"); // the refused save wrote nothing
+    const firstResult = await first;
+    expect(firstResult.exitCode).toBe(0);
+    const backups = readdirSync(join(fx.cfg, "backups"));
+    expect(backups).toHaveLength(1); // only the winner ever backs up
+  });
+
+  test("restart waits for an env-set in flight", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      composeUp: { output: "Container probe-container  Started", delayMs: 1500 },
+      composeRestart: { output: "Container probe-container  Started" },
+    });
+    const [envSet, restart] = await Promise.all([
+      botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n"),
+      botOps(fx, ["restart"]),
+    ]);
+    expect(envSet.exitCode).toBe(0);
+    expect(restart.exitCode).toBe(0);
+    const lines = readFileSync(join(fx.bin, "docker.log"), "utf8").split("\n").filter(Boolean);
+    const endIdx = lines.findIndex((l) => l.startsWith("compose-up end"));
+    const restartIdx = lines.findIndex((l) => / restart$/.test(l));
+    expect(endIdx).toBeGreaterThan(-1);
+    expect(restartIdx).toBeGreaterThan(-1);
+    expect(restartIdx).toBeGreaterThan(endIdx); // restart's own compose call queued behind env-set's lock
+  });
+});
+
+describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on the config dir (#227)", () => {
+  test("the backup name ends in the pid, and the JSON's backup field is that file", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    expect(run.exitCode).toBe(0);
+    const backups = readdirSync(join(fx.cfg, "backups"));
+    expect(backups).toHaveLength(1);
+    expect(backups[0]).toMatch(/^\.env\.bak\.\d{8}-\d{6}-\d+$/);
+    expect(run.json!.backup as string).toContain(backups[0]!);
+  });
+
+  // Shape chosen over rebuilding a minimal PATH without flock (the plan's other option): that shape
+  // needs a real, working bash + coreutils + jq on PATH with flock specifically excluded, which is
+  // fragile to construct portably and CI-only anyway (this box has no real flock to exclude in the
+  // first place) — a source pin is deterministic on every platform and directly names the exact
+  // guard ("need flock" inside the helper) the coverage table's mutant drops.
+  test("without flock on PATH, env-set refuses to run unserialised (source guard: need flock inside lock_config_dir)", () => {
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    const helperStart = src.indexOf("lock_config_dir() {");
+    expect(helperStart).toBeGreaterThan(-1);
+    const helperBody = src.slice(helperStart, src.indexOf("\n}", helperStart));
+    expect(helperBody).toContain("need flock");
+  });
+
+  test("the lock is taken once per process, never inside the recreate helper (source pin)", () => {
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    const bodyOf = (fnStart: string): string => {
+      const start = src.indexOf(fnStart);
+      expect(start).toBeGreaterThan(-1);
+      return src.slice(start, src.indexOf("\n}", start));
+    };
+    for (const [name, fnStart] of [
+      ["cmd_env_set", "cmd_env_set() {"],
+      ["cmd_restart", "cmd_restart() {"],
+      ["cmd_recreate", "cmd_recreate() {"],
+    ] as const) {
+      const matches = bodyOf(fnStart).match(/lock_config_dir\s+\w+/g) ?? [];
+      expect(matches, name).toHaveLength(1);
+    }
+    expect(bodyOf("recreate_bot() {")).not.toContain("lock_config_dir");
   });
 });
 
