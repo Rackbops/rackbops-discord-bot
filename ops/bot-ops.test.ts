@@ -3341,11 +3341,11 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
   });
 
   // #280: none of the pins below (credential-shaped, .env.example-documented, compose-interpolated,
-  // src/-scanned) can see group 4 -- the behaviour table is what proves each of the five is actually
+  // src/-scanned) can see group 4 -- the behaviour table is what proves each of the seven is actually
   // refused. This test guards the regex widening itself: reverting it to upper-case-only would silently
-  // drop http_proxy from `reserved` with nothing here to say so.
-  test("group 4 (the proxy variables and TAR_OPTIONS, #280) is present, including the lower-case http_proxy", () => {
-    for (const key of ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "TAR_OPTIONS"]) {
+  // drop the three lower-case spellings from `reserved` with nothing here to say so.
+  test("group 4 (both spellings of the proxy variables, and TAR_OPTIONS, #280) is present", () => {
+    for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "TAR_OPTIONS"]) {
       expect(reserved.has(key), key).toBe(true);
     }
   });
@@ -3487,9 +3487,10 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
 // below is the behaviour, and the RESERVED_KEYS describe above pins that the set stays complete.
 describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel does not edit (#278)", () => {
   // The four SHARD* settings are read by discord.js's Client (src/client.ts builds it with no shard
-  // options), not by the core's own source, so the src/ scan above cannot see them. The five #280 settings
-  // (the proxy variables and TAR_OPTIONS) act on the core's own outbound calls or a tool it spawns, not on
-  // anything src/ names by a form the scan knows either. This table is what pins all nine.
+  // options), not by the core's own source, so the src/ scan above cannot see them. The seven #280
+  // settings (both spellings of the proxy variables, and TAR_OPTIONS) act on the core's own outbound
+  // calls or a tool it spawns, not on anything src/ names by a form the scan knows either. This table is
+  // what pins all eleven.
   const CORE_SETTINGS = [
     "GITHUB_REPO",
     "PLUGIN_REGISTRY_URL",
@@ -3503,9 +3504,11 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
     "SHARDING_MANAGER",
     "SHARDING_MANAGER_MODE",
     "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
     "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
     "TAR_OPTIONS",
   ];
   // Two plugins claim every one of them, one plain and one `secret: true` -- except HOSTNAME and (#280)
@@ -3513,10 +3516,11 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
   // rule in load_plugin_keys (ops/bot-ops.sh) mask a forgotten RESERVED_KEYS entry from env-get on every
   // key (env-get never lists a secret row, so it would only ever fail via env-schema); a plain-only key
   // gives env-get its own first-failing case for that same regression. http_proxy is the plain-only
-  // example for group 4 on purpose: none of the "RESERVED_KEYS covers" pins above name it specifically
-  // (it is neither credential-shaped, nor documented in .env.example, nor a compose interpolation, nor
-  // read through a form the src/ scan knows), so THIS table is the only thing that fails if http_proxy
-  // drops out of RESERVED_KEYS, and being plain-only makes it fail the direct way, via env-get. Each
+  // example for group 4 on purpose: none of the "RESERVED_KEYS covers" pins above name any of group 4
+  // specifically (none is credential-shaped, documented in .env.example, a compose interpolation, or
+  // read through a form the src/ scan knows), so THIS table is the only thing that fails if any of the
+  // seven drops out of RESERVED_KEYS, and http_proxy being plain-only makes ITS failure the direct way,
+  // via env-get, rather than only through the secret-wins path the other six share. Each
   // plugin also declares a benign key, so a dropped claim is told apart from a dropped entry.
   const CLAIMS = wrapIndex([
     pluginEntry("plain-claim", [...CORE_SETTINGS.map((k) => envKey(k, "^.+$")), envKey("PLAIN_CLAIM_PORT", PORT_RE)]),

@@ -1121,8 +1121,10 @@ _Avoid_: server list, guild cache
   machinery or docker sets but the core reads from the environment: `HANDOFF_FROM`,
   `HANDOFF_RESTART_POLICY`, `HOSTNAME`; and four the discord.js `Client` the core builds reads:
   `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`), and (#280) variables that act
-  on the core's own outbound calls or on a tool it spawns rather than on the runtime in general
-  (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, the lower-case `http_proxy`, and `TAR_OPTIONS`) — are
+  on the core's own outbound calls or on a tool it spawns rather than on the runtime in general — both
+  spellings of each proxy variable, since Bun's `fetch` honours the upper- and lower-case form alike
+  (`HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`; a bare
+  `ALL_PROXY`/`all_proxy` is NOT honoured, so it stays claimable), and `TAR_OPTIONS` — are
   dropped from a manifest whether it declares them secret or not, so a manifest can't make
   `DISCORD_TOKEN`, or the bot's data directory, editable or listable, with or without its plugin
   enabled. Pinned by tests: against
@@ -1130,7 +1132,7 @@ _Avoid_: server list, guild cache
   named list of plugin-owned settings), the compose file, and a regex scan of the core's source (each
   variable it reads through `env.X`, `env["X"]`, `required`/`optional`/`list("X")` or a `*_ENV` constant is
   editable or reserved — a net, not a proof: it misses destructuring and dynamic names, and what a
-  dependency reads, which is why the four shard variables AND the five #280 variables are pinned by the
+  dependency reads, which is why the four shard variables AND the seven #280 variables are pinned by the
   behaviour table instead, since none of them is read through a form the scan knows either), so a
   new core key fails a test until it is decided. Runtime-level variables that configure the runtime in
   general rather than the core's own calls (`NODE_OPTIONS`, `PATH`, `LD_PRELOAD`, `BUN_*`, `TZ`) stay
