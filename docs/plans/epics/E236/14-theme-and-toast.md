@@ -263,3 +263,53 @@ error plus retained composite outline; and keyboard reachability.
   Dark and light screenshots were captured inline by the Chrome automation surface. Environment gap:
   that surface exposes screenshot bytes/display but no documented local-file save API, so no local
   screenshot path could be produced without leaving the required computer-use surface.
+
+## Part B1 resumed — merge #246, round-3 mutation runs, fresh gate (2026-09-22, orchestrator)
+
+The orchestrating session (Opus) took the paused PR over per roshne's direction. #246's Servers tab
+(`#304`) had landed on `main` after this branch forked, touching the same admin-panel files. The
+branch was merged with `origin/main` (merge commit) keeping BOTH features; the split was designed to
+expect this rebase.
+
+- **Conflict resolution (only `index.html` and `server.test.ts` conflicted; `CONTEXT.md`, `admin.css`,
+  `ops/README.md` auto-merged):**
+  - `buildEnvControl` gained both #300's `required` and #246's `preservePicker` params (signature +
+    the `renderEnvFields` callsite `buildEnvControl(key, value, required, pickerKeysShown.has(key))`);
+    the merged body already used each correctly, so no body change.
+  - `server.test.ts` fragment-count table set to the merged union (`rb-label` 5, `rb-select` 3,
+    `rb-input` 2) plus #300's renamed Config danger notice (`adm-note adm-note--danger`); the
+    `buildEnvControl` order assertion follows the merged callsite.
+- **field-hint sweep of #246's Servers surface (roshne's call, "rename the 13 to adm-note now"):**
+  #246 landed 13 new `field-hint` class usages in the Servers/Needs-attention/webhooks UI (all panel
+  copy) that #300's deletion of the shared `.field-hint` CSS would have orphaned. Classified them as
+  `adm-note` per #300's own non-field-copy rule (bulk rename of the literal `"field-hint"`), plus the
+  one stale `field-hint` mention in `CONTEXT.md`'s webhook-refusal prose. `git grep -n field-hint --
+  ops/admin` is now empty, no dangling class, no visual regression (`adm-note` is the same muted-copy
+  role). The historical `docs/plans/epics/E236/*.md` references are left as build records.
+- **Merged test harnesses rethreaded** (the merge combined #300's and #246's `renderEnvFields`): the
+  `applyPending` re-render harness declares the #246 `pickerKeysShown` Set (empty here); the #246
+  picker mini-harness stubs `setRequiredLabel`/`setDescribedByToken` and the Config-refusal
+  capture/restore helpers (irrelevant to picker preservation, and its tiny synthetic DOM lacks
+  `getAttribute`) — those helpers are exercised for real in the `applyPending` harness and the #300
+  builder tests. The `every non-field note` count pins moved to the merged reality (static
+  `adm-note` 2->3, scripted 15->27).
+- **Clean acceptance suite on a bash-capable host (this Opus session's Git Bash, private R:-drive
+  `TEMP`/`TMP`, serial):** `bun run --cwd ops/admin check` -> `$ bunx tsc --noEmit` exit 0.
+  `bun test ops/admin/server.test.ts --timeout 20000` -> `851 pass`, `1 skip`
+  (`test.skipIf(process.platform === "win32")`), `0 fail`, `3784 expect() calls`,
+  `Ran 852 tests across 1 file`. **Zero `uv_spawn 'bash' EPERM` failures** — the private off-AppData
+  `TEMP` lets bun spawn `bash` on this box, so this is the clean run of current HEAD the paused handoff
+  required. `git grep -n field-hint -- ops/admin` and
+  `git grep -n -F '.adm [aria-invalid="true"]' -- ops/admin/public/admin.css` both empty (exit 1).
+- **Round-3 Config state-transfer mutation matrix (the paused handoff's outstanding item):** ten
+  one-at-a-time mutants in the detached `bot-300-form-states-mutations` worktree against merged HEAD,
+  each run executing the full 852-test file. Nine were killed immediately by `applyPending (#257) >
+  plugin and Config re-renders carry inline refusal state to the rebuilt control`: capture-call ->
+  null; restore-call removed; guard container `#env-fields` -> `#plugins-list`; `saved.id` -> `""`;
+  `saved.message` -> `""`; `clearApplyInvalid()` removed; `return saved` -> `return null`. One mutant
+  SURVIVED — replacing the whole `captureConfigApplyInvalidForRender` guard with `if (false)`: no test
+  drove the real `renderEnvFields()` with no active refusal (the common reload case), where the
+  `!applyInvalid` clause keeps `applyInvalid.id` from throwing and taking the Config panel down on
+  every clean reload. Added `renderEnvFields renders normally when no Config refusal is pending
+  (#300)`; the whole-guard `if (false)` mutant and a `!applyInvalid`-clause-only variant then both
+  failed it. All round-3 Config lines are now mutation-guarded.
