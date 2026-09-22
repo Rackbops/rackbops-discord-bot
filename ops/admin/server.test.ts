@@ -10089,6 +10089,7 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     id: string;
     className: string;
     label: string;
+    textContent?: string;
     dataset: Record<string, string>;
     children: FakeEl[];
     appendChild: (c: FakeEl) => FakeEl;
@@ -10173,6 +10174,33 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     expect(channel.id).toBe("env-ANNOUNCE_CHANNEL_ID");
     expect(channel.dataset.key).toBe("ANNOUNCE_CHANNEL_ID");
     expect(channel.value).toBe("10");
+  });
+
+  // Orchestrator finding (minor 9): pickerOptions' own unit test (below, "server and channel options…")
+  // only ever calls it with a literal "server"/"channel" string, so it could not catch a regression in
+  // buildPickerSelect's DERIVATION of that string from FIELD_META[key].control -- e.g. passing the env
+  // KEY itself through unchanged, which pickerOptions would silently treat as neither "server" (falls to
+  // its channel branch) and would have gone undetected by every other test in this describe block (a
+  // mutation surviving M5 of this plan's own mutation pass surfaced the gap). This drives the real
+  // buildEnvControl -> buildPickerSelect -> FIELD_META chain end to end and inspects the actual <option>
+  // shape, so a wrong-kind derivation fails here even though the control is still a <select>.
+  test("buildEnvControl derives the picker's option SHAPE from FIELD_META's control kind, not the env key", () => {
+    const h = harness(routingDataReady);
+    const server = h.buildEnvControl("DISCORD_SERVER_ID", "100");
+    expect(server.tagName).toBe("SELECT");
+    // Server options are flat (no optgroup) and named after guilds -- the channel branch would instead
+    // group under an optgroup per guild and list "#general", not "Home".
+    const serverLabels = server.children.map((c) => c.textContent);
+    expect(serverLabels).toEqual(["— none: register globally —", "Home"]);
+    expect(server.children.every((c) => c.tagName === "OPTION")).toBe(true);
+
+    const channelField = h.buildEnvControl("ANNOUNCE_CHANNEL_ID", "10");
+    expect(channelField.tagName).toBe("SELECT");
+    // Channel options ARE grouped -- the server branch has no optgroup and would never produce one.
+    expect(channelField.children.some((c) => c.tagName === "OPTGROUP")).toBe(true);
+    const group = channelField.children.find((c) => c.tagName === "OPTGROUP")!;
+    expect(group.label).toBe("Home");
+    expect(group.children.map((c) => c.textContent)).toEqual(["#general"]);
   });
 
   test("without a ready discovery (null, or stale), buildEnvControl degrades to a plain input -- but only when nothing was already a picker", () => {
