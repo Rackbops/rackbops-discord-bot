@@ -48,8 +48,8 @@
     <button id="lock" class="rb-btn rb-btn--ghost">Lock</button>
   </div>
 
-  <!-- The three tabs only show and hide: every section below still loads at unlock, exactly as when
-       they were stacked. The open tab lives in the URL hash (#overview / #plugins / #settings). -->
+  <!-- The four tabs only show and hide: every section below still loads at unlock, exactly as when
+       they were stacked. The open tab lives in the URL hash (#overview / #plugins / #servers / #settings). -->
   <nav aria-label="Sections">
     <div class="rb-tabstrip" role="tablist">
       <button type="button" class="rb-tabstrip__tab rb-tabstrip__tab--active" role="tab" id="tab-overview" aria-controls="panel-overview" aria-selected="true" tabindex="0">Overview</button>
@@ -1286,6 +1286,12 @@
     }, ROUTING_SEND_DEBOUNCE_MS);
   }
 
+  // Orchestrator finding: returns a small signal on its two early exits ("held" -- something for this
+  // plugin was already in flight, this call was coalesced; "error" -- the planned body was unsendable,
+  // e.g. an empty channel list) so a caller with its OWN status line (retryRegistration's "retry" subject)
+  // can report it instead of silently leaving a stale "Applying…" behind. Every other caller (the
+  // debounced onRouteChange path, checkAgain) already has its own row-level UI for both cases and simply
+  // ignores the return value, unchanged.
   async function sendRouting(plugin) {
     const st = routeState.get(plugin);
     if (!st) return;
@@ -1307,9 +1313,9 @@
           }
         }
       }
-      return;
+      return "error";
     }
-    if (st.inflight) { st.held = true; return; }
+    if (st.inflight) { st.held = true; return "held"; }
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     const sentServers = Object.keys(planned.body.servers);
     // Reserve the in-flight slot BEFORE the POST. A slow request must disable the controls and hold a
@@ -1643,25 +1649,35 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
-  // The first plugin (in pluginsData's own manifest order) that has a routing.plugins entry at all, even
-  // an empty one -- "placed", not "posting" or "active". null when nothing is placed (decision 4: no
-  // button in that state, a restart is the only retry).
-  function firstPlacedPlugin() {
+  // A stale snapshot is useful for display but cannot safely seed the selection a retry would send.
+  // Retrying it as `{ servers: {} }` would clear an existing placement, so only a ready model is
+  // retryable. Orchestrator finding (post round-4): a ready model is STILL not safely retryable when it
+  // has any `unavailable` server -- routingSetBody walks model.rows only (discovery's current guilds), so
+  // a routing-set built from it silently DROPS any server routing.json still names that discovery no
+  // longer sees, from a button labelled and documented as a no-op resend.
+  //
+  // Walks every PLACED plugin, in pluginsData order (not just the first, per firstPlacedPlugin) --
+  // returns the first one whose model is ready AND has no unavailable server; for THAT plugin the resend
+  // really is a no-op. `null` when nothing is placed at all. Otherwise always an object with `blocked` set
+  // to why nothing qualified: "stale" when no placed plugin has a ready model yet, or "unavailable" (with
+  // `names`, every ready-but-blocked plugin, and `counts`, `{name, count}` per one) when at least one does
+  // but every one of those has a server the bot has left.
+  function retryablePlacement() {
     const routing = routingData && routingData.routing;
     if (!routing || !routing.plugins) return null;
-    for (const p of (pluginsData && pluginsData.plugins) || []) {
-      if (routing.plugins[p.name]) return p.name;
+    const placed = ((pluginsData && pluginsData.plugins) || []).filter((p) => routing.plugins[p.name]);
+    if (placed.length === 0) return null;
+    let anyReady = false;
+    const blockedByUnavailable = [];
+    for (const p of placed) {
+      const model = routingStepModel(p.name, routingData, Date.now());
+      if (model.mode !== "ready") continue;
+      anyReady = true;
+      if (model.unavailable.length === 0) return { name: p.name, model };
+      blockedByUnavailable.push({ name: p.name, count: model.unavailable.length });
     }
-    return null;
-  }
-
-  // A stale snapshot is useful for display but cannot safely seed the selection a retry would send.
-  // Retrying it as `{ servers: {} }` would clear an existing placement, so only a ready model is retryable.
-  function retryablePlacement() {
-    const name = firstPlacedPlugin();
-    if (!name) return null;
-    const model = routingStepModel(name, routingData, Date.now());
-    return model.mode === "ready" ? { name, model } : null;
+    if (!anyReady) return { blocked: "stale" };
+    return { blocked: "unavailable", names: blockedByUnavailable.map((b) => b.name), counts: blockedByUnavailable };
   }
 
   // Decision 4's "Try again": re-sends the first placed plugin's OWN saved placement (a no-op change --
@@ -1675,25 +1691,40 @@
   // slightly earlier. Forcing routeState back to selectionFromModel(model) here would risk silently
   // DISCARDING a real in-progress edit unless the debounce timer were also cancelled/re-armed, trading a
   // narrow self-resolving timing quirk for a real data-loss risk -- left as-is (docs/plans/epics/E236/10-servers-and-pickers.md).
+  // Orchestrator finding: sendRouting's two early exits (already in flight -> held; an unsendable
+  // planned.error) used to leave this subject's "Applying…" message on screen with no report at all --
+  // wrapped in try/finally so renderServers/renderNeedsAttention always run, and sendRouting's own return
+  // value (see its own comment) is checked so held/error settle into a visible message here too.
   async function retryRegistration() {
     const key = "retry";
     const existing = serverActionState.get(key);
     if (existing && existing.busy) return;
     const placement = retryablePlacement();
-    if (!placement) return; // no button is drawn in that state -- see appendRetryControls
+    if (!placement || placement.blocked) return; // no button is drawn in that state -- see appendRetryControls
     serverActionState.set(key, { busy: true, message: "Applying…" });
     renderServers();
-    ensureRouteState(placement.name, placement.model);
-    await sendRouting(placement.name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
-    serverActionState.delete(key);
-    renderServers();
-    renderNeedsAttention();
+    try {
+      ensureRouteState(placement.name, placement.model);
+      const outcome = await sendRouting(placement.name); // resolves once settled -- sendRouting awaits its own awaitRequestResult
+      if (outcome === "held") {
+        serverActionState.set(key, { busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
+      } else if (outcome === "error") {
+        serverActionState.set(key, { busy: false, message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab." });
+      } else {
+        serverActionState.delete(key);
+      }
+    } finally {
+      renderServers();
+      renderNeedsAttention();
+    }
   }
 
   // Appended to a card wherever decision 3 calls for "+ Try again": the button when a plugin is placed
-  // somewhere, the restart sentence when nothing is (retryRegistration would have nothing to resend).
+  // somewhere and every server it names is still visible, an explanatory note otherwise (nothing placed,
+  // routing data is stale, or resending would silently drop a server the bot has left).
   function appendRetryControls(container) {
-    if (retryablePlacement()) {
+    const placement = retryablePlacement();
+    if (placement && !placement.blocked) {
       const st = serverActionState.get("retry");
       const btn = document.createElement("button");
       btn.type = "button";
@@ -1709,7 +1740,19 @@
         msg.textContent = st.message;
         container.appendChild(msg);
       }
-    } else if (firstPlacedPlugin()) {
+    } else if (placement && placement.blocked === "unavailable") {
+      const note = document.createElement("p");
+      note.className = "field-hint";
+      if (placement.counts.length === 1) {
+        const only = placement.counts[0];
+        note.textContent =
+          "Try again would drop " + only.name + "'s placement in " + only.count + (only.count === 1 ? " server" : " servers") +
+          " the bot has left. Use Drop now on its card first.";
+      } else {
+        note.textContent = "Try again would drop placements in servers the bot has left, for: " + placement.names.join(", ") + ". Use Drop now on each card first.";
+      }
+      container.appendChild(note);
+    } else if (placement && placement.blocked === "stale") {
       const note = document.createElement("p");
       note.className = "field-hint";
       note.textContent = "Routing data is stale, so Try again is unavailable until Discord refreshes.";
@@ -1913,10 +1956,18 @@
     const meta = document.getElementById("servers-meta");
     if (meta) meta.textContent = discovery && discovery.generatedAt ? "Last read from Discord " + new Date(discovery.generatedAt).toLocaleString() : "";
     const discoveryState = serverActionState.get("discovery");
+    const copyState = serverActionState.get("copy");
     const refreshBtn = document.getElementById("refresh-discovery");
     if (refreshBtn) refreshBtn.disabled = !!(discoveryState && discoveryState.busy);
     const status = document.getElementById("servers-status");
-    if (status) setApplyText(status, (discoveryState && discoveryState.message) || (routingData && routingData.loadError ? "Couldn't read where plugins live: " + routingData.loadError : ""));
+    // A live refresh in flight (or its own outcome) always wins; otherwise a copy confirmation
+    // outranks a stale discovery message, which outranks the load-error fallback.
+    const statusMessage =
+      (discoveryState && discoveryState.busy && discoveryState.message) ||
+      (copyState && copyState.message) ||
+      (discoveryState && discoveryState.message) ||
+      (routingData && routingData.loadError ? "Couldn't read where plugins live: " + routingData.loadError : "");
+    if (status) setApplyText(status, statusMessage);
 
     clearChildren(list);
     if (!discovery) {
@@ -1975,6 +2026,10 @@
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
       } else {
         serverActionState.delete(key);
+        // #246 orchestrator follow-up (minor 7): a successful Add changes what buildWhereItLivesStep
+        // shows on the Plugins tab (the "· webhook" suffix) -- refresh it now rather than waiting for
+        // the next unrelated loadRouting.
+        refreshRoutingSteps();
       }
       renderServers();
       renderNeedsAttention();
@@ -2024,6 +2079,9 @@
         serverActionState.set(key, { busy: false, message: "The bot refused it: " + (outcome.result.reason || "") });
       } else {
         serverActionState.delete(key);
+        // #246 orchestrator follow-up (minor 7): same reasoning as addWebhook's own call -- a successful
+        // Remove also changes the Plugins tab's webhook suffix.
+        refreshRoutingSteps();
       }
       renderServers();
       renderNeedsAttention();
@@ -2141,13 +2199,12 @@
   async function copyInviteLink() {
     const url = discoveryInviteUrl();
     if (!url) return;
-    const status = document.getElementById("servers-status");
     const fallback = document.getElementById("invite-fallback");
     try {
       if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(url);
       if (fallback) fallback.hidden = true;
-      if (status) setApplyText(status, "Copied.");
+      serverActionState.set("copy", { busy: false, message: "Copied." });
     } catch {
       if (fallback) {
         fallback.value = url;
@@ -2155,8 +2212,12 @@
         fallback.focus();
         fallback.select();
       }
-      if (status) setApplyText(status, "Couldn't copy automatically — select and copy the link below.");
+      serverActionState.set("copy", { busy: false, message: "Couldn't copy automatically — select and copy the link below." });
     }
+    // Route through serverActionState/renderServers rather than writing #servers-status directly --
+    // renderServers overwrites that element from serverActionState on every redraw (a refresh, an
+    // Add/Remove, a retry), which would otherwise erase or resurrect a stale message under this one.
+    renderServers();
   }
   // Not withBusy: refreshDiscoveryAll manages #refresh-discovery's own disabled state through
   // serverActionState/renderServers (surviving a rebuild mid-flight, unlike a plain closure over `el`).
@@ -3023,6 +3084,9 @@
 
   let loadedEnv = {}; // last-loaded values, the baseline the Apply bar diffs the controls against
   let loadedSchema = {}; // last-loaded GET /api/env-schema ({} when unavailable — degrades to no client-side validation, #207)
+  // #246, decision 6: which env keys renderEnvFields has ever shown as a picker -- only ever grows (a
+  // picker is never downgraded), survives #env-fields being wiped by a failed reloadConfig's error text.
+  let pickerKeysShown = new Set();
 
   // TAG_SYNC:begin
   // Setting an input's value from code fires NO event, and the Apply bar learns of an edit only from an
@@ -3120,7 +3184,11 @@
     control.className = "rb-select";
     let currentGroup;
     let target = control;
-    for (const opt of pickerOptions(key, discovery, value)) {
+    // pickerOptions takes the CONTROL KIND (FIELD_META[key].control -- "server" or "channel"), not the key
+    // itself: keeps it a pure function of its literal inputs, testable without FIELD_META in scope, and
+    // means any future control: "server"/"channel" key gets the right shape with no code change here.
+    const controlKind = (FIELD_META[key] || {}).control;
+    for (const opt of pickerOptions(controlKind, discovery, value)) {
       if (opt.group !== currentGroup) {
         currentGroup = opt.group;
         if (opt.group) {
@@ -3152,13 +3220,18 @@
   // own flagged discussion, not silently inside an unrelated round of review fixes.
   function refreshEnvPickers() {
     if (!discoveryReadyForPickers()) return;
-    for (const key of ["DISCORD_SERVER_ID", "ANNOUNCE_CHANNEL_ID", "RELEASE_ANNOUNCE_CHANNEL_ID"]) {
+    // Orchestrator finding: one source of truth for which keys are pickers -- FIELD_META itself, not a
+    // second hardcoded list here that the three-key array in the old version could silently drift from.
+    for (const key of Object.keys(FIELD_META)) {
+      const meta = FIELD_META[key];
+      if (meta.control !== "server" && meta.control !== "channel") continue;
       const existing = document.getElementById("env-" + key);
       if (!existing || existing.tagName === "SELECT") continue;
       const value = existing.value;
       const control = buildPickerSelect(key, routingData.discovery, value);
       control.id = "env-" + key;
       control.dataset.key = key;
+      pickerKeysShown.add(key);
       existing.replaceWith(control);
     }
   }
@@ -3239,10 +3312,6 @@
   // it -- never appears in the Config editor too. #257's PLUGINS skip is unchanged.
   function renderEnvFields() {
     const container = document.getElementById("env-fields");
-    // Capture the picker shape before clearing the container. Looking it up from buildEnvControl would be
-    // too late: innerHTML="" removes the old control before the first replacement is built.
-    const pickerKeys = new Set();
-    for (const control of container.querySelectorAll("select[data-key]")) pickerKeys.add(control.dataset.key);
     const pluginKeys = new Set();
     for (const p of (pluginsData && pluginsData.plugins) || []) {
       for (const e of p.env || []) pluginKeys.add(e.key);
@@ -3252,7 +3321,15 @@
       if (key === "PLUGINS") continue;
       if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
       const value = loadedEnv[key] ?? "";
-      const control = buildEnvControl(key, value, pickerKeys.has(key));
+      // Orchestrator finding: capturing "was this a picker" from the CURRENT DOM (querySelectorAll,
+      // right before clearing the container) broke the moment a FAILED reloadConfig ran in between two
+      // renderEnvFields calls -- its catch writes plain error text into #env-fields (see reloadConfig's
+      // own catch, below), wiping every control including the query this relied on, so the NEXT successful
+      // render saw no existing pickers and downgraded every one of them. pickerKeysShown is a
+      // module-level Set renderEnvFields itself adds to whenever it builds a picker (right after this
+      // call), so the memory survives however #env-fields gets clobbered in between.
+      const control = buildEnvControl(key, value, pickerKeysShown.has(key));
+      if (control.tagName === "SELECT") pickerKeysShown.add(key);
       const label = document.createElement("label");
       label.className = "rb-label";
       label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
@@ -3702,11 +3779,18 @@
       }
     }
 
+    // Orchestrator finding: a single pass over discovery.guilds emitted commands-refused and
+    // commands-unregistered interleaved in GUILD order, not the documented kind order (a guild with null
+    // commands ahead of a refused one put "unregistered" before "refused" in the list). Two passes.
     const routed = routedMode(routing);
-    for (const g of (discovery && discovery.guilds) || []) {
+    const guilds = (discovery && discovery.guilds) || [];
+    for (const g of guilds) {
       if (g.commands && g.commands.error) {
         out.push({ kind: "commands-refused", text: g.name + ": Discord refused the bot's commands (" + g.commands.error + ")", fix: { label: "Re-invite, then try again", go: "servers" } });
-      } else if (!g.commands && routed) {
+      }
+    }
+    for (const g of guilds) {
+      if (!g.commands && routed) {
         out.push({ kind: "commands-unregistered", text: g.name + ": commands were never registered", fix: { label: "Try again", go: "retry" } });
       }
     }
@@ -3714,9 +3798,20 @@
     for (const [channelId, wh] of Object.entries((routing && routing.webhooks) || {})) {
       if (!wh.broken) continue;
       const guild = discovery && discovery.guilds && discovery.guilds.find((g) => g.id === wh.guildId);
-      const channel = guild && guild.channels.find((c) => c.id === channelId);
-      const where = guild ? guild.name : wh.guildId;
-      out.push({ kind: "webhook-broken", text: "#" + (channel ? channel.name : channelId) + " in " + where + ": its webhook stopped working (" + wh.broken + ")", fix: { label: "Add it again", go: "servers" } });
+      // Orchestrator finding (minor 8): "Add it again" -> Servers sent the operator to a server card
+      // that, once the bot has left, draws no add-webhook form at all (buildUnavailableServerCard is
+      // plain text). That guild is gone from discovery.guilds -- not merely missing a channel lookup --
+      // so there is nothing to fix here; say so instead of pointing at a dead end.
+      if (!guild) {
+        out.push({
+          kind: "webhook-broken",
+          text: "A webhook in server " + wh.guildId + " stopped working (" + wh.broken + "); the bot has left that server, so the webhook is removed when the server's dropped placement clears",
+          fix: { label: "Nothing to do here", go: "none" },
+        });
+        continue;
+      }
+      const channel = guild.channels.find((c) => c.id === channelId);
+      out.push({ kind: "webhook-broken", text: "#" + (channel ? channel.name : channelId) + " in " + guild.name + ": its webhook stopped working (" + wh.broken + ")", fix: { label: "Add it again", go: "servers" } });
     }
 
     if (discovery && discovery.homeGuildId) {
@@ -3741,10 +3836,12 @@
   // ({ value, label, group? }[]). A stored value with no matching option (a since-left server, a deleted
   // channel) is kept as its own trailing option instead of silently dropped -- same rule the plain
   // select branch already applies to an out-of-enum value.
-  function pickerOptions(key, discovery, value) {
+  // controlKind: "server" or "channel" (FIELD_META[key].control) -- the CONTROL KIND, never the key name
+  // itself, so a picker for a future control:"server"/"channel" key gets the right options shape for free.
+  function pickerOptions(controlKind, discovery, value) {
     const guilds = (discovery && discovery.guilds) || [];
     const options = [];
-    if (key === "DISCORD_SERVER_ID") {
+    if (controlKind === "server") {
       options.push({ value: "", label: "— none: register globally —" });
       for (const g of guilds) options.push({ value: g.id, label: g.name });
     } else {

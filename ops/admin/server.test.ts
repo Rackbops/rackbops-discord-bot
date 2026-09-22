@@ -6146,7 +6146,7 @@ describe("page skeleton", () => {
     const renderEnvFields = indexSrc.slice(indexSrc.indexOf("function renderEnvFields()"), indexSrc.indexOf("// ENV_SCHEMA:begin"));
     expect(renderEnvFields.length).toBeGreaterThan(500);
     expect(renderEnvFields).toContain('if (key === "PLUGINS") continue;');
-    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, pickerKeys.has(key))"));
+    expect(renderEnvFields.indexOf('if (key === "PLUGINS") continue;')).toBeLessThan(renderEnvFields.indexOf("buildEnvControl(key, value, pickerKeysShown.has(key))"));
     expect(renderEnvFields).toContain('source === "plugin"');
     expect(renderEnvFields).toContain("pluginKeys.has(key)");
   });
@@ -9001,21 +9001,91 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     expect(twoFiles.map((i) => i.text)).toEqual(["bot-ops.sh is out of date on this instance", "docker-compose.yml is out of date on this instance"]);
   });
 
+  // Orchestrator finding: the canned `discovery` above happens to list OTHER (refused) before THIRD
+  // (unregistered) already, so a single guild-order pass and the correct two-pass fix produce the SAME
+  // order there -- this test reverses the guild order specifically so only the two-pass fix (commands-
+  // refused fully emitted before commands-unregistered starts) gets it right; a single pass emits them
+  // interleaved in guild order instead.
+  test("needsAttention: commands-refused precedes commands-unregistered regardless of guild order", () => {
+    const reversedOrder = { ...discovery, guilds: [discovery.guilds[2]!, discovery.guilds[1]!, discovery.guilds[0]!] }; // Third, Other, Home
+    const routedNoWebhooks = { ...routing, webhooks: {} }; // isolate this test to the two commands kinds
+    const items = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: routedNoWebhooks, discovery: reversedOrder }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    const kinds = items.map((i) => i.kind);
+    expect(kinds.indexOf("commands-refused")).toBeLessThan(kinds.indexOf("commands-unregistered"));
+    expect(kinds).toEqual(["commands-refused", "commands-unregistered"]);
+  });
+
+  // Orchestrator finding (minor 8): "Add it again" -> Servers used to be the fix for EVERY broken
+  // webhook, including one whose guild the bot has since left -- that server's card
+  // (buildUnavailableServerCard) draws no add-webhook form, so the fix was a dead end. A vanished-guild
+  // broken webhook now gets its own explanatory, non-actionable item instead.
+  test("needsAttention: a broken webhook whose guild the bot has left gets an explanatory item, not a dead-end fix", () => {
+    const brokenGoneWebhook = { ...routing.webhooks, [GONE_CH]: { ...routing.webhooks[GONE_CH]!, broken: "404 Unknown Channel" } };
+    const items = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: { ...routing, webhooks: brokenGoneWebhook }, discovery }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    const goneItem = items.find((i) => i.kind === "webhook-broken" && i.text.indexOf(GONE) !== -1);
+    expect(goneItem).toEqual({
+      kind: "webhook-broken",
+      text: "A webhook in server 99999 stopped working (404 Unknown Channel); the bot has left that server, so the webhook is removed when the server's dropped placement clears",
+      fix: { label: "Nothing to do here", go: "none" },
+    });
+    // Still-present guild's own broken webhook (GEN_CH, in Home) keeps the original actionable fix.
+    const homeItem = items.find((i) => i.kind === "webhook-broken" && i.text.indexOf("general") !== -1);
+    expect(homeItem).toEqual({
+      kind: "webhook-broken",
+      text: "#general in Home: its webhook stopped working (410 Unknown Webhook)",
+      fix: { label: "Add it again", go: "servers" },
+    });
+  });
+
+  // Orchestrator finding (minor 1): the required-core-key loop (as opposed to a plugin's OWN missingEnv,
+  // already covered above) had no test driving it at all.
+  test("needsAttention: a required core key left blank is its own missing-setting item", () => {
+    const items = fns.needsAttention({
+      status: statusClean,
+      plugins: [],
+      routingData: { routing: null, discovery: null },
+      env: { ANNOUNCE_CHANNEL_ID: "" },
+      schema: { ANNOUNCE_CHANNEL_ID: { required: true, source: "core" } },
+      labelOf: (k: string) => k,
+    });
+    expect(items).toEqual([{ kind: "missing-setting", text: "ANNOUNCE_CHANNEL_ID is required and blank", fix: { label: "Set it", go: "settings" } }]);
+    // A non-blank value, or a plugin-owned key (already surfaced via missingEnv, never duplicated here),
+    // never adds a second item for the same key.
+    const filled = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: null, discovery: null },
+      env: { ANNOUNCE_CHANNEL_ID: "123" }, schema: { ANNOUNCE_CHANNEL_ID: { required: true, source: "core" } }, labelOf: (k: string) => k,
+    });
+    expect(filled).toEqual([]);
+    const pluginOwned = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing: null, discovery: null },
+      env: { SPOTIFY_CLIENT_SECRET: "" }, schema: { SPOTIFY_CLIENT_SECRET: { required: true, source: "plugin" } }, labelOf: (k: string) => k,
+    });
+    expect(pluginOwned).toEqual([]);
+  });
+
   test("pickerOptions: server and channel options, grouping, cannot-post suffix, an unknown stored value kept", () => {
-    const serverOpts = fns.pickerOptions("DISCORD_SERVER_ID", discovery, "");
+    // Orchestrator finding: pickerOptions takes the CONTROL KIND ("server"/"channel", FIELD_META[key].control),
+    // never the literal key name -- keeps it pure/testable without FIELD_META in scope, and means a future
+    // control:"channel" key (not just ANNOUNCE_CHANNEL_ID/RELEASE_ANNOUNCE_CHANNEL_ID) gets channel options
+    // automatically. See the buildEnvControl pickers mini-harness for the FIELD_META-driven wiring itself.
+    const serverOpts = fns.pickerOptions("server", discovery, "");
     expect(serverOpts[0]).toEqual({ value: "", label: "— none: register globally —" });
     expect(serverOpts.slice(1)).toEqual([{ value: HOME, label: "Home" }, { value: OTHER, label: "Other" }, { value: THIRD, label: "Third" }]);
 
-    const channelOpts = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, "");
+    const channelOpts = fns.pickerOptions("channel", discovery, "");
     expect(channelOpts[0]).toEqual({ value: "", label: "— default —" });
     expect(channelOpts.find((o) => o.value === GEN_CH)).toEqual({ value: GEN_CH, label: "#general", group: "Home" });
     expect(channelOpts.find((o) => o.value === AN_CH)).toEqual({ value: AN_CH, label: "#announcements · the bot can't post here", group: "Home" });
     expect(channelOpts.find((o) => o.value === OTHER_CH)).toEqual({ value: OTHER_CH, label: "#chat", group: "Other" });
 
-    const withUnknown = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, "888888888888888888");
+    const withUnknown = fns.pickerOptions("channel", discovery, "888888888888888888");
     expect(withUnknown[withUnknown.length - 1]).toEqual({ value: "888888888888888888", label: "888888888888888888 (not visible to the bot)" });
     // A stored value that DOES match an option is never duplicated as an extra trailing entry.
-    const withKnown = fns.pickerOptions("ANNOUNCE_CHANNEL_ID", discovery, GEN_CH);
+    const withKnown = fns.pickerOptions("channel", discovery, GEN_CH);
     expect(withKnown.filter((o) => o.value === GEN_CH)).toHaveLength(1);
   });
 });
@@ -9723,6 +9793,145 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   });
 });
 
+// retryablePlacement's own return shape, shared across every mini-harness that exposes it below: null
+// (nothing placed at all), { blocked: "stale" }, { blocked: "unavailable", names, counts }, or
+// { name, model } (safely retryable).
+interface RetryablePlacement {
+  name?: string;
+  model?: unknown;
+  blocked?: "stale" | "unavailable";
+  names?: string[];
+  counts?: { name: string; count: number }[];
+}
+
+// Orchestrator MAJOR finding: retryRegistration must be proven against the REAL routingStepModel /
+// routingSetBody chain, not a stubbed sendRouting -- the bug was specifically that routingSetBody walks
+// model.rows only (discovery's CURRENT guilds), silently dropping any server routing.json still names
+// that discovery no longer sees. A harness that stubs sendRouting can't see that at all. Same shape as
+// #245's own scheduleRoutingSend/sendRouting harness (PLUGIN_ROUTING + ensureRouteState-through-loadRouting),
+// with the retry slice (retryablePlacement/retryRegistration) added on top.
+describe("retryRegistration end-to-end: the real routingSetBody never drops an unavailable server silently (#246, orchestrator finding)", () => {
+  const routingSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function ensureRouteState("), applyIndexSrc.indexOf("async function loadRouting("));
+  const retrySrc = applyIndexSrc.slice(applyIndexSrc.indexOf("function retryablePlacement("), applyIndexSrc.indexOf("function appendRetryControls("));
+  const src = applyBlock("PLUGIN_ROUTING") + "\n" + routingSrc + "\n" + retrySrc;
+
+  function makeClock() {
+    let pending: { id: number; fn: () => void }[] = [];
+    let nextId = 1;
+    return {
+      setTimeout: (fn: () => void) => { const id = nextId++; pending.push({ id, fn }); return id; },
+      clearTimeout: (id: number) => { pending = pending.filter((p) => p.id !== id); },
+      tick: async () => {
+        const batch = pending;
+        pending = [];
+        for (const p of batch) p.fn();
+        for (let i = 0; i < 12; i++) await Promise.resolve();
+      },
+    };
+  }
+  interface FakeEl { textContent: string; hidden?: boolean; disabled?: boolean; attrs?: Map<string, string>; setAttribute?: (n: string, v: string) => void; removeAttribute?: (n: string) => void; appendChild?: (c: unknown) => void }
+  const makeEl = (): FakeEl => {
+    const attrs = new Map<string, string>();
+    return { textContent: "", hidden: false, disabled: false, attrs, setAttribute: (n, v) => void attrs.set(n, v), removeAttribute: (n) => void attrs.delete(n), appendChild: () => {} };
+  };
+
+  function harness(opts: { routingDataInit: { routing: { results: { id: string; action: string; ok: boolean; at: string }[] }; discovery: unknown }; pluginsData: unknown }) {
+    const posts: { path: string; body?: string }[] = [];
+    const clock = makeClock();
+    const document = { createElement: makeEl, createTextNode: () => ({}) };
+    const setApplyText = (el: FakeEl, text: string) => { if (el.textContent !== text) el.textContent = text; };
+    // The bot lands the POST's own result on the VERY NEXT GET poll -- awaitRequestResult reads its poll
+    // via .json() (not .text(), like the POST response does), so both must be provided correctly, per the
+    // "missing .json() vs .text() mismatch" gotcha this file's own #245 harness comment already documents.
+    const liveResults: { id: string; action: string; ok: boolean; at: string }[] = [];
+    const api = async (path: string, init?: { method?: string; body?: string }) => {
+      if (init && init.method === "POST") {
+        const id = "req-" + (posts.length + 1);
+        posts.push({ path, body: init.body });
+        liveResults.push({ id, action: "routing-set", ok: true, at: "t" });
+        return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id }) };
+      }
+      return { ok: true, status: 200, text: async () => "", json: async () => ({ routing: { ...opts.routingDataInit.routing, results: liveResults }, discovery: opts.routingDataInit.discovery }) };
+    };
+    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    let refreshRoutingStepsCalls = 0;
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
+    let renderServersCalls = 0;
+    let renderNeedsAttentionCalls = 0;
+    const renderServers = () => { renderServersCalls++; };
+    const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
+    const run = new Function(
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
+      "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention",
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+        "return { retryablePlacement, retryRegistration };",
+    )(
+      document, api, timeoutSignal, setApplyText, opts.pluginsData, 110000, clock.setTimeout, clock.clearTimeout,
+      refreshRoutingSteps, serverActionState, renderServers, renderNeedsAttention,
+    ) as { retryablePlacement: () => RetryablePlacement; retryRegistration: () => Promise<void> };
+    return { run, posts, clock, serverActionState, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
+  }
+
+  const HOME = "100", OTHER = "200", GONE = "999";
+  const discovery = {
+    v: 1 as const,
+    generatedAt: new Date().toISOString(),
+    bot: { id: "b", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: HOME,
+    guilds: [
+      { id: HOME, name: "Home", channels: [], commands: { registered: 1, at: "t" } },
+      { id: OTHER, name: "Other", channels: [], commands: { registered: 1, at: "t" } },
+    ], // GONE is NOT here -- the bot has left it, but routing.json below still names it
+    plugins: {},
+  };
+  const pluginsData = { plugins: [{ name: "music", active: true }, { name: "wow", active: true }] };
+
+  test("music is placed in HOME+GONE (GONE unavailable), wow in OTHER only: retry SKIPS music and targets wow, POSTing OTHER alone", async () => {
+    const routingDataInit = {
+      routing: {
+        v: 1, updatedAt: "", updatedBy: "",
+        plugins: { music: { servers: { [HOME]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } }, wow: { servers: { [OTHER]: { commands: "all" as const } } } },
+        webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[],
+      },
+      discovery,
+    };
+    const h = harness({ routingDataInit, pluginsData });
+    expect(h.run.retryablePlacement()?.name).toBe("wow"); // music is placed FIRST in pluginsData order, but blocked
+
+    const pending = h.run.retryRegistration();
+    await h.clock.tick(); // the debounced sendRouting path doesn't apply here (no debounce in this call path), but the POST is async
+    await h.clock.tick();
+    await pending;
+
+    expect(h.posts).toHaveLength(1);
+    expect(h.posts[0]!.path).toBe("/api/routing");
+    // The recorded body carries OTHER (wow's own placement) alone -- music was never touched, and GONE
+    // never appears anywhere (this test's own proof that a resend can't silently drop an unavailable
+    // server: it simply never retries the plugin that has one).
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "wow", servers: { [OTHER]: { commands: "all" } } });
+  });
+
+  test("only music is placed, in HOME+GONE: no button (retryablePlacement blocked), no POST sent", async () => {
+    const routingDataInit = {
+      routing: {
+        v: 1, updatedAt: "", updatedBy: "",
+        plugins: { music: { servers: { [HOME]: { commands: "all" as const }, [GONE]: { commands: "all" as const } } } },
+        webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[],
+      },
+      discovery,
+    };
+    const h = harness({ routingDataInit, pluginsData: { plugins: [{ name: "music", active: true }] } });
+    const placement = h.run.retryablePlacement();
+    expect(placement).toEqual({ blocked: "unavailable", names: ["music"], counts: [{ name: "music", count: 1 }] });
+
+    await h.run.retryRegistration(); // a no-op: retryRegistration itself also checks placement.blocked
+    expect(h.posts).toHaveLength(0);
+    expect(h.renderServersCalls()).toBe(0); // never even entered the busy/settle cycle
+  });
+});
+
 // #246: source-pin tests for the Servers tab, the same discipline as #245's own equivalent block above.
 describe("Servers tab: source pins (#246)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
@@ -9739,22 +9948,28 @@ describe("Servers tab: source pins (#246)", () => {
   test("the Servers tab holds no Apply-bar control (source pin)", () => {
     // Round-1 claims-vs-code finding: this used to start at renderServers, which put every DOM BUILDER
     // (buildServerCard, buildWebhookRow, buildCommandsSection, buildAddWebhookForm,
-    // buildUnavailableServerCard, appendRetryControls, retryRegistration, firstPlacedPlugin -- the
+    // buildUnavailableServerCard, appendRetryControls, retryRegistration, retryablePlacement -- the
     // functions that actually interpolate server/channel names and webhook/error text into the DOM)
     // OUTSIDE the pinned slice, since they're all declared BEFORE renderServers in source order. A
     // regression rewriting one of them to use innerHTML would have passed this test untouched. Starts at
     // clearChildren instead -- the first of this whole group.
+    //
+    // Extended (orchestrator follow-up, second round) through renderNeedsAttention/goToFix/
+    // openPluginCard: the Needs-attention list interpolates the same server/channel/plugin/error text
+    // (via needsAttention's item.text) and was declared just past copyInviteLink, outside the original
+    // slice -- the same blind spot the round-1 finding already named for the builder functions.
     const start = indexSrc.indexOf("function clearChildren(");
-    const end = indexSrc.indexOf("async function copyInviteLink(");
+    const end = indexSrc.indexOf("function buildSettingsStep(");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    // Through the end of copyInviteLink's own body, not just up to its declaration.
-    const afterCopy = indexSrc.indexOf("\n  }\n", end);
-    const slice = indexSrc.slice(start, afterCopy);
+    const slice = indexSrc.slice(start, end);
     expect(slice.length).toBeGreaterThan(500); // can't pass vacuously
     expect(slice).toContain("function buildServerCard(");
     expect(slice).toContain("function buildWebhookRow(");
-    expect(slice).toContain("function firstPlacedPlugin(");
+    expect(slice).toContain("function retryablePlacement(");
+    expect(slice).toContain("function renderNeedsAttention(");
+    expect(slice).toContain("function goToFix(");
+    expect(slice).toContain("function openPluginCard(");
     for (const bad of ["dataset.key", "data-key", "dataset.plugin", "dataset.settingKey", "dataset.secretKey", "localStorage", "sessionStorage", "innerHTML"]) {
       expect({ bad, found: slice.includes(bad) }).toEqual({ bad, found: false });
     }
@@ -9766,6 +9981,36 @@ describe("Servers tab: source pins (#246)", () => {
     const slice = indexSrc.slice(start, end);
     expect(slice).toContain('input.type = "password";');
     expect(slice).toContain('input.autocomplete = "off";');
+  });
+
+  // Orchestrator follow-up (minor 4): copyInviteLink used to write "Copied." straight into
+  // #servers-status, which renderServers then overwrote (or resurrected a stale discovery message
+  // over) on its very next redraw -- any Add/Remove/Refresh/Try again anywhere on the tab. It now
+  // routes through serverActionState like every other Servers action, and renderServers gives that a
+  // real place in its own status-message priority.
+  test("copyInviteLink routes its message through serverActionState/renderServers, not a direct DOM write (source pin)", () => {
+    const start = indexSrc.indexOf("async function copyInviteLink(");
+    const end = indexSrc.indexOf("document.getElementById(\"refresh-discovery\")", start);
+    const slice = indexSrc.slice(start, end);
+    expect(slice).toContain('serverActionState.set("copy", { busy: false, message: "Copied." });');
+    expect(slice).toContain('serverActionState.set("copy", { busy: false, message: "Couldn\'t copy automatically');
+    expect(slice).toContain("renderServers();");
+    expect(slice).not.toContain('document.getElementById("servers-status")');
+
+    const renderStart = indexSrc.indexOf("function renderServers() {");
+    const renderEnd = indexSrc.indexOf("clearChildren(list);", renderStart);
+    const renderSlice = indexSrc.slice(renderStart, renderEnd);
+    expect(renderSlice).toContain('serverActionState.get("copy")');
+    // Priority order, each ahead of the next: a busy/settled discovery message, then a copy
+    // confirmation, then a stale discovery message, then the load-error fallback.
+    const busyIdx = renderSlice.indexOf("discoveryState && discoveryState.busy && discoveryState.message");
+    const copyIdx = renderSlice.indexOf("copyState && copyState.message");
+    const staleIdx = renderSlice.indexOf("discoveryState && discoveryState.message");
+    const loadErrorIdx = renderSlice.indexOf("routingData && routingData.loadError");
+    expect(busyIdx).toBeGreaterThan(-1);
+    expect(busyIdx).toBeLessThan(copyIdx);
+    expect(copyIdx).toBeLessThan(staleIdx);
+    expect(staleIdx).toBeLessThan(loadErrorIdx);
   });
 
   test("each durable Servers action clears its busy state after a first-request 401", () => {
@@ -9782,6 +10027,24 @@ describe("Servers tab: source pins (#246)", () => {
     const helper = indexSrc.slice(indexSrc.indexOf("function clearUnauthorizedServerAction("), indexSrc.indexOf("async function addWebhook("));
     expect(helper).toContain("serverActionState.delete(key);");
     expect(helper).toContain("renderServers();");
+  });
+
+  // Orchestrator follow-up (minor 7): addWebhook's own landed-success call is covered dynamically in the
+  // "addWebhook / pollForResult" mini-harness below; removeWebhook has no equivalent real-chain harness
+  // (its only coverage anywhere else is static), so this pins the call to removeWebhook's own success
+  // branch -- and only that branch, not the timeout/refusal ones next to it.
+  test("removeWebhook refreshes the Plugins tab's routing steps only on a landed success (source pin)", () => {
+    const start = indexSrc.indexOf("async function removeWebhook(");
+    const end = indexSrc.indexOf("async function refreshDiscoveryAll(");
+    const slice = indexSrc.slice(start, end);
+    const successBranch = slice.slice(slice.indexOf("} else {\n        serverActionState.delete(key);"));
+    // indexOf("}", 1): position 0 of successBranch is itself the closing brace of the PRECEDING
+    // else-if -- searching from 0 would match that one instead of the new block's own close.
+    expect(successBranch.slice(0, successBranch.indexOf("}", 1))).toContain("refreshRoutingSteps();");
+    const timeoutBranch = slice.slice(slice.indexOf("if (outcome.timeout) {"), slice.indexOf("} else if (!outcome.result.ok) {"));
+    const refusalBranch = slice.slice(slice.indexOf("} else if (!outcome.result.ok) {"), slice.indexOf("} else {\n        serverActionState.delete(key);"));
+    expect(timeoutBranch).not.toContain("refreshRoutingSteps();");
+    expect(refusalBranch).not.toContain("refreshRoutingSteps();");
   });
 
   // Round-2 review finding: a 401 midway through pollForResult's own loop (after the initiating request
@@ -9968,6 +10231,45 @@ describe("buildEnvControl pickers (#246, mini-harness)", () => {
     expect(rebuilt.value).toBe("999999999"); // the stored/operator value survives the stale rebuild
   });
 
+  // Orchestrator finding (minor 5): the PREVIOUS fix re-derived "was this a picker" from the live DOM
+  // (container.querySelectorAll) each render -- which breaks the moment something ELSE clears #env-fields
+  // in between two renderEnvFields calls, e.g. reloadConfig's own catch (`ef.textContent = msg`) on a
+  // failed reload. pickerKeysShown is a module-level Set that only renderEnvFields/refreshEnvPickers ever
+  // write to, so it survives a wipe from any other code path.
+  test("a picker survives even when something OTHER than renderEnvFields empties #env-fields in between renders", () => {
+    const registry = new Map<string, FakeEl>();
+    const container = makeEl("div");
+    container.id = "env-fields";
+    container.appendChild = (child) => {
+      container.children.push(child);
+      if (child.id) registry.set(child.id, child);
+      return child;
+    };
+    Object.defineProperty(container, "innerHTML", {
+      get: () => "",
+      set: () => {
+        for (const child of container.children) if (child.id) registry.delete(child.id);
+        container.children = [];
+      },
+    });
+    registry.set(container.id, container);
+    const h = harness(routingDataReady, registry, { loadedEnv: { DISCORD_SERVER_ID: "999999999" } });
+
+    h.renderEnvFields();
+    expect(registry.get("env-DISCORD_SERVER_ID")!.tagName).toBe("SELECT");
+
+    // Simulate reloadConfig's OWN catch path (a network error, NOT a renderEnvFields call): it wipes
+    // #env-fields by writing plain error text, wiping the DOM but never touching pickerKeysShown.
+    container.children = [];
+    registry.delete("env-DISCORD_SERVER_ID");
+
+    h.setRoutingData({ routing: null, discovery: null }); // discovery has since gone stale too
+    h.renderEnvFields();
+    const rebuilt = registry.get("env-DISCORD_SERVER_ID")!;
+    expect(rebuilt.tagName).toBe("SELECT"); // pickerKeysShown remembered it, even though the DOM never told it
+    expect(rebuilt.value).toBe("999999999");
+  });
+
   test("refreshEnvPickers upgrades a plain field to its picker in place, keeps a typed value, and never downgrades", () => {
     const plain = makeEl("input");
     // Round-2 claims-vs-code finding: this used to be "100", which also happens to be the canned
@@ -10064,9 +10366,11 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     let renderServersCalls = 0;
     let renderNeedsAttentionCalls = 0;
     let loadRoutingCalls = 0;
+    let refreshRoutingStepsCalls = 0;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
     const loadRouting = async () => { loadRoutingCalls++; };
+    const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
     const timeoutControllers: AbortController[] = [];
     const timeoutSignal = () => {
       const controller = new AbortController();
@@ -10085,11 +10389,11 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
-      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting",
+      "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps",
       `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
         "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
     )(
-      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting,
+      document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps,
     ) as {
       addWebhook: (guildId: string) => Promise<void>;
       pollForResult: (id: string, startedAt: number) => Promise<{ result?: unknown; timeout?: boolean; unauthorized?: boolean }>;
@@ -10108,6 +10412,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
       renderServersCalls: () => renderServersCalls,
       renderNeedsAttentionCalls: () => renderNeedsAttentionCalls,
       loadRoutingCalls: () => loadRoutingCalls,
+      refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
     };
   }
 
@@ -10144,6 +10449,8 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     expect(h1.serverActionState.has("add:100")).toBe(false); // settled clean -- no lingering message
     expect(h1.renderServersCalls()).toBeGreaterThanOrEqual(2); // once busy, once settled
     expect(h1.renderNeedsAttentionCalls()).toBeGreaterThanOrEqual(1);
+    // Orchestrator follow-up (minor 7): a landed Add refreshes the Plugins tab's webhook suffix too.
+    expect(h1.refreshRoutingStepsCalls()).toBe(1);
 
     const h2 = harness({
       inputValue: "https://discord.com/api/webhooks/1/tok",
@@ -10156,6 +10463,8 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     await h2.clock.tick();
     await h2.clock.tick();
     await p2;
+    // A refusal is not a landed change -- no refresh.
+    expect(h2.refreshRoutingStepsCalls()).toBe(0);
     expect(h2.serverActionState.get("add:100")).toEqual({ busy: false, message: "The bot refused it: server 424242 is not one the bot is in" });
   });
 
@@ -10276,34 +10585,35 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
 // firstPlacedPlugin's own selection and the no-plugin-placed early return.
 describe("retryRegistration (#246, mini-harness)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const src = indexSrc.slice(indexSrc.indexOf("function firstPlacedPlugin("), indexSrc.indexOf("function appendRetryControls("));
+  const src = indexSrc.slice(indexSrc.indexOf("function retryablePlacement("), indexSrc.indexOf("function appendRetryControls("));
 
   test("the marked functions are present", () => {
-    expect(src).toContain("function firstPlacedPlugin(");
     expect(src).toContain("function retryablePlacement(");
     expect(src).toContain("async function retryRegistration(");
   });
 
+  type StubModel = { mode: string; rows: unknown[]; unavailable?: string[] };
   function harness(
     routingDataInit: unknown,
     pluginsData: unknown,
-    model: { mode: string; rows: unknown[] } | (() => { mode: string; rows: unknown[] }) = { mode: "ready", rows: [] },
+    model: StubModel | ((name?: string) => StubModel) = { mode: "ready", rows: [], unavailable: [] },
+    sendRoutingOutcome: "held" | "error" | undefined = undefined,
   ) {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const sendRoutingCalls: string[] = [];
     const ensureRouteStateCalls: string[] = [];
     let renderServersCalls = 0;
     let renderNeedsAttentionCalls = 0;
-    const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); };
+    const sendRouting = async (plugin: string) => { sendRoutingCalls.push(plugin); return sendRoutingOutcome; };
     const ensureRouteState = (plugin: string) => { ensureRouteStateCalls.push(plugin); };
-    const routingStepModel = () => typeof model === "function" ? model() : model;
+    const routingStepModel = (name: string) => typeof model === "function" ? model(name) : model;
     const renderServers = () => { renderServersCalls++; };
     const renderNeedsAttention = () => { renderNeedsAttentionCalls++; };
     const run = new Function(
       "pluginsData", "serverActionState", "renderServers", "renderNeedsAttention", "ensureRouteState", "routingStepModel", "sendRouting",
-      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { firstPlacedPlugin, retryRegistration };`,
+      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${src}\nreturn { retryablePlacement, retryRegistration };`,
     )(pluginsData, serverActionState, renderServers, renderNeedsAttention, ensureRouteState, routingStepModel, sendRouting) as {
-      firstPlacedPlugin: () => string | null;
+      retryablePlacement: () => RetryablePlacement | null;
       retryRegistration: () => Promise<void>;
     };
     return { run, serverActionState, sendRoutingCalls, ensureRouteStateCalls, renderServersCalls: () => renderServersCalls, renderNeedsAttentionCalls: () => renderNeedsAttentionCalls };
@@ -10313,12 +10623,27 @@ describe("retryRegistration (#246, mini-harness)", () => {
   const unrouted = { routing: { plugins: {} } };
   const pluginsData = { plugins: [{ name: "warbandeer" }, { name: "music" }, { name: "wow" }] };
 
-  test("firstPlacedPlugin: the first PLACED plugin in pluginsData's own order, not manifest order alone", () => {
+  test("retryablePlacement: the first PLACED-and-retryable plugin in pluginsData's own order, not manifest order alone", () => {
     const h = harness(routed, pluginsData);
-    // warbandeer is first in pluginsData but unplaced; music is placed and comes next.
-    expect(h.run.firstPlacedPlugin()).toBe("music");
+    // warbandeer is first in pluginsData but unplaced; music is placed and comes next, and (the stubbed
+    // model being ready+available for every name) qualifies immediately.
+    expect(h.run.retryablePlacement()?.name).toBe("music");
     const h2 = harness(unrouted, pluginsData);
-    expect(h2.run.firstPlacedPlugin()).toBeNull();
+    expect(h2.run.retryablePlacement()).toBeNull();
+  });
+
+  // Orchestrator MAJOR finding: retryablePlacement must SKIP a placed-but-blocked plugin and keep looking,
+  // not stop at the first placed one regardless of whether it's actually safe to resend.
+  test("retryablePlacement skips a placed plugin with an unavailable server and selects the next one", () => {
+    const h = harness(routed, pluginsData, (name?: string) =>
+      name === "music" ? { mode: "ready", rows: [], unavailable: ["999"] } : { mode: "ready", rows: [], unavailable: [] },
+    );
+    expect(h.run.retryablePlacement()).toEqual({ name: "wow", model: { mode: "ready", rows: [], unavailable: [] } });
+  });
+
+  test("retryablePlacement reports every ready-but-blocked plugin when NONE qualify", () => {
+    const h = harness(routed, pluginsData, () => ({ mode: "ready", rows: [], unavailable: ["999"] }));
+    expect(h.run.retryablePlacement()).toEqual({ blocked: "unavailable", names: ["music", "wow"], counts: [{ name: "music", count: 1 }, { name: "wow", count: 1 }] });
   });
 
   test("retryRegistration re-sends the first placed plugin's saved placement via sendRouting", async () => {
@@ -10351,12 +10676,33 @@ describe("retryRegistration (#246, mini-harness)", () => {
     let modelCalls = 0;
     const h = harness(routed, pluginsData, () => {
       modelCalls++;
-      return modelCalls === 1 ? { mode: "ready", rows: [] } : { mode: "stale", rows: [] };
+      return modelCalls === 1 ? { mode: "ready", rows: [], unavailable: [] } : { mode: "stale", rows: [], unavailable: [] };
     });
     await h.run.retryRegistration();
     expect(modelCalls).toBe(1);
     expect(h.ensureRouteStateCalls).toEqual(["music"]);
     expect(h.sendRoutingCalls).toEqual(["music"]);
+  });
+
+  // Orchestrator finding (minor 3): sendRouting's two early exits (already in flight -> "held"; an
+  // unsendable planned body -> "error") used to leave this subject's "Applying…" message on screen with
+  // no report at all. sendRouting's own return value is checked now; try/finally means renderServers
+  // always runs even on these paths.
+  test("retryRegistration reports 'held' when sendRouting coalesces into an in-flight request", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "held");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({ busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2); // busy, then the held report
+  });
+
+  test("retryRegistration reports the planned-body error instead of silently leaving 'Applying…' up", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "error");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({
+      busy: false,
+      message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab.",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -10370,9 +10716,9 @@ describe("appendRetryControls (#246, mini-harness)", () => {
     return el;
   }
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
-  const src = indexSrc.slice(indexSrc.indexOf("function firstPlacedPlugin("), indexSrc.indexOf("// Decision 3's commands line"));
+  const src = indexSrc.slice(indexSrc.indexOf("function retryablePlacement("), indexSrc.indexOf("// Decision 3's commands line"));
 
-  function harness(routingDataInit: unknown, pluginsData: unknown, model: { mode: string; rows: unknown[] }) {
+  function harness(routingDataInit: unknown, pluginsData: unknown, model: { mode: string; rows: unknown[]; unavailable?: string[] }) {
     const document = { createElement: (tag: string) => makeEl(tag) };
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const routingStepModel = () => model;
@@ -10387,13 +10733,32 @@ describe("appendRetryControls (#246, mini-harness)", () => {
   const placed = { routing: { plugins: { music: { servers: {} } } } };
   const unplaced = { routing: { plugins: {} } };
 
-  test("a ready, placed plugin draws the Try again button", () => {
-    const h = harness(placed, pluginsData, { mode: "ready", rows: [] });
+  test("a ready, placed plugin with every server still visible draws the Try again button", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: [] });
     const container = makeEl("div");
     h.appendRetryControls(container);
     expect(container.children).toHaveLength(1);
     expect(container.children[0]!.tagName).toBe("BUTTON");
     expect(container.children[0]!.textContent).toBe("Try again");
+  });
+
+  // Orchestrator MAJOR finding: routingSetBody walks model.rows only, so retrying a plugin placed in a
+  // server discovery no longer sees would silently DROP that placement from routing.json. No button; an
+  // explanatory note naming the plugin and how many servers would be dropped.
+  test("a ready, placed plugin with an unavailable server draws the blocked note, not the button", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: ["999"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Try again would drop music's placement in 1 server the bot has left. Use Drop now on its card first.");
+  });
+
+  test("a ready, placed plugin with TWO unavailable servers pluralizes the note", () => {
+    const h = harness(placed, pluginsData, { mode: "ready", rows: [], unavailable: ["999", "888"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children[0]!.textContent).toBe("Try again would drop music's placement in 2 servers the bot has left. Use Drop now on its card first.");
   });
 
   test("a placed plugin with a stale model draws the 'wait for Discord' note, not the button", () => {
@@ -10406,7 +10771,7 @@ describe("appendRetryControls (#246, mini-harness)", () => {
   });
 
   test("nothing placed draws the restart sentence", () => {
-    const h = harness(unplaced, pluginsData, { mode: "ready", rows: [] });
+    const h = harness(unplaced, pluginsData, { mode: "ready", rows: [], unavailable: [] });
     const container = makeEl("div");
     h.appendRetryControls(container);
     expect(container.children).toHaveLength(1);
