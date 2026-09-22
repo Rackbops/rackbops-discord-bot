@@ -553,6 +553,31 @@ describe("resolveRegistryBase", () => {
   });
 });
 
+// The tests above pin resolveRegistryBase in isolation -- they say nothing about whether install.ts's
+// own module-level REGISTRY_BASE constant is actually WIRED to it. `const REGISTRY_BASE =
+// resolveRegistryBase(process.env)` and `const REGISTRY_BASE = process.env.PLUGIN_REGISTRY_URL ??
+// DEFAULT_REGISTRY` (the pre-#281 form) both leave every test above green, since neither line is
+// exercised by them -- the consumer boundary, not the predicate, is what a regression would actually
+// hit. A fresh `bun -e` subprocess is the only seam: process.env at Bun's own startup is what
+// REGISTRY_BASE captures, and it can't be swapped inside this already-running test process.
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+describe("REGISTRY_BASE is resolved through resolveRegistryBase: a blank PLUGIN_REGISTRY_URL in a fresh process is the default registry (#281)", () => {
+  const runInFreshProcess = (registryUrl: string): string => {
+    const proc = Bun.spawnSync(
+      [process.execPath, "-e", 'import { REGISTRY_BASE } from "./src/plugins/install.ts"; console.log(REGISTRY_BASE)'],
+      { cwd: REPO_ROOT, env: { ...process.env, PLUGIN_REGISTRY_URL: registryUrl } },
+    );
+    return new TextDecoder().decode(proc.stdout).trim();
+  };
+
+  test("a blank PLUGIN_REGISTRY_URL", () => {
+    expect(runInFreshProcess("")).toBe("https://registry.npmjs.org");
+  });
+  test("a real PLUGIN_REGISTRY_URL, trailing slash stripped", () => {
+    expect(runInFreshProcess("http://localhost:4873/")).toBe("http://localhost:4873");
+  });
+});
+
 // reconcileManifest is exported and total (never throws) — its cache-path call in tryInstallVersion
 // sits outside that function's own try, so a throw here would take installPlugins down for every
 // plugin, not just this one. Direct unit tests for the odd shapes a real or crafted package.json

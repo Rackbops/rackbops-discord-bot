@@ -21,8 +21,10 @@ export function resolveRegistryBase(env: Record<string, string | undefined>): st
 }
 
 // Development-only override so the end-to-end fixture-plugin flow can point at a local registry
-// stub (see .env.example). Production leaves it unset and resolves against npm.
-const REGISTRY_BASE = resolveRegistryBase(process.env);
+// stub (see .env.example). Production leaves it unset and resolves against npm. Exported (constant
+// export only, nothing else changes) so install.test.ts can pin that THIS constant, not just
+// resolveRegistryBase in isolation, is actually resolved through it in a fresh process.
+export const REGISTRY_BASE = resolveRegistryBase(process.env);
 const FETCH_TIMEOUT_MS = 30_000;
 
 interface InstallLog {
