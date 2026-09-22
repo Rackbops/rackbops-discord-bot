@@ -265,4 +265,34 @@ Branch `claude/theme-classes-toast` from `origin/main` after #246 has merged, is
     through the tags-composite's `focusTarget` indirection, the `.adm [aria-invalid]` CSS deletion's
     safety, the ~37-site sweep's classification, every acceptance-bullet command re-executed for real,
     and the Part B heading reading as one coherent section — checked out clean.
+- **Two findings relayed from the orchestrator, originating in `#305`'s (the now-closed, superseded
+  form-states PR) own round-3 NOT SOUND review — checked against #306's actual code, not copied from
+  #305's diff, since the two PRs implement the sweep differently:**
+  - **Config-refusal-survives-reload: does not reproduce in #306.** #305's finding described a live
+    Apply refusal's `aria-invalid` + `rb-field__error` node + `aria-describedby` token, on a Config
+    field, being destroyed when a keep-edits `reloadConfig` → `renderEnvFields()` rebuild replaces the
+    control. Verified by reading `refuseApply`/`applyInvalid`/`clearApplyInvalid`
+    (`index.html:4355-4379`, `4261-4264`) and `renderEnvFields` (`index.html:3439-3494`) in full: #306's
+    Apply-bar refusal mechanism (pre-existing, from #244/#257, untouched by #300's diff) marks a control
+    with **`aria-invalid="true"` only** — it never builds a per-field `rb-field__error` node or an
+    error-specific `aria-describedby` token for a Config-field refusal (confirmed: the only two
+    `rb-field__error` sites in the whole file are the unrelated `stateError` notice and `channelErr`,
+    neither reachable from `reloadConfig`/`renderEnvFields`/`applyInvalid`). The one thing that IS
+    real and pre-existing (not introduced or regressed by #300): `renderEnvFields()`'s
+    `container.innerHTML = ""` rebuild does silently drop the stale `aria-invalid` attribute (the old
+    control is detached; `applyInvalid` keeps pointing at it; `clearApplyInvalid()` remains harmless —
+    `removeAttribute` on a detached node — just visually inert). Untested before #300 and still
+    untested now (`grep applyInvalid ops/admin/server.test.ts` → no matches), out of #300's acceptance
+    bullets, and not something #306's diff touches or worsens — declined for #306 on the same
+    pre-existing/out-of-scope grounds as the `channelErr` finding above, not folded into the same
+    follow-up (different mechanism, different owner: this one is #244/#257's, not #300's). The
+    "mutation-guard the null path" ask doesn't apply here either — there is no new capture/restore code
+    in #306 to guard, since #306 never added any.
+  - **`field-hint` grep re-confirmed genuinely clean, including #246's Servers-panel additions.**
+    `git grep -n "field-hint" -- ops/admin/public/index.html ops/admin/public/admin.css` → no matches
+    (exit 1). Spot-checked every Servers-panel notice built by `SERVERS_TAB` (`servers__meta` status
+    line, per-server `server__line` rows, the webhook list's empty-state text, `attention__item`
+    entries) — all `adm-note`, correctly: none describe a specific control, matching #300's own
+    classification rule. No `rb-field__help`/`rb-field__error` misclassification found anywhere in the
+    Servers panel.
 
