@@ -8891,11 +8891,18 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // turning a real ReferenceError into a misleading "posted-error" outcome -- caught once, fixed here).
     let refreshRoutingStepsCalls = 0;
     const refreshRoutingSteps = () => { refreshRoutingStepsCalls++; };
+    // A real Date subclass (so `new Date(x)`/`.toLocaleString()` elsewhere in the slice keep working)
+    // whose `now()` is independently controllable -- the fake setTimeout/clearTimeout clock never
+    // advances real wall-clock time, so a real 30s wait is otherwise the only way to reach a timeout path.
+    let fakeNow = Date.now();
+    class FakeDate extends Date {
+      static now() { return fakeNow; }
+    }
     const run = new Function(
-      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
+      "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
         "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
-    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
+    )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
       sendRouting: (plugin: string) => Promise<void>;
@@ -8931,7 +8938,11 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // fix (seed once the model first reaches "ready", not once per plugin regardless of mode) never
     // fires a surprise reseed over a selection a test built by hand via onRouteChange.
     const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null, seeded: true });
-    return { run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed, refreshRoutingStepsCalls: () => refreshRoutingStepsCalls };
+    return {
+      run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed,
+      refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
+      advanceFakeNow: (ms: number) => { fakeNow += ms; },
+    };
   }
 
   const discovery = {
@@ -9166,6 +9177,51 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await pending;
     expect(h.routeState.get("music")?.inflight).toBeNull(); // settled, not stuck forever
     expect(getCalls).toBeGreaterThanOrEqual(2);
+  });
+
+  // Round-3 review finding: a genuine 30s timeout on a discovery-refresh fell through to the SAME branch
+  // as a normal landing (a silent refreshRoutingSteps, no message at all) -- the operator saw nothing.
+  // advanceFakeNow moves the harness's own injected Date.now() past ROUTING_ANSWER_TIMEOUT_MS without a
+  // real 30s wait.
+  test("refreshDiscovery shows a visible message on a genuine 30s timeout, distinct from landing (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-3" }) };
+        // The id never lands in results -- the only way this settles is the timeout path.
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set, startedAt captured at the current fakeNow
+    h.advanceFakeNow(31000); // past ROUTING_ANSWER_TIMEOUT_MS (30000), no real wait
+    await h.clock.tick(); // the poll's own wait fires -> GET (never found) -> timedOut true
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull();
+    expect(h.routeState.get("music")?.outcome).toMatchObject({
+      phase: "posted-error",
+      message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.",
+    });
+    // The timeout path must NOT be confused with a normal landing (which calls refreshRoutingSteps
+    // instead of setting a visible outcome).
+    expect(h.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  // Round-3 review finding: a failed discovery-refresh POST (non-ok response) rendered nothing at all.
+  test("refreshDiscovery shows a visible message when the POST itself fails (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery };
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: false, status: 502, text: async () => "bot-ops: plugin-request failed" };
+        return { ok: true, status: 200, json: async () => routingDataInit };
+      }) as never,
+    });
+    h.seed("music");
+    await h.run.refreshDiscovery("music");
+    expect(h.routeState.get("music")?.outcome).toEqual({ phase: "posted-error", message: "Couldn't send it: bot-ops: plugin-request failed" });
   });
 
   // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the
