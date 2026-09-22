@@ -8894,7 +8894,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps",
       `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
-        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
+        "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
       scheduleRoutingSend: (plugin: string) => void;
@@ -8903,6 +8903,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       resetToSaved: (plugin: string) => void;
       checkAgain: (plugin: string) => void;
       refreshDiscovery: (plugin: string) => Promise<void>;
+      ensureRouteState: (plugin: string, model: { mode: string; rows: { id: string; on: boolean; commands: unknown; postTo: string | null }[] }) => { selection: Record<string, unknown>; seeded?: boolean };
       routeState: Map<
         string,
         {
@@ -8913,6 +8914,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
           sendTimer?: unknown;
           pollTimer?: unknown;
           lastSent?: { id: string; sentServers: string[] };
+          seeded?: boolean;
         }
       >;
       routingStepEls: Map<
@@ -8924,7 +8926,11 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     // onRouteChange requires a routeState entry to already exist (real usage: ensureRouteState seeds it
     // on the step's first render, inside buildWhereItLivesStep -- browser-only, not part of this slice).
     // Every test here drives a plugin already ticked into no servers, matching a freshly-opened card.
-    const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null });
+    // seeded: true -- simulates a plugin whose card has already been normally rendered/seeded once
+    // (the realistic precondition for every existing test here), so ensureRouteState's round-3 re-seed
+    // fix (seed once the model first reaches "ready", not once per plugin regardless of mode) never
+    // fires a surprise reseed over a selection a test built by hand via onRouteChange.
+    const seed = (plugin: string) => run.routeState.set(plugin, { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null, seeded: true });
     return { run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed, refreshRoutingStepsCalls: () => refreshRoutingStepsCalls };
   }
 
@@ -9102,6 +9108,64 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await pending;
     expect(h.routeState.get("music")?.held).toBe(false); // consumed, not left dangling
     expect(h.posts.some((p) => { try { return JSON.parse(p.body!).servers?.["100"]; } catch { return false; } })).toBe(true);
+  });
+
+  // Round-3 review finding: ensureRouteState used to seed on the first CALL, not the first READY model.
+  // refreshDiscovery calls it too (to track its own inflight/held) -- and in missing/stale mode
+  // model.rows is always [] (nothing has a name yet), so clicking "Refresh from Discord" from missing
+  // mode (routeState has no entry yet, since buildWhereItLivesStep never seeds in that mode) seeded an
+  // EMPTY selection FOREVER, before the real placement was ever known. The next render (discovery now
+  // landed, ready) reused that empty selection: every row showed unticked while placementSummary (reads
+  // the model, not the selection) still said "In 1 server." -- and the operator's next tick sent
+  // routingSetBody over the empty selection, silently dropping the plugin's real, existing placement.
+  test("ensureRouteState seeds once the model first reaches ready, not on the first call regardless of mode (round-3 finding)", () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: null };
+    const h = harness({ routingDataInit });
+    // First call: missing mode (rows always [] -- nothing has a name yet), the real precondition when
+    // "Refresh from Discord" is clicked on a card whose routeState has never been touched.
+    const missingModel = { mode: "missing", rows: [] };
+    const st1 = h.run.ensureRouteState("music", missingModel);
+    expect(st1.selection).toEqual({});
+    expect(st1.seeded).toBe(false);
+    // Discovery lands: the SAME plugin's model is now ready, with a real saved placement.
+    const readyModel = { mode: "ready", rows: [{ id: "100", on: true, commands: "all" as const, postTo: null }] };
+    const st2 = h.run.ensureRouteState("music", readyModel);
+    expect(st2).toBe(st1); // same routeState entry, not a fresh one
+    expect(st2.selection["100"]).toMatchObject({ on: true, scope: "all" });
+    expect(st2.seeded).toBe(true);
+    // A LATER ready model must not re-seed again (an in-progress pick survives a background refresh).
+    const laterReadyModel = { mode: "ready", rows: [{ id: "200", on: true, commands: "all" as const, postTo: null }] };
+    const st3 = h.run.ensureRouteState("music", laterReadyModel);
+    expect(st3.selection["100"]).toBeDefined(); // untouched
+    expect(st3.selection["200"]).toBeUndefined(); // NOT re-seeded from the later model
+  });
+
+  // Round-3 review finding: refreshDiscovery's own GET/json() pair inside its poll loop was unguarded,
+  // unlike awaitRequestResult's identical poll -- one transient failure threw out of the WHOLE loop to
+  // the outer catch, which left inflight set forever (the step stuck on "Applying…", every control
+  // disabled, until a full page reload). Fixed by wrapping it the same way awaitRequestResult already is.
+  test("refreshDiscovery survives one transient read failure mid-poll instead of getting stuck forever (round-3 finding)", async () => {
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let getCalls = 0;
+    const h = harness({
+      routingDataInit,
+      apiImpl: (async (_path: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "disco-2" }) };
+        getCalls++;
+        if (getCalls === 1) throw new Error("transient network failure");
+        const live = { routing: { ...routingDataInit.routing, results: [{ id: "disco-2", action: "discovery-refresh", ok: true, at: "t" }] }, discovery };
+        return { ok: true, status: 200, json: async () => live };
+      }) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await h.clock.tick(); // POST -> inflight set
+    await h.clock.tick(); // first poll -> GET throws -> must NOT propagate out
+    expect(h.routeState.get("music")?.inflight).not.toBeNull(); // still recovering, not stuck with no outcome path
+    await h.clock.tick(); // second poll -> GET succeeds -> lands
+    await pending;
+    expect(h.routeState.get("music")?.inflight).toBeNull(); // settled, not stuck forever
+    expect(getCalls).toBeGreaterThanOrEqual(2);
   });
 
   // Round-1 review finding: the plan's decision 6 ("in flight, the step body carries aria-busy and the

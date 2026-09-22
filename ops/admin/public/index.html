@@ -1044,10 +1044,23 @@
   }
 
   // Lazily seeds routeState from the model's OWN saved placement, once per plugin -- never re-seeded from
-  // a later model, so an in-progress pick a background loadRouting/poll brought in survives it.
+  // a later model, so an in-progress pick a background loadRouting/poll brought in survives it. Round-3
+  // review finding: seeding used to happen on first CALL, not first READY model -- refreshDiscovery calls
+  // this too (to track its own inflight/held), and in missing/stale mode model.rows is always [] (nothing
+  // has a name yet), so a "Refresh from Discord" click from missing mode seeded an EMPTY selection
+  // forever, before the real placement was ever known. The very next render (now ready, discovery
+  // landed) reused that empty selection: every row showed unticked while placementSummary (which reads
+  // the model, not the selection) still correctly said "In 1 server." -- and the operator's next tick
+  // sent routingSetBody over the empty selection, silently dropping every server the plugin was actually
+  // in. Fixed by seeding only once the model is actually "ready" (`st.seeded`), regardless of how many
+  // times, or in which mode, this was called before that.
   function ensureRouteState(plugin, model) {
     let st = routeState.get(plugin);
     if (!st) {
+      st = { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null, seeded: false };
+      routeState.set(plugin, st);
+    }
+    if (!st.seeded && model.mode === "ready") {
       const selection = {};
       for (const row of model.rows) {
         if (row.on) {
@@ -1059,8 +1072,8 @@
           };
         }
       }
-      st = { selection, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null };
-      routeState.set(plugin, st);
+      st.selection = selection;
+      st.seeded = true;
     }
     return st;
   }
@@ -1384,25 +1397,57 @@
           await new Promise((resolve) => setTimeout(resolve, ROUTING_POLL_MS));
           const now = routeState.get(plugin);
           if (!now || !now.inflight || now.inflight.id !== result.id) return;
-          const r = await api("/api/routing");
-          routingData = await r.json();
+          // Round-3 review finding: this GET/json() pair was unguarded, unlike awaitRequestResult's own
+          // (identical) poll -- one transient failure (a 504, a network blip) threw out of this whole
+          // loop to the outer catch below, which left `inflight` set forever: the step stayed "Applying…"
+          // with every control disabled (renderRouteStatus's busy rule) until a full page reload. Mirrors
+          // awaitRequestResult: swallow and retry until the timeout, below, actually ends the wait.
+          try {
+            const r = await api("/api/routing");
+            routingData = await r.json();
+          } catch (e) {
+            if (e && e.message === "unauthorized") return;
+            // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+          }
+          const now2 = routeState.get(plugin);
+          if (!now2 || !now2.inflight || now2.inflight.id !== result.id) return; // superseded mid-fetch
           const found = routingData.routing && routingData.routing.results && routingData.routing.results.find((x) => x.id === result.id);
-          if (found || Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS) {
-            now.inflight = null;
-            refreshRoutingSteps();
+          const timedOut = !found && Date.now() - startedAt >= ROUTING_ANSWER_TIMEOUT_MS;
+          if (found || timedOut) {
+            now2.inflight = null;
+            if (timedOut) {
+              // No "Check again" here (unlike a routing-set timeout): this request never gets a
+              // routeState.lastSent entry, and checkAgain/awaitRequestResult's "applied" outcome talks
+              // about per-server command registration, which a bare discovery refresh has none of --
+              // reusing that machinery would wire up a button that silently does nothing. A plain visible
+              // message is enough; another click on "Refresh from Discord" is the real retry.
+              now2.outcome = { phase: "posted-error", message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." };
+              renderRouteStatus(plugin, routingStepEls.get(plugin));
+            } else {
+              refreshRoutingSteps();
+            }
             // Same fix as checkAgain, same reason: a routing edit made while a discovery refresh is in
             // flight sets held (sendRouting sees this loop's own st.inflight and defers), and this is the
             // only place that settles it -- unconsumed otherwise.
-            if (now.held) {
-              now.held = false;
+            if (now2.held) {
+              now2.held = false;
               sendRouting(plugin);
             }
             return;
           }
         }
+      } else {
+        // Round-3 review finding: this branch rendered nothing at all ("a retry is just another click"),
+        // so a failed discovery-refresh POST was invisible -- same visibility the routing-set send uses.
+        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
       }
     } catch (e) {
-      if (!e || e.message !== "unauthorized") { /* the step stays as it was; a retry is just another click */ }
+      const message = e && e.message ? e.message : String(e);
+      if (message !== "unauthorized") {
+        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
+        renderRouteStatus(plugin, routingStepEls.get(plugin));
+      }
     } finally {
       cancel();
     }
