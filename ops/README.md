@@ -697,8 +697,13 @@ routed mode — the quiet single-mode line that isn't a problem; which plugins l
 here by default"; and its webhooks, each with a **Remove**. An **Add a webhook** field pastes a Discord
 webhook URL — it is cleared from the field the instant you press Add, whatever happens next, and never
 shown again; the bot asks Discord which channel it actually posts to, and that channel is where the
-webhook shows up. **Try again** re-sends whichever plugin is placed first — a no-op change that makes the
-bot re-register every server — and is replaced by a note to restart the bot when nothing is placed yet.
+webhook shows up. **Try again** re-sends the saved placement of the first placed plugin whose servers the
+bot can *all* still see — a genuine no-op that re-runs the bot's per-server command registration without
+changing `routing.json`; a plugin placed first is deliberately skipped when it still names a server the
+bot has left, since re-sending would drop that placement. When no placed plugin qualifies, a note stands
+in for the button and says why: routing data is stale (refresh Discord first), a placement names a server
+the bot has left (use **Drop now** on that plugin's card first), or nothing is placed at all (restart the
+bot to retry).
 A toolbar **Refresh from Discord** re-reads what the bot can currently see, and **Copy invite link** puts
 the bot's own invite URL on your clipboard (or shows it in a field to copy by hand). One card per server
 routing or a webhook still names but the bot has since left stays listed, read-only, until its placement
@@ -715,7 +720,9 @@ a raw snowflake, grouped by server for a channel picker, and a channel the bot c
 in its own option. They write the exact same key and value a pasted id would, so nothing about the Apply
 bar changes. Without a recent picture of the bot's servers (or before the panel has one at all), all three
 fall back to the plain id field, upgrading to the picker in place — keeping whatever you'd already typed —
-once discovery is ready.
+once discovery is ready. A picker is never downgraded back to the plain field once it has been shown, even
+if discovery later goes stale: it keeps a control the operator may be mid-edit on rather than swapping it
+out, and an id the bot can no longer see stays as its own selected option.
 
 **Driving an available update (#105).** A card whose plugin is ON and has a newer release than the one
 installed grows an update-action area (#225: an off plugin's card still shows its installed version,

@@ -469,7 +469,8 @@
   let lastStatus = null;
 
   // #246: per-subject state for the Servers tab's own actions (add:<guildId>, remove:<channelId>,
-  // "retry", "discovery") -- the same shape and reason as #245's routeState: survives a renderServers()
+  // "retry", "discovery", and "copy" -- the transient "Copied." confirmation, always cleared by the next
+  // real action or reload) -- the same shape and reason as #245's routeState: survives a renderServers()
   // rebuild (never a closure over a DOM node that render just replaced), read fresh at every render so a
   // busy control or a settled message is never lost mid-flight. { busy: boolean, message: string|null }.
   let serverActionState = new Map();
@@ -1286,12 +1287,14 @@
     }, ROUTING_SEND_DEBOUNCE_MS);
   }
 
-  // Orchestrator finding: returns a small signal on its two early exits ("held" -- something for this
-  // plugin was already in flight, this call was coalesced; "error" -- the planned body was unsendable,
-  // e.g. an empty channel list) so a caller with its OWN status line (retryRegistration's "retry" subject)
-  // can report it instead of silently leaving a stale "Applying…" behind. Every other caller (the
-  // debounced onRouteChange path, checkAgain) already has its own row-level UI for both cases and simply
-  // ignores the return value, unchanged.
+  // Orchestrator finding: returns a small signal so a caller with its OWN status line
+  // (retryRegistration's "retry" subject) can report the outcome instead of silently leaving a stale
+  // "Applying…" behind -- "held" (something for this plugin was already in flight, this call was
+  // coalesced), "error" (the planned body was unsendable, e.g. an empty channel list), "posted-error"
+  // (the POST itself failed -- a non-2xx, an unparseable body, a network error; the detail is on the
+  // plugin's own card via renderRouteStatus), "unauthorized" (a 401 -- the login gate is already up), or
+  // "sent" once the POST was accepted and its result polled to a settled outcome. Every other caller (the
+  // debounced onRouteChange path, checkAgain) already has its own row-level UI and ignores the return.
   async function sendRouting(plugin) {
     const st = routeState.get(plugin);
     if (!st) return;
@@ -1333,7 +1336,7 @@
         if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
-        return;
+        return "posted-error";
       }
       let result = null;
       try { result = JSON.parse(text); } catch { /* treated as a failure below */ }
@@ -1341,20 +1344,21 @@
         if (st.inflight === reservation) st.inflight = null;
         st.outcome = { phase: "posted-error", message: "Couldn't send it: " + text };
         renderRouteStatus(plugin, routingStepEls.get(plugin));
-        return;
+        return "posted-error";
       }
       const startedAt = Date.now();
       reservation.id = result.id;
       reservation.startedAt = startedAt;
       renderRouteStatus(plugin, routingStepEls.get(plugin));
       await awaitRequestResult(plugin, result.id, sentServers, startedAt);
+      return "sent";
     } catch (e) {
       if (st.inflight === reservation) st.inflight = null;
       const message = e && e.message ? e.message : String(e);
-      if (message !== "unauthorized") {
-        st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
-        renderRouteStatus(plugin, routingStepEls.get(plugin));
-      }
+      if (message === "unauthorized") return "unauthorized";
+      st.outcome = { phase: "posted-error", message: "Couldn't send it: " + message };
+      renderRouteStatus(plugin, routingStepEls.get(plugin));
+      return "posted-error";
     } finally {
       cancel();
       if (st.held) {
@@ -1625,6 +1629,9 @@
         ? { ...routingData, loadError }
         : { routing: null, discovery: null, loadError };
     }
+    // A reload is a fresh picture: a leftover "Copied." confirmation from before it must not survive it
+    // (orchestrator round 2 -- otherwise it could outlive every action that cleared its own state).
+    serverActionState.delete("copy");
     refreshRoutingSteps();
     renderServers();
     refreshEnvPickers();
@@ -1701,6 +1708,7 @@
     if (existing && existing.busy) return;
     const placement = retryablePlacement();
     if (!placement || placement.blocked) return; // no button is drawn in that state -- see appendRetryControls
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
     serverActionState.set(key, { busy: true, message: "Applying…" });
     renderServers();
     try {
@@ -1710,10 +1718,21 @@
         serverActionState.set(key, { busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
       } else if (outcome === "error") {
         serverActionState.set(key, { busy: false, message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab." });
+      } else if (outcome === "posted-error") {
+        // Minor 3: sendRouting used to return undefined on a failed POST, which fell into the success
+        // branch below and blanked this line -- the only report then landed on the plugin's own card.
+        serverActionState.set(key, { busy: false, message: "Couldn't resend it: the bot didn't accept the request. See the plugin's card on the Plugins tab for the reason." });
       } else {
+        // "sent", "unauthorized", or undefined (no route state) -- nothing to keep on this line; the
+        // plugin's card carries any per-server outcome, and a 401 has already shown the login gate.
         serverActionState.delete(key);
       }
     } finally {
+      // Minor 4: the busy state is set OUTSIDE the try, so a throw (e.g. from ensureRouteState) would
+      // never reach a branch above and would strand this subject at busy forever, disabling the button
+      // until a reload. Never leave it busy on the way out.
+      const s = serverActionState.get(key);
+      if (s && s.busy) serverActionState.delete(key);
       renderServers();
       renderNeedsAttention();
     }
@@ -1960,14 +1979,8 @@
     const refreshBtn = document.getElementById("refresh-discovery");
     if (refreshBtn) refreshBtn.disabled = !!(discoveryState && discoveryState.busy);
     const status = document.getElementById("servers-status");
-    // A live refresh in flight (or its own outcome) always wins; otherwise a copy confirmation
-    // outranks a stale discovery message, which outranks the load-error fallback.
-    const statusMessage =
-      (discoveryState && discoveryState.busy && discoveryState.message) ||
-      (copyState && copyState.message) ||
-      (discoveryState && discoveryState.message) ||
-      (routingData && routingData.loadError ? "Couldn't read where plugins live: " + routingData.loadError : "");
-    if (status) setApplyText(status, statusMessage);
+    // The precedence is the pure serversStatusMessage (SERVERS_TAB), so it is pinned without a DOM.
+    if (status) setApplyText(status, serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError));
 
     clearChildren(list);
     if (!discovery) {
@@ -1998,6 +2011,7 @@
     // #246: cleared BEFORE the request is awaited, whatever the outcome -- a refusal means paste again.
     if (input) input.value = "";
     if (!url) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
     serverActionState.set(key, { busy: true, message: "Adding…" });
     renderServers();
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
@@ -2051,6 +2065,7 @@
     const existing = serverActionState.get(key);
     if (existing && existing.busy) return;
     if (!confirm("Remove the webhook for #" + channelName + "? The bot posts there as itself afterwards.")) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
     serverActionState.set(key, { busy: true, message: "Removing…" });
     renderServers();
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
@@ -2147,6 +2162,7 @@
     const key = "discovery";
     const existing = serverActionState.get(key);
     if (existing && existing.busy) return;
+    serverActionState.delete("copy"); // a real action supersedes a leftover "Copied." confirmation
     serverActionState.set(key, { busy: true, message: "Refreshing…" });
     renderServers();
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
@@ -3329,7 +3345,12 @@
       // module-level Set renderEnvFields itself adds to whenever it builds a picker (right after this
       // call), so the memory survives however #env-fields gets clobbered in between.
       const control = buildEnvControl(key, value, pickerKeysShown.has(key));
-      if (control.tagName === "SELECT") pickerKeysShown.add(key);
+      // Record ONLY the server/channel pickers (minor 5): preservePicker is consulted by buildEnvControl
+      // for those keys alone, and LOG_LEVEL's enum select / BOT_BRANCH's branch select are their own
+      // controls every render regardless -- so tracking them here would make the set's meaning ("keys
+      // that have shown a discovery picker") false without changing any behaviour.
+      const controlKind = (FIELD_META[key] || {}).control;
+      if (control.tagName === "SELECT" && (controlKind === "server" || controlKind === "channel")) pickerKeysShown.add(key);
       const label = document.createElement("label");
       label.className = "rb-label";
       label.textContent = key + (loadedSchema[key] && loadedSchema[key].required ? " *" : "");
@@ -3856,6 +3877,23 @@
       options.push({ value, label: value + " (not visible to the bot)" });
     }
     return options;
+  }
+
+  // The Servers toolbar's one status line (#servers-status), decided purely so its precedence is pinned
+  // without a DOM. Orchestrator round 2: the discovery action's own message -- IN FLIGHT ("Refreshing…")
+  // OR SETTLED (a refusal, a timeout, a "Couldn't send it") -- always wins, since it is the outcome of the
+  // operator's last real action; then the retained-stale-snapshot warning; and a transient "Copied."
+  // confirmation is LAST, so it can never mask a settled refresh outcome (the previous order put copy
+  // ahead of a settled discovery message, which silently re-opened the "keep the refusal visible" fix).
+  // "copy" is also cleared at the top of every durable action and in loadRouting's tail, so it only ever
+  // reaches this function when nothing has happened since Copy was clicked.
+  function serversStatusMessage(discoveryState, copyState, loadError) {
+    return (
+      (discoveryState && discoveryState.message) ||
+      (loadError ? "Couldn't read where plugins live: " + loadError : "") ||
+      (copyState && copyState.message) ||
+      ""
+    );
   }
   // SERVERS_TAB:end
 

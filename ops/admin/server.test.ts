@@ -5241,7 +5241,7 @@ describe("Dockerfile COPY ratchet: every server.ts local import is copied into t
   });
 });
 
-// ---- #238: the panel shell (Rackbops theme, static assets, three tabs) --------------------------
+// ---- #238: the panel shell (Rackbops theme, static assets, four tabs since #246) ----------------
 
 // The page's stylesheets are served from an exact-match Map (HandlerConfig.assets), built at startup
 // from STATIC_ASSET_FILES -- the request path is only ever a key, never a filesystem path.
@@ -5844,8 +5844,8 @@ describe("tabs (lifted from index.html)", () => {
   });
 });
 
-// The markup half of the tabs, and the guarantee that moving seven stacked sections under three tabs
-// lost nothing. Parsed from the real index.html (the page markup only -- not the script below it).
+// The markup half of the tabs, and the guarantee that moving the stacked sections under four tabs (#246
+// added Servers) lost nothing. Parsed from the real index.html (the page markup only -- not the script).
 describe("page skeleton", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const bodyStart = indexSrc.indexOf("<body>");
@@ -8823,13 +8823,18 @@ describe("SERVERS_TAB (#246): pure parts", () => {
   type NeedsAttentionItem = { kind: string; text: string; fix: { label: string; go: string } };
   type PickerOption = { value: string; label: string; group?: string };
   const fns = new Function(
-    `"use strict";\n${src}\nreturn { routedMode, serverCardModel, unavailableServers, needsAttention, pickerOptions };`,
+    `"use strict";\n${src}\nreturn { routedMode, serverCardModel, unavailableServers, needsAttention, pickerOptions, serversStatusMessage };`,
   )() as {
     routedMode: (routing: unknown) => boolean;
     serverCardModel: (guild: unknown, routingData: unknown, pluginsData: unknown) => ServerCardModel;
     unavailableServers: (routingData: unknown) => { id: string; plugins: string[]; webhooks: string[] }[];
     needsAttention: (input: unknown) => NeedsAttentionItem[];
     pickerOptions: (key: string, discovery: unknown, value: string) => PickerOption[];
+    serversStatusMessage: (
+      discoveryState: { busy: boolean; message: string | null } | undefined,
+      copyState: { busy: boolean; message: string | null } | undefined,
+      loadError: string | undefined,
+    ) => string;
   };
 
   test("the marked block is present", () => {
@@ -9088,6 +9093,28 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     const withKnown = fns.pickerOptions("channel", discovery, GEN_CH);
     expect(withKnown.filter((o) => o.value === GEN_CH)).toHaveLength(1);
   });
+
+  // Orchestrator round 2 (MAJOR): the previous status-message chain placed a "Copied." confirmation ABOVE
+  // a settled discovery message, so a Refresh-from-Discord refusal (or timeout, or "Couldn't send it")
+  // was silently masked by a leftover "Copied." from an earlier Copy-invite-link click -- on the very
+  // path the commands-refused fix sends the operator down ("Re-invite, then try again" -> Copy, then
+  // Refresh). A settled discovery outcome must win.
+  test("serversStatusMessage: a settled discovery outcome outranks a leftover Copied.; copy shows only when nothing else has", () => {
+    const copied = { busy: false, message: "Copied." };
+    const refusal = { busy: false, message: "The bot refused it: Discord refused the refresh" };
+    // The regression itself: copy present AND a settled discovery refusal -> the refusal wins.
+    expect(fns.serversStatusMessage(refusal, copied, undefined)).toBe("The bot refused it: Discord refused the refresh");
+    // A busy refresh in flight also wins over copy (unchanged from before).
+    expect(fns.serversStatusMessage({ busy: true, message: "Refreshing…" }, copied, undefined)).toBe("Refreshing…");
+    // The retained-stale-snapshot warning also outranks a leftover copy.
+    expect(fns.serversStatusMessage(undefined, copied, "read failed")).toBe("Couldn't read where plugins live: read failed");
+    // A discovery message outranks the load-error fallback.
+    expect(fns.serversStatusMessage(refusal, undefined, "read failed")).toBe("The bot refused it: Discord refused the refresh");
+    // Copy shows only when there is no discovery message and no load error.
+    expect(fns.serversStatusMessage(undefined, copied, undefined)).toBe("Copied.");
+    // Nothing anywhere -> empty.
+    expect(fns.serversStatusMessage(undefined, undefined, undefined)).toBe("");
+  });
 });
 
 // #246: selectionFromModel was extracted out of #245's ensureRouteState (Step 1) -- pinned separately so
@@ -9193,12 +9220,15 @@ describe("loadRouting preserves the last good snapshot (#245 follow-up)", () => 
     const renderServers = () => { calls.servers++; };
     const refreshEnvPickers = () => { calls.pickers++; };
     const renderNeedsAttention = () => { calls.attention++; };
+    // loadRouting clears the transient "Copied." confirmation on every load (orchestrator round 2).
+    const serverActionState = new Map<string, unknown>();
     return {
       calls,
+      serverActionState,
       run: new Function(
-        "api", "refreshRoutingSteps", "renderServers", "refreshEnvPickers", "renderNeedsAttention",
+        "api", "refreshRoutingSteps", "renderServers", "refreshEnvPickers", "renderNeedsAttention", "serverActionState",
         `"use strict";\nlet routingData = ${JSON.stringify(initial)};\n${src}\nreturn { loadRouting, getRoutingData: () => routingData };`,
-      )(api, refreshRoutingSteps, renderServers, refreshEnvPickers, renderNeedsAttention) as {
+      )(api, refreshRoutingSteps, renderServers, refreshEnvPickers, renderNeedsAttention, serverActionState) as {
         loadRouting: () => Promise<void>;
         getRoutingData: () => unknown;
       },
@@ -9208,9 +9238,12 @@ describe("loadRouting preserves the last good snapshot (#245 follow-up)", () => 
   test("a transient failure retains prior routing and discovery and marks them stale", async () => {
     const previous = { routing: { plugins: { music: { servers: {} } }, webhooks: {}, results: [] }, discovery: { generatedAt: "2026-09-22T00:00:00.000Z", guilds: [] } };
     const h = harness(previous);
+    h.serverActionState.set("copy", { busy: false, message: "Copied." });
     await h.run.loadRouting();
     expect(h.run.getRoutingData()).toEqual({ ...previous, loadError: "temporary routing outage" });
     expect(h.calls).toEqual({ steps: 1, servers: 1, pickers: 1, attention: 1 });
+    // A reload wipes a leftover "Copied." (orchestrator round 2 -- otherwise it could outlive the action).
+    expect(h.serverActionState.has("copy")).toBe(false);
   });
 
   test("a first-load failure has no invented routing data and carries the visible reason", async () => {
@@ -9997,27 +10030,35 @@ describe("Servers tab: source pins (#246)", () => {
     expect(slice).toContain("renderServers();");
     expect(slice).not.toContain('document.getElementById("servers-status")');
 
+    // renderServers delegates the #servers-status precedence to the pure serversStatusMessage, which the
+    // SERVERS_TAB describe pins dynamically (orchestrator round 2 -- a source-pin on the term order used
+    // to pass with the "Copied." masking bug present, since it only checked textual order, not outcome).
     const renderStart = indexSrc.indexOf("function renderServers() {");
     const renderEnd = indexSrc.indexOf("clearChildren(list);", renderStart);
     const renderSlice = indexSrc.slice(renderStart, renderEnd);
     expect(renderSlice).toContain('serverActionState.get("copy")');
-    // Priority order, each ahead of the next: a busy/settled discovery message, then a copy
-    // confirmation, then a stale discovery message, then the load-error fallback.
-    const busyIdx = renderSlice.indexOf("discoveryState && discoveryState.busy && discoveryState.message");
-    const copyIdx = renderSlice.indexOf("copyState && copyState.message");
-    const staleIdx = renderSlice.indexOf("discoveryState && discoveryState.message");
-    const loadErrorIdx = renderSlice.indexOf("routingData && routingData.loadError");
-    expect(busyIdx).toBeGreaterThan(-1);
-    expect(busyIdx).toBeLessThan(copyIdx);
-    expect(copyIdx).toBeLessThan(staleIdx);
-    expect(staleIdx).toBeLessThan(loadErrorIdx);
+    expect(renderSlice).toContain("serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError)");
+  });
+
+  // Orchestrator round 2 (MAJOR): "Copied." had unbounded lifetime -- serverActionState.set("copy", …)
+  // with no matching delete anywhere -- so it lingered for the whole page session. It is now cleared at
+  // the top of every durable Servers action and in loadRouting's tail, so a real action or a reload
+  // always supersedes it (the pure-function ordering above is the belt to this brace).
+  test('"copy" is cleared by every durable action and by loadRouting, so a leftover confirmation cannot survive one (source pin)', () => {
+    for (const fn of ["async function addWebhook(", "async function removeWebhook(", "async function refreshDiscoveryAll(", "async function retryRegistration("]) {
+      const start = indexSrc.indexOf(fn);
+      const body = indexSrc.slice(start, indexSrc.indexOf("\n  }\n", start));
+      expect({ fn, clearsCopy: body.includes('serverActionState.delete("copy")') }).toEqual({ fn, clearsCopy: true });
+    }
+    const loadRouting = indexSrc.slice(indexSrc.indexOf("async function loadRouting("), indexSrc.indexOf("function refreshRoutingSteps("));
+    expect(loadRouting).toContain('serverActionState.delete("copy")');
   });
 
   test("each durable Servers action clears its busy state after a first-request 401", () => {
     const ranges: [string, string][] = [
       ["async function addWebhook(", "async function removeWebhook("],
       ["async function removeWebhook(", "async function pollForResult("],
-      ["async function refreshDiscoveryAll(", "function renderNeedsAttention("],
+      ["async function refreshDiscoveryAll(", "async function copyInviteLink("],
     ];
     for (const [start, end] of ranges) {
       const slice = indexSrc.slice(indexSrc.indexOf(start), indexSrc.indexOf(end, indexSrc.indexOf(start)));
@@ -10072,9 +10113,13 @@ describe("Servers tab: source pins (#246)", () => {
   });
 
   test("the Servers tab labels retained routing data as stale after a routing read failure", () => {
+    // renderServers passes routingData.loadError into the pure serversStatusMessage, which owns the
+    // "Couldn't read where plugins live:" wording (orchestrator round 2 -- the SERVERS_TAB describe pins
+    // that a load error outranks a leftover "Copied." dynamically).
     const render = indexSrc.slice(indexSrc.indexOf("function renderServers("), indexSrc.indexOf("const refreshServers = renderServers;"));
-    expect(render).toContain("routingData && routingData.loadError");
-    expect(render).toContain("Couldn't read where plugins live: ");
+    expect(render).toContain("serversStatusMessage(discoveryState, copyState, routingData && routingData.loadError)");
+    const helper = applyBlock("SERVERS_TAB").slice(applyBlock("SERVERS_TAB").indexOf("function serversStatusMessage("));
+    expect(helper).toContain("Couldn't read where plugins live: ");
   });
 });
 
@@ -10625,7 +10670,7 @@ describe("retryRegistration (#246, mini-harness)", () => {
     routingDataInit: unknown,
     pluginsData: unknown,
     model: StubModel | ((name?: string) => StubModel) = { mode: "ready", rows: [], unavailable: [] },
-    sendRoutingOutcome: "held" | "error" | undefined = undefined,
+    sendRoutingOutcome: "held" | "error" | "posted-error" | "sent" | "unauthorized" | undefined = undefined,
   ) {
     const serverActionState = new Map<string, { busy: boolean; message: string | null }>();
     const sendRoutingCalls: string[] = [];
@@ -10732,6 +10777,30 @@ describe("retryRegistration (#246, mini-harness)", () => {
     });
     expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2);
   });
+
+  // Orchestrator round 2 (minor 3): sendRouting returns "posted-error" when the POST itself failed (a
+  // non-2xx, an unparseable body, a network error). Before this, that fell into the success branch and
+  // blanked the retry line -- the only report then landed on the plugin's own card. Now it is surfaced
+  // here too, with a pointer to the card for the detail.
+  test("retryRegistration surfaces a failed POST instead of clearing the line as if it succeeded", async () => {
+    const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, "posted-error");
+    await h.run.retryRegistration();
+    expect(h.serverActionState.get("retry")).toEqual({
+      busy: false,
+      message: "Couldn't resend it: the bot didn't accept the request. See the plugin's card on the Plugins tab for the reason.",
+    });
+    expect(h.renderServersCalls()).toBeGreaterThanOrEqual(2);
+  });
+
+  // A genuine send ("sent") and a 401 ("unauthorized") both leave nothing on the retry line -- the
+  // plugin's own card carries any per-server outcome, and a 401 has shown the login gate.
+  test("retryRegistration clears the retry line on a genuine send or a 401", async () => {
+    for (const outcome of ["sent", "unauthorized"] as const) {
+      const h = harness(routed, pluginsData, { mode: "ready", rows: [], unavailable: [] }, outcome);
+      await h.run.retryRegistration();
+      expect({ outcome, retained: h.serverActionState.has("retry") }).toEqual({ outcome, retained: false });
+    }
+  });
 });
 
 // Round-3 review finding: appendRetryControls' own three-way branch selection (button / "stale, wait for
@@ -10787,6 +10856,19 @@ describe("appendRetryControls (#246, mini-harness)", () => {
     const container = makeEl("div");
     h.appendRetryControls(container);
     expect(container.children[0]!.textContent).toBe("Try again would drop music's placement in 2 servers the bot has left. Use Drop now on its card first.");
+  });
+
+  // Orchestrator round 2 (minor 1): the multi-plugin blocked note (two or more placed plugins each with
+  // an unavailable server) had no coverage -- only the single-plugin branch did.
+  test("two placed plugins each blocked draws the multi-plugin note naming both", () => {
+    const twoPlaced = { routing: { plugins: { music: { servers: {} }, wow: { servers: {} } } } };
+    const twoPluginsData = { plugins: [{ name: "music" }, { name: "wow" }] };
+    const h = harness(twoPlaced, twoPluginsData, { mode: "ready", rows: [], unavailable: ["999"] });
+    const container = makeEl("div");
+    h.appendRetryControls(container);
+    expect(container.children).toHaveLength(1);
+    expect(container.children[0]!.tagName).toBe("P");
+    expect(container.children[0]!.textContent).toBe("Try again would drop placements in servers the bot has left, for: music, wow. Use Drop now on each card first.");
   });
 
   test("a placed plugin with a stale model draws the 'wait for Discord' note, not the button", () => {
