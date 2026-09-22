@@ -68,23 +68,28 @@ Branch `claude/install-force-bin-usage` from `origin/main`, isolated worktree. T
   already uses elsewhere (`BRANCH_GUARD_LINES`'s own comment: "removing either fails the extract
   loudly") — not a design gap, just naming the actual failure shape observed instead of a narrower
   one.
-- **`schema_of()`'s mutation didn't reproduce the "aborts the script" half of the issue's own
-  description, only the "prints an empty schema" half — for the specific call sites tested.**
-  Reverting to the bare `grep -m1 ... | cut` pipeline made all three `issue #295` schema_of tests
-  fail, but by producing an *empty* schema value (`"...schema )"`, `"...schema  vs main's 5"`)
-  rather than aborting the script outright. Traced to where `$(schema_of ...)` is actually used: at
-  every call site in `install_shared_bin` it's embedded inside a larger string (an `echo`/`die`
-  argument, or a `note="... $(...)"` assignment concatenated with literal text) rather than being
-  the *entire* right-hand side of a bare `var=$(schema_of ...)` assignment — and bash's `errexit`
-  only inspects the exit status of the command actually being run (`echo`, `die`, the assignment
-  statement), not a command substitution's exit status when it's just one piece of a larger
-  expansion. The abort path the issue describes is real (and is exactly what the *unfixed*
-  `compose_schema="$(grep ... | cut ...)"` line does, confirmed separately: that one — a plain
-  `var=$(cmd | cmd)` assignment with nothing else on the right-hand side — does abort the script
-  under the old code, per #291's own review-gate note declining this exact finding). Either failure
-  mode is a defect the fix corrects and the test still catches; not a change to which lines were
-  fixed or which tests exist, just a correction to the mutation table's stated failure mode for this
-  one row.
+- **`schema_of()`'s mutation reproduces BOTH of the issue's failure modes, split across the three
+  named tests, not just the "prints an empty schema" half as an earlier draft of this note claimed
+  (round-1 review finding, reviewer B on PR #296 — verified and corrected in writing, no re-review
+  round needed since only the description changes, not the code or the tests).** Reverting to the
+  bare `grep -m1 ... | cut` pipeline makes all three `issue #295` schema_of tests fail, but not
+  uniformly: the two tests whose failing call site is `$(schema_of ...)` embedded inside a larger
+  `echo`/`die` argument (the "main's own fetch lacks the schema line" summary-line test, and the
+  "a differing branch whose OWN copy lacks the schema line" refusal-message test) fail by producing
+  an *empty* schema value instead of aborting — bash's `errexit` only inspects the exit status of
+  the command actually being run (`echo`/`die`), not a command substitution's exit status when it's
+  just one piece of a larger expansion. But the third test ("main's copy lacks the schema line, the
+  differing branch has one: --force-bin's note names 'unknown' for main's side") hits
+  `note=" (--force-bin: ... $(schema_of "$main_copy"))"` — a bare variable assignment whose entire
+  right-hand side is a string containing the command substitution — and THAT call site really does
+  abort the script under the old code: reproduced directly (`note=" ... $(schema_of missing-line-
+  file)"` under `set -euo pipefail` prints nothing after the assignment and exits 1), and it's
+  exactly why that one test's own failure under the mutation is an exit-code mismatch (`Expected: 0,
+  Received: 1`) rather than a content mismatch like the other two. The `compose_schema=` line
+  aborts for the same reason (a bare `var=$(cmd | cmd)` assignment with nothing else on the
+  right-hand side). Either failure mode is a defect the fix corrects and the named test still
+  catches it; this correction only fixes which failure mode is attributed to which of the three
+  tests, not the tests or the code.
 - **Manual acceptance runs (paste-the-real-output bullets) used the same stubs `runBranchGate`/
   `runSharedBin` use (`fetch`, `curl`, `chown`, `mkdir`, `sed` faked; `resolve_deploy_identity`
   faked to avoid a real `id`), not a live `curl | bash` against a real host** — `install.sh`
@@ -93,3 +98,12 @@ Branch `claude/install-force-bin-usage` from `origin/main`, isolated worktree. T
   approach ("no real `install.sh` run against nucbox here"). The extracted source slices are pulled
   from the real, committed `ops/install.sh` (not hand-copied), so the output below is the real
   script's real behaviour on that slice, just without a live host underneath it.
+
+## Review gate rounds
+
+**Round 1** — two adversarial reviewers, different lenses, both read-only in detached scratch worktrees at the pushed head (`e3c3434`):
+
+- **Reviewer A (correctness / failure modes): SOUND, no blocking findings.** Independently reproduced the `set -euo pipefail` claim across all three usage contexts (bare assignment aborts; `echo`/`die`-embedded does not), independently re-ran all three named mutations with matching pass/fail counts, traced the three requested dash-argument edge cases (`-x`, `--`, bare `-` as the branch) and found no position bug, confirmed no downstream code parses `schema_of`/`compose_schema` output numerically, and confirmed the empty-vs-missing conflation is intentional and matches the doc comment. Two minor/theoretical, non-blocking observations (a pre-existing, out-of-scope hyphen gap in `INSTANCE`'s own regex; a stderr-only `grep: no such file` leak on a codepath that can't be reached in practice) — both declined in writing, no code change: out of #295's scope and unreachable by any real deploy path, respectively.
+- **Reviewer B (claims-vs-code / test quality): SOUND, one minor finding — verified and fixed in writing.** Byte-for-byte confirmed the usage message, re-ran all three mutations in a separate scratch copy with matching results, confirmed the `FORCE_BIN`-reporting harness change reads the real variable (not a no-op), confirmed both dash-argument test controls are non-vacuous, confirmed the `#230`/`#232` describe blocks are unedited (diffed against `origin/main`), and independently re-derived the acceptance-output paste byte-for-byte. **Finding:** this plan file's own "Deviations from the plan" section claimed none of `schema_of`'s three real call sites reproduce the issue's "aborts the script" failure mode — false for the `note="... $(schema_of "$main_copy"))"` call site (a bare assignment), which does abort, exactly matching that test's own `Expected: 0, Received: 1` mutation-table evidence. Verified directly (see above) and corrected in place in this section's schema_of bullet — wording-only (the shipped code and the test file are both unaffected; only the *description* of why the test catches the regression was wrong), so no third-party re-review round per the personal wording-vs-behavior-fix rule.
+
+No blocking findings from either reviewer. 2 of 2 SOUND on the major points. One minor, evidenced, single-reviewer finding (reviewer B's) fixed in writing above; two minor findings (reviewer A's) declined in writing above. Stopping at round 1.
