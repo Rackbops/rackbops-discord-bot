@@ -13,11 +13,12 @@
 // `docker stop`'s own SIGKILL timeout) before letting the process exit — see `awaitCriticalIdle`
 // and `handoffExemption` below for how a handoff's own holder avoids waiting on itself.
 //
-// The one exception is a plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #217):
-// the host stops waiting on it rather than let one hung plugin hold every requested restart forever,
-// so that tick's critical section closes while its call is still running. From then until the call
-// settles, neither a restart request nor a SIGTERM/SIGINT drain waits for it — including one that
-// arrives after the section closed, not just one already pending when it did.
+// A plugin tick holds its own unit of the critical section for as long as its call is pending, even
+// past PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #248). A restart request or a shutdown notifies the
+// `onStopRequested` listeners below; the plugin host's listener aborts every pending tick's
+// AbortSignal and lets go of each hold once the tick settles or PLUGIN_TICK_ABORT_GRACE_MS elapses —
+// so a cooperating tick is never cut off mid-write, and one that ignores its signal delays a restart
+// by that grace at most, never forever (the #217 trade-off this replaces).
 
 /** Distinct from a crash, so a supervisor can tell an update apart from a failure. */
 export const RESTART_EXIT_CODE = 75;
@@ -37,6 +38,9 @@ let exitFn: ExitFn = (code) => process.exit(code);
 let shuttingDown = false;
 // Resolvers waiting on awaitCriticalIdle, drained by maybeResolveIdle() below.
 let idleResolvers: (() => void)[] = [];
+// #248: called once, the first time the process is asked to stop (see onStopRequested).
+let stopListeners: ((reason: string) => void)[] = [];
+let stopNotified = false;
 
 /**
  * #154: how much of `critical`'s current depth is the handoff's own, permanently-open holder —
@@ -102,6 +106,34 @@ export function resetForTest(): void {
   handoff = undefined;
   shuttingDown = false;
   idleResolvers = [];
+  stopListeners = [];
+  stopNotified = false;
+}
+
+/**
+ * #248: registers `fn` to run once, the first time this process is asked to stop — a restart request
+ * (`requestRestart`) or a shutdown (`beginShutdown`), whichever comes first. The plugin host uses it
+ * to abort in-flight plugin ticks, so a stop waits for them to bail rather than for them to finish.
+ * A listener runs synchronously, before `requestRestart` decides whether to exit now or defer; one
+ * that throws is logged and never stops the others or the stop itself. Returns an unsubscribe.
+ */
+export function onStopRequested(fn: (reason: string) => void): () => void {
+  stopListeners.push(fn);
+  return () => {
+    stopListeners = stopListeners.filter((l) => l !== fn);
+  };
+}
+
+function notifyStop(reason: string): void {
+  if (stopNotified) return;
+  stopNotified = true;
+  for (const listener of stopListeners) {
+    try {
+      listener(reason);
+    } catch (err) {
+      console.error("[restart] a stop listener threw (continuing)", err);
+    }
+  }
 }
 
 export function beginCritical(): void {
@@ -183,6 +215,7 @@ export function restartPending(): boolean {
 export function beginShutdown(reason: string): void {
   shuttingDown = true;
   console.log(`[restart] shutdown in progress: ${reason}`);
+  notifyStop(reason);
 }
 
 /**
@@ -218,6 +251,8 @@ export function awaitCriticalIdle(timeoutMs: number): Promise<boolean> {
 export function requestRestart(reason: string): void {
   if (pending !== undefined) return;
   pending = reason;
+  // #248: first, so a plugin tick holding the critical section is told to bail before we wait on it.
+  notifyStop(reason);
   if (critical === 0) doExit(reason);
   else console.log(`[restart] deferred until in-flight work finishes: ${reason}`);
 }

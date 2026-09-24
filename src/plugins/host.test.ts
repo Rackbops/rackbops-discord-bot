@@ -18,6 +18,8 @@ const {
   autocompleteOptionPaths,
   pluginTicks,
   PLUGIN_TICK_TIMEOUT_MS,
+  PLUGIN_TICK_ABORT_GRACE_MS,
+  createPluginTickControl,
   activatePlugins,
   disposePlugins,
   buildPluginStateFile,
@@ -29,7 +31,17 @@ const {
 // The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
 // relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
 const { runTick, TICK_MS } = await import("../announce");
-const { withCritical, requestRestart, setExitFn, resetForTest: resetRestartState } = await import("../restart");
+const {
+  withCritical,
+  requestRestart,
+  setExitFn,
+  resetForTest: resetRestartState,
+  beginCritical,
+  endCritical,
+  beginShutdown,
+  awaitCriticalIdle,
+  onStopRequested,
+} = await import("../restart");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 
@@ -526,6 +538,134 @@ describe("pluginTicks", () => {
       errorSpy.mockRestore();
       resetRestartState();
     }
+  });
+
+  // #248: the same restart as the test above, with the control index.ts wires -- each call holds the
+  // critical section until it settles, and a stop aborts it. `withStop` stands up exactly that wiring
+  // against the real restart.ts, with the exit captured.
+  const withStop = async (graceMs: number, body: (h: { control: ReturnType<typeof createPluginTickControl>; exited: () => boolean }) => Promise<void>) => {
+    resetRestartState();
+    let exited = false;
+    const restoreExit = setExitFn(() => { exited = true; });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const control = createPluginTickControl({ hold: () => { beginCritical(); return endCritical; }, graceMs });
+    const off = onStopRequested((reason) => control.stop(reason));
+    try {
+      await body({ control, exited: () => exited });
+    } finally {
+      off();
+      restoreExit();
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      resetRestartState();
+    }
+  };
+
+  test("each call is passed an AbortSignal, aborted when the timeout abandons it (#248)", async () => {
+    const seen: (AbortSignal | undefined)[] = [];
+    const run = (signal?: AbortSignal) => { seen.push(signal); return HUNG(); };
+    const lp = loaded(entry({ name: "sig" }), { ticks: [{ name: "t", run }] }, true);
+    expect(await settleOrHang(() => checkFor(lp, 20).run())).toBeInstanceOf(Error);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
+    expect(seen[0]!.aborted).toBe(true);
+    expect((seen[0]!.reason as Error).message).toBe("plugin tick sig:t exceeded 20ms");
+  });
+
+  test("a call that settles in time is not aborted (#248)", async () => {
+    let signal: AbortSignal | undefined;
+    const lp = loaded(entry({ name: "ok" }), { ticks: [{ name: "t", run: async (s?: AbortSignal) => { signal = s; } }] }, true);
+    expect(await settleOrHang(() => checkFor(lp, 60_000).run())).toBe("resolved");
+    expect(signal?.aborted).toBe(false);
+  });
+
+  test("an overrunning tick that honours its signal holds a pending restart until it has bailed (#248)", async () => {
+    await withStop(60_000, async ({ control, exited }) => {
+      const events: string[] = [];
+      const run = async (signal?: AbortSignal) => {
+        await Bun.sleep(40); // past the 20ms bound: the wait is abandoned, the section closes
+        requestRestart("update"); // a restart arrives AFTER the tick's section closed (#217's worst case)
+        events.push(`restart requested, exited=${exited()}`);
+        if (signal?.aborted) {
+          events.push("bailed");
+          return;
+        }
+        events.push("wrote after the restart"); // what a non-cooperating tick would do
+      };
+      const lp = loaded(entry({ name: "coop" }), { ticks: [{ name: "t", run }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20, control)));
+      expect(exited()).toBe(false); // the abandoned call still holds the critical section
+      await Bun.sleep(60);
+      expect(events).toEqual(["restart requested, exited=false", "bailed"]);
+      expect(exited()).toBe(true); // ...and the restart lands the moment it settles
+    });
+  });
+
+  test("a tick that ignores its signal delays a restart by the grace, never forever (#248)", async () => {
+    await withStop(50, async ({ control, exited }) => {
+      const lp = loaded(entry({ name: "deaf" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20, control)));
+      requestRestart("update");
+      expect(exited()).toBe(false); // held by the hung call...
+      await Bun.sleep(100);
+      expect(exited()).toBe(true); // ...until the 50ms grace lets go of it
+    });
+  });
+
+  test("a shutdown aborts a pending tick and the drain resolves once it bails (#248)", async () => {
+    await withStop(60_000, async ({ control }) => {
+      let signal: AbortSignal | undefined;
+      const run = (s?: AbortSignal) =>
+        new Promise<void>((resolve) => {
+          signal = s;
+          s?.addEventListener("abort", () => resolve());
+        });
+      const lp = loaded(entry({ name: "drain" }), { ticks: [{ name: "t", run }] }, true);
+      const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+      const tick = check!.run();
+      expect(signal?.aborted).toBe(false);
+      beginShutdown("SIGTERM");
+      expect(signal?.aborted).toBe(true);
+      expect(await awaitCriticalIdle(1_000)).toBe(true);
+      await tick;
+    });
+  });
+
+  test("no new plugin tick call starts once a stop is under way (#248)", async () => {
+    let started = 0;
+    const control = createPluginTickControl();
+    const lp = loaded(entry({ name: "late" }), { ticks: [{ name: "t", run: async () => { started += 1; } }] }, true);
+    const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+    await check!.run();
+    control.stop("restart");
+    await check!.run();
+    expect(started).toBe(1);
+    expect(control.stopping).toBe(true);
+  });
+
+  test("a call released by the grace and then settling releases its hold once, not twice (#248)", async () => {
+    await withStop(20, async ({ control }) => {
+      let finish = () => {};
+      const run = () => new Promise<void>((resolve) => { finish = resolve; });
+      const lp = loaded(entry({ name: "twice" }), { ticks: [{ name: "t", run }] }, true);
+      const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+      const tick = check!.run();
+      beginCritical(); // an unrelated section that must stay counted
+      control.stop("restart");
+      await Bun.sleep(50); // the grace releases the tick's hold
+      finish(); // then the tick settles: a second release would also close the unrelated section
+      await tick;
+      expect(await awaitCriticalIdle(10)).toBe(false);
+      endCritical();
+      expect(await awaitCriticalIdle(10)).toBe(true);
+    });
+  });
+
+  test("PLUGIN_TICK_ABORT_GRACE_MS leaves the shutdown grace room for dispose and the gateway close (#248)", async () => {
+    const { SHUTDOWN_GRACE_MS } = await import("../shutdown");
+    expect(PLUGIN_TICK_ABORT_GRACE_MS).toBe(5_000);
+    expect(PLUGIN_TICK_ABORT_GRACE_MS).toBeLessThan(SHUTDOWN_GRACE_MS);
   });
 
   test("PLUGIN_TICK_TIMEOUT_MS stays under the 60s scheduler tick (#217)", () => {

@@ -218,22 +218,26 @@ export interface PluginCommand {
 /**
  * One scheduler check, run inside the bot's guarded tick with the core checks; failures are isolated per check.
  *
- * What the host does with a plugin's tick (#217, `pluginTicks` in `src/plugins/host.ts`):
+ * What the host does with a plugin's tick (#217, #248, `pluginTicks` in `src/plugins/host.ts`):
  * - Each call is waited on for at most `PLUGIN_TICK_TIMEOUT_MS` (currently 30 s). Past that the host stops WAITING
- *   and logs the overrun as this plugin's failure; it cannot cancel the call, which keeps running.
+ *   and logs the overrun as this plugin's failure; it aborts the call's signal (below), but a call that ignores the
+ *   signal keeps running.
  * - A tick is skipped, with a warning, while its own previous call is still pending, so it never runs concurrently
  *   with itself. That guard is per tick, not per plugin: the plugin's OTHER ticks keep running, concurrently with
  *   the abandoned call.
  * - A call that is merely slow recovers once it settles; one that never settles silences that one tick until the
  *   bot restarts.
- * - A restart, or a SIGTERM/SIGINT stop, does not wait for an abandoned call. A tick that announces should
- *   therefore write its dedup key BEFORE it announces: an overrun past the timeout that coincides with a restart or
- *   a stop can otherwise post the announcement a second time after the restart. Cancelling the call properly
- *   (an `AbortSignal` in `run`) is tracked in #248.
+ * - `run` is passed an `AbortSignal` (#248). The host aborts it at the timeout, and when the bot is asked to stop (a
+ *   restart, or a SIGTERM/SIGINT). A restart or a stop then waits a few seconds (`PLUGIN_TICK_ABORT_GRACE_MS`, 5 s)
+ *   for every pending call to settle — including one the timeout abandoned — before it exits; no new call starts
+ *   once a stop is under way. A tick that honours the signal (pass it to `fetch`, check `signal.aborted` before a
+ *   write or a post) is therefore never cut off halfway. One that ignores it keeps working as before, but a stop
+ *   exits under it once the grace is spent, so a tick that announces should still write its dedup key BEFORE it
+ *   announces. The parameter is optional to read: a plugin built before it existed is unaffected.
  */
 export interface TickCheck {
   name: string;
-  run(): Promise<void>;
+  run(signal?: AbortSignal): Promise<void>;
 }
 
 /**

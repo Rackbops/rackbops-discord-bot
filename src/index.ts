@@ -15,7 +15,15 @@ import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
-import { awaitCriticalIdle, beginShutdown, restartPending, withCritical } from "./restart";
+import {
+  awaitCriticalIdle,
+  beginCritical,
+  beginShutdown,
+  endCritical,
+  onStopRequested,
+  restartPending,
+  withCritical,
+} from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./plugins/registry";
@@ -28,11 +36,13 @@ import {
   activatePlugins,
   buildCommandBody,
   createHostApi,
+  createPluginTickControl,
   dispatchPluginInteraction,
   disposePlugins,
   loadPlugins,
   mutatePluginState,
   PLUGIN_DISPOSE_TIMEOUT_MS,
+  PLUGIN_TICK_TIMEOUT_MS,
   pluginCommandMap,
   pluginTicks,
   readPluginState,
@@ -237,7 +247,17 @@ async function activate(c: Client<true>): Promise<void> {
   // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
 
-  startScheduler(client, pluginTicks(loadResult.loaded, console));
+  // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
+  // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores
+  // its signal holds the stop for PLUGIN_TICK_ABORT_GRACE_MS at most. Wired before the first tick runs.
+  const tickControl = createPluginTickControl({
+    hold: () => {
+      beginCritical();
+      return endCritical;
+    },
+  });
+  onStopRequested((reason) => tickControl.stop(reason));
+  startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
 
   // #241: the request mailbox is also drained every few seconds on its own timer, so a routing change
   // made in the panel shows up while the operator is still looking; the `pluginRequests` tick check

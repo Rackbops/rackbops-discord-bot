@@ -202,35 +202,121 @@ export function buildCommandBody(
  *  rejects, which `runTick` logs as that plugin's own failure before moving on to the next plugin.
  *  Kept under `announce.ts`'s 60s `TICK_MS` so a single hung tick can't by itself hold `guardedTick`
  *  past the next interval — `runTick` awaits checks one after another, so before this a hung tick
- *  held every plugin loaded after it for as long as it hung. It bounds the WAIT, not the call:
- *  cancelling would need an AbortSignal in `TickCheck.run`, a contract change every plugin would have
- *  to opt into, so the abandoned call keeps running — concurrently with whatever runs next, that
- *  plugin's other ticks included — and `pluginTicks` skips that tick (with a warning) until it
- *  settles, rather than starting a second call on top of it. A call that never settles therefore
- *  silences that tick until the bot restarts; its siblings keep running. */
+ *  held every plugin loaded after it for as long as it hung. At the bound the host also aborts the
+ *  call's `AbortSignal` (#248), so a cooperating tick bails; one that ignores the signal keeps
+ *  running — concurrently with whatever runs next, that plugin's other ticks included — and
+ *  `pluginTicks` skips that tick (with a warning) until it settles, rather than starting a second
+ *  call on top of it. A call that never settles therefore silences that tick until the bot
+ *  restarts; its siblings keep running. */
 export const PLUGIN_TICK_TIMEOUT_MS = 30_000;
+
+/** How long a stop (a requested restart, or a SIGTERM/SIGINT) waits for plugin ticks it has just
+ *  aborted to settle before it stops waiting on them (#248). Kept under `shutdown.ts`'s 8s
+ *  `SHUTDOWN_GRACE_MS`, so a tick that ignores its signal releases the drain with room left for
+ *  `disposePlugins` and the gateway close — and a restart is delayed by at most this, never held
+ *  forever the way #217 had to rule out. */
+export const PLUGIN_TICK_ABORT_GRACE_MS = 5_000;
 
 /** Rejects if `p` hasn't settled within `ms`, and clears its timer either way — unlike
  *  `disposePlugins`' race below (a one-shot on the way out, where a leftover timer is harmless),
  *  this runs on every 60s tick, and a timer left armed after its tick settled would sit dead for up
- *  to `ms`, holding the event loop open that long. Once the timeout wins, `p`'s late settle lands on
- *  an already-settled resolve/reject and is dropped, never an unhandled rejection. */
-function withTickTimeout(p: Promise<void>, ms: number, label: string): Promise<void> {
+ *  to `ms`, holding the event loop open that long. Once the timeout wins, `onTimeout` runs (it
+ *  aborts the call's signal, #248) and `p`'s late settle lands on an already-settled resolve/reject
+ *  and is dropped, never an unhandled rejection. */
+function withTickTimeout(p: Promise<void>, ms: number, label: string, onTimeout: (err: Error) => void): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`plugin tick ${label} exceeded ${ms}ms`)), ms);
+    const timer = setTimeout(() => {
+      const err = new Error(`plugin tick ${label} exceeded ${ms}ms`);
+      onTimeout(err);
+      reject(err);
+    }, ms);
     p.then(resolve, reject).finally(() => clearTimeout(timer));
   });
+}
+
+/**
+ * #248: what lets a stop cancel plugin ticks rather than walk away from them. Every plugin tick call
+ * is registered here with its `AbortController` for as long as the call itself is pending — past
+ * `PLUGIN_TICK_TIMEOUT_MS` too — and, when `hold` is wired, holds one unit of `restart.ts`'s critical
+ * section for that whole time. That closes #217's gap: a tick the timeout abandoned no longer lets a
+ * restart or a SIGTERM drain exit under it. `stop()` — wired to `restart.ts`'s `onStopRequested`, so
+ * it runs when a restart is requested or a shutdown begins — aborts every pending call, refuses to
+ * start new ones, and releases each hold once its call settles or `graceMs` elapses, whichever is
+ * first. The grace is what keeps a tick that ignores its signal from holding a restart forever.
+ */
+export interface PluginTickControl {
+  /** Registers one call; returns the signal to pass it, its abort (for the per-call timeout), and the
+   *  function to call when it settles. */
+  begin(): { signal: AbortSignal; abort: (reason: Error) => void; settle: () => void };
+  /** Aborts every pending call and bounds how long each still holds a stop. Idempotent. */
+  stop(reason: string): void;
+  /** True once `stop` has run: no new plugin tick call starts. */
+  readonly stopping: boolean;
+}
+
+export function createPluginTickControl(opts: {
+  /** Opens one unit of the critical section and returns its release (`restart.ts`'s begin/endCritical).
+   *  Omitted in tests that don't exercise the restart path. */
+  hold?: () => () => void;
+  graceMs?: number;
+} = {}): PluginTickControl {
+  const graceMs = opts.graceMs ?? PLUGIN_TICK_ABORT_GRACE_MS;
+  const pending = new Set<{ controller: AbortController; release: () => void }>();
+  let stopping = false;
+  return {
+    get stopping() {
+      return stopping;
+    },
+    begin() {
+      const controller = new AbortController();
+      const endHold = opts.hold?.();
+      let released = false;
+      const call = {
+        controller,
+        // Idempotent: a call can be released by its own settle AND by the stop's grace timer.
+        release: () => {
+          if (released) return;
+          released = true;
+          endHold?.();
+        },
+      };
+      pending.add(call);
+      return {
+        signal: controller.signal,
+        abort: (reason) => controller.abort(reason),
+        settle: () => {
+          pending.delete(call);
+          call.release();
+        },
+      };
+    },
+    stop(reason) {
+      if (stopping) return;
+      stopping = true;
+      const calls = [...pending];
+      if (calls.length === 0) return;
+      for (const call of calls) call.controller.abort(new Error(`plugin tick aborted: ${reason}`));
+      // One timer for the whole batch: past it, every call still pending lets go of the stop. Ref'd on
+      // purpose, like awaitCriticalIdle's — the process is alive only to finish exactly this.
+      setTimeout(() => {
+        for (const call of calls) call.release();
+      }, graceMs);
+    },
+  };
 }
 
 /** Each plugin tick wrapped so it only runs while that plugin's `running` flag is true — a tick
  * can fire between startScheduler and activatePlugins, and must not run before activate() resolved —
  * is abandoned after `timeoutMs` if it hasn't settled (#217, see PLUGIN_TICK_TIMEOUT_MS), and is never
- * started while its own previous call is still pending. `timeoutMs` is the test seam, like
- * `guardedTick`'s `watchdogMs`: real callers take the default. */
+ * started while its own previous call is still pending. Each call gets an `AbortSignal` (#248),
+ * aborted at the timeout and at a stop; once `control` is stopping no new call starts. `timeoutMs` is
+ * the test seam, like `guardedTick`'s `watchdogMs`: real callers take the default. `control` defaults
+ * to one with no critical-section hold, which is #217's behaviour at a restart. */
 export function pluginTicks(
   loaded: readonly LoadedPlugin[],
   log: BaseLog,
   timeoutMs = PLUGIN_TICK_TIMEOUT_MS,
+  control: PluginTickControl = createPluginTickControl(),
 ): TickCheck[] {
   const checks: TickCheck[] = [];
   for (const lp of loaded) {
@@ -249,19 +335,25 @@ export function pluginTicks(
           name,
           run: async () => {
             if (!lp.running) return;
+            // #248: on the way out — don't start a call the stop would only have to abort.
+            if (control.stopping) return;
             if (inFlight) {
               log.warn(`[plugins] ${name}: its previous tick is still running — skipping this one`);
               return;
             }
             inFlight = true;
+            const { signal, abort, settle } = control.begin();
             // The async wrapper still starts the tick synchronously, but turns a sync throw or a plain
             // (non-promise) return — plugin code is only type-asserted — into a promise, so EVERY path
-            // reaches the finally that releases the flag; a throw that skipped it would silence this
-            // tick for good.
-            const call = (async () => tick.run())().finally(() => {
+            // reaches the finally that releases the flag and the hold; a throw that skipped it would
+            // silence this tick for good.
+            const call = (async () => tick.run(signal))().finally(() => {
               inFlight = false;
+              settle();
             });
-            await withTickTimeout(call, timeoutMs, name);
+            // At the bound, abort rather than only walk away: a cooperating tick bails now. The hold
+            // and the in-flight flag stay with the call itself (the finally above), not with the wait.
+            await withTickTimeout(call, timeoutMs, name, abort);
           },
         });
       }

@@ -8,6 +8,7 @@ import {
   endCritical,
   endHandoff,
   handoffActive,
+  onStopRequested,
   requestRestart,
   resetForTest,
   restartPending,
@@ -262,5 +263,49 @@ describe("beginShutdown (#154)", () => {
     expect(restartPending()).toBe(false);
     beginShutdown("SIGTERM");
     expect(restartPending()).toBe(true);
+  });
+});
+
+describe("onStopRequested (#248)", () => {
+  test("runs once, before requestRestart decides to exit, with the reason", () => {
+    const seen: string[] = [];
+    onStopRequested((reason) => seen.push(`${reason} exits=${exits.length}`));
+    requestRestart("update");
+    requestRestart("again");
+    expect(seen).toEqual(["update exits=0"]);
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+  });
+
+  test("a shutdown notifies too, and a later restart request does not notify again", () => {
+    const seen: string[] = [];
+    onStopRequested((reason) => seen.push(reason));
+    beginShutdown("SIGTERM");
+    requestRestart("update");
+    expect(seen).toEqual(["SIGTERM"]);
+  });
+
+  test("a throwing listener is isolated: the others run and the restart still lands", () => {
+    const seen: string[] = [];
+    const errorSpy = console.error;
+    console.error = () => {};
+    try {
+      onStopRequested(() => {
+        throw new Error("boom");
+      });
+      onStopRequested((reason) => seen.push(reason));
+      requestRestart("update");
+    } finally {
+      console.error = errorSpy;
+    }
+    expect(seen).toEqual(["update"]);
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+  });
+
+  test("an unsubscribed listener is not called", () => {
+    const seen: string[] = [];
+    const off = onStopRequested((reason) => seen.push(reason));
+    off();
+    requestRestart("update");
+    expect(seen).toEqual([]);
   });
 });

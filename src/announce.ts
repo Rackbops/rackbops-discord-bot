@@ -135,8 +135,8 @@ let tickGeneration = 0;
 // The bot's own network is bounded now — the GitHub calls in github.ts/update.ts since #88, the
 // docker-daemon calls under the redeploy path since #130, the plugin index and bundle fetches by
 // their own signals, and the WAIT on each plugin tick (the `...extra` checks below) by `pluginTicks`
-// since #217 — the hung call itself can't be cancelled, so it is left running, and that tick isn't
-// started again until it settles. What remains unbounded is what this watchdog is still for:
+// since #217 — at the bound the call's AbortSignal is aborted (#248), a call that ignores it is left
+// running, and that tick isn't started again until it settles. What remains unbounded is what this watchdog is still for:
 // discord.js's REST calls (they carry internal timeouts and retries of their own, so they are
 // bounded in practice but not by us).
 //
@@ -154,8 +154,8 @@ const TICK_WATCHDOG_MS = 5 * 60 * 1000;
  * before the first tick has written it — producing a duplicate announcement. (A plugin tick over
  * PLUGIN_TICK_TIMEOUT_MS no longer holds this guard — `pluginTicks` stops waiting on it, #217 — so
  * `pluginTicks` itself skips that tick's next run until the call settles: within this process its
- * dedup-key check is still never re-entered. A restart during that call is the exception — see
- * restart.ts's header.)
+ * dedup-key check is still never re-entered, and a restart during that call aborts it and waits for
+ * it to settle, bounded — see restart.ts's header, #248.)
  *
  * Skips outright rather than queuing, so a merely-slow tick never piles up work — the next tick
  * to actually run re-reads whatever state the (by-then-finished) previous one left behind. Warns
@@ -277,10 +277,9 @@ async function onTick(client: Client, extraChecks: TickCheck[]): Promise<void> {
   await guardedTick(() =>
     // The whole tick is one critical section: a restart requested during it — by the self-update
     // check or by a due plugin-update schedule (#104) — lands only once every announcement and state
-    // write has settled. The one exception is a plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS:
-    // `pluginTicks` stops waiting on it (#217), so this section closes while that call is still
-    // running, and until it settles neither a restart nor a SIGTERM drain waits for it — see
-    // restart.ts's header.
+    // write has settled. A plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS is no longer waited on here
+    // (#217), but its call keeps its own hold on the critical section until it settles, and a restart
+    // aborts it and waits PLUGIN_TICK_ABORT_GRACE_MS at most (#248) — see restart.ts's header.
     withCritical(() => runTick(tickChecks(client, extraChecks))),
   );
 }
