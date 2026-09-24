@@ -1087,6 +1087,37 @@ describe("routeHttpRequest (#220)", () => {
     expect(read).toBe(0);
   });
 
+  test("a plugin stopped while its request's body was still arriving is not called: 503", async () => {
+    const { lp, seen } = serving("music");
+    let push: (c: Uint8Array) => void = () => {};
+    let end = () => {};
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (c) => controller.enqueue(c);
+        end = () => controller.close();
+      },
+    });
+    const pending = routeHttpRequest([lp], req("/music/x", { method: "POST", body, duplex: "half" } as RequestInit), "ip", makeLog().log, 60_000, 1_024);
+    push(new Uint8Array(10));
+    await Bun.sleep(5);
+    lp.running = false; // disposed mid-body
+    end();
+    expect((await pending).status).toBe(503);
+    expect(seen).toEqual([]);
+  });
+
+  test("the rebuilt request keeps the client's abort signal", async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    const { lp } = serving("music", true, async (request) => {
+      request.signal.addEventListener("abort", () => { aborted = true; });
+      controller.abort();
+      return new Response("ok");
+    });
+    await routeHttpRequest([lp], req("/music/x", { method: "POST", body: "hi", signal: controller.signal }), "ip", makeLog().log);
+    expect(aborted).toBe(true);
+  });
+
   test("the bounds are the ones ADR-0007 states", () => {
     expect(PLUGIN_HTTP_TIMEOUT_MS).toBe(10_000);
     expect(HTTP_MAX_BODY_BYTES).toBe(1024 * 1024);

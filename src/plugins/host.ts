@@ -657,7 +657,8 @@ async function withBoundedBody(request: Request, max: number): Promise<Request |
   const headers = new Headers(request.headers);
   headers.delete("transfer-encoding");
   headers.set("content-length", String(total));
-  return new Request(request.url, { method: request.method, headers, body });
+  // `signal` carried over, so a plugin still hears the client hang up.
+  return new Request(request.url, { method: request.method, headers, body, signal: request.signal });
 }
 
 const TIMED_OUT = Symbol("timed out");
@@ -717,6 +718,9 @@ export async function routeHttpRequest(
     return httpStatus(400, "Bad request"); // the client's body stream failed mid-read
   }
   if (bounded === "too-large") return httpStatus(413, "Request body too large");
+  // Again: reading the body can take until Bun's idleTimeout, and the plugin may have been disposed
+  // meanwhile ("called only while running" holds at the moment of the call, not only at arrival).
+  if (!lp.running) return httpStatus(503, "Unavailable");
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const outcome = await Promise.race([

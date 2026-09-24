@@ -59,8 +59,10 @@ route.
      The router enforces this itself, on every body: Bun's `maxRequestBodySize` covers only a body
      that declares its `Content-Length`, and cloudflared forwards one of unknown length as chunked. A
      plugin keeps its own tighter limit, as warbandeer does.
+   - Reading a body is bounded by Bun's `idleTimeout` (30 s), which on Bun 1.3 also closes a body
+     that trickles in slower than it. That is Bun's behaviour, not pinned by a test here.
    - An unknown first segment, or none, answers `404`. A plugin that is not running answers `503`,
-     before any of its code runs. A running plugin with no `http` handler answers `404`.
+     before any of its code runs. The check is made again once the body has been read. A running plugin with no `http` handler answers `404`.
    - An unparseable URL, or a body stream that fails mid-read, answers `400`. Bun itself answers a
      few malformed requests before the router sees them: `431` for an over-long path, `400` or `505`
      for a bad request line.
