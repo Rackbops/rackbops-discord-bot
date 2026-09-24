@@ -220,7 +220,8 @@ async function activate(c: Client<true>): Promise<void> {
       } else if (interaction.isAutocomplete()) {
         // #287: a plugin command's picker goes to its autocomplete(), behind the same routing gate as the
         // command; everything else — core declares no autocomplete option — gets an empty list at once
-        // instead of Discord's own 3s timeout failure (#218).
+        // instead of Discord's own 3s timeout failure (#218). The gate's own `[gate]` lines are not logged
+        // here: they would repeat on every keystroke, and the command itself logs them when it runs.
         await dispatchPluginAutocomplete({
           interaction,
           bare: bareName(interaction.commandName),
@@ -233,7 +234,7 @@ async function activate(c: Client<true>): Promise<void> {
               interaction,
               () => whereOf(interaction, (id) => client.channels.fetch(id)),
               () => readRouting(DATA_DIR),
-              console,
+              { error: () => {} },
             ),
           log: console,
         });

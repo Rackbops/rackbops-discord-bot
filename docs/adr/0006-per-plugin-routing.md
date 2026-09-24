@@ -53,7 +53,10 @@ request mailbox and applied without a restart.
    destination** — a name the plugin declares in its manifest (`destinations`), mapped by the operator
    to a channel per server in the same panel row (`servers[guild].destinations[name]`). A name mapped
    nowhere, or not declared, posts exactly where `announce(message)` would, so a destination is an
-   option, never a requirement. Still additive: `HOST_API_VERSION` stays 1.
+   option, never a requirement. Still additive: `HOST_API_VERSION` stays 1. The mapping is one-way
+   in time: a bot or panel from before #219 rebuilds each server entry from the keys it knows, so
+   rolling either back drops every `destinations` mapping on its next write (they have to be picked
+   again after rolling forward).
 7. **Channel restrictions are enforced by the bot at dispatch**, because a bot cannot edit
    Discord's per-channel command permissions (that needs a user's bearer token). A command used
    outside its channels gets a private reply naming the right ones; a thread counts as its parent.

@@ -10,6 +10,8 @@ import {
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { commandNamer } from "../commandNaming";
+import { DESTINATION_NAME_RE } from "../routing/model";
+import { shown } from "../routing/resolve";
 import { createKeyedJsonMutator } from "../storage";
 import type {
   HostApi,
@@ -66,22 +68,32 @@ export function createHostApi(opts: {
     warn: (m) => opts.baseLog.warn(`[${name}] ${m}`),
     error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, e),
   };
-  // #219: only a destination the manifest declares is passed on; any other is said once per name and
-  // posts where the plugin posts without one. `destinations` is index data, read defensively.
-  const declared = new Set((Array.isArray(opts.entry.destinations) ? opts.entry.destinations : []).map((d) => d?.name));
+  // #219: only a destination the manifest declares, with a valid name, is passed on; any other is said
+  // once per name (at most MAX_DESTINATION_WARNINGS of them, so a plugin forwarding user input cannot
+  // grow this without bound) and posts where the plugin posts without one. The name is shown through
+  // `shown`: bounded, and cut before where a webhook URL's token would start, should a plugin pass one.
+  // `destinations` is index data, read defensively.
+  const declared = new Set<string>();
+  for (const d of Array.isArray(opts.entry.destinations) ? opts.entry.destinations : []) {
+    const destinationName: unknown = (d as { name?: unknown } | null)?.name;
+    if (typeof destinationName === "string" && DESTINATION_NAME_RE.test(destinationName)) declared.add(destinationName);
+  }
   const warned = new Set<string>();
   const announce = (message: string, destination?: string): Promise<void> => {
     if (destination === undefined) return opts.announce(message);
     if (typeof destination === "string" && declared.has(destination)) return opts.announce(message, destination);
-    const key = String(destination);
-    if (!warned.has(key)) {
+    const key = shown(destination);
+    if (!warned.has(key) && warned.size < MAX_DESTINATION_WARNINGS) {
       warned.add(key);
-      log.warn(`announce: destination "${key}" is not declared in this plugin's manifest; posting to its usual channels`);
+      log.warn(`announce: destination ${JSON.stringify(key)} is not declared in this plugin's manifest; posting to its usual channels`);
     }
     return opts.announce(message);
   };
   return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce };
 }
+
+/** How many distinct undeclared destination names one plugin's `announce` warns about (#219). */
+const MAX_DESTINATION_WARNINGS = 50;
 
 export interface LoadResult {
   loaded: LoadedPlugin[];
@@ -149,11 +161,6 @@ export function pluginCommandMap(
   return map;
 }
 
-/**
- * The full slash-command registration body: core JSON first, then each plugin command built on a
- * `COMMAND_PREFIX`-named builder (so a plugin can't register outside the namespace). A command that
- * builds to the wrong name is dropped and logged rather than trusted.
- */
 /** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
  *  `"group sub q"`) whose built JSON declares `autocomplete: true` — dead pickers unless the command
  *  also has an `autocomplete()` handler for the host to route them to (#287, see `buildCommandBody`
@@ -175,6 +182,11 @@ export function autocompleteOptionPaths(json: RESTPostAPIChatInputApplicationCom
   return paths;
 }
 
+/**
+ * The full slash-command registration body: core JSON first, then each plugin command built on a
+ * `COMMAND_PREFIX`-named builder (so a plugin can't register outside the namespace). A command that
+ * builds to the wrong name is dropped and logged rather than trusted.
+ */
 export function buildCommandBody(
   prefix: string,
   coreCommandJson: readonly RESTPostAPIChatInputApplicationCommandsJSONBody[],
@@ -185,7 +197,10 @@ export function buildCommandBody(
   const body: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [...coreCommandJson];
   for (const [bare, { entry, command }] of map) {
     let built: RESTPostAPIChatInputApplicationCommandsJSONBody;
+    let hasAutocomplete = false;
     try {
+      // Plugin-controlled and only type-asserted: a throwing getter is caught with the build below.
+      hasAutocomplete = typeof command.autocomplete === "function";
       // Plugin code: `build()` and discord.js's `toJSON()` (which validates) can both throw. Isolate
       // it — a bad builder drops just its command, never crashing the whole registration/boot.
       built = command.build(cmd(bare)).toJSON();
@@ -201,7 +216,7 @@ export function buildCommandBody(
     // refuse. A typed value still works; only the suggestions never load, because a command without an
     // `autocomplete()` handler is answered with an empty list (`dispatchPluginAutocomplete`, #287).
     const autocompletePaths = autocompleteOptionPaths(built);
-    if (autocompletePaths.length > 0 && typeof command.autocomplete !== "function") {
+    if (autocompletePaths.length > 0 && !hasAutocomplete) {
       log.warn(
         `[plugins] ${entry.name}: command "${bare}" asks for autocomplete on ` +
           `${autocompletePaths.map((p) => `"${p}"`).join(", ")} but has no autocomplete() handler, so ` +
@@ -528,15 +543,33 @@ export async function dispatchPluginInteraction(
   return true;
 }
 
+/** The most the autocomplete dispatcher waits on the routing gate (#287) before it answers with an empty
+ *  list — the gate may fetch a channel, and Discord drops the interaction after 3 s. */
+export const AUTOCOMPLETE_GATE_TIMEOUT_MS = 1_000;
+/** The most it waits on a plugin's `autocomplete()` before answering for it; the call is not cancelled. */
+export const AUTOCOMPLETE_TIMEOUT_MS = 2_500;
+
+/** `p`'s value, or `fallback` once `ms` has passed; its timer is cleared either way. A rejection passes through. */
+function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
 /**
  * #287: answers one autocomplete interaction for the plugin command `bare` — called from index.ts's
  * InteractionCreate handler with the bare command name. Routes to the command's `autocomplete()` only
  * when the owning plugin is `running` and `gate` (the same routing gate as the command itself, #243)
- * lets it run here; a gate that throws lets it run, as it does for the command. Every other path — no
- * such command, no handler, not running, refused here, a throw, or a handler that returned without
- * responding — answers with an empty list, so Discord's picker closes at once instead of failing after
- * its own 3 s timeout. A throw is logged and isolated like every other plugin call site. Never rejects
- * past the final `respond([])`, which the caller's own catch covers.
+ * lets it run here. Unlike the command, it FAILS CLOSED: a gate that throws or takes longer than
+ * `AUTOCOMPLETE_GATE_TIMEOUT_MS` gets the empty list — a picker with no suggestions costs nothing, and
+ * Discord's 3 s would otherwise run out. Every other path — no such command, no handler, not running,
+ * refused here, a throw, a handler still running after `AUTOCOMPLETE_TIMEOUT_MS`, or one that returned
+ * without calling `respond` — answers with an empty list, so the picker closes at once instead of
+ * failing after Discord's own timeout. A handler that CALLED `respond` without awaiting it is not
+ * answered a second time: the dispatcher wraps `respond` to see the call, not just its completion.
+ * A throw is logged and isolated like every other plugin call site. Never rejects past the final
+ * `respond([])`, which the caller's own catch covers.
  */
 export async function dispatchPluginAutocomplete(opts: {
   interaction: AutocompleteInteraction;
@@ -549,22 +582,39 @@ export async function dispatchPluginAutocomplete(opts: {
   const { interaction, bare, log } = opts;
   const target = opts.map.get(bare);
   const lp = target ? opts.loaded.find((l) => l.entry.name === target.entry.name) : undefined;
-  if (target && lp?.running && typeof target.command.autocomplete === "function") {
-    let refusal: string | undefined;
-    try {
-      refusal = await opts.gate(bare);
-    } catch (err) {
-      log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; letting it run`, err);
-    }
-    if (refusal === undefined) {
+  let respondCalled = false;
+  try {
+    // Plugin-controlled and only type-asserted: read once, inside the try, so a throwing getter is isolated.
+    const handler = target && lp?.running ? target.command.autocomplete : undefined;
+    if (target && typeof handler === "function") {
+      let refusal: string | undefined;
       try {
-        await target.command.autocomplete(interaction);
+        refusal = await within(opts.gate(bare), AUTOCOMPLETE_GATE_TIMEOUT_MS, "the gate took too long");
       } catch (err) {
-        log.error(`[plugins] ${target.entry.name} autocomplete for "${bare}" failed`, err);
+        refusal = "the gate failed";
+        log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; answering with no suggestions`, err);
+      }
+      if (refusal === undefined) {
+        // `respond` is discord.js's prototype method: shadow it with an own property for the call, then
+        // take the shadow away again, leaving the object exactly as it was.
+        const hadOwn = Object.hasOwn(interaction, "respond");
+        const original = interaction.respond;
+        interaction.respond = ((...args: Parameters<typeof original>) => {
+          respondCalled = true;
+          return original.apply(interaction, args);
+        }) as typeof interaction.respond;
+        try {
+          await within(Promise.resolve().then(() => handler.call(target.command, interaction)), AUTOCOMPLETE_TIMEOUT_MS, undefined);
+        } finally {
+          if (hadOwn) interaction.respond = original;
+          else delete (interaction as { respond?: unknown }).respond;
+        }
       }
     }
+  } catch (err) {
+    log.error(`[plugins] ${target?.entry.name} autocomplete for "${bare}" failed`, err);
   }
-  if (!interaction.responded) await interaction.respond([]);
+  if (!respondCalled && !interaction.responded) await interaction.respond([]);
 }
 
 const STATE_FRESH: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };

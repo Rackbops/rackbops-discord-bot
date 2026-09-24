@@ -503,6 +503,11 @@ describe("validatePluginRouting with destinations (#219)", () => {
     expect(validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations: { news: 5 } } } }, discovery(), ["news"])).toMatchObject({ ok: false });
   });
 
+  test("a declared name that is not a valid destination name is refused, whatever discovery.json says", () => {
+    const input = JSON.parse(`{"servers":{"${HOME}":{"commands":"all","destinations":{"__proto__":"${HOME_CHAN_2}"}}}}`);
+    expect(validatePluginRouting(input, discovery(), ["__proto__"])).toMatchObject({ ok: false });
+  });
+
   test("destinations that is not an object is refused", () => {
     for (const destinations of [[HOME_CHAN], "x", null]) {
       expect(validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations } } }, discovery(), ["news"])).toEqual({

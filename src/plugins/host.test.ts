@@ -28,6 +28,8 @@ const {
   routeInteractionByPrefix,
   dispatchPluginInteraction,
   dispatchPluginAutocomplete,
+  AUTOCOMPLETE_GATE_TIMEOUT_MS,
+  AUTOCOMPLETE_TIMEOUT_MS,
 } = await import("./host");
 // The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
 // relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
@@ -151,6 +153,23 @@ describe("createHostApi: announce's destination (#219)", () => {
       '[feed] announce: destination "alerts" is not declared in this plugin\'s manifest; posting to its usual channels',
       '[feed] announce: destination "7" is not declared in this plugin\'s manifest; posting to its usual channels',
     ]);
+  });
+
+  test("the warning never carries a webhook token, a newline stays escaped, and it stops after 50 names", async () => {
+    const { host, calls } = hostWith([]);
+    const token = "TOKEN_zqx9f3k2m8v1w7p4r6t5y0uabcdef";
+    await host.announce("a", `https://discord.com/api/webhooks/555555555555555001/${token}`);
+    await host.announce("a", "evil\n[core] forged line");
+    for (let i = 0; i < 100; i += 1) await host.announce("a", `name-${i}`);
+    expect(calls.some((c) => c.message.includes(token))).toBe(false);
+    expect(calls.some((c) => c.message.includes("\n"))).toBe(false);
+    expect(calls).toHaveLength(50);
+  });
+
+  test("a declared name that is not a valid destination name is not declared", async () => {
+    const { host, posted } = hostWith([{ name: "Alerts", description: "d" }]);
+    await host.announce("a", "Alerts");
+    expect(posted).toEqual([["a", undefined]]);
   });
 
   test("a manifest with no, or malformed, destinations declares none", async () => {
@@ -830,13 +849,83 @@ describe("dispatchPluginAutocomplete (#287)", () => {
     expect(responses).toEqual([[]]);
   });
 
-  test("a gate that throws lets it run, as it does for the command", async () => {
+  test("a gate that throws fails CLOSED here, unlike the command: an empty list, the plugin not called", async () => {
     let called = 0;
     const s = setup({ autocomplete: async () => { called += 1; } });
-    const { interaction } = fakeAutocomplete();
+    const { interaction, responses } = fakeAutocomplete();
     await run(s, interaction, async () => { throw new Error("gate down"); });
-    expect(called).toBe(1);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
     expect(s.calls.some((l) => l.level === "error" && l.message.includes("[gate]"))).toBe(true);
+  });
+
+  test("a gate slower than AUTOCOMPLETE_GATE_TIMEOUT_MS gets the empty list in time", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction, responses } = fakeAutocomplete();
+    const started = Date.now();
+    await run(s, interaction, () => new Promise(() => {}));
+    expect(Date.now() - started).toBeLessThan(AUTOCOMPLETE_GATE_TIMEOUT_MS + 500);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("a handler that calls respond without awaiting it is not answered a second time", async () => {
+    let settle = () => {};
+    const s = setup({ autocomplete: async (i) => { void i.respond([{ name: "a", value: "a" }]); } });
+    const responses: unknown[][] = [];
+    const interaction = {
+      commandName: "search",
+      responded: false,
+      respond: (choices: unknown[]) => {
+        responses.push(choices);
+        return new Promise<void>((resolve) => { settle = () => { interaction.responded = true; resolve(); }; });
+      },
+    };
+    await run(s, interaction);
+    settle();
+    expect(responses).toEqual([[{ name: "a", value: "a" }]]); // the plugin's answer only, no empty one on top
+  });
+
+  test("a handler that hangs is answered for at AUTOCOMPLETE_TIMEOUT_MS, and respond is restored", async () => {
+    const s = setup({ autocomplete: () => new Promise(() => {}) });
+    const { interaction, responses } = fakeAutocomplete();
+    const original = interaction.respond;
+    const started = Date.now();
+    await run(s, interaction);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(AUTOCOMPLETE_TIMEOUT_MS - 50);
+    expect(responses).toEqual([[]]);
+    expect(interaction.respond).toBe(original);
+  }, 10_000);
+
+  test("respond on the prototype, as discord.js has it, is left there -- no own property stays behind", async () => {
+    class FakeAutocomplete {
+      commandName = "search";
+      responded = false;
+      readonly responses: unknown[][] = [];
+      async respond(choices: unknown[]): Promise<void> {
+        this.responses.push(choices);
+        this.responded = true;
+      }
+    }
+    const s = setup({ autocomplete: async (i) => { await i.respond([{ name: "a", value: "a" }]); } });
+    const interaction = new FakeAutocomplete();
+    await run(s, interaction);
+    expect(interaction.responses).toEqual([[{ name: "a", value: "a" }]]);
+    expect(Object.hasOwn(interaction, "respond")).toBe(false);
+  });
+
+  test("a throwing autocomplete getter is isolated, and the picker still gets an empty list", async () => {
+    const command = { ...cmd("search"), get autocomplete(): PluginCommand["autocomplete"] { throw new Error("getter boom"); } } as PluginCommand;
+    const lp = loaded(entry({ name: "finder" }), { commands: [command] }, true);
+    const { log, calls } = makeLog();
+    const map = pluginCommandMap([lp], [], log);
+    const { interaction, responses } = fakeAutocomplete();
+    await dispatchPluginAutocomplete({ interaction: interaction as never, bare: "search", map, loaded: [lp], gate: async () => undefined, log });
+    expect(responses).toEqual([[]]);
+    expect(calls.some((l) => l.level === "error" && l.message.includes("finder autocomplete"))).toBe(true);
+    // buildCommandBody reads it inside its own try too: the command is dropped, not the whole boot.
+    expect(() => buildCommandBody("", [], map, log)).not.toThrow();
   });
 
   test("a throwing autocomplete() is logged and isolated, and the picker still gets an empty list", async () => {

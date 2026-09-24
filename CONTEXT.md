@@ -1068,9 +1068,13 @@ _Avoid_: server list, guild cache
   `PluginCommand.autocomplete?(interaction)` is optional. `index.ts`'s `InteractionCreate` handler hands
   every autocomplete interaction to `dispatchPluginAutocomplete` (`host.ts`), which calls the command's
   `autocomplete()` only when its plugin is `running` and the command's own routing gate (`gateCommand`,
-  #243) lets it run in that channel. Every other case — no handler, not running, refused, a throw, or
-  a handler that returned without responding — gets `interaction.respond([])`, so Discord's picker
-  shows "no options" at once instead of failing after its own 3s timeout. `buildCommandBody` still
+  #243) lets it run in that channel — failing CLOSED, unlike the command: a gate that throws or takes
+  over `AUTOCOMPLETE_GATE_TIMEOUT_MS` (1 s) means no suggestions, and its `[gate]` lines are not logged
+  per keystroke. Every other case — no handler, not running, refused, a throw, a handler still running
+  at `AUTOCOMPLETE_TIMEOUT_MS` (2.5 s), or one that returned without calling `respond` — gets
+  `interaction.respond([])`, so Discord's picker shows "no options" at once instead of failing after
+  its own 3s timeout. The dispatcher shadows `respond` for the call, so a handler that called it
+  without awaiting is not answered twice. `buildCommandBody` still
   registers a command that declares `autocomplete: true` without a handler (a typed value still
   works), but warns once per command, naming every such option path (`autocompleteOptionPaths`, which
   walks subcommand groups/subcommands recursively).

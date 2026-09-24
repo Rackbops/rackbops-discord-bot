@@ -16,7 +16,7 @@
 // from a file, so nothing here does a bare `routing.plugins[name]` lookup: it would answer for an
 // inherited key like `constructor`. Lookups go through `Object.hasOwn`.
 
-import type { CommandScope, DiscoveryFile, PluginRouting, RoutingFile, ServerRouting } from "./model";
+import { DESTINATION_NAME_RE, type CommandScope, type DiscoveryFile, type PluginRouting, type RoutingFile, type ServerRouting } from "./model";
 
 /** The plugin's routing, or `undefined` when it has no entry of its own. */
 function entryOf(routing: RoutingFile, plugin: string): PluginRouting | undefined {
@@ -65,7 +65,9 @@ function compareIds(a: string, b: string): number {
  *
  * With a `destination` (#219): every channel that name is mapped to, the same way; a name mapped in no
  * server falls through to the targets above, so an unmapped destination posts where the plugin posts
- * anyway. Whether the plugin declares the name is the caller's check (`createHostApi`).
+ * anyway. Whether the plugin declares the name is the caller's check (`createHostApi`). A name mapped
+ * somewhere is honoured as mapped: if every mapped channel then fails, the post fails, as a `postTo`
+ * that fails does -- it does not fall back to the plugin's usual channels.
  */
 export function announceTargets(routing: RoutingFile, plugin: string, defaultChannelId: string, destination?: string): string[] {
   const servers = entryOf(routing, plugin)?.servers ?? {};
@@ -199,7 +201,9 @@ export function validatePluginRouting(input: unknown, discovery: DiscoveryFile, 
       if (!isRecord(raw.destinations)) return fail(`destinations for server ${guildId} must be an object`);
       const mapped: Record<string, string> = {};
       for (const [name, channel] of Object.entries(raw.destinations)) {
-        if (!declared.includes(name)) return fail(`destination ${shown(name)} is not one this plugin declares`);
+        if (!DESTINATION_NAME_RE.test(name) || !declared.includes(name)) {
+          return fail(`destination ${shown(name)} is not one this plugin declares`);
+        }
         if (typeof channel !== "string" || !channels.has(channel)) {
           return fail(`destination ${name}: channel ${shown(channel)} is not in server ${guildId}`);
         }

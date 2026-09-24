@@ -233,12 +233,14 @@ export interface PluginCommand {
   build(builder: SlashCommandBuilder): { toJSON(): RESTPostAPIChatInputApplicationCommandsJSONBody };
   handle(interaction: ChatInputCommandInteraction): Promise<void>;
   /**
-   * Answers Discord's picker for an option this command built with `setAutocomplete(true)` (#287). Called
-   * with the focused option (`interaction.options.getFocused(true)`); the plugin answers with
-   * `interaction.respond(choices)` — at most 25, within Discord's 3 s. It runs only where the command
-   * itself may run (the same routing gate as `handle`), and only while the plugin is running. Where it is
-   * absent, throws, or returns without responding, the host answers with an empty list, so the picker
-   * closes cleanly. Optional: a command with no autocomplete option omits it.
+   * Answers Discord's picker for an option this command built with `setAutocomplete(true)` (#287). The
+   * plugin reads the option being typed (`interaction.options.getFocused(true)`) and answers with
+   * `await interaction.respond(choices)` — at most 25, within Discord's 3 s (the host stops waiting at
+   * 2.5 s). It runs only where the command itself may run (the same routing gate as `handle`, failing
+   * closed here) and only while the plugin is running. Where it is absent, throws, or returns without
+   * calling `respond`, the host answers with an empty list, so the picker closes cleanly; a `respond`
+   * that Discord rejects (e.g. after its 3 s) is the plugin's own failure. Optional: a command with no
+   * autocomplete option omits it.
    */
   autocomplete?(interaction: AutocompleteInteraction): Promise<void>;
 }
