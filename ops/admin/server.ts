@@ -1320,6 +1320,8 @@ export function parsePluginRequestInput(
 
 /** A Discord id (server or channel): 5 to 25 digits. Mirrors the bot's `SNOWFLAKE_RE`. */
 const ROUTING_SNOWFLAKE_RE = /^[0-9]{5,25}$/;
+/** A destination name (#219): the plugin-name shape. Mirrors the bot's `DESTINATION_NAME_RE`. */
+const ROUTING_DESTINATION_NAME_RE = /^[a-z][a-z0-9-]*$/;
 /** The webhook URLs the bot accepts: https, discord.com or discordapp.com (canary and ptb too), with or
  *  without an API version. Mirrors the bot's `WEBHOOK_URL_RE` (which also captures the id and token). */
 const ROUTING_WEBHOOK_URL_RE =
@@ -1327,7 +1329,7 @@ const ROUTING_WEBHOOK_URL_RE =
 
 export interface RoutingSetInput {
   plugin: string;
-  servers: Record<string, { commands: "all" | string[]; postTo?: string }>;
+  servers: Record<string, { commands: "all" | string[]; postTo?: string; destinations?: Record<string, string> }>;
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -1369,6 +1371,21 @@ export function parseRoutingSetInput(raw: unknown): { ok: true; input: RoutingSe
     if (postTo !== undefined) {
       if (typeof postTo !== "string" || !ROUTING_SNOWFLAKE_RE.test(postTo)) return { ok: false, reason: "bad postTo" };
       rebuilt.postTo = postTo;
+    }
+    // #219: destination name -> channel id, rebuilt the same way as `servers` itself: each name is tested
+    // before it becomes a key. Whether the plugin declares the name, and whether the channel is in this
+    // server, is the bot's check (it has discovery; this file does not). Omitted when empty, as the bot
+    // never writes `{}` either.
+    const rawDestinations = (entry as Record<string, unknown>).destinations;
+    if (rawDestinations !== undefined) {
+      if (!isPlainRecord(rawDestinations)) return { ok: false, reason: "bad destinations" };
+      const destinations: Record<string, string> = {};
+      for (const [name, channel] of Object.entries(rawDestinations)) {
+        if (!ROUTING_DESTINATION_NAME_RE.test(name)) return { ok: false, reason: "bad destinations" };
+        if (typeof channel !== "string" || !ROUTING_SNOWFLAKE_RE.test(channel)) return { ok: false, reason: "bad destinations" };
+        destinations[name] = channel;
+      }
+      if (Object.keys(destinations).length > 0) rebuilt.destinations = destinations;
     }
     servers[guildId] = rebuilt;
   }
