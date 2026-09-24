@@ -496,7 +496,9 @@
   // replaces both lists with its error, edits and all), Discard's included, on the cards and in the Config
   // editor alike -- the user typed it after the reload started, so it is not part of what a Discard drops.
   // The controls are read twice, when the reload is asked for and again once the fetch has landed (just
-  // before the render replaces them). On the CARDS, keepEdits keeps everything that differs from the OLD
+  // before the render replaces them), and a change counts only on a control that holds the value the USER
+  // last typed there (onControlEdited's record, lastTyped) -- a value a render wrote in between (an update
+  // button's reload landing during an Apply POST) is not typing (round 2). On the CARDS, keepEdits keeps everything that differs from the OLD
   // baseline at landing time (an edit made before or during the fetch); without it only what changed
   // between the two reads is kept. A CONFIG field is only ever kept for what changed between the two reads
   // (keepEdits or not -- it has no capture/reapply of its own), by rendering it with the typed value
@@ -518,16 +520,21 @@
   let reloadConfigKeeps = false; // whether the in-flight reload keeps edits
   let reloadConfigQueued = null;
   const RELOAD_TIMEOUT_MS = 30000;
-  function reloadConfig(opts) {
+  // async (round 2): a synchronous throw here (captureControls) becomes a rejection, as it was before this
+  // stopped being one function, instead of escaping into an un-awaited caller such as showApp.
+  async function reloadConfig(opts) {
     const keepEdits = opts && opts.keepEdits !== undefined ? opts.keepEdits : !applyRereading;
     if (reloadConfigQueued) return reloadConfigQueued;
     if (reloadConfigPromise && (keepEdits || !reloadConfigKeeps)) return reloadConfigPromise;
     const before = (opts && opts.since) || captureControls();
     if (reloadConfigPromise) {
-      reloadConfigQueued = reloadConfigPromise.then(() => {
+      // Runs whether the reload it waits on lands or rejects (its finally can throw): a queue left set to
+      // a rejected promise would be joined by every later call and never fetch again (round 2).
+      const run = () => {
         reloadConfigQueued = null;
         return startReload(keepEdits, before);
-      });
+      };
+      reloadConfigQueued = reloadConfigPromise.then(run, run);
       return reloadConfigQueued;
     }
     return startReload(keepEdits, before);
@@ -548,7 +555,7 @@
             .catch(() => ({})),
         ]);
         const after = captureControls();
-        const typed = diffSnapshots(before, after);
+        const typed = diffSnapshots(before, after, lastTyped);
         const captured = keepEdits
           ? diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, after.cards)
           : typed.cards;
@@ -604,6 +611,27 @@
   // keys diffEdits kept, onto whichever matching controls the fresh render still has -- one that no
   // longer exists (the plugin left the index, the card is no longer open) is silently skipped.
   // CONTROL_SNAPSHOT:begin
+  // #284 round 2: what the USER typed, as opposed to what a render wrote. onControlEdited (the one
+  // delegated input/change handler) records, per control, the value last typed there (`lastTyped`); a
+  // render sets values programmatically and fires nothing, so it is never recorded. diffSnapshots keeps a
+  // key only when its control still holds that value AND it differs from the first read -- so an edit made
+  // before the first read (already in it) never counts, and neither does a value a render wrote. Ids:
+  // "env:KEY" (a Config field's [data-key] -- a chip field's hidden carrier, which syncTagValue fires on),
+  // "on:NAME", "set:KEY", "secret:KEY". A chip editor's typing input carries none of these, so uncommitted
+  // text is not an edit.
+  const lastTyped = new Map();
+  function controlEditId(el) {
+    const d = (el && el.dataset) || {};
+    if (d.key) return "env:" + d.key;
+    if (d.plugin) return "on:" + d.plugin;
+    if (d.settingKey) return "set:" + d.settingKey;
+    if (d.secretKey) return "secret:" + d.secretKey;
+    return "";
+  }
+  function noteControlEdited(el) {
+    const id = controlEditId(el);
+    if (id) lastTyped.set(id, el.dataset.plugin ? !!el.checked : el.value);
+  }
   function captureCardControls() {
     const on = {};
     for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
@@ -3724,17 +3752,21 @@
     }
     return { on, settings, secrets };
   }
-  // #284: what changed between two reads of the controls -- `before` and `after` are each
-  // { cards: captureCardControls(), env: captureEnvFields() }. Returns { cards: {on, settings, secrets},
-  // env: {KEY: value} } with only the keys present in BOTH reads whose value differs, at its `after`
-  // value: what the user typed while a reload was in flight. A control that appeared or went away in
-  // between was not typed into, so it is not reported -- except a secret's input (#284 round 1): it only
-  // exists once Replace is pressed, always starts empty, and has no stored value to fall back to, so one
-  // that appeared in between and is non-empty was typed into (Replace, then a paste, mid-reload).
-  function diffSnapshots(before, after) {
-    const changed = (a, b, absentAs) => {
+  // #284: what the user typed between two reads of the controls -- `before` and `after` are each
+  // { cards: {on, settings, secrets}, env: {KEY: value} } (captureControls), and `edits` is a Map of
+  // control id ("env:KEY", "on:NAME", "set:KEY", "secret:KEY") -> the value the user last typed there
+  // (lastTyped). Returns { cards: {on, settings, secrets}, env } with a key only when BOTH: its control
+  // holds exactly what was last typed there (so a value a render wrote -- a reload landing in between -- is
+  // never mistaken for the user's, round 2); and that differs from its `before` value (so an edit already
+  // in the first read, i.e. made before it, never counts, and typed-and-put-back is nothing). A control
+  // that was not in `before` is not reported -- except a secret's input (round 1): it only exists once
+  // Replace is pressed and always starts empty, so it is compared against "".
+  function diffSnapshots(before, after, edits) {
+    const typed = (prefix, a, b, absentAs) => {
       const out = {};
       for (const key of Object.keys(b)) {
+        const id = prefix + key;
+        if (!edits.has(id) || edits.get(id) !== b[key]) continue;
         const had = Object.prototype.hasOwnProperty.call(a, key);
         if (!had && absentAs === undefined) continue;
         if ((had ? a[key] : absentAs) !== b[key]) out[key] = b[key];
@@ -3743,11 +3775,11 @@
     };
     return {
       cards: {
-        on: changed(before.cards.on, after.cards.on),
-        settings: changed(before.cards.settings, after.cards.settings),
-        secrets: changed(before.cards.secrets, after.cards.secrets, ""),
+        on: typed("on:", before.cards.on, after.cards.on),
+        settings: typed("set:", before.cards.settings, after.cards.settings),
+        secrets: typed("secret:", before.cards.secrets, after.cards.secrets, ""),
       },
-      env: changed(before.env, after.env),
+      env: typed("env:", before.env, after.env),
     };
   }
   // A typed secret can't go through validateEnvChanges: it echoes the value it rejects in the message,
@@ -4537,6 +4569,7 @@
     // all (a webhook paste is never a config edit), so this is defensive -- the "#env-fields, #plugins-list"
     // check above already excludes it in practice -- but it is a source pin the tests hold it to.
     if (target.closest(".servers")) return;
+    noteControlEdited(target); // #284 round 2: what the user typed, as opposed to what a render wrote
     if (applyPhase === "done" || applyPhase === "failed") applyPhase = "idle";
     applyViolation = "";
     clearApplyInvalid();

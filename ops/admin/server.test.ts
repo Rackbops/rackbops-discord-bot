@@ -6756,7 +6756,7 @@ const { diffEdits, diffSnapshots, validateSecretChanges } = new Function(
   `"use strict";\n${applyBlock("ENV_SCHEMA")}\n${applyBlock("PLUGIN_EDITS")}\nreturn { diffEdits, diffSnapshots, validateSecretChanges };`,
 )() as {
   diffEdits: (baseline: { plugins: { name: string; enabled?: boolean }[]; env: Record<string, string> }, controls: DiffCaptured) => DiffCaptured;
-  diffSnapshots: (before: Snapshot, after: Snapshot) => { cards: DiffCaptured; env: Record<string, string> };
+  diffSnapshots: (before: Snapshot, after: Snapshot, edits: Map<string, string | boolean>) => { cards: DiffCaptured; env: Record<string, string> };
   validateSecretChanges: (schema: Record<string, unknown>, changes: ApplyChange[], labelOf: (key: string) => string) => { key: string; message: string } | null;
 };
 
@@ -6920,32 +6920,46 @@ describe("diffSnapshots (#284)", () => {
     env,
   });
 
-  test("reports every kind of control whose value changed between the two reads, at its later value", () => {
+  const NONE = { cards: { on: {}, settings: {}, secrets: {} }, env: {} };
+  const edits = (entries: Record<string, string | boolean>) => new Map(Object.entries(entries));
+
+  test("reports every kind of control that holds what the user typed and differs from the first read, at its later value", () => {
     const before = snap({ on: { music: false, wow: true }, settings: { A: "1", B: "2" }, secrets: { S: "" } }, { R: "r0", Q: "q" });
     const after = snap({ on: { music: true, wow: true }, settings: { A: "1", B: "9" }, secrets: { S: "typed" } }, { R: "r1", Q: "q" });
-    expect(diffSnapshots(before, after)).toEqual({
+    const typed = edits({ "on:music": true, "set:B": "9", "secret:S": "typed", "env:R": "r1" });
+    expect(diffSnapshots(before, after, typed)).toEqual({
       cards: { on: { music: true }, settings: { B: "9" }, secrets: { S: "typed" } },
       env: { R: "r1" },
     });
   });
 
-  test("a control that appeared or went away between the reads was not typed into, so it is not reported", () => {
+  test("round 2: a value that changed with no edit behind it (a render wrote it) is not reported", () => {
+    const before = snap({ on: { music: false }, settings: { B: "2" } }, { R: "r0" });
+    const after = snap({ on: { music: true }, settings: { B: "9" } }, { R: "r1" });
+    expect(diffSnapshots(before, after, edits({}))).toEqual(NONE);
+  });
+
+  test("round 2: an edit a render wrote over since is not reported (the control no longer holds what was typed)", () => {
+    const before = snap({}, { R: "r0" });
+    // the user typed "mine", then a reload landing in between rendered the stored "r1" over it
+    expect(diffSnapshots(before, snap({}, { R: "r1" }), edits({ "env:R": "mine" }))).toEqual(NONE);
+  });
+
+  test("typed and put back is nothing -- and so is an edit made before the first read (it is already in it)", () => {
+    expect(diffSnapshots(snap({}, { R: "r0" }), snap({}, { R: "r0" }), edits({ "env:R": "r0" }))).toEqual(NONE);
+    expect(diffSnapshots(snap({}, { R: "typed-earlier" }), snap({}, { R: "typed-earlier" }), edits({ "env:R": "typed-earlier" }))).toEqual(NONE);
+  });
+
+  test("a control that appeared or went away between the reads is not reported", () => {
     const before = snap({ settings: { GONE: "x" } }, { OLD: "o" });
     const after = snap({ settings: { NEW: "y" }, on: { fresh: true } }, { NEW_ENV: "n" });
-    expect(diffSnapshots(before, after)).toEqual({ cards: { on: {}, settings: {}, secrets: {} }, env: {} });
+    expect(diffSnapshots(before, after, edits({ "set:NEW": "y", "on:fresh": true, "env:NEW_ENV": "n" }))).toEqual(NONE);
   });
 
   test("round 1: a secret input that appeared between the reads (Replace, then a paste) counts as typed when non-empty", () => {
     const before = snap({ secrets: {} });
-    expect(diffSnapshots(before, snap({ secrets: { S: "pasted", T: "" } })).cards.secrets).toEqual({ S: "pasted" });
-  });
-
-  test("nothing changed reports nothing", () => {
-    const same = snap({ on: { music: true }, settings: { A: "1" } }, { R: "r" });
-    expect(diffSnapshots(same, snap({ on: { music: true }, settings: { A: "1" } }, { R: "r" }))).toEqual({
-      cards: { on: {}, settings: {}, secrets: {} },
-      env: {},
-    });
+    const after = snap({ secrets: { S: "pasted", T: "" } });
+    expect(diffSnapshots(before, after, edits({ "secret:S": "pasted", "secret:T": "" })).cards.secrets).toEqual({ S: "pasted" });
   });
 });
 
@@ -6970,6 +6984,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     /** #282/#284: the answer for this path waits for this promise (a fetch in flight) -- or, if the page's
      *  timeout signal aborts first, rejects the way fetch does (an AbortError). Resolve it yourself. */
     holds?: Partial<Record<"/api/plugins" | "/api/env" | "/api/env-schema", Promise<void>>>;
+    /** Round 2: the first refreshApplyBar() throws (reloadConfig's finally then rejects that reload). */
+    refreshThrowsOnce?: boolean;
   }
   function harness(
     oldEnv: Record<string, string>,
@@ -7039,7 +7055,13 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
       configEls = configKeys.map((k) => configEl(freshEnv, k, overrides));
     };
     const src = applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"));
-    const refreshApplyBar = () => {};
+    let refreshThrows = !!extra.refreshThrowsOnce;
+    const refreshApplyBar = () => {
+      if (refreshThrows) {
+        refreshThrows = false;
+        throw new Error("refreshApplyBar threw");
+      }
+    };
     // #246: reloadConfig calls renderServers() and renderNeedsAttention() after renderEnvFields();
     // browser-only, out of this stub page's scope (same reasoning as
     // loadBranches/renderPlugins/renderEnvFields themselves). Call-COUNTED, not just a no-op stub: a
@@ -7049,16 +7071,23 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     // OTHER test in this file drives reloadConfig with a populated pluginsData/routingData pair.
     const renderServers = () => { calls.renderServers++; };
     const renderNeedsAttention = () => { calls.renderNeedsAttention++; };
-    const { reloadConfig, setRereading } = new Function(
+    const { reloadConfig, setRereading, noteControlEdited } = new Function(
       "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderServers", "renderNeedsAttention", "timeoutSignal",
       `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
-        "return { reloadConfig, setRereading: (v) => { applyRereading = v; } };",
+        "return { reloadConfig, setRereading: (v) => { applyRereading = v; }, noteControlEdited };",
     )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderServers, renderNeedsAttention, timeoutSignal) as {
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
       setRereading: (v: boolean) => void;
+      noteControlEdited: (el: RC) => void;
+    };
+    /** The user edits a control: sets it and fires the page's edit handler's bookkeeping, as a real input does. */
+    const type = (control: RC, value: string | boolean) => {
+      if (typeof value === "boolean") control.checked = value;
+      else control.value = value;
+      noteControlEdited(control);
     };
     return {
-      reloadConfig, setRereading, settingEls: () => settingEls, boxEls: () => boxEls, configEls: () => configEls,
+      reloadConfig, setRereading, type, settingEls: () => settingEls, boxEls: () => boxEls, configEls: () => configEls,
       calls, plugsListEl, envFieldsEl, timer, apiCalls, overridesSeen,
     };
   }
@@ -7173,13 +7202,13 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
       configKeys: ["R"],
       holds: { "/api/env": hold },
     });
-    h.settingEls()[0]!.value = "before"; // typed, then Discard pressed
+    h.type(h.settingEls()[0]!, "before"); // typed, then Discard pressed
     h.setRereading(true); // rereadFromServer sets it before calling the aliases
     const reload = h.reloadConfig();
     await nextTask();
     // typed while the re-read is in flight
-    h.configEls()[0]!.value = "during";
-    h.boxEls()[0]!.checked = true;
+    h.type(h.configEls()[0]!, "during");
+    h.type(h.boxEls()[0]!, true);
     release();
     await reload;
     expect(h.settingEls()[0]!.value).toBe("1"); // the Discarded edit is gone
@@ -7195,16 +7224,36 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
       configKeys: ["R"],
       holds: { "/api/plugins": hold },
     });
-    h.settingEls()[0]!.value = "before"; // an update button's reload: applyRereading stays false
+    h.type(h.settingEls()[0]!, "before"); // an update button's reload: applyRereading stays false
     const reload = h.reloadConfig();
     await nextTask();
-    h.boxEls()[0]!.checked = true;
-    h.configEls()[0]!.value = "during";
+    h.type(h.boxEls()[0]!, true);
+    h.type(h.configEls()[0]!, "during");
     release();
     await reload;
     expect(h.settingEls()[0]!.value).toBe("before");
     expect(h.boxEls()[0]!.checked).toBe(true);
     expect(h.configEls()[0]!.value).toBe("during");
+  });
+
+  // Round 2: a Discard queued behind a reload that then REJECTS (its finally threw) must still run, and must not
+  // leave the queue set to a rejected promise that every later reload would join without fetching.
+  test("#284 round 2: a queued Discard still runs when the reload it waits on rejects, and later reloads fetch again", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const h = harness({ A: "1" }, [], { A: "1" }, [], { holds: { "/api/plugins": hold }, refreshThrowsOnce: true });
+    const keeping = h.reloadConfig(); // an update button's reload
+    await nextTask();
+    h.setRereading(true);
+    const discard = h.reloadConfig(); // queued behind it
+    h.setRereading(false);
+    release();
+    await expect(keeping).rejects.toThrow("refreshApplyBar threw");
+    expect(await settlesSoon(discard)).toBe(true); // it ran, and landed
+    expect(h.apiCalls.filter((p) => p === "/api/env")).toHaveLength(2);
+    const before = h.apiCalls.length;
+    expect(await settlesSoon(h.reloadConfig())).toBe(true); // not stuck joining a rejected queue
+    expect(h.apiCalls.length).toBe(before + 3);
   });
 
   test("#284: nothing typed during the fetch means nothing is overridden", async () => {
@@ -7572,6 +7621,8 @@ interface ApplySpec {
    *  drop the focus of a control they rebuild). */
   realReload?: {
     env?: Record<string, string>;
+    /** Round 2: what the server holds once the Apply POST has landed (before it, `env`). */
+    envAfterPost?: Record<string, string>;
     ticked?: string[];
     holds?: Partial<Record<"/api/plugins" | "/api/env" | "/api/env-schema", Promise<void>>>;
   };
@@ -7763,7 +7814,8 @@ function runApply(spec: ApplySpec) {
   const loadStatus = async () => void log.reloads.status++;
   // realReload: what the server holds, answered by the GETs and rendered by the render stubs.
   const real = spec.realReload;
-  const serverEnv = () => real?.env ?? baseline;
+  let postLanded = false;
+  const serverEnv = () => (postLanded && real?.envAfterPost) || real?.env || baseline;
   const serverTicked = () => real?.ticked ?? tickedOnServer;
   const gets: string[] = [];
   const api = async (path: string, opts: ApplyPost["opts"]) => {
@@ -7786,6 +7838,7 @@ function runApply(spec: ApplySpec) {
     }
     log.posts.push({ path, opts });
     if (spec.hold) await spec.hold;
+    postLanded = true;
     if (spec.response instanceof Error) throw spec.response;
     const r = spec.response ?? { ok: true, text: '{"ok":true,"changed":["X"]}' };
     return { ok: r.ok, status: r.status ?? (r.ok ? 200 : 502), text: async () => r.text };
@@ -9128,9 +9181,12 @@ describe("the Apply bar over the real reloadConfig (#282, #284)", () => {
   const nextTask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
   const TIMED_OUT = "Error: the server did not answer within 30 seconds. Reload the page to try again.";
   const edited = { ...APPLY_ENV, WATCHED_REPOS: "eu" };
+  // A real edit: the control's value changes and the page's delegated handler sees that control as the target
+  // (the stub's own closest() answers only ".plug__admin", so the target wraps it to say it is inside #env-fields).
   const typed = (page: ReturnType<typeof runApply>, key: string, value: string) => {
-    page.edit(key, value);
-    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
+    const c = page.edit(key, value);
+    const target = { dataset: c.dataset, get value() { return c.value; }, closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) };
+    page.run.onControlEdited({ target });
   };
 
   test("#282: a Discard whose /api/env hangs locks the bar only until the page's 30 s timeout, which then says so", async () => {
@@ -9181,7 +9237,7 @@ describe("the Apply bar over the real reloadConfig (#282, #284)", () => {
       let releasePost!: () => void;
       const hold = new Promise<void>((resolve) => (releasePost = resolve));
       // the server holds what was posted afterwards (both outcomes wrote .env)
-      const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold, response, realReload: { env: edited } });
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold, response, realReload: { envAfterPost: edited } });
       const applying = page.run.applyPending();
       await nextTask();
       expect(page.view().title).toBe("Restarting the bot…");
@@ -9195,6 +9251,26 @@ describe("the Apply bar over the real reloadConfig (#282, #284)", () => {
       expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
     });
   }
+
+  // Round 2: a reload that keeps edits (a plugin action button, Unlock) landing DURING the POST renders the old stored
+  // values over the controls; that is a render, not typing, so the re-read after the POST must not keep it -- it used
+  // to, leaving a successful Apply offering the old value back as a pending change.
+  test("#284 round 2: a reload landing during the Apply POST does not make the re-read keep the old value it rendered", async () => {
+    let releasePost!: () => void;
+    const hold = new Promise<void>((resolve) => (releasePost = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold, realReload: { envAfterPost: { ...edited, REPORT_ROLE_ID: "stormrage" } } });
+    const applying = page.run.applyPending();
+    await nextTask();
+    typed(page, "REPORT_ROLE_ID", "typed-then-overwritten"); // typed during the POST ...
+    await page.run.loadPlugins!(); // ... then a keeping reload lands, rendering the old stored values over both fields
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "us", REPORT_ROLE_ID: "stormrage" });
+    releasePost();
+    await applying;
+    // the posted value is what shows, and nothing is offered back
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "eu", REPORT_ROLE_ID: "stormrage" });
+    page.run.dismissApplyResult();
+    expect(page.view().hidden).toBe(true);
+  });
 
   test("#284 round 1: the field being typed in during a re-read keeps focus once the re-read rebuilds it", async () => {
     let release!: () => void;

@@ -1507,7 +1507,11 @@ _Avoid_: server list, guild cache
   **What is typed WHILE a reload is in flight is kept by every reload that lands, Discard's included, on
   the cards and in the Config editor (#284).** `reloadConfig()` reads the controls twice — when the reload is
   asked for (`captureControls`, `CONTROL_SNAPSHOT`) and once its fetch has landed — and `diffSnapshots`
-  (`PLUGIN_EDITS`) reports what changed in between: on the cards it is what `reapplyCardEdits` puts back
+  (`PLUGIN_EDITS`) reports what the USER typed in between: a key counts only when its control holds exactly
+  the value `onControlEdited` last recorded the user typing there (`noteControlEdited` → `lastTyped`, keyed
+  `env:`/`on:`/`set:`/`secret:`) and that differs from the first read, so a value a render wrote — an update button's or
+  Unlock's reload landing during an Apply POST re-renders the OLD stored values — is never mistaken for an
+  edit (round 2: it used to make a successful Apply offer the old value back). On the cards it is what `reapplyCardEdits` puts back
   when `keepEdits` is off (with it on, the late `diffEdits` already covers it), and in the Config editor,
   which has no capture/reapply of its own, `renderEnvFields(overrides)` renders those keys with the typed
   value instead of the stored one. Only this in-flight window is kept for Config fields: an edit made there
@@ -1523,6 +1527,10 @@ _Avoid_: server list, guild cache
   is in flight is QUEUED behind it (`reloadConfigQueued`), with its first read taken when it was asked for:
   joined, it would have inherited that reload's `keepEdits` and put back the very edits it discards. Any
   call made while one is queued joins the queued one, so the last reload to land is always the dropping one.
+  The queued reload starts whether the one ahead of it lands or rejects (`.then(run, run)`, round 2), so a
+  failure there never leaves every later reload joining a dead queue. Cost: a Discard queued behind a HUNG
+  reload waits out that reload's 30 s timeout and then runs its own, so the bar can stay locked for up to
+  about 70 s in that case (two 30 s timeouts plus two 5 s branch-list timeouts), not 30.
   **A key lives on exactly one card: the first plugin, in manifest order, that declares it (#244,
   `settingOwners`).** A later plugin declaring the same key shows *"Set on the `<first>` card."*; a key
   `GET /api/env-schema` reports `source: "core"` never appears on a card at all (*"Set under
