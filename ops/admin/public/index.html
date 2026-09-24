@@ -2935,8 +2935,11 @@
   // name order, produce the new PLUGINS string. A still-ticked plugin keeps any `name@version` pin
   // it already had; names are ordered by the manifest (any ticked name the manifest doesn't list is
   // appended in its own order). `changed` compares against the NORMALIZED current value (trimmed,
-  // empties dropped) so a pure-formatting difference doesn't trigger a spurious restart. Lifted by
-  // ops/admin/server.test.ts and pinned against this very source.
+  // empties dropped) as a SET of tokens, so neither a pure-formatting difference nor a hand-written
+  // order that differs from the manifest's (PLUGINS=warbandeer,wow,music against an alphabetical
+  // index) triggers a spurious restart -- the bot does not care about the order. When nothing changed,
+  // `value` is the current value as it stands, so an unrelated apply never rewrites it either. Lifted
+  // by ops/admin/server.test.ts and pinned against this very source.
   function planPluginsSave(checkedNames, currentValue, manifestOrder) {
     const checked = new Set(checkedNames);
     const currentTokens = String(currentValue || "").split(",").map((t) => t.trim()).filter(Boolean);
@@ -2954,7 +2957,9 @@
       if (!seen.has(name)) { ordered.push(name); seen.add(name); }
     }
     const value = ordered.map((name) => pinByName.get(name) || name).join(",");
-    return { value, changed: value !== currentTokens.join(",") };
+    const sameSet = (a, b) => a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
+    if (sameSet(value ? value.split(",") : [], currentTokens)) return { value: currentTokens.join(","), changed: false };
+    return { value, changed: true };
   }
   // PLUGINS_SAVE_PLAN:end
 

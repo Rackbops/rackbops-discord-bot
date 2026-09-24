@@ -4968,6 +4968,20 @@ describe("admin panel planPluginsSave (#102)", () => {
     test("a whitespace-only difference is not a change (no spurious restart)", () => {
       expect(planPluginsSave(["warbandeer", "raidhelper"], "warbandeer, raidhelper", ["warbandeer", "raidhelper"]).changed).toBe(false);
     });
+    test("a hand-written order that differs from the manifest's is not a change, and is kept as it stands", () => {
+      // debug's PLUGINS on 2026-09-24 (#247): the panel showed "1 change needs a restart" on every load.
+      expect(planPluginsSave(["music", "warbandeer", "wow"], "warbandeer,wow,music", ["music", "warbandeer", "wow"])).toEqual({
+        value: "warbandeer,wow,music",
+        changed: false,
+      });
+      expect(planPluginsSave(["wow", "music"], "music@1.2.0, wow", ["music", "wow"])).toEqual({ value: "music@1.2.0,wow", changed: false });
+    });
+    test("a real change after a reordering is still a change, in the manifest's order", () => {
+      expect(planPluginsSave(["music", "wow"], "wow,warbandeer,music", ["music", "warbandeer", "wow"])).toEqual({
+        value: "music,wow",
+        changed: true,
+      });
+    });
     test("a ticked plugin the manifest doesn't list is appended in its own order", () => {
       expect(planPluginsSave(["warbandeer", "legacy"], "warbandeer,legacy", ["warbandeer"]).value).toBe("warbandeer,legacy");
     });
