@@ -255,7 +255,7 @@ settings in the dashboard.
 | `src/handoff.ts` | Standby/verify/retire protocol shared by both instances |
 | `src/docker.ts` | Docker Engine API client over the daemon socket |
 | `src/updateReport.ts` | The follow-up after a `/update` restart: which build it came back on |
-| `src/restart.ts` | Graceful restart, deferred past in-flight announcements (except a plugin tick abandoned after its timeout, #217) |
+| `src/restart.ts` | Graceful restart, deferred past in-flight announcements (a plugin tick is aborted and waited on for 5 s at most, #248) |
 | `src/state.ts` | Release-announcement dedup state (`data/state.json`) |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
 | `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), handed to plugins as `HostApi.storage`/`dataDir` |

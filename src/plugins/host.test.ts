@@ -639,23 +639,60 @@ describe("pluginTicks", () => {
   test("an overrunning tick that honours its signal holds a pending restart until it has bailed (#248)", async () => {
     await withStop(60_000, async ({ control, exited }) => {
       const events: string[] = [];
-      const run = async (signal?: AbortSignal) => {
-        await Bun.sleep(40); // past the 20ms bound: the wait is abandoned, the section closes
-        requestRestart("update"); // a restart arrives AFTER the tick's section closed (#217's worst case)
-        events.push(`restart requested, exited=${exited()}`);
-        if (signal?.aborted) {
-          events.push("bailed");
-          return;
-        }
-        events.push("wrote after the restart"); // what a non-cooperating tick would do
+      let signal: AbortSignal | undefined;
+      let finish = () => {};
+      const run = (s?: AbortSignal) => {
+        signal = s;
+        return new Promise<void>((resolve) => { finish = resolve; });
       };
       const lp = loaded(entry({ name: "coop" }), { ticks: [{ name: "t", run }] }, true);
       await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20, control)));
+      // The 20ms bound has abandoned the wait and aborted the signal; the call itself is still pending.
+      expect(signal?.aborted).toBe(true);
+      requestRestart("update"); // a restart AFTER the tick's section closed (#217's worst case)
       expect(exited()).toBe(false); // the abandoned call still holds the critical section
-      await Bun.sleep(60);
-      expect(events).toEqual(["restart requested, exited=false", "bailed"]);
+      events.push("bailed");
+      finish();
+      await Bun.sleep(0);
+      expect(events).toEqual(["bailed"]);
       expect(exited()).toBe(true); // ...and the restart lands the moment it settles
     });
+  });
+
+  test("a restart requested during a tick aborts it through the stop, not the timeout (#248)", async () => {
+    await withStop(60_000, async ({ control, exited }) => {
+      const seen: string[] = [];
+      const run = async (signal?: AbortSignal) => {
+        await Bun.sleep(10);
+        requestRestart("update"); // e.g. a due scheduled update, from inside the same scheduler tick
+        seen.push(`aborted=${signal?.aborted} reason=${(signal?.reason as Error | undefined)?.message}`);
+      };
+      const lp = loaded(entry({ name: "inner" }), { ticks: [{ name: "t", run }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 60_000, control)));
+      expect(seen).toEqual(["aborted=true reason=plugin tick aborted: update"]);
+      expect(exited()).toBe(true);
+    });
+  });
+
+  test("a stop that lands while a deaf tick is inside its timeout ends the wait at the grace, not the timeout (#248)", async () => {
+    await withStop(30, async ({ control, exited }) => {
+      const lp = loaded(entry({ name: "deaf" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+      const tick = withCritical(() => runTick(pluginTicks([lp], makeLog().log, 60_000, control)));
+      await Bun.sleep(5);
+      requestRestart("update");
+      await Bun.sleep(150); // far under the 60s per-call timeout
+      expect(exited()).toBe(true);
+      await tick;
+    });
+  });
+
+  test("begin() after a stop takes no hold and hands out an aborted signal (#248)", () => {
+    let holds = 0;
+    const control = createPluginTickControl({ hold: () => { holds += 1; return () => {}; } });
+    control.stop("restart");
+    const { signal } = control.begin();
+    expect(signal.aborted).toBe(true);
+    expect(holds).toBe(0);
   });
 
   test("a tick that ignores its signal delays a restart by the grace, never forever (#248)", async () => {
@@ -706,12 +743,14 @@ describe("pluginTicks", () => {
       const run = () => new Promise<void>((resolve) => { finish = resolve; });
       const lp = loaded(entry({ name: "twice" }), { ticks: [{ name: "t", run }] }, true);
       const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
-      const tick = check!.run();
+      const tick = check!.run().catch((e: unknown) => e); // handled now: it rejects during the sleep below
       beginCritical(); // an unrelated section that must stay counted
       control.stop("restart");
       await Bun.sleep(50); // the grace releases the tick's hold
+      // The wait gave up at the grace too (#248), so the check has already rejected.
+      expect(((await tick) as Error).message).toBe("plugin tick twice:t abandoned: the stop's grace elapsed");
       finish(); // then the tick settles: a second release would also close the unrelated section
-      await tick;
+      await Bun.sleep(0);
       expect(await awaitCriticalIdle(10)).toBe(false);
       endCritical();
       expect(await awaitCriticalIdle(10)).toBe(true);

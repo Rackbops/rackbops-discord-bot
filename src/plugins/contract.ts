@@ -259,9 +259,12 @@ export interface PluginCommand {
  *   restart, or a SIGTERM/SIGINT). A restart or a stop then waits a few seconds (`PLUGIN_TICK_ABORT_GRACE_MS`, 5 s)
  *   for every pending call to settle — including one the timeout abandoned — before it exits; no new call starts
  *   once a stop is under way. A tick that honours the signal (pass it to `fetch`, check `signal.aborted` before a
- *   write or a post) is therefore never cut off halfway. One that ignores it keeps working as before, but a stop
- *   exits under it once the grace is spent, so a tick that announces should still write its dedup key BEFORE it
- *   announces. The parameter is optional to read: a plugin built before it existed is unaffected.
+ *   write or a post, and return) therefore gets to stop at a point of its choosing — but only within the grace: a
+ *   step it has already started, such as an `announce` in flight, is not itself cancelled and can still be cut off
+ *   once the grace is spent. A tick that ignores the signal keeps working as before, and a stop exits under it once
+ *   the grace is spent, so a tick that announces should still write its dedup key BEFORE it announces. An abort
+ *   listener must not throw: like a throw from the plugin's own timer, it is reported as an uncaught exception. The parameter is optional to read: a plugin built before it
+ *   existed is unaffected.
  */
 export interface TickCheck {
   name: string;

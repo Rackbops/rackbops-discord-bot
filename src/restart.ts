@@ -17,7 +17,8 @@
 // past PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #248). A restart request or a shutdown notifies the
 // `onStopRequested` listeners below; the plugin host's listener aborts every pending tick's
 // AbortSignal and lets go of each hold once the tick settles or PLUGIN_TICK_ABORT_GRACE_MS elapses —
-// so a cooperating tick is never cut off mid-write, and one that ignores its signal delays a restart
+// and the scheduler tick's own wait on it gives up at the same moment. So a cooperating tick gets to
+// stop at a point of its choosing within the grace, and one that ignores its signal delays a restart
 // by that grace at most, never forever (the #217 trade-off this replaces).
 
 /** Distinct from a crash, so a supervisor can tell an update apart from a failure. */

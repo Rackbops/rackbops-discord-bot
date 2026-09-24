@@ -242,7 +242,13 @@ function withTickTimeout(p: Promise<void>, ms: number, label: string, onTimeout:
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       const err = new Error(`plugin tick ${label} exceeded ${ms}ms`);
-      onTimeout(err);
+      // `onTimeout` aborts the call's signal, which runs the plugin's own abort listeners; the try keeps
+      // anything that does surface synchronously from stopping the rejection below from landing.
+      try {
+        onTimeout(err);
+      } catch {
+        // the call is abandoned all the same
+      }
       reject(err);
     }, ms);
     p.then(resolve, reject).finally(() => clearTimeout(timer));
@@ -257,7 +263,9 @@ function withTickTimeout(p: Promise<void>, ms: number, label: string, onTimeout:
  * restart or a SIGTERM drain exit under it. `stop()` — wired to `restart.ts`'s `onStopRequested`, so
  * it runs when a restart is requested or a shutdown begins — aborts every pending call, refuses to
  * start new ones, and releases each hold once its call settles or `graceMs` elapses, whichever is
- * first. The grace is what keeps a tick that ignores its signal from holding a restart forever.
+ * first. The grace is what keeps a tick that ignores its signal from holding a restart forever — and,
+ * through `graceElapsed`, from holding the scheduler tick's own critical section past it either: a stop
+ * that lands while a tick is still inside its `PLUGIN_TICK_TIMEOUT_MS` wait ends that wait at the grace.
  */
 export interface PluginTickControl {
   /** Registers one call; returns the signal to pass it, its abort (for the per-call timeout), and the
@@ -267,6 +275,9 @@ export interface PluginTickControl {
   stop(reason: string): void;
   /** True once `stop` has run: no new plugin tick call starts. */
   readonly stopping: boolean;
+  /** Resolves once a stop's grace has elapsed (never, until `stop` runs). `pluginTicks` races each wait
+   *  against it, so a tick that ignores its signal delays a stop by the grace at most. */
+  readonly graceElapsed: Promise<void>;
 }
 
 export function createPluginTickControl(opts: {
@@ -278,12 +289,33 @@ export function createPluginTickControl(opts: {
   const graceMs = opts.graceMs ?? PLUGIN_TICK_ABORT_GRACE_MS;
   const pending = new Set<{ controller: AbortController; release: () => void }>();
   let stopping = false;
+  let markGraceElapsed = () => {};
+  const graceElapsed = new Promise<void>((resolve) => {
+    markGraceElapsed = resolve;
+  });
+  /** A plugin's abort listener runs inside `abort()`. Bun reports a listener's throw as an uncaught
+   *  error rather than throwing it here (the contract says listeners must not throw); the try is for
+   *  anything that does surface synchronously, so it cannot skip the aborts after it. */
+  const abortQuietly = (controller: AbortController, reason: Error) => {
+    try {
+      controller.abort(reason);
+    } catch {
+      // the plugin's listener threw; the signal is aborted all the same
+    }
+  };
   return {
     get stopping() {
       return stopping;
     },
+    graceElapsed,
     begin() {
       const controller = new AbortController();
+      // Past a stop, nothing new may hold it: the grace timer below only covers calls already pending.
+      // `pluginTicks` never starts a call then, so this is defence in depth.
+      if (stopping) {
+        abortQuietly(controller, new Error("plugin tick aborted: the bot is stopping"));
+        return { signal: controller.signal, abort: () => {}, settle: () => {} };
+      }
       const endHold = opts.hold?.();
       let released = false;
       const call = {
@@ -298,7 +330,7 @@ export function createPluginTickControl(opts: {
       pending.add(call);
       return {
         signal: controller.signal,
-        abort: (reason) => controller.abort(reason),
+        abort: (reason) => abortQuietly(controller, reason),
         settle: () => {
           pending.delete(call);
           call.release();
@@ -309,13 +341,14 @@ export function createPluginTickControl(opts: {
       if (stopping) return;
       stopping = true;
       const calls = [...pending];
-      if (calls.length === 0) return;
-      for (const call of calls) call.controller.abort(new Error(`plugin tick aborted: ${reason}`));
-      // One timer for the whole batch: past it, every call still pending lets go of the stop. Ref'd on
-      // purpose, like awaitCriticalIdle's — the process is alive only to finish exactly this.
+      // One timer for the whole batch, armed BEFORE any abort runs plugin code: past it, every call still
+      // pending lets go of the stop, and every wait still on one gives up. Ref'd on purpose, like
+      // awaitCriticalIdle's — the process is alive only to finish exactly this.
       setTimeout(() => {
         for (const call of calls) call.release();
+        markGraceElapsed();
       }, graceMs);
+      for (const call of calls) abortQuietly(call.controller, new Error(`plugin tick aborted: ${reason}`));
     },
   };
 }
@@ -368,7 +401,14 @@ export function pluginTicks(
             });
             // At the bound, abort rather than only walk away: a cooperating tick bails now. The hold
             // and the in-flight flag stay with the call itself (the finally above), not with the wait.
-            await withTickTimeout(call, timeoutMs, name, abort);
+            // ...and a stop's grace ends the wait too, so this scheduler tick's critical section never
+            // outlasts it (a tick still inside its timeout when the stop lands would otherwise hold it
+            // for the rest of `timeoutMs`).
+            const outcome = await Promise.race([
+              withTickTimeout(call, timeoutMs, name, abort).then(() => "settled" as const),
+              control.graceElapsed.then(() => "grace" as const),
+            ]);
+            if (outcome === "grace") throw new Error(`plugin tick ${name} abandoned: the stop's grace elapsed`);
           },
         });
       }
