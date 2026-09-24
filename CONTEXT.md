@@ -1504,13 +1504,25 @@ _Avoid_: server list, guild cache
   from another (or from toggling a different card open/closed, which re-renders the whole list the same
   way, synchronously, with no fetch involved). A control the new render no longer has (the plugin left
   the index, its card is no longer open) is silently dropped, never an error.
-  **What is typed WHILE the fetch is in flight is kept on every reload, Discard's included, on the cards
-  and in the Config editor (#284).** `reloadConfig()` reads the controls twice — before the fetch and once
-  it has landed — and `diffSnapshots` (`PLUGIN_EDITS`) reports what changed in between: on the cards it is
-  what `reapplyCardEdits` puts back when `keepEdits` is off (with it on, the late `diffEdits` already
-  covers it), and in the Config editor, which has no capture/reapply of its own, `renderEnvFields(overrides)`
-  renders those keys with the typed value instead of the stored one. Only this in-flight window is kept for
-  Config fields: an edit made there BEFORE any reload is still replaced by the stored value, as before.
+  **What is typed WHILE a reload is in flight is kept by every reload that lands, Discard's included, on
+  the cards and in the Config editor (#284).** `reloadConfig()` reads the controls twice — when the reload is
+  asked for (`captureControls`, `CONTROL_SNAPSHOT`) and once its fetch has landed — and `diffSnapshots`
+  (`PLUGIN_EDITS`) reports what changed in between: on the cards it is what `reapplyCardEdits` puts back
+  when `keepEdits` is off (with it on, the late `diffEdits` already covers it), and in the Config editor,
+  which has no capture/reapply of its own, `renderEnvFields(overrides)` renders those keys with the typed
+  value instead of the stored one. Only this in-flight window is kept for Config fields: an edit made there
+  BEFORE any reload is still replaced by the stored value, as before. A reload that FAILS (or times out,
+  #282) replaces both lists with its error, typed edits included; a chip field counts its committed chips,
+  not text still in its typing input. `applyPending` reads the controls as its POST sends them and hands
+  that to the re-read as `{ since }` (through `rereadFromServer(opts)` and the `loadPlugins`/`loadEnv`
+  aliases, which forward it), so what is typed during the POST itself is kept too. A secret input that
+  appears between the two reads (Replace pressed mid-reload) counts as typed when non-empty — it has no
+  stored value. The control that had focus gets it back on its rebuilt twin (same id) after the render.
+  **A reload that drops edits never joins one that keeps them (#284 round 1).** `reloadConfig` is
+  single-flight, but a Discard (or an apply outcome) asked for while an update button's or Unlock's reload
+  is in flight is QUEUED behind it (`reloadConfigQueued`), with its first read taken when it was asked for:
+  joined, it would have inherited that reload's `keepEdits` and put back the very edits it discards. Any
+  call made while one is queued joins the queued one, so the last reload to land is always the dropping one.
   **A key lives on exactly one card: the first plugin, in manifest order, that declares it (#244,
   `settingOwners`).** A later plugin declaring the same key shows *"Set on the `<first>` card."*; a key
   `GET /api/env-schema` reports `source: "core"` never appears on a card at all (*"Set under

@@ -492,25 +492,51 @@
   // replaces, so it must not try to keep them; every OTHER reload (an update button's success, Unlock)
   // keeps them, re-applied once the new baseline has rendered. A control that no longer exists after
   // the reload is dropped silently.
-  // #284: what is typed WHILE the fetch is in flight is kept on every reload, Discard's included, on the
-  // cards and in the Config editor alike -- the user typed it after the reload started, so it is not
-  // part of what a Discard drops. The controls are read twice, before the fetch and again once it has
-  // landed (just before the render replaces them): keepEdits keeps everything that differs from the OLD
-  // baseline at landing time (so an edit made before or during the fetch); otherwise only what changed
-  // between the two reads is kept. A Config field is kept by rendering it with the typed value
-  // (renderEnvFields' overrides), since it has no capture/reapply of its own.
+  // #284: what is typed WHILE the fetch is in flight is kept by every reload that lands (one that fails
+  // replaces both lists with its error, edits and all), Discard's included, on the cards and in the Config
+  // editor alike -- the user typed it after the reload started, so it is not part of what a Discard drops.
+  // The controls are read twice, when the reload is asked for and again once the fetch has landed (just
+  // before the render replaces them). On the CARDS, keepEdits keeps everything that differs from the OLD
+  // baseline at landing time (an edit made before or during the fetch); without it only what changed
+  // between the two reads is kept. A CONFIG field is only ever kept for what changed between the two reads
+  // (keepEdits or not -- it has no capture/reapply of its own), by rendering it with the typed value
+  // (renderEnvFields' overrides). A chip field counts its committed chips only: text still in its typing
+  // input is not part of the field's value and is lost to the render, as it always was.
+  // `opts.since` replaces the first read: applyPending passes the controls as they were when its POST was
+  // SENT, so what was typed while the POST was in flight ("Restarting the bot…") is kept by the re-read
+  // that follows too.
   // #282: the three GETs share one timeout, so a hung read can neither keep the Apply bar locked (it
   // awaits this through rereadFromServer) nor hold this single-flight promise -- which every later
   // reload, Unlock's included, would otherwise join -- until the server's own 90-120 s limits.
+  // Joining (#284 round 1): a call made while a reload is in flight joins it -- EXCEPT a call that drops
+  // edits (a Discard, an apply outcome) while the in-flight one keeps them (an update button, Unlock):
+  // joined, the Discard would get a keepEdits reload that puts back the very edits it discards. It is
+  // queued behind that one instead, with the controls read NOW (when Discard was pressed), so the edits
+  // made before it are dropped and only what is typed after it is kept. Any call made while one is
+  // queued joins the queued one (rereadFromServer's second loader, a later reload), which lands last.
   let reloadConfigPromise = null;
+  let reloadConfigKeeps = false; // whether the in-flight reload keeps edits
+  let reloadConfigQueued = null;
   const RELOAD_TIMEOUT_MS = 30000;
-  async function reloadConfig(opts) {
-    if (reloadConfigPromise) return reloadConfigPromise;
+  function reloadConfig(opts) {
     const keepEdits = opts && opts.keepEdits !== undefined ? opts.keepEdits : !applyRereading;
+    if (reloadConfigQueued) return reloadConfigQueued;
+    if (reloadConfigPromise && (keepEdits || !reloadConfigKeeps)) return reloadConfigPromise;
+    const before = (opts && opts.since) || captureControls();
+    if (reloadConfigPromise) {
+      reloadConfigQueued = reloadConfigPromise.then(() => {
+        reloadConfigQueued = null;
+        return startReload(keepEdits, before);
+      });
+      return reloadConfigQueued;
+    }
+    return startReload(keepEdits, before);
+  }
+  function startReload(keepEdits, before) {
+    reloadConfigKeeps = keepEdits;
     reloadConfigPromise = (async () => {
       let cancelTimeout = () => {};
       try {
-        const before = { cards: captureCardControls(), env: captureEnvFields() };
         await loadBranches();
         const { signal, cancel } = timeoutSignal(RELOAD_TIMEOUT_MS);
         cancelTimeout = cancel;
@@ -521,11 +547,14 @@
             .then((r) => (r.ok ? r.json() : {}))
             .catch(() => ({})),
         ]);
-        const after = { cards: captureCardControls(), env: captureEnvFields() };
+        const after = captureControls();
         const typed = diffSnapshots(before, after);
         const captured = keepEdits
           ? diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, after.cards)
           : typed.cards;
+        // #284 round 1: the render replaces every control, so one being typed in loses focus to <body>;
+        // it gets it back on its rebuilt twin (same id) below, since what was typed there is now kept.
+        const focusedId = document.activeElement && document.activeElement !== document.body ? document.activeElement.id : "";
         pluginsData = plugins;
         loadedEnv = env;
         loadedSchema = schema && typeof schema === "object" ? schema : {};
@@ -541,6 +570,10 @@
         renderServers();
         renderNeedsAttention();
         if (captured) reapplyCardEdits(captured);
+        if (focusedId && (!document.activeElement || document.activeElement === document.body)) {
+          const twin = document.getElementById(focusedId);
+          if (twin) twin.focus({ preventScroll: true });
+        }
       } catch (e) {
         if (e.message !== "unauthorized") {
           const msg =
@@ -561,8 +594,8 @@
     })();
     return reloadConfigPromise;
   }
-  let loadPlugins = () => reloadConfig();
-  let loadEnv = () => reloadConfig();
+  let loadPlugins = (opts) => reloadConfig(opts);
+  let loadEnv = (opts) => reloadConfig(opts);
 
   // Live-DOM capture/reapply for reloadConfig's keepEdits, over the SAME four selectors collectPending
   // uses (never a page-wide one) -- a plugin's own bundle renders arbitrary DOM inside #plugins-list, so
@@ -570,6 +603,7 @@
   // screen (diffEdits below does the "only what changed" filtering); reapplyCardEdits writes only the
   // keys diffEdits kept, onto whichever matching controls the fresh render still has -- one that no
   // longer exists (the plugin left the index, the card is no longer open) is silently skipped.
+  // CONTROL_SNAPSHOT:begin
   function captureCardControls() {
     const on = {};
     for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
@@ -586,12 +620,17 @@
     return { on, settings, secrets };
   }
   // #284: the Config editor's values, {KEY: value}, over collectPending's own selector. A chip editor's
-  // [data-key] is its hidden carrier, which holds the field's whole value.
+  // [data-key] is its hidden carrier, which holds its committed chips (not text still being typed).
   function captureEnvFields() {
     const env = {};
     for (const el of document.querySelectorAll("#env-fields [data-key]")) env[el.dataset.key] = el.value;
     return env;
   }
+  // #284: one read of every control the Apply bar counts -- the shape diffSnapshots compares.
+  function captureControls() {
+    return { cards: captureCardControls(), env: captureEnvFields() };
+  }
+  // CONTROL_SNAPSHOT:end
   function reapplyCardEdits(captured) {
     for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
       if (el.closest(".plug__admin")) continue;
@@ -3689,12 +3728,16 @@
   // { cards: captureCardControls(), env: captureEnvFields() }. Returns { cards: {on, settings, secrets},
   // env: {KEY: value} } with only the keys present in BOTH reads whose value differs, at its `after`
   // value: what the user typed while a reload was in flight. A control that appeared or went away in
-  // between was not typed into, so it is not reported.
+  // between was not typed into, so it is not reported -- except a secret's input (#284 round 1): it only
+  // exists once Replace is pressed, always starts empty, and has no stored value to fall back to, so one
+  // that appeared in between and is non-empty was typed into (Replace, then a paste, mid-reload).
   function diffSnapshots(before, after) {
-    const changed = (a, b) => {
+    const changed = (a, b, absentAs) => {
       const out = {};
       for (const key of Object.keys(b)) {
-        if (Object.prototype.hasOwnProperty.call(a, key) && a[key] !== b[key]) out[key] = b[key];
+        const had = Object.prototype.hasOwnProperty.call(a, key);
+        if (!had && absentAs === undefined) continue;
+        if ((had ? a[key] : absentAs) !== b[key]) out[key] = b[key];
       }
       return out;
     };
@@ -3702,7 +3745,7 @@
       cards: {
         on: changed(before.cards.on, after.cards.on),
         settings: changed(before.cards.settings, after.cards.settings),
-        secrets: changed(before.cards.secrets, after.cards.secrets),
+        secrets: changed(before.cards.secrets, after.cards.secrets, ""),
       },
       env: changed(before.env, after.env),
     };
@@ -4446,13 +4489,15 @@
   // if it is inside the bar (the Discard just pressed) it rests on the bar itself meanwhile, and when it ends
   // settleFocus runs here (#284) before the caller's own recovery (settleFocus, focusIfInBar). loadStatus() is not part of it: a success starts
   // that separately, un-awaited.
-  async function rereadFromServer() {
+  // `opts` is handed to both loaders unchanged: an apply outcome passes { since } (the controls as its POST
+  // sent them, #284), a Discard passes nothing.
+  async function rereadFromServer(opts) {
     try {
       applyRereading = true;
       refreshApplyBar();
       const bar = document.getElementById("apply-bar");
       if (document.activeElement !== bar) focusIfInBar(bar);
-      const settled = await Promise.allSettled([loadPlugins, loadEnv].map(async (load) => load()));
+      const settled = await Promise.allSettled([loadPlugins, loadEnv].map(async (load) => load(opts)));
       for (const s of settled) {
         if (s.status === "rejected") console.error("re-reading the panel's state failed", s.reason);
       }
@@ -4590,6 +4635,9 @@
     // ONE POST /api/env carrying only what changed: the Origin guard, the auth check and bot-ops.sh's own
     // validation and recreate all apply unchanged, and no new mutating route exists. env-set returns only
     // after the recreate, so the bar says "Restarting the bot…" for exactly as long as this is in flight.
+    // #284: the controls as this POST sends them. Whatever differs from this when the re-read that follows
+    // lands was typed while the request (or the re-read) was in flight, and is kept.
+    const sent = captureControls();
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
     try {
       const res = await api("/api/env", { method: "POST", body: plan.body, signal });
@@ -4602,7 +4650,7 @@
         applyPhase = "done";
         refreshApplyBar();
         loadStatus(); // separate and un-awaited, as before: the status grid is not part of the bar's re-read
-        await rereadFromServer(); // awaited so withBusy keeps Apply disabled until the reads land
+        await rereadFromServer({ since: sent }); // awaited so withBusy keeps Apply disabled until the reads land
       } else {
         const failure = describeApplyFailure(text, result);
         applyPhase = "failed";
@@ -4619,7 +4667,7 @@
         // until its reads land the controls still hold the edits it is about to drop, so Discard and Apply are
         // busy (the bar used to offer Apply for that long, and an Apply pressed then sent a second POST).
         if (!failureWroteNothing(res.status, result, text)) {
-          await rereadFromServer(); // awaited so withBusy keeps Apply disabled until the reads land; OK stays usable
+          await rereadFromServer({ since: sent }); // awaited so withBusy keeps Apply disabled until the reads land; OK stays usable
         }
       }
       focusIfInBar(document.getElementById("apply-ok"));

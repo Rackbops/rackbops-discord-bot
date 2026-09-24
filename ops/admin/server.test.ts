@@ -6647,12 +6647,13 @@ describe("page skeleton", () => {
   });
 
   test("the bar re-reads what is pending whenever a baseline moves: reloadConfig ends in refreshApplyBar, and loadPlugins/loadEnv are its aliases (#244)", () => {
-    const reloadConfig = indexSrc.slice(indexSrc.indexOf("async function reloadConfig("), indexSrc.indexOf("let loadPlugins = () => reloadConfig();"));
+    const reloadConfig = indexSrc.slice(indexSrc.indexOf("function reloadConfig("), indexSrc.indexOf("let loadPlugins = (opts) => reloadConfig(opts);"));
     expect(reloadConfig.length).toBeGreaterThan(500);
     const finallyBlock = reloadConfig.slice(reloadConfig.lastIndexOf("} finally {"));
     expect(finallyBlock).toContain("refreshApplyBar();");
-    expect(indexSrc).toContain("let loadPlugins = () => reloadConfig();");
-    expect(indexSrc).toContain("let loadEnv = () => reloadConfig();");
+    // #284: the aliases forward their argument, so rereadFromServer's { since } reaches reloadConfig.
+    expect(indexSrc).toContain("let loadPlugins = (opts) => reloadConfig(opts);");
+    expect(indexSrc).toContain("let loadEnv = (opts) => reloadConfig(opts);");
   });
 
   test("while the bot's state is unreadable every plugin card's switch is rendered disabled (#244)", () => {
@@ -6932,6 +6933,11 @@ describe("diffSnapshots (#284)", () => {
     const before = snap({ settings: { GONE: "x" } }, { OLD: "o" });
     const after = snap({ settings: { NEW: "y" }, on: { fresh: true } }, { NEW_ENV: "n" });
     expect(diffSnapshots(before, after)).toEqual({ cards: { on: {}, settings: {}, secrets: {} }, env: {} });
+  });
+
+  test("round 1: a secret input that appeared between the reads (Replace, then a paste) counts as typed when non-empty", () => {
+    const before = snap({ secrets: {} });
+    expect(diffSnapshots(before, snap({ secrets: { S: "pasted", T: "" } })).cards.secrets).toEqual({ S: "pasted" });
   });
 
   test("nothing changed reports nothing", () => {
@@ -7557,6 +7563,18 @@ interface ApplySpec {
   /** #244: one EXTRA control inside .plug__admin (a plugin's own settings bundle, mounted inside #plugins-list) --
    *  proves collectPending's !el.closest(".plug__admin") filter, not just that the selector exists. */
   bundleControl?: { kind: "setting" | "secret" | "plugin"; key: string; value?: string };
+  /** #282/#284 round 1: run the page's REAL reloadConfig and its loadPlugins/loadEnv aliases (and the
+   *  CONTROL_SNAPSHOT helpers) under the real APPLY block, instead of the stub loaders -- so a test goes
+   *  through rereadFromServer -> the aliases -> reloadConfig end to end. The GETs answer from the server's
+   *  state here (`env`, `ticked`; default: the loadedEnv / pluginsValue the page started from); a path in
+   *  `holds` waits for that promise, or rejects like fetch (AbortError) when the page's timeout fires
+   *  (`fireTimeouts`). The render stubs rebuild the controls from the last answer (and, like a browser,
+   *  drop the focus of a control they rebuild). */
+  realReload?: {
+    env?: Record<string, string>;
+    ticked?: string[];
+    holds?: Partial<Record<"/api/plugins" | "/api/env" | "/api/env-schema", Promise<void>>>;
+  };
 }
 type ApplyPost = { path: string; opts: { method?: string; body?: string; signal?: AbortSignal } };
 
@@ -7572,6 +7590,8 @@ function runApply(spec: ApplySpec) {
   const log = {
     posts: [] as ApplyPost[],
     reloads: { plugins: 0, env: 0, status: 0 },
+    /** #284: what each loader call was handed (rereadFromServer forwards its opts to both). */
+    reloadOpts: [] as ["plugins" | "env", unknown][],
     tabs: [] as [string, boolean][],
     focused: [] as string[],
     /** The ids focused with { preventScroll: true }. */
@@ -7650,6 +7670,11 @@ function runApply(spec: ApplySpec) {
   const baseline = { ...spec.loadedEnv }; // what the server holds: what a re-render restores
   const fieldEntries = Object.entries(spec.fields ?? spec.loadedEnv);
   const byId = new Map<string, StubEl>([bar, title, hint, ok, discard, go].map((e) => [e.id, e]));
+  // The two lists reloadConfig's catch writes its error into (only the realReload mode's reloadConfig asks).
+  const pluginsList = makeEl("plugins-list");
+  const envFields = makeEl("env-fields");
+  byId.set(pluginsList.id, pluginsList);
+  byId.set(envFields.id, envFields);
   const controls = fieldEntries.map(([key, value]) => {
     const carrier = makeEl(`carrier-${key}`, { value, dataset: { key } });
     // A plain control is its own [data-key] element and carries the id its label points at; a chip
@@ -7723,27 +7748,73 @@ function runApply(spec: ApplySpec) {
       if (spec.loadersRefresh) refreshAfterLoad();
     }
   };
-  const loadEnv = (): Promise<void> => {
+  const loadEnv = (opts?: unknown): Promise<void> => {
     log.reloads.env++;
+    log.reloadOpts.push(["env", opts]);
     if (spec.reloadThrows === "env") throw new Error("loadEnv threw synchronously");
     return land("env", () => controls.forEach((c) => { c.value = baseline[c.dataset.key!] ?? ""; }));
   };
-  const loadPlugins = (): Promise<void> => {
+  const loadPlugins = (opts?: unknown): Promise<void> => {
     log.reloads.plugins++;
+    log.reloadOpts.push(["plugins", opts]);
     if (spec.reloadThrows === "plugins") throw new Error("loadPlugins threw synchronously");
     return land("plugins", () => boxes.forEach((b, i) => { b.checked = boxBaseline[i]!; }));
   };
   const loadStatus = async () => void log.reloads.status++;
+  // realReload: what the server holds, answered by the GETs and rendered by the render stubs.
+  const real = spec.realReload;
+  const serverEnv = () => real?.env ?? baseline;
+  const serverTicked = () => real?.ticked ?? tickedOnServer;
+  const gets: string[] = [];
   const api = async (path: string, opts: ApplyPost["opts"]) => {
+    if (real && !opts?.method) {
+      gets.push(path);
+      const held = real.holds?.[path as keyof NonNullable<NonNullable<ApplySpec["realReload"]>["holds"]>];
+      if (held) {
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(new DOMException("The operation was aborted.", "AbortError"));
+          if (opts?.signal?.aborted) return abort();
+          opts?.signal?.addEventListener("abort", abort, { once: true });
+          void held.then(resolve);
+        });
+      }
+      const answer =
+        path === "/api/plugins" ? { plugins: pluginsData?.plugins ?? [], pluginsValue: serverTicked().join(",") }
+        : path === "/api/env" ? serverEnv()
+        : spec.schema ?? APPLY_SCHEMA;
+      return { ok: true, status: 200, json: async () => answer };
+    }
     log.posts.push({ path, opts });
     if (spec.hold) await spec.hold;
     if (spec.response instanceof Error) throw spec.response;
     const r = spec.response ?? { ok: true, text: '{"ok":true,"changed":["X"]}' };
     return { ok: r.ok, status: r.status ?? (r.ok ? 200 : 502), text: async () => r.text };
   };
+  // Every signal handed out is a real one; `fireTimeouts(ms)` aborts the ones of that length (the page's own
+  // timer firing), without waiting for it.
+  const timers: { ms: number; controller: AbortController }[] = [];
   const timeoutSignal = (ms: number) => {
     log.timeouts.push(ms);
-    return { signal: new AbortController().signal, cancel: () => void log.cancels++ };
+    const controller = new AbortController();
+    timers.push({ ms, controller });
+    return { signal: controller.signal, cancel: () => void log.cancels++ };
+  };
+  // realReload's render stubs: a real render REPLACES every control, dropping focus from the one it replaces.
+  const rebuilt = (el: StubEl) => {
+    if (state.active === el) state.active = null;
+  };
+  const renderEnvFields = (overrides?: Record<string, string>) => {
+    for (const c of controls) {
+      rebuilt(byId.get(`env-${c.dataset.key}`) ?? c);
+      const key = c.dataset.key!;
+      c.value = overrides && Object.prototype.hasOwnProperty.call(overrides, key) ? overrides[key]! : (serverEnv()[key] ?? "");
+    }
+  };
+  const renderPlugins = () => {
+    for (const b of boxes) {
+      rebuilt(b);
+      b.checked = serverTicked().includes(b.dataset.plugin!);
+    }
   };
   const confirm = () => {
     throw new Error("confirm() must not be asked: the bar is the confirmation");
@@ -7761,11 +7832,24 @@ function runApply(spec: ApplySpec) {
   // now also head/body/chev, for refuseApply's card-opening) before calling
   // refreshApplyBar()/discardPending()/applyPending(). openCards is returned for the same reason --
   // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
-  const run = new Function(
-    "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
-    `"use strict";\n${["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"].map(applyBlock).join("\n")}\n` +
-      "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
-  )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal) as {
+  const blocks = ["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"];
+  const run = (real
+    ? new Function(
+        "document", "confirm", "api", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
+        "loadBranches", "renderPlugins", "renderEnvFields", "renderServers", "renderNeedsAttention",
+        // The reloadConfig slice (with the aliases and CONTROL_SNAPSHOT inside it), exactly as the reloadConfig
+        // harness lifts it.
+        `"use strict";\n${blocks.map(applyBlock).join("\n")}\n${applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"))}\n` +
+          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards, loadPlugins, loadEnv };",
+      )(document, confirm, api, loadStatus, showTab, { ...spec.loadedEnv }, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal,
+        async () => {}, renderPlugins, renderEnvFields, () => {}, () => {})
+    : new Function(
+        "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
+        `"use strict";\n${[...blocks.slice(0, 8), "CONTROL_SNAPSHOT", ...blocks.slice(8)].map(applyBlock).join("\n")}\n` +
+          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
+      )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal)) as {
+    loadPlugins?: (opts?: unknown) => Promise<void>;
+    loadEnv?: (opts?: unknown) => Promise<void>;
     applyPending: () => Promise<void>;
     discardPending: () => Promise<void>;
     refreshApplyBar: () => void;
@@ -7798,6 +7882,16 @@ function runApply(spec: ApplySpec) {
     activate(el: StubEl | null) { state.active = el; },
     /** The id of document.activeElement ("body" when nothing has focus). */
     active() { return document.activeElement.id; },
+    /** realReload: the GET paths the real reloadConfig requested, in order. */
+    gets,
+    /** The two lists reloadConfig writes its error into. */
+    lists: { pluginsList, envFields },
+    /** Fire every page timeout of `ms` handed out so far (as if its timer ran out). Returns how many. */
+    fireTimeouts(ms: number) {
+      const due = timers.filter((t) => t.ms === ms && !t.controller.signal.aborted);
+      due.forEach((t) => t.controller.abort());
+      return due.length;
+    },
     /** What the bar is showing right now. */
     view() {
       return {
@@ -8161,7 +8255,11 @@ describe("applyPending (#257)", () => {
       const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, pluginsData, checked: ["warbandeer"] });
       await page.run.applyPending();
       expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
-      // ... and it does not so much as look at the boxes.
+      // ... and the collector does not so much as look at the boxes. (#284: applyPending's own snapshot of the
+      // controls -- what the re-read compares against, never what is posted -- does read them, so the collector
+      // is checked on its own.)
+      page.log.selectors.length = 0;
+      page.run.collectPending();
       expect(page.log.selectors).not.toContain("#plugins-list input[type=checkbox][data-plugin]");
     }
     // Nothing else changed: nothing at all is posted.
@@ -9020,6 +9118,97 @@ describe("the bar while the page re-reads (#275)", () => {
     } finally {
       release();
     }
+  });
+});
+
+// #282/#284 round 1: the same bar, over the page's REAL reloadConfig (runApply's realReload mode), so these go
+// through rereadFromServer -> loadPlugins/loadEnv -> reloadConfig end to end instead of stub loaders.
+describe("the Apply bar over the real reloadConfig (#282, #284)", () => {
+  const settlesSoon = (call: Promise<unknown>) => Promise.race([call.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100))]);
+  const nextTask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const TIMED_OUT = "Error: the server did not answer within 30 seconds. Reload the page to try again.";
+  const edited = { ...APPLY_ENV, WATCHED_REPOS: "eu" };
+  const typed = (page: ReturnType<typeof runApply>, key: string, value: string) => {
+    page.edit(key, value);
+    page.run.onControlEdited({ target: { closest: (sel: string) => (sel === "#env-fields, #plugins-list" ? {} : null) } });
+  };
+
+  test("#282: a Discard whose /api/env hangs locks the bar only until the page's 30 s timeout, which then says so", async () => {
+    let release!: () => void;
+    const hang = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, realReload: { holds: { "/api/env": hang } } });
+    page.run.refreshApplyBar();
+    const discard = page.run.discardPending();
+    await nextTask();
+    try {
+      expect(page.view()).toMatchObject({ hidden: false, ...BUTTONS_LOCKED });
+      expect(await settlesSoon(discard)).toBe(false); // still waiting on the hung read
+      expect(page.log.timeouts).toContain(30000);
+      expect(page.fireTimeouts(30000)).toBe(1);
+      expect(await settlesSoon(discard)).toBe(true); // the timeout ended it: the bar is free
+      expect(page.view()).toMatchObject(BUTTONS_FREE);
+      expect([page.lists.pluginsList.textContent, page.lists.envFields.textContent]).toEqual([TIMED_OUT, TIMED_OUT]);
+    } finally {
+      release();
+    }
+    // ... and the next reload (Unlock, another Discard) makes its own requests instead of joining the hung one
+    const before = page.gets.length;
+    expect(await settlesSoon(page.run.loadEnv!())).toBe(true);
+    expect(page.gets.length).toBe(before + 3);
+  });
+
+  test("#284 round 1: a Discard pressed while a reload that keeps edits is in flight still drops them", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, realReload: { holds: { "/api/plugins": hold } } });
+    const keeping = page.run.loadPlugins!(); // an update button's reload: keeps edits
+    await nextTask();
+    typed(page, "WATCHED_REPOS", "eu"); // typed while it runs ...
+    const discard = page.run.discardPending(); // ... then discarded
+    await nextTask();
+    typed(page, "REPORT_ROLE_ID", "after-discard"); // typed after the Discard: kept
+    release();
+    await Promise.all([keeping, discard]);
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "us", REPORT_ROLE_ID: "after-discard" });
+    expect(page.gets.filter((p) => p === "/api/env")).toHaveLength(2); // the Discard got its own read, after the first
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart", ...BUTTONS_FREE });
+  });
+
+  // Both apply outcomes that re-read: a success, and a failed recreate (#47: .env was already written).
+  const JSON_FAILURE = '{"ok":false,"changed":["WATCHED_REPOS"],"backup":"/opt/x/.env.bak.1","log":"compose: image not found"}';
+  for (const [outcome, response] of [["a success", undefined], ["a failed recreate", { ok: false, text: JSON_FAILURE }]] as const) {
+    test(`#284: what is typed while the Apply POST is in flight survives the re-read that follows (${outcome})`, async () => {
+      let releasePost!: () => void;
+      const hold = new Promise<void>((resolve) => (releasePost = resolve));
+      // the server holds what was posted afterwards (both outcomes wrote .env)
+      const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold, response, realReload: { env: edited } });
+      const applying = page.run.applyPending();
+      await nextTask();
+      expect(page.view().title).toBe("Restarting the bot…");
+      typed(page, "REPORT_ROLE_ID", "during-post");
+      releasePost();
+      await applying;
+      expect(page.log.posts.map((p) => p.opts.body)).toEqual(["WATCHED_REPOS=eu"]);
+      expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "eu", REPORT_ROLE_ID: "during-post" });
+      // the posted change is the new baseline; what was typed during the POST is pending against it
+      page.run.dismissApplyResult();
+      expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
+    });
+  }
+
+  test("#284 round 1: the field being typed in during a re-read keeps focus once the re-read rebuilds it", async () => {
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => (release = resolve));
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, realReload: { holds: { "/api/env": hold } } });
+    page.activate(page.els.discard);
+    const discard = page.run.discardPending();
+    await nextTask();
+    page.activate(page.control("REPORT_ROLE_ID")); // the user went to a field ...
+    typed(page, "REPORT_ROLE_ID", "mid");           // ... and typed while the re-read runs
+    release();
+    await discard;
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "us", REPORT_ROLE_ID: "mid" });
+    expect(page.active()).toBe("env-REPORT_ROLE_ID"); // back on the rebuilt field, not moved to the bar or a tab
   });
 });
 
@@ -10085,7 +10274,7 @@ describe("Choose where it lives: source pins (#245)", () => {
   });
 
   test("loadRouting is its own path (source pin)", () => {
-    const reloadSlice = indexSrc.slice(indexSrc.indexOf("async function reloadConfig("), indexSrc.indexOf("let loadPlugins ="));
+    const reloadSlice = indexSrc.slice(indexSrc.indexOf("function reloadConfig("), indexSrc.indexOf("let loadPlugins ="));
     expect(reloadSlice).not.toContain("/api/routing");
     const showAppSlice = indexSrc.slice(indexSrc.indexOf("function showApp("), indexSrc.indexOf("function showApp(") + 400);
     expect(showAppSlice).toContain("loadRouting();");
