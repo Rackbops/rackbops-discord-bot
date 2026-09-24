@@ -179,6 +179,20 @@ for s in env-get env-schema routing-get status; do printf '%s: ' "$s"; bash /opt
 
 Same stages with `export I=prod` and a fresh stage 0 (new `$W`; the flock checks are done). Stage 1's install.sh is already done for the shared script — re-run it anyway for prod's compose file and stack `.env`. Stage 4: if the seed has `"plugins": {}` (nothing registered outside home), **do not write it** — single mode is already exactly today; capture before/after a plain restart instead. Then **enable music from the panel** (Plugins → music → On, fill its settings → Apply: one `env-set`, one recreate), and repeat D1-D3 on prod's servers. **Person:** prod's banner is clear.
 
+### Learned on the 2026-09-24 run (debug, then prod)
+
+- **Image names are `rackbops-discord-bot-<instance>-bot` and `rackbops-discord-bot-<instance>-admin`.** That settles the image-rollback line above: `docker tag <sha from images-before.txt> <that name>`, then `up … --no-build`.
+- **Debug's Pathfinder predictor said `added: ["rplugins"]`, which roshne accepted.** The 2026-09-20 hand registration had left out `/rplugins`. Routing sends the core commands to every server, but `/rplugins` has `default_member_permissions: "0"`, so only that server's own admins see it. Expect the same on any server that was registered by hand.
+- **Prod's bot is in the home server only, so it needs no seed.** Turning a plugin on from the panel saves a placement there, and the bot then says `Registered commands in 1 server`. With one server, that registers the same set of commands.
+- **Each instance has its own tunnel container, `rackbops-discord-bot-<instance>-tunnel`**, on that instance's Docker network. In Cloudflare those tunnels are named `rackbops-discord-bot-{dev,prod}-admin`. A plugin's public route goes on that tunnel as `http://rackbops-discord-bot-<instance>:<port>`.
+- **`music` needs five settings, not three.** Its three secrets, plus `SPOTIFY_REDIRECT_URI` and `MUSIC_CALLBACK_PORT`. Without the last two, `/setlist` answers "not set up yet".
+  - Each instance needs its own redirect URI: dev uses `https://music-dev.rackbops.com/spotify/callback` and prod `https://music.rackbops.com/spotify/callback`, both on port 8790.
+  - Each URI must be registered in the Spotify app, and each needs a tunnel route.
+  - `curl` on the callback URL returns `400` once the route works.
+- **Copying secrets between instances without printing them:** `grep -E '^(KEY1|KEY2)=' /opt/rackbops-discord-bot/debug/.env | BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/prod … bash bot-ops.sh env-set`. It is the same write as the panel's Apply, and it backs up `.env` first.
+- **A phantom "1 change needs a restart"** appears when `PLUGINS` in `.env` isn't in the index's alphabetical order. **Discard** is safe. It is fixed in `6949956`.
+- **wow posts only on its own schedule** (next: the Tuesday reset), so D3 can take days.
+
 ### What only a person can confirm
 
 The banner; `/rsetlist` working and being refused (the reply is ephemeral); a post arriving as the webhook vs as the bot; the panel never displaying a secret. Everything else above has a host-side record to paste.
