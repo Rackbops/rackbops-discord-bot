@@ -29,7 +29,11 @@ route.
 2. **The handler sees its own path, with the prefix stripped.** The contract gains an optional
    `Plugin.http?(request, info)`:
    - `info.path` is the path after `/<name>`: `"/"` for a bare `/<name>` or `/<name>/`, and
-     `"/callback"` for `/<name>/callback`.
+     `"/callback"` for `/<name>/callback`. It is the path as Bun's URL parser leaves it: dot segments
+     are resolved before routing (so the route and the plugin see the same path), and a few characters
+     are percent-encoded. `/<name>//x` arrives as `"//x"`, a protocol-relative URL, so a plugin must
+     never redirect to `info.path` unchecked. `request.url` takes its host from the client's `Host`
+     header, so a plugin must never build an absolute URL from it.
    - `info.clientIp` is `CF-Connecting-IP`, falling back to the socket address, computed once by the
      host. The same trust caveat applies as in warbandeer's and music's own servers: Cloudflare sets
      that header for anything that really transits its network, but nothing re-verifies it.
@@ -41,17 +45,25 @@ route.
    `HTTP_PORT` env key.
    - Unset means no listener at all: ADR-0001's fail-closed rule.
    - It starts inside `activate()`, after `takeOver()`, so a standby never binds it (the standby
-     invariant in `CONTEXT.md`). Shutdown stops it (`shutdown.ts`) before plugins are disposed.
+     invariant in `CONTEXT.md`). Shutdown stops it before plugins are disposed: the `disposePlugins`
+     closure `index.ts` hands to `shutdown.ts` calls `stopHttp()` first. From then on every request
+     is answered `503` with `Connection: close`, including one on a connection cloudflared kept
+     alive.
    - `docker-compose.yml` publishes no host port for it; the only way in is the instance's tunnel.
    - The admin panel stays its own container, on its own hostname.
 4. **The host bounds and isolates every request, as it does a tick or an interaction.**
    - A handler that throws is logged and answered with `500`.
    - One still running after `PLUGIN_HTTP_TIMEOUT_MS` (10 s) is answered with `504`. The host stops
      waiting, but the call is not cancelled.
-   - A request body over `HTTP_MAX_BODY_BYTES` (1 MiB) is refused at the transport. A plugin keeps
-     its own tighter limit, as warbandeer does.
-   - An unknown first segment, or none, answers `404`. So does a plugin with no `http` handler. A
-     plugin that has one but is not running answers `503`.
+   - A request body over `HTTP_MAX_BODY_BYTES` (1 MiB) is answered `413` before the handler runs.
+     The router enforces this itself, on every body: Bun's `maxRequestBodySize` covers only a body
+     that declares its `Content-Length`, and cloudflared forwards one of unknown length as chunked. A
+     plugin keeps its own tighter limit, as warbandeer does.
+   - An unknown first segment, or none, answers `404`. A plugin that is not running answers `503`,
+     before any of its code runs. A running plugin with no `http` handler answers `404`.
+   - An unparseable URL, or a body stream that fails mid-read, answers `400`. Bun itself answers a
+     few malformed requests before the router sees them: `431` for an over-long path, `400` or `505`
+     for a bad request line.
    - No response carries a plugin's error text.
 5. **Existing servers coexist, and each migrates in its own release.** warbandeer and music keep
    their `Bun.serve` and their public URLs. Moving one under the router changes a URL someone
@@ -86,6 +98,13 @@ route.
 - **A core `HTTP_PORT` key.** It is set by hand in `.env` at first. Making it editable in the panel
   means adding an `ALLOWED` row to `ops/bot-ops.sh`, which moves the bot-ops schema, so that is a
   separate follow-up.
+- **Every plugin shares one browser origin.** Path prefixes are not a browser boundary. A cookie a
+  plugin sets at `Path=/` is sent to every other plugin, and script one plugin serves can make
+  same-origin, credentialed requests to another. A plugin scopes its cookies to `Path=/<name>/` and
+  treats any HTML it serves as sharing an origin with every other installed plugin. That is
+  consistent with ADR-0004's trust boundary: the Plugin Index is what decides which code runs.
+- **On a host from before #220, a plugin's `http` is silently ignored.** `HOST_API_VERSION` stays 1,
+  so a plugin cannot require the router. It should treat an absent route as missing config.
 - **The operator makes one hostname and one tunnel route per instance, once.** After that, adding an
   HTTP plugin is configuration only.
 - **A self-update handoff hands the route over with the container name.** The replacement comes up

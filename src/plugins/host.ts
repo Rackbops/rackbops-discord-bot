@@ -620,9 +620,45 @@ export async function dispatchPluginAutocomplete(opts: {
 /** The most the router waits on a plugin's `http` handler (#220, ADR-0007) before it answers `504`
  *  for it. The call is not cancelled. */
 export const PLUGIN_HTTP_TIMEOUT_MS = 10_000;
-/** The largest request body the host's listener accepts (ADR-0007 decision 4); Bun refuses more at
- *  the transport, before any plugin code runs. */
+/** The largest request body the host accepts (ADR-0007 decision 4). `routeHttpRequest` enforces it
+ *  itself, before any plugin code runs: Bun's own `maxRequestBodySize` covers only a body that
+ *  declares its `Content-Length`, and cloudflared forwards a body of unknown length as chunked. */
 export const HTTP_MAX_BODY_BYTES = 1024 * 1024;
+
+/**
+ * `request` with its body read into memory, at most `max` bytes, or `"too-large"`. A declared
+ * `Content-Length` over `max` is refused without reading; any other body (chunked included) is read
+ * with a running count and abandoned the moment it passes `max`. The plugin gets a new `Request` over
+ * the buffered bytes, so what it reads can never exceed the cap.
+ */
+async function withBoundedBody(request: Request, max: number): Promise<Request | "too-large"> {
+  if (request.body === null) return request;
+  const declared = request.headers.get("content-length");
+  if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > max) return "too-large";
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      return "too-large";
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  const headers = new Headers(request.headers);
+  headers.delete("transfer-encoding");
+  headers.set("content-length", String(total));
+  return new Request(request.url, { method: request.method, headers, body });
+}
 
 const TIMED_OUT = Symbol("timed out");
 
@@ -634,11 +670,15 @@ function httpStatus(status: number, text: string): Response {
 /**
  * #220 (ADR-0007): answers one request on the host's HTTP listener. The first path segment names the
  * plugin, matched exactly against the loaded plugins' names; the rest of the path is `info.path`.
- * - No segment, or one naming no loaded plugin, or a plugin with no `http` handler: `404`.
- * - A plugin that has one but is not running (activate() hasn't resolved, threw, or it was disposed): `503`.
+ * - No segment, or one naming no loaded plugin: `404`.
+ * - A plugin that is not running (activate() hasn't resolved, threw, or it is being disposed): `503`,
+ *   before any of its code is touched.
+ * - A running plugin with no `http` handler: `404`.
+ * - A body over `maxBodyBytes`, declared or streamed: `413`, before the handler runs.
  * - A handler that throws, or returns something that is not a `Response`: `500`, logged under the plugin.
  * - A handler still running after `timeoutMs`: `504`, logged; the call is not cancelled.
- * Never rejects. `timeoutMs` is the test seam, like `pluginTicks`'.
+ * - A `request.url` that will not parse: `400` (Bun's server never produces one; defence in depth).
+ * Never rejects. `timeoutMs` and `maxBodyBytes` are test seams, like `pluginTicks`' `timeoutMs`.
  */
 export async function routeHttpRequest(
   loaded: readonly LoadedPlugin[],
@@ -646,6 +686,7 @@ export async function routeHttpRequest(
   clientIp: string,
   log: BaseLog,
   timeoutMs = PLUGIN_HTTP_TIMEOUT_MS,
+  maxBodyBytes = HTTP_MAX_BODY_BYTES,
 ): Promise<Response> {
   let pathname: string;
   try {
@@ -657,6 +698,8 @@ export async function routeHttpRequest(
   const name = match?.[1];
   const lp = name === undefined ? undefined : loaded.find((l) => l.entry.name === name);
   if (lp === undefined) return httpStatus(404, "Not found");
+  // Before the plugin's own code is touched, its getter included: "called only while running".
+  if (!lp.running) return httpStatus(503, "Unavailable");
   let handler: Plugin["http"];
   try {
     // Plugin-controlled and only type-asserted: a throwing getter is this plugin's 500, not a crash.
@@ -666,12 +709,18 @@ export async function routeHttpRequest(
     return httpStatus(500, "Internal error");
   }
   if (typeof handler !== "function") return httpStatus(404, "Not found");
-  if (!lp.running) return httpStatus(503, "Unavailable");
   const info = { path: match?.[2] ?? "/", clientIp };
+  let bounded: Request | "too-large";
+  try {
+    bounded = await withBoundedBody(request, maxBodyBytes);
+  } catch {
+    return httpStatus(400, "Bad request"); // the client's body stream failed mid-read
+  }
+  if (bounded === "too-large") return httpStatus(413, "Request body too large");
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const outcome = await Promise.race([
-      Promise.resolve().then(() => handler.call(lp.plugin, request, info)),
+      Promise.resolve().then(() => handler.call(lp.plugin, bounded, info)),
       new Promise<typeof TIMED_OUT>((resolve) => {
         timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
       }),

@@ -248,8 +248,8 @@ plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A k
 itself owns (a core credential, or a variable `docker-compose.yml` interpolates) or the bot core reads
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
 `HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
-`Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE` — all
-`RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
+`Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`, and the HTTP
+router's `HTTP_PORT` (#220) — all `RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
 spellings of each proxy variable, since Bun's `fetch` honours upper- and lower-case alike
 (`HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`), and `TAR_OPTIONS`
 (also `RESERVED_KEYS`, #280) —
@@ -320,7 +320,7 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   `docker-compose.yml` interpolates, the settings the core reads that the panel does not edit
   (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
   `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
-  `SHARDING_MANAGER_MODE`, #278), and the variables that act on the core's own outbound calls or on a
+  `SHARDING_MANAGER_MODE`, #278; the HTTP router's `HTTP_PORT`, #220), and the variables that act on the core's own outbound calls or on a
   tool it spawns — both spellings of each proxy variable (`HTTP_PROXY`/`http_proxy`,
   `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`) and `TAR_OPTIONS` (#280) — is
   dropped from every plugin path whatever the manifest says, on or off

@@ -1014,7 +1014,7 @@ describe("routeHttpRequest (#220)", () => {
     expect((await routeHttpRequest([lp], req("/g"), "ip", makeLog().log)).status).toBe(500);
   });
 
-  test("a handler still running at the bound is answered with a 504, logged, and its timer cleared", async () => {
+  test("a handler still running at the bound is answered with a 504, and logged", async () => {
     const { log, calls } = makeLog();
     const { lp } = serving("slow", true, () => new Promise<Response>(() => {}));
     const started = Date.now();
@@ -1037,6 +1037,54 @@ describe("routeHttpRequest (#220)", () => {
       setSpy.mockRestore();
       clearSpy.mockRestore();
     }
+  });
+
+  const streamed = (bytes: number, chunk = 256) =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let sent = 0; sent < bytes; sent += chunk) controller.enqueue(new Uint8Array(Math.min(chunk, bytes - sent)));
+        controller.close();
+      },
+    });
+
+  test("a streamed (chunked) body over the cap is a 413, and the handler never runs", async () => {
+    const { lp, seen } = serving("music");
+    const body = streamed(4_000);
+    const res = await routeHttpRequest([lp], req("/music/x", { method: "POST", body, duplex: "half" } as RequestInit), "ip", makeLog().log, 60_000, 1_024);
+    expect(res.status).toBe(413);
+    expect(seen).toEqual([]);
+  });
+
+  test("a declared Content-Length over the cap is a 413 without reading the body", async () => {
+    const { lp, seen } = serving("music");
+    const res = await routeHttpRequest(
+      [lp],
+      req("/music/x", { method: "POST", body: "x".repeat(2_000), headers: { "content-length": "2000" } }),
+      "ip",
+      makeLog().log,
+      60_000,
+      1_024,
+    );
+    expect(res.status).toBe(413);
+    expect(seen).toEqual([]);
+  });
+
+  test("a body within the cap, streamed or not, reaches the handler whole, with its headers", async () => {
+    const got: string[] = [];
+    const { lp } = serving("music", true, async (request) => {
+      got.push(`${(await request.text()).length} ${request.headers.get("x-kind")} ${request.headers.get("transfer-encoding")}`);
+      return new Response("ok");
+    });
+    await routeHttpRequest([lp], req("/music/x", { method: "POST", body: streamed(1_000), headers: { "x-kind": "chunked" }, duplex: "half" } as RequestInit), "ip", makeLog().log, 60_000, 1_024);
+    await routeHttpRequest([lp], req("/music/x", { method: "POST", body: "y".repeat(1_024), headers: { "x-kind": "plain" } }), "ip", makeLog().log, 60_000, 1_024);
+    expect(got).toEqual(["1000 chunked null", "1024 plain null"]);
+  });
+
+  test("a plugin that is not running gets a 503 before any of its code runs -- its http getter included", async () => {
+    let read = 0;
+    const lp = loaded(entry({ name: "g" }), { get http(): Plugin["http"] { read += 1; throw new Error("getter"); } } as Plugin, false);
+    expect((await routeHttpRequest([lp], req("/g"), "ip", makeLog().log)).status).toBe(503);
+    expect(read).toBe(0);
   });
 
   test("the bounds are the ones ADR-0007 states", () => {
