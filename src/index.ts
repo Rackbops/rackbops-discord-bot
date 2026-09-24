@@ -40,6 +40,7 @@ import {
   dispatchPluginAutocomplete,
   dispatchPluginInteraction,
   disposePlugins,
+  HTTP_MAX_BODY_BYTES,
   loadPlugins,
   mutatePluginState,
   PLUGIN_DISPOSE_TIMEOUT_MS,
@@ -47,8 +48,10 @@ import {
   pluginCommandMap,
   pluginTicks,
   readPluginState,
+  routeHttpRequest,
   writePluginState,
 } from "./plugins/host";
+import { startHostHttp } from "./http";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { describePlugins } from "./routing/discovery";
 import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
@@ -88,6 +91,9 @@ const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
 // dispose them by the time a signal actually arrives. Empty until activate() assigns it, which
 // correctly makes disposePlugins a no-op for a signal that arrives before any plugin has loaded.
 let currentLoadedPlugins: readonly LoadedPlugin[] = [];
+// #220: stops the host's HTTP listener, once activate() has started one (HTTP_PORT set). A no-op until
+// then, so a signal before activate() has nothing to stop.
+let stopHttp: () => void = () => {};
 
 // #154: the first (and only) signal handler in this codebase, registered before resolveBootMode's
 // own daemon call below so even a standby stopped mid-verify drains cleanly (trivially idle —
@@ -99,7 +105,11 @@ const shutdownHandler = createShutdownHandler({
   awaitIdle: awaitCriticalIdle,
   // #184: reads currentLoadedPlugins live at call time, not at wiring time (this closure is built
   // before activate() ever runs) — see that variable's own comment.
-  disposePlugins: () => disposePlugins(currentLoadedPlugins, console, PLUGIN_DISPOSE_TIMEOUT_MS),
+  // #220: the HTTP listener stops first, so no new request reaches a plugin that is being disposed.
+  disposePlugins: () => {
+    stopHttp();
+    return disposePlugins(currentLoadedPlugins, console, PLUGIN_DISPOSE_TIMEOUT_MS);
+  },
   destroyClient: () => client.destroy(),
   exit: (code) => process.exit(code),
   log: console,
@@ -275,6 +285,25 @@ async function activate(c: Client<true>): Promise<void> {
   });
   onStopRequested((reason) => tickControl.stop(reason));
   startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
+
+  // #220 (ADR-0007): the host's HTTP router, only when HTTP_PORT is set. After activatePlugins, so a
+  // plugin's `running` gate is already true; routeHttpRequest answers 503 for one that is not. A bind
+  // failure (a port in use) is logged and the bot runs without it — an HTTP plugin must never take
+  // the bot down.
+  if (config.httpPort !== undefined) {
+    try {
+      const loaded = loadResult.loaded;
+      const http = startHostHttp({
+        port: config.httpPort,
+        maxBodyBytes: HTTP_MAX_BODY_BYTES,
+        handle: (request, clientIp) => routeHttpRequest(loaded, request, clientIp, console),
+        log: console,
+      });
+      stopHttp = http.stop;
+    } catch (err) {
+      console.error(`[http] could not listen on :${config.httpPort} — plugin HTTP routes are off`, err);
+    }
+  }
 
   // #241: the request mailbox is also drained every few seconds on its own timer, so a routing change
   // made in the panel shows up while the operator is still looking; the `pluginRequests` tick check

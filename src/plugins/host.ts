@@ -617,6 +617,82 @@ export async function dispatchPluginAutocomplete(opts: {
   if (!respondCalled && !interaction.responded) await interaction.respond([]);
 }
 
+/** The most the router waits on a plugin's `http` handler (#220, ADR-0007) before it answers `504`
+ *  for it. The call is not cancelled. */
+export const PLUGIN_HTTP_TIMEOUT_MS = 10_000;
+/** The largest request body the host's listener accepts (ADR-0007 decision 4); Bun refuses more at
+ *  the transport, before any plugin code runs. */
+export const HTTP_MAX_BODY_BYTES = 1024 * 1024;
+
+const TIMED_OUT = Symbol("timed out");
+
+/** A fixed, plain-text answer: no plugin's error text ever reaches a client. */
+function httpStatus(status: number, text: string): Response {
+  return new Response(text + "\n", { status, headers: { "content-type": "text/plain; charset=utf-8" } });
+}
+
+/**
+ * #220 (ADR-0007): answers one request on the host's HTTP listener. The first path segment names the
+ * plugin, matched exactly against the loaded plugins' names; the rest of the path is `info.path`.
+ * - No segment, or one naming no loaded plugin, or a plugin with no `http` handler: `404`.
+ * - A plugin that has one but is not running (activate() hasn't resolved, threw, or it was disposed): `503`.
+ * - A handler that throws, or returns something that is not a `Response`: `500`, logged under the plugin.
+ * - A handler still running after `timeoutMs`: `504`, logged; the call is not cancelled.
+ * Never rejects. `timeoutMs` is the test seam, like `pluginTicks`'.
+ */
+export async function routeHttpRequest(
+  loaded: readonly LoadedPlugin[],
+  request: Request,
+  clientIp: string,
+  log: BaseLog,
+  timeoutMs = PLUGIN_HTTP_TIMEOUT_MS,
+): Promise<Response> {
+  let pathname: string;
+  try {
+    pathname = new URL(request.url).pathname;
+  } catch {
+    return httpStatus(400, "Bad request");
+  }
+  const match = /^\/([^/]+)(\/.*)?$/.exec(pathname);
+  const name = match?.[1];
+  const lp = name === undefined ? undefined : loaded.find((l) => l.entry.name === name);
+  if (lp === undefined) return httpStatus(404, "Not found");
+  let handler: Plugin["http"];
+  try {
+    // Plugin-controlled and only type-asserted: a throwing getter is this plugin's 500, not a crash.
+    handler = lp.plugin.http;
+  } catch (err) {
+    log.error(`[plugins] ${lp.entry.name} http handler failed`, err);
+    return httpStatus(500, "Internal error");
+  }
+  if (typeof handler !== "function") return httpStatus(404, "Not found");
+  if (!lp.running) return httpStatus(503, "Unavailable");
+  const info = { path: match?.[2] ?? "/", clientIp };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([
+      Promise.resolve().then(() => handler.call(lp.plugin, request, info)),
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
+      }),
+    ]);
+    if (outcome === TIMED_OUT) {
+      log.error(`[plugins] ${lp.entry.name} http handler took over ${timeoutMs}ms for ${request.method} ${info.path}`);
+      return httpStatus(504, "Timed out");
+    }
+    if (!(outcome instanceof Response)) {
+      log.error(`[plugins] ${lp.entry.name} http handler returned something that is not a Response`);
+      return httpStatus(500, "Internal error");
+    }
+    return outcome;
+  } catch (err) {
+    log.error(`[plugins] ${lp.entry.name} http handler failed for ${request.method} ${info.path}`, err);
+    return httpStatus(500, "Internal error");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const STATE_FRESH: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
 
 function statePath(dataDir: string): string {

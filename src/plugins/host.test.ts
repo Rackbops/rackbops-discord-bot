@@ -30,6 +30,9 @@ const {
   dispatchPluginAutocomplete,
   AUTOCOMPLETE_GATE_TIMEOUT_MS,
   AUTOCOMPLETE_TIMEOUT_MS,
+  routeHttpRequest,
+  PLUGIN_HTTP_TIMEOUT_MS,
+  HTTP_MAX_BODY_BYTES,
 } = await import("./host");
 // The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
 // relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
@@ -941,6 +944,104 @@ describe("dispatchPluginAutocomplete (#287)", () => {
     const { interaction, responses } = fakeAutocomplete();
     await run(s, interaction);
     expect(responses).toEqual([[]]);
+  });
+});
+
+describe("routeHttpRequest (#220)", () => {
+  type Seen = { path: string; clientIp: string; url: string };
+  const serving = (name: string, running = true, http?: Plugin["http"]) => {
+    const seen: Seen[] = [];
+    const handler: Plugin["http"] =
+      http ?? (async (request, info) => { seen.push({ ...info, url: request.url }); return new Response(`hi from ${name}`); });
+    return { lp: loaded(entry({ name }), { http: handler }, running), seen };
+  };
+  const req = (path: string, init?: RequestInit) => new Request(`http://bot.internal${path}`, init);
+
+  test("the first path segment names the plugin, and the handler sees the rest, with the untouched request", async () => {
+    const music = serving("music");
+    const other = serving("warbandeer");
+    const res = await routeHttpRequest([other.lp, music.lp], req("/music/spotify/callback?code=x&state=y"), "203.0.113.9", makeLog().log);
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("hi from music");
+    expect(music.seen).toEqual([{ path: "/spotify/callback", clientIp: "203.0.113.9", url: "http://bot.internal/music/spotify/callback?code=x&state=y" }]);
+    expect(other.seen).toEqual([]);
+  });
+
+  test("a bare /<name> and /<name>/ both reach the handler as \"/\"", async () => {
+    const { lp, seen } = serving("music");
+    await routeHttpRequest([lp], req("/music"), "ip", makeLog().log);
+    await routeHttpRequest([lp], req("/music/"), "ip", makeLog().log);
+    expect(seen.map((s) => s.path)).toEqual(["/", "/"]);
+  });
+
+  test("the name is matched exactly: a longer or shorter segment is not the plugin", async () => {
+    const { lp, seen } = serving("music");
+    for (const path of ["/musics/x", "/musi/x", "/Music/x", "/", "/x/music"]) {
+      expect((await routeHttpRequest([lp], req(path), "ip", makeLog().log)).status).toBe(404);
+    }
+    expect(seen).toEqual([]);
+  });
+
+  test("a plugin without an http handler is a 404, like an unknown name", async () => {
+    const lp = loaded(entry({ name: "wow" }), {}, true);
+    expect((await routeHttpRequest([lp], req("/wow/x"), "ip", makeLog().log)).status).toBe(404);
+  });
+
+  test("a plugin that is not running is a 503, and its handler is not called", async () => {
+    const { lp, seen } = serving("music", false);
+    expect((await routeHttpRequest([lp], req("/music/x"), "ip", makeLog().log)).status).toBe(503);
+    expect(seen).toEqual([]);
+  });
+
+  test("a handler that throws is a 500 that carries none of its error text, and is logged under the plugin", async () => {
+    const { log, calls } = makeLog();
+    const { lp } = serving("music", true, async () => { throw new Error("db password is hunter2"); });
+    const res = await routeHttpRequest([lp], req("/music/x"), "ip", log);
+    expect(res.status).toBe(500);
+    expect(await res.text()).not.toContain("hunter2");
+    expect(calls.some((c) => c.level === "error" && c.message.startsWith("[plugins] music http handler failed"))).toBe(true);
+  });
+
+  test("a handler that throws synchronously, or returns something that is not a Response, is a 500", async () => {
+    const sync = serving("a", true, (() => { throw new Error("sync"); }) as unknown as Plugin["http"]);
+    const junk = serving("b", true, (async () => "ok") as unknown as Plugin["http"]);
+    expect((await routeHttpRequest([sync.lp], req("/a"), "ip", makeLog().log)).status).toBe(500);
+    expect((await routeHttpRequest([junk.lp], req("/b"), "ip", makeLog().log)).status).toBe(500);
+  });
+
+  test("a throwing http getter is this plugin's 500, not a crash", async () => {
+    const lp = loaded(entry({ name: "g" }), { get http(): Plugin["http"] { throw new Error("getter"); } } as Plugin, true);
+    expect((await routeHttpRequest([lp], req("/g"), "ip", makeLog().log)).status).toBe(500);
+  });
+
+  test("a handler still running at the bound is answered with a 504, logged, and its timer cleared", async () => {
+    const { log, calls } = makeLog();
+    const { lp } = serving("slow", true, () => new Promise<Response>(() => {}));
+    const started = Date.now();
+    const res = await routeHttpRequest([lp], req("/slow/x"), "ip", log, 30);
+    expect(res.status).toBe(504);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(calls.some((c) => c.level === "error" && c.message.includes("took over 30ms"))).toBe(true);
+  });
+
+  test("a handler that answers in time clears its timer (no timer left holding the event loop)", async () => {
+    const setSpy = spyOn(globalThis, "setTimeout");
+    const clearSpy = spyOn(globalThis, "clearTimeout");
+    try {
+      const { lp } = serving("fast");
+      await routeHttpRequest([lp], req("/fast"), "ip", makeLog().log, 60_000);
+      const armed = setSpy.mock.calls.flatMap((call, i) => (call[1] === 60_000 ? [setSpy.mock.results[i]?.value] : []));
+      expect(armed).toHaveLength(1);
+      expect(clearSpy.mock.calls.some((call) => call[0] === armed[0])).toBe(true);
+    } finally {
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
+  });
+
+  test("the bounds are the ones ADR-0007 states", () => {
+    expect(PLUGIN_HTTP_TIMEOUT_MS).toBe(10_000);
+    expect(HTTP_MAX_BODY_BYTES).toBe(1024 * 1024);
   });
 });
 

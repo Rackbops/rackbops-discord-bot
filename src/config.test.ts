@@ -274,3 +274,22 @@ describe("resolveConfig — plugins", () => {
     expect(() => resolveConfig({ ...base, PLUGIN_INDEX_URL: "relative/x.json" })).toThrow(/PLUGIN_INDEX_URL must be/);
   });
 });
+
+describe("resolveConfig — HTTP_PORT (#220)", () => {
+  test("unset or blank means no listener: the key is absent", () => {
+    expect("httpPort" in resolveConfig(base)).toBe(false);
+    expect("httpPort" in resolveConfig({ ...base, HTTP_PORT: "" })).toBe(false);
+  });
+
+  test("a port number is read as a number", () => {
+    expect(resolveConfig({ ...base, HTTP_PORT: "8790" }).httpPort).toBe(8790);
+    expect(resolveConfig({ ...base, HTTP_PORT: "1" }).httpPort).toBe(1);
+    expect(resolveConfig({ ...base, HTTP_PORT: "65535" }).httpPort).toBe(65535);
+  });
+
+  test("anything that is not a port 1-65535 is refused at boot, naming the value", () => {
+    for (const bad of ["0", "65536", "99999", "abc", "80a", " 80", "8.0", "-1", "123456"]) {
+      expect(() => resolveConfig({ ...base, HTTP_PORT: bad })).toThrow(`HTTP_PORT must be a port number (1-65535), got "${bad}"`);
+    }
+  });
+});

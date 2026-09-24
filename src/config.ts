@@ -22,6 +22,9 @@ export interface Config {
   plugins: PluginSelector[];
   /** Where to fetch the Plugin Index (plugins.json) from — http(s), file://, or an absolute path. */
   pluginIndexUrl: string;
+  /** #220 (ADR-0007): the port the host's HTTP router listens on inside the container. Absent = no
+   *  listener at all. */
+  httpPort?: number;
 }
 
 /** One `PLUGINS=` token: a bare name, or `name@version` to pin a version. */
@@ -114,6 +117,16 @@ export function resolveConfig(env: Env): Config {
     );
   }
 
+  // #220: the host's HTTP router (ADR-0007). Unset or blank means no listener — fail closed.
+  const httpPortRaw = optional("HTTP_PORT");
+  let httpPort: number | undefined;
+  if (httpPortRaw !== undefined) {
+    httpPort = /^[0-9]{1,5}$/.test(httpPortRaw) ? Number(httpPortRaw) : NaN;
+    if (!(httpPort >= 1 && httpPort <= 65535)) {
+      throw new Error(`HTTP_PORT must be a port number (1-65535), got "${httpPortRaw}"`);
+    }
+  }
+
   return {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
@@ -130,6 +143,7 @@ export function resolveConfig(env: Env): Config {
     commandPrefix,
     plugins,
     pluginIndexUrl,
+    ...(httpPort !== undefined ? { httpPort } : {}),
   };
 }
 
