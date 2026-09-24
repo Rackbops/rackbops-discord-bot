@@ -1,5 +1,5 @@
-// Where a plugin's announcements go (ADR-0006 decisions 5-6, #243). `HostApi.announce(message)` keeps
-// its signature; what changed is what stands behind it. `announceTargets` (resolve.ts) says which
+// Where a plugin's announcements go (ADR-0006 decisions 5-6, #243). `HostApi.announce(message)` kept
+// its signature (#219 added an optional named `destination`); what changed is what stands behind it. `announceTargets` (resolve.ts) says which
 // channels the plugin posts to; for each one this posts through the channel's webhook when it has a
 // usable one, and as the bot when it does not.
 //
@@ -57,7 +57,7 @@ function usableWebhook(routing: RoutingFile, channelId: string): WebhookMeta | u
  * channels that DID get the message -- every minute, for as long as one channel stays unreachable. With
  * one target (the case with no routing) this is exactly today's behaviour: the failure propagates.
  */
-export async function postForPlugin(plugin: string, message: string, deps: PostDeps): Promise<void> {
+export async function postForPlugin(plugin: string, message: string, deps: PostDeps, destination?: string): Promise<void> {
   // Routing is read per use (one small file; no cache, so no invalidation bug). A read that fails must
   // not take a plugin's announcements down, so it reads as "no routing": the default channel.
   let routing: RoutingFile;
@@ -67,7 +67,7 @@ export async function postForPlugin(plugin: string, message: string, deps: PostD
     deps.log.warn(`[announce] ${plugin}: could not read routing; posting to the default channel`);
     routing = freshRouting();
   }
-  const targets = announceTargets(routing, plugin, deps.defaultChannelId);
+  const targets = announceTargets(routing, plugin, deps.defaultChannelId, destination);
 
   // The secrets file is only opened when some target could use it.
   let secrets: RoutingSecretsFile | undefined;

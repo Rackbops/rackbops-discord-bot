@@ -3970,6 +3970,52 @@ describe("parseRoutingSetInput (#242)", () => {
     expect(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all" } })).ok).toBe(true);
   });
 
+  test("destinations (#219): accepted, rebuilt, and omitted when empty", () => {
+    const destinations = { raids: RT_CHAN_1, "loot-2": RT_CHAN_2 };
+    expect(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", postTo: RT_CHAN_1, destinations } }))).toEqual({
+      ok: true,
+      input: { plugin: "music", servers: { [RT_GUILD_A]: { commands: "all", postTo: RT_CHAN_1, destinations } } },
+    });
+    // An empty map is dropped, never passed on as {} (the bot never writes one either).
+    const empty = parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", destinations: {} } }));
+    expect(empty).toEqual({ ok: true, input: { plugin: "music", servers: { [RT_GUILD_A]: { commands: "all" } } } });
+    if (empty.ok) expect(Object.keys(empty.input.servers[RT_GUILD_A]!)).toEqual(["commands"]);
+    // A copy, not the caller's object.
+    const result = parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", destinations } }));
+    expect(result.ok && result.input.servers[RT_GUILD_A]!.destinations).not.toBe(destinations);
+  });
+
+  test("bad destinations (#219)", () => {
+    for (const destinations of [
+      null, 7, "raids", [], [RT_CHAN_1],
+      { raids: 7 }, { raids: "x" }, { raids: "1234" }, { raids: null }, { raids: [RT_CHAN_1] }, { raids: { id: RT_CHAN_1 } },
+      { Raids: RT_CHAN_1 }, { "1raids": RT_CHAN_1 }, { raids_x: RT_CHAN_1 }, { "": RT_CHAN_1 }, { "raids\n": RT_CHAN_1 },
+      { raids: RT_CHAN_1, "bad name": RT_CHAN_2 },
+    ]) {
+      expect(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", destinations } })), JSON.stringify(destinations)).toEqual({
+        ok: false,
+        reason: "bad destinations",
+      });
+    }
+    // Neither a bad name nor a bad channel is echoed back.
+    const secret = "SECRET-VALUE-xyz";
+    for (const destinations of [{ [secret]: RT_CHAN_1 }, { raids: secret }]) {
+      expect(JSON.stringify(parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", destinations } })))).not.toContain(secret);
+    }
+  });
+
+  test("a __proto__ destination name is refused; an inherited-looking valid name stays an own key (#219)", () => {
+    const raw = JSON.parse(`{"plugin":"music","servers":{"${RT_GUILD_A}":{"commands":"all","destinations":{"__proto__":"${RT_CHAN_1}"}}}}`);
+    expect(parseRoutingSetInput(raw)).toEqual({ ok: false, reason: "bad destinations" });
+    expect(({} as Record<string, unknown>)[RT_CHAN_1]).toBeUndefined();
+    const ctor = parseRoutingSetInput(body({ [RT_GUILD_A]: { commands: "all", destinations: { constructor: RT_CHAN_1 } } }));
+    expect(ctor.ok).toBe(true);
+    if (!ctor.ok) return;
+    const map = ctor.input.servers[RT_GUILD_A]!.destinations!;
+    expect(Object.keys(map)).toEqual(["constructor"]);
+    expect(Object.hasOwn(map, "constructor")).toBe(true);
+  });
+
   test("a reason never contains the value it refused", () => {
     const secret = "SECRET-VALUE-xyz";
     for (const raw of [
@@ -4921,6 +4967,20 @@ describe("admin panel planPluginsSave (#102)", () => {
     });
     test("a whitespace-only difference is not a change (no spurious restart)", () => {
       expect(planPluginsSave(["warbandeer", "raidhelper"], "warbandeer, raidhelper", ["warbandeer", "raidhelper"]).changed).toBe(false);
+    });
+    test("a hand-written order that differs from the manifest's is not a change, and is kept as it stands", () => {
+      // debug's PLUGINS on 2026-09-24 (#247): the panel showed "1 change needs a restart" on every load.
+      expect(planPluginsSave(["music", "warbandeer", "wow"], "warbandeer,wow,music", ["music", "warbandeer", "wow"])).toEqual({
+        value: "warbandeer,wow,music",
+        changed: false,
+      });
+      expect(planPluginsSave(["wow", "music"], "music@1.2.0, wow", ["music", "wow"])).toEqual({ value: "music@1.2.0,wow", changed: false });
+    });
+    test("a real change after a reordering is still a change, in the manifest's order", () => {
+      expect(planPluginsSave(["music", "wow"], "wow,warbandeer,music", ["music", "warbandeer", "wow"])).toEqual({
+        value: "music,wow",
+        changed: true,
+      });
     });
     test("a ticked plugin the manifest doesn't list is appended in its own order", () => {
       expect(planPluginsSave(["warbandeer", "legacy"], "warbandeer,legacy", ["warbandeer"]).value).toBe("warbandeer,legacy");
@@ -9511,22 +9571,204 @@ describe("selectionFromModel (#246, extracted from ensureRouteState)", () => {
     expect(src).toContain("function selectionFromModel(");
   });
 
-  test("one entry per ticked row; scope/channels from whether commands is a list; postTo carried as-is", () => {
+  test("one entry per ticked row; scope/channels from whether commands is a list; postTo and destinations carried as-is", () => {
     const model = {
       rows: [
-        { id: "1", on: true, commands: "all" as const, postTo: null },
-        { id: "2", on: true, commands: ["a", "b"], postTo: "a" },
-        { id: "3", on: false, commands: "all" as const, postTo: null },
+        { id: "1", on: true, commands: "all" as const, postTo: null, destinations: {} },
+        { id: "2", on: true, commands: ["a", "b"], postTo: "a", destinations: { raids: "b" } },
+        { id: "3", on: false, commands: "all" as const, postTo: null, destinations: {} },
       ],
     };
-    expect(fns.selectionFromModel(model)).toEqual({
-      "1": { on: true, scope: "all", channels: [], postTo: null },
-      "2": { on: true, scope: "chosen", channels: ["a", "b"], postTo: "a" },
+    const selection = fns.selectionFromModel(model);
+    expect(selection).toEqual({
+      "1": { on: true, scope: "all", channels: [], postTo: null, destinations: {} },
+      "2": { on: true, scope: "chosen", channels: ["a", "b"], postTo: "a", destinations: { raids: "b" } },
     });
+    // #219: a copy, so a later pick never writes into the model's own row.
+    expect((selection["2"] as { destinations: unknown }).destinations).not.toBe(model.rows[1]!.destinations);
   });
 
   test("no ticked rows -> an empty selection", () => {
     expect(fns.selectionFromModel({ rows: [] })).toEqual({});
+  });
+});
+
+// #219: named destinations in "Choose where it lives" -- the pure half (what the model reads, what is sent,
+// what the Servers tab summarises) against canned discovery/routing in src/routing/model.ts's shapes.
+describe("named destinations (#219): PLUGIN_ROUTING / SERVERS_TAB", () => {
+  const src = applyBlock("PLUGIN_ROUTING");
+  type Channel = { id: string; name: string; canSend: boolean; webhook: string };
+  type Row = { id: string; name: string; on: boolean; commands: "all" | string[]; postTo: string | null; destinations: Record<string, string>; channels: Channel[] };
+  type Model = { mode: string; posts: boolean; destinations: { name: string; description: string }[]; rows: Row[]; unavailable: string[] };
+  const fns = new Function(
+    `"use strict";\n${src}\nreturn { routingStepModel, routingSetBody, selectionFromModel, declaredDestinations, pickedDestination, destinationLabel };`,
+  )() as {
+    routingStepModel: (pluginName: string, routingData: unknown, now: number) => Model;
+    routingSetBody: (pluginName: string, selection: Record<string, unknown>, model: Model) => { body: { plugin: string; servers: Record<string, Record<string, unknown>> } } | { error: string };
+    selectionFromModel: (model: Model) => Record<string, unknown>;
+    declaredDestinations: (list: unknown) => { name: string; description: string }[];
+    pickedDestination: (sel: unknown, name: string) => string | null;
+    destinationLabel: (d: { name: string; description: string }) => string;
+  };
+  const serversTab = new Function(`"use strict";\n${applyBlock("SERVERS_TAB")}\nreturn { serverCardModel };`)() as {
+    serverCardModel: (guild: unknown, routingData: unknown, pluginsData: unknown) => { plugins: Record<string, unknown>[] };
+  };
+
+  const HOME = "100", OTHER = "200";
+  const GEN_CH = "10", RAID_CH = "11", OTHER_CH = "20";
+  const NOW = Date.parse("2026-09-22T12:00:00.000Z");
+  const DECLARED = [
+    { name: "raids", description: "Raid night sign-ups" },
+    { name: "loot", description: "" },
+  ];
+  const discovery = {
+    v: 1 as const,
+    generatedAt: "2026-09-22T11:30:00.000Z",
+    bot: { id: "b1", username: "bot" },
+    inviteUrl: "",
+    homeGuildId: HOME,
+    guilds: [
+      { id: HOME, name: "Home", channels: [{ id: GEN_CH, name: "general", canSend: true }, { id: RAID_CH, name: "raid-chat", canSend: true }], commands: null },
+      { id: OTHER, name: "Other", channels: [{ id: OTHER_CH, name: "chat", canSend: true }], commands: null },
+    ],
+    plugins: { wow: { posts: true, commands: [], destinations: DECLARED }, music: { posts: true, commands: [] } },
+  };
+  const routing = {
+    v: 1 as const,
+    updatedAt: "t",
+    updatedBy: "admin",
+    plugins: { wow: { servers: { [HOME]: { commands: "all" as const, postTo: GEN_CH, destinations: { raids: RAID_CH } }, [OTHER]: { commands: "all" as const } } } },
+    webhooks: {},
+    results: [],
+  };
+  const routingData = { routing, discovery };
+
+  test("routingStepModel reads the declared destinations and each row's saved map; a plugin declaring none has []", () => {
+    const m = fns.routingStepModel("wow", routingData, NOW);
+    expect(m.destinations).toEqual(DECLARED);
+    expect(m.rows.find((r) => r.id === HOME)!.destinations).toEqual({ raids: RAID_CH });
+    expect(m.rows.find((r) => r.id === OTHER)!.destinations).toEqual({});
+    expect(fns.routingStepModel("music", routingData, NOW).destinations).toEqual([]);
+    expect(fns.routingStepModel("wow", { routing, discovery: null }, NOW).destinations).toEqual([]);
+    // seeded into the selection the way postTo is
+    expect(fns.selectionFromModel(m)[HOME]).toMatchObject({ postTo: GEN_CH, destinations: { raids: RAID_CH } });
+  });
+
+  test("declaredDestinations keeps only well-formed, first-seen names; a missing description reads as empty", () => {
+    expect(fns.declaredDestinations(undefined)).toEqual([]);
+    expect(fns.declaredDestinations("raids")).toEqual([]);
+    expect(
+      fns.declaredDestinations([null, 7, "raids", { name: "Raids" }, { name: "1x" }, { name: "__proto__" }, { name: "raids", description: "a" }, { name: "raids", description: "b" }, { name: "loot" }]),
+    ).toEqual([{ name: "raids", description: "a" }, { name: "loot", description: "" }]);
+  });
+
+  test("a saved destinations map is rebuilt pair by pair: a bad name or a non-string channel is skipped, __proto__ never becomes a key", () => {
+    const hostile = JSON.parse(`{"__proto__":"${RAID_CH}","Raids":"${RAID_CH}","loot":7,"raids":"${RAID_CH}"}`);
+    const r = { ...routing, plugins: { wow: { servers: { [HOME]: { commands: "all", destinations: hostile } } } } };
+    const row = fns.routingStepModel("wow", { routing: r, discovery }, NOW).rows.find((x) => x.id === HOME)!;
+    expect(row.destinations).toEqual({ raids: RAID_CH });
+    expect(Object.getPrototypeOf(row.destinations)).toBe(Object.prototype);
+    for (const bad of [null, "raids", [RAID_CH]]) {
+      const rb = { ...routing, plugins: { wow: { servers: { [HOME]: { commands: "all", destinations: bad } } } } };
+      expect(fns.routingStepModel("wow", { routing: rb, discovery }, NOW).rows.find((x) => x.id === HOME)!.destinations, JSON.stringify(bad)).toEqual({});
+    }
+  });
+
+  test("destinationLabel: the description, else the name", () => {
+    expect(fns.destinationLabel({ name: "raids", description: "Raid night sign-ups" })).toBe("Raid night sign-ups");
+    expect(fns.destinationLabel({ name: "loot", description: "" })).toBe("loot");
+  });
+
+  test("pickedDestination reads an own key only", () => {
+    expect(fns.pickedDestination({ destinations: { raids: RAID_CH } }, "raids")).toBe(RAID_CH);
+    expect(fns.pickedDestination({ destinations: {} }, "constructor")).toBeNull();
+    // an inherited string is not a pick either
+    expect(fns.pickedDestination({ destinations: Object.create({ raids: RAID_CH }) }, "raids")).toBeNull();
+    expect(fns.pickedDestination({ destinations: { raids: "" } }, "raids")).toBeNull();
+    expect(fns.pickedDestination({}, "raids")).toBeNull();
+    expect(fns.pickedDestination(undefined, "raids")).toBeNull();
+  });
+
+  test("routingSetBody sends a destination only when declared and still this row's channel, and omits destinations when none survive", () => {
+    const m = fns.routingStepModel("wow", routingData, NOW);
+    const sel = {
+      [HOME]: { on: true, scope: "all", channels: [], postTo: GEN_CH, destinations: { raids: RAID_CH, loot: GEN_CH } },
+      [OTHER]: { on: true, scope: "all", channels: [], postTo: null, destinations: {} },
+    };
+    expect(fns.routingSetBody("wow", sel, m)).toEqual({
+      body: { plugin: "wow", servers: { [HOME]: { commands: "all", postTo: GEN_CH, destinations: { raids: RAID_CH, loot: GEN_CH } }, [OTHER]: { commands: "all" } } },
+    });
+    // a channel of ANOTHER server (stale or moved) is dropped, not sent; the survivor still goes
+    const stale = { [HOME]: { on: true, scope: "all", channels: [], postTo: null, destinations: { raids: OTHER_CH, loot: GEN_CH } } };
+    expect((fns.routingSetBody("wow", stale, m) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all", destinations: { loot: GEN_CH } });
+    // every one stale -> no destinations key at all, never {}
+    const allStale = { [HOME]: { on: true, scope: "all", channels: [], postTo: null, destinations: { raids: OTHER_CH } } };
+    const planned = fns.routingSetBody("wow", allStale, m) as { body: { servers: Record<string, Record<string, unknown>> } };
+    expect(planned.body.servers[HOME]).toEqual({ commands: "all" });
+    expect(Object.keys(planned.body.servers[HOME]!)).toEqual(["commands"]);
+    // a name the plugin no longer declares is never sent (the bot would refuse the whole request)
+    const undeclared = { [HOME]: { on: true, scope: "all", channels: [], postTo: null, destinations: { gone: RAID_CH, raids: RAID_CH } } };
+    expect((fns.routingSetBody("wow", undeclared, m) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all", destinations: { raids: RAID_CH } });
+    // a plugin declaring none sends none, even from a hand-built selection
+    const music = fns.routingStepModel("music", routingData, NOW);
+    expect((fns.routingSetBody("music", sel, music) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all", postTo: GEN_CH });
+    // a selection with no destinations field at all (an older in-memory shape) is fine
+    const bare = { [HOME]: { on: true, scope: "all", channels: [], postTo: null } };
+    expect((fns.routingSetBody("wow", bare, m) as { body: { servers: Record<string, unknown> } }).body.servers[HOME]).toEqual({ commands: "all" });
+  });
+
+  test("serverCardModel lists the destinations mapped here by label and channel name, and adds no field when none are", () => {
+    const pluginsData = { plugins: [{ name: "wow", enabled: true, missingEnv: [] as string[] }] };
+    const home = serversTab.serverCardModel(discovery.guilds[0], routingData, pluginsData);
+    expect(home.plugins.find((p) => p.name === "wow")).toEqual({
+      name: "wow", scope: "all", postsTo: "general", webhook: "none", byDefault: false,
+      destinations: [{ label: "Raid night sign-ups", channel: "raid-chat" }],
+    });
+    const other = serversTab.serverCardModel(discovery.guilds[1], routingData, pluginsData);
+    expect(other.plugins.find((p) => p.name === "wow")).toEqual({ name: "wow", scope: "all", postsTo: null, webhook: "none", byDefault: false });
+    // an undeclared-now name falls back to the name; a channel discovery lost falls back to its id
+    const r = { ...routing, plugins: { wow: { servers: { [HOME]: { commands: "all" as const, destinations: { gone: "99999" } } } } } };
+    const lost = serversTab.serverCardModel(discovery.guilds[0], { routing: r, discovery }, pluginsData);
+    expect(lost.plugins.find((p) => p.name === "wow")!.destinations).toEqual([{ label: "gone", channel: "99999" }]);
+  });
+
+  test("pluginPlacementText appends one '· <label> to #channel' per mapped destination", () => {
+    const text = applyIndexSrc.slice(applyIndexSrc.indexOf("function pluginPlacementText("), applyIndexSrc.indexOf("function buildWebhookRow("));
+    const pluginPlacementText = new Function(`"use strict";\n${text}\nreturn pluginPlacementText;`)() as (p: unknown) => string;
+    const destinations = [{ label: "Raid night sign-ups", channel: "raid-chat" }, { label: "loot", channel: "general" }];
+    expect(pluginPlacementText({ scope: "all", postsTo: null, webhook: "none", destinations })).toBe("anywhere · Raid night sign-ups to #raid-chat · loot to #general");
+    expect(pluginPlacementText({ scope: ["a"], postsTo: "news", webhook: "ok", destinations: destinations.slice(0, 1) })).toBe("#a · posts to #news (webhook) · Raid night sign-ups to #raid-chat");
+    expect(pluginPlacementText({ scope: "all", postsTo: "news", webhook: "none" })).toBe("anywhere · posts to #news as the bot");
+  });
+});
+
+// #219: the DOM half is browser-only (no DOM harness renders buildRouteRow), so its properties are pinned
+// against the page's source, as #245's own pins below are.
+describe("named destinations (#219): source pins", () => {
+  const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
+  const rowSlice = indexSrc.slice(indexSrc.indexOf("function buildRouteRow("), indexSrc.indexOf("function onRouteChange("));
+
+  test("each ticked row draws one picker per declared destination, labelled, starting with 'Where it usually posts'", () => {
+    expect(rowSlice).toContain("for (const d of model.destinations) {");
+    expect(rowSlice).toContain("destLabel.textContent = destinationLabel(d);");
+    expect(rowSlice).toContain('usual.value = "";');
+    expect(rowSlice).toContain('usual.textContent = "Where it usually posts";');
+    expect(rowSlice).toContain("opt.textContent = channelOptionLabel(ch);");
+    // invisible to the Apply bar, like every routing control
+    expect(rowSlice).toContain("destSelect.dataset.routeServer = row.id;");
+    // lives inside the row's controls (hidden with the row when unticked), not gated on model.posts
+    expect(rowSlice).toContain("controls.appendChild(destSelect);");
+    const postsIdx = rowSlice.indexOf("if (model.posts) {");
+    const destIdx = rowSlice.indexOf("for (const d of model.destinations)");
+    expect(postsIdx).toBeGreaterThan(-1);
+    expect(rowSlice.slice(postsIdx, destIdx)).toContain("controls.appendChild(postSelect);\n    }\n");
+    expect(rowSlice).toContain('onRouteChange(plugin, row.id, "destination", { name: d.name, channel: destSelect.value || null })');
+    expect(rowSlice).toContain("destSelects, note: rowNote");
+  });
+
+  test("the destination selects are disabled while a request is in flight", () => {
+    const statusSlice = indexSrc.slice(indexSrc.indexOf("function renderRouteStatus("), indexSrc.indexOf("function renderRouteStatus(") + 2500);
+    expect(statusSlice).toContain("if (refs.destSelects) for (const destSelect of refs.destSelects.values()) destSelect.disabled = busy;");
   });
 });
 
@@ -10206,6 +10448,30 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(rowEls.chosenRadio.disabled).toBe(false);
     expect([...rowEls.channelChecks.values()].every((c) => !c.disabled)).toBe(true);
     expect(rowEls.postSelect.disabled).toBe(false);
+  });
+
+  // #219: a destination pick goes through the same debounced send as every other control, lands in the
+  // POST body under that server, and clearing it back to "Where it usually posts" drops the key again.
+  test("a destination pick is sent under its server; clearing it sends no destinations at all (#219)", async () => {
+    const destDiscovery = { ...discovery, plugins: { music: { posts: false, commands: [], destinations: [{ name: "raids", description: "Raid nights" }] } } };
+    const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] }, discovery: destDiscovery };
+    const h = harness({ routingDataInit });
+    h.seed("music");
+    h.run.onRouteChange("music", "100", "on", true);
+    h.run.onRouteChange("music", "100", "destination", { name: "raids", channel: "11" });
+    expect(h.routeState.get("music")!.selection["100"]).toMatchObject({ destinations: { raids: "11" } });
+    await h.clock.tick();
+    expect(h.posts).toHaveLength(1);
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: "all", destinations: { raids: "11" } } } });
+
+    // Settle the first request by hand, so the next pick sends at once instead of being held (the held /
+    // follow-up path has its own tests in this describe).
+    h.routeState.get("music")!.inflight = null;
+    h.run.onRouteChange("music", "100", "destination", { name: "raids", channel: null });
+    expect((h.routeState.get("music")!.selection["100"] as { destinations: Record<string, string> }).destinations).toEqual({});
+    await h.clock.tick();
+    const last = h.posts[h.posts.length - 1]!;
+    expect(JSON.parse(last.body!)).toEqual({ plugin: "music", servers: { "100": { commands: "all" } } });
   });
 
   // Round-1 review finding: resetToSaved deleted the routeState entry without clearing its pending

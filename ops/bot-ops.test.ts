@@ -2922,6 +2922,10 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     // the id length bounds: 5 and 25 digits are snowflakes, in every position
     { "12345": { commands: ["22345"], postTo: "32345" } },
     { ["1".repeat(25)]: { commands: ["2".repeat(25)], postTo: "3".repeat(25) } },
+    // #219: named destinations, with or without a postTo, one or several, names at the shape's edges
+    { [GUILD]: { commands: "all", destinations: { raids: CHANNEL } } },
+    { [GUILD]: { commands: [CHANNEL], postTo: CHANNEL, destinations: { raids: CHANNEL, "loot-2": "323456789012345678", a: "12345" } } },
+    { [GUILD]: { commands: "all", destinations: { r: "1".repeat(25) } }, "923456789012345678": { commands: "all" } },
   ];
 
   test("routing-set round-trips to the mailbox", async () => {
@@ -2972,6 +2976,23 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     ["a 4-digit channel", { [GUILD]: { commands: ["2234"] } }],
     ["a 4-digit postTo", { [GUILD]: { commands: "all", postTo: "3234" } }],
     ["commands an object whose values are snowflakes", { [GUILD]: { commands: { channel: CHANNEL } } }],
+    // #219: destinations must be a non-empty object of destination name -> snowflake
+    ["destinations null", { [GUILD]: { commands: "all", destinations: null } }],
+    ["destinations an array", { [GUILD]: { commands: "all", destinations: [CHANNEL] } }],
+    ["destinations a string", { [GUILD]: { commands: "all", destinations: "raids" } }],
+    ["destinations empty", { [GUILD]: { commands: "all", destinations: {} } }],
+    ["a destination with a non-snowflake channel", { [GUILD]: { commands: "all", destinations: { raids: "general" } } }],
+    ["a destination with a numeric channel", { [GUILD]: { commands: "all", destinations: { raids: 223456789012345678 } } }],
+    ["a destination with a null channel", { [GUILD]: { commands: "all", destinations: { raids: null } } }],
+    ["a destination with a 4-digit channel", { [GUILD]: { commands: "all", destinations: { raids: "3234" } } }],
+    ["a destination with a 26-digit channel", { [GUILD]: { commands: "all", destinations: { raids: "3".repeat(26) } } }],
+    ["a destination channel with a trailing newline", { [GUILD]: { commands: "all", destinations: { raids: `${CHANNEL}\n` } } }],
+    ["an uppercase destination name", { [GUILD]: { commands: "all", destinations: { Raids: CHANNEL } } }],
+    ["a destination name starting with a digit", { [GUILD]: { commands: "all", destinations: { "1raids": CHANNEL } } }],
+    ["a destination name with an underscore", { [GUILD]: { commands: "all", destinations: { raid_night: CHANNEL } } }],
+    ["an empty destination name", { [GUILD]: { commands: "all", destinations: { "": CHANNEL } } }],
+    ["a destination name with a trailing newline", { [GUILD]: { commands: "all", destinations: { "raids\n": CHANNEL } } }],
+    ["one bad destination beside a good one", { [GUILD]: { commands: "all", destinations: { raids: CHANNEL, "bad name": CHANNEL } } }],
   ];
   test("routing-set rejects each malformed shape, naming the field, before touching docker", async () => {
     const fx = setup(ENV);

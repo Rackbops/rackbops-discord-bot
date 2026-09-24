@@ -12,8 +12,9 @@
 // gateway client -> exit (#184) — plugins release what they acquired before the connection they'd
 // otherwise still be relying on goes away.
 //
-// One exception (#217): a plugin tick that overruns PLUGIN_TICK_TIMEOUT_MS is abandoned by
-// `pluginTicks`, so its still-running call is not drained here — see `restart.ts`'s header.
+// Plugin ticks (#248): `beginShutdown` aborts every pending plugin tick's signal, and each call holds
+// the critical section until it settles or PLUGIN_TICK_ABORT_GRACE_MS (5 s, under this grace) elapses —
+// so the drain waits for a tick to bail, and a tick that ignores its signal can't hold it past that.
 //
 // A pure factory so index.ts's own wiring is a one-line `process.on(signal, handler)` and every
 // branch here is exercised with fakes — no real process, timers, or Discord client.

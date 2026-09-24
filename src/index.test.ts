@@ -181,9 +181,9 @@ describe("index.ts wiring", () => {
     const handleCall = source.indexOf("await handleCommand(", interactionStart);
 
     test("a plugin's announce goes through postForPlugin with its own name and the default channel", () => {
-      expect(source).toMatch(/announce:\s*\(message\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps\),/);
+      expect(source).toMatch(/announce:\s*\(message,\s*destination\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps,\s*destination\),/);
       // The old wiring -- every plugin posting straight to the one channel -- is gone.
-      expect(source).not.toMatch(/announce:\s*\(message\)\s*=>\s*announceTo\(/);
+      expect(source).not.toMatch(/announce:\s*\([^)]*\)\s*=>\s*announceTo\(/);
       expect(depsBlock).toMatch(/defaultChannelId:\s*config\.announceChannelId,/);
     });
 
@@ -226,23 +226,32 @@ describe("index.ts wiring", () => {
 
     test("only plugin commands reach the gate: it is an argument to handleCommand, not a check in front of it", () => {
       // Core commands are resolved inside handleCommand before it consults the gate (commands.ts), so no
-      // gateCommand call may sit outside the handleCommand call.
-      expect((source.match(/gateCommand\(/g) ?? []).length).toBe(1);
+      // gateCommand call may sit outside the handleCommand call -- the one other is the argument #287 hands
+      // dispatchPluginAutocomplete, which consults it only for a plugin command, the same way.
+      expect((source.match(/gateCommand\(/g) ?? []).length).toBe(2);
       expect(source.slice(0, handleCall)).not.toMatch(/gateCommand\(/);
+      const autocompleteCall = source.indexOf("await dispatchPluginAutocomplete({");
+      expect(source.lastIndexOf("gateCommand(")).toBeGreaterThan(autocompleteCall);
     });
   });
 
-  // #218: the host routes no autocomplete to plugins — index.ts can't run under test, so the branch's
-  // shape is pinned in the source, the same idiom as the describes above.
-  describe("an autocomplete interaction is answered with an empty list inside the InteractionCreate handler (#218)", () => {
-    test("the branch exists inside the handler, and respond([]) appears exactly once in the file", () => {
+  // #287 (was #218's empty answer): an autocomplete interaction goes to dispatchPluginAutocomplete, which
+  // routes a plugin command's picker behind the command's own gate and answers everything else with an
+  // empty list. index.ts can't run under test, so the branch's shape is pinned in the source, the same
+  // idiom as the describes above; the dispatcher itself is tested in host.test.ts.
+  describe("an autocomplete interaction is routed through dispatchPluginAutocomplete inside the InteractionCreate handler (#287)", () => {
+    test("the branch exists inside the handler, is gated like the command, and index.ts answers nothing itself", () => {
       const start = source.indexOf("client.on(Events.InteractionCreate");
       const end = source.indexOf("client.on(Events.GuildCreate");
       expect(start).toBeGreaterThan(-1);
       expect(end).toBeGreaterThan(start);
       const handlerBlock = source.slice(start, end);
-      expect(handlerBlock).toMatch(/else if \(interaction\.isAutocomplete\(\)\)\s*\{[\s\S]*?await interaction\.respond\(\[\]\);/);
-      expect((source.match(/respond\(\[\]\)/g) ?? []).length).toBe(1);
+      const branch = handlerBlock.slice(handlerBlock.indexOf("else if (interaction.isAutocomplete())"));
+      expect(branch).toMatch(/^else if \(interaction\.isAutocomplete\(\)\)\s*\{[\s\S]*?await dispatchPluginAutocomplete\(\{/);
+      expect(branch).toMatch(/bare:\s*bareName\(interaction\.commandName\),/);
+      expect(branch).toMatch(/gate:\s*\(bare\)\s*=>\s*gateCommand\(/);
+      expect((source.match(/dispatchPluginAutocomplete\(/g) ?? []).length).toBe(1);
+      expect(source).not.toMatch(/respond\(\[\]\)/); // the empty answer lives in the dispatcher now
     });
   });
 

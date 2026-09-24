@@ -88,8 +88,10 @@ update logs its outcome rather than DMing (there's no Discord user to reach — 
 
 **Routing requests (#240, ADR-0006).** The same mailbox carries four more actions, which change where
 a plugin lives rather than what version it runs: `routing-set` (`{plugin, servers}` — `servers` maps a
-guild id to `{commands: "all" | [channel ids, non-empty], postTo?: channel id}`; an empty object places
-the plugin nowhere), `webhook-add` (`{url}` — a Discord webhook URL, on the `discord.com` /
+guild id to `{commands: "all" | [channel ids, non-empty], postTo?: channel id, destinations?: {name:
+channel id}}`; an empty object places the plugin nowhere; `destinations` (#219) maps the plugin's declared
+named destinations, each a lowercase `^[a-z][a-z0-9-]*$` name, to a channel in that server, is refused when
+empty, and whether a name is declared is checked by the bot), `webhook-add` (`{url}` — a Discord webhook URL, on the `discord.com` /
 `discordapp.com` hosts, with its numeric id and token), `webhook-remove` (`{channelId}`) and
 `discovery-refresh`. `plugin-request` validates each per action before it writes the file and names the
 offending *field* when it refuses — never the value: a webhook URL is a credential, so it travels on

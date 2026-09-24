@@ -11,6 +11,7 @@ import {
 } from "./model";
 import {
   applyRoutingRequest,
+  declaredDestinations,
   liveFetchWebhook,
   parseRoutingRequest,
   redactWebhookUrls,
@@ -926,5 +927,34 @@ describe("redactWebhookUrls", () => {
     // Linear takes tens of milliseconds; a backtracking pattern would take minutes or never finish. The bound
     // sits between the two with room for a machine that is busy with something else.
     expect(Date.now() - started).toBeLessThan(20_000);
+  });
+});
+
+describe("applyRoutingRequest: routing-set with destinations (#219)", () => {
+  const declaring = (): DiscoveryFile => ({
+    ...bothServers(),
+    plugins: { music: { posts: true, commands: [], destinations: [{ name: "news", description: "Headlines" }] } },
+  });
+
+  test("a name the plugin declares in discovery.json is written", async () => {
+    const h = harness({ discovery: declaring() });
+    await applyRoutingRequest(setRequest({ servers: { [HOME]: { commands: "all", destinations: { news: CH_HOME_2 } } } }), h.deps);
+    expect(h.routing.plugins.music).toEqual({ servers: { [HOME]: { commands: "all", destinations: { news: CH_HOME_2 } } } });
+  });
+
+  test("a name it does not declare is refused, and nothing is written", async () => {
+    const h = harness({ discovery: declaring() });
+    await expect(
+      applyRoutingRequest(setRequest({ servers: { [HOME]: { commands: "all", destinations: { alerts: CH_HOME_2 } } } }), h.deps),
+    ).rejects.toThrow("destination alerts is not one this plugin declares");
+    expect(h.routingWrites).toHaveLength(0);
+  });
+
+  test("declaredDestinations reads discovery.json defensively", () => {
+    expect(declaredDestinations(declaring(), "music")).toEqual(["news"]);
+    expect(declaredDestinations(declaring(), "constructor")).toEqual([]);
+    expect(declaredDestinations(bothServers(), "music")).toEqual([]);
+    const junk = { ...bothServers(), plugins: { music: { posts: true, commands: [], destinations: [null, { name: 5 }, { name: "ok" }] } } } as unknown as DiscoveryFile;
+    expect(declaredDestinations(junk, "music")).toEqual(["ok"]);
   });
 });

@@ -216,6 +216,49 @@ describe("describePlugins", () => {
   });
 });
 
+describe("describePlugins: declared destinations (#219)", () => {
+  const withDestinations = (name: string, destinations: unknown): LoadedPlugin => {
+    const lp = loaded(name, {});
+    return { ...lp, entry: { ...lp.entry, destinations: destinations as PluginIndexEntry["destinations"] } };
+  };
+
+  test("valid, distinct names are listed with their descriptions; a plugin with none lists no key", () => {
+    const summary = describePlugins(
+      [
+        withDestinations("feed", [
+          { name: "news", description: "Headlines" },
+          { name: "news", description: "dup" },
+          { name: "Bad", description: "x" },
+          { name: "alerts" },
+          null,
+        ]),
+        withDestinations("plain", undefined),
+        withDestinations("junk", "news"),
+      ],
+      [],
+      "",
+      new Map(),
+    );
+    expect(summary[0]!.destinations).toEqual([
+      { name: "news", description: "Headlines" },
+      { name: "alerts", description: "" },
+    ]);
+    expect("destinations" in summary[1]!).toBe(false);
+    expect("destinations" in summary[2]!).toBe(false);
+  });
+
+  test("buildDiscovery carries them for the panel, and omits the key for a plugin with none", () => {
+    const file = build({
+      plugins: [
+        { name: "feed", commands: [], posts: true, destinations: [{ name: "news", description: "Headlines" }] },
+        { name: "wow", commands: ["dmf"], posts: true },
+      ],
+    });
+    expect(file.plugins.feed).toEqual({ posts: true, commands: [], destinations: [{ name: "news", description: "Headlines" }] });
+    expect(file.plugins.wow).toEqual({ posts: true, commands: ["dmf"] });
+  });
+});
+
 // ---------------------------------------------------------------------------------------------------
 // buildDiscovery / writeDiscovery
 // ---------------------------------------------------------------------------------------------------

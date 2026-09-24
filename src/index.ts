@@ -7,7 +7,7 @@ import { Client, Events, REST } from "discord.js";
 import { config } from "./config";
 import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "./storage";
 import { createClient, CORE_INTENTS } from "./client";
-import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
+import { bareName, commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { startRequestDrain } from "./plugins/drain";
@@ -15,7 +15,15 @@ import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
-import { awaitCriticalIdle, beginShutdown, restartPending, withCritical } from "./restart";
+import {
+  awaitCriticalIdle,
+  beginCritical,
+  beginShutdown,
+  endCritical,
+  onStopRequested,
+  restartPending,
+  withCritical,
+} from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
 import { loadPluginIndex } from "./plugins";
 import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./plugins/registry";
@@ -28,11 +36,14 @@ import {
   activatePlugins,
   buildCommandBody,
   createHostApi,
+  createPluginTickControl,
+  dispatchPluginAutocomplete,
   dispatchPluginInteraction,
   disposePlugins,
   loadPlugins,
   mutatePluginState,
   PLUGIN_DISPOSE_TIMEOUT_MS,
+  PLUGIN_TICK_TIMEOUT_MS,
   pluginCommandMap,
   pluginTicks,
   readPluginState,
@@ -161,7 +172,7 @@ async function activate(c: Client<true>): Promise<void> {
         dataDir: DATA_DIR,
         baseLog: console,
         storage,
-        announce: (message) => postForPlugin(entry.name, message, postDeps),
+        announce: (message, destination) => postForPlugin(entry.name, message, postDeps, destination),
       });
     loadResult = await loadPlugins(
       installResult.installed,
@@ -207,10 +218,26 @@ async function activate(c: Client<true>): Promise<void> {
         // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
         await dispatchPluginInteraction(loadResult.loaded, interaction, console);
       } else if (interaction.isAutocomplete()) {
-        // #218: the host routes no autocomplete to plugins (see host.ts's buildCommandBody warning);
-        // an empty answer closes the picker cleanly at once instead of Discord's own 3s timeout
-        // failure. Core declares no autocomplete option, so there is nothing to route past this.
-        await interaction.respond([]);
+        // #287: a plugin command's picker goes to its autocomplete(), behind the same routing gate as the
+        // command; everything else — core declares no autocomplete option — gets an empty list at once
+        // instead of Discord's own 3s timeout failure (#218). The gate's own `[gate]` lines are not logged
+        // here: they would repeat on every keystroke, and the command itself logs them when it runs.
+        await dispatchPluginAutocomplete({
+          interaction,
+          bare: bareName(interaction.commandName),
+          map: commandMap,
+          loaded: loadResult.loaded,
+          gate: (bare) =>
+            gateCommand(
+              commandMap.get(bare)?.entry.name,
+              interaction.commandName,
+              interaction,
+              () => whereOf(interaction, (id) => client.channels.fetch(id)),
+              () => readRouting(DATA_DIR),
+              { error: () => {} },
+            ),
+          log: console,
+        });
       }
     } catch (err) {
       console.error("[interaction]", err);
@@ -237,7 +264,17 @@ async function activate(c: Client<true>): Promise<void> {
   // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
 
-  startScheduler(client, pluginTicks(loadResult.loaded, console));
+  // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
+  // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores
+  // its signal holds the stop for PLUGIN_TICK_ABORT_GRACE_MS at most. Wired before the first tick runs.
+  const tickControl = createPluginTickControl({
+    hold: () => {
+      beginCritical();
+      return endCritical;
+    },
+  });
+  onStopRequested((reason) => tickControl.stop(reason));
+  startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
 
   // #241: the request mailbox is also drained every few seconds on its own timer, so a routing change
   // made in the panel shows up while the operator is still looking; the `pluginRequests` tick check

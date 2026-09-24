@@ -18,6 +18,8 @@ const {
   autocompleteOptionPaths,
   pluginTicks,
   PLUGIN_TICK_TIMEOUT_MS,
+  PLUGIN_TICK_ABORT_GRACE_MS,
+  createPluginTickControl,
   activatePlugins,
   disposePlugins,
   buildPluginStateFile,
@@ -25,11 +27,24 @@ const {
   writePluginState,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
+  dispatchPluginAutocomplete,
+  AUTOCOMPLETE_GATE_TIMEOUT_MS,
+  AUTOCOMPLETE_TIMEOUT_MS,
 } = await import("./host");
 // The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
 // relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
 const { runTick, TICK_MS } = await import("../announce");
-const { withCritical, requestRestart, setExitFn, resetForTest: resetRestartState } = await import("../restart");
+const {
+  withCritical,
+  requestRestart,
+  setExitFn,
+  resetForTest: resetRestartState,
+  beginCritical,
+  endCritical,
+  beginShutdown,
+  awaitCriticalIdle,
+  onStopRequested,
+} = await import("../restart");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 
@@ -102,6 +117,67 @@ describe("createHostApi", () => {
     expect(host.dataDir).toBe("/data");
     host.log.info("hello");
     expect(calls).toEqual([{ level: "info", message: "[p] hello" }]);
+  });
+});
+
+describe("createHostApi: announce's destination (#219)", () => {
+  const hostWith = (destinations: unknown) => {
+    const { log, calls } = makeLog();
+    const posted: [string, string | undefined][] = [];
+    const host = createHostApi({
+      entry: entry({ name: "feed", destinations: destinations as PluginIndexEntry["destinations"] }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async (message, destination) => void posted.push([message, destination]),
+    });
+    return { host, posted, calls };
+  };
+
+  test("a declared name is passed on, and no name is passed on as none", async () => {
+    const { host, posted, calls } = hostWith([{ name: "news", description: "d" }]);
+    await host.announce("a", "news");
+    await host.announce("b");
+    expect(posted).toEqual([["a", "news"], ["b", undefined]]);
+    expect(calls).toEqual([]);
+  });
+
+  test("an undeclared name posts without one, and is said once per name", async () => {
+    const { host, posted, calls } = hostWith([{ name: "news", description: "d" }]);
+    await host.announce("a", "alerts");
+    await host.announce("b", "alerts");
+    await host.announce("c", 7 as unknown as string);
+    expect(posted).toEqual([["a", undefined], ["b", undefined], ["c", undefined]]);
+    expect(calls.map((c) => c.message)).toEqual([
+      '[feed] announce: destination "alerts" is not declared in this plugin\'s manifest; posting to its usual channels',
+      '[feed] announce: destination "7" is not declared in this plugin\'s manifest; posting to its usual channels',
+    ]);
+  });
+
+  test("the warning never carries a webhook token, a newline stays escaped, and it stops after 50 names", async () => {
+    const { host, calls } = hostWith([]);
+    const token = "TOKEN_zqx9f3k2m8v1w7p4r6t5y0uabcdef";
+    await host.announce("a", `https://discord.com/api/webhooks/555555555555555001/${token}`);
+    await host.announce("a", "evil\n[core] forged line");
+    for (let i = 0; i < 100; i += 1) await host.announce("a", `name-${i}`);
+    expect(calls.some((c) => c.message.includes(token))).toBe(false);
+    expect(calls.some((c) => c.message.includes("\n"))).toBe(false);
+    expect(calls).toHaveLength(50);
+  });
+
+  test("a declared name that is not a valid destination name is not declared", async () => {
+    const { host, posted } = hostWith([{ name: "Alerts", description: "d" }]);
+    await host.announce("a", "Alerts");
+    expect(posted).toEqual([["a", undefined]]);
+  });
+
+  test("a manifest with no, or malformed, destinations declares none", async () => {
+    for (const destinations of [undefined, "news", [null, 5]]) {
+      const { host, posted } = hostWith(destinations);
+      await host.announce("a", "news");
+      expect(posted).toEqual([["a", undefined]]);
+    }
   });
 });
 
@@ -233,6 +309,17 @@ describe("buildCommandBody", () => {
     buildCommandBody("", coreJson, map, log);
     const warn = calls.find((l) => l.level === "warn" && l.message.includes("autocomplete"));
     expect(warn?.message).toContain('"g s q"');
+  });
+
+  test("a command with an autocomplete option AND an autocomplete() handler warns nothing (#287)", () => {
+    const { log, calls } = makeLog();
+    const handled: PluginCommand = {
+      ...cmd("search", (b) => b.setDescription("d").addStringOption((o) => o.setName("q").setDescription("d").setAutocomplete(true))),
+      autocomplete: async () => {},
+    };
+    const map = pluginCommandMap([loaded(entry(), { commands: [handled] })], [], log);
+    expect(buildCommandBody("", coreJson, map, log).map((c) => c.name)).toEqual(["dmf", "search"]);
+    expect(calls.some((l) => l.message.includes("autocomplete"))).toBe(false);
   });
 
   test("a command without autocomplete options warns nothing", () => {
@@ -528,10 +615,332 @@ describe("pluginTicks", () => {
     }
   });
 
+  // #248: the same restart as the test above, with the control index.ts wires -- each call holds the
+  // critical section until it settles, and a stop aborts it. `withStop` stands up exactly that wiring
+  // against the real restart.ts, with the exit captured.
+  const withStop = async (graceMs: number, body: (h: { control: ReturnType<typeof createPluginTickControl>; exited: () => boolean }) => Promise<void>) => {
+    resetRestartState();
+    let exited = false;
+    const restoreExit = setExitFn(() => { exited = true; });
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const control = createPluginTickControl({ hold: () => { beginCritical(); return endCritical; }, graceMs });
+    const off = onStopRequested((reason) => control.stop(reason));
+    try {
+      await body({ control, exited: () => exited });
+    } finally {
+      off();
+      restoreExit();
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+      resetRestartState();
+    }
+  };
+
+  test("each call is passed an AbortSignal, aborted when the timeout abandons it (#248)", async () => {
+    const seen: (AbortSignal | undefined)[] = [];
+    const run = (signal?: AbortSignal) => { seen.push(signal); return HUNG(); };
+    const lp = loaded(entry({ name: "sig" }), { ticks: [{ name: "t", run }] }, true);
+    expect(await settleOrHang(() => checkFor(lp, 20).run())).toBeInstanceOf(Error);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBeInstanceOf(AbortSignal);
+    expect(seen[0]!.aborted).toBe(true);
+    expect((seen[0]!.reason as Error).message).toBe("plugin tick sig:t exceeded 20ms");
+  });
+
+  test("a call that settles in time is not aborted (#248)", async () => {
+    let signal: AbortSignal | undefined;
+    const lp = loaded(entry({ name: "ok" }), { ticks: [{ name: "t", run: async (s?: AbortSignal) => { signal = s; } }] }, true);
+    expect(await settleOrHang(() => checkFor(lp, 60_000).run())).toBe("resolved");
+    expect(signal?.aborted).toBe(false);
+  });
+
+  test("an overrunning tick that honours its signal holds a pending restart until it has bailed (#248)", async () => {
+    await withStop(60_000, async ({ control, exited }) => {
+      const events: string[] = [];
+      let signal: AbortSignal | undefined;
+      let finish = () => {};
+      const run = (s?: AbortSignal) => {
+        signal = s;
+        return new Promise<void>((resolve) => { finish = resolve; });
+      };
+      const lp = loaded(entry({ name: "coop" }), { ticks: [{ name: "t", run }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20, control)));
+      // The 20ms bound has abandoned the wait and aborted the signal; the call itself is still pending.
+      expect(signal?.aborted).toBe(true);
+      requestRestart("update"); // a restart AFTER the tick's section closed (#217's worst case)
+      expect(exited()).toBe(false); // the abandoned call still holds the critical section
+      events.push("bailed");
+      finish();
+      await Bun.sleep(0);
+      expect(events).toEqual(["bailed"]);
+      expect(exited()).toBe(true); // ...and the restart lands the moment it settles
+    });
+  });
+
+  test("a restart requested during a tick aborts it through the stop, not the timeout (#248)", async () => {
+    await withStop(60_000, async ({ control, exited }) => {
+      const seen: string[] = [];
+      const run = async (signal?: AbortSignal) => {
+        await Bun.sleep(10);
+        requestRestart("update"); // e.g. a due scheduled update, from inside the same scheduler tick
+        seen.push(`aborted=${signal?.aborted} reason=${(signal?.reason as Error | undefined)?.message}`);
+      };
+      const lp = loaded(entry({ name: "inner" }), { ticks: [{ name: "t", run }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 60_000, control)));
+      expect(seen).toEqual(["aborted=true reason=plugin tick aborted: update"]);
+      expect(exited()).toBe(true);
+    });
+  });
+
+  test("a stop that lands while a deaf tick is inside its timeout ends the wait at the grace, not the timeout (#248)", async () => {
+    await withStop(30, async ({ control, exited }) => {
+      const lp = loaded(entry({ name: "deaf" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+      const tick = withCritical(() => runTick(pluginTicks([lp], makeLog().log, 60_000, control)));
+      await Bun.sleep(5);
+      requestRestart("update");
+      await Bun.sleep(150); // far under the 60s per-call timeout
+      expect(exited()).toBe(true);
+      await tick;
+    });
+  });
+
+  test("begin() after a stop takes no hold and hands out an aborted signal (#248)", () => {
+    let holds = 0;
+    const control = createPluginTickControl({ hold: () => { holds += 1; return () => {}; } });
+    control.stop("restart");
+    const { signal } = control.begin();
+    expect(signal.aborted).toBe(true);
+    expect(holds).toBe(0);
+  });
+
+  test("a tick that ignores its signal delays a restart by the grace, never forever (#248)", async () => {
+    await withStop(50, async ({ control, exited }) => {
+      const lp = loaded(entry({ name: "deaf" }), { ticks: [{ name: "t", run: HUNG }] }, true);
+      await withCritical(() => runTick(pluginTicks([lp], makeLog().log, 20, control)));
+      requestRestart("update");
+      expect(exited()).toBe(false); // held by the hung call...
+      await Bun.sleep(100);
+      expect(exited()).toBe(true); // ...until the 50ms grace lets go of it
+    });
+  });
+
+  test("a shutdown aborts a pending tick and the drain resolves once it bails (#248)", async () => {
+    await withStop(60_000, async ({ control }) => {
+      let signal: AbortSignal | undefined;
+      const run = (s?: AbortSignal) =>
+        new Promise<void>((resolve) => {
+          signal = s;
+          s?.addEventListener("abort", () => resolve());
+        });
+      const lp = loaded(entry({ name: "drain" }), { ticks: [{ name: "t", run }] }, true);
+      const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+      const tick = check!.run();
+      expect(signal?.aborted).toBe(false);
+      beginShutdown("SIGTERM");
+      expect(signal?.aborted).toBe(true);
+      expect(await awaitCriticalIdle(1_000)).toBe(true);
+      await tick;
+    });
+  });
+
+  test("no new plugin tick call starts once a stop is under way (#248)", async () => {
+    let started = 0;
+    const control = createPluginTickControl();
+    const lp = loaded(entry({ name: "late" }), { ticks: [{ name: "t", run: async () => { started += 1; } }] }, true);
+    const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+    await check!.run();
+    control.stop("restart");
+    await check!.run();
+    expect(started).toBe(1);
+    expect(control.stopping).toBe(true);
+  });
+
+  test("a call released by the grace and then settling releases its hold once, not twice (#248)", async () => {
+    await withStop(20, async ({ control }) => {
+      let finish = () => {};
+      const run = () => new Promise<void>((resolve) => { finish = resolve; });
+      const lp = loaded(entry({ name: "twice" }), { ticks: [{ name: "t", run }] }, true);
+      const [check] = pluginTicks([lp], makeLog().log, 60_000, control);
+      const tick = check!.run().catch((e: unknown) => e); // handled now: it rejects during the sleep below
+      beginCritical(); // an unrelated section that must stay counted
+      control.stop("restart");
+      await Bun.sleep(50); // the grace releases the tick's hold
+      // The wait gave up at the grace too (#248), so the check has already rejected.
+      expect(((await tick) as Error).message).toBe("plugin tick twice:t abandoned: the stop's grace elapsed");
+      finish(); // then the tick settles: a second release would also close the unrelated section
+      await Bun.sleep(0);
+      expect(await awaitCriticalIdle(10)).toBe(false);
+      endCritical();
+      expect(await awaitCriticalIdle(10)).toBe(true);
+    });
+  });
+
+  test("PLUGIN_TICK_ABORT_GRACE_MS leaves the shutdown grace room for dispose and the gateway close (#248)", async () => {
+    const { SHUTDOWN_GRACE_MS } = await import("../shutdown");
+    expect(PLUGIN_TICK_ABORT_GRACE_MS).toBe(5_000);
+    expect(PLUGIN_TICK_ABORT_GRACE_MS).toBeLessThan(SHUTDOWN_GRACE_MS);
+  });
+
   test("PLUGIN_TICK_TIMEOUT_MS stays under the 60s scheduler tick (#217)", () => {
     expect(TICK_MS).toBe(60_000); // the "60s TICK_MS" host.ts's doc comments name -- change both together
     expect(PLUGIN_TICK_TIMEOUT_MS).toBe(30_000);
     expect(PLUGIN_TICK_TIMEOUT_MS).toBeLessThan(TICK_MS);
+  });
+});
+
+describe("dispatchPluginAutocomplete (#287)", () => {
+  /** Only what the dispatcher touches: commandName, responded, respond(). */
+  const fakeAutocomplete = () => {
+    const responses: unknown[][] = [];
+    const interaction = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => {
+        responses.push(choices);
+        interaction.responded = true;
+      },
+    };
+    return { interaction, responses };
+  };
+  const setup = (over: { autocomplete?: PluginCommand["autocomplete"]; running?: boolean } = {}) => {
+    const command: PluginCommand = { ...cmd("search"), ...(over.autocomplete ? { autocomplete: over.autocomplete } : {}) };
+    const lp = loaded(entry({ name: "finder" }), { commands: [command] }, over.running ?? true);
+    const { log, calls } = makeLog();
+    const map = pluginCommandMap([lp], [], log);
+    return { lp, map, log, calls };
+  };
+  const run = (s: ReturnType<typeof setup>, interaction: unknown, gate: (bare: string) => Promise<string | undefined> = async () => undefined, bare = "search") =>
+    dispatchPluginAutocomplete({ interaction: interaction as never, bare, map: s.map, loaded: [s.lp], gate, log: s.log });
+
+  test("routes to the command's autocomplete(), which answers the picker itself", async () => {
+    const s = setup({ autocomplete: async (i) => { await i.respond([{ name: "a", value: "a" }]); } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[{ name: "a", value: "a" }]]); // the plugin's answer, and no second, empty one
+  });
+
+  test("no such command, or a command without autocomplete(), is answered with an empty list", async () => {
+    const s = setup();
+    for (const bare of ["search", "nope"]) {
+      const { interaction, responses } = fakeAutocomplete();
+      await run(s, interaction, undefined, bare);
+      expect(responses).toEqual([[]]);
+    }
+  });
+
+  test("a plugin that is not running is never called", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; }, running: false });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("where the routing gate refuses the command, its autocomplete is not called either", async () => {
+    let called = 0;
+    const gated: string[] = [];
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction, async (bare) => { gated.push(bare); return "use it in #spotify"; });
+    expect(gated).toEqual(["search"]);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("a gate that throws fails CLOSED here, unlike the command: an empty list, the plugin not called", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction, async () => { throw new Error("gate down"); });
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+    expect(s.calls.some((l) => l.level === "error" && l.message.includes("[gate]"))).toBe(true);
+  });
+
+  test("a gate slower than AUTOCOMPLETE_GATE_TIMEOUT_MS gets the empty list in time", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction, responses } = fakeAutocomplete();
+    const started = Date.now();
+    await run(s, interaction, () => new Promise(() => {}));
+    expect(Date.now() - started).toBeLessThan(AUTOCOMPLETE_GATE_TIMEOUT_MS + 500);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("a handler that calls respond without awaiting it is not answered a second time", async () => {
+    let settle = () => {};
+    const s = setup({ autocomplete: async (i) => { void i.respond([{ name: "a", value: "a" }]); } });
+    const responses: unknown[][] = [];
+    const interaction = {
+      commandName: "search",
+      responded: false,
+      respond: (choices: unknown[]) => {
+        responses.push(choices);
+        return new Promise<void>((resolve) => { settle = () => { interaction.responded = true; resolve(); }; });
+      },
+    };
+    await run(s, interaction);
+    settle();
+    expect(responses).toEqual([[{ name: "a", value: "a" }]]); // the plugin's answer only, no empty one on top
+  });
+
+  test("a handler that hangs is answered for at AUTOCOMPLETE_TIMEOUT_MS, and respond is restored", async () => {
+    const s = setup({ autocomplete: () => new Promise(() => {}) });
+    const { interaction, responses } = fakeAutocomplete();
+    const original = interaction.respond;
+    const started = Date.now();
+    await run(s, interaction);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(AUTOCOMPLETE_TIMEOUT_MS - 50);
+    expect(responses).toEqual([[]]);
+    expect(interaction.respond).toBe(original);
+  }, 10_000);
+
+  test("respond on the prototype, as discord.js has it, is left there -- no own property stays behind", async () => {
+    class FakeAutocomplete {
+      commandName = "search";
+      responded = false;
+      readonly responses: unknown[][] = [];
+      async respond(choices: unknown[]): Promise<void> {
+        this.responses.push(choices);
+        this.responded = true;
+      }
+    }
+    const s = setup({ autocomplete: async (i) => { await i.respond([{ name: "a", value: "a" }]); } });
+    const interaction = new FakeAutocomplete();
+    await run(s, interaction);
+    expect(interaction.responses).toEqual([[{ name: "a", value: "a" }]]);
+    expect(Object.hasOwn(interaction, "respond")).toBe(false);
+  });
+
+  test("a throwing autocomplete getter is isolated, and the picker still gets an empty list", async () => {
+    const command = { ...cmd("search"), get autocomplete(): PluginCommand["autocomplete"] { throw new Error("getter boom"); } } as PluginCommand;
+    const lp = loaded(entry({ name: "finder" }), { commands: [command] }, true);
+    const { log, calls } = makeLog();
+    const map = pluginCommandMap([lp], [], log);
+    const { interaction, responses } = fakeAutocomplete();
+    await dispatchPluginAutocomplete({ interaction: interaction as never, bare: "search", map, loaded: [lp], gate: async () => undefined, log });
+    expect(responses).toEqual([[]]);
+    expect(calls.some((l) => l.level === "error" && l.message.includes("finder autocomplete"))).toBe(true);
+    // buildCommandBody reads it inside its own try too: the command is dropped, not the whole boot.
+    expect(() => buildCommandBody("", [], map, log)).not.toThrow();
+  });
+
+  test("a throwing autocomplete() is logged and isolated, and the picker still gets an empty list", async () => {
+    const s = setup({ autocomplete: async () => { throw new Error("boom"); } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[]]);
+    expect(s.calls.some((l) => l.level === "error" && l.message.includes("finder autocomplete"))).toBe(true);
+  });
+
+  test("an autocomplete() that returns without responding gets the empty-list fallback", async () => {
+    const s = setup({ autocomplete: async () => {} });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[]]);
   });
 });
 

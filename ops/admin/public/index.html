@@ -1172,7 +1172,7 @@
     return st;
   }
   function rowSelection(st, guildId) {
-    return st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null };
+    return st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null, destinations: {} };
   }
 
   function buildRouteRow(plugin, row, model, st, els) {
@@ -1291,6 +1291,39 @@
       controls.appendChild(postSelect);
     }
 
+    // #219: one channel picker per named destination the plugin declares, shown whether or not it posts on
+    // its own (a command can announce too). Empty = the name adds no channel in this server; a name mapped
+    // in no server posts wherever the plugin usually posts.
+    const destSelects = new Map();
+    for (const d of model.destinations) {
+      const destId = "route-" + plugin + "-" + row.id + "-dest-" + d.name;
+      const destLabel = document.createElement("label");
+      destLabel.className = "rb-label";
+      destLabel.htmlFor = destId;
+      destLabel.textContent = destinationLabel(d);
+      controls.appendChild(destLabel);
+      const destSelect = document.createElement("select");
+      destSelect.className = "rb-select";
+      destSelect.id = destId;
+      destSelect.dataset.routeServer = row.id;
+      const usual = document.createElement("option");
+      usual.value = "";
+      usual.textContent = "Where it usually posts";
+      destSelect.appendChild(usual);
+      for (const ch of row.channels) {
+        const opt = document.createElement("option");
+        opt.value = ch.id;
+        opt.textContent = channelOptionLabel(ch);
+        destSelect.appendChild(opt);
+      }
+      // A saved channel no longer in this row would match no option: show "usually" (it is not sent either).
+      const picked = pickedDestination(sel, d.name);
+      destSelect.value = picked && row.channels.some((c) => c.id === picked) ? picked : "";
+      destSelect.addEventListener("change", () => onRouteChange(plugin, row.id, "destination", { name: d.name, channel: destSelect.value || null }));
+      controls.appendChild(destSelect);
+      destSelects.set(d.name, destSelect);
+    }
+
     wrap.appendChild(controls);
     const rowNote = document.createElement("p");
     rowNote.className = "adm-note";
@@ -1299,18 +1332,18 @@
 
     box.addEventListener("change", () => onRouteChange(plugin, row.id, "on", box.checked));
 
-    els.rows.set(row.id, { box, controls, anyRadio, chosenRadio, fieldset, channelChecks, channelErr, postSelect, note: rowNote });
+    els.rows.set(row.id, { box, controls, anyRadio, chosenRadio, fieldset, channelChecks, channelErr, postSelect, destSelects, note: rowNote });
     return wrap;
   }
 
   // Updates routeState's selection for one server, patches just that row's DOM in place (never a full
   // renderPlugins -- the collector/edit-preserving machinery is #244's, not this step's), then schedules
   // a send. `what`/`value`: "on" boolean, "scope" "all"|"chosen", "channel" {id, checked}, "postTo"
-  // string|null.
+  // string|null, "destination" {name, channel: string|null} (#219; null clears the name).
   function onRouteChange(plugin, guildId, what, value) {
     const st = routeState.get(plugin);
     if (!st) return;
-    const current = st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null };
+    const current = st.selection[guildId] || { on: false, scope: "all", channels: [], postTo: null, destinations: {} };
     let next = current;
     if (what === "on") next = { ...current, on: value };
     else if (what === "scope") next = { ...current, on: true, scope: value };
@@ -1320,6 +1353,12 @@
       else set.delete(value.id);
       next = { ...current, channels: [...set] };
     } else if (what === "postTo") next = { ...current, postTo: value };
+    else if (what === "destination") {
+      const destinations = { ...(current.destinations || {}) };
+      if (value.channel) destinations[value.name] = value.channel;
+      else delete destinations[value.name];
+      next = { ...current, destinations };
+    }
     if (next.on) st.selection[guildId] = next;
     else delete st.selection[guildId];
 
@@ -1605,9 +1644,9 @@
     const el = els.status;
     const setPlain = (text) => setApplyText(el, text);
     // Decision 6: in flight, the step body carries aria-busy and its controls are disabled -- every row's
-    // checkbox/radios/channel checkboxes/post select, so a re-tick mid-flight can't be mistaken for
-    // taking effect immediately (the held/coalesced request it would actually become is invisible without
-    // this). Applied unconditionally on every call, not just the "Applying..." branch below, so it clears
+    // checkbox/radios/channel checkboxes/post select/destination selects (#219), so a re-tick mid-flight
+    // can't be mistaken for taking effect immediately (the held/coalesced request it would actually become
+    // is invisible without this). Applied unconditionally on every call, not just the "Applying..." branch below, so it clears
     // the moment inflight does (a timeout/refusal/applied outcome all fall through to here first).
     const busy = !!(st && st.inflight);
     if (els.body && els.body.setAttribute) {
@@ -1620,6 +1659,7 @@
       refs.chosenRadio.disabled = busy;
       for (const chBox of refs.channelChecks.values()) chBox.disabled = busy;
       if (refs.postSelect) refs.postSelect.disabled = busy;
+      if (refs.destSelects) for (const destSelect of refs.destSelects.values()) destSelect.disabled = busy;
     }
     els.statusActions.textContent = "";
     const addAction = (text, onClick) => {
@@ -1887,12 +1927,14 @@
 
   // scope/postsTo/webhook are serverCardModel's own data fields (channel NAMES, never ids, when
   // resolvable) -- this is presentation only.
+  // #219: `destinations` (present only when one is mapped here) follow, one "· <label> to #channel" each.
   function pluginPlacementText(p) {
     const scope = p.scope === "all" ? "anywhere" : p.scope.map((n) => "#" + n).join(", ");
-    if (!p.postsTo) return scope;
-    if (p.webhook === "ok") return scope + " · posts to #" + p.postsTo + " (webhook)";
-    if (p.webhook === "broken") return scope + " · posts to #" + p.postsTo + " (webhook stopped working)";
-    return scope + " · posts to #" + p.postsTo + " as the bot";
+    const named = (p.destinations || []).map((d) => " · " + d.label + " to #" + d.channel).join("");
+    if (!p.postsTo) return scope + named;
+    if (p.webhook === "ok") return scope + " · posts to #" + p.postsTo + " (webhook)" + named;
+    if (p.webhook === "broken") return scope + " · posts to #" + p.postsTo + " (webhook stopped working)" + named;
+    return scope + " · posts to #" + p.postsTo + " as the bot" + named;
   }
 
   function buildWebhookRow(wh) {
@@ -2893,8 +2935,11 @@
   // name order, produce the new PLUGINS string. A still-ticked plugin keeps any `name@version` pin
   // it already had; names are ordered by the manifest (any ticked name the manifest doesn't list is
   // appended in its own order). `changed` compares against the NORMALIZED current value (trimmed,
-  // empties dropped) so a pure-formatting difference doesn't trigger a spurious restart. Lifted by
-  // ops/admin/server.test.ts and pinned against this very source.
+  // empties dropped) as a SET of tokens, so neither a pure-formatting difference nor a hand-written
+  // order that differs from the manifest's (PLUGINS=warbandeer,wow,music against an alphabetical
+  // index) triggers a spurious restart -- the bot does not care about the order. When nothing changed,
+  // `value` is the current value as it stands, so an unrelated apply never rewrites it either. Lifted
+  // by ops/admin/server.test.ts and pinned against this very source.
   function planPluginsSave(checkedNames, currentValue, manifestOrder) {
     const checked = new Set(checkedNames);
     const currentTokens = String(currentValue || "").split(",").map((t) => t.trim()).filter(Boolean);
@@ -2912,7 +2957,9 @@
       if (!seen.has(name)) { ordered.push(name); seen.add(name); }
     }
     const value = ordered.map((name) => pinByName.get(name) || name).join(",");
-    return { value, changed: value !== currentTokens.join(",") };
+    const sameSet = (a, b) => a.length === b.length && [...a].sort().join(",") === [...b].sort().join(",");
+    if (sameSet(value ? value.split(",") : [], currentTokens)) return { value: currentTokens.join(","), changed: false };
+    return { value, changed: true };
   }
   // PLUGINS_SAVE_PLAN:end
 
@@ -3639,10 +3686,52 @@
     return !Number.isFinite(t) || now - t > DISCOVERY_STALE_MS;
   }
 
+  // #219: a destination name has the plugin-name shape (the bot's DESTINATION_NAME_RE).
+  const DESTINATION_NAME_RE = /^[a-z][a-z0-9-]*$/;
+
+  // #219: the named destinations a plugin declares, from discovery.plugins[name].destinations. The bot
+  // already writes valid ones only; read defensively anyway (a hand-edited file, a future bot), keeping a
+  // name only when it has the destination shape and was not seen before.
+  function declaredDestinations(list) {
+    if (!Array.isArray(list)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const d of list) {
+      if (!d || typeof d !== "object" || typeof d.name !== "string" || !DESTINATION_NAME_RE.test(d.name) || seen.has(d.name)) continue;
+      seen.add(d.name);
+      out.push({ name: d.name, description: typeof d.description === "string" ? d.description : "" });
+    }
+    return out;
+  }
+
+  // #219: a server's saved destinations from routing.json, rebuilt pair by pair (each name tested before
+  // it becomes a key, so a hand-written "__proto__" can never become one). {} when there are none.
+  function savedDestinations(value) {
+    const out = {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+    for (const [name, channel] of Object.entries(value)) {
+      if (DESTINATION_NAME_RE.test(name) && typeof channel === "string") out[name] = channel;
+    }
+    return out;
+  }
+
+  // #219: the channel a selection maps a destination to, or null. An own key only, so a name like
+  // "constructor" never reads Object.prototype's.
+  function pickedDestination(sel, name) {
+    const map = sel && sel.destinations;
+    if (!map || !Object.prototype.hasOwnProperty.call(map, name)) return null;
+    return typeof map[name] === "string" && map[name] ? map[name] : null;
+  }
+
+  // #219: a destination picker's label -- what the plugin says it is for, else its name.
+  function destinationLabel(d) {
+    return d.description || d.name;
+  }
+
   // The step's whole picture for one plugin, decided purely from the raw files: which mode to draw, the
   // home-server fallback, whether it's placed (an entry exists, even an empty one) and whether it posts on
-  // its own, one row per discovery.guilds entry (placement folded in, webhook state resolved per channel),
-  // and which placed server ids discovery no longer sees at all.
+  // its own, the named destinations it declares (#219), one row per discovery.guilds entry (placement
+  // folded in, webhook state resolved per channel), and which placed server ids discovery no longer sees.
   function routingStepModel(pluginName, routingData, now) {
     const routing = (routingData && routingData.routing) || null;
     const pluginRouting = routing && routing.plugins && routing.plugins[pluginName];
@@ -3652,9 +3741,10 @@
     // No discovery at all: nothing has a name, so the saved placement (if any) can only be listed by id --
     // every server this plugin names is "unavailable" in the sense of "not resolvable right now", same
     // field a stale-but-present discovery uses for a server it has genuinely lost.
-    if (!discovery) return { mode: "missing", generatedAt: null, home: null, placed, posts: false, rows: [], unavailable: Object.keys(servers) };
+    if (!discovery) return { mode: "missing", generatedAt: null, home: null, placed, posts: false, destinations: [], rows: [], unavailable: Object.keys(servers) };
     const mode = isDiscoveryStale(discovery.generatedAt, now) ? "stale" : "ready";
     const posts = !!(discovery.plugins && discovery.plugins[pluginName] && discovery.plugins[pluginName].posts === true);
+    const destinations = declaredDestinations(discovery.plugins && discovery.plugins[pluginName] && discovery.plugins[pluginName].destinations);
     const homeId = discovery.homeGuildId;
     const homeGuild = homeId ? discovery.guilds.find((g) => g.id === homeId) : undefined;
     const home = homeId ? { id: homeId, name: homeGuild ? homeGuild.name : null } : null;
@@ -3668,6 +3758,7 @@
         on,
         commands: on ? entry.commands : "all",
         postTo: on && entry.postTo ? entry.postTo : null,
+        destinations: on ? savedDestinations(entry.destinations) : {},
         channels: g.channels.map((c) => {
           const wh = webhooks[c.id];
           return { id: c.id, name: c.name, canSend: c.canSend, webhook: !wh ? "none" : wh.broken ? "broken" : "ok" };
@@ -3676,7 +3767,7 @@
     });
     const guildIds = new Set(discovery.guilds.map((g) => g.id));
     const unavailable = Object.keys(servers).filter((id) => !guildIds.has(id));
-    return { mode, generatedAt: discovery.generatedAt, home, placed, posts, rows, unavailable };
+    return { mode, generatedAt: discovery.generatedAt, home, placed, posts, destinations, rows, unavailable };
   }
 
   // Decision 4's five sentences, purely from the model. "In n servers" counts every server the plugin's
@@ -3701,7 +3792,8 @@
     return "#" + channel.name;
   }
 
-  // selection: { [guildId]: { on, scope: "all"|"chosen", channels: string[], postTo: string|null } }.
+  // selection: { [guildId]: { on, scope: "all"|"chosen", channels: string[], postTo: string|null,
+  // destinations: { [name]: channelId } } }.
   // Walks model.rows (discovery order), so an unavailable id (not a row) can never be sent -- the bot
   // would refuse the whole request over one server it can no longer see (#259). postTo is included only
   // when the plugin posts on its own AND one is chosen AND it is still one of THIS row's channels --
@@ -3712,6 +3804,9 @@
   // channel the operator never touched. "chosen" with nothing ticked refuses the whole plan rather than
   // silently sending "all" or an empty list; a stale postTo instead silently drops (no post target for
   // that server), matching how an unavailable server itself is silently dropped, never refused over.
+  // #219: destinations follow postTo's rule, per name: sent only for a name the plugin still declares
+  // (the bot refuses the whole request over an undeclared one) whose channel is still this row's, and
+  // `destinations` is omitted entirely when none survive (the bot never writes {} either).
   function routingSetBody(pluginName, selection, model) {
     const servers = {};
     for (const row of model.rows) {
@@ -3727,6 +3822,12 @@
       }
       const entry = { commands };
       if (model.posts && sel.postTo && row.channels.some((c) => c.id === sel.postTo)) entry.postTo = sel.postTo;
+      const destinations = {};
+      for (const d of model.destinations) {
+        const channel = pickedDestination(sel, d.name);
+        if (channel && row.channels.some((c) => c.id === channel)) destinations[d.name] = channel;
+      }
+      if (Object.keys(destinations).length > 0) entry.destinations = destinations;
       servers[row.id] = entry;
     }
     return { body: { plugin: pluginName, servers } };
@@ -3766,8 +3867,9 @@
   // #246: the seed ensureRouteState builds from a "ready" model's OWN saved placement -- moved out of
   // ensureRouteState (browser-only, DOM-adjacent) into this pure block so retryRegistration (Servers tab)
   // can build the SAME no-op selection without duplicating the shape. Behaviour unchanged: one entry per
-  // ticked row, scope/channels from whether commands is an array, postTo carried as-is (ensureRouteState's
-  // own comment on routingSetBody explains why postTo is re-validated at SEND time, not here).
+  // ticked row, scope/channels from whether commands is an array, postTo and (#219) destinations carried
+  // as-is (ensureRouteState's own comment on routingSetBody explains why both are re-validated at SEND
+  // time, not here).
   function selectionFromModel(model) {
     const selection = {};
     for (const row of model.rows) {
@@ -3777,6 +3879,7 @@
           scope: Array.isArray(row.commands) ? "chosen" : "all",
           channels: Array.isArray(row.commands) ? row.commands.slice() : [],
           postTo: row.postTo,
+          destinations: { ...row.destinations },
         };
       }
     }
@@ -3843,7 +3946,22 @@
         const wh = webhooksByChannel[entry.postTo];
         webhook = !wh ? "none" : wh.broken ? "broken" : "ok";
       }
-      plugins.push({ name: p.name, scope, postsTo, webhook, byDefault: false });
+      const here = { name: p.name, scope, postsTo, webhook, byDefault: false };
+      // #219: each named destination mapped in this server, as its label (what the plugin says it is for,
+      // else its name) and channel NAME (the id when discovery no longer has it). Present only when one is
+      // mapped, so a plugin without any reads exactly as before.
+      const declared = discovery && discovery.plugins && discovery.plugins[p.name] && discovery.plugins[p.name].destinations;
+      const destinations = [];
+      if (entry.destinations && typeof entry.destinations === "object" && !Array.isArray(entry.destinations)) {
+        for (const [destName, channelId] of Object.entries(entry.destinations)) {
+          if (typeof channelId !== "string") continue;
+          const d = Array.isArray(declared) ? declared.find((x) => x && x.name === destName) : undefined;
+          const ch = guild.channels.find((c) => c.id === channelId);
+          destinations.push({ label: (d && typeof d.description === "string" && d.description) || destName, channel: ch ? ch.name : channelId });
+        }
+      }
+      if (destinations.length > 0) here.destinations = destinations;
+      plugins.push(here);
     }
     // Round-1 review finding: an unplaced plugin lives in the home server ONLY when one is configured --
     // with DISCORD_SERVER_ID unset (homeId falsy), src/routing/resolve.ts's pluginsForGuild registers an

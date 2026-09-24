@@ -1274,7 +1274,11 @@ cmd_plugin_request() {
       ;;
     routing-set)
       # Where a plugin lives: `servers` maps a guild id to {commands: "all" | [channel ids, non-empty],
-      # postTo?: channel id}. An empty `servers` object is valid (the plugin is placed nowhere).
+      # postTo?: channel id, destinations?: {name: channel id}}. An empty `servers` object is valid (the
+      # plugin is placed nowhere). A destination name (#219) has the plugin-name shape; whether the plugin
+      # declares it, and whether each channel is in that server, is the bot's check (it has discovery). An
+      # empty `destinations` is refused like an empty channel list: it is written absent, never as {}, so
+      # every shape passed here is one the bot's repair (src/routing/model.ts) keeps as it is.
       # Every message below names the field, never the offending value.
       [[ "$plugin" =~ ^[a-z][a-z0-9-]*$ ]] || die "plugin-request: bad plugin"
       # \A…\z, not ^…$: in jq's regex flavour `$` also matches before a trailing newline, so "12345\n"
@@ -1288,6 +1292,9 @@ cmd_plugin_request() {
           and ((.value.commands == "all")
                or ((.value.commands | type == "array") and (.value.commands | length > 0) and (.value.commands | all(snowflake))))
           and ((.value | has("postTo") | not) or (.value.postTo | snowflake))
+          and ((.value | has("destinations") | not)
+               or ((.value.destinations | type == "object") and (.value.destinations | length > 0)
+                   and (.value.destinations | to_entries | all((.key | test("\\A[a-z][a-z0-9-]*\\z")) and (.value | snowflake)))))
         ))' >/dev/null 2>&1 || die "plugin-request: bad servers"
       ;;
     webhook-add)

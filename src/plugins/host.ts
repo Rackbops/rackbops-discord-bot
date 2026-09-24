@@ -4,11 +4,14 @@
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
 import {
   MessageFlags,
+  type AutocompleteInteraction,
   type MessageComponentInteraction,
   type ModalSubmitInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { commandNamer } from "../commandNaming";
+import { DESTINATION_NAME_RE } from "../routing/model";
+import { shown } from "../routing/resolve";
 import { createKeyedJsonMutator } from "../storage";
 import type {
   HostApi,
@@ -55,7 +58,7 @@ export function createHostApi(opts: {
   dataDir: string;
   baseLog: BaseLog;
   storage: HostStorage;
-  announce: (message: string) => Promise<void>;
+  announce: (message: string, destination?: string) => Promise<void>;
 }): HostApi {
   const { name } = opts.entry;
   const env: Record<string, string | undefined> = {};
@@ -65,8 +68,32 @@ export function createHostApi(opts: {
     warn: (m) => opts.baseLog.warn(`[${name}] ${m}`),
     error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, e),
   };
-  return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce: opts.announce };
+  // #219: only a destination the manifest declares, with a valid name, is passed on; any other is said
+  // once per name (at most MAX_DESTINATION_WARNINGS of them, so a plugin forwarding user input cannot
+  // grow this without bound) and posts where the plugin posts without one. The name is shown through
+  // `shown`: bounded, and cut before where a webhook URL's token would start, should a plugin pass one.
+  // `destinations` is index data, read defensively.
+  const declared = new Set<string>();
+  for (const d of Array.isArray(opts.entry.destinations) ? opts.entry.destinations : []) {
+    const destinationName: unknown = (d as { name?: unknown } | null)?.name;
+    if (typeof destinationName === "string" && DESTINATION_NAME_RE.test(destinationName)) declared.add(destinationName);
+  }
+  const warned = new Set<string>();
+  const announce = (message: string, destination?: string): Promise<void> => {
+    if (destination === undefined) return opts.announce(message);
+    if (typeof destination === "string" && declared.has(destination)) return opts.announce(message, destination);
+    const key = shown(destination);
+    if (!warned.has(key) && warned.size < MAX_DESTINATION_WARNINGS) {
+      warned.add(key);
+      log.warn(`announce: destination ${JSON.stringify(key)} is not declared in this plugin's manifest; posting to its usual channels`);
+    }
+    return opts.announce(message);
+  };
+  return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce };
 }
+
+/** How many distinct undeclared destination names one plugin's `announce` warns about (#219). */
+const MAX_DESTINATION_WARNINGS = 50;
 
 export interface LoadResult {
   loaded: LoadedPlugin[];
@@ -134,15 +161,10 @@ export function pluginCommandMap(
   return map;
 }
 
-/**
- * The full slash-command registration body: core JSON first, then each plugin command built on a
- * `COMMAND_PREFIX`-named builder (so a plugin can't register outside the namespace). A command that
- * builds to the wrong name is dropped and logged rather than trusted.
- */
 /** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
- *  `"group sub q"`) whose built JSON declares `autocomplete: true` — the host never routes an
- *  autocomplete interaction to a plugin (see `buildCommandBody` below and `index.ts`'s handler), so
- *  these are dead pickers. Total: a malformed/absent `options` (not an array) yields `[]`. */
+ *  `"group sub q"`) whose built JSON declares `autocomplete: true` — dead pickers unless the command
+ *  also has an `autocomplete()` handler for the host to route them to (#287, see `buildCommandBody`
+ *  below and `dispatchPluginAutocomplete`). Total: a malformed/absent `options` (not an array) yields `[]`. */
 export function autocompleteOptionPaths(json: RESTPostAPIChatInputApplicationCommandsJSONBody): string[] {
   const paths: string[] = [];
   const walk = (options: unknown, prefix: readonly string[]): void => {
@@ -160,6 +182,11 @@ export function autocompleteOptionPaths(json: RESTPostAPIChatInputApplicationCom
   return paths;
 }
 
+/**
+ * The full slash-command registration body: core JSON first, then each plugin command built on a
+ * `COMMAND_PREFIX`-named builder (so a plugin can't register outside the namespace). A command that
+ * builds to the wrong name is dropped and logged rather than trusted.
+ */
 export function buildCommandBody(
   prefix: string,
   coreCommandJson: readonly RESTPostAPIChatInputApplicationCommandsJSONBody[],
@@ -170,7 +197,10 @@ export function buildCommandBody(
   const body: RESTPostAPIChatInputApplicationCommandsJSONBody[] = [...coreCommandJson];
   for (const [bare, { entry, command }] of map) {
     let built: RESTPostAPIChatInputApplicationCommandsJSONBody;
+    let hasAutocomplete = false;
     try {
+      // Plugin-controlled and only type-asserted: a throwing getter is caught with the build below.
+      hasAutocomplete = typeof command.autocomplete === "function";
       // Plugin code: `build()` and discord.js's `toJSON()` (which validates) can both throw. Isolate
       // it — a bad builder drops just its command, never crashing the whole registration/boot.
       built = command.build(cmd(bare)).toJSON();
@@ -183,14 +213,14 @@ export function buildCommandBody(
       continue;
     }
     // #218: a live command with a dead picker is still better than dropping it outright — warn, don't
-    // refuse. A typed value still works; only the autocomplete suggestions never load (index.ts
-    // answers every autocomplete interaction with an empty list — see its handler for why).
+    // refuse. A typed value still works; only the suggestions never load, because a command without an
+    // `autocomplete()` handler is answered with an empty list (`dispatchPluginAutocomplete`, #287).
     const autocompletePaths = autocompleteOptionPaths(built);
-    if (autocompletePaths.length > 0) {
+    if (autocompletePaths.length > 0 && !hasAutocomplete) {
       log.warn(
         `[plugins] ${entry.name}: command "${bare}" asks for autocomplete on ` +
-          `${autocompletePaths.map((p) => `"${p}"`).join(", ")} — the host does not route autocomplete ` +
-          `to plugins (#287), so the picker offers no suggestions; a typed value still works`,
+          `${autocompletePaths.map((p) => `"${p}"`).join(", ")} but has no autocomplete() handler, so ` +
+          `the picker offers no suggestions; a typed value still works`,
       );
     }
     body.push(built);
@@ -202,35 +232,154 @@ export function buildCommandBody(
  *  rejects, which `runTick` logs as that plugin's own failure before moving on to the next plugin.
  *  Kept under `announce.ts`'s 60s `TICK_MS` so a single hung tick can't by itself hold `guardedTick`
  *  past the next interval — `runTick` awaits checks one after another, so before this a hung tick
- *  held every plugin loaded after it for as long as it hung. It bounds the WAIT, not the call:
- *  cancelling would need an AbortSignal in `TickCheck.run`, a contract change every plugin would have
- *  to opt into, so the abandoned call keeps running — concurrently with whatever runs next, that
- *  plugin's other ticks included — and `pluginTicks` skips that tick (with a warning) until it
- *  settles, rather than starting a second call on top of it. A call that never settles therefore
- *  silences that tick until the bot restarts; its siblings keep running. */
+ *  held every plugin loaded after it for as long as it hung. At the bound the host also aborts the
+ *  call's `AbortSignal` (#248), so a cooperating tick bails; one that ignores the signal keeps
+ *  running — concurrently with whatever runs next, that plugin's other ticks included — and
+ *  `pluginTicks` skips that tick (with a warning) until it settles, rather than starting a second
+ *  call on top of it. A call that never settles therefore silences that tick until the bot
+ *  restarts; its siblings keep running. */
 export const PLUGIN_TICK_TIMEOUT_MS = 30_000;
+
+/** How long a stop (a requested restart, or a SIGTERM/SIGINT) waits for plugin ticks it has just
+ *  aborted to settle before it stops waiting on them (#248). Kept under `shutdown.ts`'s 8s
+ *  `SHUTDOWN_GRACE_MS`, so a tick that ignores its signal releases the drain with room left for
+ *  `disposePlugins` and the gateway close — and a restart is delayed by at most this, never held
+ *  forever the way #217 had to rule out. */
+export const PLUGIN_TICK_ABORT_GRACE_MS = 5_000;
 
 /** Rejects if `p` hasn't settled within `ms`, and clears its timer either way — unlike
  *  `disposePlugins`' race below (a one-shot on the way out, where a leftover timer is harmless),
  *  this runs on every 60s tick, and a timer left armed after its tick settled would sit dead for up
- *  to `ms`, holding the event loop open that long. Once the timeout wins, `p`'s late settle lands on
- *  an already-settled resolve/reject and is dropped, never an unhandled rejection. */
-function withTickTimeout(p: Promise<void>, ms: number, label: string): Promise<void> {
+ *  to `ms`, holding the event loop open that long. Once the timeout wins, `onTimeout` runs (it
+ *  aborts the call's signal, #248) and `p`'s late settle lands on an already-settled resolve/reject
+ *  and is dropped, never an unhandled rejection. */
+function withTickTimeout(p: Promise<void>, ms: number, label: string, onTimeout: (err: Error) => void): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`plugin tick ${label} exceeded ${ms}ms`)), ms);
+    const timer = setTimeout(() => {
+      const err = new Error(`plugin tick ${label} exceeded ${ms}ms`);
+      // `onTimeout` aborts the call's signal, which runs the plugin's own abort listeners; the try keeps
+      // anything that does surface synchronously from stopping the rejection below from landing.
+      try {
+        onTimeout(err);
+      } catch {
+        // the call is abandoned all the same
+      }
+      reject(err);
+    }, ms);
     p.then(resolve, reject).finally(() => clearTimeout(timer));
   });
+}
+
+/**
+ * #248: what lets a stop cancel plugin ticks rather than walk away from them. Every plugin tick call
+ * is registered here with its `AbortController` for as long as the call itself is pending — past
+ * `PLUGIN_TICK_TIMEOUT_MS` too — and, when `hold` is wired, holds one unit of `restart.ts`'s critical
+ * section for that whole time. That closes #217's gap: a tick the timeout abandoned no longer lets a
+ * restart or a SIGTERM drain exit under it. `stop()` — wired to `restart.ts`'s `onStopRequested`, so
+ * it runs when a restart is requested or a shutdown begins — aborts every pending call, refuses to
+ * start new ones, and releases each hold once its call settles or `graceMs` elapses, whichever is
+ * first. The grace is what keeps a tick that ignores its signal from holding a restart forever — and,
+ * through `graceElapsed`, from holding the scheduler tick's own critical section past it either: a stop
+ * that lands while a tick is still inside its `PLUGIN_TICK_TIMEOUT_MS` wait ends that wait at the grace.
+ */
+export interface PluginTickControl {
+  /** Registers one call; returns the signal to pass it, its abort (for the per-call timeout), and the
+   *  function to call when it settles. */
+  begin(): { signal: AbortSignal; abort: (reason: Error) => void; settle: () => void };
+  /** Aborts every pending call and bounds how long each still holds a stop. Idempotent. */
+  stop(reason: string): void;
+  /** True once `stop` has run: no new plugin tick call starts. */
+  readonly stopping: boolean;
+  /** Resolves once a stop's grace has elapsed (never, until `stop` runs). `pluginTicks` races each wait
+   *  against it, so a tick that ignores its signal delays a stop by the grace at most. */
+  readonly graceElapsed: Promise<void>;
+}
+
+export function createPluginTickControl(opts: {
+  /** Opens one unit of the critical section and returns its release (`restart.ts`'s begin/endCritical).
+   *  Omitted in tests that don't exercise the restart path. */
+  hold?: () => () => void;
+  graceMs?: number;
+} = {}): PluginTickControl {
+  const graceMs = opts.graceMs ?? PLUGIN_TICK_ABORT_GRACE_MS;
+  const pending = new Set<{ controller: AbortController; release: () => void }>();
+  let stopping = false;
+  let markGraceElapsed = () => {};
+  const graceElapsed = new Promise<void>((resolve) => {
+    markGraceElapsed = resolve;
+  });
+  /** A plugin's abort listener runs inside `abort()`. Bun reports a listener's throw as an uncaught
+   *  error rather than throwing it here (the contract says listeners must not throw); the try is for
+   *  anything that does surface synchronously, so it cannot skip the aborts after it. */
+  const abortQuietly = (controller: AbortController, reason: Error) => {
+    try {
+      controller.abort(reason);
+    } catch {
+      // the plugin's listener threw; the signal is aborted all the same
+    }
+  };
+  return {
+    get stopping() {
+      return stopping;
+    },
+    graceElapsed,
+    begin() {
+      const controller = new AbortController();
+      // Past a stop, nothing new may hold it: the grace timer below only covers calls already pending.
+      // `pluginTicks` never starts a call then, so this is defence in depth.
+      if (stopping) {
+        abortQuietly(controller, new Error("plugin tick aborted: the bot is stopping"));
+        return { signal: controller.signal, abort: () => {}, settle: () => {} };
+      }
+      const endHold = opts.hold?.();
+      let released = false;
+      const call = {
+        controller,
+        // Idempotent: a call can be released by its own settle AND by the stop's grace timer.
+        release: () => {
+          if (released) return;
+          released = true;
+          endHold?.();
+        },
+      };
+      pending.add(call);
+      return {
+        signal: controller.signal,
+        abort: (reason) => abortQuietly(controller, reason),
+        settle: () => {
+          pending.delete(call);
+          call.release();
+        },
+      };
+    },
+    stop(reason) {
+      if (stopping) return;
+      stopping = true;
+      const calls = [...pending];
+      // One timer for the whole batch, armed BEFORE any abort runs plugin code: past it, every call still
+      // pending lets go of the stop, and every wait still on one gives up. Ref'd on purpose, like
+      // awaitCriticalIdle's — the process is alive only to finish exactly this.
+      setTimeout(() => {
+        for (const call of calls) call.release();
+        markGraceElapsed();
+      }, graceMs);
+      for (const call of calls) abortQuietly(call.controller, new Error(`plugin tick aborted: ${reason}`));
+    },
+  };
 }
 
 /** Each plugin tick wrapped so it only runs while that plugin's `running` flag is true — a tick
  * can fire between startScheduler and activatePlugins, and must not run before activate() resolved —
  * is abandoned after `timeoutMs` if it hasn't settled (#217, see PLUGIN_TICK_TIMEOUT_MS), and is never
- * started while its own previous call is still pending. `timeoutMs` is the test seam, like
- * `guardedTick`'s `watchdogMs`: real callers take the default. */
+ * started while its own previous call is still pending. Each call gets an `AbortSignal` (#248),
+ * aborted at the timeout and at a stop; once `control` is stopping no new call starts. `timeoutMs` is
+ * the test seam, like `guardedTick`'s `watchdogMs`: real callers take the default. `control` defaults
+ * to one with no critical-section hold, which is #217's behaviour at a restart. */
 export function pluginTicks(
   loaded: readonly LoadedPlugin[],
   log: BaseLog,
   timeoutMs = PLUGIN_TICK_TIMEOUT_MS,
+  control: PluginTickControl = createPluginTickControl(),
 ): TickCheck[] {
   const checks: TickCheck[] = [];
   for (const lp of loaded) {
@@ -249,19 +398,32 @@ export function pluginTicks(
           name,
           run: async () => {
             if (!lp.running) return;
+            // #248: on the way out — don't start a call the stop would only have to abort.
+            if (control.stopping) return;
             if (inFlight) {
               log.warn(`[plugins] ${name}: its previous tick is still running — skipping this one`);
               return;
             }
             inFlight = true;
+            const { signal, abort, settle } = control.begin();
             // The async wrapper still starts the tick synchronously, but turns a sync throw or a plain
             // (non-promise) return — plugin code is only type-asserted — into a promise, so EVERY path
-            // reaches the finally that releases the flag; a throw that skipped it would silence this
-            // tick for good.
-            const call = (async () => tick.run())().finally(() => {
+            // reaches the finally that releases the flag and the hold; a throw that skipped it would
+            // silence this tick for good.
+            const call = (async () => tick.run(signal))().finally(() => {
               inFlight = false;
+              settle();
             });
-            await withTickTimeout(call, timeoutMs, name);
+            // At the bound, abort rather than only walk away: a cooperating tick bails now. The hold
+            // and the in-flight flag stay with the call itself (the finally above), not with the wait.
+            // ...and a stop's grace ends the wait too, so this scheduler tick's critical section never
+            // outlasts it (a tick still inside its timeout when the stop lands would otherwise hold it
+            // for the rest of `timeoutMs`).
+            const outcome = await Promise.race([
+              withTickTimeout(call, timeoutMs, name, abort).then(() => "settled" as const),
+              control.graceElapsed.then(() => "grace" as const),
+            ]);
+            if (outcome === "grace") throw new Error(`plugin tick ${name} abandoned: the stop's grace elapsed`);
           },
         });
       }
@@ -379,6 +541,80 @@ export async function dispatchPluginInteraction(
     }
   }
   return true;
+}
+
+/** The most the autocomplete dispatcher waits on the routing gate (#287) before it answers with an empty
+ *  list — the gate may fetch a channel, and Discord drops the interaction after 3 s. */
+export const AUTOCOMPLETE_GATE_TIMEOUT_MS = 1_000;
+/** The most it waits on a plugin's `autocomplete()` before answering for it; the call is not cancelled. */
+export const AUTOCOMPLETE_TIMEOUT_MS = 2_500;
+
+/** `p`'s value, or `fallback` once `ms` has passed; its timer is cleared either way. A rejection passes through. */
+function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    p.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
+/**
+ * #287: answers one autocomplete interaction for the plugin command `bare` — called from index.ts's
+ * InteractionCreate handler with the bare command name. Routes to the command's `autocomplete()` only
+ * when the owning plugin is `running` and `gate` (the same routing gate as the command itself, #243)
+ * lets it run here. Unlike the command, it FAILS CLOSED: a gate that throws or takes longer than
+ * `AUTOCOMPLETE_GATE_TIMEOUT_MS` gets the empty list — a picker with no suggestions costs nothing, and
+ * Discord's 3 s would otherwise run out. Every other path — no such command, no handler, not running,
+ * refused here, a throw, a handler still running after `AUTOCOMPLETE_TIMEOUT_MS`, or one that returned
+ * without calling `respond` — answers with an empty list, so the picker closes at once instead of
+ * failing after Discord's own timeout. A handler that CALLED `respond` without awaiting it is not
+ * answered a second time: the dispatcher wraps `respond` to see the call, not just its completion.
+ * A throw is logged and isolated like every other plugin call site. Never rejects past the final
+ * `respond([])`, which the caller's own catch covers.
+ */
+export async function dispatchPluginAutocomplete(opts: {
+  interaction: AutocompleteInteraction;
+  bare: string;
+  map: PluginCommandMap;
+  loaded: readonly LoadedPlugin[];
+  gate: (bare: string) => Promise<string | undefined>;
+  log: BaseLog;
+}): Promise<void> {
+  const { interaction, bare, log } = opts;
+  const target = opts.map.get(bare);
+  const lp = target ? opts.loaded.find((l) => l.entry.name === target.entry.name) : undefined;
+  let respondCalled = false;
+  try {
+    // Plugin-controlled and only type-asserted: read once, inside the try, so a throwing getter is isolated.
+    const handler = target && lp?.running ? target.command.autocomplete : undefined;
+    if (target && typeof handler === "function") {
+      let refusal: string | undefined;
+      try {
+        refusal = await within(opts.gate(bare), AUTOCOMPLETE_GATE_TIMEOUT_MS, "the gate took too long");
+      } catch (err) {
+        refusal = "the gate failed";
+        log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; answering with no suggestions`, err);
+      }
+      if (refusal === undefined) {
+        // `respond` is discord.js's prototype method: shadow it with an own property for the call, then
+        // take the shadow away again, leaving the object exactly as it was.
+        const hadOwn = Object.hasOwn(interaction, "respond");
+        const original = interaction.respond;
+        interaction.respond = ((...args: Parameters<typeof original>) => {
+          respondCalled = true;
+          return original.apply(interaction, args);
+        }) as typeof interaction.respond;
+        try {
+          await within(Promise.resolve().then(() => handler.call(target.command, interaction)), AUTOCOMPLETE_TIMEOUT_MS, undefined);
+        } finally {
+          if (hadOwn) interaction.respond = original;
+          else delete (interaction as { respond?: unknown }).respond;
+        }
+      }
+    }
+  } catch (err) {
+    log.error(`[plugins] ${target?.entry.name} autocomplete for "${bare}" failed`, err);
+  }
+  if (!respondCalled && !interaction.responded) await interaction.respond([]);
 }
 
 const STATE_FRESH: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
