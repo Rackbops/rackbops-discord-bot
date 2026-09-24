@@ -87,7 +87,8 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    a plugin's tests need. It is a declared-dependency boundary, not a sandbox: a command handler's
    `interaction.client` still reaches the live `Client` (a handler only ever runs after the host
    attached the listener inside `activate()`). An HTTP plugin keeps its own `Bun.serve` on its own port env; a host-owned
-   router and a stop/dispose hook are additive later.
+   router and a stop/dispose hook are additive later. (The dispose hook shipped in #184, the router in
+   #220, ADR-0007; a plugin's own `Bun.serve` still works beside it.)
 8. **Commands register on every boot** from core + loaded plugins; a removed plugin's commands
    vanish through the existing bulk `rest.put` overwrite (`src/index.ts:34-41`).
 

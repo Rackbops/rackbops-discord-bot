@@ -255,6 +255,30 @@ describe("index.ts wiring", () => {
     });
   });
 
+  // #220 (ADR-0007): the host's HTTP router. index.ts can't run under test, so the wiring's shape is pinned.
+  describe("the host HTTP router is wired (#220)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const activated = source.indexOf("await activatePlugins(loadResult.loaded, console);", activateFn);
+    const start = source.indexOf("startHostHttp({", activateFn);
+
+    test("it starts only inside activate(), after activatePlugins, and only when HTTP_PORT is set", () => {
+      expect(activated).toBeGreaterThan(activateFn);
+      expect(start).toBeGreaterThan(activated);
+      expect((source.match(/startHostHttp\(/g) ?? []).length).toBe(1);
+      expect(source.lastIndexOf("if (config.httpPort !== undefined) {", start)).toBeGreaterThan(activated);
+      const call = source.slice(start, source.indexOf("});", start));
+      expect(call).toMatch(/port:\s*config\.httpPort,/);
+      expect(call).toMatch(/maxBodyBytes:\s*HTTP_MAX_BODY_BYTES,/);
+      expect(call).toMatch(/handle:\s*\(request,\s*clientIp\)\s*=>\s*routeHttpRequest\(loaded,\s*request,\s*clientIp,\s*console\),/);
+    });
+
+    test("a bind failure is caught, and shutdown stops the listener before it disposes plugins", () => {
+      expect(source.lastIndexOf("try {", start)).toBeGreaterThan(activated);
+      expect(source).toMatch(/stopHttp = http\.stop;/);
+      expect(source).toMatch(/disposePlugins:\s*\(\)\s*=>\s*\{\s*stopHttp\(\);\s*return disposePlugins\(/);
+    });
+  });
+
   // #241: the request mailbox is also drained every few seconds on its own timer. index.ts can't run under
   // test, so the shape of the wiring is pinned in the source: that the timer is started at all, and how.
   describe("the request-mailbox timer is wired (#241)", () => {
@@ -391,7 +415,8 @@ describe("index.ts wiring", () => {
     expect(createCallStart).toBeGreaterThan(-1);
     const createCallEnd = source.indexOf("});", createCallStart);
     const createCallBody = source.slice(createCallStart, createCallEnd);
-    expect(createCallBody).toMatch(/disposePlugins:\s*\(\)\s*=>\s*disposePlugins\(/);
+    // #220: it stops the HTTP listener first, then disposes (pinned in the #220 describe too).
+    expect(createCallBody).toMatch(/disposePlugins:\s*\(\)\s*=>\s*\{\s*stopHttp\(\);\s*return disposePlugins\(currentLoadedPlugins,/);
   });
 
   test("assigns the module-level loaded-plugins variable inside activate(), after loadPlugins resolves", () => {

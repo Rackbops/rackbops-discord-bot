@@ -313,6 +313,7 @@ declare -A RESERVED_KEYS=(
   [SHARD_COUNT]=1              # discord.js Client: the shard count
   [SHARDING_MANAGER]=1         # discord.js Client: makes client.shard a ShardClientUtil
   [SHARDING_MANAGER_MODE]=1    # discord.js Client: that util's mode
+  [HTTP_PORT]=1                # src/config.ts: the host's HTTP router port (#220, ADR-0007) -- set by hand, and no plugin may claim it
   # Group 4 (#280): act on the core's own outbound calls or on a tool it spawns, not on the runtime
   # in general — unlike NODE_OPTIONS/PATH/LD_PRELOAD/BUN_*/TZ, which stay claimable (#240 item 22).
   # Bun's fetch honours both the upper- and lower-case spelling of each proxy variable (reproduced
