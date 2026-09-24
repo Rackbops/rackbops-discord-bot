@@ -1499,11 +1499,40 @@ _Avoid_: server list, guild cache
   `/api/env-schema` together and renders both the cards and the Config editor; `opts.keepEdits` defaults
   to `!applyRereading`, so a re-read `rereadFromServer()` itself started (Discard, an apply outcome) is
   the one case that drops them (matching what the plan asked for), and everything else that reloads —
-  an update button's success, Unlock — calls `diffEdits` against the OLD baseline before the fetch and
-  `reapplyCardEdits` after the new render, so typing in one card survives a background reload triggered
+  an update button's success, Unlock — calls `diffEdits` against the OLD baseline once the fetch has
+  landed (just before the render) and `reapplyCardEdits` after it, so typing in one card survives a background reload triggered
   from another (or from toggling a different card open/closed, which re-renders the whole list the same
   way, synchronously, with no fetch involved). A control the new render no longer has (the plugin left
   the index, its card is no longer open) is silently dropped, never an error.
+  **What is typed WHILE a reload is in flight is kept by every reload that lands, Discard's included, on
+  the cards and in the Config editor (#284).** `reloadConfig()` reads the controls twice — when the reload is
+  asked for (`captureControls`, `CONTROL_SNAPSHOT`) and once its fetch has landed — and `diffSnapshots`
+  (`PLUGIN_EDITS`) reports what the USER typed in between: a key counts only when its control holds exactly
+  the value `onControlEdited` last recorded the user typing there (`noteControlEdited` → `lastTyped`, keyed
+  `env:`/`on:`/`set:`/`secret:`) and that differs from the first read, so a value a render wrote — an update button's or
+  Unlock's reload landing during an Apply POST re-renders the OLD stored values — is never mistaken for an
+  edit (round 2: it used to make a successful Apply offer the old value back). On the cards it is what `reapplyCardEdits` puts back
+  when `keepEdits` is off (with it on, the late `diffEdits` already covers it), and in the Config editor,
+  which has no capture/reapply of its own, `renderEnvFields(overrides)` renders those keys with the typed
+  value instead of the stored one. Only this in-flight window is kept for Config fields: an edit made there
+  BEFORE any reload is still replaced by the stored value, as before. A reload that FAILS (or times out,
+  #282) replaces both lists with its error, typed edits included; a chip field counts its committed chips,
+  not text still in its typing input. `applyPending` reads the controls as its POST sends them and hands
+  that to the re-read as `{ since }` (through `rereadFromServer(opts)` and the `loadPlugins`/`loadEnv`
+  aliases, which forward it), so what is typed during the POST itself is kept too — unless another reload (an
+  update button's, Unlock's) lands during the POST: that one replaces a Config field typed before it started,
+  like any reload, and the re-read then finds the field no longer holding what was typed. A secret input that
+  appears between the two reads (Replace pressed mid-reload) counts as typed when non-empty — it has no
+  stored value. The control that had focus gets it back on its rebuilt twin (same id) after the render.
+  **A reload that drops edits never joins one that keeps them (#284 round 1).** `reloadConfig` is
+  single-flight, but a Discard (or an apply outcome) asked for while an update button's or Unlock's reload
+  is in flight is QUEUED behind it (`reloadConfigQueued`), with its first read taken when it was asked for:
+  joined, it would have inherited that reload's `keepEdits` and put back the very edits it discards. Any
+  call made while one is queued joins the queued one, so the last reload to land is always the dropping one.
+  The queued reload starts whether the one ahead of it lands or rejects (`.then(run, run)`, round 2), so a
+  failure there never leaves every later reload joining a dead queue. Cost: a Discard queued behind a HUNG
+  reload waits out that reload's 30 s timeout and then runs its own, so the bar can stay locked for up to
+  about 70 s in that case (two 30 s timeouts plus two 5 s branch-list timeouts), not 30.
   **A key lives on exactly one card: the first plugin, in manifest order, that declares it (#244,
   `settingOwners`).** A later plugin declaring the same key shows *"Set on the `<first>` card."*; a key
   `GET /api/env-schema` reports `source: "core"` never appears on a card at all (*"Set under
@@ -1609,11 +1638,17 @@ _Avoid_: server list, guild cache
   specifically licensed to suppress that region's announcements until it clears -- marking the bar busy there
   risks the failure or success message going unheard (not verified here: no screen reader was at hand). The
   pending view has no terminal message to lose.
-  **The two GETs `rereadFromServer()` awaits have no timeout of their own** (new versus `a5eb2dd`, #276:
-  before `applyRereading` existed a slow read did not lock the bar's own buttons). A hang blocks Discard and
-  Apply for as long as the request is outstanding, up to the server's own limits (`SUBPROCESS_TIMEOUT_MS =
-  90_000`, `IDLE_TIMEOUT_SECONDS = 120`, `ops/admin/server.ts:498-499`); OK stays usable throughout. Tracked
-  as #282.
+  **`reloadConfig()`'s three GETs share one 30 s timeout (`RELOAD_TIMEOUT_MS`, #282).** Before it, a hung
+  `/api/plugins`, `/api/env` or `/api/env-schema` blocked Discard and Apply for as long as the request was
+  outstanding, up to the server's own limits (`SUBPROCESS_TIMEOUT_MS = 90_000`, `IDLE_TIMEOUT_SECONDS = 120`,
+  `ops/admin/server.ts:592-593`) — and, because `reloadConfig` is single-flight, every later reload (Unlock's
+  included) joined the hung one. Now a timed-out plugins or env read ends in `reloadConfig`'s `catch`, which
+  writes "the server did not answer within 30 seconds" into both lists, and its `finally` clears the timer
+  and the single-flight promise, so the bar unlocks and the next reload fetches afresh; a hung
+  `/api/env-schema` alone falls back to `{}` like any other schema failure. `loadBranches()` keeps its own
+  5 s timeout, before the 30 s one starts. **When the re-read ends, `rereadFromServer()` itself calls
+  `settleFocus()` (#284)**: OK pressed during a failure's re-read puts focus on the bar, and a landing that
+  leaves nothing pending hides the bar, which used to drop focus to `<body>`.
 - **A request file that may carry a webhook URL is deleted on rejection, never moved to
   `requests/rejected/` (#241).** A webhook URL is a secret, and `rejected/` is a folder nobody treats
   as one and nothing ever prunes. The drain decides a file may carry one from its NAME (the writer
