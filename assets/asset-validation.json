@@ -1,0 +1,107 @@
+{
+  "master": {
+    "file": "luma.png",
+    "width": 1254,
+    "height": 1254,
+    "mode": "RGBA",
+    "alphaBounds": [
+      49,
+      21,
+      1234,
+      1230
+    ]
+  },
+  "favicon": {
+    "svgSources": [
+      "luma-favicon.svg",
+      "luma-favicon-16.svg"
+    ],
+    "pngs": {
+      "luma-favicon-16.png": {
+        "width": 16,
+        "height": 16,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          16,
+          16
+        ]
+      },
+      "luma-favicon-32.png": {
+        "width": 32,
+        "height": 32,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          32,
+          32
+        ]
+      },
+      "luma-favicon-48.png": {
+        "width": 48,
+        "height": 48,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          48,
+          48
+        ]
+      },
+      "luma-favicon-180.png": {
+        "width": 180,
+        "height": 180,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          180,
+          180
+        ]
+      },
+      "luma-favicon-192.png": {
+        "width": 192,
+        "height": 192,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          192,
+          192
+        ]
+      },
+      "luma-favicon-512.png": {
+        "width": 512,
+        "height": 512,
+        "mode": "RGBA",
+        "alphaBounds": [
+          0,
+          0,
+          512,
+          512
+        ]
+      }
+    },
+    "icoSizes": [
+      [
+        16,
+        16
+      ],
+      [
+        32,
+        32
+      ],
+      [
+        48,
+        48
+      ]
+    ]
+  },
+  "checks": {
+    "icoMatchesPng": true,
+    "svgParsed": true,
+    "proofRendered": true
+  }
+}
