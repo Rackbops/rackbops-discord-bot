@@ -56,7 +56,7 @@ export function createHostApi(opts: {
   dataDir: string;
   baseLog: BaseLog;
   storage: HostStorage;
-  announce: (message: string) => Promise<void>;
+  announce: (message: string, destination?: string) => Promise<void>;
 }): HostApi {
   const { name } = opts.entry;
   const env: Record<string, string | undefined> = {};
@@ -66,7 +66,21 @@ export function createHostApi(opts: {
     warn: (m) => opts.baseLog.warn(`[${name}] ${m}`),
     error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, e),
   };
-  return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce: opts.announce };
+  // #219: only a destination the manifest declares is passed on; any other is said once per name and
+  // posts where the plugin posts without one. `destinations` is index data, read defensively.
+  const declared = new Set((Array.isArray(opts.entry.destinations) ? opts.entry.destinations : []).map((d) => d?.name));
+  const warned = new Set<string>();
+  const announce = (message: string, destination?: string): Promise<void> => {
+    if (destination === undefined) return opts.announce(message);
+    if (typeof destination === "string" && declared.has(destination)) return opts.announce(message, destination);
+    const key = String(destination);
+    if (!warned.has(key)) {
+      warned.add(key);
+      log.warn(`announce: destination "${key}" is not declared in this plugin's manifest; posting to its usual channels`);
+    }
+    return opts.announce(message);
+  };
+  return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce };
 }
 
 export interface LoadResult {

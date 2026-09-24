@@ -156,6 +156,15 @@ export interface RoutingRequestDeps {
   log: Pick<Console, "warn">;
 }
 
+/** #219: the destination names `plugin` declares, as `discovery.json` lists them -- none for a plugin the
+ *  bot has not published, or a file written before #219. Read defensively: the file came from disk. */
+export function declaredDestinations(discovery: DiscoveryFile, plugin: string): string[] {
+  const summary = Object.hasOwn(discovery.plugins, plugin) ? discovery.plugins[plugin] : undefined;
+  const list = summary?.destinations;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((d) => (isRecord(d) && typeof d.name === "string" ? [d.name] : []));
+}
+
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -198,7 +207,10 @@ export async function applyRoutingRequest(request: RoutingRequest, deps: Routing
     case "routing-set": {
       const { plugin, requestedBy } = request;
       // The validator's clean value goes in, never the raw input: unknown keys cannot ride through.
-      const clean = await checkAgainstDiscovery(deps, (discovery) => validatePluginRouting({ servers: request.servers }, discovery));
+      // #219: the destination names the plugin declares, as the bot published them.
+      const clean = await checkAgainstDiscovery(deps, (discovery) =>
+        validatePluginRouting({ servers: request.servers }, discovery, declaredDestinations(discovery, plugin)),
+      );
       await deps.mutateRouting((current) => ({
         ...current,
         plugins: { ...current.plugins, [plugin]: clean },

@@ -181,9 +181,9 @@ describe("index.ts wiring", () => {
     const handleCall = source.indexOf("await handleCommand(", interactionStart);
 
     test("a plugin's announce goes through postForPlugin with its own name and the default channel", () => {
-      expect(source).toMatch(/announce:\s*\(message\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps\),/);
+      expect(source).toMatch(/announce:\s*\(message,\s*destination\)\s*=>\s*postForPlugin\(entry\.name,\s*message,\s*postDeps,\s*destination\),/);
       // The old wiring -- every plugin posting straight to the one channel -- is gone.
-      expect(source).not.toMatch(/announce:\s*\(message\)\s*=>\s*announceTo\(/);
+      expect(source).not.toMatch(/announce:\s*\([^)]*\)\s*=>\s*announceTo\(/);
       expect(depsBlock).toMatch(/defaultChannelId:\s*config\.announceChannelId,/);
     });
 

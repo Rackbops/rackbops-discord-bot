@@ -172,7 +172,7 @@ async function activate(c: Client<true>): Promise<void> {
         dataDir: DATA_DIR,
         baseLog: console,
         storage,
-        announce: (message) => postForPlugin(entry.name, message, postDeps),
+        announce: (message, destination) => postForPlugin(entry.name, message, postDeps, destination),
       });
     loadResult = await loadPlugins(
       installResult.installed,

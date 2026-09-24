@@ -449,3 +449,73 @@ describe("validatePluginRouting", () => {
     });
   });
 });
+
+describe("announceTargets with a named destination (#219)", () => {
+  const r = routing({
+    feed: {
+      servers: {
+        [OTHER]: { commands: "all", postTo: OTHER_CHAN, destinations: { news: OTHER_CHAN_2 } },
+        [HOME]: { commands: "all", postTo: HOME_CHAN, destinations: { news: HOME_CHAN_2, alerts: HOME_CHAN_2 } },
+      },
+    },
+  });
+
+  test("goes to every channel the name is mapped to, once each, in guild order -- and not to postTo", () => {
+    expect(announceTargets(r, "feed", DEFAULT_CHANNEL, "news")).toEqual([HOME_CHAN_2, OTHER_CHAN_2]);
+    expect(announceTargets(r, "feed", DEFAULT_CHANNEL, "alerts")).toEqual([HOME_CHAN_2]);
+  });
+
+  test("a name mapped nowhere posts where the plugin posts without one", () => {
+    expect(announceTargets(r, "feed", DEFAULT_CHANNEL, "digest")).toEqual([HOME_CHAN, OTHER_CHAN]);
+    const noPostTo = routing({ feed: { servers: { [HOME]: { commands: "all" } } } });
+    expect(announceTargets(noPostTo, "feed", DEFAULT_CHANNEL, "news")).toEqual([DEFAULT_CHANNEL]);
+    expect(announceTargets(freshRouting(), "feed", DEFAULT_CHANNEL, "news")).toEqual([DEFAULT_CHANNEL]);
+  });
+
+  test("an inherited key is not a mapped name, and another plugin's names do not leak in", () => {
+    expect(announceTargets(r, "feed", DEFAULT_CHANNEL, "constructor")).toEqual([HOME_CHAN, OTHER_CHAN]);
+    expect(announceTargets(r, "other", DEFAULT_CHANNEL, "news")).toEqual([DEFAULT_CHANNEL]);
+  });
+});
+
+describe("validatePluginRouting with destinations (#219)", () => {
+  test("a declared name mapped to a channel in that server is kept", () => {
+    const input = { servers: { [HOME]: { commands: "all" as const, destinations: { news: HOME_CHAN_2 } } } };
+    expect(validatePluginRouting(input, discovery(), ["news"])).toEqual({ ok: true, value: input });
+  });
+
+  test("an empty map is dropped from the value rather than written", () => {
+    const result = validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations: {} } } }, discovery(), ["news"]);
+    expect(result).toEqual({ ok: true, value: { servers: { [HOME]: { commands: "all" } } } });
+  });
+
+  test("a name the plugin does not declare is refused -- by default it declares none", () => {
+    const input = { servers: { [HOME]: { commands: "all", destinations: { news: HOME_CHAN_2 } } } };
+    expect(validatePluginRouting(input, discovery(), ["alerts"])).toEqual({ ok: false, reason: "destination news is not one this plugin declares" });
+    expect(validatePluginRouting(input, discovery())).toMatchObject({ ok: false });
+  });
+
+  test("a channel from another server, or not a string, is refused", () => {
+    expect(validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations: { news: OTHER_CHAN } } } }, discovery(), ["news"])).toEqual({
+      ok: false,
+      reason: `destination news: channel ${OTHER_CHAN} is not in server ${HOME}`,
+    });
+    expect(validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations: { news: 5 } } } }, discovery(), ["news"])).toMatchObject({ ok: false });
+  });
+
+  test("destinations that is not an object is refused", () => {
+    for (const destinations of [[HOME_CHAN], "x", null]) {
+      expect(validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations } } }, discovery(), ["news"])).toEqual({
+        ok: false,
+        reason: `destinations for server ${HOME} must be an object`,
+      });
+    }
+  });
+
+  test("the kept map is a copy, not the caller's object", () => {
+    const destinations = { news: HOME_CHAN_2 };
+    const result = validatePluginRouting({ servers: { [HOME]: { commands: "all", destinations } } }, discovery(), ["news"]);
+    if (!result.ok) throw new Error("expected acceptance");
+    expect(result.value.servers[HOME]!.destinations).not.toBe(destinations);
+  });
+});

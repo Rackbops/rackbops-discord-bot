@@ -49,7 +49,11 @@ request mailbox and applied without a restart.
    can leave its temp file — and both stay owner-only.
 6. **`HostApi.announce(message)` does not change.** The host resolves a plugin's channels where it
    builds that plugin's `announce`; `HOST_API_VERSION` does not move and no published plugin is
-   affected.
+   affected. *Amended by #219:* `announce(message, destination?)` gains an optional **named
+   destination** — a name the plugin declares in its manifest (`destinations`), mapped by the operator
+   to a channel per server in the same panel row (`servers[guild].destinations[name]`). A name mapped
+   nowhere, or not declared, posts exactly where `announce(message)` would, so a destination is an
+   option, never a requirement. Still additive: `HOST_API_VERSION` stays 1.
 7. **Channel restrictions are enforced by the bot at dispatch**, because a bot cannot edit
    Discord's per-channel command permissions (that needs a user's bearer token). A command used
    outside its channels gets a private reply naming the right ones; a thread counts as its parent.
@@ -75,7 +79,7 @@ request mailbox and applied without a restart.
   filed). Rejected for this case: it moves the pasted snowflake from one env key to many, makes every
   plugin re-implement "where do I post", and changes a shipped contract. Named destinations
   (`announce(message, "alerts")`, mapped to channels in the same panel row) remain a compatible
-  later extension and stay open on #219.
+  later extension and stay open on #219 — since built, see decision 6's amendment.
 - **Per-command routing.** Rejected as unneeded: the one apparently curated per-server command set
   in production turned out to be a stale registration, not a choice.
 - **Global command registration.** Puts every command in every server, with up to an hour's

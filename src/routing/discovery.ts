@@ -8,7 +8,7 @@
 import { ChannelType, PermissionFlagsBits, type Client } from "discord.js";
 import type { LoadedPlugin, PluginCommandMap } from "../plugins/host";
 import { readJsonOrFresh, writeJsonAtomic } from "../storage";
-import type { DiscoveryChannel, DiscoveryFile } from "./model";
+import { DESTINATION_NAME_RE, type DiscoveryChannel, type DiscoveryFile } from "./model";
 import { ownerOf, type GuildRegistration } from "./register";
 
 export interface GuildSnapshot {
@@ -66,6 +66,26 @@ export interface PluginSummary {
   name: string;
   commands: string[];
   posts: boolean;
+  /** #219: the named destinations the plugin's manifest declares, valid ones only; absent when none, so a
+   *  plugin without any is described exactly as before. */
+  destinations?: { name: string; description: string }[];
+}
+
+/** #219: an entry's declared destinations, from index data read defensively: a malformed list or item
+ *  is skipped, a name is kept only when it has the destination-name shape, and nothing else is copied. */
+function declaredDestinationsOf(entry: LoadedPlugin["entry"]): { name: string; description: string }[] {
+  const list: unknown = entry.destinations;
+  if (!Array.isArray(list)) return [];
+  const seen = new Set<string>();
+  const out: { name: string; description: string }[] = [];
+  for (const d of list) {
+    if (typeof d !== "object" || d === null) continue;
+    const { name, description } = d as { name?: unknown; description?: unknown };
+    if (typeof name !== "string" || !DESTINATION_NAME_RE.test(name) || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ name, description: typeof description === "string" ? description : "" });
+  }
+  return out;
 }
 
 /**
@@ -92,7 +112,8 @@ export function describePlugins(
       posts = false;
     }
     const commands = fullBody.filter((c) => ownerOf(c.name, prefix, commandMap) === lp.entry.name).map((c) => c.name);
-    return { name: lp.entry.name, commands, posts };
+    const destinations = declaredDestinationsOf(lp.entry);
+    return { name: lp.entry.name, commands, posts, ...(destinations.length > 0 ? { destinations } : {}) };
   });
 }
 
@@ -134,7 +155,16 @@ export function buildDiscovery(opts: {
     }),
     // `Object.fromEntries` creates own data properties, so a plugin named like an inherited key
     // (`constructor` is a legal plugin name) is an ordinary entry.
-    plugins: Object.fromEntries(plugins.map((p) => [p.name, { posts: p.posts, commands: [...p.commands] }])),
+    plugins: Object.fromEntries(
+      plugins.map((p) => [
+        p.name,
+        {
+          posts: p.posts,
+          commands: [...p.commands],
+          ...(p.destinations !== undefined && p.destinations.length > 0 ? { destinations: p.destinations.map((d) => ({ ...d })) } : {}),
+        },
+      ]),
+    ),
   };
 }
 

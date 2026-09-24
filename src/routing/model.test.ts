@@ -754,3 +754,36 @@ describe("repairSecrets", () => {
     expect(Object.getPrototypeOf(repaired.webhooks)).toBe(Object.prototype);
   });
 });
+
+describe("destinations in routing.json (#219)", () => {
+  const withDestinations = (destinations: unknown) => ({ plugins: { feed: { servers: { [GUILD_A]: { commands: "all", destinations } } } } });
+
+  test("valid name -> channel pairs are kept", () => {
+    const repaired = repairRouting(withDestinations({ news: CHAN_1, alerts: CHAN_2 }));
+    expect(repaired.plugins.feed!.servers[GUILD_A]).toEqual({ commands: "all", destinations: { news: CHAN_1, alerts: CHAN_2 } });
+  });
+
+  test("a bad pair costs only itself, and a map left empty is not written back", () => {
+    const repaired = repairRouting(withDestinations({ news: CHAN_1, "Bad Name": CHAN_2, alerts: "not-a-channel" }));
+    expect(repaired.plugins.feed!.servers[GUILD_A]).toEqual({ commands: "all", destinations: { news: CHAN_1 } });
+    for (const bad of [{ alerts: 5 }, {}, [CHAN_1], "x", null]) {
+      expect(repairRouting(withDestinations(bad)).plugins.feed!.servers[GUILD_A]).toEqual({ commands: "all" });
+    }
+  });
+
+  test("a __proto__ key never reaches an assignment", () => {
+    const repaired = repairRouting(JSON.parse(`{"plugins":{"feed":{"servers":{"${GUILD_A}":{"commands":"all","destinations":{"__proto__":"${CHAN_1}","news":"${CHAN_1}"}}}}}}`));
+    const destinations = repaired.plugins.feed!.servers[GUILD_A]!.destinations!;
+    expect(Object.keys(destinations)).toEqual(["news"]);
+    expect(Object.getPrototypeOf(destinations)).toBe(Object.prototype);
+  });
+
+  test("droppedByRepair names each dropped pair, and says nothing about good ones", () => {
+    expect(droppedByRepair(withDestinations({ news: CHAN_1 }))).toEqual([]);
+    expect(droppedByRepair(withDestinations({ "Bad Name": CHAN_1, alerts: "x" }))).toEqual([
+      `plugin feed: server ${GUILD_A}: destination Bad Name is not a valid name`,
+      `plugin feed: server ${GUILD_A}: destination alerts -> x is not a channel id`,
+    ]);
+    expect(droppedByRepair(withDestinations([CHAN_1]))).toEqual([`plugin feed: server ${GUILD_A}: destinations is not an object`]);
+  });
+});

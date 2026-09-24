@@ -19,6 +19,8 @@ import { shown } from "./resolve";
 export const ROUTING_VERSION = 1 as const;
 /** Same rule as `PluginIndexEntry.name` (`src/plugins/requests.ts` and `src/plugins/index.ts`). */
 export const PLUGIN_NAME_RE = /^[a-z][a-z0-9-]*$/;
+/** A destination name (#219): the same rule as a plugin name. */
+export const DESTINATION_NAME_RE = PLUGIN_NAME_RE;
 /** A Discord snowflake as it appears in JSON. */
 export const SNOWFLAKE_RE = /^[0-9]{5,25}$/;
 
@@ -31,6 +33,12 @@ export interface ServerRouting {
    * to the default announce channel instead (`announceTargets` in `resolve.ts`).
    */
   postTo?: string;
+  /**
+   * #219: destination name (one the plugin's manifest declares) -> channel id in this server. Absent or
+   * missing a name = this server adds no target for that name; a name mapped in NO server posts where
+   * the plugin posts without one (`announceTargets`).
+   */
+  destinations?: Record<string, string>;
 }
 /** key: guild id */
 export interface PluginRouting {
@@ -105,7 +113,9 @@ export interface DiscoveryFile {
   inviteUrl: string;
   homeGuildId: string | null;
   guilds: DiscoveryGuild[];
-  plugins: Record<string, { posts: boolean; commands: string[] }>;
+  /** `destinations` (#219): what the plugin's manifest declares, for the panel's pickers. Absent in a file
+   *  written before #219, and read as none. */
+  plugins: Record<string, { posts: boolean; commands: string[]; destinations?: { name: string; description: string }[] }>;
 }
 
 export function freshRouting(): RoutingFile {
@@ -149,6 +159,19 @@ function repairScope(value: unknown): CommandScope | undefined {
   return channels;
 }
 
+/**
+ * #219: the valid `name -> channel id` pairs of a server's `destinations`, built from scratch (a key is
+ * tested before it is used); `undefined` when there are none, so an empty map is never written back.
+ */
+function repairDestinations(value: unknown): Record<string, string> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const destinations: Record<string, string> = {};
+  for (const [name, channel] of Object.entries(value)) {
+    if (DESTINATION_NAME_RE.test(name) && isSnowflake(channel)) destinations[name] = channel;
+  }
+  return Object.keys(destinations).length > 0 ? destinations : undefined;
+}
+
 function repairPlugin(value: unknown): PluginRouting | undefined {
   if (!isPlainObject(value) || !isPlainObject(value.servers)) return undefined;
   const servers: Record<string, ServerRouting> = {};
@@ -160,6 +183,8 @@ function repairPlugin(value: unknown): PluginRouting | undefined {
     const repaired: ServerRouting = { commands };
     // A bad `postTo` costs the server its posting channel, not its whole entry.
     if (isSnowflake(entry.postTo)) repaired.postTo = entry.postTo;
+    const destinations = repairDestinations(entry.destinations);
+    if (destinations !== undefined) repaired.destinations = destinations;
     servers[guildId] = repaired;
   }
   return { servers };
@@ -299,9 +324,20 @@ export function droppedByRepair(raw: unknown): string[] {
           dropped.push(`${where} is not a server id`);
         } else if (!isPlainObject(server) || repairScope(server.commands) === undefined) {
           dropped.push(`${where} has no valid commands ("all" or a list of channel ids)`);
-        } else if (server.postTo !== undefined && !isSnowflake(server.postTo)) {
-          // The server entry is kept, as the repair keeps it; only its posting channel is lost.
-          dropped.push(`${where}: postTo ${shown(server.postTo)} is not a channel id`);
+        } else {
+          if (server.postTo !== undefined && !isSnowflake(server.postTo)) {
+            // The server entry is kept, as the repair keeps it; only its posting channel is lost.
+            dropped.push(`${where}: postTo ${shown(server.postTo)} is not a channel id`);
+          }
+          // #219: likewise a bad destination costs only itself.
+          if (server.destinations !== undefined && !isPlainObject(server.destinations)) {
+            dropped.push(`${where}: destinations is not an object`);
+          } else if (isPlainObject(server.destinations)) {
+            for (const [name, channel] of Object.entries(server.destinations)) {
+              if (!DESTINATION_NAME_RE.test(name)) dropped.push(`${where}: destination ${shown(name)} is not a valid name`);
+              else if (!isSnowflake(channel)) dropped.push(`${where}: destination ${shown(name)} -> ${shown(channel)} is not a channel id`);
+            }
+          }
         }
       }
     }

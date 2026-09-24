@@ -118,6 +118,50 @@ describe("createHostApi", () => {
   });
 });
 
+describe("createHostApi: announce's destination (#219)", () => {
+  const hostWith = (destinations: unknown) => {
+    const { log, calls } = makeLog();
+    const posted: [string, string | undefined][] = [];
+    const host = createHostApi({
+      entry: entry({ name: "feed", destinations: destinations as PluginIndexEntry["destinations"] }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async (message, destination) => void posted.push([message, destination]),
+    });
+    return { host, posted, calls };
+  };
+
+  test("a declared name is passed on, and no name is passed on as none", async () => {
+    const { host, posted, calls } = hostWith([{ name: "news", description: "d" }]);
+    await host.announce("a", "news");
+    await host.announce("b");
+    expect(posted).toEqual([["a", "news"], ["b", undefined]]);
+    expect(calls).toEqual([]);
+  });
+
+  test("an undeclared name posts without one, and is said once per name", async () => {
+    const { host, posted, calls } = hostWith([{ name: "news", description: "d" }]);
+    await host.announce("a", "alerts");
+    await host.announce("b", "alerts");
+    await host.announce("c", 7 as unknown as string);
+    expect(posted).toEqual([["a", undefined], ["b", undefined], ["c", undefined]]);
+    expect(calls.map((c) => c.message)).toEqual([
+      '[feed] announce: destination "alerts" is not declared in this plugin\'s manifest; posting to its usual channels',
+      '[feed] announce: destination "7" is not declared in this plugin\'s manifest; posting to its usual channels',
+    ]);
+  });
+
+  test("a manifest with no, or malformed, destinations declares none", async () => {
+    for (const destinations of [undefined, "news", [null, 5]]) {
+      const { host, posted } = hostWith(destinations);
+      await host.announce("a", "news");
+      expect(posted).toEqual([["a", undefined]]);
+    }
+  });
+});
+
 describe("loadPlugins", () => {
   const makeHost = (e: PluginIndexEntry): HostApi =>
     createHostApi({ entry: e, processEnv: {}, dataDir: "/d", baseLog: makeLog().log, storage: realStorage, announce: async () => {} });

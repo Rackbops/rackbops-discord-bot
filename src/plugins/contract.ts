@@ -44,6 +44,16 @@ export interface PluginEnvKey {
   description: string;
 }
 
+/**
+ * One named place a plugin can post (#219), declared in its manifest so the operator can map it to a
+ * channel per server in the admin panel. `name` is `^[a-z][a-z0-9-]*$` — what the plugin passes as
+ * `HostApi.announce`'s `destination`; `description` is what the panel shows beside the picker.
+ */
+export interface PluginDestination {
+  name: string;
+  description: string;
+}
+
 /** One published version, extracted from the plugin's CHANGELOG.md — what the update notification shows. */
 export interface PluginRelease {
   version: string;
@@ -73,6 +83,8 @@ export interface PluginIndexEntry {
   /** Bare slash-command names the bundle contributes; uniqueness (core + every enabled plugin) is checked BEFORE any code loads. */
   commands: string[];
   env: PluginEnvKey[];
+  /** Named places this plugin can post besides its main one (#219) — see `HostApi.announce`. Absent = none. */
+  destinations?: PluginDestination[];
   /** jsDelivr-npm URL of the plugin's admin bundle (`dist/admin.js`), DERIVED by the plugins repo's
    *  `generate-index` when a plugin advertises admin support (by declaring `botPlugin.adminApiVersion`).
    *  Absent = the plugin contributes no admin UI. The admin panel fetches it and serves it same-origin
@@ -205,8 +217,14 @@ export interface HostApi {
    *  posted through its registered webhook when it has a working one, and as the bot otherwise (a webhook that times out may
    *  already have delivered, so the fallback can put a second copy there); mention-safe defaults apply on both paths.
    *  Rejects only when EVERY target failed, with the first error, so a plugin that retries after a rejection does not
-   *  repost to the channels that did get the message. */
-  announce(message: string): Promise<void>;
+   *  repost to the channels that did get the message.
+   *
+   *  `destination` (#219) names one of the `destinations` the plugin's manifest declares — a second kind of post that
+   *  wants its own channel. The operator maps each name to a channel per server in the panel; the message goes to every
+   *  channel mapped for that name. Where the name is mapped nowhere, it posts exactly as it would without one, so a
+   *  destination is an option the operator can take up, never something that stops a post. A name the manifest does not
+   *  declare is logged and treated the same way. */
+  announce(message: string, destination?: string): Promise<void>;
 }
 
 export interface PluginCommand {

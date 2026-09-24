@@ -62,11 +62,24 @@ function compareIds(a: string, b: string): number {
 /**
  * Channels a plugin posts to: every `postTo` it has, de-duplicated, ordered by guild id; none
  * (unplaced, placed nowhere, or placed without a `postTo`) -> `[defaultChannelId]`.
+ *
+ * With a `destination` (#219): every channel that name is mapped to, the same way; a name mapped in no
+ * server falls through to the targets above, so an unmapped destination posts where the plugin posts
+ * anyway. Whether the plugin declares the name is the caller's check (`createHostApi`).
  */
-export function announceTargets(routing: RoutingFile, plugin: string, defaultChannelId: string): string[] {
+export function announceTargets(routing: RoutingFile, plugin: string, defaultChannelId: string, destination?: string): string[] {
   const servers = entryOf(routing, plugin)?.servers ?? {};
+  const guildIds = Object.keys(servers).sort(compareIds);
+  if (destination !== undefined) {
+    const named = new Set<string>();
+    for (const guildId of guildIds) {
+      const map = servers[guildId]?.destinations;
+      if (map !== undefined && Object.hasOwn(map, destination)) named.add(map[destination]!);
+    }
+    if (named.size > 0) return [...named];
+  }
   const targets = new Set<string>();
-  for (const guildId of Object.keys(servers).sort(compareIds)) {
+  for (const guildId of guildIds) {
     const postTo = servers[guildId]?.postTo;
     if (postTo !== undefined) targets.add(postTo);
   }
@@ -143,9 +156,10 @@ type Validation = { ok: true; value: PluginRouting } | { ok: false; reason: stri
 /**
  * One plugin's routing as the panel sent it, checked against what the bot can see. Returns a clean
  * value (unknown keys stripped) or the FIRST problem, worded for the panel. `servers: {}` is valid:
- * it places the plugin nowhere.
+ * it places the plugin nowhere. `declared` (#219) is the destination names the plugin's manifest
+ * declares; a server's `destinations` may map only those, each to a channel in that server.
  */
-export function validatePluginRouting(input: unknown, discovery: DiscoveryFile): Validation {
+export function validatePluginRouting(input: unknown, discovery: DiscoveryFile, declared: readonly string[] = []): Validation {
   const fail = (reason: string): Validation => ({ ok: false, reason });
   if (!isRecord(input) || !isRecord(input.servers)) return fail("routing must be an object with a servers object");
 
@@ -180,6 +194,18 @@ export function validatePluginRouting(input: unknown, discovery: DiscoveryFile):
         return fail(`postTo ${shown(raw.postTo)} is not in server ${guildId}`);
       }
       clean.postTo = raw.postTo;
+    }
+    if (raw.destinations !== undefined) {
+      if (!isRecord(raw.destinations)) return fail(`destinations for server ${guildId} must be an object`);
+      const mapped: Record<string, string> = {};
+      for (const [name, channel] of Object.entries(raw.destinations)) {
+        if (!declared.includes(name)) return fail(`destination ${shown(name)} is not one this plugin declares`);
+        if (typeof channel !== "string" || !channels.has(channel)) {
+          return fail(`destination ${name}: channel ${shown(channel)} is not in server ${guildId}`);
+        }
+        mapped[name] = channel;
+      }
+      if (Object.keys(mapped).length > 0) clean.destinations = mapped;
     }
     servers[guildId] = clean;
   }

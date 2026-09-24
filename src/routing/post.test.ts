@@ -610,3 +610,24 @@ describe("the webhook url never appears", () => {
     expect(seen).not.toContain(TOKEN);
   });
 });
+
+describe("postForPlugin with a named destination (#219)", () => {
+  const CHAN_NEWS = "444444444444444009";
+  const routingWithNews = (): RoutingFile => {
+    const r = routingFor({ both: true });
+    r.plugins.music!.servers[G2] = { commands: "all", postTo: CHAN_B, destinations: { news: CHAN_NEWS } };
+    return r;
+  };
+
+  test("a mapped name posts only to its channel", async () => {
+    const h = harness({ routing: routingWithNews() });
+    await postForPlugin("music", "hello", h.deps, "news");
+    expect(h.events).toEqual([`bot:${CHAN_NEWS}:hello`]);
+  });
+
+  test("an unmapped name posts where the plugin posts without one", async () => {
+    const h = harness({ routing: routingWithNews() });
+    await postForPlugin("music", "hello", h.deps, "digest");
+    expect(h.events).toEqual([`bot:${CHAN_A}:hello`, `bot:${CHAN_B}:hello`]);
+  });
+});
