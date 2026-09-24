@@ -490,30 +490,47 @@
   // `opts.keepEdits` (2026-09-21 patch to #244's plan, following #275): defaults to `!applyRereading` --
   // a re-read the Apply bar itself started (Discard, an apply outcome) is about to drop the edits it
   // replaces, so it must not try to keep them; every OTHER reload (an update button's success, Unlock)
-  // keeps them, captured from the live controls before the fetch and re-applied once the new baseline
-  // has rendered. A control that no longer exists after the reload is dropped silently.
+  // keeps them, re-applied once the new baseline has rendered. A control that no longer exists after
+  // the reload is dropped silently.
+  // #284: what is typed WHILE the fetch is in flight is kept on every reload, Discard's included, on the
+  // cards and in the Config editor alike -- the user typed it after the reload started, so it is not
+  // part of what a Discard drops. The controls are read twice, before the fetch and again once it has
+  // landed (just before the render replaces them): keepEdits keeps everything that differs from the OLD
+  // baseline at landing time (so an edit made before or during the fetch); otherwise only what changed
+  // between the two reads is kept. A Config field is kept by rendering it with the typed value
+  // (renderEnvFields' overrides), since it has no capture/reapply of its own.
+  // #282: the three GETs share one timeout, so a hung read can neither keep the Apply bar locked (it
+  // awaits this through rereadFromServer) nor hold this single-flight promise -- which every later
+  // reload, Unlock's included, would otherwise join -- until the server's own 90-120 s limits.
   let reloadConfigPromise = null;
+  const RELOAD_TIMEOUT_MS = 30000;
   async function reloadConfig(opts) {
     if (reloadConfigPromise) return reloadConfigPromise;
     const keepEdits = opts && opts.keepEdits !== undefined ? opts.keepEdits : !applyRereading;
     reloadConfigPromise = (async () => {
+      let cancelTimeout = () => {};
       try {
-        const captured = keepEdits
-          ? diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, captureCardControls())
-          : null;
+        const before = { cards: captureCardControls(), env: captureEnvFields() };
         await loadBranches();
+        const { signal, cancel } = timeoutSignal(RELOAD_TIMEOUT_MS);
+        cancelTimeout = cancel;
         const [plugins, env, schema] = await Promise.all([
-          api("/api/plugins").then((r) => r.json()),
-          api("/api/env").then((r) => r.json()),
-          api("/api/env-schema")
+          api("/api/plugins", { signal }).then((r) => r.json()),
+          api("/api/env", { signal }).then((r) => r.json()),
+          api("/api/env-schema", { signal })
             .then((r) => (r.ok ? r.json() : {}))
             .catch(() => ({})),
         ]);
+        const after = { cards: captureCardControls(), env: captureEnvFields() };
+        const typed = diffSnapshots(before, after);
+        const captured = keepEdits
+          ? diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, after.cards)
+          : typed.cards;
         pluginsData = plugins;
         loadedEnv = env;
         loadedSchema = schema && typeof schema === "object" ? schema : {};
         renderPlugins();
-        renderEnvFields();
+        renderEnvFields(typed.env);
         // #246: loadRouting() and reloadConfig() fire concurrently from showApp -- whichever finishes
         // LAST is the one whose renderServers() call actually has both routingData AND pluginsData
         // populated. Calling it only from loadRouting's own tail (as originally written) left the
@@ -526,13 +543,17 @@
         if (captured) reapplyCardEdits(captured);
       } catch (e) {
         if (e.message !== "unauthorized") {
-          const msg = "Error: " + e.message;
+          const msg =
+            e.name === "AbortError"
+              ? "Error: the server did not answer within " + RELOAD_TIMEOUT_MS / 1000 + " seconds. Reload the page to try again."
+              : "Error: " + e.message;
           const pl = document.getElementById("plugins-list");
           if (pl) pl.textContent = msg;
           const ef = document.getElementById("env-fields");
           if (ef) ef.textContent = msg;
         }
       } finally {
+        cancelTimeout();
         reloadConfigPromise = null;
         // The baseline moved (or the fetch failed): what is pending is read from the controls again.
         refreshApplyBar();
@@ -563,6 +584,13 @@
       if (!el.closest(".plug__admin")) secrets[el.dataset.secretKey] = el.value;
     }
     return { on, settings, secrets };
+  }
+  // #284: the Config editor's values, {KEY: value}, over collectPending's own selector. A chip editor's
+  // [data-key] is its hidden carrier, which holds the field's whole value.
+  function captureEnvFields() {
+    const env = {};
+    for (const el of document.querySelectorAll("#env-fields [data-key]")) env[el.dataset.key] = el.value;
+    return env;
   }
   function reapplyCardEdits(captured) {
     for (const el of document.querySelectorAll("#plugins-list input[type=checkbox][data-plugin]")) {
@@ -3484,7 +3512,10 @@
   // the schema says so (loadedSchema[key].source === "plugin") or the fetch that built loadedSchema is
   // degraded ({} on an old bot-ops.sh or a transient failure) and a plugin's OWN manifest still declares
   // it -- never appears in the Config editor too. #257's PLUGINS skip is unchanged.
-  function renderEnvFields() {
+  // `overrides` (#284), optional {KEY: value}: a key it holds is rendered with that value instead of the
+  // stored one -- reloadConfig passes what was typed while its fetch was in flight, so the new render
+  // keeps it (and the Apply bar then counts it as pending, against the new baseline).
+  function renderEnvFields(overrides) {
     const container = document.getElementById("env-fields");
     const pluginKeys = new Set();
     for (const p of (pluginsData && pluginsData.plugins) || []) {
@@ -3494,7 +3525,7 @@
     for (const key of Object.keys(loadedEnv)) {
       if (key === "PLUGINS") continue;
       if ((loadedSchema[key] && loadedSchema[key].source === "plugin") || pluginKeys.has(key)) continue;
-      const value = loadedEnv[key] ?? "";
+      const value = overrides && Object.prototype.hasOwnProperty.call(overrides, key) ? overrides[key] : loadedEnv[key] ?? "";
       // Orchestrator finding: capturing "was this a picker" from the CURRENT DOM (querySelectorAll,
       // right before clearing the container) broke the moment a FAILED reloadConfig ran in between two
       // renderEnvFields calls -- its catch writes plain error text into #env-fields (see reloadConfig's
@@ -3653,6 +3684,28 @@
       if (controls.secrets[key] !== "") secrets[key] = controls.secrets[key];
     }
     return { on, settings, secrets };
+  }
+  // #284: what changed between two reads of the controls -- `before` and `after` are each
+  // { cards: captureCardControls(), env: captureEnvFields() }. Returns { cards: {on, settings, secrets},
+  // env: {KEY: value} } with only the keys present in BOTH reads whose value differs, at its `after`
+  // value: what the user typed while a reload was in flight. A control that appeared or went away in
+  // between was not typed into, so it is not reported.
+  function diffSnapshots(before, after) {
+    const changed = (a, b) => {
+      const out = {};
+      for (const key of Object.keys(b)) {
+        if (Object.prototype.hasOwnProperty.call(a, key) && a[key] !== b[key]) out[key] = b[key];
+      }
+      return out;
+    };
+    return {
+      cards: {
+        on: changed(before.cards.on, after.cards.on),
+        settings: changed(before.cards.settings, after.cards.settings),
+        secrets: changed(before.cards.secrets, after.cards.secrets),
+      },
+      env: changed(before.env, after.env),
+    };
   }
   // A typed secret can't go through validateEnvChanges: it echoes the value it rejects in the message,
   // which is right for a plain setting and wrong for a secret. schema is GET /api/env-schema's object;
@@ -4390,8 +4443,8 @@
   // Promise.all (which rejects on the FIRST rejection, so the finally would run while the other list was still
   // loading), and each loader is started inside an async arrow, so one that throws synchronously becomes its own
   // rejection instead of skipping the other one. Focus follows the rule for buttons that become disabled (#257):
-  // if it is inside the bar (the Discard just pressed) it rests on the bar itself meanwhile, and the caller's
-  // recovery (settleFocus, focusIfInBar) runs when it ends. loadStatus() is not part of it: a success starts
+  // if it is inside the bar (the Discard just pressed) it rests on the bar itself meanwhile, and when it ends
+  // settleFocus runs here (#284) before the caller's own recovery (settleFocus, focusIfInBar). loadStatus() is not part of it: a success starts
   // that separately, un-awaited.
   async function rereadFromServer() {
     try {
@@ -4411,6 +4464,16 @@
     } finally {
       applyRereading = false;
       refreshApplyBar();
+      // #284: the landing can hide the bar focus rests on -- OK pressed during a failure's re-read moved
+      // it onto the bar, and once nothing is pending the bar goes, taking focus to <body>; the apply
+      // path's own focusIfInBar(OK) then targets a hidden button. settleFocus acts only when focus is on
+      // <body>, so a user who has moved elsewhere is not pulled back. Guarded like the try above: a throw
+      // here must not reach a caller that does not await.
+      try {
+        settleFocus();
+      } catch (e) {
+        console.error("re-reading the panel's state failed", e);
+      }
     }
   }
 

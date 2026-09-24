@@ -600,7 +600,7 @@ back as one of `env-set`'s own refusals above (`bot-ops: env-set: another bot-op
 running…`) — which keeps the user's edits exactly like any other `env-set` refusal, the right outcome
 for "try again." Any
 other failure **re-reads** the page's state from the bot, so only OK is left on the bar (nothing is
-pending after the re-read): a **failed recreate** (a 502 with a JSON body: `.env` was already rewritten,
+pending after the re-read, unless something was typed while it ran — that is kept): a **failed recreate** (a 502 with a JSON body: `.env` was already rewritten,
 so the bar shows the compose error and the backup path, issue #47), a **timeout** (504: the outcome is
 unknown), any status the page does not know, and a plain-text 502 with no such line — a `set -e` abort
 after the write, a kill during the recreate, a proxy's own 502, or a refusal before the write that has no
