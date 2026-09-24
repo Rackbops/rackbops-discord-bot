@@ -1,0 +1,22 @@
+{
+  "name": "Luma",
+  "status": "selected mascot direction",
+  "vectorTokens": {
+    "night": "#241b1a",
+    "lanternShadow": "#5b342a",
+    "glass": "#69382a",
+    "agedBrass": "#d79a50",
+    "brassHighlight": "#efc477",
+    "flame": "#f5a33c",
+    "flameLight": "#ffe3a0",
+    "chatBlurple": "#5865f2",
+    "chatWhite": "#ffffff",
+    "brassDark": "#a85f31",
+    "brassWarm": "#dc9b50",
+    "faceInk": "#653526",
+    "brassLight": "#e6ad62",
+    "baseDark": "#9b582f",
+    "smallFlame": "#ffcf70"
+  },
+  "note": "All colors used by the SVG sources; #ffffff is written as #fff in SVG. The painted PNG contains additional colors and shading."
+}
