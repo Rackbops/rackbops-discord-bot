@@ -1482,30 +1482,34 @@ export function createPluginIndexLister(deps: PluginIndexListerDeps): () => Prom
   };
 }
 
-/** One static file the panel page links to (a stylesheet today), held in memory and served as-is. */
+/** One static file the panel page links to, held in memory and served as-is. */
 export interface StaticAsset {
   body: string;
   contentType: string;
 }
 
-/** The panel's static files: request path -> file under `./public/`, both fixed here. This is the
+/** The panel's static files: request path -> file under `./public/`, fixed here. This is the
  *  whole allowlist -- `handleRequest` looks a request's path up in a Map built from it (see
- *  `HandlerConfig.assets`), so no request can name a file. A new stylesheet the page links must be
- *  added here or it 404s (a test walks every `<link rel="stylesheet">` in index.html against it). */
+ *  `HandlerConfig.assets`), so no request can name a file. Any new asset the page links must be
+ *  added here or it 404s (tests walk the page's stylesheet and icon links against it). */
 export const STATIC_ASSET_FILES: Readonly<Record<string, string>> = {
   "/rb-theme.css": "rb-theme.css",
   "/admin.css": "admin.css",
+  "/favicon.svg": "favicon.svg",
 };
 
 /** Reads every `STATIC_ASSET_FILES` entry through the injected `readText` (`file` is the name under
- *  `./public/`) into the Map `HandlerConfig.assets` takes, each served as `text/css`. Pulled out of
+ *  `./public/`) into the Map `HandlerConfig.assets` takes with its content type. Pulled out of
  *  the `import.meta.main` block, which the suite never runs, so the route -> file mapping and the
  *  content type are pinned by a test instead of only by eye. A file that can't be read rejects, so a
- *  missing stylesheet fails the boot loudly rather than 404ing on a live page. */
+ *  missing asset fails the boot loudly rather than 404ing on a live page. */
 export async function loadStaticAssets(readText: (file: string) => Promise<string>): Promise<Map<string, StaticAsset>> {
   const assets = new Map<string, StaticAsset>();
   for (const [route, file] of Object.entries(STATIC_ASSET_FILES)) {
-    assets.set(route, { body: await readText(file), contentType: "text/css; charset=utf-8" });
+    assets.set(route, {
+      body: await readText(file),
+      contentType: file.endsWith(".svg") ? "image/svg+xml; charset=utf-8" : "text/css; charset=utf-8",
+    });
   }
   return assets;
 }
@@ -1905,7 +1909,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
     return new Response(config.indexHtml, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
 
-  // The page's stylesheets, public at this layer exactly like the page itself. An exact-match lookup
+  // The page's static assets, public at this layer exactly like the page itself. An exact-match lookup
   // in a fixed Map: the request path is only ever a key, never a filesystem path, so a
   // percent-encoded spelling (/%72b-theme.css) or an Object.prototype name (/constructor) simply
   // misses and falls through to the 404 below. no-cache = revalidate each load, so a redeploy is
@@ -2149,8 +2153,8 @@ if (import.meta.main) {
     await Bun.file(new URL("./public/index.html", import.meta.url)).text(),
     instanceName,
   );
-  // The stylesheets the page links, read once like index.html. A missing file throws here, at boot,
-  // rather than 404ing on a live page -- the image's `COPY public ./public` ships both.
+  // The static assets the page links, read once like index.html. A missing file throws here, at boot,
+  // rather than 404ing on a live page -- the image's `COPY public ./public` ships them.
   const assets = await loadStaticAssets((file) => Bun.file(new URL(`./public/${file}`, import.meta.url)).text());
   console.log(`[admin] serving admin panel for instance "${instanceName}"`);
 
