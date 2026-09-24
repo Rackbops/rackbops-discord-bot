@@ -4563,7 +4563,7 @@
   // not standing, or with no such control, it is dropped -- so the bar never names a field that is not marked.
   function carryRefusal(refusal, getById, current) {
     const dropped = { control: null, message: "", id: null, value: null };
-    if (current !== refusal.value) return dropped;
+    if (current === undefined || current !== refusal.value) return dropped; // no value is never a refusal that stands
     const live = refusal.control && refusal.control.isConnected !== false ? refusal.control : getById(refusal.id);
     if (!live) return dropped;
     live.setAttribute("aria-invalid", "true");

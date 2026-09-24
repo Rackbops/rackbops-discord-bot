@@ -12269,6 +12269,8 @@ describe("APPLY_INVALID_CARRY (#308): a refusal and a field's marks survive a re
   test("no control holds it any more (its card or key is gone, a secret put back to Keep): dropped", () => {
     expect(carryRefusal({ control: el("set-GONE", { isConnected: false }), message: "x", id: "set-GONE", value: "abc" }, () => null, "abc")).toEqual(DROPPED);
     expect(carryRefusal({ control: el("secret-TOKEN", { isConnected: false }), message: "x", id: "secret-TOKEN", value: "tok" }, () => null, undefined)).toEqual(DROPPED);
+    // A refusal recorded with no value (its key in neither list) can never stand, even when "undefined === undefined".
+    expect(carryRefusal({ control: el("env-X", { isConnected: true }), message: "x", id: "env-X", value: undefined }, () => null, undefined)).toEqual(DROPPED);
   });
 
   test("carryFieldMarks copies required, the description and a refusal's marking -- and nothing that was not there", () => {
