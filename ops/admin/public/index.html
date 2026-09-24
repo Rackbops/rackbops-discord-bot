@@ -499,8 +499,8 @@
   // before the render replaces them), and a change counts only on a control that holds the value the USER
   // last typed there (onControlEdited's record, lastTyped) -- a value a render wrote in between (an update
   // button's reload landing during an Apply POST) is not typing (round 2). On the CARDS, keepEdits keeps everything that differs from the OLD
-  // baseline at landing time (an edit made before or during the fetch); without it only what changed
-  // between the two reads is kept. A CONFIG field is only ever kept for what changed between the two reads
+  // baseline at landing time (an edit made before or during the fetch); without it only what was typed
+  // between the two reads is kept. A CONFIG field is only ever kept for what was typed between the two reads
   // (keepEdits or not -- it has no capture/reapply of its own), by rendering it with the typed value
   // (renderEnvFields' overrides). A chip field counts its committed chips only: text still in its typing
   // input is not part of the field's value and is lost to the render, as it always was.

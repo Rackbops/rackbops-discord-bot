@@ -1519,7 +1519,9 @@ _Avoid_: server list, guild cache
   #282) replaces both lists with its error, typed edits included; a chip field counts its committed chips,
   not text still in its typing input. `applyPending` reads the controls as its POST sends them and hands
   that to the re-read as `{ since }` (through `rereadFromServer(opts)` and the `loadPlugins`/`loadEnv`
-  aliases, which forward it), so what is typed during the POST itself is kept too. A secret input that
+  aliases, which forward it), so what is typed during the POST itself is kept too — unless another reload (an
+  update button's, Unlock's) lands during the POST: that one replaces a Config field typed before it started,
+  like any reload, and the re-read then finds the field no longer holding what was typed. A secret input that
   appears between the two reads (Replace pressed mid-reload) counts as typed when non-empty — it has no
   stored value. The control that had focus gets it back on its rebuilt twin (same id) after the render.
   **A reload that drops edits never joins one that keeps them (#284 round 1).** `reloadConfig` is
