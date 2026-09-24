@@ -1034,7 +1034,6 @@
       empty.className = "adm-note";
       empty.textContent = "No plugins available or installed.";
       container.appendChild(empty);
-      reattachApplyInvalid(); // #308
       return;
     }
     // A failed state read (stateError) means the current PLUGINS baseline is untrustworthy: every switch
@@ -1053,7 +1052,6 @@
     note.style.marginTop = "8px";
     note.textContent = "Switches and settings apply when the bot restarts, through the bar below. Where a plugin lives applies at once.";
     container.appendChild(note);
-    reattachApplyInvalid(); // #308: a refused plugin setting is marked again on its rebuilt twin
   }
 
   // A card's "Version X" / "not installed" line, browser-only text (no acceptance bullet cites its exact
@@ -1487,9 +1485,12 @@
     if (ids.length > 0) el.setAttribute("aria-describedby", ids.join(" "));
     else el.removeAttribute("aria-describedby");
   }
-  // A row's channel-list refusal (#309): shown first and then filled, so the alert role announces the new
-  // text; the fieldset is marked invalid and described by it. Cleared, it is emptied and unpointed.
+  // A row's channel-list refusal (#309): the error (role=alert) is shown and filled, and the fieldset is
+  // marked invalid and described by it. An error already showing the same text is left untouched: rewriting
+  // it would put a new text node in the alert and announce it again, on every later send. Cleared, it is
+  // emptied and unpointed.
   function showChannelError(refs, message) {
+    if (!refs.channelErr.hidden && refs.channelErr.textContent === message) return;
     refs.channelErr.hidden = false;
     refs.channelErr.textContent = message;
     refs.fieldset.setAttribute("aria-invalid", "true");
@@ -1535,7 +1536,8 @@
         const sel = rowSelection(st, row.id);
         if (sel.on && sel.scope === "chosen" && sel.channels.length === 0) {
           const refs = rowEls && rowEls.rows.get(row.id);
-          if (refs) showChannelError(refs, planned.error); // #309
+          // #309: each row's own message, naming its own server (routingSetBody's names only the first).
+          if (refs) showChannelError(refs, "Pick at least one channel for " + row.name + ".");
         }
       }
       return "error";
@@ -3670,7 +3672,6 @@
       }
       container.appendChild(control);
     }
-    reattachApplyInvalid(); // #308: a refused Config field is marked again on its rebuilt twin
   }
 
   // ENV_SCHEMA:begin
@@ -4398,6 +4399,9 @@
   let applyNoop = false; // phase "done": bot-ops.sh answered "no changes" (nothing was restarted)
   let applyViolation = ""; // a validation refusal being shown, until the next edit
   let applyInvalid = null; // the control that refusal marked aria-invalid
+  // #308: what that refusal was about -- the control's id, the key, and the value that was refused -- so a
+  // rebuild can tell whether the refusal still stands (see carryRefusal). null for a refusal with no field.
+  let applyRefused = null;
   // #275: true while the page re-reads the plugins and the config from the server (rereadFromServer). The
   // controls keep the user's edits until those reads land, so an Apply pressed meanwhile would send edits the
   // page is about to drop: after a Discard (it would send the very edits just discarded) and after a
@@ -4506,6 +4510,7 @@
 
   function refreshApplyBar() {
     const pending = collectPending();
+    reconcileRefusal(pending); // #308: before the bar is written, so it never shows a refusal that no longer stands
     writeApplyBar(planApply(pending));
     refreshCardHeaders(pending);
   }
@@ -4542,22 +4547,27 @@
   function clearApplyInvalid() {
     if (applyInvalid) applyInvalid.removeAttribute("aria-invalid");
     applyInvalid = null;
+    applyRefused = null;
   }
 
   // APPLY_INVALID_CARRY:begin
-  // #308: a refusal points at one control, and renderPlugins / renderEnvFields rebuild every control from
-  // scratch -- a keep-edits reload (an update button, Unlock) used to leave the bar's refusal behind with
-  // the field it names no longer marked. Pure over what it is handed, so it is lifted and tested.
-  // `refusal` is { control, message }: the control the refusal marked (or null) and the bar's text. A
-  // control still in the page is left alone. One the rebuild replaced is looked up by its id (the rebuilt
-  // twin has the same one) and marked again; when there is no twin (its card or key is gone), the refusal
-  // is dropped with it, so the bar never names a field that is not marked.
-  function carryRefusal(refusal, getById) {
-    if (!refusal.control || refusal.control.isConnected !== false) return refusal;
-    const twin = refusal.control.id ? getById(refusal.control.id) : null;
-    if (!twin) return { control: null, message: "" };
-    twin.setAttribute("aria-invalid", "true");
-    return { control: twin, message: refusal.message };
+  // #308: a refusal points at one control, and a reload (an update button, Unlock, a card toggle) rebuilds
+  // every control -- the bar used to keep the refusal while the field it names lost its aria-invalid. Run
+  // once the rebuild has settled (from refreshApplyBar, after reapplyCardEdits), never from inside a render.
+  // Pure over what it is handed, so it is lifted and tested. `refusal` is { control, message, id, value }:
+  // the control the refusal marked, the bar's text, that control's id and the value that was refused;
+  // `current` is what the field holds now. The refusal stands only while the field still holds the refused
+  // value: a keep-edits reload keeps a Config field's value only if it was typed DURING the reload (#284),
+  // so a refused value typed before it is replaced by the stored one, and a valid field must not announce
+  // invalid. Standing, it is marked on the control that holds it now (the rebuilt twin has the same id);
+  // not standing, or with no such control, it is dropped -- so the bar never names a field that is not marked.
+  function carryRefusal(refusal, getById, current) {
+    const dropped = { control: null, message: "", id: null, value: null };
+    if (current !== refusal.value) return dropped;
+    const live = refusal.control && refusal.control.isConnected !== false ? refusal.control : getById(refusal.id);
+    if (!live) return dropped;
+    live.setAttribute("aria-invalid", "true");
+    return { control: live, message: refusal.message, id: refusal.id, value: refusal.value };
   }
   // #308: a control replaced in place (refreshEnvPickers upgrading a plain input to a picker) keeps what
   // makes it announce correctly: required, its help/error description, and an active refusal's marking.
@@ -4570,13 +4580,26 @@
   }
   // APPLY_INVALID_CARRY:end
 
-  // The page half of carryRefusal: run after every render that may have replaced the refused control.
-  function reattachApplyInvalid() {
-    const next = carryRefusal({ control: applyInvalid, message: applyViolation }, (id) => document.getElementById(id));
-    const dropped = applyViolation !== "" && next.message === "";
+  // The page half of carryRefusal, run by refreshApplyBar before it plans -- so after every rebuild path
+  // (reloadConfig's finally, a card toggle, a secret's Replace/Keep), each of which puts card edits back
+  // first. `pending` is collectPending()'s answer, which holds what every field says now.
+  function reconcileRefusal(pending) {
+    if (!applyViolation || !applyRefused) return;
+    const key = applyRefused.key;
+    // What the field holds now -- and only while it is still a pending change: a field back at its stored value
+    // (the saved value moved to match it) is not a change the bar can refuse, so it counts as not holding it.
+    const isField = Object.prototype.hasOwnProperty.call(pending.fields, key);
+    const value = isField ? pending.fields[key] : pending.secrets[key];
+    const stillPending = isField ? value !== (pending.loadedEnv[key] ?? "") : value !== undefined;
+    const current = stillPending ? value : undefined;
+    const refusal = { control: applyInvalid, message: applyViolation, id: applyRefused.id, value: applyRefused.value };
+    const next = carryRefusal(refusal, (id) => document.getElementById(id), current);
+    if (next.message === "") {
+      clearApplyInvalid();
+      applyViolation = "";
+      return;
+    }
     applyInvalid = next.control;
-    applyViolation = next.message;
-    if (dropped) refreshApplyBar();
   }
 
   // The ONE place the bar re-reads the server (#275): Discard, a re-baselining failure and a success all call it,
@@ -4682,6 +4705,7 @@
   // exists; re-rendering would only replace it out from under the focus() call below), so the id is
   // always there to find AND visible.
   function refuseApply(bad) {
+    clearApplyInvalid(); // #308: a new refusal replaces the last one, marking and all
     applyViolation = bad.message;
     const s = loadedSchema[bad.key];
     const onPluginTab = bad.key === "PLUGINS" || (s && s.source === "plugin");
@@ -4702,6 +4726,10 @@
     if (control) {
       control.setAttribute("aria-invalid", "true");
       applyInvalid = control;
+      // #308: what was refused, so a later rebuild can tell whether the refusal still stands.
+      const pending = collectPending();
+      const refusedValue = Object.prototype.hasOwnProperty.call(pending.fields, bad.key) ? pending.fields[bad.key] : pending.secrets[bad.key];
+      applyRefused = { id: controlId, key: bad.key, value: refusedValue };
       control.focus();
     }
     refreshApplyBar();

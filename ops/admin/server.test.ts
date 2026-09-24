@@ -153,12 +153,11 @@ function tamperSignature(jwt: string): string {
 }
 
 // #308: what the Config-field harnesses need besides the fields' own source -- the real APPLY_INVALID_CARRY
-// block (carryFieldMarks is what refreshEnvPickers calls), the refusal's `applyInvalid` slot, and a no-op in
-// place of reattachApplyInvalid, the page glue that renderEnvFields ends with (tested on its own below).
+// block (carryFieldMarks is what refreshEnvPickers calls) and the refusal's `applyInvalid` slot.
 function carryPrelude(src: string): string {
   const block = src.match(/\/\/ APPLY_INVALID_CARRY:begin\n([\s\S]*?)\n\s*\/\/ APPLY_INVALID_CARRY:end/)?.[1];
   if (!block) throw new Error("APPLY_INVALID_CARRY block not found in index.html");
-  return `let applyInvalid = null;\nfunction reattachApplyInvalid() {}\n${block}`;
+  return `let applyInvalid = null;\n${block}`;
 }
 
 describe("tokensMatch", () => {
@@ -7931,6 +7930,8 @@ function runApply(spec: ApplySpec) {
     boxes,
     /** The control the page marks / focuses for `key` (a chip editor's typing input, else the field itself). */
     control: (key: string) => byId.get(`env-${key}`)!,
+    /** #308: any control by its id -- a card's setting is `set-KEY`, a typed secret `secret-KEY`. */
+    byId: (id: string) => byId.get(id)!,
     edit(key: string, value: string) {
       const c = controls.find((x) => x.dataset.key === key)!;
       c.value = value;
@@ -10997,13 +10998,14 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     order.length = 0;
     await h.run.sendRouting("music");
     expect(channelErr.hidden).toBe(false);
-    expect(text).toBeTruthy();
-    expect(order[0]).toBe("text while hidden=false"); // shown first, then filled: the alert announces the text
+    expect(text).toMatch(/^Pick at least one channel for .+\.$/); // this row's own server
     expect(fieldset.attrs!.get("aria-invalid")).toBe("true");
     expect(fieldset.attrs!.get("aria-describedby")).toBe("route-music-100-channels-help route-music-100-channels-error");
 
-    // A second refusal does not add the error's id twice.
+    // A second refusal neither rewrites the same text (which would announce it again) nor adds the id twice.
+    order.length = 0;
     await h.run.sendRouting("music");
+    expect(order).toEqual([]);
     expect(fieldset.attrs!.get("aria-describedby")).toBe("route-music-100-channels-help route-music-100-channels-error");
 
     h.run.onRouteChange("music", "100", "channel", { id: "10", checked: true }); // the row is fixed
@@ -12229,7 +12231,7 @@ describe("appendRetryControls (#246, mini-harness)", () => {
 
 describe("APPLY_INVALID_CARRY (#308): a refusal and a field's marks survive a rebuild", () => {
   const { carryRefusal, carryFieldMarks } = new Function(`"use strict";\n${applyBlock("APPLY_INVALID_CARRY")}\nreturn { carryRefusal, carryFieldMarks };`)() as {
-    carryRefusal: (r: { control: unknown; message: string }, getById: (id: string) => unknown) => { control: unknown; message: string };
+    carryRefusal: (r: { control: unknown; message: string; id: string | null; value: unknown }, getById: (id: string) => unknown, current: unknown) => { control: unknown; message: string };
     carryFieldMarks: (from: unknown, to: unknown) => void;
   };
   type El = { id: string; isConnected?: boolean; required?: boolean; attrs: Map<string, string>; setAttribute: (n: string, v: string) => void; getAttribute: (n: string) => string | null };
@@ -12237,28 +12239,36 @@ describe("APPLY_INVALID_CARRY (#308): a refusal and a field's marks survive a re
     const attrs = new Map<string, string>();
     return { id, attrs, setAttribute: (n, v) => void attrs.set(n, v), getAttribute: (n) => attrs.get(n) ?? null, ...over };
   };
+  const DROPPED = { control: null, message: "", id: null, value: null };
 
-  test("a refused control still in the page is left as it is", () => {
+  test("the field still holds the refused value and its control is still in the page: kept, and marked", () => {
     const control = el("env-FOO", { isConnected: true });
-    const refusal = { control, message: "FOO is required." };
-    expect(carryRefusal(refusal, () => { throw new Error("not looked up"); })).toBe(refusal);
+    const next = carryRefusal({ control, message: "FOO is bad.", id: "env-FOO", value: "abc" }, () => { throw new Error("not looked up"); }, "abc");
+    expect(next).toMatchObject({ control, message: "FOO is bad." });
+    expect(control.attrs.get("aria-invalid")).toBe("true");
   });
 
-  test("a replaced control's rebuilt twin (same id) is marked, and the refusal moves to it", () => {
-    const old = el("set-FOO", { isConnected: false });
+  test("the control was rebuilt but still holds the refused value: the twin (same id) is marked and the refusal moves to it", () => {
     const twin = el("set-FOO", { isConnected: true });
-    const next = carryRefusal({ control: old, message: "FOO is required." }, (id) => (id === "set-FOO" ? twin : null));
-    expect(next).toEqual({ control: twin, message: "FOO is required." });
+    const next = carryRefusal({ control: el("set-FOO", { isConnected: false }), message: "FOO is bad.", id: "set-FOO", value: "abc" }, (id) => (id === "set-FOO" ? twin : null), "abc");
+    expect(next).toMatchObject({ control: twin, message: "FOO is bad." });
     expect(twin.attrs.get("aria-invalid")).toBe("true");
   });
 
-  test("with no twin the refusal is dropped too, so the bar never names a field that is not marked", () => {
-    expect(carryRefusal({ control: el("set-GONE", { isConnected: false }), message: "GONE is required." }, () => null)).toEqual({ control: null, message: "" });
+  test("the rebuild put a different value back (a keep-edits reload restores a Config field's stored one): dropped, nothing marked", () => {
+    const twin = el("env-ANNOUNCE_CHANNEL_ID", { isConnected: true });
+    const next = carryRefusal(
+      { control: el("env-ANNOUNCE_CHANNEL_ID", { isConnected: false }), message: 'ANNOUNCE_CHANNEL_ID: "abc" is bad.', id: "env-ANNOUNCE_CHANNEL_ID", value: "abc" },
+      () => twin,
+      "11111",
+    );
+    expect(next).toEqual(DROPPED);
+    expect(twin.attrs.has("aria-invalid")).toBe(false);
   });
 
-  test("the clean path -- no refusal at all -- touches nothing and never throws", () => {
-    const refusal = { control: null, message: "" };
-    expect(carryRefusal(refusal, () => { throw new Error("not looked up"); })).toBe(refusal);
+  test("no control holds it any more (its card or key is gone, a secret put back to Keep): dropped", () => {
+    expect(carryRefusal({ control: el("set-GONE", { isConnected: false }), message: "x", id: "set-GONE", value: "abc" }, () => null, "abc")).toEqual(DROPPED);
+    expect(carryRefusal({ control: el("secret-TOKEN", { isConnected: false }), message: "x", id: "secret-TOKEN", value: "tok" }, () => null, undefined)).toEqual(DROPPED);
   });
 
   test("carryFieldMarks copies required, the description and a refusal's marking -- and nothing that was not there", () => {
@@ -12276,44 +12286,63 @@ describe("APPLY_INVALID_CARRY (#308): a refusal and a field's marks survive a re
   });
 });
 
-describe("reattachApplyInvalid (#308): the page glue after every render", () => {
-  const src = applyIndexSrc.slice(applyIndexSrc.indexOf("function reattachApplyInvalid("), applyIndexSrc.indexOf("\n  }\n", applyIndexSrc.indexOf("function reattachApplyInvalid(")) + 4);
-  const run = (control: unknown, message: string, twins: Record<string, unknown>) => {
-    let refreshes = 0;
-    const fn = new Function(
-      "document", "refreshApplyBar", "initial",
-      `"use strict";\nlet applyInvalid = initial.control;\nlet applyViolation = initial.message;\n${applyBlock("APPLY_INVALID_CARRY")}\n${src}\n` +
-        "reattachApplyInvalid();\nreturn { applyInvalid, applyViolation };",
-    );
-    const out = fn({ getElementById: (id: string) => twins[id] ?? null }, () => { refreshes += 1; }, { control, message }) as { applyInvalid: unknown; applyViolation: string };
-    return { ...out, refreshes };
-  };
-  const el = (id: string, isConnected: boolean) => {
-    const attrs = new Map<string, string>();
-    return { id, isConnected, attrs, setAttribute: (n: string, v: string) => void attrs.set(n, v), getAttribute: (n: string) => attrs.get(n) ?? null };
-  };
+describe("a refusal across the real reloadConfig (#308)", () => {
+  const nextTask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-  test("the slice is the whole function", () => {
-    expect(src.startsWith("function reattachApplyInvalid(")).toBe(true);
-    expect(src.trimEnd().endsWith("}")).toBe(true);
+  test("a keep-edits reload that puts the stored value back drops the refusal: the field is not marked and the bar stops quoting it", async () => {
+    // The reviewer's scenario: a refused Config value typed before the reload, then an update button's keep-edits
+    // reload, which keeps only what was typed DURING it (#284) and so renders the stored value back.
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" }, realReload: {} });
+    await page.run.applyPending();
+    const control = page.control("ANNOUNCE_CHANNEL_ID");
+    expect(page.view().hint).toBe("ANNOUNCE_CHANNEL_ID is required and cannot be blank.");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    await page.run.loadPlugins!(); // keep-edits: the render puts ANNOUNCE_CHANNEL_ID's stored "11111" back
+    await nextTask();
+    expect(control.value).toBe("11111");
+    expect(control.attrs.has("aria-invalid")).toBe(false);
+    expect(page.view().hint).not.toContain("ANNOUNCE_CHANNEL_ID");
+    expect(page.view().tone).toBe("");
   });
 
-  test("with a refusal: the rebuilt field is marked again and the bar keeps its message, with no extra refresh", () => {
-    const twin = el("env-FOO", true);
-    const out = run(el("env-FOO", false), "FOO is required.", { "env-FOO": twin });
-    expect(out.applyInvalid).toBe(twin);
-    expect(out.applyViolation).toBe("FOO is required.");
-    expect(twin.attrs.get("aria-invalid")).toBe("true");
-    expect(out.refreshes).toBe(0);
+  test("a refused plugin setting a keep-edits reload keeps stands: re-marked though the rebuild dropped the mark, and the bar still says it", async () => {
+    // A card's setting survives a keep-edits reload (reloadConfig captures and reapplies card edits), unlike a Config field.
+    const env = { ...APPLY_ENV, MUSIC_PORT: "8790" };
+    const page = runApply({
+      loadedEnv: env,
+      settings: { MUSIC_PORT: "" },
+      schema: { ...APPLY_SCHEMA, MUSIC_PORT: { pattern: "^[0-9]+$", required: true, source: "plugin" } },
+      realReload: {},
+    });
+    await page.run.applyPending();
+    const control = page.byId("set-MUSIC_PORT");
+    const refusal = page.view().hint;
+    expect(refusal).toContain("MUSIC_PORT");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    control.removeAttribute("aria-invalid"); // what a real rebuild does to the control it replaces
+    await page.run.loadPlugins!();
+    await nextTask();
+    expect(control.value).toBe("");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    expect(page.view().hint).toBe(refusal);
   });
 
-  test("with a refusal whose field is gone: both are dropped and the bar is refreshed, so it stops naming it", () => {
-    const out = run(el("set-GONE", false), "GONE is required.", {});
-    expect(out).toEqual({ applyInvalid: null, applyViolation: "", refreshes: 1 });
+  test("a refused field whose saved value moved to match it is no longer a change: dropped, not left marked under a hidden bar", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" }, realReload: { env: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "" } } });
+    await page.run.applyPending();
+    const control = page.control("ANNOUNCE_CHANNEL_ID");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    await page.run.loadPlugins!(); // the saved value is now blank too: nothing is pending
+    await nextTask();
+    expect(page.view().hidden).toBe(true);
+    expect(control.attrs.has("aria-invalid")).toBe(false);
   });
 
-  test("with no refusal (a clean reload): nothing changes and nothing throws", () => {
-    expect(run(null, "", {})).toEqual({ applyInvalid: null, applyViolation: "", refreshes: 0 });
+  test("a clean reload (no refusal) marks nothing and never throws", async () => {
+    const page = runApply({ loadedEnv: APPLY_ENV, fields: APPLY_ENV, realReload: {} });
+    await page.run.loadPlugins!();
+    await nextTask();
+    for (const c of page.controls) expect(c.attrs.has("aria-invalid")).toBe(false);
   });
 });
 
@@ -12353,12 +12382,17 @@ describe("#308/#309 wiring: source pins", () => {
     return applyIndexSrc.slice(start, applyIndexSrc.indexOf("\n  }\n", start));
   };
 
-  test("renderPlugins re-marks a refusal on both of its exits, and renderEnvFields at its end", () => {
-    const plugins = fnBody("renderPlugins");
-    expect((plugins.match(/reattachApplyInvalid\(\);/g) ?? []).length).toBe(2);
-    expect(plugins).toMatch(/reattachApplyInvalid\(\);[^\n]*\n\s*return;/); // the empty-list exit
-    expect(plugins.trimEnd()).toMatch(/reattachApplyInvalid\(\);[^\n]*$/); // the normal exit
-    expect(fnBody("renderEnvFields").trimEnd()).toMatch(/reattachApplyInvalid\(\);[^\n]*$/);
+  test("the refusal is reconciled in refreshApplyBar, before the bar is written -- never inside a render", () => {
+    const bar = fnBody("refreshApplyBar");
+    expect(bar).toMatch(/reconcileRefusal\(pending\);/);
+    expect(bar.indexOf("reconcileRefusal(pending)")).toBeLessThan(bar.indexOf("writeApplyBar("));
+    for (const name of ["renderPlugins", "renderEnvFields"]) expect(fnBody(name)).not.toMatch(/reconcileRefusal|carryRefusal/);
+  });
+
+  test("refuseApply records what it refused, and clearApplyInvalid forgets it", () => {
+    expect(fnBody("refuseApply")).toMatch(/applyRefused = \{ id: controlId, key: bad\.key, value: refusedValue \};/);
+    expect(fnBody("refuseApply")).toMatch(/^function refuseApply\(bad\) \{\n\s*clearApplyInvalid\(\);/);
+    expect(fnBody("clearApplyInvalid")).toMatch(/applyRefused = null;/);
   });
 
   test("refreshEnvPickers carries the old field's marks and moves an active refusal to the picker", () => {
@@ -12371,7 +12405,7 @@ describe("#308/#309 wiring: source pins", () => {
   test("the channel error has a stable id and role=alert, and both sendRouting and onRouteChange go through the helpers", () => {
     expect(applyIndexSrc).toMatch(/channelErr\.id = "route-" \+ plugin \+ "-" \+ row\.id \+ "-channels-error";/);
     expect(applyIndexSrc).toMatch(/channelErr\.setAttribute\("role", "alert"\);/);
-    expect(fnBody("sendRouting")).toMatch(/showChannelError\(refs, planned\.error\)/);
+    expect(fnBody("sendRouting")).toMatch(/showChannelError\(refs, "Pick at least one channel for " \+ row\.name \+ "\."\)/);
     expect(fnBody("onRouteChange")).toMatch(/clearChannelError\(refs\)/);
     expect(applyIndexSrc).not.toMatch(/refs\.channelErr\.hidden = (true|false);\s*\n\s*}/); // no bare show/hide left outside the helpers
   });
