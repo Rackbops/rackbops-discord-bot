@@ -4,6 +4,7 @@
 // Runs inside the bot's activate(), after takeOver() — see src/index.ts.
 import {
   MessageFlags,
+  type AutocompleteInteraction,
   type MessageComponentInteraction,
   type ModalSubmitInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
@@ -140,9 +141,9 @@ export function pluginCommandMap(
  * builds to the wrong name is dropped and logged rather than trusted.
  */
 /** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
- *  `"group sub q"`) whose built JSON declares `autocomplete: true` — the host never routes an
- *  autocomplete interaction to a plugin (see `buildCommandBody` below and `index.ts`'s handler), so
- *  these are dead pickers. Total: a malformed/absent `options` (not an array) yields `[]`. */
+ *  `"group sub q"`) whose built JSON declares `autocomplete: true` — dead pickers unless the command
+ *  also has an `autocomplete()` handler for the host to route them to (#287, see `buildCommandBody`
+ *  below and `dispatchPluginAutocomplete`). Total: a malformed/absent `options` (not an array) yields `[]`. */
 export function autocompleteOptionPaths(json: RESTPostAPIChatInputApplicationCommandsJSONBody): string[] {
   const paths: string[] = [];
   const walk = (options: unknown, prefix: readonly string[]): void => {
@@ -183,14 +184,14 @@ export function buildCommandBody(
       continue;
     }
     // #218: a live command with a dead picker is still better than dropping it outright — warn, don't
-    // refuse. A typed value still works; only the autocomplete suggestions never load (index.ts
-    // answers every autocomplete interaction with an empty list — see its handler for why).
+    // refuse. A typed value still works; only the suggestions never load, because a command without an
+    // `autocomplete()` handler is answered with an empty list (`dispatchPluginAutocomplete`, #287).
     const autocompletePaths = autocompleteOptionPaths(built);
-    if (autocompletePaths.length > 0) {
+    if (autocompletePaths.length > 0 && typeof command.autocomplete !== "function") {
       log.warn(
         `[plugins] ${entry.name}: command "${bare}" asks for autocomplete on ` +
-          `${autocompletePaths.map((p) => `"${p}"`).join(", ")} — the host does not route autocomplete ` +
-          `to plugins (#287), so the picker offers no suggestions; a typed value still works`,
+          `${autocompletePaths.map((p) => `"${p}"`).join(", ")} but has no autocomplete() handler, so ` +
+          `the picker offers no suggestions; a typed value still works`,
       );
     }
     body.push(built);
@@ -471,6 +472,45 @@ export async function dispatchPluginInteraction(
     }
   }
   return true;
+}
+
+/**
+ * #287: answers one autocomplete interaction for the plugin command `bare` — called from index.ts's
+ * InteractionCreate handler with the bare command name. Routes to the command's `autocomplete()` only
+ * when the owning plugin is `running` and `gate` (the same routing gate as the command itself, #243)
+ * lets it run here; a gate that throws lets it run, as it does for the command. Every other path — no
+ * such command, no handler, not running, refused here, a throw, or a handler that returned without
+ * responding — answers with an empty list, so Discord's picker closes at once instead of failing after
+ * its own 3 s timeout. A throw is logged and isolated like every other plugin call site. Never rejects
+ * past the final `respond([])`, which the caller's own catch covers.
+ */
+export async function dispatchPluginAutocomplete(opts: {
+  interaction: AutocompleteInteraction;
+  bare: string;
+  map: PluginCommandMap;
+  loaded: readonly LoadedPlugin[];
+  gate: (bare: string) => Promise<string | undefined>;
+  log: BaseLog;
+}): Promise<void> {
+  const { interaction, bare, log } = opts;
+  const target = opts.map.get(bare);
+  const lp = target ? opts.loaded.find((l) => l.entry.name === target.entry.name) : undefined;
+  if (target && lp?.running && typeof target.command.autocomplete === "function") {
+    let refusal: string | undefined;
+    try {
+      refusal = await opts.gate(bare);
+    } catch (err) {
+      log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; letting it run`, err);
+    }
+    if (refusal === undefined) {
+      try {
+        await target.command.autocomplete(interaction);
+      } catch (err) {
+        log.error(`[plugins] ${target.entry.name} autocomplete for "${bare}" failed`, err);
+      }
+    }
+  }
+  if (!interaction.responded) await interaction.respond([]);
 }
 
 const STATE_FRESH: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };

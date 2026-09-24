@@ -7,7 +7,7 @@ import { Client, Events, REST } from "discord.js";
 import { config } from "./config";
 import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "./storage";
 import { createClient, CORE_INTENTS } from "./client";
-import { commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
+import { bareName, commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
 import { startScheduler, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { startRequestDrain } from "./plugins/drain";
@@ -37,6 +37,7 @@ import {
   buildCommandBody,
   createHostApi,
   createPluginTickControl,
+  dispatchPluginAutocomplete,
   dispatchPluginInteraction,
   disposePlugins,
   loadPlugins,
@@ -217,10 +218,25 @@ async function activate(c: Client<true>): Promise<void> {
         // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
         await dispatchPluginInteraction(loadResult.loaded, interaction, console);
       } else if (interaction.isAutocomplete()) {
-        // #218: the host routes no autocomplete to plugins (see host.ts's buildCommandBody warning);
-        // an empty answer closes the picker cleanly at once instead of Discord's own 3s timeout
-        // failure. Core declares no autocomplete option, so there is nothing to route past this.
-        await interaction.respond([]);
+        // #287: a plugin command's picker goes to its autocomplete(), behind the same routing gate as the
+        // command; everything else — core declares no autocomplete option — gets an empty list at once
+        // instead of Discord's own 3s timeout failure (#218).
+        await dispatchPluginAutocomplete({
+          interaction,
+          bare: bareName(interaction.commandName),
+          map: commandMap,
+          loaded: loadResult.loaded,
+          gate: (bare) =>
+            gateCommand(
+              commandMap.get(bare)?.entry.name,
+              interaction.commandName,
+              interaction,
+              () => whereOf(interaction, (id) => client.channels.fetch(id)),
+              () => readRouting(DATA_DIR),
+              console,
+            ),
+          log: console,
+        });
       }
     } catch (err) {
       console.error("[interaction]", err);

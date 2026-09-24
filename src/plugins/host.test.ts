@@ -27,6 +27,7 @@ const {
   writePluginState,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
+  dispatchPluginAutocomplete,
 } = await import("./host");
 // The real consumers of pluginTicks' checks (#217): runTick drives the isolation/logging the bound
 // relies on, and restart.ts's critical section is what a bounded wait lets a restart out of.
@@ -245,6 +246,17 @@ describe("buildCommandBody", () => {
     buildCommandBody("", coreJson, map, log);
     const warn = calls.find((l) => l.level === "warn" && l.message.includes("autocomplete"));
     expect(warn?.message).toContain('"g s q"');
+  });
+
+  test("a command with an autocomplete option AND an autocomplete() handler warns nothing (#287)", () => {
+    const { log, calls } = makeLog();
+    const handled: PluginCommand = {
+      ...cmd("search", (b) => b.setDescription("d").addStringOption((o) => o.setName("q").setDescription("d").setAutocomplete(true))),
+      autocomplete: async () => {},
+    };
+    const map = pluginCommandMap([loaded(entry(), { commands: [handled] })], [], log);
+    expect(buildCommandBody("", coreJson, map, log).map((c) => c.name)).toEqual(["dmf", "search"]);
+    expect(calls.some((l) => l.message.includes("autocomplete"))).toBe(false);
   });
 
   test("a command without autocomplete options warns nothing", () => {
@@ -672,6 +684,91 @@ describe("pluginTicks", () => {
     expect(TICK_MS).toBe(60_000); // the "60s TICK_MS" host.ts's doc comments name -- change both together
     expect(PLUGIN_TICK_TIMEOUT_MS).toBe(30_000);
     expect(PLUGIN_TICK_TIMEOUT_MS).toBeLessThan(TICK_MS);
+  });
+});
+
+describe("dispatchPluginAutocomplete (#287)", () => {
+  /** Only what the dispatcher touches: commandName, responded, respond(). */
+  const fakeAutocomplete = () => {
+    const responses: unknown[][] = [];
+    const interaction = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => {
+        responses.push(choices);
+        interaction.responded = true;
+      },
+    };
+    return { interaction, responses };
+  };
+  const setup = (over: { autocomplete?: PluginCommand["autocomplete"]; running?: boolean } = {}) => {
+    const command: PluginCommand = { ...cmd("search"), ...(over.autocomplete ? { autocomplete: over.autocomplete } : {}) };
+    const lp = loaded(entry({ name: "finder" }), { commands: [command] }, over.running ?? true);
+    const { log, calls } = makeLog();
+    const map = pluginCommandMap([lp], [], log);
+    return { lp, map, log, calls };
+  };
+  const run = (s: ReturnType<typeof setup>, interaction: unknown, gate: (bare: string) => Promise<string | undefined> = async () => undefined, bare = "search") =>
+    dispatchPluginAutocomplete({ interaction: interaction as never, bare, map: s.map, loaded: [s.lp], gate, log: s.log });
+
+  test("routes to the command's autocomplete(), which answers the picker itself", async () => {
+    const s = setup({ autocomplete: async (i) => { await i.respond([{ name: "a", value: "a" }]); } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[{ name: "a", value: "a" }]]); // the plugin's answer, and no second, empty one
+  });
+
+  test("no such command, or a command without autocomplete(), is answered with an empty list", async () => {
+    const s = setup();
+    for (const bare of ["search", "nope"]) {
+      const { interaction, responses } = fakeAutocomplete();
+      await run(s, interaction, undefined, bare);
+      expect(responses).toEqual([[]]);
+    }
+  });
+
+  test("a plugin that is not running is never called", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; }, running: false });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("where the routing gate refuses the command, its autocomplete is not called either", async () => {
+    let called = 0;
+    const gated: string[] = [];
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction, async (bare) => { gated.push(bare); return "use it in #spotify"; });
+    expect(gated).toEqual(["search"]);
+    expect(called).toBe(0);
+    expect(responses).toEqual([[]]);
+  });
+
+  test("a gate that throws lets it run, as it does for the command", async () => {
+    let called = 0;
+    const s = setup({ autocomplete: async () => { called += 1; } });
+    const { interaction } = fakeAutocomplete();
+    await run(s, interaction, async () => { throw new Error("gate down"); });
+    expect(called).toBe(1);
+    expect(s.calls.some((l) => l.level === "error" && l.message.includes("[gate]"))).toBe(true);
+  });
+
+  test("a throwing autocomplete() is logged and isolated, and the picker still gets an empty list", async () => {
+    const s = setup({ autocomplete: async () => { throw new Error("boom"); } });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[]]);
+    expect(s.calls.some((l) => l.level === "error" && l.message.includes("finder autocomplete"))).toBe(true);
+  });
+
+  test("an autocomplete() that returns without responding gets the empty-list fallback", async () => {
+    const s = setup({ autocomplete: async () => {} });
+    const { interaction, responses } = fakeAutocomplete();
+    await run(s, interaction);
+    expect(responses).toEqual([[]]);
   });
 });
 

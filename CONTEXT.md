@@ -1064,17 +1064,16 @@ _Avoid_: server list, guild cache
   here:** the admin panel still offers *Update now* on a carried-off plugin's card until #244 folds in
   an `enabled` check — the bot refuses the request with the reason above, which the panel surfaces, so
   nothing silently succeeds, but the button itself is misleading until then.
-- **A plugin option that asks for autocomplete gets a warning, not a working picker (#218).** Nothing
-  in `src/` routes an autocomplete interaction to plugin code — `buildCommandBody` (`host.ts`) still
-  registers the command (dropping it would remove a working command over a dead picker; a typed value
-  still works), but warns once per command, naming every option path (`autocompleteOptionPaths`, which
-  walks subcommand groups/subcommands recursively) that declared `autocomplete: true`. `index.ts`'s
-  `InteractionCreate` handler answers every autocomplete interaction with `interaction.respond([])`,
-  so Discord's picker shows "no options" immediately instead of failing after its own 3s timeout with
-  no explanation anywhere in the log. Actually routing an autocomplete interaction to a plugin's own
-  handler needs an addition to `PluginCommand` in `contract.ts` — out of scope here (that file is
-  vendored verbatim by `rackbops-bot-plugins`) — tracked as its own contract-change issue, #287, to
-  land with the post-#236 contract batch (#219/#248/#220) in one paired vendor bump.
+- **A plugin command's autocomplete picker is routed to its `autocomplete()` (#287; #218 before it).**
+  `PluginCommand.autocomplete?(interaction)` is optional. `index.ts`'s `InteractionCreate` handler hands
+  every autocomplete interaction to `dispatchPluginAutocomplete` (`host.ts`), which calls the command's
+  `autocomplete()` only when its plugin is `running` and the command's own routing gate (`gateCommand`,
+  #243) lets it run in that channel. Every other case — no handler, not running, refused, a throw, or
+  a handler that returned without responding — gets `interaction.respond([])`, so Discord's picker
+  shows "no options" at once instead of failing after its own 3s timeout. `buildCommandBody` still
+  registers a command that declares `autocomplete: true` without a handler (a typed value still
+  works), but warns once per command, naming every such option path (`autocompleteOptionPaths`, which
+  walks subcommand groups/subcommands recursively).
 - **`ops/admin/Dockerfile`'s `COPY server.ts admin-contract.ts ./` must name every relative local
   import `server.ts` has, or the admin container crash-loops at boot.** #124 added the
   `./admin-contract` import; a missed COPY update shipped in the same epic and crash-looped with
