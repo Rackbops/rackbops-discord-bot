@@ -18,6 +18,19 @@ describe("wrapBareUrls", () => {
   test("text with no url is unchanged", () => {
     expect(wrapBareUrls("no links here")).toBe("no links here");
   });
+
+  // #736 review: a URL sitting loose inside an unrelated bracketed span must still be wrapped on its
+  // own -- treating the whole span as "already wrapped" left it unsuppressed, since Discord's <url>
+  // syntax needs the brackets immediately around the URL itself, not just present somewhere nearby.
+  test("a url loose inside an unrelated bracketed span is still wrapped on its own", () => {
+    expect(wrapBareUrls("<click here https://evil.example more text>")).toBe(
+      "<click here <https://evil.example> more text>",
+    );
+  });
+
+  test("a tightly wrapped url (nothing else inside the brackets) is the only thing left untouched", () => {
+    expect(wrapBareUrls("<https://a.example>")).toBe("<https://a.example>");
+  });
 });
 
 describe("validateHostMessage: content", () => {

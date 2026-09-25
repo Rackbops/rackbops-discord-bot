@@ -32,16 +32,24 @@ export interface BuiltPayload {
 
 export type ValidationResult = { ok: true; payload: BuiltPayload } | { ok: false; reason: string };
 
-// Matches an already-wrapped `<...>` run (kept as-is) or a bare http(s) URL (about to be wrapped).
-// `<...>` is tried first, so a URL already inside one is never double-wrapped or re-matched as bare.
-const URL_OR_WRAPPED_RE = /(<[^>]*>)|(https?:\/\/[^\s<>]+)/g;
+// Matches a URL that is ALREADY tightly wrapped -- `<` immediately before it, `>` immediately after,
+// nothing else between -- or a bare http(s) URL otherwise. The first alternative must require the
+// brackets to hold nothing but the URL itself: a looser first cut ("<[^>]*>", matching any bracketed
+// span containing a URL anywhere inside it) let a URL sitting mid-sentence inside an UNRELATED
+// bracketed span -- "<click here https://evil.example more text>" -- read as "already wrapped" and
+// pass through untouched, even though the URL there is not adjacent to either bracket and Discord's
+// own <url> suppression syntax requires exactly that adjacency (#736 review). Matching the wrapped
+// form as `<(url)>` closes that: a URL is only ever left alone when the brackets truly hold nothing
+// else, and a URL loose inside a larger bracketed span is still found and wrapped on its own.
+const URL_OR_WRAPPED_RE = /<(https?:\/\/[^\s<>]+)>|(https?:\/\/[^\s<>]+)/g;
 
-/** Wraps every bare `http(s)://` run in `<...>` so it does not unfurl, leaving a run already inside
- *  `<...>` untouched. `MessageFlags.SuppressEmbeds` would also hide the card, so this is the only way
- *  to keep a link from unfurling without losing the card too (decision 5). */
+/** Wraps every bare `http(s)://` run in `<...>` so it does not unfurl, leaving a URL that is already
+ *  tightly wrapped (`<url>`, nothing else inside the brackets) untouched. `MessageFlags.SuppressEmbeds`
+ *  would also hide the card, so this is the only way to keep a link from unfurling without losing the
+ *  card too (decision 5). */
 export function wrapBareUrls(content: string): string {
-  return content.replace(URL_OR_WRAPPED_RE, (whole: string, wrapped: string | undefined) =>
-    wrapped !== undefined ? wrapped : `<${whole}>`,
+  return content.replace(URL_OR_WRAPPED_RE, (whole: string, alreadyWrapped: string | undefined, bare: string | undefined) =>
+    alreadyWrapped !== undefined ? whole : `<${bare}>`,
   );
 }
 
