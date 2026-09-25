@@ -336,6 +336,19 @@ describe("createHostApi: delivery (#736)", () => {
     expect(calls).toEqual([]);
   });
 
+  test("edit passes the validated payload through to editOwnMessage, unchanged", async () => {
+    let editArgs: [string, string, unknown] | undefined;
+    const { deps, calls } = fakeDeps({
+      editOwnMessage: async (channelId, messageId, payload) => {
+        editArgs = [channelId, messageId, payload];
+      },
+    });
+    const host = hostWith({ delivery: deps });
+    await host.edit!({ guildId: HOME, channelId: CHAN, messageId: MSG }, { content: "hi" });
+    expect(calls).toEqual(["editOwnMessage"]);
+    expect(editArgs).toEqual([CHAN, MSG, { content: "hi", allowedMentions: { parse: [] } }]);
+  });
+
   test("destinations lists only mapped + declared destinations, named from discovery, falling back to the id", async () => {
     const routing = routingWith({
       feed: {
