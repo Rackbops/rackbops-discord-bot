@@ -10,9 +10,10 @@ import {
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { commandNamer } from "../commandNaming";
-import { DESTINATION_NAME_RE } from "../routing/model";
-import { shown } from "../routing/resolve";
+import { DESTINATION_NAME_RE, SNOWFLAKE_RE, type DiscoveryFile, type RoutingFile } from "../routing/model";
+import { destinationChannel, mappedDestinations, shown } from "../routing/resolve";
 import { createKeyedJsonMutator } from "../storage";
+import { validateHostMessage, type BuiltPayload } from "./hostMessage";
 import type {
   HostApi,
   HostStorage,
@@ -48,6 +49,18 @@ export interface LoadedPlugin {
 
 export type PluginCommandMap = Map<string, { entry: PluginIndexEntry; command: PluginCommand }>;
 
+/** Live deps behind `HostApi.post`/`dm`/`edit`/`destinations` (#736) — I/O kept at the edge
+ *  (`src/plugins/delivery.ts` implements the three send/edit functions over a real `Client`; the two
+ *  reads reuse `routing/discovery.ts`'s and `routing/store.ts`'s own functions) so `createHostApi`'s
+ *  own decisions (declared-destination check, id shape, validation, resolution) unit-test with a fake. */
+export interface HostDeliveryDeps {
+  readRouting(): Promise<RoutingFile>;
+  readDiscovery(): Promise<DiscoveryFile | null>;
+  sendToChannel(channelId: string, payload: BuiltPayload): Promise<{ messageId: string; guildId: string | null }>;
+  sendDm(userId: string, payload: BuiltPayload): Promise<{ messageId: string; channelId: string }>;
+  editOwnMessage(channelId: string, messageId: string, payload: BuiltPayload): Promise<void>;
+}
+
 /**
  * Builds a HostApi for one plugin. `env` is ONLY the keys the plugin's Plugin Index entry declares,
  * read from `processEnv` — never the whole environment. `log` prefixes every line with `[name] `.
@@ -59,6 +72,9 @@ export function createHostApi(opts: {
   baseLog: BaseLog;
   storage: HostStorage;
   announce: (message: string, destination?: string) => Promise<void>;
+  /** Wires `post`/`dm`/`edit`/`destinations` onto the returned HostApi (#736). Absent — the default —
+   *  means a host that predates them: the four members are absent too, exactly as before. */
+  delivery?: HostDeliveryDeps;
 }): HostApi {
   const { name } = opts.entry;
   const env: Record<string, string | undefined> = {};
@@ -89,11 +105,81 @@ export function createHostApi(opts: {
     }
     return opts.announce(message);
   };
-  return { name, env, dataDir: opts.dataDir, log, storage: opts.storage, announce };
+  return {
+    name,
+    env,
+    dataDir: opts.dataDir,
+    log,
+    storage: opts.storage,
+    announce,
+    ...(opts.delivery !== undefined ? buildDeliveryApi(name, declared, log, opts.delivery) : {}),
+  };
 }
 
 /** How many distinct undeclared destination names one plugin's `announce` warns about (#219). */
 const MAX_DESTINATION_WARNINGS = 50;
+
+/**
+ * The four optional HostApi members built only when `opts.delivery` is wired (#736) — kept as its own
+ * function so `createHostApi` stays readable. `declared` and `log` are the same values `announce`
+ * above already closes over (declared destination names, and the `[name] `-prefixed logger).
+ */
+function buildDeliveryApi(
+  name: string,
+  declared: ReadonlySet<string>,
+  log: PluginLog,
+  deps: HostDeliveryDeps,
+): Pick<HostApi, "post" | "dm" | "edit" | "destinations"> {
+  return {
+    // Decision 3: `post` targets exactly the one channel mapped for `destination` in `guildId` --
+    // never `announce`'s postTo/default fallback. Checked in this order: declared, then id shape,
+    // then the message itself, then whether it is actually mapped here -- so a caller learns the
+    // cheapest problem first, and nothing is sent to Discord until every check has passed.
+    async post(guildId, destination, message) {
+      if (!declared.has(destination)) throw new Error("destination is not declared in this plugin's manifest");
+      if (!SNOWFLAKE_RE.test(guildId)) throw new Error("guildId is not a valid id");
+      const validated = validateHostMessage(message, { partial: false });
+      if (!validated.ok) throw new Error(validated.reason);
+      const routing = await deps.readRouting();
+      const channelId = destinationChannel(routing, name, guildId, destination);
+      if (channelId === undefined) throw new Error("destination is not mapped in that server");
+      const sent = await deps.sendToChannel(channelId, validated.payload);
+      log.info(`post -> ${channelId}`); // never the content
+      return { guildId, channelId, messageId: sent.messageId };
+    },
+    async dm(userId, message) {
+      if (!SNOWFLAKE_RE.test(userId)) throw new Error("userId is not a valid id");
+      const validated = validateHostMessage(message, { partial: false });
+      if (!validated.ok) throw new Error(validated.reason);
+      const sent = await deps.sendDm(userId, validated.payload);
+      return { guildId: null, channelId: sent.channelId, messageId: sent.messageId };
+    },
+    // Decision 4: authorship, not per-plugin ownership -- `delivery.editOwnMessage` (live) or the
+    // fake in tests is what actually checks `author.id`; this only shapes and validates the call.
+    async edit(delivery, message) {
+      if (!SNOWFLAKE_RE.test(delivery.channelId) || !SNOWFLAKE_RE.test(delivery.messageId)) {
+        throw new Error("delivery is not a valid channel/message id");
+      }
+      const validated = validateHostMessage(message, { partial: true });
+      if (!validated.ok) throw new Error(validated.reason);
+      await deps.editOwnMessage(delivery.channelId, delivery.messageId, validated.payload);
+    },
+    async destinations() {
+      let routing: RoutingFile;
+      try {
+        routing = await deps.readRouting();
+      } catch {
+        log.warn("destinations: could not read routing; reporting none");
+        return [];
+      }
+      const discovery = await deps.readDiscovery();
+      const guildName = (guildId: string): string => discovery?.guilds.find((g) => g.id === guildId)?.name ?? guildId;
+      return mappedDestinations(routing, name)
+        .filter((d) => declared.has(d.destination))
+        .map((d) => ({ guildId: d.guildId, guildName: guildName(d.guildId), destination: d.destination }));
+    },
+  };
+}
 
 export interface LoadResult {
   loaded: LoadedPlugin[];

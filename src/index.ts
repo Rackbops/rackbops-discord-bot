@@ -53,7 +53,8 @@ import {
 } from "./plugins/host";
 import { startHostHttp } from "./http";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
-import { describePlugins } from "./routing/discovery";
+import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
+import { describePlugins, readDiscovery } from "./routing/discovery";
 import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
 import { gateCommand, whereOf } from "./routing/gate";
 import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
@@ -183,6 +184,14 @@ async function activate(c: Client<true>): Promise<void> {
         baseLog: console,
         storage,
         announce: (message, destination) => postForPlugin(entry.name, message, postDeps, destination),
+        // #736: post/dm/edit/destinations, over the same live Client every other send path uses.
+        delivery: {
+          readRouting: () => readRouting(DATA_DIR),
+          readDiscovery: () => readDiscovery(DATA_DIR),
+          sendToChannel: (channelId, payload) => sendPayloadToChannel(client, channelId, payload),
+          sendDm: (userId, payload) => sendPayloadDm(client, userId, payload),
+          editOwnMessage: (channelId, messageId, payload) => editOwnMessage(client, channelId, messageId, payload),
+        },
       });
     loadResult = await loadPlugins(
       installResult.installed,
