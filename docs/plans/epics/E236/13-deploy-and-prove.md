@@ -90,10 +90,22 @@ docker exec rackbops-discord-bot-$I sh -c 'ls -l /app/data/routing.json /app/dat
 ```
 Expect `No such file` for both. If `routing.json` exists, STOP: someone already placed a plugin and the seed below would overwrite it.
 
+Resolve `main`'s commit once, and use it both for what is built and for the `GIT_SHA` baked into the image (see [Rebuilding the bot later](#rebuilding-the-bot-later-without-installsh)):
+
 ```bash
-docker compose -f $BOT_OPS_COMPOSE_FILE -p $BOT_OPS_PROJECT up -d --build bot
+SHA=$(git ls-remote https://github.com/Rackbops/rackbops-discord-bot.git refs/heads/main | cut -f1); echo "$SHA"
+```
+Expect one 40-character sha. Empty → STOP.
+
+```bash
+GIT_SHA=$SHA BOT_BUILD_CONTEXT=https://github.com/Rackbops/rackbops-discord-bot.git#$SHA docker compose -f $BOT_OPS_COMPOSE_FILE -p $BOT_OPS_PROJECT up -d --build bot
 ```
 Expect the build, then `Container rackbops-discord-bot-debug Recreated`/`Started`. Do **not** touch the panel's placement controls until stage 4 is done.
+
+```bash
+[ "$(docker exec rackbops-discord-bot-$I printenv GIT_SHA)" = "$SHA" ] && echo "GIT_SHA ok" || echo "GIT_SHA MISMATCH"
+```
+Expect `GIT_SHA ok`. `MISMATCH` → the image carries the wrong commit and self-update will misjudge it: STOP.
 
 ```bash
 docker logs --since 5m rackbops-discord-bot-$I 2>&1 | grep -E 'Registered|\[routing\]|\[startup\]'
@@ -179,6 +191,22 @@ for s in env-get env-schema routing-get status; do printf '%s: ' "$s"; bash /opt
 
 Same stages with `export I=prod` and a fresh stage 0 (new `$W`; the flock checks are done). Stage 1's install.sh is already done for the shared script — re-run it anyway for prod's compose file and stack `.env`. Stage 4: if the seed has `"plugins": {}` (nothing registered outside home), **do not write it** — single mode is already exactly today; capture before/after a plain restart instead. Then **enable music from the panel** (Plugins → music → On, fill its settings → Apply: one `env-set`, one recreate), and repeat D1-D3 on prod's servers. **Person:** prod's banner is clear.
 
+### Rebuilding the bot later (without install.sh)
+
+The stack `.env` that `install.sh` writes holds **two** build inputs (`ops/install.sh:320-321`):
+- `BOT_BUILD_CONTEXT=<repo>#main`, which builds whatever `main` is when the rebuild runs;
+- `GIT_SHA=<main's head when install.sh last ran>`, which is frozen.
+
+Compose passes `GIT_SHA` as the image's build arg (`docker-compose.yml:27`), and the Dockerfile bakes it into the bot's environment (`Dockerfile:18-19`). So a plain `up -d --build bot` any time after `install.sh` builds today's `main` but labels it with the old commit.
+
+Self-update compares that label with `main` (`src/update.ts:249-258`). The bot then reports itself stale, `/update` offers an update it doesn't need, and with `AUTO_UPDATE` on it redeploys for nothing. (Found on the #235 close-out, 2026-09-24.)
+
+**So every rebuild without `install.sh` pins both inputs to one resolved commit.** Use Stage 3's three blocks: resolve `SHA`, build with `GIT_SHA=$SHA BOT_BUILD_CONTEXT=<repo>#$SHA`, then check `printenv GIT_SHA`.
+- Shell variables take precedence over the stack `.env` in compose's interpolation, which is why the prefix works. The `printenv` check proves it on the host rather than trusting that rule.
+- Building from `#$SHA`, not `#main`, closes the race where `main` moves between the `ls-remote` and the build.
+- The admin panel needs none of this: it bakes in no commit.
+- Re-running `install.sh` also refreshes the stack `.env`, and then a plain rebuild is correct again, until `main` moves.
+
 ### Learned on the 2026-09-24 run (debug, then prod)
 
 - **Image names are `rackbops-discord-bot-<instance>-bot` and `rackbops-discord-bot-<instance>-admin`.** That settles the image-rollback line above: `docker tag <sha from images-before.txt> <that name>`, then `up … --no-build`.
@@ -192,6 +220,7 @@ Same stages with `export I=prod` and a fresh stage 0 (new `$W`; the flock checks
 - **Copying secrets between instances without printing them:** `grep -E '^(KEY1|KEY2)=' /opt/rackbops-discord-bot/debug/.env | BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/prod … bash bot-ops.sh env-set`. It is the same write as the panel's Apply, and it backs up `.env` first.
 - **A phantom "1 change needs a restart"** appears when `PLUGINS` in `.env` isn't in the index's alphabetical order. **Discard** is safe. It is fixed in `6949956`.
 - **wow posts only on its own schedule** (next: the Tuesday reset), so D3 can take days.
+- **A later rebuild must re-pin `GIT_SHA`.** The stack `.env`'s value is frozen at the last `install.sh`. See [Rebuilding the bot later](#rebuilding-the-bot-later-without-installsh).
 
 ### What only a person can confirm
 

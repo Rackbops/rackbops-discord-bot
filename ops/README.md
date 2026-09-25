@@ -212,11 +212,18 @@ The compose file's `build.context` defaults to `.` (a local checkout, unchanged 
 running `docker compose up -d --build` from a clone) — the bootstrap command instead supplies
 `BOT_BUILD_CONTEXT=https://github.com/Rackbops/rackbops-discord-bot.git#<branch>` as a one-shot
 shell variable on that single invocation, so the Docker daemon fetches and builds the source
-itself. It is **not** written into `.env` — nothing rebuilds via `docker compose --build` after
-that initial bring-up (self-update's own rebuilds go through the Docker Engine API directly, in
-`src/redeploy.ts`, independent of this file); a future manual rebuild needs the same variable
-re-supplied by hand. `GIT_SHA` (for self-update's staleness check) is resolved via
-`git ls-remote` at bootstrap time — no clone needed for that either.
+itself. It is also written into the stack `.env`, as `<repo>#<branch>` (`ops/install.sh:320`), next to
+`GIT_SHA`. `GIT_SHA` is what self-update's staleness check reads, and it is resolved via
+`git ls-remote` when `install.sh` runs, with no clone needed. Self-update's own rebuilds go through
+the Docker Engine API (`src/redeploy.ts`) and set both themselves.
+
+**A manual `up -d --build bot` after `main` has moved** builds the new `main` but bakes the stack
+`.env`'s old `GIT_SHA`, so the bot reports itself stale. Either re-run `install.sh` first, or pin both
+on the command line to one resolved commit:
+`GIT_SHA=$SHA BOT_BUILD_CONTEXT=<repo>#$SHA docker compose … up -d --build bot`, with
+`SHA=$(git ls-remote <repo> refs/heads/main | cut -f1)`. The exact blocks, and a check that the
+running bot carries it, are in `docs/plans/epics/E236/13-deploy-and-prove.md` ("Rebuilding the bot
+later").
 
 ## Editable keys (whitelist)
 
