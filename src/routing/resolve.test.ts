@@ -3,8 +3,10 @@ import { freshRouting, type DiscoveryFile, type PluginRouting, type RoutingFile 
 import {
   announceTargets,
   commandAllowed,
+  destinationChannel,
   hasPlacements,
   isPlaced,
+  mappedDestinations,
   pluginsForGuild,
   validatePluginRouting,
 } from "./resolve";
@@ -475,6 +477,67 @@ describe("announceTargets with a named destination (#219)", () => {
   test("an inherited key is not a mapped name, and another plugin's names do not leak in", () => {
     expect(announceTargets(r, "feed", DEFAULT_CHANNEL, "constructor")).toEqual([HOME_CHAN, OTHER_CHAN]);
     expect(announceTargets(r, "other", DEFAULT_CHANNEL, "news")).toEqual([DEFAULT_CHANNEL]);
+  });
+});
+
+describe("destinationChannel (#736)", () => {
+  const r = routing({
+    feed: {
+      servers: {
+        [HOME]: { commands: "all", destinations: { news: HOME_CHAN_2 } },
+        [OTHER]: { commands: "all", destinations: { alerts: OTHER_CHAN_2 } },
+      },
+    },
+  });
+
+  test("a mapped destination resolves to its channel", () => {
+    expect(destinationChannel(r, "feed", HOME, "news")).toBe(HOME_CHAN_2);
+  });
+
+  test("an unplaced plugin resolves to undefined", () => {
+    expect(destinationChannel(r, "other", HOME, "news")).toBeUndefined();
+  });
+
+  test("placed, but not in this server, resolves to undefined", () => {
+    expect(destinationChannel(r, "feed", THIRD, "news")).toBeUndefined();
+  });
+
+  test("a name mapped only in another guild resolves to undefined here -- no fallback, unlike announceTargets", () => {
+    expect(destinationChannel(r, "feed", HOME, "alerts")).toBeUndefined();
+    expect(destinationChannel(r, "feed", OTHER, "news")).toBeUndefined();
+  });
+
+  test("an inherited key is never a match, for the plugin, the guild id or the destination name", () => {
+    for (const key of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+      expect(destinationChannel(r, "feed", key, "news")).toBeUndefined();
+      expect(destinationChannel(r, "feed", HOME, key)).toBeUndefined();
+      expect(destinationChannel(r, key, HOME, "news")).toBeUndefined();
+    }
+  });
+});
+
+describe("mappedDestinations (#736)", () => {
+  test("lists every mapped destination, guilds ordered by id, destinations in insertion order", () => {
+    const r = routing({
+      feed: {
+        servers: {
+          [OTHER]: { commands: "all", destinations: { news: OTHER_CHAN_2 } },
+          [HOME]: { commands: "all", destinations: { news: HOME_CHAN_2, alerts: HOME_CHAN_2 } },
+        },
+      },
+    });
+    expect(mappedDestinations(r, "feed")).toEqual([
+      { guildId: HOME, destination: "news", channelId: HOME_CHAN_2 },
+      { guildId: HOME, destination: "alerts", channelId: HOME_CHAN_2 },
+      { guildId: OTHER, destination: "news", channelId: OTHER_CHAN_2 },
+    ]);
+    expect(mappedDestinations(r, "other")).toEqual([]);
+  });
+
+  test("a server with no destinations contributes nothing, and placed-nowhere is empty", () => {
+    const noDestinations = routing({ feed: { servers: { [HOME]: { commands: "all" } } } });
+    expect(mappedDestinations(noDestinations, "feed")).toEqual([]);
+    expect(mappedDestinations(routing({ feed: { servers: {} } }), "feed")).toEqual([]);
   });
 });
 

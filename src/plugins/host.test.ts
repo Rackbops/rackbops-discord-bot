@@ -5,9 +5,10 @@ import { join } from "node:path";
 import { SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
 import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
 import { installPlugins, type InstalledPlugin } from "./install";
-import type { LoadedPlugin } from "./host";
+import type { HostDeliveryDeps, LoadedPlugin } from "./host";
 import { pinsFromState, selectPlugins } from "./registry";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
+import { freshRouting, type DiscoveryFile, type RoutingFile } from "../routing/model";
 // DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
 // once, for every test file, by test/setup.ts's bunfig preload (#136).
 const {
@@ -181,6 +182,239 @@ describe("createHostApi: announce's destination (#219)", () => {
       await host.announce("a", "news");
       expect(posted).toEqual([["a", undefined]]);
     }
+  });
+});
+
+describe("createHostApi: delivery (#736)", () => {
+  const HOME = "111111111111111111";
+  const OTHER = "222222222222222222";
+  const CHAN = "333333333333333333";
+  const USER = "444444444444444444";
+  const MSG = "666666666666666666";
+
+  function routingWith(plugins: RoutingFile["plugins"]): RoutingFile {
+    return { ...freshRouting(), plugins };
+  }
+
+  function fakeDeps(
+    over: Partial<{
+      routing: RoutingFile;
+      routingFails: boolean;
+      discovery: DiscoveryFile | null;
+      sendToChannel: HostDeliveryDeps["sendToChannel"];
+      sendDm: HostDeliveryDeps["sendDm"];
+      editOwnMessage: HostDeliveryDeps["editOwnMessage"];
+    }> = {},
+  ) {
+    const calls: string[] = [];
+    const deps: HostDeliveryDeps = {
+      readRouting: async () => {
+        calls.push("readRouting");
+        if (over.routingFails) throw new Error("disk error");
+        return over.routing ?? routingWith({});
+      },
+      readDiscovery: async () => {
+        calls.push("readDiscovery");
+        return over.discovery ?? null;
+      },
+      sendToChannel: async (channelId, payload) => {
+        calls.push("sendToChannel");
+        return over.sendToChannel ? over.sendToChannel(channelId, payload) : { messageId: "m1", guildId: HOME };
+      },
+      sendDm: async (userId, payload) => {
+        calls.push("sendDm");
+        return over.sendDm ? over.sendDm(userId, payload) : { messageId: "m2", channelId: "555" };
+      },
+      editOwnMessage: async (channelId, messageId, payload) => {
+        calls.push("editOwnMessage");
+        if (over.editOwnMessage) await over.editOwnMessage(channelId, messageId, payload);
+      },
+    };
+    return { deps, calls };
+  }
+
+  function hostWith(opts: { destinations?: unknown; delivery?: HostDeliveryDeps } = {}): HostApi {
+    const { log } = makeLog();
+    return createHostApi({
+      entry: entry({ name: "feed", destinations: opts.destinations as PluginIndexEntry["destinations"] }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async () => {},
+      delivery: opts.delivery,
+    });
+  }
+
+  test("without delivery, the four members are absent", () => {
+    const host = hostWith();
+    expect(host.post).toBeUndefined();
+    expect(host.dm).toBeUndefined();
+    expect(host.edit).toBeUndefined();
+    expect(host.destinations).toBeUndefined();
+  });
+
+  test("with delivery, the four members are functions", () => {
+    const { deps } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    expect(typeof host.post).toBe("function");
+    expect(typeof host.dm).toBe("function");
+    expect(typeof host.edit).toBe("function");
+    expect(typeof host.destinations).toBe("function");
+  });
+
+  test("post rejects an undeclared destination before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    await expect(host.post!(HOME, "alerts", { content: "hi" })).rejects.toThrow(
+      "destination is not declared in this plugin's manifest",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("post rejects an unmapped destination after reading routing, before sending", async () => {
+    const { deps, calls } = fakeDeps({ routing: routingWith({}) });
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    await expect(host.post!(HOME, "news", { content: "hi" })).rejects.toThrow("destination is not mapped in that server");
+    expect(calls).toEqual(["readRouting"]);
+  });
+
+  test("post sends to exactly the mapped channel, with allowedMentions.parse empty", async () => {
+    const routing = routingWith({ feed: { servers: { [HOME]: { commands: "all", destinations: { news: CHAN } } } } });
+    let sentPayload: { allowedMentions: { parse: unknown[] } } | undefined;
+    const { deps, calls } = fakeDeps({
+      routing,
+      sendToChannel: async (channelId, payload) => {
+        expect(channelId).toBe(CHAN);
+        sentPayload = payload as { allowedMentions: { parse: unknown[] } };
+        return { messageId: "m1", guildId: HOME };
+      },
+    });
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    const result = await host.post!(HOME, "news", { content: "hi" });
+    expect(result).toEqual({ guildId: HOME, channelId: CHAN, messageId: "m1" });
+    expect(sentPayload?.allowedMentions).toEqual({ parse: [] });
+    expect(calls).toEqual(["readRouting", "sendToChannel"]);
+  });
+
+  test("post rejects an invalid message before reading routing or sending", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    await expect(host.post!(HOME, "news", { content: "" })).rejects.toThrow("content is empty");
+    expect(calls).toEqual([]);
+  });
+
+  test("dm refuses a non-snowflake user id, before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    await expect(host.dm!("not-an-id", { content: "hi" })).rejects.toThrow("userId is not a valid id");
+    expect(calls).toEqual([]);
+  });
+
+  test("dm sends and returns a null guildId", async () => {
+    const { deps } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    const result = await host.dm!(USER, { content: "hi" });
+    expect(result).toEqual({ guildId: null, channelId: "555", messageId: "m2" });
+  });
+
+  test("edit with no parts refuses before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    await expect(host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, {})).rejects.toThrow(
+      "at least one of content, card or links must be present",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("edit refuses a malformed channel/message id before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    await expect(host.edit!({ guildId: null, channelId: "bad", messageId: "666" }, { content: "hi" })).rejects.toThrow(
+      "delivery is not a valid channel/message id",
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("destinations lists only mapped + declared destinations, named from discovery, falling back to the id", async () => {
+    const routing = routingWith({
+      feed: {
+        servers: {
+          [HOME]: { commands: "all", destinations: { news: CHAN, undeclared: CHAN } },
+          [OTHER]: { commands: "all", destinations: { news: CHAN } },
+        },
+      },
+    });
+    const discovery: DiscoveryFile = {
+      v: 1,
+      generatedAt: "2026-09-25T00:00:00.000Z",
+      bot: { id: "1", username: "b" },
+      inviteUrl: "https://discord.com/oauth2/authorize?client_id=1&scope=bot",
+      homeGuildId: null,
+      guilds: [{ id: HOME, name: "Home", channels: [], commands: null }],
+      plugins: {},
+    };
+    const { deps } = fakeDeps({ routing, discovery });
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    expect(await host.destinations!()).toEqual([
+      { guildId: HOME, guildName: "Home", destination: "news" },
+      { guildId: OTHER, guildName: OTHER, destination: "news" },
+    ]);
+  });
+
+  test("destinations reports none, with a warning, when routing cannot be read", async () => {
+    const { log, calls: logCalls } = makeLog();
+    const { deps } = fakeDeps({ routingFails: true });
+    const host = createHostApi({
+      entry: entry({ name: "feed", destinations: [{ name: "news", description: "d" }] }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async () => {},
+      delivery: deps,
+    });
+    expect(await host.destinations!()).toEqual([]);
+    expect(logCalls).toEqual([{ level: "warn", message: "[feed] destinations: could not read routing; reporting none" }]);
+  });
+
+  test("an old-style plugin loads and announces fine through the real loader, even though the host also carries post/dm/edit/destinations (backward compatibility)", async () => {
+    const unused = async () => {
+      throw new Error("an old-style plugin should never reach a delivery dep");
+    };
+    const delivery: HostDeliveryDeps = {
+      readRouting: unused,
+      readDiscovery: unused,
+      sendToChannel: unused,
+      sendDm: unused,
+      editOwnMessage: unused,
+    };
+    const posted: string[] = [];
+    const makeHost = (e: PluginIndexEntry): HostApi =>
+      createHostApi({
+        entry: e,
+        processEnv: {},
+        dataDir: "/d",
+        baseLog: makeLog().log,
+        storage: realStorage,
+        announce: async (message) => void posted.push(message),
+        delivery,
+      });
+    const installed: InstalledPlugin[] = [{ entry: entry({ name: "oldstyle" }), version: "1.0.0", bundlePath: "/a" }];
+    const importer = async (): Promise<PluginModule> => ({
+      createPlugin: (host) => ({
+        commands: [],
+        activate: async () => {
+          await host.announce("hello");
+        },
+      }),
+    });
+    const { log } = makeLog();
+    const { loaded, errors } = await loadPlugins(installed, makeHost, importer, log);
+    expect(errors).toEqual({});
+    expect(loaded).toHaveLength(1);
+    await loaded[0]!.plugin.activate!();
+    expect(posted).toEqual(["hello"]);
   });
 });
 
