@@ -88,6 +88,31 @@ export function announceTargets(routing: RoutingFile, plugin: string, defaultCha
   return targets.size > 0 ? [...targets] : [defaultChannelId];
 }
 
+/** The channel `destination` is mapped to in `guildId`, for `plugin` -- `undefined` when the plugin is
+ *  not placed there, the server has no entry, or the name is not mapped in it (#736, `HostApi.post`).
+ *  Unlike `announceTargets`, there is no fallback: an unmapped destination is the caller's rejection to
+ *  make, not a route to fall back through. */
+export function destinationChannel(routing: RoutingFile, plugin: string, guildId: string, destination: string): string | undefined {
+  const entry = entryOf(routing, plugin);
+  const server = entry !== undefined && Object.hasOwn(entry.servers, guildId) ? entry.servers[guildId] : undefined;
+  const map = server?.destinations;
+  return map !== undefined && Object.hasOwn(map, destination) ? map[destination] : undefined;
+}
+
+/** Every destination `plugin` has mapped, across every server it lives in (#736, `HostApi.destinations`)
+ *  -- guilds ordered by `compareIds`, destinations within a guild in the order `Object.keys` gives its
+ *  `destinations` map (insertion order, since it is built key-by-key by `validatePluginRouting`). */
+export function mappedDestinations(routing: RoutingFile, plugin: string): { guildId: string; destination: string; channelId: string }[] {
+  const servers = entryOf(routing, plugin)?.servers ?? {};
+  const guildIds = Object.keys(servers).sort(compareIds);
+  const out: { guildId: string; destination: string; channelId: string }[] = [];
+  for (const guildId of guildIds) {
+    const map = servers[guildId]?.destinations ?? {};
+    for (const destination of Object.keys(map)) out.push({ guildId, destination, channelId: map[destination]! });
+  }
+  return out;
+}
+
 export type GateResult = { allowed: true } | { allowed: false; channels: string[] };
 
 /**
