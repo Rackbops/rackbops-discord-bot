@@ -52,6 +52,7 @@ import {
   writePluginState,
 } from "./plugins/host";
 import { startHostHttp } from "./http";
+import { createTrustedProxy } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
 import { describePlugins, readDiscovery } from "./routing/discovery";
@@ -301,12 +302,23 @@ async function activate(c: Client<true>): Promise<void> {
   // the bot down.
   if (config.httpPort !== undefined) {
     try {
+      // #319: resolved (or explicitly never-trusted) before the listener binds, so the very first
+      // request sees the real address set rather than an empty one racing the first refresh.
+      const proxy = createTrustedProxy({ host: config.trustedProxyHost });
+      if (config.trustedProxyHost === undefined) {
+        console.log(
+          "[http] TRUSTED_PROXY_HOST is not set -- CF-Connecting-IP will never be trusted; every caller shares one rate-limit budget",
+        );
+      } else {
+        await proxy.refresh();
+      }
       const loaded = loadResult.loaded;
       const http = startHostHttp({
         port: config.httpPort,
         maxBodyBytes: HTTP_MAX_BODY_BYTES,
         handle: (request, clientIp) => routeHttpRequest(loaded, request, clientIp, console),
         log: console,
+        proxy,
       });
       stopHttp = http.stop;
     } catch (err) {

@@ -25,6 +25,10 @@ export interface Config {
   /** #220 (ADR-0007): the port the host's HTTP router listens on inside the container. Absent = no
    *  listener at all. */
   httpPort?: number;
+  /** #319: the compose hostname (or IP literal) of this instance's Cloudflare Tunnel sidecar --
+   *  `CF-Connecting-IP` is honored only from a peer that resolves to this. Absent = the header is
+   *  never trusted, matching #220's own fail-closed default. */
+  trustedProxyHost?: string;
 }
 
 /** One `PLUGINS=` token: a bare name, or `name@version` to pin a version. */
@@ -127,6 +131,15 @@ export function resolveConfig(env: Env): Config {
     }
   }
 
+  // #319: the tunnel sidecar CF-Connecting-IP is trusted from. Unset or blank means never trusted
+  // -- fail closed, the same rule #220's own HTTP_PORT above uses. A hostname or an IP literal
+  // (IPv6 included, since a tunnel running on the host reaches the container via the bridge
+  // gateway's address rather than a compose service name).
+  const trustedProxyHost = optional("TRUSTED_PROXY_HOST");
+  if (trustedProxyHost !== undefined && !/^[A-Za-z0-9.:[\]-]+$/.test(trustedProxyHost)) {
+    throw new Error(`TRUSTED_PROXY_HOST must be a hostname or IP address, got "${trustedProxyHost}"`);
+  }
+
   return {
     discordToken: required("DISCORD_TOKEN"),
     announceChannelId,
@@ -144,6 +157,7 @@ export function resolveConfig(env: Env): Config {
     plugins,
     pluginIndexUrl,
     ...(httpPort !== undefined ? { httpPort } : {}),
+    ...(trustedProxyHost !== undefined ? { trustedProxyHost } : {}),
   };
 }
 

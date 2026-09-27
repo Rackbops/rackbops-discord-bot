@@ -1,5 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { startHostHttp } from "./http";
+import { createTrustedProxy, type TrustedProxy } from "./net/clientIp";
+
+// #319: a proxy the loopback peer addresses Bun's OWN fetch/listener pair report for this test file
+// resolve to trusted -- IPv4, IPv6, and IPv4-mapped-IPv6, since which form appears is platform-
+// dependent (src/net/clientIp.test.ts pins the mapped-form canonicalization itself; this just needs
+// every form the CI/dev machines this suite actually runs on could report).
+async function trusted(addrs: string[]): Promise<TrustedProxy> {
+  const proxy = createTrustedProxy({ host: "tunnel", lookup: async () => addrs });
+  await proxy.refresh();
+  return proxy;
+}
+const LOOPBACK_ADDRS = ["127.0.0.1", "::1", "::ffff:127.0.0.1"];
+const untrusted = (): TrustedProxy => createTrustedProxy({ host: undefined });
 
 // A real listener on an OS-assigned port (0), driven by fetch: what the tunnel sees, minus the tunnel.
 describe("startHostHttp (#220)", () => {
@@ -15,6 +28,7 @@ describe("startHostHttp (#220)", () => {
         return new Response("ok");
       },
       log: quiet,
+      proxy: await trusted(LOOPBACK_ADDRS),
     });
     try {
       const res = await fetch(`http://127.0.0.1:${http.port}/music/x`, { headers: { "CF-Connecting-IP": "203.0.113.9" } });
@@ -27,9 +41,52 @@ describe("startHostHttp (#220)", () => {
     }
   });
 
+  test("an untrusted peer's CF-Connecting-IP is ignored -- keyed by the socket address", async () => {
+    const seen: string[] = [];
+    const http = startHostHttp({
+      port: 0,
+      maxBodyBytes: 1024,
+      handle: async (_request, clientIp) => {
+        seen.push(clientIp);
+        return new Response("ok");
+      },
+      log: quiet,
+      proxy: await trusted(["10.0.0.5"]), // the real peer (loopback) is never in this set
+    });
+    try {
+      await fetch(`http://127.0.0.1:${http.port}/music/x`, { headers: { "CF-Connecting-IP": "203.0.113.9" } });
+      expect(seen[0]).toMatch(/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/);
+    } finally {
+      http.stop();
+    }
+  });
+
+  test("with TRUSTED_PROXY_HOST unset the header is never honoured", async () => {
+    const seen: string[] = [];
+    const http = startHostHttp({
+      port: 0,
+      maxBodyBytes: 1024,
+      handle: async (_request, clientIp) => {
+        seen.push(clientIp);
+        return new Response("ok");
+      },
+      log: quiet,
+      proxy: untrusted(),
+    });
+    try {
+      await fetch(`http://127.0.0.1:${http.port}/music/x`, { headers: { "CF-Connecting-IP": "203.0.113.9" } });
+      expect(seen[0]).toMatch(/^(127\.0\.0\.1|::1|::ffff:127\.0\.0\.1)$/);
+    } finally {
+      http.stop();
+    }
+  });
+
   test("a body over maxBodyBytes is refused before the handler runs", async () => {
     let called = 0;
-    const http = startHostHttp({ port: 0, maxBodyBytes: 1024, handle: async () => { called += 1; return new Response("ok"); }, log: quiet });
+    const http = startHostHttp({
+      port: 0, maxBodyBytes: 1024, handle: async () => { called += 1; return new Response("ok"); }, log: quiet,
+      proxy: untrusted(),
+    });
     try {
       const res = await fetch(`http://127.0.0.1:${http.port}/music/x`, { method: "POST", body: "x".repeat(64 * 1024) }).catch(() => undefined);
       expect(res === undefined || res.status === 413).toBe(true);
@@ -41,7 +98,10 @@ describe("startHostHttp (#220)", () => {
 
   test("an empty CF-Connecting-IP falls back to the socket's address", async () => {
     const seen: string[] = [];
-    const http = startHostHttp({ port: 0, maxBodyBytes: 1024, handle: async (_r, ip) => { seen.push(ip); return new Response("ok"); }, log: quiet });
+    const http = startHostHttp({
+      port: 0, maxBodyBytes: 1024, handle: async (_r, ip) => { seen.push(ip); return new Response("ok"); }, log: quiet,
+      proxy: untrusted(),
+    });
     try {
       await fetch(`http://127.0.0.1:${http.port}/x`, { headers: { "CF-Connecting-IP": "" } });
       expect(seen[0]).not.toBe("");
@@ -65,6 +125,7 @@ describe("startHostHttp (#220)", () => {
       maxBodyBytes: 1024,
       handle: (request, ip) => routeHttpRequest([lp], request, ip, { info: () => {}, warn: () => {}, error: () => {} }, 60_000, 1024),
       log: quiet,
+      proxy: untrusted(),
     });
     try {
       const body = new ReadableStream<Uint8Array>({
@@ -100,6 +161,7 @@ describe("startHostHttp (#220)", () => {
       maxBodyBytes: 4096,
       handle: (request, ip) => routeHttpRequest([lp], request, ip, { info: () => {}, warn: () => {}, error: () => {} }, 60_000, 4096),
       log: quiet,
+      proxy: untrusted(),
     });
     try {
       const body = new ReadableStream<Uint8Array>({
@@ -118,7 +180,10 @@ describe("startHostHttp (#220)", () => {
 
   test("after stop(), a request on an already-open (kept-alive) connection gets a 503, not the handler", async () => {
     let called = 0;
-    const http = startHostHttp({ port: 0, maxBodyBytes: 1024, handle: async () => { called += 1; return new Response("ok"); }, log: quiet });
+    const http = startHostHttp({
+      port: 0, maxBodyBytes: 1024, handle: async () => { called += 1; return new Response("ok"); }, log: quiet,
+      proxy: untrusted(),
+    });
     const first = await fetch(`http://127.0.0.1:${http.port}/x`); // opens a keep-alive connection
     await first.text();
     http.stop();
@@ -129,7 +194,9 @@ describe("startHostHttp (#220)", () => {
   });
 
   test("stop() closes the listener", async () => {
-    const http = startHostHttp({ port: 0, maxBodyBytes: 1024, handle: async () => new Response("ok"), log: quiet });
+    const http = startHostHttp({
+      port: 0, maxBodyBytes: 1024, handle: async () => new Response("ok"), log: quiet, proxy: untrusted(),
+    });
     http.stop();
     await Bun.sleep(10);
     await expect(fetch(`http://127.0.0.1:${http.port}/x`)).rejects.toThrow();

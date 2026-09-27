@@ -293,3 +293,24 @@ describe("resolveConfig — HTTP_PORT (#220)", () => {
     }
   });
 });
+
+describe("resolveConfig -- TRUSTED_PROXY_HOST (#319)", () => {
+  test("unset or blank means never trusted: the key is absent", () => {
+    expect("trustedProxyHost" in resolveConfig(base)).toBe(false);
+    expect("trustedProxyHost" in resolveConfig({ ...base, TRUSTED_PROXY_HOST: "" })).toBe(false);
+  });
+
+  test("a compose hostname or an IP literal (v4 or v6) is accepted verbatim", () => {
+    for (const value of ["cloudflared", "172.18.0.1", "fd00::1"]) {
+      expect(resolveConfig({ ...base, TRUSTED_PROXY_HOST: value }).trustedProxyHost).toBe(value);
+    }
+  });
+
+  test("anything that isn't a hostname or IP address is refused at boot, naming the value", () => {
+    for (const bad of ["tunnel host", "a/b"]) {
+      expect(() => resolveConfig({ ...base, TRUSTED_PROXY_HOST: bad })).toThrow(
+        `TRUSTED_PROXY_HOST must be a hostname or IP address, got "${bad}"`,
+      );
+    }
+  });
+});

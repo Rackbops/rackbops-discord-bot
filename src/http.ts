@@ -3,6 +3,7 @@
 // (plugins/host.ts), pure and tested without a socket. Started from index.ts's `activate()` — after
 // `takeOver()`, so a standby never binds it — and only when `HTTP_PORT` is set. `docker-compose.yml`
 // publishes no host port for it: the only way in is the instance's own tunnel.
+import { clientIpFrom, type TrustedProxy } from "./net/clientIp";
 
 /** One request, as the router needs it: the `Request` and the client's address. */
 export type HostHttpHandler = (request: Request, clientIp: string) => Promise<Response>;
@@ -10,10 +11,10 @@ export type HostHttpHandler = (request: Request, clientIp: string) => Promise<Re
 /**
  * Binds `port` on every interface inside the container (the tunnel reaches the bot over the compose
  * network, which a loopback bind would refuse) and hands each request to `handle`. `CF-Connecting-IP`
- * is the client's address when present and non-empty — trusted with the same caveat as the plugins'
- * own servers (ADR-0007 decision 2) — else the socket's. `maxBodyBytes` becomes Bun's
- * `maxRequestBodySize`, which bounds only a body that declares its length; `routeHttpRequest`
- * enforces the same cap on every body, chunked included.
+ * is the client's address only when the peer is a resolved address of `opts.proxy` (#319,
+ * src/net/clientIp.ts) — otherwise the socket's, same as when the header is absent. `maxBodyBytes`
+ * becomes Bun's `maxRequestBodySize`, which bounds only a body that declares its length;
+ * `routeHttpRequest` enforces the same cap on every body, chunked included.
  *
  * `stop()` answers every request that arrives afterwards with `503` and `Connection: close` —
  * `server.stop()` alone only closes the listening socket, and cloudflared keeps its connections to the
@@ -24,6 +25,7 @@ export function startHostHttp(opts: {
   maxBodyBytes: number;
   handle: HostHttpHandler;
   log: Pick<Console, "log" | "error">;
+  proxy: TrustedProxy;
 }): { port: number; stop: () => void } {
   let closing = false;
   const server = Bun.serve({
@@ -32,7 +34,7 @@ export function startHostHttp(opts: {
     idleTimeout: 30,
     fetch: (req, srv) => {
       if (closing) return new Response("Unavailable\n", { status: 503, headers: { connection: "close" } });
-      const clientIp = req.headers.get("CF-Connecting-IP") || srv.requestIP(req)?.address || "unknown";
+      const clientIp = clientIpFrom(req, srv.requestIP(req)?.address, opts.proxy);
       return opts.handle(req, clientIp);
     },
     // `handle` never rejects (routeHttpRequest answers every failure itself); this is the backstop.
