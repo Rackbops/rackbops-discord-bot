@@ -277,6 +277,14 @@ describe("index.ts wiring", () => {
       expect((source.match(/createTrustedProxy\(\{\s*host:\s*config\.trustedProxyHost\s*\}\)/g) ?? []).length).toBe(1);
       expect(source.indexOf("createTrustedProxy({", activateFn)).toBeGreaterThan(activateFn);
       expect(source.indexOf("createTrustedProxy({", activateFn)).toBeLessThan(start);
+      // #319: the startup refresh is awaited (not fire-and-forget) between building the proxy and
+      // starting the listener, so the very first tunnel request after boot sees the real resolved
+      // address set rather than an empty one racing the first cache-miss-triggered refresh -- a
+      // mutation dropping this await left every other assertion here green.
+      expect(source.indexOf("await proxy.refresh();", activateFn)).toBeGreaterThan(
+        source.indexOf("createTrustedProxy({", activateFn),
+      );
+      expect(source.indexOf("await proxy.refresh();", activateFn)).toBeLessThan(start);
     });
 
     test("a bind failure is caught, and shutdown stops the listener before it disposes plugins", () => {
