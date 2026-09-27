@@ -37,6 +37,10 @@ route.
    - `info.clientIp` is `CF-Connecting-IP`, falling back to the socket address, computed once by the
      host. The same trust caveat applies as in warbandeer's and music's own servers: Cloudflare sets
      that header for anything that really transits its network, but nothing re-verifies it.
+     **Amended 2026-09-27 (#319):** that gap is closed. The header is honoured only from a peer
+     address that resolves to the deployment's own Cloudflare Tunnel sidecar (`TRUSTED_PROXY_HOST`,
+     `src/net/clientIp.ts`); anything else falls back to the real connection peer, same as an absent
+     header. Unset means never trusted, matching decision 3's own fail-closed `HTTP_PORT` rule.
    - `request` is the untouched `Request`, full URL included, for anything else (headers, query,
      body).
    - A plugin never needs to know where it is mounted.

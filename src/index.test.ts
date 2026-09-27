@@ -270,6 +270,13 @@ describe("index.ts wiring", () => {
       expect(call).toMatch(/port:\s*config\.httpPort,/);
       expect(call).toMatch(/maxBodyBytes:\s*HTTP_MAX_BODY_BYTES,/);
       expect(call).toMatch(/handle:\s*\(request,\s*clientIp\)\s*=>\s*routeHttpRequest\(loaded,\s*request,\s*clientIp,\s*console\),/);
+      // #319: the trust proxy is threaded into the same call, built once inside activate() from the
+      // resolved config rather than defaulted -- a caller that drops it is a `bun run check` type
+      // error (D1), not a silently-unconditionally-trusting listener.
+      expect(call).toMatch(/proxy,/);
+      expect((source.match(/createTrustedProxy\(\{\s*host:\s*config\.trustedProxyHost\s*\}\)/g) ?? []).length).toBe(1);
+      expect(source.indexOf("createTrustedProxy({", activateFn)).toBeGreaterThan(activateFn);
+      expect(source.indexOf("createTrustedProxy({", activateFn)).toBeLessThan(start);
     });
 
     test("a bind failure is caught, and shutdown stops the listener before it disposes plugins", () => {
