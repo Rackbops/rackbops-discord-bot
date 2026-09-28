@@ -422,33 +422,49 @@ config env var (`WARBANDEER_OPS_CONFIG` / `WOW_COMPANION_OPS_CONFIG`).
     {
       "name": "debug",
       "ssh": "roshne@192.168.7.48",
-      "remoteDir": "~/repos/wow-debug/apps/warbandeer-discord",
-      "project": "warbandeer-discord-debug",
-      "container": "warbandeer-discord"
+      "remoteDir": "/opt/rackbops-discord-bot/bin",
+      "project": "rackbops-discord-bot-debug",
+      "container": "rackbops-discord-bot-debug",
+      "configDir": "/opt/rackbops-discord-bot/debug",
+      "composeFile": "/opt/stacks/rackbops-discord-bot-debug/docker-compose.yml",
+      "scriptPath": "/opt/rackbops-discord-bot/bin/bot-ops.sh"
+    },
+    {
+      "name": "prod",
+      "ssh": "roshne@192.168.7.48",
+      "remoteDir": "/opt/rackbops-discord-bot/bin",
+      "project": "rackbops-discord-bot-prod",
+      "container": "rackbops-discord-bot-prod",
+      "configDir": "/opt/rackbops-discord-bot/prod",
+      "composeFile": "/opt/stacks/rackbops-discord-bot-prod/docker-compose.yml",
+      "scriptPath": "/opt/rackbops-discord-bot/bin/bot-ops.sh"
     }
   ]
 }
 ```
 
-Per target: `name` (the switch label), `ssh` (SSH destination), `remoteDir` (the bot dir on that
-host — historically the same directory as `.env`/`docker-compose.yml`), and the compose `project`
-/ `container` (optional; default to the debug bot's `warbandeer-discord-debug` /
-`warbandeer-discord`). The panel runs
-`ssh <ssh> "BOT_OPS_PROJECT=<project> BOT_OPS_CONTAINER=<container> bash <remoteDir>/ops/bot-ops.sh …"`,
-reusing your existing key — so key-based SSH to that host (as a user in the `docker` group, no sudo)
-must already work.
+Per target:
+- `name` is the switch label, and `ssh` is the SSH destination.
+- `project` and `container` are the compose project and container. Both are optional, but the
+  defaults are the old `nazumods/wow` debug bot's (`warbandeer-discord-debug` /
+  `warbandeer-discord`), so set them for an instance of this bot.
+- `configDir`, `composeFile` and `scriptPath` are for an instance laid out as described above. Set
+  all three or none: the backend refuses a target with only some of them. They become
+  `BOT_OPS_CONFIG_DIR`, `BOT_OPS_COMPOSE_FILE` and the path to the shared script.
+- `remoteDir` is still a required field, but it is unused once `scriptPath` is set. Without
+  `scriptPath`, the script is taken to be `<remoteDir>/ops/bot-ops.sh`, which only fits a
+  pre-migration checkout deploy.
 
-**Known gap since the config-dir/compose-file split above: this `ops.json` shape can't drive a
-migrated instance yet.** The panels only pass `BOT_OPS_PROJECT`/`BOT_OPS_CONTAINER` —
-`BOT_OPS_CONFIG_DIR` and `BOT_OPS_COMPOSE_FILE` are now also required by `bot-ops.sh`, and neither
-app nor the shared `apps/bot-ops` backend has a field for them yet — tracked as
-[roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197) (the design doc's
-Q4, `opsCmd`/`configDir` fields). Until that lands, a
-target pointed at a migrated instance needs its invocation hand-adjusted; the panels work
-unmodified only against a pre-migration, `remoteDir`-shaped deploy.
+With all three set, the panel runs
+`ssh <ssh> "BOT_OPS_PROJECT=<project> BOT_OPS_CONTAINER=<container> BOT_OPS_CONFIG_DIR='<configDir>' BOT_OPS_COMPOSE_FILE='<composeFile>' bash '<scriptPath>' …"`,
+reusing your existing key. So key-based SSH to that host must already work, as a user in the
+`docker` group with no sudo. The shared backend (`nazumods/wow` `apps/bot-ops`) gained these three
+fields for
+[roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197).
 
-The old single-bot shape still works for what it invokes: `{ "ssh": "...", "remoteDir": "..." }`
-is read as one `debug` target. Shipped builds without an `ops.json` never show the tab.
+The old single-bot shape, `{ "ssh": "...", "remoteDir": "..." }`, is still read as one `debug`
+target, but only works against the old, pre-migration contract. Shipped builds without an
+`ops.json` never show the tab.
 
 ## Standing up prod
 

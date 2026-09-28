@@ -474,11 +474,12 @@ _Avoid_: server list, guild cache
   - `ops/bot-ops.sh`'s consumers — `apps/warbandeer-desktop`'s and `wow-companion`'s **Ops**
     tabs, plus the shared `apps/bot-ops` backend — live in the original monorepo and
     `roshne/wow-companion`, not here. The script itself still works over a direct SSH
-    invocation (see `ops/README.md`'s "Run directly on the box" example) — but a caller now
-    must also pass `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` (see the config-dir gotcha
-    below), which neither app's `ops.json` has a field for yet. Tracked as
-    [roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197) (the design
-    doc's Q4: `opsCmd`/`configDir` fields).
+    invocation (see `ops/README.md`'s "Run directly on the box" example). A caller must also
+    pass `BOT_OPS_CONFIG_DIR` + `BOT_OPS_COMPOSE_FILE` (see the config-dir gotcha below).
+    ~~Neither app's `ops.json` has a field for them~~: **resolved** by
+    [roshne/wow-companion#197](https://github.com/roshne/wow-companion/issues/197). The shared
+    backend gained `configDir`/`composeFile`/`scriptPath` target fields (nazumods/wow#940), set
+    together or not at all. See `ops/README.md`'s "Enabling a panel" example.
   - ~~No CI~~ — **resolved**: `.github/workflows/ci.yml` now runs `bun run check` + `bun test`
     on every pull request (`on: pull_request` — not a direct push to `main`), a fork-native
     workflow rather than a carry-over of the original monorepo's path-scoped
