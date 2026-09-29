@@ -81,8 +81,8 @@ export interface HostCard {
 /**
  * One interactive button (#323). `customId` must start with `<name>:` (this plugin's manifest name +
  * colon) and be at most 100 characters, so a press routes back to this plugin's `interactions`;
- * `label` is 1..80 characters. `style` defaults to `"secondary"`; a host that predates `style`
- * refuses `buttons` outright, so it never silently drops it.
+ * `label` is 1..80 characters; `style` defaults to `"secondary"`. The prefix rule is the Host API's
+ * only: a plugin answering a raw interaction itself can still attach any components it likes.
  */
 export interface HostButton {
   customId: string;
@@ -92,10 +92,14 @@ export interface HostButton {
 
 /**
  * What `post`/`dm`/`edit` accept. `buttons` are rendered (#323) as action rows of at most 5, in list
- * order, ahead of the one row of `links`; at most 5 rows in all, and customIds unique per message. A
- * host that predates #323 refuses `buttons` with a clean rejection, so feature-detect by trying. On
- * `edit`, giving `buttons` or `links` replaces every button row the message had (`buttons: []`
- * removes them; `links: []` alone changes nothing, as before #323); giving neither leaves them be.
+ * order, ahead of the one row of `links`; at most 5 rows in all, customIds unique per message, and
+ * refused unless this plugin declares `interactions`. A host that predates #323 refuses `buttons`
+ * with "interactive buttons are not supported yet"; a plugin that must work on either host retries
+ * without `buttons` on any refusal. On `edit`, `buttons` or `links` replaces every row the message
+ * had -- `edit(d, { links: [{ label: "Open", url }] })` leaves only that link, dropping its buttons,
+ * and `buttons: []` removes them all -- while `links: []` alone, or neither, leaves the rows as they
+ * are. `edit` is bot-scoped, not plugin-scoped: any plugin can edit any delivery this bot made,
+ * another plugin's buttons included.
  */
 export interface HostMessage {
   content: string;

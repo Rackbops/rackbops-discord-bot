@@ -313,6 +313,19 @@ describe("validateHostMessage: buttons (#323)", () => {
     expect(rowsOf(validateHostMessage({ buttons: btns(3) }, E))).toHaveLength(1);
   });
 
+  test("edit: non-empty links alone is the whole new row set (only the links row)", () => {
+    const rows = rowsOf(validateHostMessage({ links: [{ label: "Open", url: "https://a.example" }] }, { partial: true, pluginName: "feed" }));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.components.map((c) => c.style)).toEqual([ButtonStyle.Link]);
+  });
+
+  test("invalid links are refused before buttons are counted into rows", () => {
+    // Six links is itself invalid; it must be reported as that, not as a row overflow computed from it.
+    const sixLinks = Array.from({ length: 6 }, () => ({ label: "l", url: "https://a.example" }));
+    const result = validateHostMessage({ content: "hi", buttons: btns(25), links: sixLinks }, P);
+    expect(result).toEqual({ ok: false, reason: `more than ${LIMITS.LINKS_MAX} link buttons` });
+  });
+
   test("edit: links: [] alone still sends no components key, exactly as before #323", () => {
     const result = validateHostMessage({ links: [] }, { partial: true, pluginName: "feed" });
     expect(result).toEqual({ ok: true, payload: { allowedMentions: { parse: [] } } });

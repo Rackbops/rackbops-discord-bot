@@ -28,6 +28,8 @@ const {
   writePluginState,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
+  answerUnclaimedPress,
+  UNCLAIMED_PRESS_REPLY,
   dispatchPluginAutocomplete,
   AUTOCOMPLETE_GATE_TIMEOUT_MS,
   AUTOCOMPLETE_TIMEOUT_MS,
@@ -204,6 +206,7 @@ describe("createHostApi: delivery (#736)", () => {
       sendToChannel: HostDeliveryDeps["sendToChannel"];
       sendDm: HostDeliveryDeps["sendDm"];
       editOwnMessage: HostDeliveryDeps["editOwnMessage"];
+      handlesInteractions: boolean;
     }> = {},
   ) {
     const calls: string[] = [];
@@ -229,6 +232,7 @@ describe("createHostApi: delivery (#736)", () => {
         calls.push("editOwnMessage");
         if (over.editOwnMessage) await over.editOwnMessage(channelId, messageId, payload);
       },
+      handlesInteractions: () => over.handlesInteractions ?? true,
     };
     return { deps, calls };
   }
@@ -434,6 +438,50 @@ describe("createHostApi: delivery (#736)", () => {
     expect(calls).toEqual([]);
   });
 
+  test("post, dm and edit refuse buttons from a plugin with no interactions handler, before any dep call", async () => {
+    const { deps, calls } = fakeDeps({ handlesInteractions: false });
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    const buttons = [{ customId: "feed:x", label: "x" }];
+    const reason = "buttons need this plugin to declare an interactions handler";
+    await expect(host.post!(HOME, "news", { content: "hi", buttons })).rejects.toThrow(reason);
+    await expect(host.dm!(USER, { content: "hi", buttons })).rejects.toThrow(reason);
+    await expect(host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, { buttons })).rejects.toThrow(reason);
+    expect(calls).toEqual([]);
+  });
+
+  test("without an interactions handler, edit may still clear rows with buttons: [], and post plain messages", async () => {
+    const { deps, calls } = fakeDeps({ handlesInteractions: false });
+    const host = hostWith({ delivery: deps });
+    await host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, { buttons: [] });
+    await host.dm!(USER, { content: "hi" });
+    expect(calls).toEqual(["editOwnMessage", "sendDm"]);
+  });
+
+  test("the interactions check is asked at call time, not when the HostApi is built", async () => {
+    let handles = false;
+    const { deps } = fakeDeps();
+    deps.handlesInteractions = () => handles;
+    const host = hostWith({ delivery: deps });
+    const msg = { content: "hi", buttons: [{ customId: "feed:x", label: "x" }] };
+    await expect(host.dm!(USER, msg)).rejects.toThrow("interactions handler");
+    handles = true; // the plugin's module is now loaded, with `interactions`
+    await expect(host.dm!(USER, msg)).resolves.toMatchObject({ messageId: "m2" });
+  });
+
+  test("edit with only non-empty links replaces every row, interactive buttons included", async () => {
+    let sent: unknown;
+    const { deps } = fakeDeps({
+      editOwnMessage: async (_c, _m, payload) => {
+        sent = payload;
+      },
+    });
+    const host = hostWith({ delivery: deps });
+    await host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, { links: [{ label: "Open", url: "https://a.example" }] });
+    const rows = componentsOf(sent)!;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.components.map((c) => c.style)).toEqual([ButtonStyle.Link]);
+  });
+
   test("destinations lists only mapped + declared destinations, named from discovery, falling back to the id", async () => {
     const routing = routingWith({
       feed: {
@@ -486,6 +534,7 @@ describe("createHostApi: delivery (#736)", () => {
       sendToChannel: unused,
       sendDm: unused,
       editOwnMessage: unused,
+      handlesInteractions: () => false,
     };
     const posted: string[] = [];
     const makeHost = (e: PluginIndexEntry): HostApi =>
@@ -1498,6 +1547,42 @@ describe("routeInteractionByPrefix", () => {
   // not a fuzzy match either way), but pin it so both directions are covered, not just one.
   test("a segment that is a strict PREFIX of a real plugin name does not match either", () => {
     expect(routeInteractionByPrefix("wo:x", ["wow"])).toBeUndefined();
+  });
+});
+
+describe("answerUnclaimedPress (#323)", () => {
+  test("logs the prefix only, and replies ephemerally", async () => {
+    const { log, calls } = makeLog();
+    const replies: unknown[] = [];
+    await answerUnclaimedPress(fakeInteraction("tracker:done:user-secret-123", { reply: async (o) => void replies.push(o) }), log);
+    expect(calls).toEqual([
+      { level: "warn", message: '[plugins] a button press with prefix "tracker" was not claimed by any running plugin' },
+    ]);
+    expect(replies).toEqual([{ content: UNCLAIMED_PRESS_REPLY, flags: 64 }]);
+  });
+
+  test("a customId with no prefix is logged as (none)", async () => {
+    const { log, calls } = makeLog();
+    await answerUnclaimedPress(fakeInteraction("nocolon"), log);
+    expect(calls[0]!.message).toContain("prefix (none)");
+    expect(calls[0]!.message).not.toContain("nocolon");
+  });
+
+  test("does not reply when something already replied or deferred", async () => {
+    const { log } = makeLog();
+    let replied = 0;
+    const reply = async () => void replied++;
+    await answerUnclaimedPress(fakeInteraction("x:y", { replied: true, reply }), log);
+    await answerUnclaimedPress(fakeInteraction("x:y", { deferred: true, reply }), log);
+    expect(replied).toBe(0);
+  });
+
+  test("a failing reply is swallowed", async () => {
+    const { log } = makeLog();
+    const reply = async () => {
+      throw new Error("Unknown interaction");
+    };
+    await expect(answerUnclaimedPress(fakeInteraction("x:y", { reply }), log)).resolves.toBeUndefined();
   });
 });
 

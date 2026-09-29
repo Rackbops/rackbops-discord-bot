@@ -247,7 +247,8 @@ export function validateHostMessage(message: unknown, opts: { partial: boolean; 
   const hasCard = m.card !== undefined;
   const hasLinks = m.links !== undefined;
   const hasButtons = m.buttons !== undefined;
-  if (hasButtons && opts.pluginName === undefined) return { ok: false, reason: "interactive buttons are not supported here" };
+  const { pluginName } = opts;
+  if (hasButtons && pluginName === undefined) return { ok: false, reason: "interactive buttons are not supported here" };
   if (opts.partial && !hasContent && !hasCard && !hasLinks && !hasButtons) {
     return { ok: false, reason: "at least one of content, card, links or buttons must be present" };
   }
@@ -272,24 +273,27 @@ export function validateHostMessage(message: unknown, opts: { partial: boolean; 
 
   let components: APIActionRowComponent<APIButtonComponent>[] | undefined;
   if (hasButtons || hasLinks) {
-    components = [];
-    if (hasButtons) {
-      const shape = validateButtons(m.buttons, opts.pluginName as string);
+    // Links first, so the row count below is taken from a validated list, not raw caller input.
+    let links: HostLinkButton[] = [];
+    if (hasLinks) {
+      const shape = validateLinks(m.links);
       if (!shape.ok) return shape;
-      const rows = Math.ceil(shape.value.length / LIMITS.BUTTONS_PER_ROW) + (hasLinks && Array.isArray(m.links) && m.links.length > 0 ? 1 : 0);
+      links = shape.value;
+    }
+    components = [];
+    if (hasButtons && pluginName !== undefined) {
+      const shape = validateButtons(m.buttons, pluginName);
+      if (!shape.ok) return shape;
+      const rows = Math.ceil(shape.value.length / LIMITS.BUTTONS_PER_ROW) + (links.length > 0 ? 1 : 0);
       if (rows > LIMITS.ROWS_MAX) return { ok: false, reason: `buttons and links need more than ${LIMITS.ROWS_MAX} rows` };
       const built = buildButtonRows(shape.value);
       if (!built.ok) return built;
       components.push(...built.value);
     }
-    if (hasLinks) {
-      const shape = validateLinks(m.links);
-      if (!shape.ok) return shape;
-      if (shape.value.length > 0) {
-        const built = buildLinksRow(shape.value);
-        if (!built.ok) return built;
-        components.push(built.value);
-      }
+    if (links.length > 0) {
+      const built = buildLinksRow(links);
+      if (!built.ok) return built;
+      components.push(built.value);
     }
     // Before #323 a present-but-empty `links` sent no `components` key at all (an edit left the
     // message's rows alone); keep exactly that when `buttons` is absent, so a pre-#323 caller sees

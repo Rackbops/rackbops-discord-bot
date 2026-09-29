@@ -34,6 +34,7 @@ import type { InstallResult } from "./plugins/install";
 import type { LoadedPlugin, LoadResult, PluginCommandMap } from "./plugins/host";
 import {
   activatePlugins,
+  answerUnclaimedPress,
   buildCommandBody,
   createHostApi,
   createPluginTickControl,
@@ -192,6 +193,9 @@ async function activate(c: Client<true>): Promise<void> {
           sendToChannel: (channelId, payload) => sendPayloadToChannel(client, channelId, payload),
           sendDm: (userId, payload) => sendPayloadDm(client, userId, payload),
           editOwnMessage: (channelId, messageId, payload) => editOwnMessage(client, channelId, messageId, payload),
+          // #323: read at call time -- loadResult is assigned once loadPlugins returns, after this host exists.
+          handlesInteractions: () =>
+            typeof loadResult.loaded.find((lp) => lp.entry.name === entry.name)?.plugin.interactions === "function",
         },
       });
     loadResult = await loadPlugins(
@@ -236,7 +240,9 @@ async function activate(c: Client<true>): Promise<void> {
       } else if (interaction.isMessageComponent() || interaction.isModalSubmit()) {
         // #185: core's report: modal check above always wins that prefix, regardless of what
         // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
-        await dispatchPluginInteraction(loadResult.loaded, interaction, console);
+        const claimed = await dispatchPluginInteraction(loadResult.loaded, interaction, console);
+        // #323: a press no running plugin answers gets a short ephemeral reply, not "This interaction failed".
+        if (!claimed && interaction.isMessageComponent()) await answerUnclaimedPress(interaction, console);
       } else if (interaction.isAutocomplete()) {
         // #287: a plugin command's picker goes to its autocomplete(), behind the same routing gate as the
         // command; everything else — core declares no autocomplete option — gets an empty list at once

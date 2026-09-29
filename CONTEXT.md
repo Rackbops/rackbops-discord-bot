@@ -373,7 +373,18 @@ _Avoid_: server list, guild cache
   another plugin's prefix, or core's `report:`, is refused before any Discord call, so a message can
   never carry a button whose press would be routed somewhere other than its sender. Presses are not
   routing-gated (they belong to a message already delivered), and the plugin must still reply or
-  defer itself within Discord's 3 s, exactly like any other component interaction.
+  defer itself within Discord's 3 s, exactly like any other component interaction. The prefix rule
+  covers Host API messages only: an in-process plugin replying to a raw interaction can still attach
+  any components it likes. `buttons` is also refused when the sending plugin declares no
+  `interactions` (checked at call time through `HostDeliveryDeps.handlesInteractions`, since the
+  HostApi exists before the module does). A press no running plugin claims -- plugin gone, disabled,
+  not yet running, or without `interactions` -- is logged by prefix only and answered with an
+  ephemeral "This button is no longer available." (`answerUnclaimedPress`), not Discord's "This
+  interaction failed". **`edit` is bot-scoped, not plugin-scoped**: any plugin can edit any delivery
+  this bot made, including another plugin's buttons, and an edit that gives only non-empty `links`
+  (`{ links: [{ label, url }] }`) replaces every row, dropping the interactive buttons. An older
+  host refuses `buttons` with "interactive buttons are not supported yet" -- the marker for a pre-#323
+  host; a plugin can simply retry without `buttons` on any refusal.
 
 - **`BOT_DATA_DIR` is a test seam and a production footgun (#139).** It relocates the whole data
   directory, which is what stops `bun test` reading and writing the developer's real

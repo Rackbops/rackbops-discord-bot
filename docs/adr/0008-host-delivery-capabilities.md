@@ -54,7 +54,11 @@ as the bot, contract version unchanged.
   **Update (#323):** shipped once the task tracker needed them (Rackbops/Tooling#816). `buttons` is
   now rendered as action rows (at most 5 per row, 5 rows in all including the `links` row), each
   customId must start with the calling plugin's `<name>:`, and `HostButton.style` was added as an
-  optional field — additive, no `HOST_API_VERSION` bump; an older host still refuses `buttons`.
+  optional field — additive, no `HOST_API_VERSION` bump; an older host still refuses `buttons`, with
+  "interactive buttons are not supported yet". `buttons` is refused from a plugin with no
+  `interactions` handler, and an unclaimed press gets an ephemeral "no longer available" reply.
+  Decision 4 carries over unchanged: `edit` is bot-scoped, so a plugin can edit — or strip — another
+  plugin's buttons; the prefix rule binds Host API messages only, not a plugin's own raw replies.
 
 ## Consequences
 
