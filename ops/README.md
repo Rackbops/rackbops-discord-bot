@@ -256,7 +256,7 @@ itself owns (a core credential, or a variable `docker-compose.yml` interpolates)
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
 `HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
 `Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`, and the HTTP
-router's `HTTP_PORT` (#220) and `TRUSTED_PROXY_HOST` (#319) — all `RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
+router's `HTTP_PORT` (#220) and `TRUSTED_PROXY_HOST` (#319), and `LOG_FORMAT` (#324) — all `RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
 spellings of each proxy variable, since Bun's `fetch` honours upper- and lower-case alike
 (`HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`), and `TAR_OPTIONS`
 (also `RESERVED_KEYS`, #280) —
@@ -327,7 +327,7 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   `docker-compose.yml` interpolates, the settings the core reads that the panel does not edit
   (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
   `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
-  `SHARDING_MANAGER_MODE`, #278; the HTTP router's `HTTP_PORT`, #220, and `TRUSTED_PROXY_HOST`, #319), and the variables that act on the core's own outbound calls or on a
+  `SHARDING_MANAGER_MODE`, #278; the HTTP router's `HTTP_PORT`, #220, and `TRUSTED_PROXY_HOST`, #319; `LOG_FORMAT`, #324), and the variables that act on the core's own outbound calls or on a
   tool it spawns — both spellings of each proxy variable (`HTTP_PROXY`/`http_proxy`,
   `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`) and `TAR_OPTIONS` (#280) — is
   dropped from every plugin path whatever the manifest says, on or off
@@ -484,6 +484,226 @@ debug's identity. Once bootstrapped, give it an `ops.json` target once the panel
 closed; until then, manage it directly (the fetched `/opt/rackbops-discord-bot/bin/bot-ops.sh`
 over SSH, or `ops/install.sh`'s own
 printed commands).
+
+## A Rackbops Clerk instance (the task tracker)
+
+The task tracker (`@rackbops/plugin-tracker`, Rackbops/rackbops-bot-plugins `plugins/tracker`) runs
+on an instance of its own, logged in as the **Rackbops Clerk** Discord application (#324; plan of
+record: Rackbops/Tooling `research/city-hall-task-tracker.md`, E3 and items 19 and 39). It is an
+ordinary `ops/install.sh` instance -- here called `clerk` -- configured so that:
+
+- **commands register globally and work in DMs.** `DISCORD_SERVER_ID` stays blank and
+  `data/routing.json` places no plugin, so registration is the one global PUT
+  (`src/routing/register.ts:56-59`, `:128-131`), and the routing gate lets every command typed in a
+  DM through (`src/routing/gate.ts:105`). No command sets Discord's `contexts`, so Discord's default
+  applies (see step 1).
+- **it loads the tracker and nothing else** (`PLUGINS=tracker`). The core commands `/update`,
+  `/plugins` and `/report` still register next to the tracker's: they are part of the core, not a
+  plugin. `/report` says it is not configured while `REPORT_ROLE_ID` is blank. `/update` and
+  `/plugins` carry `setDefaultMemberPermissions(0)`, which hides them from non-admins in a server,
+  but in a DM they are probably visible to everyone (**inferred**): there, the only protection is
+  the handler's own refusal of anyone not in `ADMIN_USER_IDS` (`src/commands.ts:37-55`).
+- **the tracker's HTTP is reachable through the instance's own tunnel**: the host router serves
+  every plugin under `/<plugin-name>/` on `HTTP_PORT` inside the container (`src/plugins/host.ts`,
+  `routeHttpRequest`; ADR-0007), with no host port published. Today the tracker serves only
+  `/tracker/healthz`; its web area (E5) will live under the same prefix.
+
+**Secrets.** The one application secret is `DISCORD_TOKEN` (Clerk's own bot token). Beside it sit
+the panel's `ADMIN_TOKEN`, which `install.sh` generates for every instance, and
+`CLOUDFLARE_TUNNEL_TOKEN`, which every tunnelled instance has. There is **no city-hall or usr credential yet**: the reminder slice
+never calls city-hall, and rev17 took people out of usr, so nothing here needs one until the
+execute lane is built (and that waits on the Lepid-Labs side, plan item 25). There is **no
+subscription token and no `ANTHROPIC_*` variable, ever** (plan 5.12): model calls run in
+Rackbops/docket-runner, not in this bot.
+
+**Precondition: reads gated (plan 5.10).** Every read of the tracker's store needs an identity and
+returns only what that identity may see. For this slice the tracker meets it in the plugin itself:
+every command and button passes its membership and admission gates, and `/task history` reads
+through docket's owner / recipient / admin check; the only HTTP route, `/tracker/healthz`, returns
+a status and a timestamp and nothing about anyone. The web area (E5) must keep to the same rule
+before it is exposed.
+
+### 1. The Discord application
+
+Create **Rackbops Clerk** at <https://discord.com/developers/applications> under roshne's account,
+distinct from every other bot. On **Bot**, copy the token and leave every privileged intent off
+(the tracker declares none). On **Installation**, keep **Guild Install** with the scopes `bot` and
+`applications.commands`, and invite Clerk to the tracker's server (the `TRACKER_GUILD_ID` one, so
+its membership lookup works). A command with no `contexts` of its own gets Discord's default, which
+takes in the bot's DMs, so a person who shares that server with Clerk can use the commands in a DM
+with it (**inferred** from Discord's documentation, not yet seen on a live Clerk). **User Install**
+is not needed for that and is left off.
+
+### 2. The tunnel
+
+In the Cloudflare Zero Trust dashboard, create a tunnel for this instance (Networks -> Tunnels ->
+create -> Docker connector) and copy its token: it goes into `.env` in the next step. Give it one
+public hostname, `clerk.<domain>`, with the service `http://rackbops-discord-bot-clerk:8080` --
+the container **name**, not the `bot` alias a self-update's replacement also carries (see
+`HTTP_PORT` in `.env.example`). No Access application is put in front of it for now: the one
+route is the health check, which a monitor has to reach. Revisit when the web area (E5) lands.
+
+### 3. Bootstrap and `.env`
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh \
+  | bash -s -- clerk
+```
+
+Then, in the instance's config-dir `.env` (the hand-edited one; `install.sh` never touches it
+again):
+
+Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-ops.sh` strips a
+`# comment` written after a value.
+
+```sh
+DISCORD_TOKEN=<Clerk's bot token>
+# Required by the core: release announcements for GITHUB_REPO land here. A private channel in the
+# tracker's server that Clerk can post in.
+ANNOUNCE_CHANNEL_ID=<channel id>
+# Blank: global registration, commands in DMs.
+DISCORD_SERVER_ID=
+# Blank: Clerk is its own application, nothing to collide with.
+COMMAND_PREFIX=
+GITHUB_REPO=Rackbops/rackbops-discord-bot
+BOT_BRANCH=main
+ADMIN_USER_IDS=<roshne's Discord user id>
+AUTO_UPDATE=false
+PLUGINS=tracker
+# Any free port; only the tunnel reaches it.
+HTTP_PORT=8080
+# The tunnel sidecar's compose service name.
+TRUSTED_PROXY_HOST=cloudflared
+LOG_FORMAT=json
+TRACKER_ADMIN_DISCORD_IDS=<roshne's Discord user id>
+TRACKER_GUILD_ID=<the tracker server's id>
+CLOUDFLARE_TUNNEL_TOKEN=<this instance's tunnel token>
+```
+
+Everything else (`REPORT_ROLE_ID`, `GITHUB_TOKEN`, the warbandeer and wow keys) stays blank.
+`TRACKER_GUILD_ID` may be left blank -- then only the admission list gates the tracker, and the
+plugin logs a warning each time it activates -- but set it.
+
+**Never place the tracker.** A `routing-set` from the panel, or a hand-written `data/routing.json`,
+that places a plugin switches the instance to routed mode: per-server registration, the global list
+emptied, and the commands gone from DMs (`src/routing/register.ts:61-72`, `:143-146`). Check with
+`bot-ops.sh routing-get`: `routing` is `null`, or places no plugin.
+
+### 4. Up
+
+Bring the bot up with `install.sh`'s printed step 2, then the tunnel sidecar with its step 5 (the
+`--profile tunnel` command).
+
+### 5. Health
+
+```sh
+curl -sS https://clerk.<domain>/tracker/healthz
+```
+
+`200` with `{"status":"ok"}` (or `"starting"` in the first minutes) while the notify lane ticks.
+The tracker's own `503` is JSON: `stale` when the last good tick is more than three minutes old,
+`blocked` when the lane cannot run at all. A plugin that is loaded but not running never reaches
+the tracker: the host router answers a plain-text `503 Unavailable` itself
+(`src/plugins/host.ts:827`). A host-router `404` means the tracker did not load (read the logs);
+no answer at all means `HTTP_PORT` or the tunnel. From the host,
+without the tunnel:
+
+```sh
+docker exec rackbops-discord-bot-clerk bun -e \
+  'const r = await fetch("http://127.0.0.1:8080/tracker/healthz"); console.log(r.status, await r.text()); process.exit(r.ok ? 0 : 1)'
+```
+
+Docker restarts a process that exits, not one that hangs, so point a monitor at the public URL and
+alert on anything but `200`.
+
+### 6. Restart, and logs
+
+The named restart path is `bot-ops.sh` with this instance's identity (`install.sh`'s printed
+step 3):
+
+```sh
+export BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/clerk
+export BOT_OPS_COMPOSE_FILE=/opt/stacks/rackbops-discord-bot-clerk/docker-compose.yml
+export BOT_OPS_PROJECT=rackbops-discord-bot-clerk
+export BOT_OPS_CONTAINER=rackbops-discord-bot-clerk
+# Same containers, same env.
+bash /opt/rackbops-discord-bot/bin/bot-ops.sh restart
+# Re-reads .env (the panel's Restart).
+bash /opt/rackbops-discord-bot/bin/bot-ops.sh recreate
+bash /opt/rackbops-discord-bot/bin/bot-ops.sh logs 200
+```
+
+`restart` is `docker compose restart` over the whole project, so the panel and the tunnel sidecar
+restart with the bot. Either command stops the bot with `SIGTERM`, which drains, disposes the plugins (the tracker closes its
+database) and exits inside `docker stop`'s grace (`src/shutdown.ts`). With `LOG_FORMAT=json` every
+line, the tracker's included, is one `{"time","level","msg"}` object (`src/logFormat.ts`), so
+`docker logs rackbops-discord-bot-clerk 2>&1 | jq -rR 'fromjson? | select(.level=="error") | .msg'`
+works (`fromjson?` skips any line that is not JSON). A crash is the exception: an uncaught exception
+or unhandled rejection that ends the process is printed by Bun itself, as plain text.
+
+### 7. Backing up the tracker's database
+
+The tracker keeps everything -- people, tasks, runs, history -- in one SQLite file in WAL mode,
+`/app/data/tracker/tracker.sqlite` in the instance's `state` volume. It is personal data, so a
+backup is kept only on this host, in an owner-only directory, and pruned.
+
+**Decision: an online `VACUUM INTO`, run with the bun already in the bot's image.** It writes a
+transactionally consistent copy while the bot keeps running (a WAL reader blocks no writer), folds
+in whatever the `-wal` file holds, and needs no `sqlite3` on the host or in the image. Copying the
+files out while the bot runs was rejected: the database, `-wal` and `-shm` would be caught at
+different moments. Copying them with the bot stopped is consistent but stops the reminders for the
+length of the copy, for no gain over `VACUUM INTO`.
+
+Save this as `clerk-backup.sh` somewhere of the operator's choosing, outside the config dir:
+
+```sh
+#!/usr/bin/env bash
+# Backs up the Clerk instance's tracker database. Exits non-zero on any failure.
+set -eu
+C="${CLERK_CONTAINER:-rackbops-discord-bot-clerk}"
+DEST="${CLERK_BACKUP_DIR:?set CLERK_BACKUP_DIR to the backup directory}"
+KEEP_DAYS="${CLERK_BACKUP_KEEP_DAYS:-14}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+TMP="/tmp/tracker-$STAMP.sqlite"
+umask 077
+mkdir -p "$DEST"
+chmod 700 "$DEST"
+# ESM, not require(): an error in a `bun -e` script that uses require() is printed but exits 0.
+docker exec -u bun -e DB=/app/data/tracker/tracker.sqlite -e OUT="$TMP" "$C" bun -e \
+  'import { Database } from "bun:sqlite"; const db = new Database(process.env.DB, { readwrite: true, create: false }); db.run("VACUUM INTO ?", [process.env.OUT]); db.close();'
+docker cp "$C:$TMP" "$DEST/tracker-$STAMP.sqlite"
+docker exec -u bun "$C" rm -f "$TMP"
+find "$DEST" -name 'tracker-*.sqlite' -mtime +"$KEEP_DAYS" -delete
+echo "clerk-backup: wrote $DEST/tracker-$STAMP.sqlite"
+```
+
+`create: false` makes a wrong database path an error instead of a new empty database, and
+`VACUUM INTO` refuses a target that already exists; either exits the script non-zero. Run it daily
+from the crontab of a user in the `docker` group (the script needs `docker exec` and `docker cp`),
+for example:
+
+```sh
+15 4 * * * CLERK_BACKUP_DIR=<backup-dir> bash <path>/clerk-backup.sh >> <backup-dir>/backup.log 2>&1
+```
+
+The copy's own file mode comes from the container, so it is the `700` directory, not the file,
+that keeps other users out. Fourteen days is the suggested retention; a person's forget-me (E5) is
+not honoured by a backup until it ages out -- say so when forget-me ships.
+
+**Restore** (the bot stopped, so nothing holds the file open):
+
+```sh
+docker compose -f /opt/stacks/rackbops-discord-bot-clerk/docker-compose.yml -p rackbops-discord-bot-clerk stop bot
+docker run --rm -v rackbops-discord-bot-clerk_state:/app/data -v "<backup-dir>":/backup:ro oven/bun:1-slim sh -c \
+  'cp /backup/tracker-<STAMP>.sqlite /app/data/tracker/tracker.sqlite && rm -f /app/data/tracker/tracker.sqlite-wal /app/data/tracker/tracker.sqlite-shm && chown bun:bun /app/data/tracker/tracker.sqlite'
+docker compose -f /opt/stacks/rackbops-discord-bot-clerk/docker-compose.yml -p rackbops-discord-bot-clerk start bot
+```
+
+The stale `-wal`/`-shm` must go: a `-wal` left from the old file would be replayed onto the
+restored one. Neither the backup script nor the restore has been run against a live instance
+yet. The script was run against a stand-in `docker`. The `VACUUM INTO` step was checked against a
+WAL database held open by another process, and it exits 1 on a missing database or an unusable
+target.
 
 ## Admin panel
 
