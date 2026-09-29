@@ -6,7 +6,7 @@
 // escape as a raw discord.js error string.
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } from "discord.js";
 import type { APIActionRowComponent, APIButtonComponent, APIEmbed } from "discord.js";
-import type { HostCard, HostCardField, HostLinkButton, HostMessage } from "./contract";
+import type { HostButton, HostCard, HostCardField, HostLinkButton, HostMessage } from "./contract";
 
 /** The numbers behind decision 6. `CARD_TOTAL_MAX` is title + description + footer + every field's
  *  name and value, summed -- Discord's own 6000-character embed budget. */
@@ -21,7 +21,20 @@ export const LIMITS = {
   CARD_TOTAL_MAX: 6000,
   LINKS_MAX: 5,
   LINK_LABEL_MAX: 80,
+  BUTTONS_PER_ROW: 5,
+  ROWS_MAX: 5,
+  BUTTON_LABEL_MAX: 80,
+  CUSTOM_ID_MAX: 100,
 } as const;
+
+/** `HostButton.style` -> discord.js's `ButtonStyle` (#323). `Link` and `Premium` are deliberately
+ *  absent: a link button is `HostMessage.links`, and a premium button is not a plugin's to send. */
+const BUTTON_STYLES: Record<NonNullable<HostButton["style"]>, ButtonStyle> = {
+  primary: ButtonStyle.Primary,
+  secondary: ButtonStyle.Secondary,
+  success: ButtonStyle.Success,
+  danger: ButtonStyle.Danger,
+};
 
 export interface BuiltPayload {
   content?: string;
@@ -151,25 +164,93 @@ function buildLinksRow(
 }
 
 /**
+ * Validates `buttons` (#323): a list of objects, each with a 1..80-character label, a customId that
+ * starts with `<pluginName>:` and is at most 100 characters, unique within the message, and an
+ * optional style from `BUTTON_STYLES`. The prefix is what routes a press back to the sending plugin
+ * (`routeInteractionByPrefix`, host.ts), so a customId naming any other prefix -- another plugin's,
+ * or core's `report:` -- is refused rather than sent. Reasons never echo caller text; the plugin name
+ * is the host's own value, not the caller's.
+ */
+function validateButtons(
+  buttons: unknown,
+  pluginName: string,
+): { ok: true; value: Required<HostButton>[] } | { ok: false; reason: string } {
+  if (!Array.isArray(buttons)) return { ok: false, reason: "buttons must be a list" };
+  const prefix = `${pluginName}:`;
+  const seen = new Set<string>();
+  const value: Required<HostButton>[] = [];
+  for (const b of buttons) {
+    if (typeof b !== "object" || b === null) return { ok: false, reason: "button must be an object" };
+    const button = b as Partial<HostButton>;
+    if (typeof button.label !== "string" || button.label.length === 0 || button.label.length > LIMITS.BUTTON_LABEL_MAX) {
+      return { ok: false, reason: `button label must be 1..${LIMITS.BUTTON_LABEL_MAX} characters` };
+    }
+    if (typeof button.customId !== "string" || !button.customId.startsWith(prefix)) {
+      return { ok: false, reason: `button customId must start with "${prefix}"` };
+    }
+    if (button.customId.length > LIMITS.CUSTOM_ID_MAX) {
+      return { ok: false, reason: `button customId is longer than ${LIMITS.CUSTOM_ID_MAX}` };
+    }
+    if (seen.has(button.customId)) return { ok: false, reason: "button customIds must be unique within a message" };
+    seen.add(button.customId);
+    const style = button.style ?? "secondary";
+    if (typeof style !== "string" || !Object.hasOwn(BUTTON_STYLES, style)) {
+      return { ok: false, reason: `button style must be one of ${Object.keys(BUTTON_STYLES).join(", ")}` };
+    }
+    value.push({ customId: button.customId, label: button.label, style });
+  }
+  return { ok: true, value };
+}
+
+/** Builds the interactive buttons into rows of `BUTTONS_PER_ROW`, in list order, through
+ *  `ActionRowBuilder`/`ButtonBuilder`; a throw becomes a fixed refusal, like `buildEmbed`. */
+function buildButtonRows(
+  buttons: Required<HostButton>[],
+): { ok: true; value: APIActionRowComponent<APIButtonComponent>[] } | { ok: false; reason: string } {
+  try {
+    const rows: APIActionRowComponent<APIButtonComponent>[] = [];
+    for (let i = 0; i < buttons.length; i += LIMITS.BUTTONS_PER_ROW) {
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        buttons
+          .slice(i, i + LIMITS.BUTTONS_PER_ROW)
+          .map((b) => new ButtonBuilder().setStyle(BUTTON_STYLES[b.style]).setLabel(b.label).setCustomId(b.customId)),
+      );
+      rows.push(row.toJSON() as APIActionRowComponent<APIButtonComponent>);
+    }
+    return { ok: true, value: rows };
+  } catch {
+    return { ok: false, reason: "button is not valid" };
+  }
+}
+
+/**
  * Validates `message` against `LIMITS` and decision 6, and builds the payload through discord.js's
  * own builders. `opts.partial` (for `edit`) makes every part optional, but at least one of
- * content/card/links must be present; a part that IS present is still validated in full. `content` is
- * wrapped (`wrapBareUrls`) before its length is checked, so the 2000-character bound is the bound
- * Discord actually sees. `message.buttons` (interactive components) is always refused -- reserved
- * until an app needs it (#736 Notes) -- including `buttons: []`, since the key's presence is what
- * signals intent to use them, not its contents. The returned payload always carries
+ * content/card/links/buttons must be present; a part that IS present is still validated in full.
+ * `content` is wrapped (`wrapBareUrls`) before its length is checked, so the 2000-character bound is
+ * the bound Discord actually sees.
+ *
+ * `message.buttons` (#323) is rendered as rows of at most 5 interactive buttons, followed by the one
+ * row of `links`; more than `ROWS_MAX` rows in all is refused. Each customId must start with
+ * `<opts.pluginName>:`; without a `pluginName` there is no prefix to check against, so `buttons` is
+ * refused outright (`buttons: []` included, as before #323). When either `buttons` or `links` is
+ * given the payload's `components` is the full new set of rows -- `[]` when both are empty, which on
+ * `edit` removes the message's buttons -- and when neither is given it is omitted, so an `edit` of
+ * other parts leaves the buttons alone. The returned payload always carries
  * `allowedMentions: { parse: [] }` (mentions are inert on every path).
  */
-export function validateHostMessage(message: unknown, opts: { partial: boolean }): ValidationResult {
+export function validateHostMessage(message: unknown, opts: { partial: boolean; pluginName?: string }): ValidationResult {
   if (typeof message !== "object" || message === null) return { ok: false, reason: "message must be an object" };
   const m = message as Partial<HostMessage>;
-  if (m.buttons !== undefined) return { ok: false, reason: "interactive buttons are not supported yet" };
 
   const hasContent = m.content !== undefined;
   const hasCard = m.card !== undefined;
   const hasLinks = m.links !== undefined;
-  if (opts.partial && !hasContent && !hasCard && !hasLinks) {
-    return { ok: false, reason: "at least one of content, card or links must be present" };
+  const hasButtons = m.buttons !== undefined;
+  const { pluginName } = opts;
+  if (hasButtons && pluginName === undefined) return { ok: false, reason: "interactive buttons are not supported here" };
+  if (opts.partial && !hasContent && !hasCard && !hasLinks && !hasButtons) {
+    return { ok: false, reason: "at least one of content, card, links or buttons must be present" };
   }
 
   let content: string | undefined;
@@ -191,14 +272,33 @@ export function validateHostMessage(message: unknown, opts: { partial: boolean }
   }
 
   let components: APIActionRowComponent<APIButtonComponent>[] | undefined;
-  if (hasLinks) {
-    const shape = validateLinks(m.links);
-    if (!shape.ok) return shape;
-    if (shape.value.length > 0) {
-      const built = buildLinksRow(shape.value);
-      if (!built.ok) return built;
-      components = [built.value];
+  if (hasButtons || hasLinks) {
+    // Links first, so the row count below is taken from a validated list, not raw caller input.
+    let links: HostLinkButton[] = [];
+    if (hasLinks) {
+      const shape = validateLinks(m.links);
+      if (!shape.ok) return shape;
+      links = shape.value;
     }
+    components = [];
+    if (hasButtons && pluginName !== undefined) {
+      const shape = validateButtons(m.buttons, pluginName);
+      if (!shape.ok) return shape;
+      const rows = Math.ceil(shape.value.length / LIMITS.BUTTONS_PER_ROW) + (links.length > 0 ? 1 : 0);
+      if (rows > LIMITS.ROWS_MAX) return { ok: false, reason: `buttons and links need more than ${LIMITS.ROWS_MAX} rows` };
+      const built = buildButtonRows(shape.value);
+      if (!built.ok) return built;
+      components.push(...built.value);
+    }
+    if (links.length > 0) {
+      const built = buildLinksRow(links);
+      if (!built.ok) return built;
+      components.push(built.value);
+    }
+    // Before #323 a present-but-empty `links` sent no `components` key at all (an edit left the
+    // message's rows alone); keep exactly that when `buttons` is absent, so a pre-#323 caller sees
+    // no change in behaviour.
+    if (components.length === 0 && !hasButtons) components = undefined;
   }
 
   return {

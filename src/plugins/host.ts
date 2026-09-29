@@ -59,6 +59,10 @@ export interface HostDeliveryDeps {
   sendToChannel(channelId: string, payload: BuiltPayload): Promise<{ messageId: string; guildId: string | null }>;
   sendDm(userId: string, payload: BuiltPayload): Promise<{ messageId: string; channelId: string }>;
   editOwnMessage(channelId: string, messageId: string, payload: BuiltPayload): Promise<void>;
+  /** Whether this plugin's loaded module declares `interactions` (#323), asked at CALL time -- the
+   *  HostApi is built before `createPlugin` returns, so it cannot be known when this object is. A
+   *  button nobody can answer is refused rather than sent. */
+  handlesInteractions(): boolean;
 }
 
 /**
@@ -138,8 +142,9 @@ function buildDeliveryApi(
     async post(guildId, destination, message) {
       if (!declared.has(destination)) throw new Error("destination is not declared in this plugin's manifest");
       if (!SNOWFLAKE_RE.test(guildId)) throw new Error("guildId is not a valid id");
-      const validated = validateHostMessage(message, { partial: false });
+      const validated = validateHostMessage(message, { partial: false, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
+      refuseUnanswerableButtons(message, deps);
       const routing = await deps.readRouting();
       const channelId = destinationChannel(routing, name, guildId, destination);
       if (channelId === undefined) throw new Error("destination is not mapped in that server");
@@ -149,8 +154,9 @@ function buildDeliveryApi(
     },
     async dm(userId, message) {
       if (!SNOWFLAKE_RE.test(userId)) throw new Error("userId is not a valid id");
-      const validated = validateHostMessage(message, { partial: false });
+      const validated = validateHostMessage(message, { partial: false, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
+      refuseUnanswerableButtons(message, deps);
       const sent = await deps.sendDm(userId, validated.payload);
       return { guildId: null, channelId: sent.channelId, messageId: sent.messageId };
     },
@@ -160,8 +166,9 @@ function buildDeliveryApi(
       if (!SNOWFLAKE_RE.test(delivery.channelId) || !SNOWFLAKE_RE.test(delivery.messageId)) {
         throw new Error("delivery is not a valid channel/message id");
       }
-      const validated = validateHostMessage(message, { partial: true });
+      const validated = validateHostMessage(message, { partial: true, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
+      refuseUnanswerableButtons(message, deps);
       await deps.editOwnMessage(delivery.channelId, delivery.messageId, validated.payload);
     },
     async destinations() {
@@ -179,6 +186,16 @@ function buildDeliveryApi(
         .map((d) => ({ guildId: d.guildId, guildName: guildName(d.guildId), destination: d.destination }));
     },
   };
+}
+
+/** #323: a message that carries at least one interactive button is refused when the sending plugin
+ *  declares no `interactions` handler -- every press would go unanswered. `buttons: []` (an edit
+ *  clearing its rows) needs no handler. Runs after validation, so `message` is known well-formed. */
+function refuseUnanswerableButtons(message: unknown, deps: HostDeliveryDeps): void {
+  const buttons = (message as { buttons?: unknown }).buttons;
+  if (Array.isArray(buttons) && buttons.length > 0 && !deps.handlesInteractions()) {
+    throw new Error("buttons need this plugin to declare an interactions handler");
+  }
 }
 
 export interface LoadResult {
@@ -627,6 +644,27 @@ export async function dispatchPluginInteraction(
     }
   }
   return true;
+}
+
+/** What a press on a button no plugin claims is told (#323) -- instead of Discord's own "This
+ *  interaction failed". */
+export const UNCLAIMED_PRESS_REPLY = "This button is no longer available.";
+
+/**
+ * Answers a message-component press that `dispatchPluginInteraction` did not claim (#323): its plugin
+ * is gone, disabled, not running yet, or declares no `interactions`. Logs one line naming only the
+ * customId's prefix (bounded through `shown`, never the rest of the id or anything about the user),
+ * then sends a best-effort ephemeral reply; a failure to reply is swallowed.
+ */
+export async function answerUnclaimedPress(
+  interaction: Pick<MessageComponentInteraction, "customId" | "replied" | "deferred" | "reply">,
+  log: BaseLog,
+): Promise<void> {
+  const i = interaction.customId.indexOf(":");
+  const prefix = i === -1 ? "(none)" : JSON.stringify(shown(interaction.customId.slice(0, i)));
+  log.warn(`[plugins] a button press with prefix ${prefix} was not claimed by any running plugin`);
+  if (interaction.replied || interaction.deferred) return;
+  await interaction.reply({ content: UNCLAIMED_PRESS_REPLY, flags: MessageFlags.Ephemeral }).catch(() => {});
 }
 
 /** The most the autocomplete dispatcher waits on the routing gate (#287) before it answers with an empty
