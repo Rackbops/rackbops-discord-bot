@@ -20,6 +20,8 @@
 // throw still fired after it), so this uses the same explicit `log + process.exit(1)` shape
 // `ops/admin/server.ts`'s `resolveAdminStorePathsOrExit` already uses for the identical situation
 // (a config problem the entry point must react to by refusing to start, not by half-crashing).
+import { installJsonConsole, logFormatFrom } from "./logFormat";
+
 export function describeEnvFile(env: Record<string, string | undefined>): string {
   const envFile = env.BOT_ENV_FILE;
   return envFile
@@ -38,6 +40,12 @@ export function describeBoot(env: Record<string, string | undefined>, dataDir: s
   return [describeEnvFile(env), describeDataDir(dataDir)];
 }
 
+// #324: before the first line, so even the boot lines come out as JSON when LOG_FORMAT=json. A value
+// that is neither json nor text is said once, in text, and the bot runs on: a log format is not worth
+// refusing to deliver reminders over.
+const logFormat = logFormatFrom(process.env);
+if (logFormat === "json") installJsonConsole(console, process.stdout, process.stderr);
+else if (logFormat === "invalid") console.error(`[boot] LOG_FORMAT must be json or text, got "${process.env.LOG_FORMAT}" -- logging as text`);
 console.log(describeEnvFile(process.env));
 let dataDir: string;
 try {
