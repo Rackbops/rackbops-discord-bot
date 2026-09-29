@@ -138,7 +138,7 @@ function buildDeliveryApi(
     async post(guildId, destination, message) {
       if (!declared.has(destination)) throw new Error("destination is not declared in this plugin's manifest");
       if (!SNOWFLAKE_RE.test(guildId)) throw new Error("guildId is not a valid id");
-      const validated = validateHostMessage(message, { partial: false });
+      const validated = validateHostMessage(message, { partial: false, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
       const routing = await deps.readRouting();
       const channelId = destinationChannel(routing, name, guildId, destination);
@@ -149,7 +149,7 @@ function buildDeliveryApi(
     },
     async dm(userId, message) {
       if (!SNOWFLAKE_RE.test(userId)) throw new Error("userId is not a valid id");
-      const validated = validateHostMessage(message, { partial: false });
+      const validated = validateHostMessage(message, { partial: false, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
       const sent = await deps.sendDm(userId, validated.payload);
       return { guildId: null, channelId: sent.channelId, messageId: sent.messageId };
@@ -160,7 +160,7 @@ function buildDeliveryApi(
       if (!SNOWFLAKE_RE.test(delivery.channelId) || !SNOWFLAKE_RE.test(delivery.messageId)) {
         throw new Error("delivery is not a valid channel/message id");
       }
-      const validated = validateHostMessage(message, { partial: true });
+      const validated = validateHostMessage(message, { partial: true, pluginName: name });
       if (!validated.ok) throw new Error(validated.reason);
       await deps.editOwnMessage(delivery.channelId, delivery.messageId, validated.payload);
     },

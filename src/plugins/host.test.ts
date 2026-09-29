@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
+import { ButtonStyle, SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
 import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
 import { installPlugins, type InstalledPlugin } from "./install";
 import type { HostDeliveryDeps, LoadedPlugin } from "./host";
@@ -322,7 +322,7 @@ describe("createHostApi: delivery (#736)", () => {
     const { deps, calls } = fakeDeps();
     const host = hostWith({ delivery: deps });
     await expect(host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, {})).rejects.toThrow(
-      "at least one of content, card or links must be present",
+      "at least one of content, card, links or buttons must be present",
     );
     expect(calls).toEqual([]);
   });
@@ -347,6 +347,91 @@ describe("createHostApi: delivery (#736)", () => {
     await host.edit!({ guildId: HOME, channelId: CHAN, messageId: MSG }, { content: "hi" });
     expect(calls).toEqual(["editOwnMessage"]);
     expect(editArgs).toEqual([CHAN, MSG, { content: "hi", allowedMentions: { parse: [] } }]);
+  });
+
+  // #323: interactive buttons, prefixed with the CALLING plugin's name (the host is built for "feed").
+  type SentRow = { components: { custom_id?: string; style: number }[] };
+  const componentsOf = (payload: unknown): SentRow[] | undefined => (payload as { components?: SentRow[] }).components;
+
+  test("post renders buttons as action rows carrying the plugin's customIds", async () => {
+    const routing = routingWith({ feed: { servers: { [HOME]: { commands: "all", destinations: { news: CHAN } } } } });
+    let sent: unknown;
+    const { deps } = fakeDeps({
+      routing,
+      sendToChannel: async (_channelId, payload) => {
+        sent = payload;
+        return { messageId: "m1", guildId: HOME };
+      },
+    });
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    const buttons = Array.from({ length: 6 }, (_, i) => ({ customId: `feed:done:${i}`, label: "Done" }));
+    await host.post!(HOME, "news", { content: "hi", buttons });
+    const rows = componentsOf(sent)!;
+    expect(rows.map((r) => r.components.length)).toEqual([5, 1]);
+    expect(rows[1]!.components[0]!.custom_id).toBe("feed:done:5");
+  });
+
+  test("post refuses a customId prefixed with another plugin's name, before reading routing or sending", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ destinations: [{ name: "news", description: "d" }], delivery: deps });
+    await expect(
+      host.post!(HOME, "news", { content: "hi", buttons: [{ customId: "other:x", label: "x" }] }),
+    ).rejects.toThrow('button customId must start with "feed:"');
+    expect(calls).toEqual([]);
+  });
+
+  test("dm renders buttons with their styles", async () => {
+    let sent: unknown;
+    const { deps } = fakeDeps({
+      sendDm: async (_userId, payload) => {
+        sent = payload;
+        return { messageId: "m2", channelId: "555" };
+      },
+    });
+    const host = hostWith({ delivery: deps });
+    await host.dm!(USER, {
+      content: "accept?",
+      buttons: [
+        { customId: "feed:accept", label: "Accept", style: "success" },
+        { customId: "feed:decline", label: "Decline", style: "danger" },
+      ],
+    });
+    const rows = componentsOf(sent)!;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.components.map((c) => [c.custom_id, c.style])).toEqual([
+      ["feed:accept", ButtonStyle.Success],
+      ["feed:decline", ButtonStyle.Danger],
+    ]);
+  });
+
+  test("dm refuses more than 5 rows of buttons before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    const buttons = Array.from({ length: 26 }, (_, i) => ({ customId: `feed:${i}`, label: "x" }));
+    await expect(host.dm!(USER, { content: "hi", buttons })).rejects.toThrow("buttons and links need more than 5 rows");
+    expect(calls).toEqual([]);
+  });
+
+  test("edit with buttons: [] alone passes an empty components list through, clearing the buttons", async () => {
+    let editArgs: [string, string, unknown] | undefined;
+    const { deps, calls } = fakeDeps({
+      editOwnMessage: async (channelId, messageId, payload) => {
+        editArgs = [channelId, messageId, payload];
+      },
+    });
+    const host = hostWith({ delivery: deps });
+    await host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, { buttons: [] });
+    expect(calls).toEqual(["editOwnMessage"]);
+    expect(editArgs).toEqual([CHAN, MSG, { components: [], allowedMentions: { parse: [] } }]);
+  });
+
+  test("edit refuses a malformed buttons list before any dep call", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ delivery: deps });
+    await expect(
+      host.edit!({ guildId: null, channelId: CHAN, messageId: MSG }, { buttons: [{ customId: "feed:x" }] as never }),
+    ).rejects.toThrow("button label must be 1..80 characters");
+    expect(calls).toEqual([]);
   });
 
   test("destinations lists only mapped + declared destinations, named from discovery, falling back to the id", async () => {

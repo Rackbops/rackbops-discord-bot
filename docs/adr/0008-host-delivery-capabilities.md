@@ -51,6 +51,10 @@ as the bot, contract version unchanged.
   designs them, but nothing consumes them yet (S1's bridge is link-only). `HostMessage.buttons` is
   reserved and refused — including `buttons: []` — so the shape exists without shipping the feature
   early.
+  **Update (#323):** shipped once the task tracker needed them (Rackbops/Tooling#816). `buttons` is
+  now rendered as action rows (at most 5 per row, 5 rows in all including the `links` row), each
+  customId must start with the calling plugin's `<name>:`, and `HostButton.style` was added as an
+  optional field — additive, no `HOST_API_VERSION` bump; an older host still refuses `buttons`.
 
 ## Consequences
 

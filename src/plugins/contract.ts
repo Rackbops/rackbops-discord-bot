@@ -78,12 +78,30 @@ export interface HostCard {
   footer?: string;
 }
 
-/** What `post`/`dm`/`edit` accept. `buttons` is RESERVED for interactive components and refused today. */
+/**
+ * One interactive button (#323). `customId` must start with `<name>:` (this plugin's manifest name +
+ * colon) and be at most 100 characters, so a press routes back to this plugin's `interactions`;
+ * `label` is 1..80 characters. `style` defaults to `"secondary"`; a host that predates `style`
+ * refuses `buttons` outright, so it never silently drops it.
+ */
+export interface HostButton {
+  customId: string;
+  label: string;
+  style?: "primary" | "secondary" | "success" | "danger";
+}
+
+/**
+ * What `post`/`dm`/`edit` accept. `buttons` are rendered (#323) as action rows of at most 5, in list
+ * order, ahead of the one row of `links`; at most 5 rows in all, and customIds unique per message. A
+ * host that predates #323 refuses `buttons` with a clean rejection, so feature-detect by trying. On
+ * `edit`, giving `buttons` or `links` replaces every button row the message had (`buttons: []`
+ * removes them; `links: []` alone changes nothing, as before #323); giving neither leaves them be.
+ */
 export interface HostMessage {
   content: string;
   card?: HostCard;
   links?: HostLinkButton[];
-  buttons?: { customId: string; label: string }[];
+  buttons?: HostButton[];
 }
 
 /** A message `post`/`dm` delivered, and what `edit` needs to find it again. `guildId` is `null` for a DM. */
