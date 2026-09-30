@@ -582,7 +582,11 @@ CLOUDFLARE_TUNNEL_TOKEN=<this instance's tunnel token>
 
 Everything else (`REPORT_ROLE_ID`, `GITHUB_TOKEN`, the warbandeer and wow keys) stays blank.
 `TRACKER_GUILD_ID` may be left blank -- then only the admission list gates the tracker, and the
-plugin logs a warning each time it activates -- but set it.
+plugin logs a warning each time it activates -- but set it. From tracker 0.8.0 it may also list
+several servers, comma-separated (`TRACKER_GUILD_ID=<first id>,<second id>`): a member of any
+listed server passes, one store and one admission list serve them all, and Clerk must be invited to
+each listed server so its membership lookup works there (rackbops-bot-plugins#106). 0.7.0 and
+older refuse to load a list.
 
 **Never place the tracker.** A `routing-set` from the panel, or a hand-written `data/routing.json`,
 that places a plugin switches the instance to routed mode: per-server registration, the global list
