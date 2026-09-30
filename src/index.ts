@@ -39,7 +39,7 @@ import {
   createHostApi,
   createPluginTickControl,
   dispatchPluginAutocomplete,
-  dispatchPluginInteraction,
+  dispatchPluginInteractionOutcome,
   disposePlugins,
   HTTP_MAX_BODY_BYTES,
   loadPlugins,
@@ -53,6 +53,7 @@ import {
   writePluginState,
 } from "./plugins/host";
 import { startHostHttp } from "./http";
+import { describeInteraction, interactionLogLine, type InteractionOutcome } from "./interactionLog";
 import { createTrustedProxy } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
@@ -219,10 +220,16 @@ async function activate(c: Client<true>): Promise<void> {
   // and no ticks for the length of one Discord API call, on every boot — worst on a self-update,
   // where takeOver() has already stopped the original and this delay lands inside the no-bot window.
   client.on(Events.InteractionCreate, async (interaction) => {
+    // #328: one line per command, component press or modal submit (autocomplete is skipped: it fires on
+    // every keystroke), written once the interaction is handled. Only names and ids -- never an option
+    // value, a field or a reply (src/interactionLog.ts).
+    const facts = describeInteraction(interaction);
+    const started = Date.now();
+    let outcome: InteractionOutcome = "answered";
     try {
       if (interaction.isChatInputCommand()) {
         // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
-        await handleCommand(
+        outcome = await handleCommand(
           interaction,
           (bare) => commandMap.get(bare)?.command,
           (bare, chatInput) =>
@@ -240,9 +247,9 @@ async function activate(c: Client<true>): Promise<void> {
       } else if (interaction.isMessageComponent() || interaction.isModalSubmit()) {
         // #185: core's report: modal check above always wins that prefix, regardless of what
         // plugins are installed -- this branch only ever sees what isReportModal() didn't claim.
-        const claimed = await dispatchPluginInteraction(loadResult.loaded, interaction, console);
+        outcome = await dispatchPluginInteractionOutcome(loadResult.loaded, interaction, console);
         // #323: a press no running plugin answers gets a short ephemeral reply, not "This interaction failed".
-        if (!claimed && interaction.isMessageComponent()) await answerUnclaimedPress(interaction, console);
+        if (outcome === "unclaimed" && interaction.isMessageComponent()) await answerUnclaimedPress(interaction, console);
       } else if (interaction.isAutocomplete()) {
         // #287: a plugin command's picker goes to its autocomplete(), behind the same routing gate as the
         // command; everything else — core declares no autocomplete option — gets an empty list at once
@@ -266,7 +273,10 @@ async function activate(c: Client<true>): Promise<void> {
         });
       }
     } catch (err) {
+      outcome = "error";
       console.error("[interaction]", err);
+    } finally {
+      if (facts) console.info(interactionLogLine(facts, outcome, Date.now() - started));
     }
   });
 

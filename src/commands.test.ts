@@ -271,7 +271,7 @@ describe("handleCommand — plugin dispatch (default case)", () => {
   test("warns and resolves when neither a core case nor a plugin matches", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
-      await handleCommand({ commandName: "nope" } as unknown as ChatInputCommandInteraction, () => undefined);
+      expect(await handleCommand({ commandName: "nope" } as unknown as ChatInputCommandInteraction, () => undefined)).toBe("unclaimed");
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0]?.[0])).toContain("no handler for /nope");
     } finally {
@@ -321,7 +321,7 @@ describe("handleCommand — the channel gate (#243)", () => {
   test("a refused plugin command gets a private reply and its handler is not called", async () => {
     const { state, lookup } = plugin();
     const { interaction, replies } = chatInput();
-    await handleCommand(interaction, lookup, async () => "`/hello` works in <#1> here.");
+    expect(await handleCommand(interaction, lookup, async () => "`/hello` works in <#1> here.")).toBe("gated");
     expect(replies).toEqual([{ content: "`/hello` works in <#1> here.", flags: MessageFlags.Ephemeral }]);
     expect(state.handled).toBe(0);
   });
@@ -342,7 +342,7 @@ describe("handleCommand — the channel gate (#243)", () => {
   test("with no gate argument a plugin command runs", async () => {
     const { state, lookup } = plugin();
     const { interaction, replies } = chatInput();
-    await handleCommand(interaction, lookup);
+    expect(await handleCommand(interaction, lookup)).toBe("answered");
     expect(state.handled).toBe(1);
     expect(replies).toEqual([]);
   });
