@@ -540,8 +540,13 @@ In the Cloudflare Zero Trust dashboard, create a tunnel for this instance (Netwo
 create -> Docker connector) and copy its token: it goes into `.env` in the next step. Give it one
 public hostname, `clerk.<domain>`, with the service `http://rackbops-discord-bot-clerk:8080` --
 the container **name**, not the `bot` alias a self-update's replacement also carries (see
-`HTTP_PORT` in `.env.example`). No Access application is put in front of it for now: the one
-route is the health check, which a monitor has to reach. Revisit when the web area (E5) lands.
+`HTTP_PORT` in `.env.example`). Put a Cloudflare Access application in front of the hostname
+(Access -> Applications -> self-hosted, `clerk.<domain>`): Google sign-in with an allow policy
+listing the people who may use the web area, plus a service token and a Service Auth policy for
+the uptime monitor, which checks `/tracker/healthz` through the gate. Each friend is added to the
+allow policy once. The tracker's own one-time-link sign-in (`/web`) still runs behind it. The JSON
+task API (`/tracker/api/v1/`) is gated too, so non-browser callers are turned away until the
+tracker plan settles how they get through (plan item 74).
 
 ### 3. Bootstrap and `.env`
 
