@@ -629,21 +629,35 @@ export async function dispatchPluginInteraction(
   interaction: MessageComponentInteraction | ModalSubmitInteraction,
   log: BaseLog,
 ): Promise<boolean> {
+  return (await dispatchPluginInteractionOutcome(loaded, interaction, log)) !== "unclaimed";
+}
+
+/**
+ * `dispatchPluginInteraction`, telling apart what the boolean folds together (#328, for the
+ * interaction log line): `unclaimed` (it returned false), `error` (the plugin threw -- logged and
+ * answered exactly as before) and `answered`.
+ */
+export async function dispatchPluginInteractionOutcome(
+  loaded: readonly LoadedPlugin[],
+  interaction: MessageComponentInteraction | ModalSubmitInteraction,
+  log: BaseLog,
+): Promise<"answered" | "error" | "unclaimed"> {
   const routedName = routeInteractionByPrefix(
     interaction.customId,
     loaded.map((lp) => lp.entry.name),
   );
   const lp = routedName ? loaded.find((l) => l.entry.name === routedName) : undefined;
-  if (!lp?.running || !lp.plugin.interactions) return false;
+  if (!lp?.running || !lp.plugin.interactions) return "unclaimed";
   try {
     await lp.plugin.interactions(interaction);
+    return "answered";
   } catch (err) {
     log.error(`[plugins] ${lp.entry.name} interaction failed`, err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});
     }
+    return "error";
   }
-  return true;
 }
 
 /** What a press on a button no plugin claims is told (#323) -- instead of Discord's own "This

@@ -385,7 +385,7 @@ describe("index.ts wiring", () => {
     const dispatchBranch = source.indexOf(
       '} else if (interaction.isMessageComponent() || interaction.isModalSubmit())',
     );
-    const dispatchCall = source.indexOf("dispatchPluginInteraction(");
+    const dispatchCall = source.indexOf("dispatchPluginInteractionOutcome(");
     expect(reportCheck).toBeGreaterThan(-1);
     expect(dispatchBranch).toBeGreaterThan(-1);
     expect(dispatchCall).toBeGreaterThan(-1);
@@ -393,6 +393,22 @@ describe("index.ts wiring", () => {
     // which could then both fire on the same interaction) fails one of these three.
     expect(reportCheck).toBeLessThan(dispatchBranch);
     expect(dispatchBranch).toBeLessThan(dispatchCall);
+  });
+
+  // #328: one log line per interaction, written after it is handled, from the one handler.
+  test("the InteractionCreate handler logs one interaction line in a finally, with each branch's outcome", () => {
+    const start = source.indexOf("client.on(Events.InteractionCreate");
+    const end = source.indexOf("client.on(Events.GuildCreate", start);
+    const handler = source.slice(start, end);
+    expect(start).toBeGreaterThan(-1);
+    expect(handler).toContain("const facts = describeInteraction(interaction);");
+    expect(handler).toMatch(/outcome = await handleCommand\(/);
+    expect(handler).toMatch(/outcome = await dispatchPluginInteractionOutcome\(/);
+    expect(handler).toMatch(/catch \(err\) \{\s*outcome = "error";\s*console\.error\("\[interaction\]", err\);/);
+    expect(handler).toMatch(/finally \{\s*if \(facts\) console\.info\(interactionLogLine\(facts, outcome, Date\.now\(\) - started\)\);\s*\}/);
+    // Only one line per interaction: the log call appears once.
+    expect(handler.match(/interactionLogLine\(/g)?.length).toBe(1);
+    expect(handler).toContain('if (outcome === "unclaimed" && interaction.isMessageComponent()) await answerUnclaimedPress(');
   });
 
   // #154: the first (and only) signal handler in this codebase. Registered before resolveBootMode

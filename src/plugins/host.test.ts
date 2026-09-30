@@ -28,6 +28,7 @@ const {
   writePluginState,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
+  dispatchPluginInteractionOutcome,
   answerUnclaimedPress,
   UNCLAIMED_PRESS_REPLY,
   dispatchPluginAutocomplete,
@@ -1647,6 +1648,21 @@ describe("dispatchPluginInteraction", () => {
     const second = await dispatchPluginInteraction([lp], fakeInteraction("wow:second"), log);
     expect(second).toBe(true);
     expect(secondCallReceived).toBe("wow:second"); // the throw didn't corrupt anything for the next call
+  });
+
+  test("#328: the outcome form tells answered, error and unclaimed apart", async () => {
+    const { log, calls } = makeLog();
+    const lp = loaded(
+      entry({ name: "wow" }),
+      { interactions: async (i) => { if (i.customId === "wow:bad") throw new Error("boom"); } },
+      true,
+    );
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("wow:ok"), log)).toBe("answered");
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("wow:bad"), log)).toBe("error");
+    expect(calls).toEqual([{ level: "error", message: "[plugins] wow interaction failed" }]);
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("other:x"), log)).toBe("unclaimed");
+    const stopped = loaded(entry({ name: "wow" }), { interactions: async () => {} }, false);
+    expect(await dispatchPluginInteractionOutcome([stopped], fakeInteraction("wow:ok"), log)).toBe("unclaimed");
   });
 
   test("a throwing handler gets a best-effort ephemeral reply IF it hadn't already replied/deferred", async () => {

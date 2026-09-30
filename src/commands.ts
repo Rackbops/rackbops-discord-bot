@@ -298,19 +298,19 @@ export async function handleCommand(
   interaction: ChatInputCommandInteraction,
   lookup: (bare: string) => PluginCommand | undefined = () => undefined,
   gate: CommandGate = async () => undefined,
-): Promise<void> {
+): Promise<"answered" | "gated" | "unclaimed"> {
   const bare = bareName(interaction.commandName);
   // A core row wins on a name collision (mirrors pluginCommandMap's own rule) and is never gated.
   const core = coreByName.get(bare);
   if (core) {
     await core.handle(interaction);
-    return;
+    return "answered";
   }
   // The lookup is keyed by bare name, and a name that matches neither just warns rather than silently dropping.
   const target = lookup(bare);
   if (!target) {
     console.warn(`[interaction] no handler for /${interaction.commandName}`);
-    return;
+    return "unclaimed";
   }
   // A gate that fails must not take the command down: it runs.
   let refusal: string | undefined;
@@ -321,9 +321,10 @@ export async function handleCommand(
   }
   if (refusal !== undefined) {
     await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
-    return;
+    return "gated";
   }
   await target.handle(interaction);
+  return "answered";
 }
 
 /**

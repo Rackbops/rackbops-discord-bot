@@ -645,6 +645,18 @@ line, the tracker's included, is one `{"time","level","msg"}` object (`src/logFo
 works (`fromjson?` skips any line that is not JSON). A crash is the exception: an uncaught exception
 or unhandled rejection that ends the process is printed by Bun itself, as plain text.
 
+Every command, button press and modal submit writes one line once it is handled (#328), e.g.
+`[interaction] command /web user=<id> where=dm outcome=answered 212ms`: the kind, the command (with
+its subcommand) or the customId's plugin prefix, the user's Discord id, `dm` or
+`guild:<id>/channel:<id>`, the outcome (`answered`, `gated` by the routing gate, `unclaimed`, or
+`error`, next to the error's own `[interaction]` or `[plugins] <name> interaction failed` line) and
+how long it took. It never carries an option value, a
+modal field or what the bot answered, so a `/web` sign-in link or a reminder's text never reaches
+the log. `docker logs rackbops-discord-bot-clerk 2>&1 | jq -rR 'fromjson? | .msg | select(test("^\\[interaction\\] (command|component|modal) "))'`
+lists them (the `[interaction]` error and "no handler" lines share the tag, so the filter names the
+three kinds). Clerk runs with `AUTO_UPDATE=false`, so this reaches it on an admin's `/update` or a
+re-run of `ops/install.sh clerk`, not by itself.
+
 ### 7. Backing up the tracker's database
 
 The tracker keeps everything -- people, tasks, runs, history -- in one SQLite file in WAL mode,
