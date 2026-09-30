@@ -73,9 +73,19 @@ export function customIdPrefix(customId: string): string {
 
 /**
  * The facts for one interaction, or null for a kind this log skips (autocomplete, which fires on
- * every keystroke, and anything else that is not a command, component or modal). Pure.
+ * every keystroke, and anything else that is not a command, component or modal). Pure, and never
+ * throws: index.ts calls it before its try, so a surprise here answers null (no line), never an
+ * unhandled rejection.
  */
 export function describeInteraction(i: InteractionLike): InteractionFacts | null {
+  try {
+    return describe(i);
+  } catch {
+    return null;
+  }
+}
+
+function describe(i: InteractionLike): InteractionFacts | null {
   const where = { userId: i.user.id, guildId: i.guildId, channelId: i.channelId };
   if (i.isChatInputCommand()) {
     // Subcommand names come from the command's definition, never from what the person typed. A

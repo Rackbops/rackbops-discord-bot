@@ -70,6 +70,12 @@ describe("describeInteraction + interactionLogLine", () => {
     expect(customIdPrefix("report:abc")).toBe("report");
   });
 
+  test("an interaction that throws while being read gives no line, never a throw", () => {
+    const broken = fake("command", { commandName: "web" });
+    Object.defineProperty(broken, "user", { get: () => { throw new Error("gone"); } });
+    expect(describeInteraction(broken)).toBeNull();
+  });
+
   test("autocomplete (and anything else) writes no line", () => {
     expect(describeInteraction(fake("autocomplete", { commandName: "remind" }))).toBeNull();
   });
