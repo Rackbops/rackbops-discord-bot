@@ -58,5 +58,17 @@
   "related_issues": [
     332,
     338
+  ],
+  "documentation_created_for_import": [
+    {
+      "file": "README.md",
+      "purpose": "Asset inventory and integration status"
+    },
+    {
+      "file": "pip-design-spec.md",
+      "purpose": "Comprehensive specification derived from the preserved artwork and prompts",
+      "bytes": 12498,
+      "sha256": "ecac2080679185fdd12334ea134801cac62575602a3efecef1f04b865d31d4a5"
+    }
   ]
 }

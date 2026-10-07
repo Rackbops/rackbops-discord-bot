@@ -8,11 +8,10 @@ This folder holds Pip's existing avatar artwork and its design artifacts for the
 - [Circular-crop inspection](qa-circular-inspection.png): a 512 × 512 review proof.
 - [Size inspection](qa-size-inspection.png): square previews at 32, 64, 128 and 256 px, plus small circular previews.
 - [Initial design prompt](prompt-canonical-v1.txt) and framing refinements [one](prompt-refine-1.txt) and [two](prompt-refine-2.txt): the saved prompts, preserved verbatim.
+- [Full design specification](pip-design-spec.md): identity, composition, finish, sampled colors, small-size use, reproduction limits and review checklist.
 - [Provenance and verification](provenance.json).
 
 The avatar is a painted teal-and-ivory messenger sprite against a dark navy background, with leaf-shaped ears, a swept crest, large amber-and-dark eyes, a teal wrap and a gold clasp. The QA images are review aids, not alternative avatar masters. The prompts record design intent, not a guarantee of exact reproducibility.
-
-The detailed design specification is being prepared separately for this same draft PR.
 
 ## Verification and status
 
