@@ -1,8 +1,8 @@
 {
-  "schema_version": 1,
-  "asset": "Pip avatar and design artifacts",
+  "schema_version": 2,
+  "asset": "Pip avatar and banner design artifacts",
   "published_date": "2026-10-07",
-  "source": "Existing generated artwork and saved design-review artifacts; no image regeneration or image editing during repository publication.",
+  "source": "Existing avatar artwork and saved review artifacts preserved without image editing; companion banner generated on 2026-10-07 with the avatar as a visual reference, then exported at the requested upload dimensions.",
   "canonical": {
     "file": "pip-canonical-review-v1.png",
     "format": "PNG",
@@ -66,9 +66,77 @@
     },
     {
       "file": "pip-design-spec.md",
-      "purpose": "Comprehensive specification derived from the preserved artwork and prompts",
-      "bytes": 12498,
-      "sha256": "ecac2080679185fdd12334ea134801cac62575602a3efecef1f04b865d31d4a5"
+      "purpose": "Comprehensive avatar and banner specification, export details and limits",
+      "bytes": 15311,
+      "sha256": "4f947f82f223003d21ee608bbc55967650698dfa06019b1c03991c6ce8a41197",
+      "git_blob_sha1": "5e9fd7773c606e0d32fdc910b8c69851ad818ec0"
     }
-  ]
+  ],
+  "banner": {
+    "generated_date": "2026-10-07",
+    "generation_method": "OpenAI image generation",
+    "reference_asset": "pip-canonical-review-v1.png",
+    "reference_sha256": "393ec6500d81fd50ca2a20bc229e719baf120c6454712034261fdc8d373fe72e",
+    "prompt": {
+      "file": "prompt-banner-v1.txt",
+      "bytes": 900,
+      "sha256": "78534cf33c25dc1845047c92ac23ab8936127a5e7affca586910ae3488e9c659",
+      "git_blob_sha1": "aeb2d842456e3373993ba16610a26f4c8fa950a7"
+    },
+    "master": {
+      "file": "pip-banner-master-v1.png",
+      "bytes": 2114558,
+      "sha256": "c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32",
+      "git_blob_sha1": "16e4848045fec0f41a5bdda7c324643e3f6377d5",
+      "format": "PNG",
+      "width": 1884,
+      "height": 835,
+      "color_mode": "RGB",
+      "bytes_preserved": true
+    },
+    "upload_export": {
+      "file": "pip-banner-680x240-v1.png",
+      "bytes": 222496,
+      "sha256": "6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b",
+      "git_blob_sha1": "48b040a0443efe4a810db6eb0ccc6b3f4604cf65",
+      "format": "PNG",
+      "width": 680,
+      "height": 240,
+      "color_mode": "RGB",
+      "aspect_ratio": "17:6"
+    },
+    "requested_generation_dimensions": {
+      "preferred_width": 1360,
+      "preferred_height": 480,
+      "actual_master_matches_requested_aspect_ratio": false
+    },
+    "export": {
+      "tool": "ImageMagick",
+      "command": "magick pip-banner-master-v1.png -filter Lanczos -resize '680x240^' -gravity center -extent 680x240 pip-banner-680x240-v1.png",
+      "intermediate_dimensions": [
+        680,
+        301
+      ],
+      "operation": "Lanczos resize to cover followed by a centered crop",
+      "repainted": false
+    },
+    "upload_target": {
+      "dimensions": [
+        680,
+        240
+      ],
+      "maximum_bytes_label": "10 MB",
+      "source": "User-supplied screenshot of the banner upload UI"
+    },
+    "verification": {
+      "master_and_export_decoded": true,
+      "master_and_export_visually_inspected": true,
+      "export_dimensions_match": true,
+      "export_under_observed_upload_size_limit": true,
+      "live_discord_application": "Not changed or verified by this asset publication"
+    },
+    "unknowns": [
+      "Exact generator model version and seed were not exposed."
+    ]
+  }
 }

@@ -1,4 +1,4 @@
-# Pip avatar design specification
+# Pip avatar and banner design specification
 
 Pip's avatar is a small teal-and-ivory messenger sprite with leaf-shaped ears, a swept crest, attentive eyes and a simple shoulder wrap. This specification records the existing artwork, its saved design prompts, and practical rules for making consistent future assets. The supplied PNG is the visual reference. It remains named `pip-canonical-review-v1.png`; publication does not imply a separate final-art approval or a live Discord avatar change.
 
@@ -15,7 +15,9 @@ The following six files are preserved from the existing design package. Their si
 | [prompt-refine-1.txt](prompt-refine-1.txt) | First framing refinement | Saved prompt, unchanged |
 | [prompt-refine-2.txt](prompt-refine-2.txt) | Second framing refinement | Saved prompt, unchanged |
 
-The README, this specification and provenance record document the import. This package contains no editable vector master, layered painting, separate transparent cutout, animated character, alternate pose, standalone small-size export, or dedicated favicon. None should be inferred from the review sheet.
+The companion banner adds [the unmodified generated master](pip-banner-master-v1.png), [the exact 680 × 240 upload export](pip-banner-680x240-v1.png), and [its generation prompt](prompt-banner-v1.txt). Its design and export details are documented below.
+
+The README, this specification and provenance record document the assets. This package contains no editable vector master, layered painting, separate transparent cutout, animated character, alternate pose, standalone small-size avatar export, or dedicated favicon. None should be inferred from the review sheet.
 
 ## Character identity
 
@@ -79,6 +81,26 @@ The following values are reproducible samples from this PNG, not previously appr
 
 The painting contains many intermediate shades. Do not recolor the master to this short table, or claim it is an exact palette of the entire image. A future vector mark or interface palette needs its own explicit token choices and contrast checks. No text accessibility contrast certification is implied by these artwork samples.
 
+## Companion profile banner
+
+The banner extends the avatar's painted navy, teal and warm-gold world into a quiet twilight woodland. Teal leaves frame the top and right edges; amber fireflies and a trail of small lights lead across the center toward the right. The left third, especially the lower-left area, stays comparatively dark and uncluttered for the circular avatar overlap. Low-contrast foliage remains in that space. There is no character, text, logo, UI or border in the artwork.
+
+The avatar PNG was used as the visual style and palette reference for the generation. It was not pasted into the banner. The saved banner prompt requested an exact 17:6 composition, ideally 1360 × 480, for a 680 × 240 upload. The actual generated master is 1884 × 835, so it does not have the requested aspect ratio. It is preserved unchanged as `pip-banner-master-v1.png`.
+
+The production-sized file is `pip-banner-680x240-v1.png`, an opaque RGB PNG measuring exactly 680 × 240 pixels, or 17:6. It is 222,496 bytes, below the 10 MB limit shown in the supplied upload UI. These dimensions and limit document that observed upload target; they are not a claim about every Discord banner surface.
+
+The export was made with ImageMagick using this command from the asset directory:
+
+```sh
+magick pip-banner-master-v1.png -filter Lanczos -resize '680x240^' -gravity center -extent 680x240 pip-banner-680x240-v1.png
+```
+
+The resize produces 680 × 301 pixels; the centered extent operation removes the excess vertical area to reach 680 × 240. The export preserves the dark left-side space and the principal illuminated foliage and fireflies on the right. Both the full master and final crop were visually inspected. There was no repainting or character redesign during this export.
+
+For future banner variants, retain the original master, keep important detail clear of the overlapping-avatar area, and inspect the final target crop rather than relying only on the uncropped source. Avoid adding lettering or a second Pip portrait. Do not apply the avatar prompt's exclusions on scenery and glow to this separate banner: the banner prompt intentionally introduces woodland foliage and firefly light.
+
+The export's SHA-256 is `6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b`. The master's SHA-256 is `c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32`. The banner's appearance in a live Discord profile has not been verified by this asset publication.
+
 ## Avatar and small-size use
 
 The review sheet supports visual inspection at 32, 64, 128 and 256 px. At the smallest square size, the pale face and teal silhouette remain visible, while the fine mouth line, brows, clasp facets and painted texture become less distinct. This is a visual judgment from the included proof, not a measured recognition test.
@@ -127,6 +149,6 @@ Typechecks, Bun tests and Docker builds are separate repository checks. The asse
 
 ## Repository and live integration boundary
 
-These files live under `assets/PIP/` for Pip's separate identity. Existing Luma assets and their admin-page integration are outside this change. This package adds no runtime references, configuration, API calls, credentials or deployment changes.
+These files live under `assets/PIP/` for Pip's separate identity. Existing Luma assets and their admin-page integration are outside this change. This package adds no runtime references, configuration, API calls, credentials or deployment changes, and does not apply the avatar or banner to the live application.
 
 The related work is [Pip identity epic #332](https://github.com/Rackbops/rackbops-discord-bot/issues/332) and [live acceptance #338](https://github.com/Rackbops/rackbops-discord-bot/issues/338). Publishing the design package does not satisfy their delivery, isolation, acceptance or rollback criteria and does not close either issue.
