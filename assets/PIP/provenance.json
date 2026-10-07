@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "asset": "Pip avatar and design artifacts",
+  "published_date": "2026-10-07",
+  "source": "Existing generated artwork and saved design-review artifacts; no image regeneration or image editing during repository publication.",
+  "canonical": {
+    "file": "pip-canonical-review-v1.png",
+    "format": "PNG",
+    "width": 1254,
+    "height": 1254,
+    "color_mode": "RGB",
+    "bytes": 1892101,
+    "sha256": "393ec6500d81fd50ca2a20bc229e719baf120c6454712034261fdc8d373fe72e",
+    "git_blob_sha1": "ef79d2d54522e6b0a0bfa08b63c7fe101acfd932"
+  },
+  "review_proofs": [
+    {
+      "file": "qa-circular-inspection.png",
+      "width": 512,
+      "height": 512,
+      "bytes": 266111,
+      "sha256": "16fbad9940a5fa7dd1671df0bffdf04737d5fe606a0c898717fb10cff6779146"
+    },
+    {
+      "file": "qa-size-inspection.png",
+      "width": 800,
+      "height": 420,
+      "bytes": 127988,
+      "sha256": "54cdd27616f1f09ce92441c4e9c1a42fa72db9becca2d08e866a74034ee4a994"
+    }
+  ],
+  "prompts": [
+    {
+      "file": "prompt-canonical-v1.txt",
+      "bytes": 2044,
+      "sha256": "fbaa7a9788b5dc3a580f8ce244f20b0d6d099fe76fa0d7e9d0d72e9dd56d10bb"
+    },
+    {
+      "file": "prompt-refine-1.txt",
+      "bytes": 936,
+      "sha256": "c65197b55044b5ebf7647999a2630e9a7efbe82a20711127909ff7ca65e044c8"
+    },
+    {
+      "file": "prompt-refine-2.txt",
+      "bytes": 972,
+      "sha256": "577ffa22d8d99abb1d02eec50346805a68a399468db1ee9bfb46431322c8246a"
+    }
+  ],
+  "verification": {
+    "canonical_bytes_preserved": true,
+    "png_decode": "passed",
+    "visual_inspection": "completed for the canonical avatar and both QA proofs",
+    "live_discord_avatar": "not changed or verified by this asset publication"
+  },
+  "unknowns": [
+    "Exact generator version and seed were not established for this repository import."
+  ],
+  "related_issues": [
+    332,
+    338
+  ]
+}
