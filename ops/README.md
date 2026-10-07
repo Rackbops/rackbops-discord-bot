@@ -742,11 +742,11 @@ Two identities are involved, and they are not the same thing:
 - **The bot** is the Pip application. It is what Rod sees as the DM's author.
 - **The principal** is Rod's own paired user on the `pip` bridge (`u-<discord id>@pip`), holding only
   the `dm:self` grant. It is what authorises the send. The service's `whoami` reports the principal,
-  never the bot. (The principal's shape and grants are discord-mcp's, not this repository's; see its
-  add-a-bridge runbook, step 4 below.)
+  never the bot. (The principal's shape and grants are discord-mcp's, not this repository's; see
+  its add-a-bridge runbook, linked in section 4 below.)
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-`install.sh` also generates an `ADMIN_TOKEN` for every instance and prints it; Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:262-273`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -846,14 +846,17 @@ assumption. Line numbers are on `8d039c9`.
 | `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:62-68` |
 | `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:212`; `src/index.ts:366-381` |
 | Report-backs after an update | A DM, or a channel post, to the requester of an explicit `/pipupdate` or `/pipplugins update`, or of a scheduled one. | Delivered only when an owed marker exists (`state.pendingUpdateReport`, set only with a `requester`, `src/commands.ts:117`; `state.pendingReport`, set by `/plugins update` and `runDueSchedules`). Nobody can run those here. A panel-origin report is logged, not sent (`src/plugins/updates.ts:686-689`). | `src/index.ts:439` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:443-454` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:673-703`) |
+| Plugin `post` / `dm` / `edit` / `announce` (the host API) | A channel post, a DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. `announce` goes to `ANNOUNCE_CHANNEL_ID`. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives an unfinished one, `plugins/mcp/src/index.ts:53-62`, `drain.ts:133`, `:177-197`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring), `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`) |
+| Guild events | Nothing sent. | `GuildCreate`/`GuildDelete` re-register commands or rewrite discovery. | `src/index.ts:293-294`, `src/routing/live.ts:272-293` |
 | Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:457-471`; `src/announce.ts:235-270` (`pluginRequests`, `discovery`) |
 
 Interaction replies (`/pipagent` and the refusals above) are solicited: someone typed the command. The
-plugin's own deliveries are the bridge's, not the core's: they happen only when the `pip` bridge's
-service sends something, under the principal's grants (section 4). **Conclusion:** under this
-configuration the only *unsolicited* Discord output that is not a bridge delivery is a release post into
-the private announce channel, which cannot occur while the watched repository publishes no releases, and
-no core path produces a DM. If that is not acceptable, the way to close it is a small host change to
+deliveries through the host API are sent by core code but asked for by the plugin, so they are bridge
+deliveries, bounded by the service's grants (section 4) and not by this `.env`. **Conclusion:** under
+this configuration the only *unsolicited* Discord output that is not a bridge delivery is a release post
+into the private announce channel, which cannot occur while the watched repository publishes no
+releases, and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through
+the host API on the bridge's request. If that is not acceptable, the way to close it is a small host change to
 switch the release watcher off, filed as its own issue, not a configuration trick.
 
 ### 4. The bridge
