@@ -21,7 +21,8 @@ final design.
 ## Repo facts confirmed as part of this research (in addition to the ones already given)
 
 - `discord.js` resolves to **14.27.0** (`bun.lock:50`: `"discord.js@14.27.0"`); `package.json:14`
-  asks for `^14.27.0`, `package.json:6` pins `"packageManager": "bun@1.3.14"`.
+  asks for `^14.27.0`, `package.json:6` pins `"packageManager": "bun@1.3.14"` (as of this
+  research; #145 moved the pin to `bun@1.4.2` on 2026-09-08).
 - **The connector's storage is read at boot even when the connector is disabled.**
   `src/warbandeer/links.ts:215` is a top-level `await loadLinksFrom(LINKS_FILE)`, and that module
   is reached statically from two always-imported places: `src/commands.ts:23` →
@@ -613,9 +614,9 @@ surface in §2, so its extraction is where the contract earns its generality:
 6. Where WoW dedup keys go — stay in `state.json` at their current paths (keeping `bot-ops.sh:272-273`
    and the panel untouched) or move under a namespace/file with an additive migration.
 7. Whether the host owns the one `Bun.serve` and mounts plugin routes (Bun `routes`, v1.2.3+;
-   the pinned Bun is 1.3.14) behind the single tunnel hostname, or each HTTP-needing plugin binds its
-   own port with its own env key (today's shape; a second plugin would need a second public
-   hostname, `README.md:171-172`).
+   the pinned Bun was 1.3.14 then, 1.4.2 since #145) behind the single tunnel hostname, or each
+   HTTP-needing plugin binds its own port with its own env key (today's shape; a second plugin would
+   need a second public hostname, `README.md:171-172`).
 8. Whether a shutdown/dispose hook is added at the same time (nothing calls the connector's `stop`
    today, `index.ts:83`) or left as a separate behaviour change.
 9. Whether `src/warbandeer/storage.ts` is promoted to a host module (it is shared infrastructure;
