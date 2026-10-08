@@ -147,12 +147,15 @@ export function releaseNotesBetween(entry: PluginIndexEntry, from: string, to: s
   return renderNotes(releasesBetween(entry, from, to));
 }
 
-/** The DM/channel notification text. Compatible: the four operator options. Incompatible: says the
- *  bot must update first, and offers no install path. */
-export function notificationMessage(u: PluginUpdateDecision, botHostApi: number): string {
+/** The DM/channel notification text. Compatible: the four operator options, naming the `/plugins`
+ *  command as `pluginsCommand` — its registered name, `COMMAND_PREFIX` included (`pipplugins`), since
+ *  a bare `/plugins` doesn't exist on a prefixed instance. Incompatible: says the bot must update
+ *  first, and offers no install path. */
+export function notificationMessage(u: PluginUpdateDecision, botHostApi: number, pluginsCommand: string): string {
   const head = `📦 **${u.name}** ${u.to} is available (installed ${u.from}).\n`;
+  const cmd = `/${pluginsCommand}`;
   const last = u.compatible
-    ? `Update with \`/plugins update ${u.name}\` (now, or \`at:\` a time), \`/plugins remind ${u.name}\`, \`/plugins skip ${u.name}\`, or use the admin panel.`
+    ? `Update with \`${cmd} update ${u.name}\` (now, or \`at:\` a time), \`${cmd} remind ${u.name}\`, \`${cmd} skip ${u.name}\`, or use the admin panel.`
     : `This version needs a newer bot (host API v${u.neededHostApi}, this bot is v${botHostApi}) — update the bot first.`;
   // Budget the notes so head + notes + "\n" + last stays within Discord's 2000-char cap — clamping
   // only the notes (as before) let the assembled message overflow and Discord rejected the send,
@@ -524,6 +527,9 @@ export interface PluginUpdateDeps {
   deliverers: PluginNotifyDeliverers;
   adminUserIds: string[];
   hostApiVersion: number;
+  /** The core `/plugins` command's registered name, `COMMAND_PREFIX` included (`pipplugins`) — what
+   *  the notice tells admins to run. Injected because this module stays free of `config.ts`. */
+  pluginsCommand: string;
   now: () => Date;
   log: PluginUpdateLog;
   // #104 — running a due scheduled update. Injected (updates.ts imports nothing from restart.ts), so
@@ -570,7 +576,7 @@ export async function checkPluginUpdates(deps: PluginUpdateDeps): Promise<void> 
   const decisions = decidePluginUpdates(state, index, deps.hostApiVersion, deps.now());
   for (const d of decisions) {
     if (d.action === "none") continue; // already notified/skipped/scheduled, or a snooze not yet due
-    const message = notificationMessage(d, deps.hostApiVersion);
+    const message = notificationMessage(d, deps.hostApiVersion, deps.pluginsCommand);
     const delivered = await deliverPluginNotification(message, deps.adminUserIds, deps.deliverers, deps.log);
     const key = `${d.name}@${d.to}`;
     if (delivered) {

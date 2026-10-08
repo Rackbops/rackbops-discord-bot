@@ -31,37 +31,59 @@ describe("isAdmin", () => {
   });
 });
 
+/** A non-admin chat-input interaction under `commandName`, capturing the private reply. */
+function nonAdminInteraction(commandName: string, extra: Record<string, unknown> = {}) {
+  const seen: { replied?: { content?: string }; deferred: boolean } = { deferred: false };
+  const interaction = {
+    commandName,
+    user: { id: "999" },
+    reply: async (o: { content?: string }) => {
+      seen.replied = o;
+    },
+    deferReply: async () => {
+      seen.deferred = true;
+    },
+    ...extra,
+  } as unknown as ChatInputCommandInteraction;
+  return { interaction, seen };
+}
+
 describe("refuseUnlessAdmin (#206)", () => {
   // config.adminUserIds is empty in this test process (ADMIN_USER_IDS unset — see the file's own
   // top comment), so this exercises the no-admins-configured branch directly. The
   // configured-but-not-this-user branch below mutates the array IN PLACE (never reassigns the
   // `config` binding itself) and restores it in a `finally`, so it can't leak into another test.
   test("refuses with the no-admins-configured message, naming the command, when none are set", async () => {
-    let replied: { content?: string } | undefined;
-    const interaction = {
-      user: { id: "999" },
-      reply: async (o: { content?: string }) => {
-        replied = o;
-      },
-    } as unknown as ChatInputCommandInteraction;
-    const refused = await refuseUnlessAdmin(interaction, "/update");
+    const { interaction, seen } = nonAdminInteraction("update");
+    const refused = await refuseUnlessAdmin(interaction);
     expect(refused).toBe(true);
-    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+    expect(seen.replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+  });
+
+  // Every command is registered under COMMAND_PREFIX (commandNaming.ts), so on a `pip` instance the
+  // user typed `/pipupdate` — and `/update` does not exist there. The refusal must name what was
+  // typed. Mutation: reverting the interpolation to a literal `/update` (or `/plugins`) fails these.
+  test("names the prefixed command the user typed, never the bare core name", async () => {
+    for (const [typed, bare] of [
+      ["pipupdate", "update"],
+      ["pipplugins", "plugins"],
+      ["rupdate", "update"],
+      ["rplugins", "plugins"],
+    ] as const) {
+      const { interaction, seen } = nonAdminInteraction(typed);
+      expect(await refuseUnlessAdmin(interaction)).toBe(true);
+      expect(seen.replied?.content).toBe(`⛔ No admins are configured — set \`ADMIN_USER_IDS\` to enable \`/${typed}\`.`);
+      expect(seen.replied?.content).not.toContain(`\`/${bare}\``);
+    }
   });
 
   test("refuses with the not-allowed message when admins ARE configured but this user isn't one", async () => {
     config.adminUserIds.push("111");
     try {
-      let replied: { content?: string } | undefined;
-      const interaction = {
-        user: { id: "999" },
-        reply: async (o: { content?: string }) => {
-          replied = o;
-        },
-      } as unknown as ChatInputCommandInteraction;
-      const refused = await refuseUnlessAdmin(interaction, "/plugins");
+      const { interaction, seen } = nonAdminInteraction("pipplugins");
+      const refused = await refuseUnlessAdmin(interaction);
       expect(refused).toBe(true);
-      expect(replied?.content).toBe("⛔ You're not allowed to run this.");
+      expect(seen.replied?.content).toBe("⛔ You're not allowed to run this.");
     } finally {
       config.adminUserIds.length = 0;
     }
@@ -72,18 +94,43 @@ describe("refuseUnlessAdmin (#206)", () => {
     try {
       let replyCalled = false;
       const interaction = {
+        commandName: "update",
         user: { id: "111" },
         reply: async () => {
           replyCalled = true;
         },
       } as unknown as ChatInputCommandInteraction;
-      const refused = await refuseUnlessAdmin(interaction, "/update");
+      const refused = await refuseUnlessAdmin(interaction);
       expect(refused).toBe(false);
       expect(replyCalled).toBe(false);
     } finally {
       config.adminUserIds.length = 0;
     }
   });
+});
+
+// The consumer boundary: each admin-gated row's own `handle`, driven directly with a PREFIXED
+// interaction. `handleCommand` can't carry one here — COMMAND_PREFIX is empty in this test process,
+// so `bareName("pipupdate")` finds no core row — but the rows' handlers are what a prefixed instance
+// actually runs once dispatch has stripped the prefix, and the refusal text comes from inside them.
+// A prefix-stripping slip (`bareName(interaction.commandName)`) is invisible here, where the module
+// prefix is ""; src/commandPrefix.test.ts runs the same refusals under a real prefix and catches it.
+describe("the admin-gated core rows under a COMMAND_PREFIX", () => {
+  for (const [row, typed] of [
+    ["update", "pipupdate"],
+    ["plugins", "pipplugins"],
+    ["update", "rupdate"],
+    ["plugins", "rplugins"],
+  ] as const) {
+    test(`the ${row} row refuses /${typed} by that name, before any deferReply`, async () => {
+      const handle = CORE_COMMANDS.find((c) => c.name === row)!.handle;
+      const { interaction, seen } = nonAdminInteraction(typed, { options: { getSubcommand: () => "list" } });
+      await handle(interaction);
+      expect(seen.replied?.content).toBe(`⛔ No admins are configured — set \`ADMIN_USER_IDS\` to enable \`/${typed}\`.`);
+      expect(seen.replied?.content).not.toContain(`\`/${row}\``);
+      expect(seen.deferred).toBe(false);
+    });
+  }
 });
 
 describe("bareName", () => {
@@ -210,7 +257,9 @@ describe("CORE_COMMANDS table (#206)", () => {
   // `new SlashCommandBuilder()` leaves `cmd` unused and fails the typecheck (verified directly: TS6133
   // on `cmd`). This test covers the other, independently-testable half of the same property — that
   // each row's `build` genuinely HONORS whatever already-namespaced builder it's handed, rather than
-  // hardcoding a bare one internally — using the real `commandNamer` with a non-empty prefix.
+  // hardcoding a bare one internally — using the real `commandNamer` with a non-empty prefix. (The
+  // fresh-import route this comment calls out of scope exists now, as a child process:
+  // src/commandPrefix.test.ts checks the real `commandData` names under `pip` and `r`.)
   test("each row's build() honors an externally-namespaced builder (non-empty prefix)", async () => {
     const { commandNamer } = await import("./commandNaming");
     const prefixed = commandNamer("r_");
@@ -387,27 +436,16 @@ describe("handleCommand — the channel gate (#243)", () => {
 });
 
 // Found in review: nothing dispatched "/update" through the real handleCommand at all before this
-// — only "/plugins" had a non-admin dispatch test. Paired with that one (same shape, same exact-
-// message assertion, different command name), the two together catch a table row swap either way:
-// swapping the two rows' handle bodies makes dispatching by ONE name produce the OTHER's embedded
-// command name in the refusal text, which either exact assertion below would then fail.
+// — only "/plugins" had a non-admin dispatch test. Since the refusal names the command from
+// `interaction.commandName`, a non-admin refusal reads the same whichever row's body runs, so the
+// row-swap guard lives in src/commandPrefix.test.ts instead: there each admin-gated row, run as an
+// admin in a fresh process, does something only its own body does.
 describe("handleCommand — /update", () => {
   test("refuses a non-admin before any deferReply / update check", async () => {
-    let replied: { content?: string } | undefined;
-    let deferred = false;
-    const interaction = {
-      commandName: "update",
-      user: { id: "999" },
-      reply: async (o: { content?: string }) => {
-        replied = o;
-      },
-      deferReply: async () => {
-        deferred = true;
-      },
-    } as unknown as ChatInputCommandInteraction;
+    const { interaction, seen } = nonAdminInteraction("update");
     await handleCommand(interaction);
-    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
-    expect(deferred).toBe(false);
+    expect(seen.replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
+    expect(seen.deferred).toBe(false);
   });
 });
 
@@ -417,26 +455,12 @@ describe("handleCommand — /plugins", () => {
   // deferReply and hit the index/state I/O instead of refusing. The rendered list body is covered by
   // renderPluginsList's own tests (plugins/updates.test.ts) and the fixture E2E in the deploy check.
   test("refuses a non-admin before any deferReply / index fetch", async () => {
-    let replied: { content?: string } | undefined;
-    let deferred = false;
-    const interaction = {
-      commandName: "plugins",
-      user: { id: "999" },
-      options: { getSubcommand: () => "list" },
-      reply: async (o: { content?: string }) => {
-        replied = o;
-      },
-      deferReply: async () => {
-        deferred = true;
-      },
-    } as unknown as ChatInputCommandInteraction;
+    const { interaction, seen } = nonAdminInteraction("plugins", { options: { getSubcommand: () => "list" } });
     await handleCommand(interaction);
-    // Full equality, not a substring: the message embeds the SPECIFIC command name
-    // (refuseUnlessAdmin(interaction, "/plugins")) — found in review that a looser substring check
-    // (just "set `ADMIN_USER_IDS`") can't tell this apart from /update's own refusal, which shares
-    // that same fragment and would still match if the two rows' handle bodies were swapped.
-    expect(replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.");
-    expect(deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
+    // Full equality, not a substring: the message names the command the user typed
+    // (interaction.commandName), which a looser check (just "set `ADMIN_USER_IDS`") wouldn't pin.
+    expect(seen.replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/plugins`.");
+    expect(seen.deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
   });
 
   // #104 update-now restart ordering. The handler does real network/state I/O (loadPluginIndex,

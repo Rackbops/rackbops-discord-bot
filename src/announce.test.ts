@@ -19,7 +19,9 @@ const {
   shouldRefreshDiscovery,
   resetDiscoveryGapForTest,
   livePluginRequestDeps,
+  livePluginUpdateDeps,
 } = await import("./announce");
+const { config } = await import("./config");
 const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routingIdleForTest } = await import("./routing/live");
 const { DATA_DIR } = await import("./storage");
 const { writeDiscovery } = await import("./routing/discovery");
@@ -80,6 +82,24 @@ describe("livePluginRequestDeps (#241)", () => {
     } finally {
       stub.mockRestore();
       cleanUp();
+    }
+  });
+});
+
+describe("livePluginUpdateDeps — the /plugins name the update notice uses", () => {
+  // The notice DMs admins "`/plugins update <name>`"; on a COMMAND_PREFIX=pip instance that command is
+  // `/pipplugins`. The deps read config.commandPrefix when built, so a temporary prefix shows the
+  // wiring. Building them touches no Client (only a delivery would). Mutation: a literal "plugins"
+  // here, or dropping the prefix, fails this.
+  test("is the registered name under the configured prefix", () => {
+    const realPrefix = config.commandPrefix;
+    try {
+      config.commandPrefix = "pip";
+      expect(livePluginUpdateDeps({} as Client).pluginsCommand).toBe("pipplugins");
+      config.commandPrefix = "";
+      expect(livePluginUpdateDeps({} as Client).pluginsCommand).toBe("plugins");
+    } finally {
+      config.commandPrefix = realPrefix;
     }
   });
 });

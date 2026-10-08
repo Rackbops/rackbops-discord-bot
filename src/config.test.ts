@@ -102,9 +102,17 @@ describe("report helpers", () => {
   });
 
   test("reportBody keeps the description and names the reporter", () => {
-    const b = reportBody("it crashed on login", "alice");
+    const b = reportBody("it crashed on login", "alice", "report");
     expect(b).toContain("it crashed on login");
     expect(b).toContain("alice");
+  });
+
+  // The footer names the command the report was filed through, as registered: `pipreport` on a
+  // `COMMAND_PREFIX=pip` instance, where `/report` doesn't exist.
+  test("reportBody's footer names the command it is given, not a bare /report", () => {
+    const b = reportBody("it crashed on login", "alice", "pipreport");
+    expect(b).toContain("_Filed from Discord via `/pipreport` by **alice**._");
+    expect(b).not.toContain("`/report`");
   });
 });
 

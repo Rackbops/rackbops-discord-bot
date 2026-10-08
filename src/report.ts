@@ -8,15 +8,17 @@ import {
   type ModalSubmitInteraction,
 } from "discord.js";
 import { config, repoForProject } from "./config";
+import { prefixedName } from "./commandNaming";
 import { clampReply, createIssue, ensureLabel } from "./github";
 
 const REPORT_LABEL = "automated";
 const MODAL_PREFIX = "report:"; // modal customId = report:<project>
 
 /** Issue body: the reporter's text plus a traceability footer naming the Discord user by
- * plain username (never a pingable mention). Pure — unit-tested. */
-export function reportBody(description: string, username: string): string {
-  return `${description}\n\n---\n_Filed from Discord via \`/report\` by **${username}**._`;
+ * plain username (never a pingable mention) and `command`, the registered name the report was
+ * filed through (`COMMAND_PREFIX` included, e.g. `pipreport`). Pure — unit-tested. */
+export function reportBody(description: string, username: string, command: string): string {
+  return `${description}\n\n---\n_Filed from Discord via \`/${command}\` by **${username}**._`;
 }
 
 // Discord's hard cap on a message's content. The modal's Description field is unbounded, so a
@@ -57,11 +59,13 @@ export function isReportModal(customId: string): boolean {
   return customId.startsWith(MODAL_PREFIX);
 }
 
-/** `/report project:<..>` → gate on config + role, then pop the Title/Description modal. */
+/** `/report project:<..>` → gate on config + role, then pop the Title/Description modal. The
+ *  not-configured refusal names `interaction.commandName`, the name the user typed (`/pipreport`
+ *  under `COMMAND_PREFIX=pip`), not a bare `/report` that doesn't exist on a prefixed instance. */
 export async function handleReportCommand(interaction: ChatInputCommandInteraction): Promise<void> {
   if (!config.reportRoleId || !config.githubToken) {
     await interaction.reply({
-      content: "`/report` isn't configured — an admin must set `REPORT_ROLE_ID` and `GITHUB_TOKEN`.",
+      content: `\`/${interaction.commandName}\` isn't configured — an admin must set \`REPORT_ROLE_ID\` and \`GITHUB_TOKEN\`.`,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -115,6 +119,9 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
  * in `handleReportCommand` above is the only enforcement point that can actually be reached, and
  * it stays sufficient. A role revoked in the (typically seconds-long) window between showing the
  * modal and submitting it is an accepted, pre-existing race, not introduced or fixed here.
+ *
+ * A modal submit carries no `commandName`, so the issue footer's command name is built from
+ * `config.commandPrefix` — the same prefix `/report` was registered under — read at submit time.
  */
 export async function handleReportModal(interaction: ModalSubmitInteraction): Promise<void> {
   const project = interaction.customId.slice(MODAL_PREFIX.length);
@@ -130,7 +137,8 @@ export async function handleReportModal(interaction: ModalSubmitInteraction): Pr
   await interaction.deferReply();
   try {
     await ensureLabel(repo, REPORT_LABEL);
-    const issue = await createIssue(repo, title, reportBody(description, username), [REPORT_LABEL]);
+    const body = reportBody(description, username, prefixedName(config.commandPrefix, "report"));
+    const issue = await createIssue(repo, title, body, [REPORT_LABEL]);
     await interaction.editReply({
       content: reportAnnouncement({ repo, number: issue.number, url: issue.url, title, description, username }),
       allowedMentions: { parse: [] },
