@@ -2,11 +2,98 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stallBunWrite } from "../test/stallBunWrite";
+import { settled } from "../test/stateLeaks";
 import type { BotState } from "./state";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time) -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { createStateWriter, loadStateFrom, normalizeSeenReleaseIds, saveStateTo } = await import("./state");
+const {
+  botStateForTest,
+  createStateWriter,
+  loadStateFrom,
+  normalizeSeenReleaseIds,
+  resetBotStateForTest,
+  resetStateWriterForTest,
+  saveState,
+  saveStateTo,
+  state,
+} = await import("./state");
+
+// The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track the
+// live `state` object and the live writer, and the reset must really put `state` back.
+describe("botStateForTest / resetBotStateForTest", () => {
+  afterEach(resetBotStateForTest);
+
+  test("names each key changed since load, and the reset puts them back in place", () => {
+    const same = state;
+    expect(botStateForTest().changedKeys).toEqual([]);
+    state.attemptedUpdateToSha = "a".repeat(40);
+    state.seenReleaseIds["x/y"] = [1];
+    expect(botStateForTest().changedKeys.sort()).toEqual(["attemptedUpdateToSha", "seenReleaseIds"]);
+    resetBotStateForTest();
+    expect(botStateForTest().changedKeys).toEqual([]);
+    expect(state.attemptedUpdateToSha).toBeUndefined();
+    expect(state).toBe(same); // the one object every importer holds
+  });
+
+  test("a key put back to undefined counts as unchanged", () => {
+    state.attemptedUpdateToSha = undefined;
+    expect(botStateForTest().changedKeys).toEqual([]);
+  });
+
+  // Each is a separate way a leak could go unseen: a key only one side has, a key the reset leaves
+  // behind, and a field the reset shares with the snapshot instead of copying.
+  test("a key added or removed counts, and the reset removes it and shares nothing with the snapshot", () => {
+    const loose = state as unknown as Record<string, unknown>;
+    loose.notAStateKey = "added by a test";
+    delete loose.seenReleaseIds; // always loaded, {} when there is no state.json
+    expect(botStateForTest().changedKeys.sort()).toEqual(["notAStateKey", "seenReleaseIds"]);
+    resetBotStateForTest();
+    expect("notAStateKey" in state).toBe(false);
+    expect(botStateForTest().changedKeys).toEqual([]);
+    state.seenReleaseIds["x/y"] = [1]; // would change the snapshot too, were the map shared
+    expect(botStateForTest().changedKeys).toEqual(["seenReleaseIds"]);
+  });
+
+  // What the guard runs once it has waited, so a save that never finishes can't hold every later
+  // test up. The old save is held stuck, not hoped to be still running.
+  test("resetStateWriterForTest starts the writer on a fresh queue, dropping a save that never finishes", async () => {
+    const stall = stallBunWrite();
+    try {
+      void saveState();
+      await stall.reached;
+      const before = botStateForTest().writes;
+      resetStateWriterForTest();
+      expect(await settled(botStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+    } finally {
+      stall.restore();
+    }
+  });
+
+  // Tests clean up with resetBotStateForTest: were it to drop the writer's queue too, a save the
+  // test leaked would be gone before the guard looked.
+  test("resetBotStateForTest leaves the writer's queue alone, so a leaked save still reaches the guard", async () => {
+    const stall = stallBunWrite();
+    try {
+      void saveState();
+      await stall.reached;
+      resetBotStateForTest();
+      expect(await settled(botStateForTest().writes)).toBe(false);
+    } finally {
+      stall.restore();
+      resetStateWriterForTest(); // the stuck save would otherwise fail this test through the guard
+    }
+  });
+
+  test("writes settles only once a queued save has", async () => {
+    let saved = false;
+    void saveState().then(() => (saved = true));
+    await botStateForTest().writes;
+    expect(saved).toBe(true);
+  });
+});
 
 describe("normalizeSeenReleaseIds", () => {
   test("migrates a legacy global array under the default repo", () => {

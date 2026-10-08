@@ -224,6 +224,16 @@ const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy };
 // every exit — including a thrown fetch — releases it.
 let checkInFlight = false;
 
+/** What `resetUpdateForTest` resets, for the test-state guard (test/stateGuard.ts). */
+export function updateStateForTest(): { checkInFlight: boolean } {
+  return { checkInFlight };
+}
+
+/** Releases the in-flight guard, as a check that finished would. */
+export function resetUpdateForTest(): void {
+  checkInFlight = false;
+}
+
 /**
  * Compare this build against the newest bot commit and, when stale, ask for a
  * restart so the orchestrator can bring up the new code. `force` is an admin's

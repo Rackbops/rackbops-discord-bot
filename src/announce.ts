@@ -385,17 +385,42 @@ export function resetDiscoveryGapForTest(): void {
   lastDiscoveryAt = 0;
 }
 
-/** What `resetTickGuardForTest` and `resetDiscoveryGapForTest` reset, as plain values — what the
- *  test-state guard reads (test/stateGuard.ts). `tickGeneration` is left out: a tick only ever
- *  compares it with the generation it took itself, so its starting value changes nothing later. */
+/** Forgets when releases, self-update and plugin updates were last polled, whether the boot
+ *  state.json write has landed, and which watched repos were found unreachable. */
+export function resetPollStateForTest(): void {
+  lastReleasePollAt = 0;
+  lastUpdatePollAt = 0;
+  lastPluginPollAt = 0;
+  pluginStateReady = false;
+  releaseReachability = createReachabilityLog();
+}
+
+/** What `resetTickGuardForTest`, `resetDiscoveryGapForTest` and `resetPollStateForTest` reset, as
+ *  plain values — what the test-state guard reads (test/stateGuard.ts). `tickGeneration` is left
+ *  out: a tick only ever compares it with the generation it took itself, so its starting value
+ *  changes nothing later. */
 export interface AnnounceStateForTest {
   tickInFlight: boolean;
   consecutiveSkips: number;
   lastDiscoveryAt: number;
+  lastReleasePollAt: number;
+  lastUpdatePollAt: number;
+  lastPluginPollAt: number;
+  pluginStateReady: boolean;
+  unreachableRepos: number;
 }
 
 export function announceStateForTest(): AnnounceStateForTest {
-  return { tickInFlight, consecutiveSkips, lastDiscoveryAt };
+  return {
+    tickInFlight,
+    consecutiveSkips,
+    lastDiscoveryAt,
+    lastReleasePollAt,
+    lastUpdatePollAt,
+    lastPluginPollAt,
+    pluginStateReady,
+    unreachableRepos: releaseReachability.unreachableCount(),
+  };
 }
 
 /** One line for the boot log: whether the release watcher is on (`WATCHED_REPOS=none` = off). */
@@ -426,8 +451,9 @@ export async function checkReleases(
 
 // A watched repo can be unreadable for as long as it is watched — renamed, deleted, or private
 // to the bot's token — and that must not reprint the same failure every poll, where it would
-// bury a real one. Track it here so the condition is reported on its edges only.
-const releaseReachability = createReachabilityLog();
+// bury a real one. Track it here so the condition is reported on its edges only. (`let` only so
+// resetPollStateForTest can start a fresh record.)
+let releaseReachability = createReachabilityLog();
 
 async function checkRepoReleases(client: Client, repo: string): Promise<void> {
   const releases = await fetchReleases(repo);

@@ -1,9 +1,49 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 // The `config` singleton resolves process.env at import time. DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID
 // are primed once, for every test file, by test/setup.ts's bunfig preload (#136) -- this file's
 // own tests below cover resolveConfig's OTHER vars directly, with their own explicit env.
-const { resolveConfig, repoForProject } = await import("./config");
+const { config, configStateForTest, resetConfigForTest, resolveConfig, repoForProject } = await import("./config");
+
+// The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track the
+// live `config` object, and the reset must really put it back.
+describe("configStateForTest / resetConfigForTest", () => {
+  afterEach(resetConfigForTest);
+
+  test("names each key changed since it was resolved, and the reset puts them back in place", () => {
+    const same = config;
+    const token = config.githubToken;
+    expect(configStateForTest().changedKeys).toEqual([]);
+    config.githubToken = "changed-by-a-test";
+    config.watchedRepos.push("x/y"); // a change inside a field counts too
+    expect(configStateForTest().changedKeys.sort()).toEqual(["githubToken", "watchedRepos"]);
+    resetConfigForTest();
+    expect(configStateForTest().changedKeys).toEqual([]);
+    expect(config.githubToken as string | undefined).toBe(token); // narrowed by the assignment above
+    expect(config).toBe(same); // the one object every importer holds
+  });
+
+  // A test that restores an optional field by assigning `undefined` leaves the key present where it
+  // was absent: that is put back, not a leak. (A key no resolved config has, so no env can change it.)
+  test("a key present but undefined counts as unchanged where it was absent", () => {
+    (config as unknown as Record<string, unknown>).notAConfigKey = undefined;
+    expect(configStateForTest().changedKeys).toEqual([]);
+  });
+
+  // Each is a separate way a leak could go unseen: a key only one side has, a key the reset leaves
+  // behind, and a field the reset shares with the snapshot instead of copying.
+  test("a key added or removed counts, and the reset removes it and shares nothing with the snapshot", () => {
+    const loose = config as unknown as Record<string, unknown>;
+    loose.notAConfigKey = "added by a test";
+    delete loose.commandPrefix; // always resolved, "" when unset
+    expect(configStateForTest().changedKeys.sort()).toEqual(["commandPrefix", "notAConfigKey"]);
+    resetConfigForTest();
+    expect("notAConfigKey" in config).toBe(false);
+    expect(configStateForTest().changedKeys).toEqual([]);
+    config.watchedRepos.push("x/y"); // would change the snapshot too, were the array shared
+    expect(configStateForTest().changedKeys).toEqual(["watchedRepos"]);
+  });
+});
 const { reportBody, reportAnnouncement } = await import("./report");
 
 const base = {

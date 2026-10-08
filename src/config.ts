@@ -172,3 +172,22 @@ export function resolveConfig(env: Env): Config {
 }
 
 export const config: Config = resolveConfig(process.env);
+
+// `config` as it was resolved, for the test-state guard (test/stateGuard.ts): tests set fields of
+// the shared object (gitSha, githubToken, commandPrefix, ...) and must put them back.
+const loadedConfig: Config = structuredClone(config);
+
+/** The keys of `config` that differ from what was resolved. */
+export function configStateForTest(): { changedKeys: string[] } {
+  const current = config as unknown as Record<string, unknown>;
+  const loaded = loadedConfig as unknown as Record<string, unknown>;
+  const keys = [...new Set([...Object.keys(current), ...Object.keys(loaded)])];
+  return { changedKeys: keys.filter((k) => !Bun.deepEquals(current[k], loaded[k])) };
+}
+
+/** Puts `config` back to what was resolved — in place, since every importer holds this one object. */
+export function resetConfigForTest(): void {
+  const current = config as unknown as Record<string, unknown>;
+  for (const k of Object.keys(current)) delete current[k];
+  Object.assign(current, structuredClone(loadedConfig));
+}
