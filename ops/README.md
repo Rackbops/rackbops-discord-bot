@@ -502,7 +502,8 @@ ordinary `ops/install.sh` instance -- here called `clerk` -- configured so that:
   plugin. `/report` says it is not configured while `REPORT_ROLE_ID` is blank. `/update` and
   `/plugins` carry `setDefaultMemberPermissions(0)`, which hides them from non-admins in a server,
   but in a DM they are probably visible to everyone (**inferred**): there, the only protection is
-  the handler's own refusal of anyone not in `ADMIN_USER_IDS` (`src/commands.ts:37-55`).
+  the handler's own refusal of anyone not in `ADMIN_USER_IDS` (`refuseUnlessAdmin`,
+  `src/commands.ts:47-59`).
 - **the tracker's HTTP is reachable through the instance's own tunnel**: the host router serves
   every plugin under `/<plugin-name>/` on `HTTP_PORT` inside the container (`src/plugins/host.ts`,
   `routeHttpRequest`; ADR-0007), with no host port published. Today the tracker serves only
@@ -558,8 +559,10 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 Then, in the instance's config-dir `.env` (the hand-edited one; `install.sh` never touches it
 again):
 
-Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-ops.sh` strips a
-`# comment` written after a value.
+Comments go on their own lines: Compose's `env_file:` loader strips a ` # comment` written after a
+value, but `bot-ops.sh` and the panel read it as part of the value (`load_env_values` in
+`ops/bot-ops.sh`, `parseEnvValue` in `ops/admin/server.ts`), so the two would disagree about what
+the bot is running with.
 
 ```sh
 DISCORD_TOKEN=<Clerk's bot token>
@@ -613,9 +616,9 @@ curl -sS https://clerk.<domain>/tracker/healthz
 The tracker's own `503` is JSON: `stale` when the last good tick is more than three minutes old,
 `blocked` when the lane cannot run at all. A plugin that is loaded but not running never reaches
 the tracker: the host router answers a plain-text `503 Unavailable` itself
-(`src/plugins/host.ts:827`). A host-router `404` means the tracker did not load (read the logs);
-no answer at all means `HTTP_PORT` or the tunnel. From the host,
-without the tunnel:
+(`src/plugins/host.ts:841`, and again at `:861` once the body has been read). A host-router `404`
+means the tracker did not load (read the logs); no answer at all means `HTTP_PORT` or the tunnel.
+From the host, without the tunnel:
 
 ```sh
 docker exec rackbops-discord-bot-clerk bun -e \
@@ -746,7 +749,7 @@ Two identities are involved, and they are not the same thing:
   its add-a-bridge runbook, linked in section 4 below.)
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:262-273`); Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:269-273`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -782,8 +785,8 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 ```
 
 Then, in the instance's config-dir `.env` (the hand-edited one; `install.sh` never touches it again).
-Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-ops.sh` strips a
-`# comment` written after a value.
+Comments go on their own lines, for the reason given in the Clerk runbook's step 3 (Compose strips
+an inline ` # comment`; `bot-ops.sh` and the panel do not).
 
 ```sh
 DISCORD_TOKEN=<Pip's bot token>
@@ -871,8 +874,10 @@ This side supplies three values, and the service side is configured from them:
 The bot's compose project is `rackbops-discord-bot-pip` and its network is the project default,
 `rackbops-discord-bot-pip_default` (`docker-compose.yml` declares no `networks:` key), so the service
 reaches the bridge at `http://rackbops-discord-bot-pip:<HTTP_PORT>/mcp` once it is attached to that
-network. The service side (the `pip` bridge entry, the network attachment and the Pip-only grants) is in
-`Rackbops/discord-mcp`'s `deploy/add-bridge.md` (Rackbops/discord-mcp#334).
+network. The service side (the `pip` bridge entry, the network attachment and the default `dm:self`
+grant) is in `Rackbops/discord-mcp`'s
+[`deploy/add-bridge.md`](https://github.com/Rackbops/discord-mcp/blob/main/deploy/add-bridge.md)
+(Rackbops/discord-mcp#78, for this repo's #334).
 
 `GET /mcp/capabilities` answers `401` without the bearer (and `503` if `MCP_BRIDGE_TOKEN` is unset in the
 container: `plugins/mcp/src/http.ts:186-191`, `plugins/mcp/src/auth.ts:63-71`), so a `401` from inside the
@@ -1004,7 +1009,7 @@ Everything between the two rules below is written to be pasted into hosted Pip's
 understood without this repository open. The policy is Rod's, recorded on #332 on 2026-10-07: "opt-in
 phrase **"notify me on Discord"** per task; everything else excluded. No quiet hours; 24-hour expiry; no
 replay; retry = the same event id." The script's contract is the `scripts/result-dm.mjs` entry in
-Rackbops/discord-mcp's README (#335, #79).
+Rackbops/discord-mcp's README (this repo's #335, Rackbops/discord-mcp#79).
 
 ---
 
