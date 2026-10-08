@@ -48,9 +48,11 @@ export const GUARDED: readonly GuardedModule[] = [
 ];
 
 /** Every guarded module whose state differs from what its reset hooks leave, with what differs. */
-export async function findStateLeaks(): Promise<{ module: string; leaks: string[] }[]> {
+export async function findStateLeaks(
+  table: readonly GuardedModule[] = GUARDED,
+): Promise<{ module: string; leaks: string[] }[]> {
   const found: { module: string; leaks: string[] }[] = [];
-  for (const g of GUARDED) {
+  for (const g of table) {
     const leaks = await g.leaks(g.snapshot() as never);
     if (leaks.length > 0) found.push({ module: g.module, leaks });
   }
@@ -58,6 +60,6 @@ export async function findStateLeaks(): Promise<{ module: string; leaks: string[
 }
 
 /** Runs every guarded module's reset hooks. */
-export function resetAllState(): void {
-  for (const g of GUARDED) for (const reset of g.resets) reset();
+export function resetAllState(table: readonly GuardedModule[] = GUARDED): void {
+  for (const g of table) for (const reset of g.resets) reset();
 }

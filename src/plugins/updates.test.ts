@@ -2,7 +2,7 @@
 // Client. Every side effect of checkPluginUpdates is an injected fake. #104 added `restartPending`/
 // `requestRestart` to the deps, so "never restarts without a due schedule" is now enforced
 // BEHAVIORALLY (the restart-spy tests below), not structurally.
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach } from "bun:test";
 import type { PluginIndex, PluginIndexEntry, PluginRelease, PluginStateEntry, PluginStateFile } from "./contract";
 import {
   compareSemver,
@@ -303,9 +303,6 @@ describe("deliverPluginNotification", () => {
 
 describe("checkPluginUpdates", () => {
   beforeEach(resetPluginUpdateStateForTest);
-  // Failed deliveries are counted per process; the test-state guard (test/stateGuard.ts) fails a
-  // test that leaves a count behind.
-  afterEach(resetPluginUpdateStateForTest);
 
   function harness(opts: {
     index: PluginIndex;

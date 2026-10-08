@@ -8,7 +8,7 @@ import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/
 import { resetForTest, stateForTest, type RestartStateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, routingWarningsStateForTest } from "../src/routing/store";
-import { GUARDED } from "./stateGuard";
+import { findStateLeaks, GUARDED, resetAllState, type GuardedModule } from "./stateGuard";
 import {
   announceLeaks,
   pluginRequestLeaks,
@@ -189,6 +189,40 @@ describe("GUARDED", () => {
       ["src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]],
       ["src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]],
     ]);
+  });
+});
+
+// The two loops the hook runs, over a table of fakes that record what they were given and asked.
+describe("findStateLeaks and resetAllState", () => {
+  function fakeTable() {
+    const seen: unknown[] = [];
+    const resets: string[] = [];
+    const table: GuardedModule[] = [
+      { module: "src/clean.ts", snapshot: () => "clean-snap", leaks: (s: never) => (seen.push(s), []), resets: [() => resets.push("clean")] },
+      { module: "src/sync.ts", snapshot: () => "sync-snap", leaks: (s: never) => (seen.push(s), ["sync leak"]), resets: [() => resets.push("sync")] },
+      {
+        module: "src/async.ts",
+        snapshot: () => "async-snap",
+        leaks: async (s: never) => (seen.push(s), ["async leak", "another"]),
+        resets: [() => resets.push("async-1"), () => resets.push("async-2")],
+      },
+    ];
+    return { table, seen, resets };
+  }
+
+  test("findStateLeaks hands each module its own snapshot and reports only the ones that leaked, in order", async () => {
+    const { table, seen } = fakeTable();
+    expect(await findStateLeaks(table)).toEqual([
+      { module: "src/sync.ts", leaks: ["sync leak"] },
+      { module: "src/async.ts", leaks: ["async leak", "another"] },
+    ]);
+    expect(seen).toEqual(["clean-snap", "sync-snap", "async-snap"]);
+  });
+
+  test("resetAllState runs every reset hook of every module, leaked or not", () => {
+    const { table, resets } = fakeTable();
+    resetAllState(table);
+    expect(resets).toEqual(["clean", "sync", "async-1", "async-2"]);
   });
 });
 
