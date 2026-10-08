@@ -918,15 +918,15 @@ node 'R:\repos\discord-mcp\dist\shim\cli.js' pair <code>
 (`Rackbops/discord-mcp` `src/shim/cli.ts:42-44` refuses a relative one), dedicated to Pip (a separate
 directory is what keeps the prod integration's `credentials.json` untouched), and under your own profile: the
 shim writes `credentials.json` with mode `0o600`, which Windows ignores (`cli.ts:80-82`), so the directory's
-inherited ACL is the plaintext bearer's only protection, and `%APPDATA%` inherits a user-only one while a
-directory at the root of a drive does not. `pair` saves the URL into `credentials.json`, so later runs need
+inherited ACL is the plaintext bearer's only protection, and `%APPDATA%` normally inherits a user-only one while a
+directory at the root of a drive typically does not. `pair` saves the URL into `credentials.json`, so later runs need
 only the directory (`cli.ts:107-181`). Paste the code nowhere but that command.
 
 The command prints `Paired as u-<your Discord id>@pip. Credentials saved to ...` (on stderr,
 `cli.ts:181`). Check the suffix. The service redeems a code on whichever bridge issued it (production
 bridges are tried first, `src/service/redeem.ts:177`) and the shim saves whatever principal comes back
 (`cli.ts:173-181`), so if the code came from `/agent pair` or `/ragent pair` on another bot by mistake, the
-Pip directory now holds an `@prod` or `@debug` principal while the prod directory still looks untouched:
+Pip directory now holds an `@prod`, `@debug` or other non-`@pip` principal while the prod directory still looks untouched:
 `unregister` on that bot and pair again with `/pipagent`. The add-a-bridge runbook ends the same step with a
 `whoami` expecting `u-<discord_user_id>@pip` (`deploy/add-bridge.md` section 7, step 5).
 
@@ -945,7 +945,7 @@ crash-loop restarts of `restart: unless-stopped` (`docker-compose.yml:57`), so a
 can match an earlier boot while the new process is failing to log in. Expect, in order, `[boot] env file:
 /opt/rackbops-discord-bot/pip/.env` (`src/bootLog.ts:28`, printed every boot), `Logged in as pip#<tag>`
 (`src/index.ts:130`) and `[release] watcher off (WATCHED_REPOS=none)`. A `[plugins] mcp@<version>
-downloaded, integrity ok` line appears only on the first boot of a version on that state volume
+downloaded, integrity ok` line, between the login and the `[release]` line, appears only on the first boot of a version on that state volume
 (`src/plugins/install.ts:281`); a cached bundle is reused silently (`:238-242`), so after a `restart` or a
 `recreate` on the same version there is no per-plugin line, and `bot-ops.sh status` is where the installed
 version shows.
@@ -955,7 +955,9 @@ env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints i
 `{"dm":true,...}` says the listener is up, the token the plugin loaded is the file's, and DMs are enabled
 (`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
 the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:112-121`),
-so it may run in a loop. Any other answer:
+so it may run in a loop. The failing answers below do count toward that lockout (a bad bearer records a
+failure, `auth.ts:66-67`; more than ten in a minute answers `429`, `auth.ts:8-12`), so read them by hand
+rather than looping. Any other answer:
 
 - `401 {"error":"unauthorized"}` **with** the bearer: the token in the container is blank (a
   `MCP_BRIDGE_TOKEN=` line with no value, section 2), so the plugin rejects every bearer
@@ -967,16 +969,20 @@ so it may run in a loop. Any other answer:
   (`src/plugins/host.ts:841`, `:861`): `activate()` threw and the log has a line beginning `[plugins] mcp
   failed to activate` (`host.ts:547-549`). `src/http.ts:36` answers the same while the listener is
   closing.
-- `404 Not found`: the plugin never loaded (`host.ts:839`): the index or the registry unreachable on a
-  fresh instance with no cache, a `hostApiVersion` skip, a throwing `createPlugin`, each contained per
-  plugin and recorded where `bot-ops.sh status` shows it, `plugins[]` with `error`, `active` and
-  `installedVersion` (`ops/bot-ops.sh:632-633` passes the state file's array through; the fields are
-  `src/plugins/contract.ts:187-201`). An unexpected failure of the whole plugin setup instead logs a line
+- `404 Not found`: the plugin never loaded (`host.ts:839`). Either `PLUGINS` does not name `mcp` (the boot
+  log then says `[plugins] index: <source>, 0 selected, 0 skipped`, `src/index.ts:88`), or it was selected
+  and failed to come up: the index or the registry unreachable on a fresh instance with no cache, a
+  `hostApiVersion` skip, a throwing `createPlugin`, each contained per plugin and recorded where
+  `bot-ops.sh status` shows a selected plugin, `plugins[]` with `error`, `active` and `installedVersion`
+  (`ops/bot-ops.sh:632-633` passes the state file's array through; the fields are
+  `src/plugins/contract.ts:187-201`). A loaded plugin with no `http` handler answers the same 404
+  (`host.ts:850`; `mcp` 0.3.1 has one). An unexpected failure of the whole plugin setup instead logs a line
   beginning `[plugins] plugin setup failed` and the bot starts core-only (`src/index.ts:213-214`).
 - No answer: the listener binds after login, plugin install and activation (`src/index.ts:316-344`,
   `startHostHttp` at `:333`) and before command registration (`:367-383`), so a boot that has not reached
   that point answers nothing yet; a bind failure logs a line beginning `[http] could not listen on :8794`
-  (`:342`); otherwise the port in the probe is not `HTTP_PORT`.
+  (`:342`); with `HTTP_PORT` unset there is no listener at all (`:320`); otherwise the port in the probe is
+  not `HTTP_PORT`.
 
 Restart and logs are Clerk's step 6 with `pip` substituted: `install.sh`'s printed step 3 prints the four
 `BOT_OPS_*` lines instance-exact (`BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/pip`,
