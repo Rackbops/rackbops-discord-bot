@@ -292,8 +292,9 @@ describe("GUARDED", () => {
   });
 
   // The hook waits for a queue at most QUEUE_DRAIN_MS, then relies on a reset to start a fresh one;
-  // a row holding a queue with no reset at all would let a job that never finishes fail every later
-  // test (#394's round 1). For whatever row is added next.
+  // a row holding a queue with no reset at all (as src/plugins/host.ts's row was, before #394's
+  // round 1) would let a job that never finishes fail every later test. This catches only a row
+  // with no reset; that a reset really replaces its queue is pinned by each queue's own test.
   test("every row whose snapshot holds a queue has a reset hook", () => {
     const holdsQueue = (g: GuardedModule) => Object.values(g.snapshot() as object).some((v) => v instanceof Promise);
     expect(GUARDED.filter(holdsQueue).length).toBeGreaterThan(0);
