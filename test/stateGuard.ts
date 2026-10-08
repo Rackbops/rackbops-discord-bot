@@ -9,12 +9,12 @@
 
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest } from "../src/announce";
 import { configStateForTest, resetConfigForTest } from "../src/config";
-import { pluginHostStateForTest } from "../src/plugins/host";
+import { pluginHostStateForTest, resetPluginHostForTest } from "../src/plugins/host";
 import { pluginRequestsStateForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
 import { resetForTest, stateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
-import { resetRoutingWarningsForTest, routingStoreStateForTest } from "../src/routing/store";
+import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import {
@@ -60,8 +60,11 @@ export const GUARDED: readonly GuardedModule[] = [
     resetPollStateForTest,
   ]),
   guarded("src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]),
-  guarded("src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [resetRoutingWarningsForTest]),
-  guarded("src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, []),
+  guarded("src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [
+    resetRoutingWarningsForTest,
+    resetRoutingWritesForTest,
+  ]),
+  guarded("src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, [resetPluginHostForTest]),
   guarded("src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]),
   guarded("src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]),
 ];
@@ -83,8 +86,10 @@ export const QUEUE_DRAIN_MS = 1_000;
 
 /**
  * Waits — at most `ms` — for every promise any guarded module's snapshot holds (its work and write
- * queues) to settle, so a job a test left running finishes before the next test starts rather than
- * during it: a fresh queue would not stop it. Resolves `false` if `ms` ran out first.
+ * queues) to settle, so work a test left queued finishes before the next test starts rather than
+ * during it: the reset hooks that run next start fresh queues, which would not stop it. Resolves
+ * `false` if `ms` ran out first. Work no snapshot holds a promise for — an update check, a release
+ * poll, a tick — is not waited for at all.
  */
 export async function drainQueues(table: readonly GuardedModule[] = GUARDED, ms = QUEUE_DRAIN_MS): Promise<boolean> {
   const pending = table.flatMap((g) =>

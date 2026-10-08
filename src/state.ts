@@ -126,7 +126,8 @@ export function createStateWriter(path: string): {
   };
 }
 
-const stateWriter = createStateWriter(STATE_FILE);
+// (`let` only so resetBotStateForTest can start a fresh queue.)
+let stateWriter = createStateWriter(STATE_FILE);
 
 // `state` as it was loaded, for the test-state guard (test/stateGuard.ts): tests change fields of
 // the shared object (attemptedUpdateToSha, pendingUpdateReport, ...) and must put them back.
@@ -140,11 +141,15 @@ export function botStateForTest(): { changedKeys: string[]; writes: Promise<void
   return { changedKeys: keys.filter((k) => !Bun.deepEquals(current[k], loaded[k])), writes: stateWriter.idle() };
 }
 
-/** Puts `state` back to what was loaded — in place, since every importer holds this one object. */
+/** Puts `state` back to what was loaded — in place, since every importer holds this one object —
+ *  and starts the writer on a fresh, empty queue. A save already running is not stopped, only no
+ *  longer waited for, so a test should await its saves; the guard runs this only once it has waited
+ *  for them, so a save that never finishes can't hold every later test up. */
 export function resetBotStateForTest(): void {
   const current = state as unknown as Record<string, unknown>;
   for (const k of Object.keys(current)) delete current[k];
   Object.assign(current, structuredClone(loadedState));
+  stateWriter = createStateWriter(STATE_FILE);
 }
 
 export function saveState(): Promise<void> {

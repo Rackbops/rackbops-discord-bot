@@ -109,15 +109,20 @@ export function pluginUpdateLeaks(s: { deliveryFailures: number }): string[] {
     : [`${s.deliveryFailures} failed notice delivery count(s) kept — a later check gives up sooner`];
 }
 
-/** The error the guard throws for what it found, one entry per module that leaked. */
-export function stateLeakMessage(found: { module: string; leaks: string[] }[]): string {
+/** The error the guard throws for what it found, one entry per module that leaked; `drained` is
+ *  whether the queued work it waited for had finished before it stopped waiting. */
+export function stateLeakMessage(found: { module: string; leaks: string[] }[], drained = true): string {
   const what = found.map(({ module, leaks }) => `${module}: ${leaks.join("; ")}`).join(" | ");
+  const stuck = drained
+    ? ""
+    : " Queued work was still running when the guard stopped waiting for it; its queues were " +
+      "replaced, so it may yet change state during a later test.";
   return (
     `${STATE_GUARD} module state was left behind at the end of this test, and every later test ` +
     `file would inherit it — ${what}. Usually this test leaked it: clean up in its own afterEach ` +
     `or finally — put state back with that module's reset...ForTest(), and await any write or job ` +
-    `it started (a queue has no reset). If it never touches that state, look at ` +
-    `what ran just before it: a beforeAll or afterAll, an afterEach that threw (which skips this ` +
-    `guard for its own test), or async work an earlier test left running.`
+    `it started (a reset does not stop one already running). If it never touches that state, look ` +
+    `at what ran just before it: a beforeAll or afterAll, an afterEach that threw (which skips this ` +
+    `guard for its own test), or async work an earlier test left running.${stuck}`
   );
 }

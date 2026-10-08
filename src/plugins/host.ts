@@ -1033,14 +1033,21 @@ export async function writePluginState(opts: {
 // write ordered before any tick (index.ts sets the "state ready" flag only after it); every
 // subsequent runtime change (#103's notifiedVersion, #104's schedules) goes through this shared
 // keyed mutator, which serializes read-modify-write per path so concurrent ticks can't lose an
-// update. A module singleton so all callers share the one per-path queue.
-const stateMutator = createKeyedJsonMutator<PluginStateFile>();
+// update. A module singleton so all callers share the one per-path queue. (`let` only so
+// resetPluginHostForTest can start a fresh queue.)
+let stateMutator = createKeyedJsonMutator<PluginStateFile>();
 
 /** What the test-state guard (test/stateGuard.ts) reads here: `writes` settles once every
- *  state.json update queued through `mutatePluginState` has. Waited for, never reset — a fresh queue
- *  would not stop a write already running. */
+ *  state.json update queued through `mutatePluginState` has (which `resetPluginHostForTest` drops). */
 export function pluginHostStateForTest(): { writes: Promise<void> } {
   return { writes: stateMutator.idle() };
+}
+
+/** Starts state.json on a fresh, empty queue. A write already running is not stopped, only no
+ *  longer waited for — so a test should await its writes instead; the guard runs this only once it
+ *  has waited for them, so a write that never finishes can't hold every later test up. */
+export function resetPluginHostForTest(): void {
+  stateMutator = createKeyedJsonMutator<PluginStateFile>();
 }
 
 /** Race-safe read-modify-write of data/plugins/state.json (see stateMutator). */

@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest, type AnnounceStateForTest } from "../src/announce";
 import { configStateForTest, resetConfigForTest } from "../src/config";
-import { pluginHostStateForTest } from "../src/plugins/host";
+import { pluginHostStateForTest, resetPluginHostForTest } from "../src/plugins/host";
 import { pluginRequestsStateForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
 import { resetForTest, stateForTest, type RestartStateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
-import { resetRoutingWarningsForTest, routingStoreStateForTest } from "../src/routing/store";
+import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import { settleWithin } from "./settleWithin";
@@ -260,9 +260,16 @@ describe("stateLeakMessage", () => {
     expect(message).toContain("src/a.ts: first leak; second leak | src/b.ts: third leak");
   });
 
-  // A write still running has no reset hook to call (src/plugins/host.ts has none at all).
+  // A reset hook starts a fresh queue but does not stop a write already running on the old one.
   test("says how to clean up a write or job still running, not just state", () => {
     expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }])).toContain("await any write or job it started");
+  });
+
+  test("says when queued work outlasted the guard's wait, and only then", () => {
+    const outlasted = "still running when the guard stopped waiting for it";
+    expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }], false)).toContain(outlasted);
+    expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }], true)).not.toContain(outlasted);
+    expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }])).not.toContain(outlasted);
   });
 });
 
@@ -277,8 +284,8 @@ describe("GUARDED", () => {
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
       ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]],
-      ["src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [resetRoutingWarningsForTest]],
-      ["src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, []],
+      ["src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [resetRoutingWarningsForTest, resetRoutingWritesForTest]],
+      ["src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, [resetPluginHostForTest]],
       ["src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]],
       ["src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]],
     ]);
@@ -389,7 +396,8 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
         [process.execPath, "test", "./test/stateLeak.fixture.ts", "--reporter=junit", `--reporter-outfile=${report}`],
         {
           cwd: join(import.meta.dir, ".."),
-          // The child takes well under a second; this bounds it on its own, whatever the runner does.
+          // The child takes about a second (one leak waits out QUEUE_DRAIN_MS); this bounds it on
+          // its own, whatever the runner does.
           timeout: CHILD_TIMEOUT_MS,
           stdout: "pipe",
           stderr: "pipe",
@@ -418,12 +426,25 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
     expect(drain?.failure).toContain("src/plugins/requests.ts: a request drain still running");
   });
 
+  // Only the write that never finished outlasted the wait; the drain finished inside it.
+  test("says so when queued work outlasted its wait, and only then", () => {
+    const outlasted = "still running when the guard stopped waiting for it";
+    const stuck = cases.find((c) => c.name === "leaks a write that never finishes");
+    expect(stuck?.failure).toContain("src/routing/store.ts: a routing or secrets write still running");
+    expect(stuck?.failure).toContain(outlasted);
+    const others = cases.filter((c) => c.failure !== undefined && c !== stuck);
+    expect(others).toHaveLength(3);
+    for (const c of others) expect(c.failure).not.toContain(outlasted);
+  });
+
   test("fails only the leaking tests, and resets — after waiting out a running job — so the next starts clean", () => {
     expect(cases.map((c) => [c.name, c.failure === undefined ? "pass" : "fail"])).toEqual([
       ["leaks a handoff", "fail"],
       ["starts clean after the guard caught the leak", "pass"],
       ["leaks a request drain still running", "fail"],
       ["starts after the leaked drain has finished", "pass"],
+      ["leaks a write that never finishes", "fail"],
+      ["starts with that write no longer queued", "pass"],
       ["leaks a failed-delivery count", "fail"],
       ["starts clean after that leak too", "pass"],
     ]);

@@ -472,12 +472,15 @@ describe("announceStateForTest's poll state", () => {
   test("lastPluginPollAt records the plugin-update check's poll, stamped before its fetch", async () => {
     markPluginStateReady();
     const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "error").mockImplementation(() => {})];
+    let stampedAtFetch: number | undefined;
     const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      stampedAtFetch = announceStateForTest().lastPluginPollAt;
       throw new Error("offline");
     }) as unknown as typeof fetch);
     try {
       expect(announceStateForTest().lastPluginPollAt).toBe(0);
       await tickChecks({} as unknown as Client, []).find((c) => c.name === "pluginUpdates")!.run().catch(() => {});
+      expect(stampedAtFetch).toBeGreaterThan(0); // already stamped when the index fetch went out
       expect(announceStateForTest().lastPluginPollAt).toBeGreaterThan(0);
     } finally {
       fetchSpy.mockRestore();

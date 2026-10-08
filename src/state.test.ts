@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { settled } from "../test/stateLeaks";
 import type { BotState } from "./state";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time) -- the
@@ -43,6 +44,17 @@ describe("botStateForTest / resetBotStateForTest", () => {
     expect(botStateForTest().changedKeys).toEqual([]);
     state.seenReleaseIds["x/y"] = [1]; // would change the snapshot too, were the map shared
     expect(botStateForTest().changedKeys).toEqual(["seenReleaseIds"]);
+  });
+
+  // The guard runs the reset once it has waited: a save that never finishes must not hold every
+  // later test up. Three saves, so the old queue is surely still busy when it is checked.
+  test("the reset also starts the writer on a fresh queue", async () => {
+    const saving = Promise.all([saveState(), saveState(), saveState()]);
+    const before = botStateForTest().writes;
+    resetBotStateForTest();
+    expect(await settled(botStateForTest().writes)).toBe(true);
+    expect(await settled(before)).toBe(false);
+    await saving;
   });
 
   test("writes settles only once a queued save has", async () => {

@@ -13,10 +13,14 @@
 // unless that test's own afterEach throws, since Bun then skips this hook for it. Such a leak, and
 // one made outside a test — by a beforeAll or afterAll, or by async work finishing late — lands on
 // whichever test runs next, and goes uncaught if none does (nothing is left to inherit it then).
-// After failing a test the guard first waits, up to QUEUE_DRAIN_MS, for any queued work still
-// running to finish — a fresh queue would not stop a job already running — then resets every
-// guarded module, so one leak fails one test instead of every test after it. A job that outlasts
-// that wait can still change guarded state during the next test and fail that one too.
+// After failing a test the guard first waits, up to QUEUE_DRAIN_MS, for the work still running on
+// the queues the snapshots hold (the write queues, routing/live.ts's registration queue, the
+// plugin-request drain) — the fresh queues the resets start would not stop it — then resets every
+// guarded module, queues included, so one leak fails one test instead of every test after it. Two
+// kinds of job can still change guarded state during the next test and fail that one too: one on
+// those queues that outlasts the wait (the message then says so), and one on no queue at all — an
+// update check, a release poll, a tick — which is not waited for, and runs on after its flag or
+// poll time is reset, possibly against `config` or `state` already put back under it.
 //
 // Loading those modules here means config.ts loads for every run, even of a single file that never
 // imports it — so a value config.ts refuses, left in your shell (HTTP_PORT=abc, a malformed
@@ -29,7 +33,7 @@ import { stateLeakMessage } from "./stateLeaks";
 afterEach(async () => {
   const found = await findStateLeaks();
   if (found.length === 0) return;
-  await drainQueues();
+  const drained = await drainQueues();
   resetAllState();
-  throw new Error(stateLeakMessage(found));
+  throw new Error(stateLeakMessage(found, drained));
 });

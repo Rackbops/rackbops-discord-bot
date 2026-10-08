@@ -419,7 +419,7 @@ _Avoid_: server list, guild cache
   it (two agent sessions' `bun test` runs on one machine is routine, not a corner case). See
   `test/sweep.ts` for the pure decision logic and its own tests.
 - **A test that leaves module-level state behind fails, in any order (the test-state guard).**
-  Ten modules keep module-level state a test can change, and for the same one-process reason as
+  The guard covers the module-level state of ten modules, and for the same one-process reason as
   above every test file shares one copy of each: `restart.ts` (critical-section depth, a pending
   restart, an active handoff, a begun shutdown, `awaitCriticalIdle` waiters, `onStopRequested`
   listeners and whether they were notified), `config.ts` (the shared `config` object, against what
@@ -436,11 +436,15 @@ _Avoid_: server list, guild cache
   after every test in every file — after that file's own `afterEach` hooks, measured on Bun 1.4.2
   — and fails the test if any module's `…StateForTest()` snapshot differs from what its reset
   hooks leave, naming the module and each leaked field (a queue counts only while it still has
-  work pending). It then waits, up to `QUEUE_DRAIN_MS` (1 s), for every queue's pending work to
-  finish — a fresh queue would not stop a job already running, which is why the write queues have
-  no reset hook at all — and runs every reset hook, so one leak fails one test rather than every
-  test after it. A job that outlasts that wait can still change guarded state during the next test
-  and fail that one too. It has to be a second preload: `announce.ts` and the routing modules read
+  work pending). It then waits, up to `QUEUE_DRAIN_MS` (1 s), for the pending work on every queue a
+  snapshot holds (the four write queues, the registration queue, the request drain) — the fresh
+  queues the reset hooks start would not stop a job already running — and runs every reset hook,
+  queues included, so one leak fails one test rather than every test after it. If the wait runs out
+  the message says so, and the stuck queue is dropped all the same. Two kinds of job can still
+  change guarded state during the next test and fail that one too: one on those queues that
+  outlasts the wait, and one on no queue at all — an update check, a release poll, a tick — which
+  is not waited for, and runs on after its flag or poll time is reset, possibly against `config` or
+  `state` already put back under it. It has to be a second preload: `announce.ts` and the routing modules read
   the environment `test/setup.ts` primes when they load, and a static import in `setup.ts` would be
   hoisted above that priming. A side effect: `config.ts` now loads for every run, even of one file
   that never imports it, so a value it refuses left in your shell (`HTTP_PORT=abc`, a malformed
@@ -456,16 +460,19 @@ _Avoid_: server list, guild cache
   without a context, cleared by `initRouting`), the temp-file counters in `storage.ts`,
   `plugins/index.ts` and `ops/admin/server.ts` (they only keep temp names unique), `bootLog.ts`'s
   `dataDir` (set once at load), `index.ts`'s globals (no test imports it — `index.test.ts` reads its
-  source), constant lookup tables, and process-wide globals that are not module state at all
-  (`globalThis.fetch`, `process.env`, `console`), which tests stub and restore themselves. Guarded
-  state can't carry from one test to the next, so clean up by the end of each test — an `afterEach`
+  source), constant lookup tables (`REPORT_PROJECTS`, `LIMITS`, `CLIENT_OPTIONS`, ... — exported
+  objects nothing writes to, in code or tests), and process-wide globals that are not module state
+  at all (`globalThis.fetch`, `process.env`, `console`), which tests stub and restore themselves.
+  Guarded state must not carry from one test to the next, so clean up by the end of each test — an `afterEach`
   calling the module's reset hook, as `restart.test.ts`, `routing/live.test.ts` and
   `routing/store.test.ts` do; `config` and `state` changes are put back by hand (or with
-  `resetConfigForTest()` / `resetBotStateForTest()`). The table is `test/stateGuard.ts`, the
-  decisions `test/stateLeaks.ts`; `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which
-  leaks from the table's first and last modules and leaves a request drain running — as a child
-  `bun test` to prove the real hook reaches both ends of the table, waits for the running job, and
-  resets after each leak (the `.fixture.ts` name keeps discovery from running it in the main
+  `resetConfigForTest()` / `resetBotStateForTest()`), and a write a test queues is awaited before it
+  ends. The table is `test/stateGuard.ts`, the decisions `test/stateLeaks.ts`;
+  `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which leaks from the table's first
+  and last modules, leaves a request drain running, and leaves a write that never finishes — as a
+  child `bun test` to prove the real hook reaches both ends of the table, waits for the running job,
+  stops waiting for the stuck one and says so, and resets after each leak (the `.fixture.ts` name
+  keeps discovery from running it in the main
   suite); that every row is checked and reset is pinned by the table-identity and fake-table loop
   tests in the same file.
 - **`admins.json` is written through one serialised mutator per process, with a per-call temp name

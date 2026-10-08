@@ -9,6 +9,7 @@ import type { HostDeliveryDeps, LoadedPlugin } from "./host";
 import { pinsFromState, selectPlugins } from "./registry";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
 import { freshRouting, type DiscoveryFile, type RoutingFile } from "../routing/model";
+import { settled } from "../../test/stateLeaks";
 // DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
 // once, for every test file, by test/setup.ts's bunfig preload (#136).
 const {
@@ -28,6 +29,7 @@ const {
   writePluginState,
   mutatePluginState,
   pluginHostStateForTest,
+  resetPluginHostForTest,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
   dispatchPluginInteractionOutcome,
@@ -67,6 +69,22 @@ describe("pluginHostStateForTest", () => {
       await pluginHostStateForTest().writes;
       expect(written).toBe(true);
       expect((await readPluginState(dir, realStorage)).writtenAt).toBe("probe");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The guard runs the reset once it has waited: a write that never finishes must not hold every
+  // later test up. Three writes, so the old queue is surely still busy when it is checked.
+  test("resetPluginHostForTest starts state.json on a fresh queue", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-state-reset-"));
+    try {
+      const writing = Promise.all([1, 2, 3].map(() => mutatePluginState(dir, (s) => s)));
+      const before = pluginHostStateForTest().writes;
+      resetPluginHostForTest();
+      expect(await settled(pluginHostStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+      await writing;
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
