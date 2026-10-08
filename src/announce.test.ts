@@ -20,6 +20,8 @@ const {
   shouldPollReleases,
   shouldRefreshDiscovery,
   resetDiscoveryGapForTest,
+  resetPollStateForTest,
+  markPluginStateReady,
   announceStateForTest,
   livePluginRequestDeps,
   livePluginUpdateDeps,
@@ -386,6 +388,25 @@ describe("announceTo", () => {
 
 describe("checkReleases (#342)", () => {
   const client = {} as unknown as Client;
+  // A release check records when it polled, and which repos it found unreachable; the test-state
+  // guard (test/stateGuard.ts) fails a test that leaves either behind.
+  afterEach(resetPollStateForTest);
+
+  // The guard decides from this snapshot alone, so these fields must track the live poll.
+  test("announceStateForTest records the release poll and each repo it found unreachable", async () => {
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response("not found", { status: 404 })) as unknown as typeof fetch);
+    try {
+      expect(announceStateForTest()).toMatchObject({ lastReleasePollAt: 0, unreachableRepos: 0 });
+      await checkReleases(client, ["a/b", "c/d"]);
+      expect(announceStateForTest().lastReleasePollAt).toBeGreaterThan(0);
+      expect(announceStateForTest().unreachableRepos).toBe(2);
+    } finally {
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
 
   test("with no repos it makes no per-repo call", async () => {
     const calls: string[] = [];
@@ -419,6 +440,49 @@ describe("checkReleases (#342)", () => {
     });
     expect(calls).toEqual(["a/b", "c/d"]);
     errorSpy.mockRestore();
+  });
+});
+
+// The rest of the poll state the test-state guard (test/stateGuard.ts) reads; each field must track
+// the live check that sets it.
+describe("announceStateForTest's poll state", () => {
+  afterEach(resetPollStateForTest);
+
+  test("pluginStateReady tracks markPluginStateReady", () => {
+    expect(announceStateForTest().pluginStateReady).toBe(false);
+    markPluginStateReady();
+    expect(announceStateForTest().pluginStateReady).toBe(true);
+  });
+
+  test("lastUpdatePollAt records the auto-update check's poll", async () => {
+    const realAuto = config.autoUpdate;
+    const realSha = config.gitSha;
+    config.autoUpdate = true;
+    config.gitSha = undefined; // so checkForUpdate answers "disabled" at once, with no network call
+    try {
+      expect(announceStateForTest().lastUpdatePollAt).toBe(0);
+      await tickChecks({} as unknown as Client, []).find((c) => c.name === "autoUpdate")!.run();
+      expect(announceStateForTest().lastUpdatePollAt).toBeGreaterThan(0);
+    } finally {
+      config.autoUpdate = realAuto;
+      config.gitSha = realSha;
+    }
+  });
+
+  test("lastPluginPollAt records the plugin-update check's poll, stamped before its fetch", async () => {
+    markPluginStateReady();
+    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "error").mockImplementation(() => {})];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch);
+    try {
+      expect(announceStateForTest().lastPluginPollAt).toBe(0);
+      await tickChecks({} as unknown as Client, []).find((c) => c.name === "pluginUpdates")!.run().catch(() => {});
+      expect(announceStateForTest().lastPluginPollAt).toBeGreaterThan(0);
+    } finally {
+      fetchSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+    }
   });
 });
 

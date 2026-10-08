@@ -187,6 +187,8 @@ export function createJsonWriter<T>(path: string): { save: (data: T) => Promise<
  */
 export function createKeyedJsonMutator<T>(): {
   update: (path: string, fresh: () => T, mutate: (current: T) => T, label: string) => Promise<void>;
+  /** Settles once every update queued so far has, on every path (what the test-state guard reads). */
+  idle: () => Promise<void>;
 } {
   const chains = new Map<string, Promise<void>>();
   return {
@@ -197,5 +199,6 @@ export function createKeyedJsonMutator<T>(): {
       chains.set(path, next.catch(() => {}));
       return next;
     },
+    idle: () => Promise.all(chains.values()).then(() => {}),
   };
 }

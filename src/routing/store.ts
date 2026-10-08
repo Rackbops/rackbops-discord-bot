@@ -53,9 +53,15 @@ export function resetRoutingWarningsForTest(): void {
   said.clear();
 }
 
-/** What `resetRoutingWarningsForTest` resets, for the test-state guard (test/stateGuard.ts). */
-export function routingWarningsStateForTest(): { said: number } {
-  return { said: said.size };
+/** What the test-state guard (test/stateGuard.ts) reads here: the warnings said (which
+ *  `resetRoutingWarningsForTest` resets), and every write queued on the routing and secrets files —
+ *  `writes` settles once they all have. The queues are not reset, only waited for: a fresh chain
+ *  would not stop a write already running. */
+export function routingStoreStateForTest(): { said: number; writes: Promise<void> } {
+  return {
+    said: said.size,
+    writes: Promise.all([routingMutator.idle(), ...secretsQueues.values()]).then(() => {}),
+  };
 }
 
 /** What went wrong, as text that is clipped (an engine's message can echo a hostile key) and cannot throw. */

@@ -1,6 +1,6 @@
 // The decisions behind the test-state guard (test/stateGuard.ts): which parts of a module's
-// module-level state a test left behind. Pure — the two promise checks only ask whether a promise
-// has settled — so each unit-tests field by field without driving the real module
+// module-level state a test left behind. Pure — the promise checks only ask whether a promise has
+// settled — so each unit-tests field by field without driving the real module
 // (test/stateGuard.test.ts, which also runs a fixture through the real hook).
 
 import type { AnnounceStateForTest } from "../src/announce";
@@ -40,12 +40,17 @@ export function restartStateLeaks(s: RestartStateForTest): string[] {
   return leaks;
 }
 
-/** Against what `resetTickGuardForTest()` and `resetDiscoveryGapForTest()` leave. */
+/** Against what `resetTickGuardForTest()`, `resetDiscoveryGapForTest()` and `resetPollStateForTest()` leave. */
 export function announceLeaks(s: AnnounceStateForTest): string[] {
   const leaks: string[] = [];
   if (s.tickInFlight) leaks.push("a tick still in flight — the next guardedTick is skipped");
   if (s.consecutiveSkips !== 0) leaks.push(`${s.consecutiveSkips} skipped tick(s) counted`);
   if (s.lastDiscoveryAt !== 0) leaks.push("a discovery refresh time recorded — the next discovery check waits out its gap");
+  if (s.lastReleasePollAt !== 0) leaks.push("a release poll time recorded — the next release check waits out its gap");
+  if (s.lastUpdatePollAt !== 0) leaks.push("a self-update poll time recorded — the next auto-update check waits out its gap");
+  if (s.lastPluginPollAt !== 0) leaks.push("a plugin-update poll time recorded — the next plugin-update check waits out its gap");
+  if (s.pluginStateReady) leaks.push("plugin state marked ready — the plugin request and update checks now run");
+  if (s.unreachableRepos !== 0) leaks.push(`${s.unreachableRepos} watched repo(s) recorded unreachable — not reported again`);
   return leaks;
 }
 
@@ -58,9 +63,35 @@ export async function routingLeaks(s: RoutingStateForTest): Promise<string[]> {
   return leaks;
 }
 
-/** Against what `resetRoutingWarningsForTest()` leaves. */
-export function routingWarningLeaks(s: { said: number }): string[] {
-  return s.said === 0 ? [] : [`${s.said} routing.json warning(s) already said — a later read will not say them again`];
+/** Against what `resetRoutingWarningsForTest()` leaves, and with no routing or secrets write pending. */
+export async function routingStoreLeaks(s: { said: number; writes: Promise<void> }): Promise<string[]> {
+  const leaks: string[] = [];
+  if (s.said !== 0) leaks.push(`${s.said} routing.json warning(s) already said — a later read will not say them again`);
+  if (!(await settled(s.writes))) leaks.push("a routing or secrets write still running");
+  return leaks;
+}
+
+/** Against `state` as it was loaded, and with no state.json write pending. */
+export async function botStateLeaks(s: { changedKeys: string[]; writes: Promise<void> }): Promise<string[]> {
+  const leaks: string[] = [];
+  if (s.changedKeys.length !== 0) leaks.push(`state changed since it was loaded: ${s.changedKeys.join(", ")}`);
+  if (!(await settled(s.writes))) leaks.push("a state.json write still running");
+  return leaks;
+}
+
+/** Against `config` as it was resolved. */
+export function configLeaks(s: { changedKeys: string[] }): string[] {
+  return s.changedKeys.length === 0 ? [] : [`config changed since it was resolved: ${s.changedKeys.join(", ")}`];
+}
+
+/** Against what `resetUpdateForTest()` leaves. */
+export function updateLeaks(s: { checkInFlight: boolean }): string[] {
+  return s.checkInFlight ? ["an update check still in flight — the next checkForUpdate answers busy"] : [];
+}
+
+/** With no plugin state.json write pending. */
+export async function pluginHostLeaks(s: { writes: Promise<void> }): Promise<string[]> {
+  return (await settled(s.writes)) ? [] : ["a plugin state.json write still running"];
 }
 
 /** Against what `resetPluginRequestsForTest()` leaves. */

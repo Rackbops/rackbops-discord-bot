@@ -1,25 +1,33 @@
-// The test-state guard's table: every module whose module-level state has a reset...ForTest hook,
-// with the snapshot it reads, the decision it applies (test/stateLeaks.ts) and those reset hooks.
-// Module state with no reset hook is not in it (see CONTEXT.md's test-state guard gotcha).
+// The test-state guard's table: every module with module-level state a test can change, with the
+// snapshot it reads, the decision it applies (test/stateLeaks.ts) and the module's reset hooks.
+// What is deliberately left out, and why, is in CONTEXT.md's test-state guard gotcha.
 // test/stateGuardHook.ts runs it after every test. No side effects here, so a test can import it.
 //
 // Imports modules that read `config` and `storage` at load, so it may only be loaded once
 // test/setup.ts has primed the environment — bunfig.toml's preload order guarantees that for the
 // hook; a test file is loaded after both preloads anyway.
 
-import { announceStateForTest, resetDiscoveryGapForTest, resetTickGuardForTest } from "../src/announce";
+import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest } from "../src/announce";
+import { configStateForTest, resetConfigForTest } from "../src/config";
+import { pluginHostStateForTest } from "../src/plugins/host";
 import { pluginRequestsStateForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
 import { resetForTest, stateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
-import { resetRoutingWarningsForTest, routingWarningsStateForTest } from "../src/routing/store";
+import { resetRoutingWarningsForTest, routingStoreStateForTest } from "../src/routing/store";
+import { botStateForTest, resetBotStateForTest } from "../src/state";
+import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import {
   announceLeaks,
+  botStateLeaks,
+  configLeaks,
+  pluginHostLeaks,
   pluginRequestLeaks,
   pluginUpdateLeaks,
   restartStateLeaks,
   routingLeaks,
-  routingWarningLeaks,
+  routingStoreLeaks,
+  updateLeaks,
 } from "./stateLeaks";
 
 export interface GuardedModule {
@@ -39,11 +47,21 @@ function guarded<S>(
   return { module, snapshot, leaks, resets };
 }
 
+// src/restart.ts stays first and src/plugins/updates.ts last: test/stateLeak.fixture.ts leaks from
+// both ends to prove the real hook reaches the whole table.
 export const GUARDED: readonly GuardedModule[] = [
   guarded("src/restart.ts", stateForTest, restartStateLeaks, [resetForTest]),
-  guarded("src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest]),
+  guarded("src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]),
+  guarded("src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest]),
+  guarded("src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]),
+  guarded("src/announce.ts", announceStateForTest, announceLeaks, [
+    resetTickGuardForTest,
+    resetDiscoveryGapForTest,
+    resetPollStateForTest,
+  ]),
   guarded("src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]),
-  guarded("src/routing/store.ts", routingWarningsStateForTest, routingWarningLeaks, [resetRoutingWarningsForTest]),
+  guarded("src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [resetRoutingWarningsForTest]),
+  guarded("src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, []),
   guarded("src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]),
   guarded("src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]),
 ];
@@ -58,6 +76,27 @@ export async function findStateLeaks(
     if (leaks.length > 0) found.push({ module: g.module, leaks });
   }
   return found;
+}
+
+/** How long the hook waits, once it has found a leak, for queued work to finish. */
+export const QUEUE_DRAIN_MS = 1_000;
+
+/**
+ * Waits — at most `ms` — for every promise any guarded module's snapshot holds (its work and write
+ * queues) to settle, so a job a test left running finishes before the next test starts rather than
+ * during it: a fresh queue would not stop it. Resolves `false` if `ms` ran out first.
+ */
+export async function drainQueues(table: readonly GuardedModule[] = GUARDED, ms = QUEUE_DRAIN_MS): Promise<boolean> {
+  const pending = table.flatMap((g) =>
+    Object.values(g.snapshot() as object).filter((v): v is Promise<unknown> => v instanceof Promise),
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolve) => (timer = setTimeout(() => resolve(false), ms)));
+  try {
+    return await Promise.race([Promise.allSettled(pending).then(() => true as const), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** Runs every guarded module's reset hooks. */

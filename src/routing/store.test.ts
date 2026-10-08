@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, routingWarningsStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, routingStoreStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -593,14 +593,22 @@ describe("readRouting says what it ignored (#260)", () => {
 
   // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track
   // the live record.
-  test("routingWarningsStateForTest counts what has been said", async () => {
+  test("routingStoreStateForTest counts what has been said", async () => {
     write(music({ [GUILD]: { commands: "none" } }));
-    expect(routingWarningsStateForTest().said).toBe(0);
+    expect(routingStoreStateForTest().said).toBe(0);
     await said(async () => {
       await readRouting(dir);
       await readRouting(dir);
     });
-    expect(routingWarningsStateForTest().said).toBe(1);
+    expect(routingStoreStateForTest().said).toBe(1);
+  });
+
+  test("routingStoreStateForTest's writes settle only once a queued routing and secrets write has", async () => {
+    const done: string[] = [];
+    void mutateRouting(dir, withPlugin("music")).then(() => done.push("routing"));
+    void mutateSecrets(dir, (s) => s).then(() => done.push("secrets"));
+    await routingStoreStateForTest().writes;
+    expect(done.sort()).toEqual(["routing", "secrets"]);
   });
 
   test("the same problem is said again once the record is cleared (the test seam works)", async () => {

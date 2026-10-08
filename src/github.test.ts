@@ -321,4 +321,15 @@ describe("createReachabilityLog", () => {
     expect(log.observe("a/b", true)).toBe("recovered");
     expect(log.observe("c/d", false)).toBeNull();
   });
+
+  test("unreachableCount is how many repos are recorded unreachable right now", () => {
+    const log = createReachabilityLog();
+    expect(log.unreachableCount()).toBe(0);
+    log.observe("a/b", false);
+    log.observe("c/d", false);
+    log.observe("a/b", false); // still just the two
+    expect(log.unreachableCount()).toBe(2);
+    log.observe("a/b", true);
+    expect(log.unreachableCount()).toBe(1);
+  });
 });

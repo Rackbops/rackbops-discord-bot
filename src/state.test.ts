@@ -6,7 +6,38 @@ import type { BotState } from "./state";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time) -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { createStateWriter, loadStateFrom, normalizeSeenReleaseIds, saveStateTo } = await import("./state");
+const { botStateForTest, createStateWriter, loadStateFrom, normalizeSeenReleaseIds, resetBotStateForTest, saveState, saveStateTo, state } =
+  await import("./state");
+
+// The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track the
+// live `state` object and the live writer, and the reset must really put `state` back.
+describe("botStateForTest / resetBotStateForTest", () => {
+  afterEach(resetBotStateForTest);
+
+  test("names each key changed since load, and the reset puts them back in place", () => {
+    const same = state;
+    expect(botStateForTest().changedKeys).toEqual([]);
+    state.attemptedUpdateToSha = "a".repeat(40);
+    state.seenReleaseIds["x/y"] = [1];
+    expect(botStateForTest().changedKeys.sort()).toEqual(["attemptedUpdateToSha", "seenReleaseIds"]);
+    resetBotStateForTest();
+    expect(botStateForTest().changedKeys).toEqual([]);
+    expect(state.attemptedUpdateToSha).toBeUndefined();
+    expect(state).toBe(same); // the one object every importer holds
+  });
+
+  test("a key put back to undefined counts as unchanged", () => {
+    state.attemptedUpdateToSha = undefined;
+    expect(botStateForTest().changedKeys).toEqual([]);
+  });
+
+  test("writes settles only once a queued save has", async () => {
+    let saved = false;
+    void saveState().then(() => (saved = true));
+    await botStateForTest().writes;
+    expect(saved).toBe(true);
+  });
+});
 
 describe("normalizeSeenReleaseIds", () => {
   test("migrates a legacy global array under the default repo", () => {

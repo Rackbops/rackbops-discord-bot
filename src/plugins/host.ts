@@ -1036,6 +1036,13 @@ export async function writePluginState(opts: {
 // update. A module singleton so all callers share the one per-path queue.
 const stateMutator = createKeyedJsonMutator<PluginStateFile>();
 
+/** What the test-state guard (test/stateGuard.ts) reads here: `writes` settles once every
+ *  state.json update queued through `mutatePluginState` has. Waited for, never reset — a fresh queue
+ *  would not stop a write already running. */
+export function pluginHostStateForTest(): { writes: Promise<void> } {
+  return { writes: stateMutator.idle() };
+}
+
 /** Race-safe read-modify-write of data/plugins/state.json (see stateMutator). */
 export async function mutatePluginState(
   dataDir: string,

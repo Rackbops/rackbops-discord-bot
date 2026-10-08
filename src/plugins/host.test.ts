@@ -26,6 +26,8 @@ const {
   buildPluginStateFile,
   readPluginState,
   writePluginState,
+  mutatePluginState,
+  pluginHostStateForTest,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
   dispatchPluginInteractionOutcome,
@@ -54,6 +56,22 @@ const {
 } = await import("../restart");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
+
+// The test-state guard (test/stateGuard.ts) waits on this, so it must track the live state.json queue.
+describe("pluginHostStateForTest", () => {
+  test("its writes settle only once a queued state.json update has", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-state-writes-"));
+    try {
+      let written = false;
+      void mutatePluginState(dir, (s) => ({ ...s, writtenAt: "probe" })).then(() => (written = true));
+      await pluginHostStateForTest().writes;
+      expect(written).toBe(true);
+      expect((await readPluginState(dir, realStorage)).writtenAt).toBe("probe");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 function makeLog() {
   const calls: { level: "info" | "warn" | "error"; message: string }[] = [];
