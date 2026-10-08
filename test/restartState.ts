@@ -25,8 +25,10 @@ export function restartStateLeaks(s: RestartStateForTest): string[] {
 /** The error the guard throws for `leaks`. */
 export function restartLeakMessage(leaks: string[]): string {
   return (
-    `${RESTART_STATE_GUARD} this test left src/restart.ts state behind, which every later test ` +
-    `file would inherit: ${leaks.join("; ")}. Clean up in the test's own afterEach or finally ` +
-    `(resetForTest(), endHandoff(), ...).`
+    `${RESTART_STATE_GUARD} src/restart.ts state was left behind at the end of this test, and ` +
+    `every later test file would inherit it: ${leaks.join("; ")}. Usually this test leaked it — ` +
+    `clean up in its own afterEach or finally (resetForTest(), endHandoff(), ...). If it never ` +
+    `touches restart state, look at what ran just before it: an afterAll, an afterEach that threw ` +
+    `(which skips this guard for its own test), or async work an earlier test left running.`
   );
 }
