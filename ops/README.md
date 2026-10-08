@@ -1058,8 +1058,8 @@ $env:DISCORD_MCP_CONFIG_DIR = "$env:APPDATA\discord-mcp-pip"
 node 'R:\repos\discord-mcp\scripts\result-dm.mjs' --bridge pip --event <id> --label '<text>' --status <word> --expires <iso> [--link <url>]
 ```
 
-`R:\repos\discord-mcp` is the discord-mcp checkout on Melody (use its actual path if it differs, for the
-`workdir` and the script path alike). Never rely on the task's default working directory: it is a folder
+`R:\repos\discord-mcp` is the discord-mcp checkout on Melody (use its verified actual path if it differs,
+for the `workdir` and the script path alike). Never rely on the task's default working directory: it is a folder
 that can be deleted (on 2026-10-08 a cleanup removed it, Rackbops/discord-mcp#81), and then the command
 fails at process creation, before PowerShell starts. A `Set-Location` inside the command is no substitute,
 because that failure comes before the command runs. `%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
@@ -1084,7 +1084,8 @@ to. If the delegation never reaches Melody (offline, backend error, no task turn
 task could not start and that no DM was sent; do not switch machines, do not revoke anything, and do not
 queue a send. When Melody is back, the same event may be run once.
 
-If the task reaches Melody but the command reports no `outcome` line, keep two cases apart:
+If the task reaches Melody but the command reports no `outcome` line, keep two cases apart (and if you
+can't tell whether the task reached Melody, treat it as the second case):
 
 - **A confirmed launch failure.** The execution tool says outright that the process could not be created,
   for example `CreateProcessAsUserW failed: 267 (The directory name is invalid.)`. The script never ran in
@@ -1093,8 +1094,10 @@ If the task reaches Melody but the command reports no `outcome` line, keep two c
   clear result does not show that nothing was sent. Treat it like `error`: "Outcome unknown: do not treat
   the DM as sent."
 
-In both cases keep the same event and its expiry. Retry only when Rod asks, with the same event, before it
-expires, and with the working directory set as above. Never replay on your own, and never mint a new event.
+If any attempt for the event falls in the second case, the outcome is unknown, whatever another attempt
+showed. In both cases keep the same event and its expiry. Retry only when Rod asks, with the same event,
+before it expires, and with the working directory set as above. Never replay on your own, and never mint a
+new event.
 
 *Stopping it.* Rod can stop every send instantly and reversibly by renaming or deleting
 `%APPDATA%\discord-mcp-pip` on Melody: the script then refuses with `invalid` (credentials missing) and
