@@ -822,7 +822,7 @@ TRUSTED_PROXY_HOST=
 LOG_FORMAT=json
 # The pip bridge's shared secret: the same value the discord-mcp service holds as
 # DISCORD_MCP_BRIDGE_TOKEN_PIP. Generated once, written to both files, never printed.
-MCP_BRIDGE_TOKEN=<43+ characters, base64url>
+MCP_BRIDGE_TOKEN=<43+ non-whitespace characters, e.g. 32 random bytes>
 ```
 
 `MCP_BRIDGE_TOKEN` is the plugin's own secret key (`format` `^\S{43,}$`, `secret: true` in the manifest),
@@ -872,7 +872,7 @@ The bot's compose project is `rackbops-discord-bot-pip` and its network is the p
 `rackbops-discord-bot-pip_default` (`docker-compose.yml` declares no `networks:` key), so the service
 reaches the bridge at `http://rackbops-discord-bot-pip:<HTTP_PORT>/mcp` once it is attached to that
 network. The service side (the `pip` bridge entry, the network attachment and the Pip-only grants) is in
-`Rackbops/discord-mcp`'s `deploy/add-bridge.md`, being written as #334; that path exists once both land.
+`Rackbops/discord-mcp`'s `deploy/add-bridge.md` (Rackbops/discord-mcp#334).
 
 `GET /mcp/capabilities` answers `401` without the bearer (and `503` if `MCP_BRIDGE_TOKEN` is unset in the
 container: `plugins/mcp/src/http.ts:186-191`, `plugins/mcp/src/auth.ts:63-71`), so a `401` from inside the
@@ -931,6 +931,143 @@ In this order:
    restore the service's state from a snapshot.
 
 Revoking the bot token and deleting the application are Rod's explicit calls, not part of a rollback.
+
+### 9. What the live run showed
+
+Brought up on nucbox on 2026-10-07 (evening, America/Detroit) and accepted through 2026-10-08 01:28Z. Every
+line and number below is quoted from the evidence comments on #336, #337 and #338 and the hosted-side
+comments on #332; ids are redacted exactly as they are there. Nothing here is from memory.
+
+**Boot** (second boot, after the `.env` was corrected; `docker logs`, JSON; #336,
+[comment](https://github.com/Rackbops/rackbops-discord-bot/issues/336#issuecomment-6047243628)):
+
+```
+[boot] env file: /opt/rackbops-discord-bot/pip/.env
+[plugins] index: fresh, 1 selected, 0 skipped
+Logged in as pip#0023
+[plugins] mcp@0.3.0 downloaded, integrity ok
+Registered 4 slash commands
+```
+
+The first boot ran before the `.env` edit (token only): plain-text logs, `0 selected`, and `Registered 3
+slash commands` **globally**. It was corrected by editing the `.env` and `bot-ops.sh recreate`, and the
+global list was then emptied with one authenticated `PUT [] /applications/<app>/commands` -> `200`,
+because single-server mode never clears it itself (`src/routing/register.ts:43-44`). **Set the `.env`
+before the first `up`.** Four distinct bot ids across the instances (pip `15...391`, prod `15...246`,
+debug `15...424`, clerk `15...121`).
+
+**The bridge** (`pins.js show` on the discord-mcp stack, #336,
+[comment](https://github.com/Rackbops/rackbops-discord-bot/issues/336#issuecomment-6047273999)):
+
+```
+bridge  pip              ... test=false  recorded=2026-10-07T21:32:01.524Z  (matches)
+```
+
+The `pip` pin was recorded at the service's recreate, which means its authenticated `capabilities` probe
+reached the Pip bridge in-network and the shared secret matched on both sides. `curl
+https://mcp.rackbops.com/healthz` -> `200`. (The live instance's `MCP_BRIDGE_TOKEN` was 32 random bytes in
+hex; any 43+ character non-whitespace value satisfies the manifest's format.)
+
+**Acceptance A1-A11** (the plan document's matrix, `EP-pip-discord-identity.md` section 7):
+
+| Row | Outcome | Date (UTC) | Evidence |
+|---|---|---|---|
+| A1 identity | passed (name + application id confirmed by Rod); the approved avatar is in the repo (`assets/PIP/pip-canonical-review-v1.png`, #343) and goes on the application when Rod uploads it, which is **not confirmed** | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
+| A2 isolation | passed: the Pip credential is `u-...@pip` with `dm:self`; the prod integration still answers `@prod` through its own untouched directory | 2026-10-07 | [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047685066), [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047828399) |
+| A3 duplicate | passed | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| A4 blocked DMs | passed (a block is the control) | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| A5 revocation | **not run on pip**, by Rod's decision (he declined to cycle a working registration); "proven on debug + per-bridge tests" is the basis, not a pass | - | [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047828399), [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| A6 outage | passed | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| A7 privacy | passed | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| A8 Melody unavailable | passed: Melody genuinely reported offline, delegation returned a generic backend error and no task turn was admitted; hosted chat said the task could not start and no DM had been sent; no queued or automatic send (the error's cause is not established) | 2026-10-08 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
+| A9 policy | passed, both cases: a task without the phrase produced no send (00:37Z); a fresh task with the exact text `notify me on Discord` sent once after Melody reconnected, with the **same** event id and expiry resumed (01:28Z) | 2026-10-08 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049826123), [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
+| A10 preserved instances | passed: prod, debug and Clerk start times unchanged; only Pip created and discord-mcp recreated once | 2026-10-07 | [#336](https://github.com/Rackbops/rackbops-discord-bot/issues/336#issuecomment-6047072913), [#336](https://github.com/Rackbops/rackbops-discord-bot/issues/336#issuecomment-6047685310) |
+| A11 restart | passed | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
+| Exit demo | shown: hosted Pip -> connected Melody -> `scripts/result-dm.mjs` -> one DM visibly from the Pip application, `sent` / exit 0; hosted chat reported the truthful outcome in both the failure and the success case | 2026-10-08 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
+
+**Unverified, and why.** A5 was not re-run on pip (Rod's decision). The **service-side half of the
+rollback** was not rehearsed (Rod's decision; the runbook and the `compose.yaml.bak-pre-pip` /
+`config.json.bak-pre-pip` backups are in place). What *was* rehearsed is the disable control: the Pip
+credentials directory renamed away -> `{"outcome":"invalid","stage":"validate",...}` and `result-dm:
+invalid (credentials.json under DISCORD_MCP_CONFIG_DIR is missing, unreadable or not JSON)`, no network
+call, nothing sent; renamed back -> `dry_run`, `u-20...144@pip` ([#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760)).
+The A8 error's cause and the avatar upload are not established. Seven DMs were delivered to Rod from the
+Pip application during acceptance, all bridge records `delivered`; prod, debug and Clerk were never
+touched. The screenshot of the first hosted DM proves visible delivery, not a full-history duplicate
+audit; duplicate behaviour is covered by A3 and A11.
+
+### 10. Hosted-Pip handoff
+
+Everything between the two rules below is written to be pasted into hosted Pip's instructions and to be
+understood without this repository open. The policy is Rod's, recorded on #332 on 2026-10-07: "opt-in
+phrase **"notify me on Discord"** per task; everything else excluded. No quiet hours; 24-hour expiry; no
+replay; retry = the same event id." The script's contract is the `scripts/result-dm.mjs` entry in
+Rackbops/discord-mcp's README (#335, #79).
+
+---
+
+**Result DMs to Rod, from the Pip application**
+
+*When.* Only for a task Rod starts with the exact phrase **notify me on Discord** in the task's own text,
+and only for that task's terminal result. A task without the phrase never notifies. One DM per task. Never
+a progress update, never a summary of a conversation.
+
+*The event.* Mint one opaque **event id** for the task when you hand it off, store it in the task, and
+reuse the same id on every retry. Never mint a new id per attempt, and never use a bare conversation id (one
+conversation can hold several tasks). It is 1-120 characters from `A-Z a-z 0-9 . _ : -`. The service turns
+a repeat of the same event into `duplicate`, never a second DM; a new id would be a second DM.
+
+*The fields.*
+
+- `--label`: the task's own title, trimmed to 200 characters.
+- `--status`: one of `done`, `failed`, `blocked`, `cancelled`, from the task's terminal state (finished
+  successfully -> `done`; ended in error -> `failed`; stopped waiting on Rod -> `blocked`; stopped on
+  request -> `cancelled`). No other word.
+- `--link`: optional; include it only when the task produced exactly one result page, as an `https://` URL
+  of at most 512 characters. Otherwise leave it out.
+- `--expires`: **required**. The handoff time plus 24 hours, as ISO-8601 with an offset or `Z`, for
+  example `2026-10-08T21:25:00-04:00`. After it the script refuses to send.
+
+*The one command.* The delegated Melody task runs exactly this, in PowerShell, with the directory variable
+always set explicitly (the script refuses to run without it):
+
+```powershell
+$env:DISCORD_MCP_CONFIG_DIR = "$env:APPDATA\discord-mcp-pip"
+node 'R:\repos\discord-mcp\scripts\result-dm.mjs' --bridge pip --event <id> --label '<text>' --status <word> --expires <iso> [--link <url>]
+```
+
+`%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
+(`C:/Users/roshn/.config/discord-mcp`) is never used for Pip. `--bridge pip` makes the script refuse any
+credential whose principal is not on the `pip` bridge. Run it **once** and read its one JSON line on
+stdout. Never pair, read, copy or print a credential, and never pass `--dry-run`.
+
+*What to tell Rod, by the `outcome` word.* Report a DM as sent only on `sent` or `duplicate`.
+
+| `outcome` (exit code) | Say |
+|---|---|
+| `sent` (0) | "DM sent." |
+| `duplicate` (0) | "Already sent earlier." |
+| `pending`, `unknown`, `rate_limited` (3) | "Delivery pending -- retry the same event later; do not start a new one." |
+| `unavailable` (3) | "DM not sent: the delivery route was unavailable. Retry the same event later." |
+| `expired` (4) | "Not sent: the result is older than its expiry." |
+| `unreachable`, `denied`, `unresolved`, `invalid` (2), `error` (1) | A plain failure that names the outcome word. Nothing was sent. |
+
+To retry, re-run the **same** event while it has not expired, and only when Rod asks or the outcome says
+to. If the delegation never reaches Melody (offline, backend error, no task turn admitted), say that the
+task could not start and that no DM was sent; do not switch machines, do not revoke anything, and do not
+queue a send. When Melody is back, the same event may be run once.
+
+*Stopping it.* Rod can stop every send instantly and reversibly by renaming or deleting
+`%APPDATA%\discord-mcp-pip` on Melody: the script then refuses with `invalid` (credentials missing) and
+sends nothing. `/pipagent unregister` in Discord is the server-side alternative; the next call is
+`ACCESS_DENIED`.
+
+---
+
+*Rollback, in the order section 8 gives.* Stop sending (the directory above, or `/pipagent unregister`),
+stop Pip (`docker compose ... stop`), remove the `pip` bridge from the service, and never restore the
+service's state from a snapshot. Only the first step was rehearsed on this deployment (section 9); the
+service-side half was not.
 
 ## Admin panel
 

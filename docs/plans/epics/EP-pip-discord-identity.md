@@ -322,3 +322,24 @@ as a shortcut: `dm:registered` has a broader recipient surface than the MVP owne
 - 2026-10-06: plan drafted from read-only source inspection and earlier authorized identity tests.
   No Pip application, instance, token, registration, grant, integration or notification created.
   Implementation and live acceptance remain pending; planning permission is the only new scope.
+- 2026-10-07 (evening, America/Detroit): #336 done. Pip application, `pip` instance and the `pip` bridge
+  on nucbox: boot `Logged in as pip#0023`, `Registered 4 slash commands`, the service's `pip` pin
+  recorded and matching, `/healthz` 200, prod/debug/Clerk start times unchanged (A10). Deviations: a
+  first token-only boot registered three commands globally (emptied with one PUT), the generated
+  `ADMIN_TOKEN` was rotated after it reached a transcript, Pip was briefly in two servers (removed).
+- 2026-10-07: #337 done. The Pip credential is `u-...@pip` with `dm:self` in
+  `%APPDATA%\discord-mcp-pip`; the prod integration still answers `@prod` through its own untouched
+  directory (A2). A5 was **not run** on pip, by Rod's decision.
+- 2026-10-08 (00:22Z): #338 local rows passed or recorded: A1 (name + id), A3, A4, A6, A7, A10, A11; the
+  disable control rehearsed (Pip directory renamed -> `invalid`, nothing sent; renamed back -> `dry_run`).
+  The service-side half of the rollback was **not rehearsed**, by Rod's decision.
+- 2026-10-08 (00:35Z-01:28Z): hosted rows from Pip's evidence on #332: the exit-demo path shown, A9 excluded
+  and included (literal `notify me on Discord`) passed, A8 passed (Melody offline, no DM, same event
+  resumed once after reconnect). Seven DMs delivered during acceptance, all `delivered`.
+- 2026-10-08: #339 done. `ops/README.md` sections 9 and 10 carry the live evidence and the hosted-Pip
+  handoff. **Epic delivered:** a separate Pip application and instance, its bridge, a separately paired
+  Melody integration, `scripts/result-dm.mjs`, the handoff text, and a rehearsed disable control.
+  **Deliberately not delivered:** the section 9 track (Melody-independent execution) is untouched; A5 and
+  the service-side rollback were not performed on pip; the approved avatar
+  (`assets/PIP/pip-canonical-review-v1.png`, #343) is in the repository but its upload to the application
+  is not confirmed; the release-watcher switch is #342.
