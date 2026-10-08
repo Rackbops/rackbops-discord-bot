@@ -31,6 +31,20 @@ describe("botStateForTest / resetBotStateForTest", () => {
     expect(botStateForTest().changedKeys).toEqual([]);
   });
 
+  // Each is a separate way a leak could go unseen: a key only one side has, a key the reset leaves
+  // behind, and a field the reset shares with the snapshot instead of copying.
+  test("a key added or removed counts, and the reset removes it and shares nothing with the snapshot", () => {
+    const loose = state as unknown as Record<string, unknown>;
+    loose.notAStateKey = "added by a test";
+    delete loose.seenReleaseIds; // always loaded, {} when there is no state.json
+    expect(botStateForTest().changedKeys.sort()).toEqual(["notAStateKey", "seenReleaseIds"]);
+    resetBotStateForTest();
+    expect("notAStateKey" in state).toBe(false);
+    expect(botStateForTest().changedKeys).toEqual([]);
+    state.seenReleaseIds["x/y"] = [1]; // would change the snapshot too, were the map shared
+    expect(botStateForTest().changedKeys).toEqual(["seenReleaseIds"]);
+  });
+
   test("writes settles only once a queued save has", async () => {
     let saved = false;
     void saveState().then(() => (saved = true));

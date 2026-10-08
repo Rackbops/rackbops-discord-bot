@@ -29,6 +29,20 @@ describe("configStateForTest / resetConfigForTest", () => {
     (config as unknown as Record<string, unknown>).notAConfigKey = undefined;
     expect(configStateForTest().changedKeys).toEqual([]);
   });
+
+  // Each is a separate way a leak could go unseen: a key only one side has, a key the reset leaves
+  // behind, and a field the reset shares with the snapshot instead of copying.
+  test("a key added or removed counts, and the reset removes it and shares nothing with the snapshot", () => {
+    const loose = config as unknown as Record<string, unknown>;
+    loose.notAConfigKey = "added by a test";
+    delete loose.commandPrefix; // always resolved, "" when unset
+    expect(configStateForTest().changedKeys.sort()).toEqual(["commandPrefix", "notAConfigKey"]);
+    resetConfigForTest();
+    expect("notAConfigKey" in config).toBe(false);
+    expect(configStateForTest().changedKeys).toEqual([]);
+    config.watchedRepos.push("x/y"); // would change the snapshot too, were the array shared
+    expect(configStateForTest().changedKeys).toEqual(["watchedRepos"]);
+  });
 });
 const { reportBody, reportAnnouncement } = await import("./report");
 

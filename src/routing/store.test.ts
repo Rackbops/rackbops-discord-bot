@@ -603,12 +603,20 @@ describe("readRouting says what it ignored (#260)", () => {
     expect(routingStoreStateForTest().said).toBe(1);
   });
 
-  test("routingStoreStateForTest's writes settle only once a queued routing and secrets write has", async () => {
-    const done: string[] = [];
-    void mutateRouting(dir, withPlugin("music")).then(() => done.push("routing"));
-    void mutateSecrets(dir, (s) => s).then(() => done.push("secrets"));
+  // One queue at a time: queued together, one write always finishes first, and `writes` would pass
+  // while ignoring that queue.
+  test("routingStoreStateForTest's writes settle only once a queued routing write has", async () => {
+    let done = false;
+    void mutateRouting(dir, withPlugin("music")).then(() => (done = true));
     await routingStoreStateForTest().writes;
-    expect(done.sort()).toEqual(["routing", "secrets"]);
+    expect(done).toBe(true);
+  });
+
+  test("routingStoreStateForTest's writes settle only once a queued secrets write has", async () => {
+    let done = false;
+    void mutateSecrets(dir, (s) => s).then(() => (done = true));
+    await routingStoreStateForTest().writes;
+    expect(done).toBe(true);
   });
 
   test("the same problem is said again once the record is cleared (the test seam works)", async () => {

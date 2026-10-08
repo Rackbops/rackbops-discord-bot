@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -197,6 +197,9 @@ describe("configLeaks", () => {
   test("nothing changed is no leak", () => {
     expect(configLeaks({ changedKeys: [] })).toEqual([]);
   });
+  test("one changed key is a leak", () => {
+    expect(configLeaks({ changedKeys: ["gitSha"] })).toEqual([expect.stringContaining("config changed since it was resolved: gitSha")]);
+  });
   test("names every changed key", () => {
     expect(configLeaks({ changedKeys: ["gitSha", "githubToken"] })).toEqual([
       expect.stringContaining("config changed since it was resolved: gitSha, githubToken"),
@@ -296,6 +299,22 @@ describe("drainQueues", () => {
   test("gives up after its bound when something never settles, and says so", async () => {
     const outcome = await settleWithin(drainQueues(table(() => ({ stuck: NEVER })), 20), "drainQueues", 500);
     expect(outcome).toEqual({ ok: true, v: false });
+  });
+
+  // Otherwise every caught leak leaves a timer running out the whole bound after the hook moved on.
+  test("clears its timer when everything settles first", async () => {
+    const set = spyOn(globalThis, "setTimeout");
+    const clear = spyOn(globalThis, "clearTimeout");
+    try {
+      const done = drainQueues(table(() => ({ ready: DONE })), 60_000);
+      const timer = set.mock.results[0]?.value; // set before drainQueues first awaits
+      expect(timer).toBeDefined();
+      expect(await done).toBe(true);
+      expect(clear.mock.calls.some(([t]) => t === timer)).toBe(true);
+    } finally {
+      set.mockRestore();
+      clear.mockRestore();
+    }
   });
 });
 
