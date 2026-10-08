@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { mkdir, readdir, readFile, rename, unlink } from "node:fs/promises";
 import type { Client, MessageMentionOptions } from "discord.js";
 import { config } from "./config";
+import { prefixedName } from "./commandNaming";
 import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
 import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
@@ -302,8 +303,9 @@ function shouldPollPluginUpdates(): boolean {
 
 /** Live deps for `checkPluginUpdates`, built from config + the shared storage + the Client's DM and
  *  announce paths. `loadIndex` re-fetches (and re-caches) the manifest; `mutateState` is host.ts's
- *  single race-safe state.json mutator; the fallback reuses `announceTo`. */
-function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
+ *  single race-safe state.json mutator; the fallback reuses `announceTo`. Exported for the wiring
+ *  test, which builds it (no Client call happens until a delivery) to read `pluginsCommand`. */
+export function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
   return {
     loadIndex: async () => (await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)).index,
     readState: () => readPluginState(DATA_DIR, pluginStorage),
@@ -317,6 +319,8 @@ function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
     },
     adminUserIds: config.adminUserIds,
     hostApiVersion: HOST_API_VERSION,
+    // The notice tells admins to run `/plugins …` — under the name it is registered as here.
+    pluginsCommand: prefixedName(config.commandPrefix, "plugins"),
     now: () => new Date(),
     log: console,
     // #104: a due scheduled update restarts the bot. requestRestart inside the tick's withCritical

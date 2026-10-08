@@ -40,19 +40,19 @@ export function isAdmin(userId: string, adminUserIds: string[]): boolean {
 
 /**
  * The admin gate `/update` and `/plugins` both used to duplicate inline. Replies with the refusal
- * (naming `ADMIN_USER_IDS` if none are configured, `command` so the message names the command that
- * was actually blocked) and returns `true` when it did — the caller returns immediately in that
- * case. Returns `false`, with nothing sent, for an admin.
+ * (naming `ADMIN_USER_IDS` if none are configured) and returns `true` when it did — the caller
+ * returns immediately in that case. Returns `false`, with nothing sent, for an admin.
+ *
+ * The refusal names the command from `interaction.commandName` — the name the user actually typed,
+ * `COMMAND_PREFIX` included (`/pipupdate`) — never a bare literal: under a prefix `/update` does not
+ * exist, so telling someone to "enable `/update`" sent them looking for a command that isn't there.
  */
-export async function refuseUnlessAdmin(
-  interaction: ChatInputCommandInteraction,
-  command: "/update" | "/plugins",
-): Promise<boolean> {
+export async function refuseUnlessAdmin(interaction: ChatInputCommandInteraction): Promise<boolean> {
   if (isAdmin(interaction.user.id, config.adminUserIds)) return false;
   await interaction.reply({
     content: config.adminUserIds.length
       ? "⛔ You're not allowed to run this."
-      : `⛔ No admins are configured — set \`ADMIN_USER_IDS\` to enable \`${command}\`.`,
+      : `⛔ No admins are configured — set \`ADMIN_USER_IDS\` to enable \`/${interaction.commandName}\`.`,
     flags: MessageFlags.Ephemeral,
   });
   return true;
@@ -106,7 +106,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         // Hides it from non-admins in the UI. Defence in depth — the ID allowlist is the gate.
         .setDefaultMemberPermissions(0),
     handle: async (interaction) => {
-      if (await refuseUnlessAdmin(interaction, "/update")) return;
+      if (await refuseUnlessAdmin(interaction)) return;
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       // Inside a critical section so the restart waits for the reply to be delivered.
       await withCritical(async () => {
@@ -168,7 +168,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
             .addStringOption((o) => o.setName("name").setDescription("Plugin name").setRequired(true)),
         ),
     handle: async (interaction) => {
-      if (await refuseUnlessAdmin(interaction, "/plugins")) return;
+      if (await refuseUnlessAdmin(interaction)) return;
       const sub = interaction.options.getSubcommand();
       if (sub === "list") {
         // Deferred: re-fetching the Plugin Index (for "available" + notes) can outrun the 3s window.
@@ -216,7 +216,9 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         const name = interaction.options.getString("name", true);
         const stateEntry = state.plugins.find((p) => p.name === name);
         if (!stateEntry?.installedVersion) {
-          await interaction.editReply(`⚠️ **${name}** isn't an installed plugin. See \`/plugins list\`.`);
+          await interaction.editReply(
+            `⚠️ **${name}** isn't an installed plugin. See \`/${interaction.commandName} list\`.`,
+          );
           return;
         }
         const entry = index.plugins.find((e) => e.name === name);
@@ -241,7 +243,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         } else if (sub === "cancel") {
           action = { kind: "cancel" };
         } else {
-          await interaction.editReply(`Unknown /plugins subcommand: ${sub}`);
+          await interaction.editReply(`Unknown /${interaction.commandName} subcommand: ${sub}`);
           return;
         }
 

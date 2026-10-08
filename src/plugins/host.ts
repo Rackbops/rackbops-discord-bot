@@ -9,7 +9,7 @@ import {
   type ModalSubmitInteraction,
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
-import { commandNamer } from "../commandNaming";
+import { commandNamer, prefixedName } from "../commandNaming";
 import { DESTINATION_NAME_RE, SNOWFLAKE_RE, type DiscoveryFile, type RoutingFile } from "../routing/model";
 import { destinationChannel, mappedDestinations, shown } from "../routing/resolve";
 import { createKeyedJsonMutator } from "../storage";
@@ -311,7 +311,7 @@ export function buildCommandBody(
       log.error(`[plugins] ${entry.name}: command "${bare}" failed to build — dropping it`, err);
       continue;
     }
-    if (built.name !== `${prefix}${bare}`) {
+    if (built.name !== prefixedName(prefix, bare)) {
       log.warn(`[plugins] ${entry.name}: command "${bare}" built the wrong name "${built.name}" — dropping it`);
       continue;
     }

@@ -1,10 +1,66 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import type { ModalSubmitInteraction } from "discord.js";
+import type { ChatInputCommandInteraction, ModalSubmitInteraction } from "discord.js";
 
 // report.ts pulls in the `config` singleton, which resolves process.env at import time -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { handleReportModal } = await import("./report");
+const { handleReportCommand, handleReportModal } = await import("./report");
 const { config } = await import("./config");
+
+// Every command is registered under COMMAND_PREFIX, so on a `pip` instance the user typed
+// `/pipreport` and `/report` does not exist there. Both user-facing names must be the registered one.
+describe("/report names itself by its registered (prefixed) name", () => {
+  const realRole = config.reportRoleId;
+  const realToken = config.githubToken;
+  const realPrefix = config.commandPrefix;
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    config.reportRoleId = realRole;
+    config.githubToken = realToken;
+    config.commandPrefix = realPrefix;
+    globalThis.fetch = realFetch;
+  });
+
+  // Mutation: reverting the interpolation to the literal "`/report`" fails this.
+  test("the not-configured refusal names the command the user typed", async () => {
+    config.reportRoleId = undefined;
+    for (const typed of ["pipreport", "rreport", "report"]) {
+      let replied: { content?: string } | undefined;
+      const interaction = {
+        commandName: typed,
+        reply: async (o: { content?: string }) => {
+          replied = o;
+        },
+      } as unknown as ChatInputCommandInteraction;
+      await handleReportCommand(interaction);
+      expect(replied?.content).toBe(
+        `\`/${typed}\` isn't configured — an admin must set \`REPORT_ROLE_ID\` and \`GITHUB_TOKEN\`.`,
+      );
+      if (typed !== "report") expect(replied?.content).not.toContain("`/report`");
+    }
+  });
+
+  // A modal submit has no commandName, so the footer's name comes from config.commandPrefix at submit
+  // time. Mutation: passing a literal "report" to reportBody (or dropping the prefix) fails this.
+  test("the filed issue's footer names the prefixed command", async () => {
+    config.githubToken = "test-token";
+    config.commandPrefix = "pip";
+    const issueBodies: string[] = [];
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith("/issues")) {
+        issueBodies.push((JSON.parse(String(init?.body)) as { body: string }).body);
+        return new Response(JSON.stringify({ number: 7, html_url: "https://github.com/x/y/issues/7" }), { status: 201 });
+      }
+      return new Response("{}", { status: 201 }); // ensureLabel
+    }) as unknown as typeof fetch;
+
+    const { interaction } = fakeModalSubmit({ customId: "report:wow", username: "alice" });
+    await handleReportModal(interaction);
+
+    expect(issueBodies).toHaveLength(1);
+    expect(issueBodies[0]).toContain("_Filed from Discord via `/pipreport` by **alice**._");
+    expect(issueBodies[0]).not.toContain("`/report`");
+  });
+});
 
 /** A minimal stand-in for a `report:<project>` modal submit, capturing what gets sent back. */
 function fakeModalSubmit(o: { customId: string; title?: string; description?: string; username?: string }) {

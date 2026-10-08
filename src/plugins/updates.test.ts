@@ -152,15 +152,25 @@ describe("releaseNotesBetween", () => {
 describe("notificationMessage", () => {
   const base = { name: "warbandeer", from: "1.0.0", to: "1.1.0", neededHostApi: 1, releases: [rel("1.1.0")] };
   test("compatible: the four operator options, exact command names", () => {
-    const msg = notificationMessage({ ...base, compatible: true, action: "notify" }, 1);
+    const msg = notificationMessage({ ...base, compatible: true, action: "notify" }, 1, "plugins");
     expect(msg).toContain("📦 **warbandeer** 1.1.0 is available (installed 1.0.0).");
     expect(msg).toContain("`/plugins update warbandeer` (now, or `at:` a time)");
     expect(msg).toContain("`/plugins remind warbandeer`");
     expect(msg).toContain("`/plugins skip warbandeer`");
     expect(msg).toContain("or use the admin panel.");
   });
+  // On a `COMMAND_PREFIX=pip` instance the command is `/pipplugins`; a bare `/plugins` doesn't exist.
+  // Mutation: reverting any of the three options to a literal `/plugins` fails this.
+  test("compatible: names the /plugins command by its registered (prefixed) name, all three times", () => {
+    const msg = notificationMessage({ ...base, compatible: true, action: "notify" }, 1, "pipplugins");
+    expect(msg).toContain(
+      "Update with `/pipplugins update warbandeer` (now, or `at:` a time), `/pipplugins remind warbandeer`, " +
+        "`/pipplugins skip warbandeer`, or use the admin panel.",
+    );
+    expect(msg).not.toContain("`/plugins");
+  });
   test("incompatible: says the bot must update first, no install path", () => {
-    const msg = notificationMessage({ ...base, to: "2.0.0", neededHostApi: 2, compatible: false, action: "notify" }, 1);
+    const msg = notificationMessage({ ...base, to: "2.0.0", neededHostApi: 2, compatible: false, action: "notify" }, 1, "plugins");
     expect(msg).toContain("This version needs a newer bot (host API v2, this bot is v1) — update the bot first.");
     expect(msg).not.toContain("/plugins update");
   });
@@ -168,15 +178,17 @@ describe("notificationMessage", () => {
     const msg = notificationMessage(
       { ...base, to: "2.0.0", compatible: true, action: "notify", releases: [rel("2.0.0", { notes: "x".repeat(3000) })] },
       1,
+      "pipplugins",
     );
     expect(msg.length).toBeLessThanOrEqual(2000);
     expect(msg).toContain("📦 **warbandeer** 2.0.0 is available"); // head survives
-    expect(msg).toContain("`/plugins update warbandeer`"); // footer survives the clamp
+    expect(msg).toContain("`/pipplugins update warbandeer`"); // footer survives the clamp, prefix and all
   });
   test("hard-caps even a pathologically long plugin name (belt-and-suspenders)", () => {
     const msg = notificationMessage(
       { ...base, name: "a".repeat(500), compatible: true, action: "notify", releases: [rel("1.1.0")] },
       1,
+      "plugins",
     );
     expect(msg.length).toBeLessThanOrEqual(2000);
   });
@@ -301,8 +313,10 @@ describe("checkPluginUpdates", () => {
     /** Simulate a concurrent `/plugins cancel` winning the serialized queue: clear every `scheduled`
      *  from `current` just before the first mutate runs, so the arbiter closure sees it cancelled. */
     cancelRace?: boolean;
+    pluginsCommand?: string;
   }) {
     const dms: string[] = [];
+    const dmContents: string[] = [];
     const posts: string[] = [];
     const restarts: string[] = [];
     let current = opts.state;
@@ -321,18 +335,33 @@ describe("checkPluginUpdates", () => {
         mutations.push(current);
       },
       deliverers: {
-        dmUser: async (id) => { if (opts.dm) await opts.dm(); dms.push(id); },
+        dmUser: async (id, content) => { if (opts.dm) await opts.dm(); dms.push(id); dmContents.push(content); },
         postAnnounce: async () => { if (opts.post) await opts.post(); posts.push("x"); },
       },
       adminUserIds: opts.adminUserIds ?? ["admin1"],
       hostApiVersion: 1,
+      pluginsCommand: opts.pluginsCommand ?? "plugins",
       now: () => NOW,
       log: { info() {}, warn() {}, error() {} },
       restartPending: () => opts.restartPending ?? false,
       requestRestart: (reason) => { restarts.push(reason); },
     };
-    return { deps, dms, posts, restarts, mutations, get state() { return current; }, get indexLoads() { return indexLoads; } };
+    return { deps, dms, dmContents, posts, restarts, mutations, get state() { return current; }, get indexLoads() { return indexLoads; } };
   }
+
+  // The consumer boundary for the prefixed name: what the tick actually DMs is built from
+  // deps.pluginsCommand. Mutation: dropping that argument (or passing a literal) fails this.
+  test("the DM it sends names the /plugins command by deps.pluginsCommand", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0", { releases: [rel("1.1.0")] })]),
+      state: state([stateEntry("a", "1.0.0")]),
+      pluginsCommand: "pipplugins",
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.dmContents).toHaveLength(1);
+    expect(h.dmContents[0]).toContain("`/pipplugins update a`");
+    expect(h.dmContents[0]).not.toContain("`/plugins");
+  });
 
   test("notifies once and records notifiedVersion/availableVersion; a second run is silent", async () => {
     const h = harness({ index: index([entry("a", "1.1.0", { releases: [rel("1.1.0")] })]), state: state([stateEntry("a", "1.0.0")]) });
