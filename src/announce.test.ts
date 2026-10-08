@@ -365,6 +365,23 @@ describe("checkReleases (#342)", () => {
     expect(calls).toEqual([]);
   });
 
+  test("with no injected deps it polls config.watchedRepos through the real per-repo check", async () => {
+    const { config } = await import("./config");
+    expect(config.watchedRepos.length).toBeGreaterThan(0);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response("not found", { status: 404 })) as unknown as typeof fetch);
+    try {
+      await checkReleases(client);
+      const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+      expect(urls).toHaveLength(config.watchedRepos.length);
+      config.watchedRepos.forEach((repo, i) => expect(urls[i]).toContain(`/repos/${repo}/releases`));
+    } finally {
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
   test("calls checkRepo once per repo and isolates a throwing one", async () => {
     const calls: string[] = [];
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
