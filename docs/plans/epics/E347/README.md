@@ -3,8 +3,8 @@
 Epic issue: [#347](https://github.com/Rackbops/rackbops-discord-bot/issues/347). Written 2026-10-08 against
 `main` @ `4ff8eef` (this repository), `Rackbops/discord-mcp` `main` @ `fe46591`, and `@rackbops/plugin-mcp`
 0.3.1 (`Rackbops/rackbops-bot-plugins` @ `2820afe`, the version live on the Pip instance). Every README line
-number in these plans is `ops/README.md` on `4ff8eef`; the Pip section is lines 732-951 and its section 10
-is 1018-1092.
+number in these plans is `ops/README.md` on `4ff8eef`; the Pip section is lines 732-1093, its sections 1-8
+are 757-950 and its section 10 is 1018-1092.
 
 Thirty children were open at pickup (#348, #350, #358, #381 and #382 had already landed). All thirty are
 documentation changes to the one section, so they ship as **four PRs, one per region of the section**, and
@@ -59,9 +59,10 @@ on its PR and continues under it.
 4. **The section 3 table re-pins to the PR's base commit.** Its header says "Line numbers are on `8d039c9`";
    bundle D re-reads every cite in the table on its own tree and replaces that commit. The section 2 block
    pins no commit; bundle B re-reads its cites on its tree the same way (#390). Plugin cites everywhere are
-   re-read at `2820afe` (0.3.1): between `477770d` (the review's 0.3.0) and `2820afe` the only source change
-   under `plugins/mcp/src` is `commands.ts` (`gh api repos/Rackbops/rackbops-bot-plugins/compare/477770d...2820afe`),
-   so the `http.ts`, `auth.ts`, `drain.ts`, `index.ts` and `registry.ts` cites did not move.
+   re-read at `2820afe` (0.3.1): between `477770d` (the review's 0.3.0) and `2820afe` the only source changes
+   under `plugins/mcp/src` are `commands.ts` and `commands.test.ts`
+   (`gh api repos/Rackbops/rackbops-bot-plugins/compare/477770d...2820afe`), so the `http.ts`, `auth.ts`,
+   `drain.ts`, `index.ts` and `registry.ts` cites did not move; every `commands.ts` cite did, and is re-read.
 5. **The intro stops pinning the whole section to one commit.** After four PRs land at four commits, "the
    cites below were read at `8d039c9`" cannot stay true. Bundle A rewrites it as a rule: a `file:line` is as
    read on `main` by the PR that last changed the sentence, and section 3's table names its own commit.
@@ -70,13 +71,12 @@ on its PR and continues under it.
    exception is the plugin-move recipe (the `printf ... | bot-ops.sh plugin-request` lines #391 added):
    a multi-line command does not belong in a table cell, so the `ADMIN_USER_IDS` comment keeps the recipe
    and the table's plugin-update row points at the comment for it, as it already does.
-7. **#375 (pin `PLUGINS=mcp@<version>`) is Rod's call and is the one open question.** An operator pin wins
-   over every other version source at every boot, the mailbox's `update-now` target included
-   (`src/plugins/install.ts:289-293`, `:318-320` on `4ff8eef`), so a pin makes the mailbox route inert
-   until the pin is edited. Recommendation: decline the pin and say that in the block (the unpinned
-   version is recorded in `plugins/state.json` and moves only on request, never on its own). Bundle B's
-   plan carries both texts under a `[NEEDS CLARIFICATION]` marker and is not handed over until it is
-   resolved.
+7. **#375 (pin `PLUGINS=mcp@<version>`) is declined, by Rod on 2026-10-08.** An operator pin wins over
+   every other version source at every boot, the mailbox's `update-now` target included
+   (`src/plugins/install.ts:289-293`, `:318-320` on `4ff8eef`), so a pin would make the mailbox route
+   inert until the pin is edited. The block stays unpinned and says why (the installed version is
+   recorded in `plugins/state.json` and moves only on request, never on its own); bundle B closes #375 as
+   declined in writing.
 8. **Section 10 is pasted into hosted Pip.** Bundle A changes its *Stopping it* paragraph (#353). After A
    merges, Rod re-pastes the text between the two rules into hosted Pip's instructions; the PR body says so.
 9. **The exit criterion's "run as written" clause.** The health steps were run on the live Pip on 2026-10-08

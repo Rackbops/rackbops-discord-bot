@@ -33,18 +33,19 @@ as the DM's author.` After the two identity bullets (after line 749) add one par
 > service run. **Melody** is Rod's Windows workstation, where the discord-mcp shim and the Pip credentials
 > live (section 6); it is never the bot host, which matters in section 8.
 
-Confirm "nucbox" is the name the file already uses for the host (lines 424 and 944 on `4ff8eef`).
+"nucbox" is the name the file uses for the host from section 9 on (first at line 954 on `4ff8eef`; the
+hosts block at line 424 names the box by IP only), so this paragraph is its first use in the section.
 
 **#361.** After that paragraph add:
 
 > Any member of the approved server can run `/pipagent register` and then `pair`, and becomes a principal of
 > their own with the same `dm:self` grant: the plugin's `agent` command sets no default member permission
-> (`plugins/mcp/src/commands.ts:48-56`), the host adds none (`src/plugins/host.ts:299-329`), an unplaced
-> plugin's command is allowed everywhere in the server (`src/routing/resolve.ts:130-134`), and the service
-> hands every `u-<id>@pip` its service-wide `defaultUserGrants` with no per-bridge allowlist (discord-mcp
-> `src/service/principals.ts:35-41`, `contracts/config.schema.json:108-116`). Server membership is the
-> control, not this runbook's "Rod": such a principal can DM only itself, on its own rate budget. Rod
-> accepted that boundary on #332.
+> (the builder, `plugins/mcp/src/commands.ts:59-64` at 0.3.1), the host adds none
+> (`src/plugins/host.ts:299-329`), an unplaced plugin's command is allowed everywhere in the server
+> (`src/routing/resolve.ts:130-134`), and the service hands every `u-<id>@pip` its service-wide
+> `defaultUserGrants` with no per-bridge allowlist (discord-mcp `src/service/principals.ts:35-41`,
+> `contracts/config.schema.json:108-116`). Server membership is the control, not this runbook's "Rod":
+> such a principal can DM only itself. Rod accepted that boundary on #332.
 
 ### 2. Section 1 (lines 757-778)
 
@@ -72,25 +73,27 @@ unregister`.` with:
 
 > 1. **Stop sending.** First `/pipagent unregister` in Discord: that is the revocation. The bridge refuses a
 >    delivery to an unregistered user at drain time (`plugins/mcp/src/drain.ts:128-131`,
->    `registry.ts:120-125`) and the service stops accepting every token paired through that bot within about
->    60 seconds (discord-mcp `src/service/registration.ts:204-207`, `store.ts:1012-1029`; its README,
->    "Revocation": there is no separate revoke call). Then delete the Pip credentials directory on Melody:
->    housekeeping that stops the one-shot `scripts/result-dm.mjs` sender, which reads only
->    `credentials.json`, but revokes nothing. A deleted file leaves the token valid server-side until the
->    inactivity prune, a running shim keeps its bearer in memory (`src/shim/cli.ts:190-204`), a backup copy
->    or a `DISCORD_MCP_TOKEN` environment variable still authenticates, and a delivery the bridge already
->    accepted (`plugins/mcp/src/http.ts:54-57`) is still re-driven by the plugin's tick
->    (`plugins/mcp/src/index.ts:65-80`) with nothing on Melody consulted.
+>    `registry.ts:120-125`), and within roughly 60 seconds the service refuses every **tool call** made with
+>    a token paired through that bot (discord-mcp `src/service/registration.ts:30`, `:204-207`,
+>    `store.ts:1012-1029`; its README, "Revocation": there is no separate revoke call, the token row stays
+>    and still authenticates and lists tools, but no call succeeds). Then delete the Pip credentials
+>    directory on Melody: housekeeping that stops the one-shot `scripts/result-dm.mjs` sender, which reads
+>    only `credentials.json`, but revokes nothing. A deleted file leaves the token valid server-side until
+>    the inactivity prune, a running shim keeps its bearer in memory (`src/shim/cli.ts:190-204`), a backup
+>    copy or a `DISCORD_MCP_TOKEN` environment variable still authenticates (`cli.ts:99`), a delivery the
+>    bridge already accepted is drained at once (`plugins/mcp/src/http.ts:54-57`), and one a restart left
+>    `unknown` is re-driven by the plugin's tick (`plugins/mcp/src/index.ts:65-80`, `:89-91`), with nothing
+>    on Melody consulted.
 
-Verify on discord-mcp's tree that the shim honours a `DISCORD_MCP_TOKEN` variable (grep `src/shim/cli.ts`);
-if it does not, drop that clause and say so in the PR.
+The `DISCORD_MCP_TOKEN` clause was verified at `fe46591` (`src/shim/cli.ts:99`,
+`env.DISCORD_MCP_TOKEN ?? credentials?.token`); re-read it on your tree.
 
 ### 4. Section 10 (lines 1082-1092)
 
 **#353.** Replace the *Stopping it* paragraph with:
 
-> *Stopping it.* `/pipagent unregister` in Discord is the revocation: within about a minute every call with
-> the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge, not re-run on pip). Renaming or
+> *Stopping it.* `/pipagent unregister` in Discord is the revocation: within about a minute every tool call
+> with the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge, not re-run on pip). Renaming or
 > deleting `%APPDATA%\discord-mcp-pip` on Melody stops this script instantly and reversibly (it refuses with
 > `invalid`, credentials missing, and sends nothing) but revokes nothing: the credential stays valid until
 > Rod unregisters.

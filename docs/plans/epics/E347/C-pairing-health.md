@@ -68,12 +68,15 @@ Replace the section body with:
 > ```
 >
 > The log check is bounded to the current boot on purpose: the container's log is cumulative across
-> `bot-ops.sh restart` (`docker compose restart` of the same container, `ops/bot-ops.sh:670`) and across the
+> `bot-ops.sh restart` (`docker compose restart` of the same container, `ops/bot-ops.sh:671`) and across the
 > crash-loop restarts of `restart: unless-stopped` (`docker-compose.yml:57`), so a bare `grep 'Logged in as'`
 > can match an earlier boot while the new process is failing to log in. Expect, in order, `[boot] env file:
 > /opt/rackbops-discord-bot/pip/.env` (`src/bootLog.ts:28`, printed every boot), `Logged in as pip#<tag>`
-> (`src/index.ts:130`), `[plugins] mcp@<version> downloaded, integrity ok` and `[release] watcher off
-> (WATCHED_REPOS=none)`.
+> (`src/index.ts:130`) and `[release] watcher off (WATCHED_REPOS=none)`. A `[plugins] mcp@<version>
+> downloaded, integrity ok` line appears only on the first boot of a version on that state volume
+> (`src/plugins/install.ts:281`); a cached bundle is reused silently (`:238-242`), so after a `restart` or a
+> `recreate` on the same version there is no per-plugin line, and `bot-ops.sh status` is where the installed
+> version shows.
 >
 > The probe reads the token from the container's own environment (`docker exec` inherits the create-time
 > env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints it. `200` with
@@ -89,16 +92,19 @@ Replace the section body with:
 > - `503 {"error":"bridge not configured"}`: `MCP_BRIDGE_TOKEN` is absent in the container
 >   (`plugins/mcp/src/http.ts:187`), for example appended to the `.env` without the recreate (section 5).
 > - `503 Unavailable`, plain text: the host router's own answer for a plugin that loaded but is not running
->   (`src/plugins/host.ts:841`, `:861`): `activate()` threw and the log has `[plugins] mcp failed to
->   activate -- the bot keeps running without it` (`host.ts:547-549`). `src/http.ts:36` answers the same
->   while the listener is closing.
+>   (`src/plugins/host.ts:841`, `:861`): `activate()` threw and the log has a line beginning `[plugins] mcp
+>   failed to activate` (`host.ts:547-549`). `src/http.ts:36` answers the same while the listener is
+>   closing.
 > - `404 Not found`: the plugin never loaded (`host.ts:839`): the index or the registry unreachable on a
->   fresh instance with no cache, a `hostApiVersion` skip, a throwing `createPlugin`; the bot runs core-only
->   (`src/index.ts:213-214`). `bot-ops.sh status` prints `plugins[]` with `error`, `active` and
->   `installedVersion` (`ops/bot-ops.sh:631-637`).
-> - No answer: the listener binds last in boot, after login and plugin install (`src/index.ts:319-343`), so
->   a boot still in progress answers nothing yet; a bind failure logs `[http] could not listen on :8794`;
->   otherwise the port in the probe is not `HTTP_PORT`.
+>   fresh instance with no cache, a `hostApiVersion` skip, a throwing `createPlugin`, each contained per
+>   plugin and recorded where `bot-ops.sh status` shows it, `plugins[]` with `error`, `active` and
+>   `installedVersion` (`ops/bot-ops.sh:632-633` passes the state file's array through; the fields are
+>   `src/plugins/contract.ts:187-201`). An unexpected failure of the whole plugin setup instead logs a line
+>   beginning `[plugins] plugin setup failed` and the bot starts core-only (`src/index.ts:213-214`).
+> - No answer: the listener binds after login, plugin install and activation (`src/index.ts:316-344`,
+>   `startHostHttp` at `:333`) and before command registration (`:367-383`), so a boot that has not reached
+>   that point answers nothing yet; a bind failure logs a line beginning `[http] could not listen on :8794`
+>   (`:342`); otherwise the port in the probe is not `HTTP_PORT`.
 >
 > Restart and logs are Clerk's step 6 with `pip` substituted: `install.sh`'s printed step 3 prints the four
 > `BOT_OPS_*` lines instance-exact (`BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/pip`,
@@ -108,7 +114,8 @@ Replace the section body with:
 
 Carries #351 (status and body printed; the two host-router answers and "still booting / bind failed"
 mapped; `bot-ops.sh status` named), #352's section 7 half (the blank-token reading), #364 (`--since` the
-container's `StartedAt`, and why), #365 (the authenticated probe as the primary check; the rationing caveat
+container's `StartedAt`, and why; the per-plugin line is stated as fetch-only, which the audit of this
+plan caught), #365 (the authenticated probe as the primary check; the rationing caveat
 gone), #373 (three spans instead of `restart | recreate | logs 200`), #376's section 7 half (`8794` in the
 probe, no placeholder), #377's section 7 half (the `BOT_OPS_*` set is named as `install.sh`'s printed step 3
 with the instance values kept).

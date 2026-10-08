@@ -23,7 +23,7 @@ Replace with:
 > initiative** under the `.env` above, plus the three command paths a member can trigger, so that "Pip's
 > host sends nothing unsolicited that reaches a DM" is a cited claim and not an assumption. Not listed, by
 > design: the host's other interaction replies, which go only to the person who interacted and only after
-> they did (`src/plugins/host.ts:657`, `:681`, `:755`; `src/commands.ts:200-203`, `:323`). Line numbers are
+> they did (`src/plugins/host.ts:657`, `:681`, `:755`; `src/commands.ts:200-203`, `:325`). Line numbers are
 > on `<your base commit>` (this repository) and `2820afe` (`plugins/mcp` 0.3.1).
 
 Carries #370 ("every way" no longer claims a completeness it lacks; the replies are listed in one clause).
@@ -31,29 +31,30 @@ Carries #370 ("every way" no longer claims a completeness it lacks; the replies 
 ### 2. The `/pipupdate`, `/pipplugins` row (line 860)
 
 "Why it is bounded" becomes: `Both set `setDefaultMemberPermissions(0)`, hiding them from members without
-Discord's Administrator permission (`src/commands.ts:106-107`); the handler then refuses anyone not in
-`ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included.` Carries #374's
-section 3 half.
+Discord's Administrator permission (`src/commands.ts:106-107` and `:138`); the handler then refuses anyone
+not in `ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included.` Keep the
+row's Evidence cell. Carries #374's section 3 half.
 
 ### 3. The "Scheduled plugin update" row (line 858)
 
 - Where it goes: `Nowhere under this `.env` unless someone writes the request mailbox on the host (see why).
   In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it
-  (`src/plugins/updates.ts:642-647`).`
+  (`src/plugins/updates.ts:653-658`).`
 - Why it is bounded: `A schedule comes only from a request: an admin's `/pipplugins` (none here) or the
   host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`,
-  `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1243-1317`); the bot's
-  `validate` requires only a non-empty string there (`src/plugins/requests.ts:424`) and never consults
-  `ADMIN_USER_IDS`; `schedule` and `update-now` carry it into the state (`:482-495`), and a snowflake is DMed
-  (`updates.ts:642-647`; after the restart, `:686-691`). So anyone in the host's docker group can make Pip's
-  core DM any user id, twice. That group is Pip's real admin set: it reads every secret with `docker
-  inspect` (`docker-compose.yml:84-85`, `ops/install.sh:357-359`) and is root-equivalent through the mounted
-  socket (`docker-compose.yml:45-49`); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's
-  "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy`
-  (`ops/admin/server.ts:2031`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the
-  mailbox recipe.`
-- Evidence: `src/plugins/updates.ts:604-655` (`runDueSchedules`, the DM at `:644`); `src/plugins/requests.ts:419-430`
-  (`validate`), `:482-495`.
+  `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1243-1317`, the write at
+  `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:430`) and
+  never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:488-501`), and a
+  snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker
+  group can make Pip's core DM any user id, twice. That group is Pip's real admin set: the bot service
+  loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret
+  (the admin sidecar's comment at `:74-76` says exactly that), and the group is root-equivalent through the
+  mounted socket (`docker-compose.yml:45-49`, `ops/install.sh:357-359`); `ADMIN_USER_IDS=` governs
+  Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a
+  non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's
+  `ADMIN_USER_IDS` comment carries the mailbox recipe.`
+- Evidence: `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:419-430`
+  (`validate`), `:488-501`.
 
 Carries #349 (the two rows and the trust model) and #359 (the column answers "under this `.env`" first).
 
@@ -66,9 +67,9 @@ Carries #349 (the two rows and the trust model) and #359 (the column answers "un
 - Why it is bounded: `Delivered only when an owed marker exists: `state.pendingUpdateReport`, set only with a
   `requester` (the guard `src/update.ts:103-111`, applied at `:293-298`; the one call site constructing a
   requester is `src/commands.ts:117`), or `state.pendingReport`, set by `/plugins update`, `runDueSchedules`
-  and a mailbox `update-now` (`src/plugins/requests.ts:482-495`). `/pipupdate` and `/pipplugins` refuse here,
+  and a mailbox `update-now` (`src/plugins/requests.ts:488-498`). `/pipupdate` and `/pipplugins` refuse here,
   so the mailbox is the only writer left; a snowflake `requestedBy` is DMed and any other value is logged
-  (`src/plugins/updates.ts:686-691`, `:692-693`).`
+  (`src/plugins/updates.ts:697-702`: the log at `:697-698`, the DM at `:702`).`
 - Evidence: unchanged (`src/index.ts:440` ... `src/plugins/updates.ts:673-703`), re-read.
 
 Carries #349, #359 and #369 (the token route listed first).
@@ -79,11 +80,14 @@ Carries #349, #359 and #369 (the token route listed first).
   result DMs take. A channel delivery is refused here: `host.post` is wired (`src/index.ts:191-200`), every
   channel delivery takes that branch (`plugins/mcp/src/drain.ts:177-190`), and with no `routing.json` it
   throws "destination is not mapped in that server" before any Discord call (`src/plugins/host.ts:148-150`,
-  `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`; Pip runs no panel, so no
-  `routing.json` can be written. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`drain.ts:192-202`) runs
-  only when `host.post` is not a function, so never here.`
-- Why it is bounded: keep the sentence, with the cites corrected: `(or the plugin's own tick re-drives an
-  unfinished one, `plugins/mcp/src/index.ts:65-80`; the `edit` call `drain.ts:105`, `:133`, `:177-197`)`.
+  `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`. Pip runs no panel, and a
+  destination can be mapped only by a `routing-set` request written to the host mailbox (`ops/bot-ops.sh:1279-1303`,
+  applied at `src/plugins/requests.ts:370` and `:394`), the same host-side write the scheduled-update row
+  describes; none has been. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`drain.ts:192-202`) runs only
+  when `host.post` is not a function, so never here.`
+- Why it is bounded: keep the sentence, with the cites corrected: `(or the plugin's own tick re-drives one
+  a restart left `unknown`, `plugins/mcp/src/index.ts:65-80`; the `edit` call `drain.ts:105`, the DM call
+  `:133`, the channel branch `:177-197`)`.
 - Evidence: `src/index.ts:171-200` (the host wiring); `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`,
   `sendPayloadDm`), `:56-62` (`editOwnMessage`); `src/routing/post.ts:60` (`postForPlugin`, the `announce`
   path).
@@ -93,7 +97,7 @@ Carries #355 and three of #371's four cites.
 ### 6. The "Boot, handoff, ticks" row (line 866)
 
 Evidence becomes: `` `src/bootLog.ts`; `src/index.ts:130`, `:458-472`; the 5-second mailbox drain
-`src/plugins/drain.ts:11`, `:26`, started at `src/index.ts:353-358`; the 60-second backstop
+`src/plugins/drain.ts:11`, `:26`, started at `src/index.ts:354-359`; the 60-second backstop
 `src/announce.ts:235-270` (`pluginRequests`, `discovery`) ``. Carries #371's fourth cite.
 
 ### 7. The conclusion (lines 868-875)
@@ -151,7 +155,7 @@ so a Discord snowflake from the host side is accepted as-is.
 | #349: executed assertion pasted | 8 | the pasted `1 pass` | a claim about `validate` that the code does not make |
 | #359: every "Where it goes" cell answers under the Pip `.env` first | 3, 4 | audit reads the column top to bottom | a generic answer first |
 | #369: the token route first with the `updateReport.ts` cites | 4 | audit re-reads `:101-104`, `:13-14`, `:128-133` | the route missing |
-| #355: the row describes only paths reachable under the Pip `.env` | 5 | audit re-reads `host.ts:148-150`, `resolve.ts:95-99`, `drain.ts:177-202` | the `announce` path presented as live |
+| #355: the row describes only paths reachable under the Pip `.env`, and names the mailbox `routing-set` as the one way a destination could appear | 5 | audit re-reads `host.ts:148-150`, `resolve.ts:95-99`, `drain.ts:177-202`, `bot-ops.sh:1279-1303`, `requests.ts:370`, `:394` | the `announce` path presented as live, or "no routing.json can be written" |
 | #371: each of the four cites names the establishing line | 5, 6 | audit re-reads the four | a cite one hop off |
 | #370: the sentence no longer claims completeness, or lists the replies | 1 | audit re-reads the five reply sites | "every way" back |
 | #374 (section 3 half): "admin" disambiguated | 2 | audit reads the row | the two senses back |

@@ -16,8 +16,8 @@ at `fe46591` or newer; `plugins/mcp` at `2820afe`) and write the line you actual
 added a `reset...ForTest` hook to most `src/` modules after the review, so expect small shifts; #390 lists
 four that already moved.
 
-`[NEEDS CLARIFICATION: #375 -- pin PLUGINS=mcp@0.3.1 or leave it unpinned? Rod's call; both texts are in
-step 2 below. This plan is not handed over until the marker is resolved by the orchestrator.]`
+#375 is **declined** (Rod, 2026-10-08): the block stays unpinned and says why; the PR closes #375 with that
+sentence as the written decline. The reason is decision 7 in the index.
 
 ## Steps
 
@@ -28,8 +28,8 @@ the panel do not).` with:
 
 > Then edit the instance's config-dir `.env`: the hand-edited file `install.sh` seeds from `.env.example`
 > and never touches again. The rules are the Clerk runbook's step 3 (two `.env` files with different jobs;
-> comments on their own lines). **Complete the file before the first `up`** (section 5). The seeded
-> placeholders pass the core's `required()` check (`src/config.ts:58-62`), so a token-only edit boots; with
+> comments on their own lines). **Complete the block below before the first `up`** (section 5). The seeded
+> placeholders pass the core's `required()` check (`src/config.ts:59-63`), so a token-only edit boots; with
 > `DISCORD_SERVER_ID` blank that boot registers `/update`, `/plugins` and `/report` **globally and
 > unprefixed**, and once the server is set single-server mode issues its one guild-scoped PUT and never
 > clears the global list (`src/routing/register.ts:43`, `:72`, `:143`: `clearGlobal` exists only in routed
@@ -52,7 +52,7 @@ DISCORD_TOKEN=<Pip's bot token>
 # here. Use a private channel in the approved server. If the watcher is ever turned on, give the Pip
 # bot View Channel and Send Messages there by channel overwrite: a post to a channel it cannot see
 # throws before the release is marked seen, and the next 15-minute poll fails the same way, forever
-# (src/announce.ts:95, :478-485; the poll src/announce.ts:27).
+# (src/announce.ts:95, :478-485; the poll src/announce.ts:28).
 ANNOUNCE_CHANNEL_ID=<channel id>
 RELEASE_ANNOUNCE_CHANNEL_ID=
 # The one approved server: registration is one guild-scoped PUT there and nowhere else
@@ -77,19 +77,25 @@ REPORT_ROLE_ID=
 # can write the request mailbox on the host needs no entry here and can schedule an update or move
 # the plugin regardless (section 3, scheduled-update row). Moving the plugin with no admin: a
 # mailbox request, which the bot applies and then restarts onto (ops/bot-ops.sh:1244-1278;
-# src/plugins/requests.ts:482-491, :335), run with section 7's BOT_OPS_* variables:
+# src/plugins/requests.ts:488-498, :341), run with section 7's BOT_OPS_* variables:
 #   printf '%s' '{"action":"update-now","plugin":"mcp","version":"<x.y.z>","requestedBy":"operator"}' |
 #     bash /opt/rackbops-discord-bot/bin/bot-ops.sh plugin-request
-# A non-numeric requestedBy keeps the outcome in the log (src/plugins/updates.ts:692-693). The same
+# A non-numeric requestedBy keeps the outcome in the log (src/plugins/updates.ts:697-698). The same
 # request with "action":"skip" and the index's newest version silences the warning without moving
-# the plugin (src/plugins/requests.ts:499-501).
+# the plugin (src/plugins/requests.ts:505-507).
 ADMIN_USER_IDS=
 AUTO_UPDATE=false
 BOT_BRANCH=main
-<<PLUGINS LINE AND ITS COMMENT: see the two variants below>>
+# Unpinned on purpose (#375 declined). A fresh install takes the index's version that day and
+# records it in plugins/state.json on the state volume (docker-compose.yml:44); from then on it
+# moves only on a request (the mailbox above, or an explicit name@version pin here followed by
+# bot-ops.sh recreate), never on its own (src/plugins/install.ts:289-293, :318-320). A pin would win
+# over the mailbox's target at every boot and so make the mailbox route inert while set. This
+# section's plugin cites are 0.3.1's.
+PLUGINS=mcp
 PLUGIN_INDEX_URL=
 # The host router (ADR-0007): the bridge answers under /mcp/ on this port, inside the compose network
-# only. Any port 1-65535 (src/config.ts:128-131): nothing else listens inside Pip's container and no
+# only. Any port 1-65535 (src/config.ts:139-141): nothing else listens inside Pip's container and no
 # host port is published (docker-compose.yml:12-58 has no ports:), so "free" constrains nothing; it
 # must equal the port in the service's bridge url (section 4). 8794 is what the live instance uses.
 HTTP_PORT=8794
@@ -97,36 +103,14 @@ TRUSTED_PROXY_HOST=
 LOG_FORMAT=json
 ```
 
-**Variant "unpinned" (recommended; use if Rod declines #375):**
-
-```sh
-# Unpinned: a fresh install takes the index's version that day and records it in plugins/state.json
-# on the state volume (docker-compose.yml:44); from then on it moves only on a request (the mailbox
-# above, or an explicit pin here followed by bot-ops.sh recreate), never on its own
-# (src/plugins/install.ts:289-293, :318-320). This section's plugin cites are 0.3.1's.
-PLUGINS=mcp
-```
-
-**Variant "pinned" (use if Rod accepts #375):**
-
-```sh
-# Pinned to the version this section's plugin cites were read from. An operator pin wins over every
-# other version source at every boot, the mailbox's update-now target included
-# (src/plugins/install.ts:289-293, :318-320), so while it is set the mailbox request above does not
-# move the plugin: each bump is this line plus bot-ops.sh recreate (.env.example:49, ops/bot-ops.sh
-# recreate).
-PLUGINS=mcp@0.3.1
-```
-
-In the pinned variant also change the `ADMIN_USER_IDS` comment's "Moving the plugin with no admin" sentence
-to say the mailbox route applies only while `PLUGINS` is unpinned.
-
 This block carries #354 (the channel comment, rewritten for the watcher-off world the block itself
 prescribes: the channel is idle, and the failure mode is stated for the day the watcher is turned on), #356
 (the `DISCORD_SERVER_ID` qualification), #372 (the plugin-update and release-watcher explanations now point
 at section 3's rows; the recipe stays, decision 6), #374's section 2 half (none: "printed step 2" was
-already gone from this block on `4ff8eef`), #375 (one variant), #376 (the port), #390 (the four cites), and
-the line `MCP_BRIDGE_TOKEN=` is gone (decision 3).
+already gone from this block on `4ff8eef`), #375 (declined in the `PLUGINS` comment), #376 (the port), #390
+(the four cites), and the line `MCP_BRIDGE_TOKEN=` is gone (decision 3). The `requests.ts`, `updates.ts`,
+`config.ts` and `announce.ts` numbers above are as read on `4ff8eef`, after #392's shifts; re-read them on
+your base anyway.
 
 ### 3. Section 2, the paragraph after the block (lines 843-846)
 
@@ -139,10 +123,10 @@ Replace `` `MCP_BRIDGE_TOKEN` is the plugin's own secret key ... Everything else
 > this file, and the service's `DISCORD_MCP_BRIDGE_TOKEN_PIP` to its own `app.env`; Pip is then recreated
 > so the new key is read (section 4). Never leave a blank `MCP_BRIDGE_TOKEN=` line as a placeholder: Compose
 > makes it the empty string, not unset, the host copies plugin keys raw (`src/plugins/host.ts:85`, unlike
-> the core's `optional()` at `src/config.ts:64-67`, which is what makes `KEY=` mean "off" for core keys),
+> the core's `optional()` at `src/config.ts:65-68`, which is what makes `KEY=` mean "off" for core keys),
 > the plugin treats only `undefined` as unconfigured (`plugins/mcp/src/http.ts:187`), and it then answers
-> `401` to every bearer, the service's correct one included (`plugins/mcp/src/auth.ts:66-69`) -- which
-> section 7's unauthenticated probe cannot tell from healthy; the authenticated one can. The append would
+> `401` to every bearer, the service's correct one included (`plugins/mcp/src/auth.ts:66-69`) -- which an
+> unauthenticated probe cannot tell from healthy; section 7's authenticated probe can. The append would
 > still work after such a line (the last value wins in Compose and in `bot-ops.sh`), but check with
 > `grep -c '^MCP_BRIDGE_TOKEN=' /opt/rackbops-discord-bot/pip/.env` (a count, never the value) before and
 > after. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
@@ -188,7 +172,7 @@ step 2" is gone), #376's section 4 half (the port).
 
 Replace with:
 
-> Bring the bot up with `install.sh`'s printed step 2, with the `.env` completed (section 2) and **before**
+> Bring the bot up with `install.sh`'s printed step 2, with section 2's block completed and **before**
 > the service side of section 4: the compose network the service attaches to exists only after this first
 > `up`. No admin profile and no tunnel: the printed steps 4 and 5 are not run for Pip. After
 > `add-bridge.md` has appended `MCP_BRIDGE_TOKEN`, recreate Pip (`bot-ops.sh recreate`, section 7) so the
@@ -205,10 +189,11 @@ file's own convention for `install.sh`'s steps and stays).
 - Spawn one read-only claims-vs-code audit subagent over the diff (lens: every cite, every "section N"
   pointer resolves to a sentence that says what is claimed, the three ordering sentences -- complete before
   first `up`; bring up before the bridge; recreate after the append -- do not contradict each other, and
-  the pinned/unpinned comment matches `src/plugins/install.ts`). Fix or decline each finding in writing.
+  the `PLUGINS` comment matches `src/plugins/install.ts`). Fix or decline each finding in writing.
 - PR title: `docs(ops): Pip runbook .env block, bridge hand-off and bring-up order (#347)`. Body: `Closes
-  #354, #356, #362, #366, #368, #372, #375, #390`; `Part of #352, #374, #376, #377 (the rest is bundle C or D)`;
-  the pasted checks; the audit findings. Do not merge.
+  #354, #356, #362, #366, #368, #372, #375, #390`, with one line saying #375 is closed as declined (Rod,
+  2026-10-08) and the `PLUGINS` comment is the written decline; `Part of #352, #374, #376, #377 (the rest
+  is bundle C or D)`; the pasted checks; the audit findings. Do not merge.
 
 ## Coverage
 
@@ -222,7 +207,7 @@ file's own convention for `install.sh`'s steps and stays).
 | #368: section 4 names `commandPrefix` and `test` with the add-bridge cite | 4 | audit reads `add-bridge.md` section 2 | the two facts dropped |
 | #372: each explanation lives once; the comments point at the table | 2 | grep the block for `updates.ts:` -> only the two recipe cites | a duplicated explanation re-growing |
 | #374 (section 4 half): "from step 2" gone | 4 | grep sections 2-5 for `step 2` -> only "printed step 2" | the ambiguity back |
-| #375: the block pins or says why not, per Rod | 2 | the variant matches the marker's resolution | the wrong variant |
+| #375: the block says why it is unpinned; the issue closes as declined | 2 | grep the block for `PLUGINS=mcp` with no `@`, and for `#375 declined` | a pin, or an unexplained bare line |
 | #376 (sections 2, 4): the constraint stated; the port concrete | 2, 4 | grep for `<free internal port>` -> none | the placeholder back |
 | #377 (sections 2, 5): no copied factual sentence | 1, 3 | grep Clerk step 3's sentences in the Pip section -> none verbatim | a copy back |
 | #390: the four cites land; the four lines pasted | 2 | the pasted lines | a cite one line off |
@@ -232,7 +217,7 @@ file's own convention for `install.sh`'s steps and stays).
 
 ```
 EXECUTE AS WRITTEN
-Repo: Rackbops/rackbops-discord-bot. Plan: docs/plans/epics/E347/B-env-bridge-up.md on main (also the ## Plan comment on #347 for bundle B); the #375 marker is resolved as: <UNPINNED|PINNED>. Children: #354, #356, #352, #362, #366, #368, #372, #374, #375, #376, #377, #390 -- read each in full, comments included; you own only the section 2, 4 and 5 sentences of #352, #374, #376 and #377.
+Repo: Rackbops/rackbops-discord-bot. Plan: docs/plans/epics/E347/B-env-bridge-up.md on main (also the ## Plan comment on #347 for bundle B); #375 is declined by Rod, the block stays unpinned as written. Children: #354, #356, #352, #362, #366, #368, #372, #374, #375, #376, #377, #390 -- read each in full, comments included; you own only the section 2, 4 and 5 sentences of #352, #374, #376 and #377.
 Worktree: git -C S:\Repos\rackbops-discord-bot worktree add S:\Repos\_wt\rdb-347-b origin/main -b docs/347-b-env-bridge-up (fetch first). Sibling trees: discord-mcp at S:\Repos\discord-mcp (fetch; git show origin/main:deploy/add-bridge.md), plugins/mcp 0.3.1 at Rackbops/rackbops-bot-plugins 2820afe.
 Documentation-only, single-audit lane: verify every cite on your tree while writing, execute the "executed" bullet and paste real output, then one read-only claims-vs-code audit subagent; fix or decline each finding in writing. Scratch files use task-unique names (pr-body-347b.md, commit-msg-347b.txt) and are read back before use. Rebase on origin/main before marking ready; never resolve a conflict in another bundle's region -- report it. Report the PR link, the pasted checks, the audit's findings and any deviation. Do not merge.
 ```
