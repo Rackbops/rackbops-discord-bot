@@ -74,14 +74,16 @@ describe("restartLeakMessage", () => {
 // turns the console's `(fail)` marker into a coloured `✗`).
 const CHILD_TIMEOUT_MS = 20_000;
 
-/** Each `<testcase>` in a Bun JUnit report: its name, and its failure message if it failed. */
+/**
+ * Each `<testcase>` in a Bun JUnit report: its name, and its failure message if it failed. Decodes
+ * only `&quot;`, the one entity this fixture's names and messages produce; any other entity would
+ * stay encoded and fail the assertions below rather than let them pass.
+ */
 function testcases(xml: string): { name: string; failure: string | undefined }[] {
-  const unescape = (s: string) =>
-    s.replaceAll("&quot;", '"').replaceAll("&lt;", "<").replaceAll("&gt;", ">").replaceAll("&amp;", "&");
-  return [...xml.matchAll(/<testcase name="([^"]*)"[^>]*?(?:\/>|>([\s\S]*?)<\/testcase>)/g)].map((m) => {
-    const failure = m[2]?.match(/<failure[^>]*\bmessage="([^"]*)"/)?.[1];
-    return { name: unescape(m[1] ?? ""), failure: failure === undefined ? undefined : unescape(failure) };
-  });
+  return [...xml.matchAll(/<testcase name="([^"]*)"[^>]*?(?:\/>|>([\s\S]*?)<\/testcase>)/g)].map((m) => ({
+    name: m[1] ?? "",
+    failure: m[2]?.match(/<failure[^>]*\bmessage="([^"]*)"/)?.[1]?.replaceAll("&quot;", '"'),
+  }));
 }
 
 describe("the guard in test/setup.ts, run for real", () => {
