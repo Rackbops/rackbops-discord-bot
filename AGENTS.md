@@ -91,9 +91,14 @@ Run before staging (they do not substitute for the **review gate**):
   (Bun resolves each test file relative to its own location). There is no `test` npm script -- Bun's
   runner discovers the `*.test.ts` files directly.
 
-**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those typechecks + `bun test`
-(`checks` job) plus a build-only validation of both Docker images (`docker-build` job, #83) on
-`pull_request` (not on push to `main`). Some tests `skipIf(win32)`, or skip when `docker compose` / `jq`
+**CI:** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those typechecks + `bun test`,
+then the same suite again as `bun test --randomize` (`checks` job), plus a build-only validation of
+both Docker images (`docker-build` job, #83) on `pull_request` (not on push to `main`). The
+randomized step draws a fresh seed every run and prints it as ` --seed=N`; a failure there but not in
+the plain `Test` step is most likely a test-order dependency. The seed alone does not replay CI's
+order on this Windows checkout -- the same seed gives a different file order here (measured on #387)
+-- so work from the job log, which groups output per test file in the order the files ran. One run
+samples one order, so a green randomized step is not proof the suite is order-independent. Some tests `skipIf(win32)`, or skip when `docker compose` / `jq`
 is absent -- those run only on CI's Linux, so a green run on this Windows box is **not** proof they
 pass; name that gap per personal's **Done means**. **`main` is branch-protected (#84):** both jobs
 must be green and the branch up to date with `main` (strict) before GitHub allows a merge, admins

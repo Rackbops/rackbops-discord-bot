@@ -41,6 +41,18 @@ jobs:
       - name: Test
         run: bun test
 
+      # The same suite again in a shuffled order, so a test that only passes because of what ran
+      # before it gets a chance to fail instead of staying latent (#385: restart.test.ts leaked an
+      # active handoff into update.test.ts, invisible in the default order). One run samples one
+      # order -- a fresh seed every run, so coverage builds up across PRs rather than being
+      # guaranteed on any one. Bun prints the seed as ` --seed=N` above the totals, but the seed
+      # alone does not replay this order on a Windows checkout -- the same seed gives a different
+      # file order there (measured on #387). The log groups output per test file in the order the
+      # files ran, so start from the files that ran before the failing one. A failure here but not
+      # in `Test` above is most likely an order dependency.
+      - name: Test (randomized order)
+        run: bun test --randomize
+
   # #83, Phase 2 of #80's CI plan: build-only validation that both images still build --
   # no push, no registry, no secrets. Every var docker-compose.yml's admin service
   # interpolates has a `${VAR:-}` fallback (none are `${VAR:?required}`), so a plain

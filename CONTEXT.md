@@ -1005,7 +1005,9 @@ _Avoid_: server list, guild cache
 - Run `bun run check` (tsc) and `bun test` after changes. `.github/workflows/ci.yml` now runs
   both on every pull request (`on: pull_request` only — a direct push to `main` runs no CI)
   (`bun install --frozen-lockfile`, `bun run check` for both projects, one
-  root `bun test`) — the fork's own CI, not carried over from the original monorepo's
+  root `bun test`, then the same suite as `bun test --randomize` — a fresh seed each run, printed
+  as ` --seed=N`, so a test-order dependency the default order hides gets a chance to surface in
+  CI) — the fork's own CI, not carried over from the original monorepo's
   path-scoped `discord-bot-test.yml` (see **Fork gotchas**). No lint beyond tsc.
 - **`cloudflared` now has something to route to**: the `warbandeer` plugin's ingest endpoint
   (`@rackbops/plugin-warbandeer`), once `WARBANDEER_INGEST_PORT` is set. The sidecar itself is still
