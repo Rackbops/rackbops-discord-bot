@@ -115,7 +115,8 @@ export function stateLeakMessage(found: { module: string; leaks: string[] }[]): 
   return (
     `${STATE_GUARD} module state was left behind at the end of this test, and every later test ` +
     `file would inherit it — ${what}. Usually this test leaked it: clean up in its own afterEach ` +
-    `or finally, with that module's reset...ForTest(). If it never touches that state, look at ` +
+    `or finally — put state back with that module's reset...ForTest(), and await any write or job ` +
+    `it started (a queue has no reset). If it never touches that state, look at ` +
     `what ran just before it: a beforeAll or afterAll, an afterEach that threw (which skips this ` +
     `guard for its own test), or async work an earlier test left running.`
   );

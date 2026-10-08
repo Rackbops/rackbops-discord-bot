@@ -259,6 +259,11 @@ describe("stateLeakMessage", () => {
     expect(message.startsWith(STATE_GUARD)).toBe(true);
     expect(message).toContain("src/a.ts: first leak; second leak | src/b.ts: third leak");
   });
+
+  // A write still running has no reset hook to call (src/plugins/host.ts has none at all).
+  test("says how to clean up a write or job still running, not just state", () => {
+    expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }])).toContain("await any write or job it started");
+  });
 });
 
 // Each row is the module's own snapshot, decision and reset hooks — not lookalikes — so a module
