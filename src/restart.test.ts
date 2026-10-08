@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   RESTART_EXIT_CODE,
   awaitCriticalIdle,
@@ -24,6 +24,15 @@ beforeEach(() => {
   exits = [];
   restore?.();
   restore = setExitFn((code) => exits.push(code));
+});
+
+// Bun runs every test file in one process with one module registry (test/setup.ts), so restart.ts's
+// module state outlives this file. Several tests here end mid-handoff, and when one of them ran last
+// `handoffActive()` stayed true for every later file until something reset it — update.test.ts's
+// checkForUpdate then refused with `busy` before doing anything. Reset on the way out, as
+// redeploy.test.ts and plugins/host.test.ts do.
+afterEach(() => {
+  resetForTest();
 });
 
 describe("requestRestart", () => {
