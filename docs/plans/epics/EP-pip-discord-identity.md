@@ -294,17 +294,23 @@ an independent claims-vs-source audit; no live acceptance is claimed by writing 
 
 ## 8. Handoff checklist and exit demo
 
-- [ ] Rebase/reconcile current main and verify related MCP/plugin versions and source claims.
-- [ ] Record G1-G8 decisions/authorizations, owner and operator; create child issues only if asked.
-- [ ] Complete C1 core-behavior review; bounded code child if needed, otherwise configuration-only.
-- [ ] Review non-secret diffs and secret-provisioning method; preserve existing pins/config/state.
-- [ ] Execute C2-C4 without credential copying or unapproved authentication changes.
-- [ ] Execute A1-A11; record outcome, redacted evidence, limitations and restoration for each.
-- [ ] Implement/verify C6 event identity, expiry, consent, fallback and bounded retry policy.
-- [ ] Rehearse rollback, then publish the owner-approved runbook and notification disable control.
-- [ ] Exit demo: approved task completes in hosted Pip; online Melody delivers exactly one DM
+- [x] Rebase/reconcile current main and verify related MCP/plugin versions and source claims.
+- [x] Record G1-G8 decisions/authorizations, owner and operator; create child issues only if asked.
+- [x] Complete C1 core-behavior review; bounded code child if needed, otherwise configuration-only.
+- [x] Review non-secret diffs and secret-provisioning method; preserve existing pins/config/state.
+- [x] Execute C2-C4 without credential copying or unapproved authentication changes.
+- [x] Execute A1-A11; record outcome, redacted evidence, limitations and restoration for each
+      (A5 is recorded as not re-run on pip, by Rod's decision; see the running log).
+- [x] Implement/verify C6 event identity, expiry, consent, fallback and bounded retry policy.
+- [x] Rehearse rollback, then publish the owner-approved runbook and notification disable control
+      (the disable control was rehearsed; the service-side half was not, by Rod's decision).
+- [x] Exit demo: approved task completes in hosted Pip; online Melody delivers exactly one DM
       visibly from Pip; hosted chat reports the truthful result; excluded task/offline case sends
       nothing; existing bots remain healthy. Rod confirms identity and scope before closing epic.
+
+Ticked 2026-10-08, after Epic #332 closed. The evidence for each item is on the child issues
+(#333-#339, #342) and in `ops/README.md` section 9; the two exceptions above are the only rows not
+executed as written.
 
 ## 9. Optional later track - Melody-independent execution (not MVP)
 
@@ -336,10 +342,18 @@ as a shortcut: `dm:registered` has a broader recipient surface than the MVP owne
 - 2026-10-08 (00:35Z-01:28Z): hosted rows from Pip's evidence on #332: the exit-demo path shown, A9 excluded
   and included (literal `notify me on Discord`) passed, A8 passed (Melody offline, no DM, same event
   resumed once after reconnect). Seven DMs delivered during acceptance, all `delivered`.
-- 2026-10-08: #339 (this change). `ops/README.md` sections 9 and 10 carry the live evidence and the hosted-Pip
+- 2026-10-08: #339. `ops/README.md` sections 9 and 10 carry the live evidence and the hosted-Pip
   handoff. **Epic delivers:** a separate Pip application and instance, its bridge, a separately paired
   Melody integration, `scripts/result-dm.mjs`, the handoff text, and a rehearsed disable control.
   **Deliberately not delivered:** this document's section 9 track (Melody-independent execution) is untouched; A5 and
-  the service-side rollback were not performed on pip; the approved avatar
-  (`assets/PIP/pip-canonical-review-v1.png`, #343) is in the repository but its upload to the application
-  is not confirmed; the release-watcher switch is #342.
+  the service-side rollback were not performed on pip. Still open when #339 merged, and closed by the
+  next entry: the upload of the approved avatar (`assets/PIP/pip-canonical-review-v1.png`, #343) to the
+  application, and the release-watcher switch (#342).
+- 2026-10-08 (03:00Z-03:04Z; the evening of 2026-10-07 in America/Detroit): #342 merged as `b4d322c` (#367)
+  and rolled onto the live Pip instance with Rod's approval: image rebuilt from `main`, `WATCHED_REPOS=none`
+  set through `bot-ops.sh env-set`, boot line `[release] watcher off (WATCHED_REPOS=none)` (evidence on
+  #342). Epic #332 closed at 03:04Z. Later that morning: Rod uploaded the approved avatar to the Pip
+  application (#338); the `mcp` plugin's register reply, which named `/agent pair` whatever the instance's
+  prefix (Rackbops/rackbops-bot-plugins#129), was fixed in `@rackbops/plugin-mcp` 0.3.1 and installed on
+  Pip through the update mailbox (`installedVersion 0.3.1`). Section 8 above is ticked, with A5 and the
+  service-side rollback standing as the two recorded exceptions.

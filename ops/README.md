@@ -989,7 +989,7 @@ hex; any 43+ character non-whitespace value satisfies the manifest's format.)
 
 | Row | Outcome | Date (as on the issue; evening rows are America/Detroit) | Evidence |
 |---|---|---|---|
-| A1 identity | passed (name + application id confirmed by Rod); the approved avatar is in the repo (`assets/PIP/pip-canonical-review-v1.png`, #343) and goes on the application when Rod uploads it, which is **not confirmed** | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
+| A1 identity | passed (name + application id confirmed by Rod); the approved avatar (`assets/PIP/pip-canonical-review-v1.png`, #343) was uploaded to the Pip application by Rod on 2026-10-08 | 2026-10-07 (avatar 2026-10-08) | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866), [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6059443571) |
 | A2 isolation | passed: the Pip credential is `u-...@pip` with `dm:self`; the prod integration still answers `@prod` through its own untouched directory | 2026-10-07 | [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047685066), [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047828399) |
 | A3 duplicate | passed | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
 | A4 blocked DMs | passed (a block is the control) | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760) |
@@ -1008,12 +1008,12 @@ rollback** was not rehearsed (Rod's decision; the runbook and the `compose.yaml.
 credentials directory renamed away -> `{"outcome":"invalid","stage":"validate",...}` and `result-dm:
 invalid (credentials.json under DISCORD_MCP_CONFIG_DIR is missing, unreadable or not JSON)`, no network
 call, nothing sent; renamed back -> `dry_run`, `u-20...144@pip` ([#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6049553760)).
-The A8 error's cause and the avatar upload are not established. Seven DMs were delivered to Rod from the
+The A8 error's cause is not established. Seven DMs were delivered to Rod from the
 Pip application during acceptance, all bridge records `delivered`; prod, debug and Clerk were never
 touched. The screenshot of the first hosted DM proves visible delivery, not a full-history duplicate
 audit; duplicate behaviour is covered by A3 and A11.
 
-The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) exists as of [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342); this run predates it, and enabling it on the live Pip instance is a separate operator step whose evidence (the deployed `GIT_SHA` and the `[release] watcher off` boot line) is recorded on #342. The section 3 table describes the configuration this runbook prescribes, not a statement about the live instance.
+The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) did not exist when this run happened. It was enabled on the live Pip instance afterwards, on 2026-10-07 23:02 EDT, with the evidence (the deployed `GIT_SHA` `b4d322c` and the `[release] watcher off (WATCHED_REPOS=none)` boot line) recorded on [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342#issuecomment-6051317589). The section 3 table describes the configuration this runbook prescribes, not a statement about the live instance.
 
 ### 10. Hosted-Pip handoff
 
