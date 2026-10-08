@@ -5,7 +5,8 @@ export interface Config {
   guildId?: string;
   githubRepo: string;
   /** Repos whose releases get announced (`owner/repo`). Distinct from `githubRepo`, which
-   * anchors self-update; defaults to `[githubRepo]`. */
+   * anchors self-update; blank defaults to `[githubRepo]`. `[]` means the release watcher is off
+   * (`WATCHED_REPOS=none`): the release tick then polls nothing. */
   watchedRepos: string[];
   githubToken?: string;
   /** Commit this build was made from, baked in via the GIT_SHA build arg. Absent = self-update disabled. */
@@ -81,6 +82,15 @@ export function resolveConfig(env: Env): Config {
   // Repos whose releases get announced. Distinct from githubRepo (self-update's anchor);
   // an empty/unset WATCHED_REPOS falls back to just githubRepo, i.e. the prior behavior.
   const watchedRepos = list("WATCHED_REPOS");
+  // The literal `none` (nothing else) switches release polling off (#342); the sentinel must bypass
+  // the githubRepo fallback below, and mixing it into a list is ambiguous, so it is refused by name.
+  const releaseWatchOff = (optional("WATCHED_REPOS") ?? "").trim() === "none";
+  if (!releaseWatchOff && watchedRepos.includes("none")) {
+    throw new Error(
+      `WATCHED_REPOS is either "none" (release watcher off) or a comma-separated list of owner/repo, ` +
+        `not both (got "${optional("WATCHED_REPOS")}")`,
+    );
+  }
 
   // Optional prefix for slash-command names, so a second (debug/staging) bot can run in the
   // same server without command collisions. Discord requires lowercase command names.
@@ -146,7 +156,7 @@ export function resolveConfig(env: Env): Config {
     releaseAnnounceChannelId: optional("RELEASE_ANNOUNCE_CHANNEL_ID") ?? announceChannelId,
     guildId: optional("DISCORD_SERVER_ID"),
     githubRepo,
-    watchedRepos: watchedRepos.length ? watchedRepos : [githubRepo],
+    watchedRepos: releaseWatchOff ? [] : watchedRepos.length ? watchedRepos : [githubRepo],
     githubToken: optional("GITHUB_TOKEN"),
     gitSha: optional("GIT_SHA"),
     botBranch: optional("BOT_BRANCH") ?? "main",

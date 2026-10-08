@@ -340,6 +340,27 @@ async function fullBody(fx: Fixture, overrides: Record<string, string>): Promise
 // issue #41: BOT_OPS_PROJECT/BOT_OPS_CONTAINER have no fallback — a caller that forgets either
 // must get a named, immediate die, never a silent guess. This is the precondition every other
 // subcommand depends on, so it's checked before any of them (using "status" here is arbitrary).
+// #342: source-level pins that need neither bash nor jq, so they also run on a box where the
+// subprocess tests above skip (the behavioural twins are the env-set tests under "issue #44").
+describe("bot-ops.sh WATCHED_REPOS accepts none (#342, source pins)", () => {
+  const src = readFileSync(BOT_OPS_SH, "utf8");
+  const row = src.match(/^\s*'WATCHED_REPOS\|(.*)'\s*$/m);
+
+  test("the WATCHED_REPOS row accepts the single word none and nothing mixed with it", () => {
+    expect(row).not.toBeNull();
+    const re = new RegExp(row![1]!);
+    for (const ok of ["none", "acme/thing", "a/b,c/d"]) expect(re.test(ok), ok).toBe(true);
+    for (const bad of ["none,acme/thing", "acme/thing,none", "xnone", "none,", "NONE", "None"]) {
+      expect(re.test(bad), bad).toBe(false);
+    }
+  });
+
+  test("BOT_OPS_SCHEMA is 6 with its history line (the ratchet moved with the whitelist row)", () => {
+    expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=6$/m);
+    expect(src).toMatch(/^# 6: WATCHED_REPOS accepts `none` \(#342\)\.$/m);
+  });
+});
+
 describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINER, no fallback (issue #41)", () => {
   test("BOT_OPS_PROJECT unset dies naming it, before touching docker", async () => {
     const fx = setup("");
@@ -597,6 +618,23 @@ describe.skipIf(!runnable)("bot-ops.sh env-set diffs against the effective value
     expect(b.exitCode).toBe(1);
     expect(b.stderr).toContain("value for 'BOT_BRANCH' is invalid");
     expect(envText(fx)).toBe(wowEnv("WOW_REGION=US\n"));
+  });
+
+  test("env-set accepts WATCHED_REPOS=none and env-get round-trips it (#342)", async () => {
+    const fx = setup("WATCHED_REPOS=acme/thing\n");
+    const run = await botOps(fx, ["env-set"], "WATCHED_REPOS=none\n");
+    expect(run.exitCode).toBe(0);
+    expect((await envGet(fx)).WATCHED_REPOS).toBe("none");
+  });
+
+  test("env-set refuses none mixed with repos, naming WATCHED_REPOS (#342)", async () => {
+    const fx = setup("WATCHED_REPOS=acme/thing\n");
+    for (const value of ["none,acme/thing", "acme/thing,none", "xnone", "none,"]) {
+      const run = await botOps(fx, ["env-set"], `WATCHED_REPOS=${value}\n`);
+      expect(run.exitCode, value).toBe(1);
+      expect(run.stderr, value).toContain("value for 'WATCHED_REPOS' is invalid");
+    }
+    expect(envText(fx)).toBe("WATCHED_REPOS=acme/thing\n");
   });
 
   test("a key repeated on stdin: the last value wins, like .env itself, and only it is judged", async () => {
@@ -1622,22 +1660,22 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 5, composeSchema: null });
+    expect(run.json).toEqual({ schema: 6, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
-  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 5, #277)", () => {
+  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 6, #342)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=5\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=6\b/);
   });
 
-  test("version reports schema 5 (#277: recreate)", async () => {
+  test("version reports schema 6 (#342: WATCHED_REPOS accepts none)", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["version"]);
     expect(run.exitCode).toBe(0);
-    expect((run.json as { schema: number }).schema).toBe(5);
+    expect((run.json as { schema: number }).schema).toBe(6);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
@@ -1657,7 +1695,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 5, composeSchema: null });
+    expect(run.json).toEqual({ schema: 6, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -1670,7 +1708,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 5, composeSchema: null });
+    expect(run.json).toEqual({ schema: 6, composeSchema: null });
   });
 });
 
@@ -1683,7 +1721,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 5, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 6, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -1694,7 +1732,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 5, composeSchema: null });
+    expect(run.json).toEqual({ schema: 6, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -1702,7 +1740,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 5, composeSchema: null });
+    expect(run.json).toEqual({ schema: 6, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -1710,7 +1748,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 5, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 6, composeSchema: 2 });
   });
 });
 

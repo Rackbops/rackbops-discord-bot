@@ -228,7 +228,7 @@ later").
 ## Editable keys (whitelist)
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
-`ADMIN_USER_IDS`, `WATCHED_REPOS`, `AUTO_UPDATE`,
+`ADMIN_USER_IDS`, `WATCHED_REPOS` (a list of `owner/repo`, or the single word `none` to turn release polling off), `AUTO_UPDATE`,
 `BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
@@ -502,7 +502,8 @@ ordinary `ops/install.sh` instance -- here called `clerk` -- configured so that:
   plugin. `/report` says it is not configured while `REPORT_ROLE_ID` is blank. `/update` and
   `/plugins` carry `setDefaultMemberPermissions(0)`, which hides them from non-admins in a server,
   but in a DM they are probably visible to everyone (**inferred**): there, the only protection is
-  the handler's own refusal of anyone not in `ADMIN_USER_IDS` (`src/commands.ts:37-55`).
+  the handler's own refusal of anyone not in `ADMIN_USER_IDS` (`refuseUnlessAdmin`,
+  `src/commands.ts:47-59`).
 - **the tracker's HTTP is reachable through the instance's own tunnel**: the host router serves
   every plugin under `/<plugin-name>/` on `HTTP_PORT` inside the container (`src/plugins/host.ts`,
   `routeHttpRequest`; ADR-0007), with no host port published. Today the tracker serves only
@@ -558,8 +559,10 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 Then, in the instance's config-dir `.env` (the hand-edited one; `install.sh` never touches it
 again):
 
-Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-ops.sh` strips a
-`# comment` written after a value.
+Comments go on their own lines: Compose's `env_file:` loader strips a ` # comment` written after a
+value, but `bot-ops.sh` and the panel read it as part of the value (`load_env_values` in
+`ops/bot-ops.sh`, `parseEnvValue` in `ops/admin/server.ts`), so the two would disagree about what
+the bot is running with.
 
 ```sh
 DISCORD_TOKEN=<Clerk's bot token>
@@ -613,9 +616,9 @@ curl -sS https://clerk.<domain>/tracker/healthz
 The tracker's own `503` is JSON: `stale` when the last good tick is more than three minutes old,
 `blocked` when the lane cannot run at all. A plugin that is loaded but not running never reaches
 the tracker: the host router answers a plain-text `503 Unavailable` itself
-(`src/plugins/host.ts:827`). A host-router `404` means the tracker did not load (read the logs);
-no answer at all means `HTTP_PORT` or the tunnel. From the host,
-without the tunnel:
+(`src/plugins/host.ts:841`, and again at `:861` once the body has been read). A host-router `404`
+means the tracker did not load (read the logs); no answer at all means `HTTP_PORT` or the tunnel.
+From the host, without the tunnel:
 
 ```sh
 docker exec rackbops-discord-bot-clerk bun -e \
@@ -746,7 +749,7 @@ Two identities are involved, and they are not the same thing:
   its add-a-bridge runbook, linked in section 4 below.)
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:262-273`); Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:269-273`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -782,27 +785,27 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 ```
 
 Then, in the instance's config-dir `.env` (the hand-edited one; `install.sh` never touches it again).
-Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-ops.sh` strips a
-`# comment` written after a value.
+Comments go on their own lines, for the reason given in the Clerk runbook's step 3 (Compose strips
+an inline ` # comment`; `bot-ops.sh` and the panel do not).
 
 ```sh
 DISCORD_TOKEN=<Pip's bot token>
 # Required by the core (src/config.ts:78). A private channel in the approved server that only Rod can
-# read: the one unsolicited core output that can exist (a release post, see section 3) lands here,
-# never in a DM.
+# read: the default post target for plugins (section 3), never a DM. With the release watcher off
+# (WATCHED_REPOS=none below) the core posts nothing here of its own.
 ANNOUNCE_CHANNEL_ID=<channel id>
 RELEASE_ANNOUNCE_CHANNEL_ID=
 # The one approved server: with it set, registration is one guild-scoped PUT there and nowhere else
-# (src/routing/register.ts:56-59, :128-131, reached from src/index.ts:366-381).
+# (src/routing/register.ts:56-59, :128-131, reached from src/index.ts:367-382).
 DISCORD_SERVER_ID=<server id>
 # Every command is prefixed, core ones included (src/commandNaming.ts:13; commands.ts:61-67), so:
 # /pipagent register|pair|unregister, /pipupdate, /pipplugins, /pipreport. 1-20 chars of
-# [a-z0-9_-] (src/config.ts:87-93). The debug bot's prefix `r` (/ragent) is the precedent:
+# [a-z0-9_-] (src/config.ts:96-102). The debug bot's prefix `r` (/ragent) is the precedent:
 # Rackbops/discord-mcp deploy/config.multi-bridge.example.json:8.
 COMMAND_PREFIX=pip
 GITHUB_REPO=Rackbops/rackbops-discord-bot
-# Blank falls back to GITHUB_REPO (src/config.ts:149); that repository publishes no releases.
-WATCHED_REPOS=
+# `none` turns release polling off (src/config.ts:87, :159); blank would fall back to GITHUB_REPO.
+WATCHED_REPOS=none
 GITHUB_TOKEN=
 # Blank: /pipreport answers that it is not configured (src/report.ts:62-68).
 REPORT_ROLE_ID=
@@ -834,30 +837,30 @@ because the plugin's behaviour with it unset is a runtime one: the bridge answer
 
 The core still runs next to the plugin. This is every way the host can emit something under the `.env`
 above, so that "Pip's host sends nothing unsolicited that reaches a DM" is a cited claim and not an
-assumption. Line numbers are on `8d039c9`.
+assumption. Line numbers are on `8d039c9`, except the release-watcher row, whose cites are on the #342 change.
 
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
-| Release watcher | A post into `ANNOUNCE_CHANNEL_ID` (`RELEASE_ANNOUNCE_CHANNEL_ID` falls back to it), the private channel. Never a DM. | The one release channel is `releaseAnnounceChannelId` (`src/config.ts:146`, `src/announce.ts:73-75`). The watched repo is `GITHUB_REPO` (`src/config.ts:149`), and `gh release list --repo Rackbops/rackbops-discord-bot` is empty (2026-10-06), so there is nothing to announce. The first poll seeds silently, so a release already published when Pip is stood up is never announced. A future release would post to the private channel. | `src/announce.ts:384-425` (`checkReleases`, `checkRepoReleases`), `:27` (15-minute poll), `:437-457`, seeding at `:443-449`; the tick check at `:217-222` |
+| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:384-408` (`describeReleaseWatch`, `checkReleases`), the tick check at `:217-222` (15-minute poll `:27`), the boot line `src/index.ts:313` |
 | Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:486-516` (`deliverPluginNotification`; the empty-list return at `:492-495`, the fallback at `:507-509`), `:570-592`; live deliverers `src/announce.ts:306-317` |
 | Scheduled plugin update | Restarts the bot; a heads-up DM only to the Discord user who scheduled it. | It exists only if an admin scheduled it. With no admin, nobody can. | `src/plugins/updates.ts:604-655` (`runDueSchedules`, the DM at `:644`) |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:223-228` |
 | `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from non-admin members, and the handler refuses anyone not in `ADMIN_USER_IDS`; with the list empty, everyone. | `src/commands.ts:107` and `:138`; the refusal `:47-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:13` |
 | `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:62-68` |
-| `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:212`; `src/index.ts:366-381` |
-| Report-backs after an update | A DM, or a channel post, to the requester of an explicit `/pipupdate` or `/pipplugins update`, or of a scheduled one. | Delivered only when an owed marker exists (`state.pendingUpdateReport`, set only with a `requester`, `src/commands.ts:117`; `state.pendingReport`, set by `/plugins update` and `runDueSchedules`). Nobody can run those here. A panel-origin report is logged, not sent (`src/plugins/updates.ts:686-689`). | `src/index.ts:439` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:443-454` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:673-703`) |
+| `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:212`; `src/index.ts:367-382` |
+| Report-backs after an update | A DM, or a channel post, to the requester of an explicit `/pipupdate` or `/pipplugins update`, or of a scheduled one. | Delivered only when an owed marker exists (`state.pendingUpdateReport`, set only with a `requester`, `src/commands.ts:117`; `state.pendingReport`, set by `/plugins update` and `runDueSchedules`). Nobody can run those here. A panel-origin report is logged, not sent (`src/plugins/updates.ts:686-689`). | `src/index.ts:440` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:444-455` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:673-703`) |
 | Plugin `post` / `dm` / `edit` / `announce` (the host API) | A channel post, a DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. `announce` goes to `ANNOUNCE_CHANNEL_ID`. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives an unfinished one, `plugins/mcp/src/index.ts:53-62`, `drain.ts:133`, `:177-197`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring), `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`) |
 | Guild events | Nothing sent. | `GuildCreate`/`GuildDelete` re-register commands or rewrite discovery. | `src/index.ts:293-294`, `src/routing/live.ts:272-293` |
-| Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:457-471`; `src/announce.ts:235-270` (`pluginRequests`, `discovery`) |
+| Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:458-472`; `src/announce.ts:235-270` (`pluginRequests`, `discovery`) |
 
 Interaction replies (`/pipagent` and the refusals above) are solicited: someone typed the command. The
 deliveries through the host API are sent by core code but asked for by the plugin, so they are bridge
 deliveries, bounded by the service's grants (section 4) and not by this `.env`. **Conclusion:** under
-this configuration the only *unsolicited* Discord output that is not a bridge delivery is a release post
-into the private announce channel, which cannot occur while the watched repository publishes no
-releases, and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through
-the host API on the bridge's request. If that is not acceptable, the way to close it is a small host change to
-switch the release watcher off, filed as its own issue, not a configuration trick.
+this configuration the core has no unsolicited Discord output that is not a bridge delivery: the release
+watcher is off (`WATCHED_REPOS=none`, added by [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)),
+and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through the host API
+on the bridge's request. The switch turns off release polling, not every GitHub request: the Plugin Index
+fetch and the self-update checks are separate paths.
 
 ### 4. The bridge
 
@@ -871,8 +874,10 @@ This side supplies three values, and the service side is configured from them:
 The bot's compose project is `rackbops-discord-bot-pip` and its network is the project default,
 `rackbops-discord-bot-pip_default` (`docker-compose.yml` declares no `networks:` key), so the service
 reaches the bridge at `http://rackbops-discord-bot-pip:<HTTP_PORT>/mcp` once it is attached to that
-network. The service side (the `pip` bridge entry, the network attachment and the Pip-only grants) is in
-`Rackbops/discord-mcp`'s `deploy/add-bridge.md` (Rackbops/discord-mcp#334).
+network. The service side (the `pip` bridge entry, the network attachment and the default `dm:self`
+grant) is in `Rackbops/discord-mcp`'s
+[`deploy/add-bridge.md`](https://github.com/Rackbops/discord-mcp/blob/main/deploy/add-bridge.md)
+(Rackbops/discord-mcp#78, for this repo's #334).
 
 `GET /mcp/capabilities` answers `401` without the bearer (and `503` if `MCP_BRIDGE_TOKEN` is unset in the
 container: `plugins/mcp/src/http.ts:186-191`, `plugins/mcp/src/auth.ts:63-71`), so a `401` from inside the
@@ -996,13 +1001,15 @@ Pip application during acceptance, all bridge records `delivered`; prod, debug a
 touched. The screenshot of the first hosted DM proves visible delivery, not a full-history duplicate
 audit; duplicate behaviour is covered by A3 and A11.
 
+The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) exists as of [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342); this run predates it, and enabling it on the live Pip instance is a separate operator step whose evidence (the deployed `GIT_SHA` and the `[release] watcher off` boot line) is recorded on #342. The section 3 table describes the configuration this runbook prescribes, not a statement about the live instance.
+
 ### 10. Hosted-Pip handoff
 
 Everything between the two rules below is written to be pasted into hosted Pip's instructions and to be
 understood without this repository open. The policy is Rod's, recorded on #332 on 2026-10-07: "opt-in
 phrase **"notify me on Discord"** per task; everything else excluded. No quiet hours; 24-hour expiry; no
 replay; retry = the same event id." The script's contract is the `scripts/result-dm.mjs` entry in
-Rackbops/discord-mcp's README (#335, #79).
+Rackbops/discord-mcp's README (this repo's #335, Rackbops/discord-mcp#79).
 
 ---
 

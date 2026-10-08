@@ -9,7 +9,7 @@ import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, wr
 import { createClient, CORE_INTENTS } from "./client";
 import { bareName, commandData, handleCommand, CORE_COMMAND_NAMES } from "./commands";
 import { isReportModal, handleReportModal } from "./report";
-import { startScheduler, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
+import { startScheduler, describeReleaseWatch, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
@@ -310,6 +310,7 @@ async function activate(c: Client<true>): Promise<void> {
     },
   });
   onStopRequested((reason) => tickControl.stop(reason));
+  console.log(describeReleaseWatch(config.watchedRepos));
   startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
 
   // #220 (ADR-0007): the host's HTTP router, only when HTTP_PORT is set. After activatePlugins, so a
