@@ -810,9 +810,21 @@ GITHUB_TOKEN=
 # Blank: /pipreport answers that it is not configured (src/report.ts:62-68).
 REPORT_ROLE_ID=
 # Empty on purpose: with no admins a plugin-update notice is only a log warning, repeated each
-# 15-minute poll, and is never DMed or posted (src/plugins/updates.ts:492-495; the channel fallback at
-# :507-509 runs only after a DM to a configured admin failed). Updates happen by re-running
-# install.sh and its printed step 2.
+# 15-minute poll (src/announce.ts:31), never DMed or posted (src/plugins/updates.ts:495-498; the
+# channel fallback at :510-517 runs only after a DM to a configured admin failed). The warning stops
+# once mcp is on the index's newest version (:106) or that version is skipped (:110).
+# Re-running install.sh and its printed step 2 (ops/install.sh:341) updates the bot core only. The
+# plugin's installed version lives in plugins/state.json on the state volume
+# (docker-compose.yml:44), and the bot never moves it on its own (src/plugins/install.ts:289-293,
+# :320). With no admin, move it either with a mailbox request, which the bot applies and then
+# restarts onto (ops/bot-ops.sh:1244-1278; src/plugins/requests.ts:482-491, :335), run with
+# section 7's BOT_OPS_* variables:
+#   printf '%s' '{"action":"update-now","plugin":"mcp","version":"<x.y.z>","requestedBy":"operator"}' |
+#     bash /opt/rackbops-discord-bot/bin/bot-ops.sh plugin-request
+# or by pinning PLUGINS=mcp@<x.y.z> below and running bot-ops.sh recreate (.env.example:46-48,
+# ops/bot-ops.sh:682-691, :949). A non-numeric requestedBy keeps the outcome in the log
+# (src/plugins/updates.ts:692-693). The same request with "action":"skip" and the index's newest
+# version silences the warning without moving the plugin (src/plugins/requests.ts:499-501).
 ADMIN_USER_IDS=
 AUTO_UPDATE=false
 BOT_BRANCH=main
@@ -842,7 +854,7 @@ assumption. Line numbers are on `8d039c9`, except the release-watcher row, whose
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
 | Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:384-408` (`describeReleaseWatch`, `checkReleases`), the tick check at `:217-222` (15-minute poll `:27`), the boot line `src/index.ts:313` |
-| Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:486-516` (`deliverPluginNotification`; the empty-list return at `:492-495`, the fallback at `:507-509`), `:570-592`; live deliverers `src/announce.ts:306-317` |
+| Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:486-516` (`deliverPluginNotification`; the empty-list return at `:492-495`, the fallback at `:507-509`), `:570-592`; live deliverers `src/announce.ts:306-317` |
 | Scheduled plugin update | Restarts the bot; a heads-up DM only to the Discord user who scheduled it. | It exists only if an admin scheduled it. With no admin, nobody can. | `src/plugins/updates.ts:604-655` (`runDueSchedules`, the DM at `:644`) |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:223-228` |
 | `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from non-admin members, and the handler refuses anyone not in `ADMIN_USER_IDS`; with the list empty, everyone. | `src/commands.ts:107` and `:138`; the refusal `:47-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:13` |
