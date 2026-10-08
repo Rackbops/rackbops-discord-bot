@@ -107,8 +107,11 @@ convention.
 
 Follows personal's **Code style** baseline. This repo's individuality:
 
-- **Bun + TypeScript, ESM** (`"type": "module"`), `bun@1.3.14` pinned in `package.json`. discord.js
-  v14 is the bot's one runtime dependency (root `package.json`; `undici` pinned via `overrides`); the
+- **Bun + TypeScript, ESM** (`"type": "module"`). CI installs the Bun named by `package.json`'s
+  `packageManager` (`setup-bun` reads it). `Dockerfile` and `ops/admin/Dockerfile` build
+  `FROM oven/bun:1-slim`, a moving Bun 1.x tag that neither the self-update build nor `ops/install.sh`
+  re-pulls, so a host runs whichever Bun it first cached, older or newer than CI's. discord.js v14 is
+  the bot's one runtime dependency (root `package.json`; `undici` pinned via `overrides`); the
   `ops/admin/` panel is a separate package with its own deps (e.g. `jose`).
 - **Keep I/O at the edges.** The codebase is built around pure `decide*()` functions with injected
   deps (`fetch`, the Docker socket, deliverers) so behaviour unit-tests without a live
