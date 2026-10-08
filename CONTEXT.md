@@ -440,7 +440,8 @@ _Avoid_: server list, guild cache
   snapshot holds (the four write queues, the registration queue, the request drain) — the fresh
   queues the reset hooks start would not stop a job already running — and runs every reset hook,
   queues included, so one leak fails one test rather than every test after it. If the wait runs out
-  the message says so, and the stuck queue is dropped all the same. Two kinds of job can still
+  the message says so, and the stuck queue is dropped all the same (a write still running then can
+  overlap a later one on the same file). Two kinds of job can still
   change guarded state during the next test and fail that one too: one on those queues that
   outlasts the wait, and one on no queue at all — an update check, a release poll, a tick — which
   is not waited for, and runs on after its flag or poll time is reset, possibly against `config` or
@@ -467,13 +468,16 @@ _Avoid_: server list, guild cache
   calling the module's reset hook, as `restart.test.ts`, `routing/live.test.ts` and
   `routing/store.test.ts` do; `config` and `state` changes are put back by hand (or with
   `resetConfigForTest()` / `resetBotStateForTest()`), and a write a test queues is awaited before it
-  ends. The table is `test/stateGuard.ts`, the decisions `test/stateLeaks.ts`;
+  ends — not dropped with `resetRoutingWritesForTest()`, `resetPluginHostForTest()` or
+  `resetStateWriterForTest()`, which are the guard's own and would hide a leaked write from it. The
+  table is `test/stateGuard.ts`, the decisions `test/stateLeaks.ts`;
   `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which leaks from the table's first
   and last modules, leaves a request drain running, and leaves a write that never finishes — as a
   child `bun test` to prove the real hook reaches both ends of the table, waits for the running job,
   stops waiting for the stuck one and says so, and resets after each leak (the `.fixture.ts` name
   keeps discovery from running it in the main
-  suite); that every row is checked and reset is pinned by the table-identity and fake-table loop
+  suite); that every row is checked and reset, and that every row holding a queue has a reset, is
+  pinned by the table-identity, queue-reset and fake-table loop
   tests in the same file.
 - **`admins.json` is written through one serialised mutator per process, with a per-call temp name
   (#228).** The panel's `AdminStore.mutateDynamic` (`ops/admin/server.ts`) is the `src/storage.ts`

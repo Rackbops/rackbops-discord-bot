@@ -1043,9 +1043,10 @@ export function pluginHostStateForTest(): { writes: Promise<void> } {
   return { writes: stateMutator.idle() };
 }
 
-/** Starts state.json on a fresh, empty queue. A write already running is not stopped, only no
- *  longer waited for — so a test should await its writes instead; the guard runs this only once it
- *  has waited for them, so a write that never finishes can't hold every later test up. */
+/** Starts state.json on a fresh, empty queue, for the test-state guard: it runs this once it has
+ *  waited for the queue, so a write that never finishes can't hold every later test up. A write
+ *  still running is not stopped, only no longer waited for — so not for a test's own cleanup, where
+ *  it would hide a leaked write from the guard: a test awaits its writes instead. */
 export function resetPluginHostForTest(): void {
   stateMutator = createKeyedJsonMutator<PluginStateFile>();
 }

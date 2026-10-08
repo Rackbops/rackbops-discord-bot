@@ -126,7 +126,7 @@ export function createStateWriter(path: string): {
   };
 }
 
-// (`let` only so resetBotStateForTest can start a fresh queue.)
+// (`let` only so resetStateWriterForTest can start a fresh queue.)
 let stateWriter = createStateWriter(STATE_FILE);
 
 // `state` as it was loaded, for the test-state guard (test/stateGuard.ts): tests change fields of
@@ -141,14 +141,19 @@ export function botStateForTest(): { changedKeys: string[]; writes: Promise<void
   return { changedKeys: keys.filter((k) => !Bun.deepEquals(current[k], loaded[k])), writes: stateWriter.idle() };
 }
 
-/** Puts `state` back to what was loaded — in place, since every importer holds this one object —
- *  and starts the writer on a fresh, empty queue. A save already running is not stopped, only no
- *  longer waited for, so a test should await its saves; the guard runs this only once it has waited
- *  for them, so a save that never finishes can't hold every later test up. */
+/** Puts `state` back to what was loaded — in place, since every importer holds this one object. */
 export function resetBotStateForTest(): void {
   const current = state as unknown as Record<string, unknown>;
   for (const k of Object.keys(current)) delete current[k];
   Object.assign(current, structuredClone(loadedState));
+}
+
+/** Starts the writer on a fresh, empty queue, for the test-state guard: it runs this once it has
+ *  waited for the queue, so a save that never finishes can't hold every later test up. A save still
+ *  running is not stopped (and can overlap the next one on the same temp file), only no longer
+ *  waited for — so not for a test's own cleanup, where it would hide a leaked save from the guard:
+ *  a test awaits its saves instead. */
+export function resetStateWriterForTest(): void {
   stateWriter = createStateWriter(STATE_FILE);
 }
 

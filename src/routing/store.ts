@@ -64,10 +64,10 @@ export function routingStoreStateForTest(): { said: number; writes: Promise<void
   };
 }
 
-/** Starts the routing and secrets files on fresh, empty queues. A write already running is not
- *  stopped, only no longer waited for — so a test should await its writes instead; the guard runs
- *  this only once it has waited for them, so a write that never finishes can't hold every later
- *  test up. */
+/** Starts the routing and secrets files on fresh, empty queues, for the test-state guard: it runs
+ *  this once it has waited for them, so a write that never finishes can't hold every later test up.
+ *  A write still running is not stopped, only no longer waited for — so not for a test's own
+ *  cleanup, where it would hide a leaked write from the guard: a test awaits its writes instead. */
 export function resetRoutingWritesForTest(): void {
   routingMutator = createKeyedJsonMutator<RoutingFile>();
   secretsQueues.clear();

@@ -2,13 +2,23 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stallBunWrite } from "../test/stallBunWrite";
 import { settled } from "../test/stateLeaks";
 import type { BotState } from "./state";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time) -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { botStateForTest, createStateWriter, loadStateFrom, normalizeSeenReleaseIds, resetBotStateForTest, saveState, saveStateTo, state } =
-  await import("./state");
+const {
+  botStateForTest,
+  createStateWriter,
+  loadStateFrom,
+  normalizeSeenReleaseIds,
+  resetBotStateForTest,
+  resetStateWriterForTest,
+  saveState,
+  saveStateTo,
+  state,
+} = await import("./state");
 
 // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track the
 // live `state` object and the live writer, and the reset must really put `state` back.
@@ -46,15 +56,35 @@ describe("botStateForTest / resetBotStateForTest", () => {
     expect(botStateForTest().changedKeys).toEqual(["seenReleaseIds"]);
   });
 
-  // The guard runs the reset once it has waited: a save that never finishes must not hold every
-  // later test up. Three saves, so the old queue is surely still busy when it is checked.
-  test("the reset also starts the writer on a fresh queue", async () => {
-    const saving = Promise.all([saveState(), saveState(), saveState()]);
-    const before = botStateForTest().writes;
-    resetBotStateForTest();
-    expect(await settled(botStateForTest().writes)).toBe(true);
-    expect(await settled(before)).toBe(false);
-    await saving;
+  // What the guard runs once it has waited, so a save that never finishes can't hold every later
+  // test up. The old save is held stuck, not hoped to be still running.
+  test("resetStateWriterForTest starts the writer on a fresh queue, dropping a save that never finishes", async () => {
+    const stall = stallBunWrite();
+    try {
+      void saveState();
+      await stall.reached;
+      const before = botStateForTest().writes;
+      resetStateWriterForTest();
+      expect(await settled(botStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+    } finally {
+      stall.restore();
+    }
+  });
+
+  // Tests clean up with resetBotStateForTest: were it to drop the writer's queue too, a save the
+  // test leaked would be gone before the guard looked.
+  test("resetBotStateForTest leaves the writer's queue alone, so a leaked save still reaches the guard", async () => {
+    const stall = stallBunWrite();
+    try {
+      void saveState();
+      await stall.reached;
+      resetBotStateForTest();
+      expect(await settled(botStateForTest().writes)).toBe(false);
+    } finally {
+      stall.restore();
+      resetStateWriterForTest(); // the stuck save would otherwise fail this test through the guard
+    }
   });
 
   test("writes settles only once a queued save has", async () => {

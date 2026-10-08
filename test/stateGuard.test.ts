@@ -10,7 +10,7 @@ import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/
 import { resetForTest, stateForTest, type RestartStateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
-import { botStateForTest, resetBotStateForTest } from "../src/state";
+import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import { settleWithin } from "./settleWithin";
 import { drainQueues, findStateLeaks, GUARDED, resetAllState, type GuardedModule } from "./stateGuard";
@@ -280,7 +280,7 @@ describe("GUARDED", () => {
     expect(GUARDED.map((g) => [g.module, g.snapshot, g.leaks, g.resets])).toEqual([
       ["src/restart.ts", stateForTest, restartStateLeaks, [resetForTest]],
       ["src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]],
-      ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest]],
+      ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]],
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
       ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]],
@@ -289,6 +289,15 @@ describe("GUARDED", () => {
       ["src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]],
       ["src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]],
     ]);
+  });
+
+  // The hook waits for a queue at most QUEUE_DRAIN_MS, then relies on a reset to start a fresh one;
+  // a row holding a queue with no reset at all would let a job that never finishes fail every later
+  // test (#394's round 1). For whatever row is added next.
+  test("every row whose snapshot holds a queue has a reset hook", () => {
+    const holdsQueue = (g: GuardedModule) => Object.values(g.snapshot() as object).some((v) => v instanceof Promise);
+    expect(GUARDED.filter(holdsQueue).length).toBeGreaterThan(0);
+    expect(GUARDED.filter((g) => holdsQueue(g) && g.resets.length === 0).map((g) => g.module)).toEqual([]);
   });
 });
 

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
+import { stallBunWrite } from "../../test/stallBunWrite";
 import { settled } from "../../test/stateLeaks";
 import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, resetRoutingWritesForTest, routingPath, routingStoreStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
 
@@ -620,16 +621,29 @@ describe("readRouting says what it ignored (#260)", () => {
     expect(done).toBe(true);
   });
 
-  // The guard runs the reset once it has waited: a write that never finishes must not hold every
-  // later test up. Three routing writes, so that queue is surely still busy when it is checked.
-  test("resetRoutingWritesForTest starts both files on fresh queues, dropping a write that never finishes", async () => {
-    const routing = Promise.all([1, 2, 3].map((n) => mutateRouting(dir, withPlugin(`p${n}`))));
+  // What the guard runs once it has waited, so a write that never finishes can't hold every later
+  // test up. One stuck write per file, each held stuck rather than hoped to be still running, so
+  // each queue's reset is checked on its own.
+  test("resetRoutingWritesForTest starts the routing file on a fresh queue, dropping a write that never finishes", async () => {
+    const stall = stallBunWrite();
+    try {
+      void mutateRouting(dir, withPlugin("music"));
+      await stall.reached;
+      const before = routingStoreStateForTest().writes;
+      resetRoutingWritesForTest();
+      expect(await settled(routingStoreStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+    } finally {
+      stall.restore();
+    }
+  });
+
+  test("resetRoutingWritesForTest starts the secrets file on a fresh queue, dropping a write that never finishes", async () => {
     void mutateSecrets(dir, (s) => s, undefined, { writeFile: () => new Promise<void>(() => {}) });
     const before = routingStoreStateForTest().writes;
     resetRoutingWritesForTest();
     expect(await settled(routingStoreStateForTest().writes)).toBe(true);
-    expect(await settled(before)).toBe(false); // the secrets write is still stuck
-    await routing;
+    expect(await settled(before)).toBe(false);
   });
 
   test("the same problem is said again once the record is cleared (the test seam works)", async () => {

@@ -15,7 +15,7 @@ import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/
 import { resetForTest, stateForTest } from "../src/restart";
 import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
-import { botStateForTest, resetBotStateForTest } from "../src/state";
+import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import {
   announceLeaks,
@@ -52,7 +52,7 @@ function guarded<S>(
 export const GUARDED: readonly GuardedModule[] = [
   guarded("src/restart.ts", stateForTest, restartStateLeaks, [resetForTest]),
   guarded("src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]),
-  guarded("src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest]),
+  guarded("src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]),
   guarded("src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]),
   guarded("src/announce.ts", announceStateForTest, announceLeaks, [
     resetTickGuardForTest,
