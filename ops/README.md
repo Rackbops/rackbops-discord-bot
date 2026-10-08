@@ -731,22 +731,37 @@ target.
 
 ## A Pip instance (owner result DMs)
 
-Pip's own Discord identity (#333, Epic #332; plan of record `docs/plans/epics/EP-pip-discord-identity.md`
-on the epic's plan branch, PR #331). It is an ordinary `ops/install.sh` instance -- here called `pip` --
+Pip's own Discord identity (#333, Epic #332; design document `docs/plans/epics/EP-pip-discord-identity.md`,
+on `main` via #340). It is an ordinary `ops/install.sh` instance -- here called `pip` --
 logged in as the **Pip** Discord application and loading one plugin, `@rackbops/plugin-mcp`
-(Rackbops/rackbops-bot-plugins `plugins/mcp`, 0.3.0 in the published index). Its purpose is to be the
+(Rackbops/rackbops-bot-plugins `plugins/mcp`; a fresh install takes the version the published index holds
+that day, 0.3.1 as of 2026-10-08). Its purpose is to be the
 visible sender of **owner result DMs**: a result sent through the `pip` bridge of the shared
 `Rackbops/discord-mcp` service arrives as a DM *from the Pip application* instead of from prod, debug or
-Clerk. The cites below were read from this repository at `8d039c9` (`main`), and the plugin's from
-`Rackbops/rackbops-bot-plugins` at `477770d`.
+Clerk. A `file:line` in this section is as read on `main` by the change that last touched the sentence;
+section 3's table names its own commit. Plugin cites are `plugins/mcp` at 0.3.1
+(`Rackbops/rackbops-bot-plugins` `2820afe`); discord-mcp cites are its `main` at `fe46591`.
 
 Two identities are involved, and they are not the same thing:
 
-- **The bot** is the Pip application. It is what Rod sees as the DM's author.
+- **The bot** is the Pip application. It is what Rod (roshne, the owner) sees as the DM's author.
 - **The principal** is Rod's own paired user on the `pip` bridge (`u-<discord id>@pip`), holding only
   the `dm:self` grant. It is what authorises the send. The service's `whoami` reports the principal,
   never the bot. (The principal's shape and grants are discord-mcp's, not this repository's; see
   its add-a-bridge runbook, linked in section 4 below.)
+
+Two machines are involved as well. **nucbox** is the bot host, where this instance and the discord-mcp
+service run. **Melody** is Rod's Windows workstation, where the discord-mcp shim and the Pip credentials
+live (section 6); it is never the bot host, which matters in section 8.
+
+Any member of the approved server can run `/pipagent register` and then `pair`, and becomes a principal of
+their own with the same `dm:self` grant: the plugin's `agent` command sets no default member permission
+(the builder, `plugins/mcp/src/commands.ts:59-64` at 0.3.1), the host adds none
+(`src/plugins/host.ts:299-329`), an unplaced plugin's command is allowed everywhere in the server
+(`src/routing/resolve.ts:130-134`; Pip places no plugin, section 3's `/pipagent` row), and the service hands every `u-<id>@pip` its service-wide
+`defaultUserGrants` with no per-bridge allowlist (discord-mcp `src/service/principals.ts:35-41`,
+`contracts/config.schema.json:108-116`). Server membership is the control, not this runbook's "Rod":
+such a principal can DM only itself. Rod accepted that boundary on #332.
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
 On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:269-273`); Pip never starts the
@@ -763,8 +778,15 @@ other bot. Official documentation, read 2026-10-06 (both pages now live under `d
 - Creating an app: [Getting Started](https://docs.discord.com/developers/quick-start/getting-started) --
   after you name the app and press **Create** you land on **General Information**.
 - Installation: the same page describes **Installation contexts** (server and user) and **Default Install
-  Settings**. For Pip use **Guild Install** only, with the scopes `bot` and `applications.commands`, and
-  leave **User Install** off. Invite Pip to the one approved server with the install link the
+  Settings**. For Pip use **Guild Install** only, with the scopes `bot` and `applications.commands`.
+  Selecting `bot` reveals a **Permissions** menu: leave it empty (permissions integer `0`). Nothing Pip
+  does needs a server-wide permission: a DM is `client.users.fetch` + `user.send`
+  (`src/plugins/delivery.ts:36-38`), and the one channel send the core makes on its own, a release post, is
+  off under section 2 (`WATCHED_REPOS=none`). A plugin post to the announce channel needs View Channel and
+  Send Messages in that channel alone, which a per-channel permission overwrite can grant (Discord's
+  [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read 2026-10-08, documents
+  per-channel overwrites; the Permissions menu is the one the Getting Started page above walks into). Leave
+  **User Install** off. Invite Pip to the one approved server with the install link the
   Installation page gives you.
 - Privileged intents: [Gateway](https://docs.discord.com/developers/topics/gateway) names three,
   `GUILD_PRESENCES`, `GUILD_MEMBERS` and `MESSAGE_CONTENT`, toggled on the **Bot** page. Leave all three
@@ -773,8 +795,11 @@ other bot. Official documentation, read 2026-10-06 (both pages now live under `d
   `intents: []` (`plugins.json`'s `mcp` entry and `plugins/mcp/package.json` in
   `Rackbops/rackbops-bot-plugins`).
 
-Keeping the application private (the **Public Bot** toggle on the **Bot** page) is the epic's decision;
-that toggle was **not** read from a documentation page. On **Bot**, copy the token into the next step.
+Keep the application private: on the **Bot** page turn **Public Bot** off. Discord's
+[OAuth2](https://docs.discord.com/developers/topics/oauth2) topic, "Bot Authorization Flow", read 2026-10-08,
+documents the toggle: with it unchecked only the application's owner can add the bot to a server (the
+[Application](https://docs.discord.com/developers/resources/application) resource's `bot_public` field says
+the same, read 2026-10-08). On **Bot**, copy the token into the next step.
 The avatar is a separate task and not part of this runbook.
 
 ### 2. Bootstrap and `.env`
@@ -847,31 +872,36 @@ because the plugin's behaviour with it unset is a runtime one: the bridge answer
 
 ### 3. What the core still does
 
-The core still runs next to the plugin. This is every way the host can emit something under the `.env`
-above, so that "Pip's host sends nothing unsolicited that reaches a DM" is a cited claim and not an
-assumption. Line numbers are on `8d039c9`, except the release-watcher row, whose cites are on the #342 change.
+The core still runs next to the plugin. This is every way the host sends something **on its own
+initiative** under the `.env` above, plus the command paths a member can trigger, so that "Pip's host
+sends nothing unsolicited that reaches a DM" is a cited claim and not an assumption. Not listed, by design:
+the host's other interaction replies, which go only to the person who interacted and only after they did
+(`src/plugins/host.ts:657`, `:681`, and the empty autocomplete response `:755`; `src/commands.ts:200-203`, `:325`). Line numbers are on `f5e7bd7`
+(this repository) and `2820afe` (`plugins/mcp` 0.3.1).
 
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
-| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:384-408` (`describeReleaseWatch`, `checkReleases`), the tick check at `:217-222` (15-minute poll `:27`), the boot line `src/index.ts:313` |
-| Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:486-516` (`deliverPluginNotification`; the empty-list return at `:492-495`, the fallback at `:507-509`), `:570-592`; live deliverers `src/announce.ts:306-317` |
-| Scheduled plugin update | Restarts the bot; a heads-up DM only to the Discord user who scheduled it. | It exists only if an admin scheduled it. With no admin, nobody can. | `src/plugins/updates.ts:604-655` (`runDueSchedules`, the DM at `:644`) |
-| Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:223-228` |
-| `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from non-admin members, and the handler refuses anyone not in `ADMIN_USER_IDS`; with the list empty, everyone. | `src/commands.ts:107` and `:138`; the refusal `:47-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:13` |
+| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:427-431` (`describeReleaseWatch`) and `:435-443` (`checkReleases`), the tick check at `:217-222` (15-minute poll `:28`), the boot line `src/index.ts:313` |
+| Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:489-518` (`deliverPluginNotification`; the empty-list return at `:495-498`, the fallback at `:510-517`), `:578-605` (`checkPluginUpdates`); live deliverers `src/announce.ts:308-322` |
+| Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:430`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:488-501`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:357-359`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:419-430` (`validate`), `:488-501` |
+| Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:224-228` |
+| `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from members without Discord's Administrator permission (`src/commands.ts:106-107` and `:138`); the handler then refuses anyone not in `ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included. | `src/commands.ts:107` and `:138`; the refusal `:50-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:15-16` |
 | `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:62-68` |
 | `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:212`; `src/index.ts:367-382` |
-| Report-backs after an update | A DM, or a channel post, to the requester of an explicit `/pipupdate` or `/pipplugins update`, or of a scheduled one. | Delivered only when an owed marker exists (`state.pendingUpdateReport`, set only with a `requester`, `src/commands.ts:117`; `state.pendingReport`, set by `/plugins update` and `runDueSchedules`). Nobody can run those here. A panel-origin report is logged, not sent (`src/plugins/updates.ts:686-689`). | `src/index.ts:440` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:444-455` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:673-703`) |
-| Plugin `post` / `dm` / `edit` / `announce` (the host API) | A channel post, a DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. `announce` goes to `ANNOUNCE_CHANNEL_ID`. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives an unfinished one, `plugins/mcp/src/index.ts:53-62`, `drain.ts:133`, `:177-197`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring), `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`) |
+| Report-backs after an update | Nowhere under this `.env` unless a mailbox request moved the plugin (see why). In general: an ephemeral follow-up where the command was typed, within 15 minutes of it, else a DM, else a channel post (`src/updateReport.ts:101-104`, the window `:13-14`; the follow-up is a raw REST webhook POST, `:128-133`, the one send path outside the Client, `src/client.ts:6-7`). | Delivered only when an owed marker exists: `state.pendingUpdateReport`, set only with a `requester` (the guard `src/update.ts:103-111`, applied at `:303-308`; the one call site constructing a requester is `src/commands.ts:117`), or `state.pendingReport`, set by `/plugins update`, `runDueSchedules` and a mailbox `update-now` (`src/plugins/requests.ts:488-498`). `/pipupdate` and `/pipplugins` refuse here, so the mailbox, which writes only `state.pendingReport` (`src/plugins/requests.ts:489-496`), is the only writer left and `state.pendingUpdateReport` has none; a snowflake `requestedBy` is DMed and any other value is logged (`src/plugins/updates.ts:697-702`: the log at `:697-698`, the DM at `:702`). | `src/index.ts:440` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:444-455` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:684-714`) |
+| Plugin `post` / `dm` / `edit` / `announce` (the host API) | A DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. A channel delivery is refused here: `host.post` is wired (`src/index.ts:191-200`), every channel delivery takes that branch (`plugins/mcp/src/drain.ts:177-190`), and with no `routing.json` it throws "destination is not mapped in that server" before any Discord call (`src/plugins/host.ts:148-150`, `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`. Pip runs no panel, and the bot's own paths map a destination only through a `routing-set` request written to the host mailbox (`ops/bot-ops.sh:1279-1303`, applied at `src/plugins/requests.ts:372`), the same host-side write the scheduled-update row describes; this runbook writes none. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`plugins/mcp/src/drain.ts:196-202`) runs only when `host.post` is not a function, so never here. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives one a restart left `unknown`, `plugins/mcp/src/index.ts:65-80`; the `edit` call `plugins/mcp/src/drain.ts:105`, the DM call `:133`, the channel branch `:177-190`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring); `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`), `:56-62` (`editOwnMessage`); `src/routing/post.ts:60` (`postForPlugin`, the `announce` path) |
 | Guild events | Nothing sent. | `GuildCreate`/`GuildDelete` re-register commands or rewrite discovery. | `src/index.ts:293-294`, `src/routing/live.ts:272-293` |
-| Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:458-472`; `src/announce.ts:235-270` (`pluginRequests`, `discovery`) |
+| Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:458-472`; the 5-second mailbox drain `src/plugins/drain.ts:11`, `:26`, started at `src/index.ts:354-359`; the 60-second backstop `src/announce.ts:230-270` (`pluginRequests`, `discovery`) |
 
 Interaction replies (`/pipagent` and the refusals above) are solicited: someone typed the command. The
 deliveries through the host API are sent by core code but asked for by the plugin, so they are bridge
 deliveries, bounded by the service's grants (section 4) and not by this `.env`. **Conclusion:** under
 this configuration the core has no unsolicited Discord output that is not a bridge delivery: the release
 watcher is off (`WATCHED_REPOS=none`, added by [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)),
-and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through the host API
-on the bridge's request. The switch turns off release polling, not every GitHub request: the Plugin Index
+and no core-initiated path produces a DM without a host-side mailbox write: the two rows above that can
+DM, a scheduled update's heads-up and the report-back, need a request in the mailbox, which only the
+host's docker group can write, and that group is Pip's real admin set; the only other DMs are the ones the
+plugin sends through the host API on the bridge's request. The switch turns off release polling, not every GitHub request: the Plugin Index
 fetch and the self-update checks are separate paths.
 
 ### 4. The bridge
@@ -937,7 +967,21 @@ in a minute answers `429`), so probe a few times, not in a loop. Restart and log
 
 In this order:
 
-1. **Stop sending:** remove the Pip credentials directory on Melody, or run `/pipagent unregister`.
+1. **Stop sending.** First `/pipagent unregister` in Discord: that is the revocation. The bridge refuses a
+   delivery to an unregistered user at drain time (`plugins/mcp/src/drain.ts:128-131`,
+   `registry.ts:120-125`, where `unregisterUser` deletes the entry, and `:148`, `:223-226`, where
+   `generationOf` is the check), and within roughly 60 seconds the service refuses every **tool call** made with
+   a token paired through that bot (discord-mcp `src/service/registration.ts:30`, `:204-207`,
+   `store.ts:1012-1029`; its README, "Revocation": there is no separate revoke call, the token row stays
+   and still authenticates and lists tools, but no call succeeds). Then delete the Pip credentials
+   directory on Melody: housekeeping that stops the one-shot `scripts/result-dm.mjs` sender, which reads
+   only `credentials.json`, but revokes nothing. A deleted file leaves the token valid server-side until
+   the 90-day inactivity prune (discord-mcp README, "Revocation"), a running shim keeps its bearer in
+   memory (`src/shim/cli.ts:190-204`), a backup copy or a `DISCORD_MCP_TOKEN` environment variable still
+   authenticates (`cli.ts:99`), a delivery the bridge already accepted is drained at once
+   (`plugins/mcp/src/http.ts:54-57`), and one a restart left `unknown` is re-driven by the plugin's tick
+   (`plugins/mcp/src/index.ts:65-80`, `:89-91`), with nothing on Melody consulted; only the `unregister`
+   above stops those, because the drain re-checks the registration each time.
 2. **Stop Pip.** `bot-ops.sh` has no stop subcommand (`ops/bot-ops.sh:1361` lists them), so:
 
    ```sh
@@ -1050,14 +1094,19 @@ a repeat of the same event into `duplicate`, never a second DM; a new id would b
   example `2026-10-08T21:25:00-04:00`. After it the script refuses to send.
 
 *The one command.* The delegated Melody task runs exactly this, in PowerShell, with the directory variable
-always set explicitly (the script refuses to run without it):
+always set explicitly (the script refuses to run without it), and with the execution tool's own working
+directory (its `workdir`) set to the discord-mcp checkout, `R:\repos\discord-mcp`, on **every** attempt:
 
 ```powershell
 $env:DISCORD_MCP_CONFIG_DIR = "$env:APPDATA\discord-mcp-pip"
 node 'R:\repos\discord-mcp\scripts\result-dm.mjs' --bridge pip --event <id> --label '<text>' --status <word> --expires <iso> [--link <url>]
 ```
 
-`R:\repos\discord-mcp` is the discord-mcp checkout on Melody (use its actual path if it differs). `%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
+`R:\repos\discord-mcp` is the discord-mcp checkout on Melody (use its verified actual path if it differs,
+for the `workdir` and the script path alike). Never rely on the task's default working directory: it is a folder
+that can be deleted (on 2026-10-08 a cleanup removed it, Rackbops/discord-mcp#81), and then the command
+fails at process creation, before PowerShell starts. A `Set-Location` inside the command is no substitute,
+because that failure comes before the command runs. `%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
 (`C:/Users/roshn/.config/discord-mcp`) is never used for Pip. `--bridge pip` makes the script refuse any
 credential whose principal is not on the `pip` bridge. Run it once per attempt and read its one JSON line on
 stdout. Never pair, read, copy or print a credential, and never pass `--dry-run`.
@@ -1079,14 +1128,31 @@ to. If the delegation never reaches Melody (offline, backend error, no task turn
 task could not start and that no DM was sent; do not switch machines, do not revoke anything, and do not
 queue a send. When Melody is back, the same event may be run once.
 
-*Stopping it.* Rod can stop every send instantly and reversibly by renaming or deleting
-`%APPDATA%\discord-mcp-pip` on Melody: the script then refuses with `invalid` (credentials missing) and
-sends nothing. `/pipagent unregister` in Discord is the server-side alternative; the next call is
-`ACCESS_DENIED` (as proven on the debug bridge, not re-run on pip).
+If the task reaches Melody but the command reports no `outcome` line, keep two cases apart (and if you
+can't tell whether the task reached Melody, treat it as the second case):
+
+- **A confirmed launch failure.** The execution tool says outright that the process could not be created,
+  for example `CreateProcessAsUserW failed: 267 (The directory name is invalid.)`. The script never ran in
+  that attempt, so that attempt sent nothing: say that the task could not start.
+- **Anything less clear.** A generic execution-tool error, a lost response, or a fallback attempt with no
+  clear result does not show that nothing was sent. Treat it like `error`: "Outcome unknown: do not treat
+  the DM as sent."
+
+If any attempt for the event falls in the second case, the outcome is unknown, whatever another attempt
+showed. In both cases keep the same event and its expiry. Retry only when Rod asks, with the same event,
+before it expires, and with the working directory set as above. Never replay on your own, and never mint a
+new event.
+
+*Stopping it.* `/pipagent unregister` in Discord is the revocation: within about a minute every tool call
+with the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge, not re-run on pip); the token itself still authenticates and lists tools, it
+just can no longer call one. Renaming
+or deleting `%APPDATA%\discord-mcp-pip` on Melody stops this script instantly and reversibly (it refuses with
+`invalid`, credentials missing, and sends nothing) but revokes nothing: the credential stays valid until
+Rod unregisters.
 
 ---
 
-*Rollback, in the order section 8 gives.* Stop sending (the directory above, or `/pipagent unregister`),
+*Rollback, in the order section 8 gives.* Stop sending (`/pipagent unregister`, then the directory above),
 stop Pip (`docker compose ... stop`), remove the `pip` bridge from the service, and never restore the
 service's state from a snapshot. Only the first step was rehearsed on this deployment (section 9); the
 service-side half was not.
