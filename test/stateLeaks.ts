@@ -54,7 +54,7 @@ export function announceLeaks(s: AnnounceStateForTest): string[] {
   return leaks;
 }
 
-/** Against what `resetRoutingForTest()` leaves. */
+/** Against what `resetRoutingForTest()` and `resetRoutingQueueForTest()` leave. */
 export async function routingLeaks(s: RoutingStateForTest): Promise<string[]> {
   const leaks: string[] = [];
   if (s.initialized) leaks.push("routing initialized (initRouting) — joins, leaves and registrations act on it");
@@ -94,7 +94,7 @@ export async function pluginHostLeaks(s: { writes: Promise<void> }): Promise<str
   return (await settled(s.writes)) ? [] : ["a plugin state.json write still running"];
 }
 
-/** Against what `resetPluginRequestsForTest()` leaves. */
+/** Against what `resetPluginRequestsForTest()` and `resetPluginRequestDrainForTest()` leave. */
 export async function pluginRequestLeaks(s: { undeletable: number; draining: Promise<void> }): Promise<string[]> {
   const leaks: string[] = [];
   if (s.undeletable !== 0) leaks.push(`${s.undeletable} request file(s) remembered as undeletable — a later drain skips them`);

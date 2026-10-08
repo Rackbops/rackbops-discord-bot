@@ -7,7 +7,14 @@ import { freshRouting, freshSecrets, repairRouting, repairSecrets, type Discover
 import type { RoutingRequestDeps } from "../routing/requests";
 import type { PluginIndex, PluginIndexEntry, PluginStateEntry, PluginStateFile } from "./contract";
 import { settled } from "../../test/stateLeaks";
-import { consumePluginRequests, pluginRequestsStateForTest, resetPluginRequestsForTest, validate, type PluginRequestDeps } from "./requests";
+import {
+  consumePluginRequests,
+  pluginRequestsStateForTest,
+  resetPluginRequestDrainForTest,
+  resetPluginRequestsForTest,
+  validate,
+  type PluginRequestDeps,
+} from "./requests";
 
 const REQ_DIR = "/data/plugins/requests";
 
@@ -147,7 +154,8 @@ describe("validate (#105 trust boundary)", () => {
 describe("consumePluginRequests drain", () => {
   beforeEach(resetPluginRequestsForTest);
   // A file that could not be deleted is remembered per process; the test-state guard
-  // (test/stateGuard.ts) fails a test that leaves it behind.
+  // (test/stateGuard.ts) fails a test that leaves it behind. Neither reset touches the drain queue:
+  // a test awaits its drains, and the guard fails one that leaves a drain running.
   afterEach(resetPluginRequestsForTest);
 
   function harness(files: Record<string, unknown>, opts: { routing?: RoutingRequestDeps; state?: PluginStateFile } = {}) {
@@ -235,6 +243,43 @@ describe("consumePluginRequests drain", () => {
     await drain;
     expect(await settled(pluginRequestsStateForTest().draining)).toBe(true);
     expect(pluginRequestsStateForTest().undeletable).toBe(1);
+  });
+
+  /** Starts a drain that hangs at its first step for good, and resolves once it is there: the drain
+   *  is held stuck, not hoped to be still running. */
+  function stuckDrain(): Promise<void> {
+    let reach!: () => void;
+    const reached = new Promise<void>((resolve) => (reach = resolve));
+    const h = harness({});
+    h.deps.readDir = () => {
+      reach();
+      return new Promise<never>(() => {});
+    };
+    void consumePluginRequests(h.deps);
+    return reached;
+  }
+
+  // What the guard runs once it has waited, so a drain that never finishes can't hold every later
+  // test up.
+  test("resetPluginRequestDrainForTest starts a fresh drain queue, dropping a drain that never finishes", async () => {
+    await stuckDrain();
+    const before = pluginRequestsStateForTest().draining;
+    resetPluginRequestDrainForTest();
+    expect(await settled(pluginRequestsStateForTest().draining)).toBe(true);
+    expect(await settled(before)).toBe(false);
+  });
+
+  // Tests clean up with resetPluginRequestsForTest, as this describe's beforeEach and afterEach do:
+  // were it to drop the drain queue too, a drain the test leaked would be gone before the guard
+  // looked.
+  test("resetPluginRequestsForTest leaves the drain queue alone, so a leaked drain still reaches the guard", async () => {
+    await stuckDrain();
+    try {
+      resetPluginRequestsForTest();
+      expect(await settled(pluginRequestsStateForTest().draining)).toBe(false);
+    } finally {
+      resetPluginRequestDrainForTest(); // the stuck drain would otherwise fail this test through the guard
+    }
   });
 
   test("applies a valid update-now: sets targetVersion, deletes the file, ONE restart", async () => {

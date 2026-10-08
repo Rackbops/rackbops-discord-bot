@@ -10,10 +10,10 @@
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest } from "../src/announce";
 import { configStateForTest, resetConfigForTest } from "../src/config";
 import { pluginHostStateForTest, resetPluginHostForTest } from "../src/plugins/host";
-import { pluginRequestsStateForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
+import { pluginRequestsStateForTest, resetPluginRequestDrainForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
 import { resetForTest, stateForTest } from "../src/restart";
-import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
+import { resetRoutingForTest, resetRoutingQueueForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
@@ -59,13 +59,16 @@ export const GUARDED: readonly GuardedModule[] = [
     resetDiscoveryGapForTest,
     resetPollStateForTest,
   ]),
-  guarded("src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]),
+  guarded("src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest, resetRoutingQueueForTest]),
   guarded("src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [
     resetRoutingWarningsForTest,
     resetRoutingWritesForTest,
   ]),
   guarded("src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, [resetPluginHostForTest]),
-  guarded("src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]),
+  guarded("src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [
+    resetPluginRequestsForTest,
+    resetPluginRequestDrainForTest,
+  ]),
   guarded("src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]),
 ];
 

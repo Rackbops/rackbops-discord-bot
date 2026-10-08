@@ -7,7 +7,17 @@ import type { PluginCommand, PluginIndexEntry } from "../plugins/contract";
 import type { PluginCommandMap } from "../plugins/host";
 import { discoveryPath, type PluginSummary } from "./discovery";
 import { settled } from "../../test/stateLeaks";
-import { applyRouting, guildJoined, guildLeft, initRouting, refreshDiscovery, resetRoutingForTest, routingStateForTest, type RoutingContext } from "./live";
+import {
+  applyRouting,
+  guildJoined,
+  guildLeft,
+  initRouting,
+  refreshDiscovery,
+  resetRoutingForTest,
+  resetRoutingQueueForTest,
+  routingStateForTest,
+  type RoutingContext,
+} from "./live";
 import type { DiscoveryFile } from "./model";
 import { mutateRouting, routingPath } from "./store";
 
@@ -23,6 +33,8 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "live-test-"));
 });
+// Not the queue: a test awaits what it queues, and the test-state guard fails one that leaves a job
+// running.
 afterEach(() => {
   resetRoutingForTest();
   rmSync(dir, { recursive: true, force: true });
@@ -1049,8 +1061,25 @@ describe("a home server the bot is not in (#260)", () => {
 });
 
 // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so each field must
-// track the live module. The file's afterEach resets everything before the guard looks.
+// track the live module. The file's afterEach puts the context and the warnings said back before
+// the guard looks, and leaves the queue for it to check.
 describe("routingStateForTest (what the test-state guard reads)", () => {
+  /** Queues a registration that hangs at its put for good, and resolves once it is there: the job is
+   *  held stuck, not hoped to be still running. */
+  function stuckRegistration(): Promise<void> {
+    let reach!: () => void;
+    const reached = new Promise<void>((resolve) => (reach = resolve));
+    const h = harness({
+      onPut: () => {
+        reach();
+        return new Promise<never>(() => {});
+      },
+    });
+    initRouting(h.ctx);
+    void applyRouting("stuck");
+    return reached;
+  }
+
   test("initialized tracks initRouting", () => {
     expect(routingStateForTest().initialized).toBe(false);
     initRouting(harness().ctx);
@@ -1076,5 +1105,27 @@ describe("routingStateForTest (what the test-state guard reads)", () => {
     release();
     await boot;
     expect(await settled(routingStateForTest().chain)).toBe(true);
+  });
+
+  // What the guard runs once it has waited, so a job that never finishes can't hold every later
+  // test up.
+  test("resetRoutingQueueForTest starts a fresh queue, dropping a job that never finishes", async () => {
+    await stuckRegistration();
+    const before = routingStateForTest().chain;
+    resetRoutingQueueForTest();
+    expect(await settled(routingStateForTest().chain)).toBe(true);
+    expect(await settled(before)).toBe(false);
+  });
+
+  // Tests clean up with resetRoutingForTest, as this file's afterEach does: were it to drop the
+  // queue too, a job the test leaked would be gone before the guard looked.
+  test("resetRoutingForTest leaves the queue alone, so a leaked job still reaches the guard", async () => {
+    await stuckRegistration();
+    try {
+      resetRoutingForTest();
+      expect(await settled(routingStateForTest().chain)).toBe(false);
+    } finally {
+      resetRoutingQueueForTest(); // the stuck job would otherwise fail this test through the guard
+    }
   });
 });

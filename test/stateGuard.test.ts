@@ -5,10 +5,10 @@ import { join } from "node:path";
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest, type AnnounceStateForTest } from "../src/announce";
 import { configStateForTest, resetConfigForTest } from "../src/config";
 import { pluginHostStateForTest, resetPluginHostForTest } from "../src/plugins/host";
-import { pluginRequestsStateForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
+import { pluginRequestsStateForTest, resetPluginRequestDrainForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
 import { resetForTest, stateForTest, type RestartStateForTest } from "../src/restart";
-import { resetRoutingForTest, routingStateForTest } from "../src/routing/live";
+import { resetRoutingForTest, resetRoutingQueueForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
@@ -283,10 +283,10 @@ describe("GUARDED", () => {
       ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]],
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
-      ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest]],
+      ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest, resetRoutingQueueForTest]],
       ["src/routing/store.ts", routingStoreStateForTest, routingStoreLeaks, [resetRoutingWarningsForTest, resetRoutingWritesForTest]],
       ["src/plugins/host.ts", pluginHostStateForTest, pluginHostLeaks, [resetPluginHostForTest]],
-      ["src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest]],
+      ["src/plugins/requests.ts", pluginRequestsStateForTest, pluginRequestLeaks, [resetPluginRequestsForTest, resetPluginRequestDrainForTest]],
       ["src/plugins/updates.ts", pluginUpdateStateForTest, pluginUpdateLeaks, [resetPluginUpdateStateForTest]],
     ]);
   });

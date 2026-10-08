@@ -125,14 +125,23 @@ let draining: Promise<void> = Promise.resolve();
 const UNREAD: unique symbol = Symbol("unread");
 const undeletable = new Map<string, string | typeof UNREAD>();
 
-/** Test seam: reset the single-flight chain between cases. */
+/** Forgets every file remembered as undeletable, as a restart does. Leaves the drain queue alone
+ *  (that is `resetPluginRequestDrainForTest`), so a drain a test leaked still reaches the guard. */
 export function resetPluginRequestsForTest(): void {
-  draining = Promise.resolve();
   undeletable.clear();
 }
 
-/** What `resetPluginRequestsForTest` resets, for the test-state guard (test/stateGuard.ts).
- *  `draining` is handed over as is: the guard asks whether it is still pending. */
+/** The test-state guard's own (test/stateGuard.ts): starts a fresh drain queue. The guard runs this
+ *  once it has waited for the queue, so a drain that never finishes can't hold every later test up.
+ *  A drain still running is not stopped, only no longer waited for — so not for a test's own
+ *  cleanup, where it would hide a leaked drain from the guard: a test awaits its drains instead. */
+export function resetPluginRequestDrainForTest(): void {
+  draining = Promise.resolve();
+}
+
+/** What the test-state guard (test/stateGuard.ts) reads here: `undeletable`, which
+ *  `resetPluginRequestsForTest` resets, and `draining`, handed over as is — the guard asks whether
+ *  it is still pending (which `resetPluginRequestDrainForTest` drops). */
 export function pluginRequestsStateForTest(): { undeletable: number; draining: Promise<void> } {
   return { undeletable: undeletable.size, draining };
 }
