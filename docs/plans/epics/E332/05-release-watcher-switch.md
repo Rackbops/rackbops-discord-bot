@@ -107,8 +107,11 @@ behaviour. `ANNOUNCE_CHANNEL_ID` stays required -- plugins post through it (`src
   the new cites; and the paragraph `:855-860` (the conclusion's "cannot occur while the watched
   repository publishes no releases" clause and the closing "If that is not acceptable, the way to
   close it is a small host change ... not a configuration trick" sentence) -> the watcher is off and
-  the switch is this change. Section 9 (what the live run showed) is history and stays as written;
-  add one line there that the switch landed afterwards (#342) and Pip now runs with it.
+  the switch is this change. Section 9 (what the live run showed) is history and stays as written.
+  Do **not** write that Pip runs with the switch: at implementation time it does not; the rollout
+  below is a separate, later operator step, and its evidence (the deployed revision and the boot
+  line) is recorded on #342 when it happens. Section 9 may say only that the switch exists (#342)
+  and that enabling it on Pip is an operator step.
 
 ### Step 5 -- tests
 
@@ -162,26 +165,41 @@ instance moves the host to schema 6 and the prod and debug **admin panels** (bui
 comparison is strict, `ops/admin/server.ts:386`) show the OUT OF DATE banner until their admin
 images are rebuilt (`ops/README.md:105-136`; the rebuild is install.sh's printed step 4, as in
 `docs/plans/epics/E236/13-deploy-and-prove.md` stage 2 -- that runbook's stage 1 still expects
-"schema 5" at its `:63` and `:68`; the number it prints is whatever `main` carries). Order, on
-nucbox:
+"schema 5" at its `:63` and `:68`; the number it prints is whatever `main` carries).
+
+The switch lives in the bot's **image**, and nothing in the first two steps builds one:
+`install.sh` only refreshes the shared script, the compose file and the stack `.env` (with
+`GIT_SHA` resolved to `main`'s head) and *prints* the build command (`ops/install.sh:44-46`,
+`:333-341`), and `env-set` recreates without `--build` (`ops/README.md:404-406`). So the image is
+built explicitly, before the key is set -- otherwise the old image would read `none` as a repo named
+`none` and poll GitHub for it. Order, on nucbox, after the implementing PR is on `main`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/ops/install.sh | bash -s -- pip
 ```
 
 ```bash
+docker compose -f /opt/stacks/rackbops-discord-bot-pip/docker-compose.yml -p rackbops-discord-bot-pip up -d --build
+```
+
+(install.sh's printed step 2: builds `main` and bakes the `GIT_SHA` the stack `.env` just got;
+`ops/README.md:220-226` is why the two run together). Then the key, one recreate on the new image:
+
+```bash
 echo 'WATCHED_REPOS=none' | BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/pip BOT_OPS_COMPOSE_FILE=/opt/stacks/rackbops-discord-bot-pip/docker-compose.yml BOT_OPS_PROJECT=rackbops-discord-bot-pip BOT_OPS_CONTAINER=rackbops-discord-bot-pip bash /opt/rackbops-discord-bot/bin/bot-ops.sh env-set
 ```
 
-(one recreate; the `BOT_OPS_*` form is `ops/README.md:913-917`), then expect the boot line --
-Pip logs JSON, so match the substring:
+(the `BOT_OPS_*` form is `ops/README.md:913-917`). Verify the deployed revision and the boot line
+-- Pip logs JSON, so match the substring -- and paste both on #342; the rollout is complete only
+with that evidence:
 
 ```bash
-docker logs --since 2m rackbops-discord-bot-pip 2>&1 | grep -F '[release] watcher off (WATCHED_REPOS=none)'
+docker exec rackbops-discord-bot-pip printenv GIT_SHA; docker logs --since 2m rackbops-discord-bot-pip 2>&1 | grep -F '[release] watcher off (WATCHED_REPOS=none)'
 ```
 
-Rebuild prod's and debug's panels in a window of Rod's choosing. The bots themselves are
-unaffected by the schema number.
+Expect the `GIT_SHA` to equal `main`'s head (`git ls-remote https://github.com/Rackbops/rackbops-discord-bot.git refs/heads/main`)
+and one JSON line carrying the watcher-off message. Rebuild prod's and debug's panels in a window
+of Rod's choosing. The bots themselves are unaffected by the schema number.
 
 ### Hand-off brief (spawn text)
 
