@@ -307,15 +307,25 @@ export function routingIdleForTest(): Promise<void> {
   return chain.then(() => {});
 }
 
+/** Forgets the context, the last registrations and the home-server warnings said. Leaves the queue
+ *  alone (that is `resetRoutingQueueForTest`), so a job a test leaked still reaches the guard. */
 export function resetRoutingForTest(): void {
   context = undefined;
   lastRegistrations = [];
-  chain = Promise.resolve();
   said.clear();
 }
 
-/** What `resetRoutingForTest` resets, for the test-state guard (test/stateGuard.ts). `chain` is
- *  handed over as is: the guard asks whether it is still pending. `lastRegistrations` is left out:
+/** The test-state guard's own (test/stateGuard.ts): starts a fresh queue. The guard runs this once
+ *  it has waited for the queue, so a job that never finishes can't hold every later test up. A job
+ *  still running is not stopped, only no longer waited for — so not for a test's own cleanup, where
+ *  it would hide a leaked job from the guard: a test awaits its jobs instead. */
+export function resetRoutingQueueForTest(): void {
+  chain = Promise.resolve();
+}
+
+/** What the test-state guard (test/stateGuard.ts) reads here: `initialized` and `said`, which
+ *  `resetRoutingForTest` resets, and `chain`, handed over as is — the guard asks whether it is still
+ *  pending (which `resetRoutingQueueForTest` drops). `lastRegistrations` is left out:
  *  nothing reads it without a `context` (`refreshDiscovery` does nothing before `initRouting`), and
  *  `initRouting` clears it — so a leftover value cannot reach a later test, unless a job was still
  *  running when the queue was reset (see test/stateGuardHook.ts's queue caveat), which guarding

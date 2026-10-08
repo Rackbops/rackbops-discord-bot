@@ -54,7 +54,7 @@ export function announceLeaks(s: AnnounceStateForTest): string[] {
   return leaks;
 }
 
-/** Against what `resetRoutingForTest()` leaves. */
+/** Against what `resetRoutingForTest()` and `resetRoutingQueueForTest()` leave. */
 export async function routingLeaks(s: RoutingStateForTest): Promise<string[]> {
   const leaks: string[] = [];
   if (s.initialized) leaks.push("routing initialized (initRouting) — joins, leaves and registrations act on it");
@@ -94,7 +94,7 @@ export async function pluginHostLeaks(s: { writes: Promise<void> }): Promise<str
   return (await settled(s.writes)) ? [] : ["a plugin state.json write still running"];
 }
 
-/** Against what `resetPluginRequestsForTest()` leaves. */
+/** Against what `resetPluginRequestsForTest()` and `resetPluginRequestDrainForTest()` leave. */
 export async function pluginRequestLeaks(s: { undeletable: number; draining: Promise<void> }): Promise<string[]> {
   const leaks: string[] = [];
   if (s.undeletable !== 0) leaks.push(`${s.undeletable} request file(s) remembered as undeletable — a later drain skips them`);
@@ -121,7 +121,8 @@ export function stateLeakMessage(found: { module: string; leaks: string[] }[], d
     `${STATE_GUARD} module state was left behind at the end of this test, and every later test ` +
     `file would inherit it — ${what}. Usually this test leaked it: clean up in its own afterEach ` +
     `or finally — put state back with that module's reset...ForTest(), and await any write or job ` +
-    `it started (a reset does not stop one already running). If it never touches that state, look ` +
+    `it started (a reset does not stop one already running, and the guard's own queue resets would ` +
+    `only hide it). If it never touches that state, look ` +
     `at what ran just before it: a beforeAll or afterAll, an afterEach that threw (which skips this ` +
     `guard for its own test), or async work an earlier test left running.${stuck}`
   );
