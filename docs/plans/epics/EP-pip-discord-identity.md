@@ -336,10 +336,10 @@ as a shortcut: `dm:registered` has a broader recipient surface than the MVP owne
 - 2026-10-08 (00:35Z-01:28Z): hosted rows from Pip's evidence on #332: the exit-demo path shown, A9 excluded
   and included (literal `notify me on Discord`) passed, A8 passed (Melody offline, no DM, same event
   resumed once after reconnect). Seven DMs delivered during acceptance, all `delivered`.
-- 2026-10-08: #339 done. `ops/README.md` sections 9 and 10 carry the live evidence and the hosted-Pip
-  handoff. **Epic delivered:** a separate Pip application and instance, its bridge, a separately paired
+- 2026-10-08: #339 (this change). `ops/README.md` sections 9 and 10 carry the live evidence and the hosted-Pip
+  handoff. **Epic delivers:** a separate Pip application and instance, its bridge, a separately paired
   Melody integration, `scripts/result-dm.mjs`, the handoff text, and a rehearsed disable control.
-  **Deliberately not delivered:** the section 9 track (Melody-independent execution) is untouched; A5 and
+  **Deliberately not delivered:** this document's section 9 track (Melody-independent execution) is untouched; A5 and
   the service-side rollback were not performed on pip; the approved avatar
   (`assets/PIP/pip-canonical-review-v1.png`, #343) is in the repository but its upload to the application
   is not confirmed; the release-watcher switch is #342.

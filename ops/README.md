@@ -970,7 +970,7 @@ hex; any 43+ character non-whitespace value satisfies the manifest's format.)
 
 **Acceptance A1-A11** (the plan document's matrix, `EP-pip-discord-identity.md` section 7):
 
-| Row | Outcome | Date (UTC) | Evidence |
+| Row | Outcome | Date (as on the issue; evening rows are America/Detroit) | Evidence |
 |---|---|---|---|
 | A1 identity | passed (name + application id confirmed by Rod); the approved avatar is in the repo (`assets/PIP/pip-canonical-review-v1.png`, #343) and goes on the application when Rod uploads it, which is **not confirmed** | 2026-10-07 | [#338](https://github.com/Rackbops/rackbops-discord-bot/issues/338#issuecomment-6050347866) |
 | A2 isolation | passed: the Pip credential is `u-...@pip` with `dm:self`; the prod integration still answers `@prod` through its own untouched directory | 2026-10-07 | [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047685066), [#337](https://github.com/Rackbops/rackbops-discord-bot/issues/337#issuecomment-6047828399) |
@@ -1019,12 +1019,14 @@ a repeat of the same event into `duplicate`, never a second DM; a new id would b
 
 *The fields.*
 
-- `--label`: the task's own title, trimmed to 200 characters.
+- `--label`: the task's own title as one line (no line breaks), trimmed to 200 characters; the script
+  refuses a longer or multi-line label as `invalid`. In PowerShell a single-quoted title must double any
+  apostrophe (`it''s`).
 - `--status`: one of `done`, `failed`, `blocked`, `cancelled`, from the task's terminal state (finished
   successfully -> `done`; ended in error -> `failed`; stopped waiting on Rod -> `blocked`; stopped on
   request -> `cancelled`). No other word.
 - `--link`: optional; include it only when the task produced exactly one result page, as an `https://` URL
-  of at most 512 characters. Otherwise leave it out.
+  of at most 512 characters with no spaces. Otherwise leave it out.
 - `--expires`: **required**. The handoff time plus 24 hours, as ISO-8601 with an offset or `Z`, for
   example `2026-10-08T21:25:00-04:00`. After it the script refuses to send.
 
@@ -1036,9 +1038,9 @@ $env:DISCORD_MCP_CONFIG_DIR = "$env:APPDATA\discord-mcp-pip"
 node 'R:\repos\discord-mcp\scripts\result-dm.mjs' --bridge pip --event <id> --label '<text>' --status <word> --expires <iso> [--link <url>]
 ```
 
-`%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
+`R:\repos\discord-mcp` is the discord-mcp checkout on Melody (use its actual path if it differs). `%APPDATA%\discord-mcp-pip` is Pip's own credentials directory. The prod integration's directory
 (`C:/Users/roshn/.config/discord-mcp`) is never used for Pip. `--bridge pip` makes the script refuse any
-credential whose principal is not on the `pip` bridge. Run it **once** and read its one JSON line on
+credential whose principal is not on the `pip` bridge. Run it once per attempt and read its one JSON line on
 stdout. Never pair, read, copy or print a credential, and never pass `--dry-run`.
 
 *What to tell Rod, by the `outcome` word.* Report a DM as sent only on `sent` or `duplicate`.
@@ -1050,7 +1052,8 @@ stdout. Never pair, read, copy or print a credential, and never pass `--dry-run`
 | `pending`, `unknown`, `rate_limited` (3) | "Delivery pending -- retry the same event later; do not start a new one." |
 | `unavailable` (3) | "DM not sent: the delivery route was unavailable. Retry the same event later." |
 | `expired` (4) | "Not sent: the result is older than its expiry." |
-| `unreachable`, `denied`, `unresolved`, `invalid` (2), `error` (1) | A plain failure that names the outcome word. Nothing was sent. |
+| `unreachable`, `denied`, `unresolved`, `invalid` (2) | A plain failure that names the outcome word. Nothing was sent. |
+| `error` (1) | "Outcome unknown (`error`): do not treat the DM as sent." Retry the same event only if Rod asks. |
 
 To retry, re-run the **same** event while it has not expired, and only when Rod asks or the outcome says
 to. If the delegation never reaches Melody (offline, backend error, no task turn admitted), say that the
@@ -1060,7 +1063,7 @@ queue a send. When Melody is back, the same event may be run once.
 *Stopping it.* Rod can stop every send instantly and reversibly by renaming or deleting
 `%APPDATA%\discord-mcp-pip` on Melody: the script then refuses with `invalid` (credentials missing) and
 sends nothing. `/pipagent unregister` in Discord is the server-side alternative; the next call is
-`ACCESS_DENIED`.
+`ACCESS_DENIED` (as proven on the debug bridge, not re-run on pip).
 
 ---
 
