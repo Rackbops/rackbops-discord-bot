@@ -14,6 +14,7 @@ One file per PR bundle, plus one for the three operator children:
 | #335 result-DM script | Sonnet | [03-result-dm-script.md](03-result-dm-script.md) | Rackbops/discord-mcp |
 | #336, #337, #338 | operator (orchestrator + Rod) | [operator.md](operator.md) | no PR; evidence on the issues |
 | #339 handoff and close-out | Sonnet | [04-handoff-and-closeout.md](04-handoff-and-closeout.md) | this repo |
+| #342 release-watcher switch (added 2026-10-07 from Rod's Q3 decision) | Sonnet | [05-release-watcher-switch.md](05-release-watcher-switch.md) | this repo |
 
 ## Build order
 
