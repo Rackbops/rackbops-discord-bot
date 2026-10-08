@@ -903,35 +903,86 @@ and 5 are not run for Pip.
 ### 6. Pairing on Melody
 
 In Discord, in the approved server, run `/pipagent register` and then `/pipagent pair` (a single-use,
-10-minute pairing code, per the plugin's 0.2.0 release notes in the published index). Then, on Melody:
+10-minute pairing code, per the plugin's 0.2.0 release notes in the published index). From `mcp` 0.3.1 the
+bot's replies name the prefixed command; on 0.3.0 they said `/agent pair`
+(Rackbops/rackbops-bot-plugins#129). Then, on Melody, in PowerShell (the shell the live run used; the
+add-a-bridge runbook's section 7 has the POSIX form):
 
-```sh
-DISCORD_MCP_URL=https://mcp.rackbops.com/mcp DISCORD_MCP_CONFIG_DIR=<new Pip-only dir> \
-  node <discord-mcp checkout>/dist/shim/cli.js pair <code>
+```powershell
+$env:DISCORD_MCP_URL = "https://mcp.rackbops.com/mcp"
+$env:DISCORD_MCP_CONFIG_DIR = "$env:APPDATA\discord-mcp-pip"
+node 'R:\repos\discord-mcp\dist\shim\cli.js' pair <code>
 ```
 
-`pair` saves the URL into `credentials.json`, so later runs need only the directory
-(`Rackbops/discord-mcp` `src/shim/cli.ts:107-181`). Use a dedicated, **absolute** directory
-(`cli.ts:39-53`: the shim resolves credentials from `DISCORD_MCP_CONFIG_DIR`, and a relative path is
-refused): a separate directory is what keeps the prod integration's `credentials.json` untouched. Paste
-the code nowhere but that command.
+`R:\repos\discord-mcp` is the discord-mcp checkout on Melody. The directory must be absolute
+(`Rackbops/discord-mcp` `src/shim/cli.ts:42-44` refuses a relative one), dedicated to Pip (a separate
+directory is what keeps the prod integration's `credentials.json` untouched), and under your own profile: the
+shim writes `credentials.json` with mode `0o600`, which Windows ignores (`cli.ts:80-82`), so the directory's
+inherited ACL is the plaintext bearer's only protection, and `%APPDATA%` inherits a user-only one while a
+directory at the root of a drive does not. `pair` saves the URL into `credentials.json`, so later runs need
+only the directory (`cli.ts:107-181`). Paste the code nowhere but that command.
+
+The command prints `Paired as u-<your Discord id>@pip. Credentials saved to ...` (on stderr,
+`cli.ts:181`). Check the suffix. The service redeems a code on whichever bridge issued it (production
+bridges are tried first, `src/service/redeem.ts:177`) and the shim saves whatever principal comes back
+(`cli.ts:173-181`), so if the code came from `/agent pair` or `/ragent pair` on another bot by mistake, the
+Pip directory now holds an `@prod` or `@debug` principal while the prod directory still looks untouched:
+`unregister` on that bot and pair again with `/pipagent`. The add-a-bridge runbook ends the same step with a
+`whoami` expecting `u-<discord_user_id>@pip` (`deploy/add-bridge.md` section 7, step 5).
 
 ### 7. Health, restart, and logs
 
 ```sh
-docker logs rackbops-discord-bot-pip 2>&1 | grep 'Logged in as'
+docker logs --since "$(docker inspect -f '{{.State.StartedAt}}' rackbops-discord-bot-pip)" rackbops-discord-bot-pip 2>&1 \
+  | grep -E 'env file|Logged in as|\[release\]|mcp@'
 docker exec rackbops-discord-bot-pip bun -e \
-  'const r = await fetch("http://127.0.0.1:<HTTP_PORT>/mcp/capabilities"); console.log(r.status); process.exit(r.status === 401 ? 0 : 1)'
+  'const r = await fetch("http://127.0.0.1:8794/mcp/capabilities", { headers: { authorization: "Bearer " + process.env.MCP_BRIDGE_TOKEN } }); console.log(r.status, await r.text()); process.exit(r.status === 200 ? 0 : 1)'
 ```
 
-`Logged in as <tag>` (`src/index.ts:130`) says the gateway login worked; `401` from the probe says the
-bridge listens and the token is set. `503` means `MCP_BRIDGE_TOKEN` did not reach the container; no
-answer at all means `HTTP_PORT`. Failed bearers count toward the plugin's per-IP lockout (more than ten
-in a minute answers `429`), so probe a few times, not in a loop. Restart and logs are Clerk's step 6 with
-`pip` substituted: `BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/pip`,
-`BOT_OPS_COMPOSE_FILE=/opt/stacks/rackbops-discord-bot-pip/docker-compose.yml`,
-`BOT_OPS_PROJECT=rackbops-discord-bot-pip`, `BOT_OPS_CONTAINER=rackbops-discord-bot-pip`, then
-`bash /opt/rackbops-discord-bot/bin/bot-ops.sh restart | recreate | logs 200`.
+The log check is bounded to the current boot on purpose: the container's log is cumulative across
+`bot-ops.sh restart` (`docker compose restart` of the same container, `ops/bot-ops.sh:671`) and across the
+crash-loop restarts of `restart: unless-stopped` (`docker-compose.yml:57`), so a bare `grep 'Logged in as'`
+can match an earlier boot while the new process is failing to log in. Expect, in order, `[boot] env file:
+/opt/rackbops-discord-bot/pip/.env` (`src/bootLog.ts:28`, printed every boot), `Logged in as pip#<tag>`
+(`src/index.ts:130`) and `[release] watcher off (WATCHED_REPOS=none)`. A `[plugins] mcp@<version>
+downloaded, integrity ok` line appears only on the first boot of a version on that state volume
+(`src/plugins/install.ts:281`); a cached bundle is reused silently (`:238-242`), so after a `restart` or a
+`recreate` on the same version there is no per-plugin line, and `bot-ops.sh status` is where the installed
+version shows.
+
+The probe reads the token from the container's own environment (`docker exec` inherits the create-time
+env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints it. `200` with
+`{"dm":true,...}` says the listener is up, the token the plugin loaded is the file's, and DMs are enabled
+(`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
+the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:112-121`),
+so it may run in a loop. Any other answer:
+
+- `401 {"error":"unauthorized"}` **with** the bearer: the token in the container is blank (a
+  `MCP_BRIDGE_TOKEN=` line with no value, section 2), so the plugin rejects every bearer
+  (`plugins/mcp/src/auth.ts:66-69`). Without the bearer `401` only says the listener is up and a token is
+  set, and cannot tell a blank one from a good one.
+- `503 {"error":"bridge not configured"}`: `MCP_BRIDGE_TOKEN` is absent in the container
+  (`plugins/mcp/src/http.ts:187`), for example appended to the `.env` without the recreate (section 5).
+- `503 Unavailable`, plain text: the host router's own answer for a plugin that loaded but is not running
+  (`src/plugins/host.ts:841`, `:861`): `activate()` threw and the log has a line beginning `[plugins] mcp
+  failed to activate` (`host.ts:547-549`). `src/http.ts:36` answers the same while the listener is
+  closing.
+- `404 Not found`: the plugin never loaded (`host.ts:839`): the index or the registry unreachable on a
+  fresh instance with no cache, a `hostApiVersion` skip, a throwing `createPlugin`, each contained per
+  plugin and recorded where `bot-ops.sh status` shows it, `plugins[]` with `error`, `active` and
+  `installedVersion` (`ops/bot-ops.sh:632-633` passes the state file's array through; the fields are
+  `src/plugins/contract.ts:187-201`). An unexpected failure of the whole plugin setup instead logs a line
+  beginning `[plugins] plugin setup failed` and the bot starts core-only (`src/index.ts:213-214`).
+- No answer: the listener binds after login, plugin install and activation (`src/index.ts:316-344`,
+  `startHostHttp` at `:333`) and before command registration (`:367-383`), so a boot that has not reached
+  that point answers nothing yet; a bind failure logs a line beginning `[http] could not listen on :8794`
+  (`:342`); otherwise the port in the probe is not `HTTP_PORT`.
+
+Restart and logs are Clerk's step 6 with `pip` substituted: `install.sh`'s printed step 3 prints the four
+`BOT_OPS_*` lines instance-exact (`BOT_OPS_CONFIG_DIR=/opt/rackbops-discord-bot/pip`,
+`BOT_OPS_COMPOSE_FILE=/opt/stacks/rackbops-discord-bot-pip/docker-compose.yml`, and `BOT_OPS_PROJECT` and
+`BOT_OPS_CONTAINER` both `rackbops-discord-bot-pip`), then `bash /opt/rackbops-discord-bot/bin/bot-ops.sh
+restart`, or `recreate` (re-reads `.env`), or `logs 200` (`ops/bot-ops.sh:1362` lists the subcommands).
 
 ### 8. Rollback and disable
 
