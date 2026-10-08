@@ -11,9 +11,12 @@
 // developer's shell — say one exported while debugging a deployment — would then silently disable
 // the entire protection. Safety beats overridability for this one.
 
+import { afterEach } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { resetForTest, stateForTest } from "../src/restart";
+import { restartLeakMessage, restartStateLeaks } from "./restartState";
 import { isPidAlive, MAX_AGE_MS, sweepStaleTestDirs, TEST_DATA_PREFIX } from "./sweep";
 
 // Sweep PREVIOUS runs' dirs before making this one, rather than removing our own on the way out:
@@ -70,3 +73,17 @@ snapshotTree(repoDataDir);
 // them now rely on this preload instead.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+
+// The restart-state guard. src/restart.ts keeps module-level state (a critical-section depth, a
+// pending restart, an active handoff, ...) and every test file shares one copy of it, for the same
+// one-process reason as above. A test that leaves some behind changes what every later file sees:
+// #385's leaked handoff made update.test.ts's checkForUpdate answer `busy`, and only a randomized
+// order ever showed it. A preload's afterEach runs after every test in every file, and after that
+// file's own afterEach hooks (measured on Bun 1.4.2), so this fails the test that leaked, whatever
+// the order. It then resets the state, so one leak fails one test instead of every test after it.
+afterEach(() => {
+  const leaks = restartStateLeaks(stateForTest());
+  if (leaks.length === 0) return;
+  resetForTest();
+  throw new Error(restartLeakMessage(leaks));
+});
