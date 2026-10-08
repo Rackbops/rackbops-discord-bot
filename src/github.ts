@@ -99,6 +99,8 @@ export interface ReachabilityLog {
    * instead of once per poll.
    */
   observe(repo: string, reachable: boolean): ReachabilityTransition | null;
+  /** How many repos are recorded unreachable right now (what the test-state guard reads). */
+  unreachableCount(): number;
 }
 
 /** Deliberately in-memory: a restart re-reports a still-unreachable repo exactly once, which
@@ -112,6 +114,7 @@ export function createReachabilityLog(): ReachabilityLog {
       unreachable.add(repo);
       return "lost";
     },
+    unreachableCount: () => unreachable.size,
   };
 }
 

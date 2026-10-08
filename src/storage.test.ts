@@ -2,7 +2,30 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, tmpPathFor, writeJsonAtomic } from "./storage";
+import { createJsonWriter, createKeyedJsonMutator, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, tmpPathFor, writeJsonAtomic } from "./storage";
+
+describe("createKeyedJsonMutator idle (what the test-state guard reads)", () => {
+  test("settles only once every update queued so far has, on every path", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "keyed-mutator-idle-"));
+    try {
+      const m = createKeyedJsonMutator<{ n: number }>();
+      const done: string[] = [];
+      const fresh = () => ({ n: 0 });
+      void m.update(join(dir, "a.json"), fresh, (c) => ({ n: c.n + 1 }), "a").then(() => done.push("a"));
+      void m.update(join(dir, "b.json"), fresh, (c) => ({ n: c.n + 1 }), "b").then(() => done.push("b"));
+      void m.update(join(dir, "a.json"), fresh, (c) => ({ n: c.n + 1 }), "a").then(() => done.push("a2"));
+      await m.idle();
+      expect(done.sort()).toEqual(["a", "a2", "b"]);
+      expect(JSON.parse(readFileSync(join(dir, "a.json"), "utf8"))).toEqual({ n: 2 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("with nothing queued it is already settled", async () => {
+    await expect(createKeyedJsonMutator().idle()).resolves.toBeUndefined();
+  });
+});
 
 describe("resolveDataDir", () => {
   // The default is still one hop up from src/ — the mutation this guards is a wrong hop count.

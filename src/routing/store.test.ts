@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, routingWarningsStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
+import { stallBunWrite } from "../../test/stallBunWrite";
+import { settled } from "../../test/stateLeaks";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, resetRoutingWritesForTest, routingPath, routingStoreStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -593,14 +595,55 @@ describe("readRouting says what it ignored (#260)", () => {
 
   // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track
   // the live record.
-  test("routingWarningsStateForTest counts what has been said", async () => {
+  test("routingStoreStateForTest counts what has been said", async () => {
     write(music({ [GUILD]: { commands: "none" } }));
-    expect(routingWarningsStateForTest().said).toBe(0);
+    expect(routingStoreStateForTest().said).toBe(0);
     await said(async () => {
       await readRouting(dir);
       await readRouting(dir);
     });
-    expect(routingWarningsStateForTest().said).toBe(1);
+    expect(routingStoreStateForTest().said).toBe(1);
+  });
+
+  // One queue at a time: queued together, one write always finishes first, and `writes` would pass
+  // while ignoring that queue.
+  test("routingStoreStateForTest's writes settle only once a queued routing write has", async () => {
+    let done = false;
+    void mutateRouting(dir, withPlugin("music")).then(() => (done = true));
+    await routingStoreStateForTest().writes;
+    expect(done).toBe(true);
+  });
+
+  test("routingStoreStateForTest's writes settle only once a queued secrets write has", async () => {
+    let done = false;
+    void mutateSecrets(dir, (s) => s).then(() => (done = true));
+    await routingStoreStateForTest().writes;
+    expect(done).toBe(true);
+  });
+
+  // What the guard runs once it has waited, so a write that never finishes can't hold every later
+  // test up. One stuck write per file, each held stuck rather than hoped to be still running, so
+  // each queue's reset is checked on its own.
+  test("resetRoutingWritesForTest starts the routing file on a fresh queue, dropping a write that never finishes", async () => {
+    const stall = stallBunWrite();
+    try {
+      void mutateRouting(dir, withPlugin("music"));
+      await stall.reached;
+      const before = routingStoreStateForTest().writes;
+      resetRoutingWritesForTest();
+      expect(await settled(routingStoreStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+    } finally {
+      stall.restore();
+    }
+  });
+
+  test("resetRoutingWritesForTest starts the secrets file on a fresh queue, dropping a write that never finishes", async () => {
+    void mutateSecrets(dir, (s) => s, undefined, { writeFile: () => new Promise<void>(() => {}) });
+    const before = routingStoreStateForTest().writes;
+    resetRoutingWritesForTest();
+    expect(await settled(routingStoreStateForTest().writes)).toBe(true);
+    expect(await settled(before)).toBe(false);
   });
 
   test("the same problem is said again once the record is cleared (the test seam works)", async () => {

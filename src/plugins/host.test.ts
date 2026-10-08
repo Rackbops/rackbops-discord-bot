@@ -9,6 +9,8 @@ import type { HostDeliveryDeps, LoadedPlugin } from "./host";
 import { pinsFromState, selectPlugins } from "./registry";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
 import { freshRouting, type DiscoveryFile, type RoutingFile } from "../routing/model";
+import { stallBunWrite } from "../../test/stallBunWrite";
+import { settled } from "../../test/stateLeaks";
 // DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
 // once, for every test file, by test/setup.ts's bunfig preload (#136).
 const {
@@ -26,6 +28,9 @@ const {
   buildPluginStateFile,
   readPluginState,
   writePluginState,
+  mutatePluginState,
+  pluginHostStateForTest,
+  resetPluginHostForTest,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
   dispatchPluginInteractionOutcome,
@@ -54,6 +59,40 @@ const {
 } = await import("../restart");
 
 const realStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
+
+// The test-state guard (test/stateGuard.ts) waits on this, so it must track the live state.json queue.
+describe("pluginHostStateForTest", () => {
+  test("its writes settle only once a queued state.json update has", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-state-writes-"));
+    try {
+      let written = false;
+      void mutatePluginState(dir, (s) => ({ ...s, writtenAt: "probe" })).then(() => (written = true));
+      await pluginHostStateForTest().writes;
+      expect(written).toBe(true);
+      expect((await readPluginState(dir, realStorage)).writtenAt).toBe("probe");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // What the guard runs once it has waited, so a write that never finishes can't hold every later
+  // test up. The old write is held stuck, not hoped to be still running.
+  test("resetPluginHostForTest starts state.json on a fresh queue, dropping a write that never finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "host-state-reset-"));
+    const stall = stallBunWrite();
+    try {
+      void mutatePluginState(dir, (s) => s);
+      await stall.reached;
+      const before = pluginHostStateForTest().writes;
+      resetPluginHostForTest();
+      expect(await settled(pluginHostStateForTest().writes)).toBe(true);
+      expect(await settled(before)).toBe(false);
+    } finally {
+      stall.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 function makeLog() {
   const calls: { level: "info" | "warn" | "error"; message: string }[] = [];

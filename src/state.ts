@@ -107,7 +107,11 @@ export async function saveStateTo(path: string, data: BotState): Promise<void> {
  * so one call's failure can't permanently wedge every later call behind a rejected chain link —
  * the promise returned to *that* caller still reflects its own real outcome.
  */
-export function createStateWriter(path: string): { save: (data: BotState) => Promise<void> } {
+export function createStateWriter(path: string): {
+  save: (data: BotState) => Promise<void>;
+  /** Settles once every save queued so far has (what the test-state guard reads). */
+  idle: () => Promise<void>;
+} {
   let chain: Promise<void> = Promise.resolve();
   return {
     save(data: BotState): Promise<void> {
@@ -118,10 +122,40 @@ export function createStateWriter(path: string): { save: (data: BotState) => Pro
       chain = next.catch(() => {});
       return next;
     },
+    idle: () => chain,
   };
 }
 
-const stateWriter = createStateWriter(STATE_FILE);
+// (`let` only so resetStateWriterForTest can start a fresh queue.)
+let stateWriter = createStateWriter(STATE_FILE);
+
+// `state` as it was loaded, for the test-state guard (test/stateGuard.ts): tests change fields of
+// the shared object (attemptedUpdateToSha, pendingUpdateReport, ...) and must put them back.
+const loadedState: BotState = structuredClone(state);
+
+/** The keys of `state` that differ from what was loaded, and the writer's queue. */
+export function botStateForTest(): { changedKeys: string[]; writes: Promise<void> } {
+  const current = state as unknown as Record<string, unknown>;
+  const loaded = loadedState as unknown as Record<string, unknown>;
+  const keys = [...new Set([...Object.keys(current), ...Object.keys(loaded)])];
+  return { changedKeys: keys.filter((k) => !Bun.deepEquals(current[k], loaded[k])), writes: stateWriter.idle() };
+}
+
+/** Puts `state` back to what was loaded — in place, since every importer holds this one object. */
+export function resetBotStateForTest(): void {
+  const current = state as unknown as Record<string, unknown>;
+  for (const k of Object.keys(current)) delete current[k];
+  Object.assign(current, structuredClone(loadedState));
+}
+
+/** Starts the writer on a fresh, empty queue, for the test-state guard: it runs this once it has
+ *  waited for the queue, so a save that never finishes can't hold every later test up. A save still
+ *  running is not stopped (and can overlap the next one on the same temp file), only no longer
+ *  waited for — so not for a test's own cleanup, where it would hide a leaked save from the guard:
+ *  a test awaits its saves instead. */
+export function resetStateWriterForTest(): void {
+  stateWriter = createStateWriter(STATE_FILE);
+}
 
 export function saveState(): Promise<void> {
   // Cap each repo's release-id history so the file never grows unbounded.

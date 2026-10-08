@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 // `update.ts` pulls in the `config` singleton, which resolves process.env at import time -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelation } =
+const { checkForUpdate, decideUpdate, sameSha, buildUpdateReport, fetchShaRelation, resetUpdateForTest, updateStateForTest } =
   await import("./update");
 const { beginHandoff, endHandoff } = await import("./restart");
 const { config } = await import("./config");
@@ -367,6 +367,20 @@ describe("checkForUpdate — concurrent calls before any handoff begins (#51 ite
     expect(firstResult.decision).toBe("restart");
     expect(secondResult.decision).toBe("busy");
     expect(redeployCalls).toBe(1);
+  });
+
+  // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track the
+  // live flag, and the reset must really release it.
+  test("updateStateForTest reports a check in flight, and resetUpdateForTest releases it", async () => {
+    stubGitHub();
+    const deps = { redeployAvailable: async () => true, redeploy: async () => ({ outcome: "failed" as const }) };
+    expect(updateStateForTest().checkInFlight).toBe(false);
+    const first = checkForUpdate({ force: true }, deps);
+    expect(updateStateForTest().checkInFlight).toBe(true);
+    resetUpdateForTest();
+    expect(updateStateForTest().checkInFlight).toBe(false);
+    await first;
+    expect(updateStateForTest().checkInFlight).toBe(false);
   });
 
   // The flag must release on every exit, not just the "restart" path — otherwise one busy/current/

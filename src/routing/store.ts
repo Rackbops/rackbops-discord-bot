@@ -39,8 +39,9 @@ export function secretsPath(dataDir: string): string {
 // overlapping callers each read the same file and the later write silently drop the earlier change
 // -- a lost update, not a corrupt file. The queue is keyed by the path STRING, so every caller must
 // spell the directory the same way (production passes `DATA_DIR`); `d`, `d/` and `d\` are three
-// queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason.
-const routingMutator = createKeyedJsonMutator<RoutingFile>();
+// queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason. (`let` only
+// so resetRoutingWritesForTest can start a fresh queue.)
+let routingMutator = createKeyedJsonMutator<RoutingFile>();
 
 // What `readRouting` has already said about a damaged file (#260). It is on the path of every plugin command
 // used in a server (`gateCommand`) and every announcement since #243, and of every join since #259, so a
@@ -53,9 +54,23 @@ export function resetRoutingWarningsForTest(): void {
   said.clear();
 }
 
-/** What `resetRoutingWarningsForTest` resets, for the test-state guard (test/stateGuard.ts). */
-export function routingWarningsStateForTest(): { said: number } {
-  return { said: said.size };
+/** What the test-state guard (test/stateGuard.ts) reads here: the warnings said (which
+ *  `resetRoutingWarningsForTest` resets), and every write queued on the routing and secrets files —
+ *  `writes` settles once they all have (which `resetRoutingWritesForTest` drops). */
+export function routingStoreStateForTest(): { said: number; writes: Promise<void> } {
+  return {
+    said: said.size,
+    writes: Promise.all([routingMutator.idle(), ...secretsQueues.values()]).then(() => {}),
+  };
+}
+
+/** Starts the routing and secrets files on fresh, empty queues, for the test-state guard: it runs
+ *  this once it has waited for them, so a write that never finishes can't hold every later test up.
+ *  A write still running is not stopped, only no longer waited for — so not for a test's own
+ *  cleanup, where it would hide a leaked write from the guard: a test awaits its writes instead. */
+export function resetRoutingWritesForTest(): void {
+  routingMutator = createKeyedJsonMutator<RoutingFile>();
+  secretsQueues.clear();
 }
 
 /** What went wrong, as text that is clipped (an engine's message can echo a hostile key) and cannot throw. */
