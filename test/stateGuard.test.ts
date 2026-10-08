@@ -260,9 +260,12 @@ describe("stateLeakMessage", () => {
     expect(message).toContain("src/a.ts: first leak; second leak | src/b.ts: third leak");
   });
 
-  // A reset hook starts a fresh queue but does not stop a write already running on the old one.
+  // A reset hook starts a fresh queue but does not stop a write already running on the old one, and
+  // a test that calls one of the guard's own queue resets only hides the write from the guard.
   test("says how to clean up a write or job still running, not just state", () => {
-    expect(stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }])).toContain("await any write or job it started");
+    const message = stateLeakMessage([{ module: "src/a.ts", leaks: ["x"] }]);
+    expect(message).toContain("await any write or job it started");
+    expect(message).toContain("the guard's own queue resets would only hide it");
   });
 
   test("says when queued work outlasted the guard's wait, and only then", () => {

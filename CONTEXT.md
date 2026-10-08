@@ -474,10 +474,11 @@ _Avoid_: server list, guild cache
   leave every queue alone, so a job a test leaks still reaches the guard after that test's own
   `afterEach`. Each such reset of a module that holds a queue — `resetBotStateForTest()`,
   `resetRoutingForTest()`, `resetRoutingWarningsForTest()` and `resetPluginRequestsForTest()` —
-  has a test in its module's own test file pinning that (`plugins/host.ts` offers tests none: its
-  only reset is the guard's own). (`resetRoutingForTest()` and
-  `resetPluginRequestsForTest()` used to replace their queue too, so `routing/live.test.ts`'s and
-  `plugins/requests.test.ts`'s cleanup dropped a leaked job before the guard looked.) The
+  has a test in its module's own test file pinning that, one per queue it leaves alone
+  (`plugins/host.ts` has no such reset: its only one is the guard's own). (`resetRoutingForTest()`
+  and `resetPluginRequestsForTest()` used to replace their queue too, so cleanup that called them
+  inside a test — `routing/live.test.ts`'s and `plugins/requests.test.ts`'s `afterEach`,
+  `announce.test.ts`'s `finally` blocks — dropped a leaked job before the guard looked.) The
   table is `test/stateGuard.ts`, the decisions `test/stateLeaks.ts`;
   `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which leaks from the table's first
   and last modules, leaves a request drain running, and leaves a write that never finishes — as a

@@ -647,8 +647,9 @@ describe("readRouting says what it ignored (#260)", () => {
   });
 
   // Tests clean up with resetRoutingWarningsForTest, as this file's afterEach does: were it to drop
-  // the write queues too, a write the test leaked would be gone before the guard looked.
-  test("resetRoutingWarningsForTest leaves the write queues alone, so a leaked write still reaches the guard", async () => {
+  // a write queue too, a write the test leaked would be gone before the guard looked. One stuck
+  // write per file: with both stuck, either one would keep `writes` pending on its own.
+  test("resetRoutingWarningsForTest leaves the routing file's queue alone, so a leaked write still reaches the guard", async () => {
     const stall = stallBunWrite();
     try {
       void mutateRouting(dir, withPlugin("music"));
@@ -657,6 +658,16 @@ describe("readRouting says what it ignored (#260)", () => {
       expect(await settled(routingStoreStateForTest().writes)).toBe(false);
     } finally {
       stall.restore();
+      resetRoutingWritesForTest(); // the stuck write would otherwise fail this test through the guard
+    }
+  });
+
+  test("resetRoutingWarningsForTest leaves the secrets file's queue alone, so a leaked write still reaches the guard", async () => {
+    try {
+      void mutateSecrets(dir, (s) => s, undefined, { writeFile: () => new Promise<void>(() => {}) });
+      resetRoutingWarningsForTest();
+      expect(await settled(routingStoreStateForTest().writes)).toBe(false);
+    } finally {
       resetRoutingWritesForTest(); // the stuck write would otherwise fail this test through the guard
     }
   });
