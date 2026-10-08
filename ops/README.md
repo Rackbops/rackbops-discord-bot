@@ -824,7 +824,8 @@ runbook writes it.
 DISCORD_TOKEN=<Pip's bot token>
 # Required by the core (src/config.ts:79) but idle under this file: the release watcher is off
 # (WATCHED_REPOS=none) and the service grants no principal a channel post unless an operator assigns one
-# (Rackbops/discord-mcp contracts/config.schema.json:112), so nothing posts here. Use a private channel
+# (Rackbops/discord-mcp contracts/config.schema.json:112), and the mcp plugin uses host.post, not
+# host.announce, the one path that targets this channel, so nothing posts here. Use a private channel
 # in the approved server. If the watcher is ever turned on, give the Pip bot View Channel and Send Messages there by channel
 # overwrite: a post to a channel it cannot see throws before the release is marked seen, and the next
 # 15-minute poll fails the same way, forever (src/announce.ts:95, :508-512; the poll src/announce.ts:28).
@@ -866,8 +867,8 @@ BOT_BRANCH=main
 # records it in plugins/state.json on the state volume (docker-compose.yml:44); from then on it
 # moves only on a request (the mailbox above, or an explicit name@version pin here followed by
 # bot-ops.sh recreate), never on its own (src/plugins/install.ts:289-293, :318-320). A pin would win
-# over the mailbox's target at every boot and so make the mailbox route inert while set. This
-# section's plugin cites are 0.3.1's.
+# over the mailbox's target at every boot and so make the mailbox route inert while set. The plugin
+# cites in this block are 0.3.1's (Rackbops/rackbops-bot-plugins 2820afe).
 PLUGINS=mcp
 PLUGIN_INDEX_URL=
 # The host router (ADR-0007): the bridge answers under /mcp/ on this port, inside the compose network
@@ -888,11 +889,13 @@ so the new key is read (section 4). Never leave a blank `MCP_BRIDGE_TOKEN=` line
 makes it the empty string, not unset, the host copies plugin keys raw (`src/plugins/host.ts:85`, unlike
 the core's `optional()` at `src/config.ts:65-68`, which is what makes `KEY=` mean "off" for core keys),
 the plugin treats only `undefined` as unconfigured (`plugins/mcp/src/http.ts:187`), and it then answers
-`401` to every bearer, the service's correct one included (`plugins/mcp/src/auth.ts:66-69`) -- which an
-unauthenticated probe cannot tell from healthy; section 7's authenticated probe can. The append would
+`401` to every bearer, the service's correct one included (`plugins/mcp/src/auth.ts:66-69`), each one
+counting toward the plugin's per-IP lockout (`:63-67`) -- which an unauthenticated probe cannot tell from
+healthy; section 7's authenticated probe can. The append would
 still work after such a line (the last value wins in Compose and in `bot-ops.sh`), but check with
 `grep -c '^MCP_BRIDGE_TOKEN=' /opt/rackbops-discord-bot/pip/.env` (a count, never the value) before and
-after. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
+after. Leave the file ending in a newline: `add-bridge.md` section 3 appends with `>>`, which would
+otherwise fuse the new line onto the last one. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
 filled (`ops/install.sh:269-270`); leave it.
 
 ### 3. What the core still does
@@ -945,7 +948,8 @@ This side supplies three values and two facts:
 - the entry's `commandPrefix` must equal `COMMAND_PREFIX=pip`: the host prefixes every plugin command, and
   the service shows users that name when it asks for a pairing code (`add-bridge.md` section 2);
 - Pip is a production bridge, `test: false`: production bridges are tried first when a code is redeemed,
-  and a pinned flag refuses start if it changes later (`add-bridge.md` sections 2 and 6).
+  and a pinned flag refuses start if it changes later (`add-bridge.md` section 2 for the order, section 6
+  for the refusal).
 
 `GET /mcp/capabilities` answers `401` without the bearer (and `503` if `MCP_BRIDGE_TOKEN` is unset in the
 container: `plugins/mcp/src/http.ts:186-191`, `plugins/mcp/src/auth.ts:63-71`), so a `401` from inside
