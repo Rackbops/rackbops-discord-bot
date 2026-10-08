@@ -13,7 +13,13 @@
 // one made outside a test — by a beforeAll or afterAll, or by async work finishing late — lands on
 // whichever test runs next, and goes uncaught if none does (nothing is left to inherit it then).
 // After failing a test the guard resets every guarded module, so one leak fails one test instead of
-// every test after it.
+// every test after it — except a queue left with a job still running: resetting a queue does not
+// stop its job, which can change guarded state again while the next test runs and fail that one
+// too. (The same is why a test should await the queue, e.g. routingIdleForTest(), before resetting.)
+//
+// Loading those modules here means config.ts loads for every run, even of a single file that never
+// imports it — so a value config.ts refuses, left in your shell (HTTP_PORT=abc, a malformed
+// PLUGINS, ...), stops every run before its first test. Unset it; CI sets none of them.
 
 import { afterEach } from "bun:test";
 import { findStateLeaks, resetAllState } from "./stateGuard";

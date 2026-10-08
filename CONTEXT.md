@@ -433,23 +433,31 @@ _Avoid_: server list, guild cache
   after that file's own `afterEach` hooks, measured on Bun 1.4.2 — and fails the test if any
   module's `…StateForTest()` snapshot differs from what its reset hooks leave, naming the module
   and each leaked field (a queue counts only while it still has work pending). It then runs every
-  reset hook, so one leak fails one test rather than every test after it. It has to be a second
-  preload: `announce.ts` and the routing modules read the environment `test/setup.ts` primes when
-  they load, and a static import in `setup.ts` would be hoisted above that priming. A leak made
+  reset hook, so one leak fails one test rather than every test after it — except a queue left
+  with a job still running: resetting a queue does not stop its job, which can change guarded state
+  again during the next test and fail that one too, so await the queue (`routingIdleForTest()`)
+  before resetting it. It has to be a second preload: `announce.ts` and the routing modules read
+  the environment `test/setup.ts` primes when they load, and a static import in `setup.ts` would be
+  hoisted above that priming. A side effect: `config.ts` now loads for every run, even of one file
+  that never imports it, so a value it refuses left in your shell (`HTTP_PORT=abc`, a malformed
+  `PLUGINS`, ...) stops every run before its first test — unset it. A leak made
   inside a test fails that test, whatever the order — unless that test's own `afterEach` throws,
   since Bun then skips the guard for it. Such a leak, and one made outside a test — by a
   `beforeAll` or `afterAll`, or by async work that finishes after its test — is charged to
   whichever test runs next, possibly in the next file, and goes uncaught if no test runs after it
   (nothing is left to inherit it then). Left outside the check: `restart.ts`'s exit stub
   (`setExitFn`, which `resetForTest` doesn't own), `announce.ts`'s `tickGeneration` (a tick only
-  compares it with the one it took), and module state no hook resets (`announce.ts`'s release,
-  update and plugin poll times and `pluginStateReady`; `routing/store.ts`'s secrets write queues;
-  `update.ts`'s `checkInFlight`). This state can't carry from one test to the next, so clean up by
+  compares it with the one it took), and all module state no hook resets — for example `state.ts`'s
+  exported `state` (which `update.test.ts` resets by hand) and its writer, `announce.ts`'s release,
+  update and plugin poll times, `pluginStateReady` and release-reachability record,
+  `routing/store.ts`'s routing and secrets write queues, `plugins/host.ts`'s state mutator, and
+  `update.ts`'s `checkInFlight`. Guarded state can't carry from one test to the next, so clean up by
   the end of each test — an `afterEach` calling the module's reset hook, as `restart.test.ts`,
   `routing/live.test.ts` and `routing/store.test.ts` do. The table is `test/stateGuard.ts`, the
-  decisions `test/stateLeaks.ts`; `test/stateGuard.test.ts` runs `test/restartLeak.fixture.ts` as a
-  child `bun test` to prove the hook is really wired (the `.fixture.ts` name keeps discovery from
-  running it in the main suite).
+  decisions `test/stateLeaks.ts`; `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which
+  leaks from the table's first and last modules — as a child `bun test` to prove the hook checks
+  and resets the whole table (the `.fixture.ts` name keeps discovery from running it in the main
+  suite).
 - **`admins.json` is written through one serialised mutator per process, with a per-call temp name
   (#228).** The panel's `AdminStore.mutateDynamic` (`ops/admin/server.ts`) is the `src/storage.ts`
   `writeJsonAtomic`/`createJsonWriter` parallel for the admin allow-list: two concurrent

@@ -136,8 +136,9 @@ describe("routingWarningLeaks", () => {
   test("nothing said is no leak", () => {
     expect(routingWarningLeaks({ said: 0 })).toEqual([]);
   });
+  // 1, the smallest leak: most real ones are a single warning.
   test("names warnings already said", () => {
-    expect(routingWarningLeaks({ said: 3 })).toEqual([expect.stringContaining("3 routing.json warning(s)")]);
+    expect(routingWarningLeaks({ said: 1 })).toEqual([expect.stringContaining("1 routing.json warning(s)")]);
   });
 });
 
@@ -227,7 +228,7 @@ describe("findStateLeaks and resetAllState", () => {
 });
 
 // The consumer boundary: the table is only worth anything if test/stateGuardHook.ts really runs it
-// after every test. This runs test/restartLeak.fixture.ts as a child `bun test`, rooted at the repo
+// after every test. This runs test/stateLeak.fixture.ts as a child `bun test`, rooted at the repo
 // so bunfig.toml's preloads apply, and reads what the guard did to it from the child's JUnit
 // report — structured, so the result doesn't hang on console formatting (FORCE_COLOR, for one,
 // turns the console's `(fail)` marker into a coloured `✗`).
@@ -255,7 +256,7 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
     const report = join(dir, "junit.xml");
     try {
       const child = Bun.spawnSync(
-        [process.execPath, "test", "./test/restartLeak.fixture.ts", "--reporter=junit", `--reporter-outfile=${report}`],
+        [process.execPath, "test", "./test/stateLeak.fixture.ts", "--reporter=junit", `--reporter-outfile=${report}`],
         {
           cwd: join(import.meta.dir, ".."),
           // The child takes well under a second; this bounds it on its own, whatever the runner does.
@@ -274,17 +275,23 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
     }
   }, CHILD_TIMEOUT_MS + 10_000); // longer than the child's own bound, so that bound is what fires
 
-  test("fails the run, and the leaking test, when a test leaves a handoff active", () => {
+  // The literal, not STATE_GUARD: it is what someone searches a CI log for.
+  test("fails the run, and each leaking test, naming the first and the last module in the table", () => {
     expect(exitCode).toBe(1);
-    const leaking = cases.find((c) => c.name === "leaks a handoff");
-    expect(leaking?.failure).toStartWith(STATE_GUARD);
-    expect(leaking?.failure).toContain('src/restart.ts: handoff active ("fixture leak")');
+    const handoff = cases.find((c) => c.name === "leaks a handoff");
+    expect(handoff?.failure).toStartWith("[test-state guard]");
+    expect(handoff?.failure).toContain('src/restart.ts: handoff active ("fixture leak")');
+    const delivery = cases.find((c) => c.name === "leaks a failed-delivery count");
+    expect(delivery?.failure).toStartWith("[test-state guard]");
+    expect(delivery?.failure).toContain("src/plugins/updates.ts: 1 failed notice delivery count(s)");
   });
 
-  test("fails only the leaking test, then resets so the next one starts clean", () => {
+  test("fails only the leaking tests, and resets after each so the next one starts clean", () => {
     expect(cases.map((c) => [c.name, c.failure === undefined ? "pass" : "fail"])).toEqual([
       ["leaks a handoff", "fail"],
       ["starts clean after the guard caught the leak", "pass"],
+      ["leaks a failed-delivery count", "fail"],
+      ["starts clean after that leak too", "pass"],
     ]);
   });
 });

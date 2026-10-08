@@ -1,5 +1,6 @@
-// The test-state guard's table: every module whose module-level state outlives a test, with the
-// snapshot it reads, the decision it applies (test/stateLeaks.ts) and the module's own reset hooks.
+// The test-state guard's table: every module whose module-level state has a reset...ForTest hook,
+// with the snapshot it reads, the decision it applies (test/stateLeaks.ts) and those reset hooks.
+// Module state with no reset hook is not in it (see CONTEXT.md's test-state guard gotcha).
 // test/stateGuardHook.ts runs it after every test. No side effects here, so a test can import it.
 //
 // Imports modules that read `config` and `storage` at load, so it may only be loaded once
