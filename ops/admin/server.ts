@@ -765,8 +765,9 @@ export const HOST_API_VERSION = 1;
  *  2 = env-schema (#205).
  *  3 = routing-get, the routing / webhook plugin-request actions, write-only plugin secrets (#240).
  *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256).
- *  5 = recreate (#277). */
-export const REQUIRED_BOT_OPS_SCHEMA = 5;
+ *  5 = recreate (#277).
+ *  6 = WATCHED_REPOS accepts `none` (#342). */
+export const REQUIRED_BOT_OPS_SCHEMA = 6;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed

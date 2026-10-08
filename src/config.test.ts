@@ -74,6 +74,18 @@ describe("resolveConfig", () => {
     ).toEqual(["nazumods/wow", "roshne/ActionBarMaster"]);
   });
 
+  test("WATCHED_REPOS=none turns the release watcher off: watchedRepos is empty", () => {
+    expect(resolveConfig({ ...base, WATCHED_REPOS: "none" }).watchedRepos).toEqual([]);
+    expect(resolveConfig({ ...base, WATCHED_REPOS: " none " }).watchedRepos).toEqual([]);
+    // Only the exact lowercase word is the switch; anything else keeps today's list parsing.
+    expect(resolveConfig({ ...base, WATCHED_REPOS: "NONE" }).watchedRepos).toEqual(["NONE"]);
+  });
+
+  test("none mixed into a WATCHED_REPOS list is refused by name", () => {
+    expect(() => resolveConfig({ ...base, WATCHED_REPOS: "none,acme/thing" })).toThrow(/WATCHED_REPOS/);
+    expect(() => resolveConfig({ ...base, WATCHED_REPOS: "acme/thing, none" })).toThrow(/WATCHED_REPOS/);
+  });
+
   test("an empty WATCHED_REPOS falls back to GITHUB_REPO", () => {
     expect(resolveConfig({ ...base, WATCHED_REPOS: "" }).watchedRepos).toEqual([
       "Rackbops/rackbops-discord-bot",
