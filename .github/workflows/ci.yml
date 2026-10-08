@@ -42,46 +42,14 @@ jobs:
         run: bun test
 
       # The same suite again in a shuffled order, so a test that only passes because of what ran
-      # before it fails here instead of staying latent (#385: restart.test.ts leaked an active
-      # handoff into update.test.ts, invisible in the default order). A fresh seed every run; Bun
-      # prints it as ` --seed=N` above the totals, and `bun test --randomize --seed N` reproduces
-      # that exact order locally. A failure here but not in `Test` above is an order dependency.
+      # before it gets a chance to fail instead of staying latent (#385: restart.test.ts leaked an
+      # active handoff into update.test.ts, invisible in the default order). One run samples one
+      # order -- a fresh seed every run, so coverage builds up across PRs rather than being
+      # guaranteed on any one. Bun prints the seed as ` --seed=N` above the totals, and
+      # `bun test --randomize --seed N` reproduces that exact order locally. A failure here but not
+      # in `Test` above is most likely an order dependency.
       - name: Test (randomized order)
         run: bun test --randomize
-
-      # PROBE (temporary, removed before merge): is the Linux suite -- including the tests that
-      # skip on Windows -- order-clean across many seeds?
-      - name: PROBE full suite randomized, seeds 1-20
-        run: |
-          bad=""
-          for s in $(seq 1 20); do
-            if bun test --randomize --seed "$s" > "/tmp/seed-$s.log" 2>&1; then
-              echo "seed $s: ok $(grep -E '^ *[0-9]+ (pass|skip|fail)$' "/tmp/seed-$s.log" | tr -s ' ' | paste -sd' ')"
-            else
-              echo "seed $s: FAILED"
-              grep -E '^\(fail\)' "/tmp/seed-$s.log" || tail -40 "/tmp/seed-$s.log"
-              bad="$bad $s"
-            fi
-          done
-          echo "failing seeds:${bad:- none}"
-          [ -z "$bad" ]
-
-      # PROBE (temporary, removed before merge): with #385's afterEach removed, does a randomized
-      # run exit non-zero on Linux for some seeds? Mutates the CI workspace only.
-      - name: PROBE order bug fails a randomized run on Linux
-        run: |
-          sed -i '/^afterEach(() => {$/,/^});$/d' src/restart.test.ts
-          echo "afterEach mentions left (expect 1, the import): $(grep -c afterEach src/restart.test.ts)"
-          bad=""
-          for s in $(seq 1 30); do
-            if ! bun test --randomize --seed "$s" src/restart.test.ts src/update.test.ts > "/tmp/mut-$s.log" 2>&1; then
-              bad="$bad $s"
-            fi
-          done
-          echo "seeds that exit non-zero with the fix removed:${bad:- none}"
-          first=$(echo $bad | cut -d' ' -f1)
-          [ -n "$first" ] && grep -E '^\(fail\)|--seed=|^ *[0-9]+ (pass|fail)$' "/tmp/mut-$first.log"
-          [ -n "$bad" ]
 
   # #83, Phase 2 of #80's CI plan: build-only validation that both images still build --
   # no push, no registry, no secrets. Every var docker-compose.yml's admin service
