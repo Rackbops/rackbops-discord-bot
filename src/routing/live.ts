@@ -317,7 +317,9 @@ export function resetRoutingForTest(): void {
 /** What `resetRoutingForTest` resets, for the test-state guard (test/stateGuard.ts). `chain` is
  *  handed over as is: the guard asks whether it is still pending. `lastRegistrations` is left out:
  *  nothing reads it without a `context` (`refreshDiscovery` does nothing before `initRouting`), and
- *  `initRouting` clears it — so a leftover value cannot reach a later test. */
+ *  `initRouting` clears it — so a leftover value cannot reach a later test, unless a job was still
+ *  running when the queue was reset (see test/stateGuardHook.ts's queue caveat), which guarding
+ *  this field would not catch either. */
 export interface RoutingStateForTest {
   initialized: boolean;
   said: number;

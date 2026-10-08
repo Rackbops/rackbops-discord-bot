@@ -1,7 +1,7 @@
 // Run only by test/stateGuard.test.ts, as a child `bun test` — the `.fixture.ts` name keeps the
 // main run's discovery from picking it up. It leaks on purpose from the FIRST and the LAST entry of
 // test/stateGuard.ts's table (src/restart.ts, src/plugins/updates.ts), so the child run shows that
-// test/stateGuardHook.ts checks and resets the whole table, not just its head.
+// test/stateGuardHook.ts reaches both ends of the table, not just its head, and resets after each.
 
 import { expect, test } from "bun:test";
 import { checkPluginUpdates, pluginUpdateStateForTest, type PluginUpdateDeps } from "../src/plugins/updates";

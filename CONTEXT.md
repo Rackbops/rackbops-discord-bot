@@ -455,9 +455,10 @@ _Avoid_: server list, guild cache
   the end of each test — an `afterEach` calling the module's reset hook, as `restart.test.ts`,
   `routing/live.test.ts` and `routing/store.test.ts` do. The table is `test/stateGuard.ts`, the
   decisions `test/stateLeaks.ts`; `test/stateGuard.test.ts` runs `test/stateLeak.fixture.ts` — which
-  leaks from the table's first and last modules — as a child `bun test` to prove the hook checks
-  and resets the whole table (the `.fixture.ts` name keeps discovery from running it in the main
-  suite).
+  leaks from the table's first and last modules — as a child `bun test` to prove the real hook
+  reaches both ends of the table and resets after each leak (the `.fixture.ts` name keeps discovery
+  from running it in the main suite); that every row is checked and reset is pinned by the
+  table-identity and fake-table loop tests in the same file.
 - **`admins.json` is written through one serialised mutator per process, with a per-call temp name
   (#228).** The panel's `AdminStore.mutateDynamic` (`ops/admin/server.ts`) is the `src/storage.ts`
   `writeJsonAtomic`/`createJsonWriter` parallel for the admin allow-list: two concurrent
