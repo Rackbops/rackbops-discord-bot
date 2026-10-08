@@ -740,7 +740,7 @@ visible sender of **owner result DMs**: a result sent through the `pip` bridge o
 `Rackbops/discord-mcp` service arrives as a DM *from the Pip application* instead of from prod, debug or
 Clerk. A `file:line` in this section is as read on `main` by the change that last touched the sentence;
 section 3's table names its own commit. Plugin cites are `plugins/mcp` at 0.3.1
-(`Rackbops/rackbops-bot-plugins` `2820afe`).
+(`Rackbops/rackbops-bot-plugins` `2820afe`); discord-mcp cites are its `main` at `fe46591`.
 
 Two identities are involved, and they are not the same thing:
 
@@ -758,7 +758,7 @@ Any member of the approved server can run `/pipagent register` and then `pair`, 
 their own with the same `dm:self` grant: the plugin's `agent` command sets no default member permission
 (the builder, `plugins/mcp/src/commands.ts:59-64` at 0.3.1), the host adds none
 (`src/plugins/host.ts:299-329`), an unplaced plugin's command is allowed everywhere in the server
-(`src/routing/resolve.ts:130-134`), and the service hands every `u-<id>@pip` its service-wide
+(`src/routing/resolve.ts:130-134`; Pip places no plugin, section 3's `/pipagent` row), and the service hands every `u-<id>@pip` its service-wide
 `defaultUserGrants` with no per-bridge allowlist (discord-mcp `src/service/principals.ts:35-41`,
 `contracts/config.schema.json:108-116`). Server membership is the control, not this runbook's "Rod":
 such a principal can DM only itself. Rod accepted that boundary on #332.
@@ -783,8 +783,9 @@ other bot. Official documentation, read 2026-10-06 (both pages now live under `d
   does needs a server-wide permission: a DM is `client.users.fetch` + `user.send`
   (`src/plugins/delivery.ts:36-38`), and the one channel send the core makes on its own, a release post, is
   off under section 2 (`WATCHED_REPOS=none`). A plugin post to the announce channel needs View Channel and
-  Send Messages in that channel alone, which a per-channel permission overwrite grants (Discord's
-  [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read 2026-10-08). Leave
+  Send Messages in that channel alone, which a per-channel permission overwrite can grant (Discord's
+  [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read 2026-10-08, documents
+  per-channel overwrites; the Permissions menu is the one the Getting Started page above walks into). Leave
   **User Install** off. Invite Pip to the one approved server with the install link the
   Installation page gives you.
 - Privileged intents: [Gateway](https://docs.discord.com/developers/topics/gateway) names three,
@@ -963,7 +964,8 @@ In this order:
 
 1. **Stop sending.** First `/pipagent unregister` in Discord: that is the revocation. The bridge refuses a
    delivery to an unregistered user at drain time (`plugins/mcp/src/drain.ts:128-131`,
-   `registry.ts:120-125`), and within roughly 60 seconds the service refuses every **tool call** made with
+   `registry.ts:120-125`, where `unregisterUser` deletes the entry, and `:148`, `:223-226`, where
+   `generationOf` is the check), and within roughly 60 seconds the service refuses every **tool call** made with
    a token paired through that bot (discord-mcp `src/service/registration.ts:30`, `:204-207`,
    `store.ts:1012-1029`; its README, "Revocation": there is no separate revoke call, the token row stays
    and still authenticates and lists tools, but no call succeeds). Then delete the Pip credentials
@@ -973,7 +975,8 @@ In this order:
    memory (`src/shim/cli.ts:190-204`), a backup copy or a `DISCORD_MCP_TOKEN` environment variable still
    authenticates (`cli.ts:99`), a delivery the bridge already accepted is drained at once
    (`plugins/mcp/src/http.ts:54-57`), and one a restart left `unknown` is re-driven by the plugin's tick
-   (`plugins/mcp/src/index.ts:65-80`, `:89-91`), with nothing on Melody consulted.
+   (`plugins/mcp/src/index.ts:65-80`, `:89-91`), with nothing on Melody consulted; only the `unregister`
+   above stops those, because the drain re-checks the registration each time.
 2. **Stop Pip.** `bot-ops.sh` has no stop subcommand (`ops/bot-ops.sh:1361` lists them), so:
 
    ```sh
@@ -1116,7 +1119,8 @@ task could not start and that no DM was sent; do not switch machines, do not rev
 queue a send. When Melody is back, the same event may be run once.
 
 *Stopping it.* `/pipagent unregister` in Discord is the revocation: within about a minute every tool call
-with the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge, not re-run on pip). Renaming
+with the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge, not re-run on pip); the token itself still authenticates and lists tools, it
+just can no longer call one. Renaming
 or deleting `%APPDATA%\discord-mcp-pip` on Melody stops this script instantly and reversibly (it refuses with
 `invalid`, credentials missing, and sends nothing) but revokes nothing: the credential stays valid until
 Rod unregisters.
