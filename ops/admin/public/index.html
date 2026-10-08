@@ -3333,7 +3333,7 @@
     REPORT_ROLE_ID: { hint: "The role allowed to run /report. Not a channel — a report posts in whatever channel /report was run from." },
     ADMIN_USER_IDS: { control: "tags", hint: "Discord user IDs allowed to run /update. Add one per chip.", placeholder: "Discord user ID" },
     AUTO_UPDATE: { control: "select", options: ["true", "false"] },
-    WATCHED_REPOS: { control: "tags", hint: "GitHub repos the bot watches for new releases to announce (owner/repo each). Empty falls back to just GITHUB_REPO.", placeholder: "owner/repo" },
+    WATCHED_REPOS: { control: "tags", hint: "GitHub repos the bot watches for new releases to announce (owner/repo each). Empty falls back to just GITHUB_REPO; the single value none turns release polling off.", placeholder: "owner/repo" },
     BOT_BRANCH: { control: "branch", hint: "The branch self-update (/update, AUTO_UPDATE) builds from. Lists the configured repo's live branches; blank uses the default (main)." },
   };
 

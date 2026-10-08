@@ -13,6 +13,8 @@ const {
   guardedTick,
   resetTickGuardForTest,
   commitReleaseAnnouncements,
+  checkReleases,
+  describeReleaseWatch,
   tickChecks,
   announceTo,
   shouldPollReleases,
@@ -354,10 +356,38 @@ describe("announceTo", () => {
   });
 });
 
-// Scoped to runTick's isolation guarantee (issue #43). The remaining core checks (checkReleases,
-// checkAutoUpdate, and the plugin-request/update passes) call real discord.js / GitHub APIs and aren't
-// exported, so this exercises the actual extracted isolation mechanism onTick delegates to, rather than
-// mocking discord.js's Client end-to-end.
+describe("checkReleases (#342)", () => {
+  const client = {} as unknown as Client;
+
+  test("with no repos it makes no per-repo call", async () => {
+    const calls: string[] = [];
+    await checkReleases(client, [], async (repo) => void calls.push(repo));
+    expect(calls).toEqual([]);
+  });
+
+  test("calls checkRepo once per repo and isolates a throwing one", async () => {
+    const calls: string[] = [];
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    await checkReleases(client, ["a/b", "c/d"], async (repo) => {
+      calls.push(repo);
+      if (repo === "a/b") throw new Error("kaboom");
+    });
+    expect(calls).toEqual(["a/b", "c/d"]);
+    errorSpy.mockRestore();
+  });
+});
+
+describe("describeReleaseWatch (#342)", () => {
+  test("off line for [], watching line otherwise", () => {
+    expect(describeReleaseWatch([])).toBe("[release] watcher off (WATCHED_REPOS=none)");
+    expect(describeReleaseWatch(["a/b", "c/d"])).toBe("[release] watching 2 repo(s): a/b, c/d");
+  });
+});
+
+// Scoped to runTick's isolation guarantee (issue #43). checkReleases is exported with injectable deps
+// (#342) and tested above; the remaining core checks (checkAutoUpdate, and the plugin-request/update
+// passes) call real discord.js / GitHub APIs and aren't exported, so this exercises the actual
+// extracted isolation mechanism onTick delegates to, rather than mocking discord.js's Client end-to-end.
 describe("runTick", () => {
   test("a throwing check doesn't stop the rest from running", async () => {
     const ran: string[] = [];

@@ -79,7 +79,8 @@ set -euo pipefail
 # 4: a plugin's env keys are listed and editable whether or not the plugin is in PLUGINS, so one
 #    env-set can turn a plugin on and configure it (#256).
 # 5: adds recreate (#277).
-readonly BOT_OPS_SCHEMA=5
+# 6: WATCHED_REPOS accepts `none` (#342).
+readonly BOT_OPS_SCHEMA=6
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -205,7 +206,7 @@ ALLOWED_SPEC=(
   # @rackbops/plugin-wow. They are the wow plugin's manifest env keys now, merged into this whitelist at
   # runtime by load_plugin_keys (the same #101 path WARBANDEER_INGEST_PORT uses) — validated with the
   # FORMAT the Plugin Index carries, so their regexes live in the plugin's package.json, not here.
-  'WATCHED_REPOS|^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*$'
+  'WATCHED_REPOS|^(none|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)*)$'
   'AUTO_UPDATE|^(true|false)$'
   'BOT_BRANCH|^[A-Za-z0-9._/-]{1,100}$'
   'COMMAND_PREFIX|^[a-z0-9_-]{1,20}$'

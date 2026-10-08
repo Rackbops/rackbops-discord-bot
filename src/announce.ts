@@ -381,13 +381,26 @@ export function resetDiscoveryGapForTest(): void {
   lastDiscoveryAt = 0;
 }
 
-async function checkReleases(client: Client): Promise<void> {
+/** One line for the boot log: whether the release watcher is on (`WATCHED_REPOS=none` = off). */
+export function describeReleaseWatch(repos: readonly string[]): string {
+  return repos.length === 0
+    ? "[release] watcher off (WATCHED_REPOS=none)"
+    : `[release] watching ${repos.length} repo(s): ${repos.join(", ")}`;
+}
+
+// `repos`/`checkRepo` default to the live config and the real per-repo check; tests inject both.
+// With `repos` empty (WATCHED_REPOS=none) the loop never runs, so no release is ever fetched.
+export async function checkReleases(
+  client: Client,
+  repos: readonly string[] = config.watchedRepos,
+  checkRepo: (repo: string) => Promise<void> = (repo) => checkRepoReleases(client, repo),
+): Promise<void> {
   lastReleasePollAt = Date.now();
   // Poll each watched repo independently: one repo's fetch failure (e.g. a bad name → 404)
   // must not starve the others' announcements on this tick.
-  for (const repo of config.watchedRepos) {
+  for (const repo of repos) {
     try {
-      await checkRepoReleases(client, repo);
+      await checkRepo(repo);
     } catch (err) {
       console.error(`[release] ${repo}`, err);
     }

@@ -228,7 +228,7 @@ later").
 ## Editable keys (whitelist)
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
-`ADMIN_USER_IDS`, `WATCHED_REPOS`, `AUTO_UPDATE`,
+`ADMIN_USER_IDS`, `WATCHED_REPOS` (a list of `owner/repo`, or the single word `none` to turn release polling off), `AUTO_UPDATE`,
 `BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
 against a format regex when it *changes* (see the safety notes below); an empty value clears the
@@ -788,8 +788,8 @@ Comments go on their own lines: neither Compose's `env_file:` loader nor `bot-op
 ```sh
 DISCORD_TOKEN=<Pip's bot token>
 # Required by the core (src/config.ts:78). A private channel in the approved server that only Rod can
-# read: the one unsolicited core output that can exist (a release post, see section 3) lands here,
-# never in a DM.
+# read: the default post target for plugins (section 3), never a DM. With the release watcher off
+# (WATCHED_REPOS=none below) the core posts nothing here of its own.
 ANNOUNCE_CHANNEL_ID=<channel id>
 RELEASE_ANNOUNCE_CHANNEL_ID=
 # The one approved server: with it set, registration is one guild-scoped PUT there and nowhere else
@@ -801,8 +801,8 @@ DISCORD_SERVER_ID=<server id>
 # Rackbops/discord-mcp deploy/config.multi-bridge.example.json:8.
 COMMAND_PREFIX=pip
 GITHUB_REPO=Rackbops/rackbops-discord-bot
-# Blank falls back to GITHUB_REPO (src/config.ts:149); that repository publishes no releases.
-WATCHED_REPOS=
+# `none` turns release polling off (src/config.ts:87, :159); blank would fall back to GITHUB_REPO.
+WATCHED_REPOS=none
 GITHUB_TOKEN=
 # Blank: /pipreport answers that it is not configured (src/report.ts:62-68).
 REPORT_ROLE_ID=
@@ -834,11 +834,11 @@ because the plugin's behaviour with it unset is a runtime one: the bridge answer
 
 The core still runs next to the plugin. This is every way the host can emit something under the `.env`
 above, so that "Pip's host sends nothing unsolicited that reaches a DM" is a cited claim and not an
-assumption. Line numbers are on `8d039c9`.
+assumption. Line numbers are on `8d039c9`, except the release-watcher row, whose cites are on the #342 change.
 
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
-| Release watcher | A post into `ANNOUNCE_CHANNEL_ID` (`RELEASE_ANNOUNCE_CHANNEL_ID` falls back to it), the private channel. Never a DM. | The one release channel is `releaseAnnounceChannelId` (`src/config.ts:146`, `src/announce.ts:73-75`). The watched repo is `GITHUB_REPO` (`src/config.ts:149`), and `gh release list --repo Rackbops/rackbops-discord-bot` is empty (2026-10-06), so there is nothing to announce. The first poll seeds silently, so a release already published when Pip is stood up is never announced. A future release would post to the private channel. | `src/announce.ts:384-425` (`checkReleases`, `checkRepoReleases`), `:27` (15-minute poll), `:437-457`, seeding at `:443-449`; the tick check at `:217-222` |
+| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:384-407` (`describeReleaseWatch`, `checkReleases`), the tick check at `:217-222` (15-minute poll `:27`), the boot line `src/index.ts:313` |
 | Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:486-516` (`deliverPluginNotification`; the empty-list return at `:492-495`, the fallback at `:507-509`), `:570-592`; live deliverers `src/announce.ts:306-317` |
 | Scheduled plugin update | Restarts the bot; a heads-up DM only to the Discord user who scheduled it. | It exists only if an admin scheduled it. With no admin, nobody can. | `src/plugins/updates.ts:604-655` (`runDueSchedules`, the DM at `:644`) |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:223-228` |
@@ -853,11 +853,11 @@ assumption. Line numbers are on `8d039c9`.
 Interaction replies (`/pipagent` and the refusals above) are solicited: someone typed the command. The
 deliveries through the host API are sent by core code but asked for by the plugin, so they are bridge
 deliveries, bounded by the service's grants (section 4) and not by this `.env`. **Conclusion:** under
-this configuration the only *unsolicited* Discord output that is not a bridge delivery is a release post
-into the private announce channel, which cannot occur while the watched repository publishes no
-releases, and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through
-the host API on the bridge's request. If that is not acceptable, the way to close it is a small host change to
-switch the release watcher off, filed as its own issue, not a configuration trick.
+this configuration the core has no unsolicited Discord output that is not a bridge delivery: the release
+watcher is off (`WATCHED_REPOS=none`, added by [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)),
+and no core-initiated path produces a DM; the only DMs are the ones the plugin sends through the host API
+on the bridge's request. The switch turns off release polling, not every GitHub request: the Plugin Index
+fetch and the self-update checks are separate paths.
 
 ### 4. The bridge
 
@@ -995,6 +995,8 @@ The A8 error's cause and the avatar upload are not established. Seven DMs were d
 Pip application during acceptance, all bridge records `delivered`; prod, debug and Clerk were never
 touched. The screenshot of the first hosted DM proves visible delivery, not a full-history duplicate
 audit; duplicate behaviour is covered by A3 and A11.
+
+The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) landed after this run; Pip now runs with it, and the section 3 table describes that configuration.
 
 ### 10. Hosted-Pip handoff
 
