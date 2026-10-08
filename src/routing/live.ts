@@ -313,3 +313,16 @@ export function resetRoutingForTest(): void {
   chain = Promise.resolve();
   said.clear();
 }
+
+/** What `resetRoutingForTest` resets, for the test-state guard (test/stateGuard.ts). `chain` is
+ *  handed over as is: the guard asks whether it is still pending. `lastRegistrations` is left out:
+ *  it only ever holds anything while `context` is set, which `initialized` already reports. */
+export interface RoutingStateForTest {
+  initialized: boolean;
+  said: number;
+  chain: Promise<unknown>;
+}
+
+export function routingStateForTest(): RoutingStateForTest {
+  return { initialized: context !== undefined, said: said.size, chain };
+}

@@ -20,6 +20,7 @@ const {
   shouldPollReleases,
   shouldRefreshDiscovery,
   resetDiscoveryGapForTest,
+  announceStateForTest,
   livePluginRequestDeps,
   livePluginUpdateDeps,
 } = await import("./announce");
@@ -119,6 +120,10 @@ describe("the pluginRequests tick check (#241)", () => {
 });
 
 describe("tickChecks", () => {
+  // The discovery tests run the real check, which records when it last refreshed; the test-state
+  // guard (test/stateGuard.ts) fails a test that leaves that behind.
+  afterEach(resetDiscoveryGapForTest);
+
   // The core checks in order (pluginRequests drains the #105 mailbox BEFORE pluginUpdates; discovery
   // (#239) comes after pluginUpdates), then extras.
   const CORE = ["releases", "autoUpdate", "pluginRequests", "pluginUpdates", "discovery"];
@@ -177,8 +182,11 @@ describe("tickChecks", () => {
         await routingIdleForTest();
       };
 
-      // The first run is the startup catch-up: it refreshes.
+      // The first run is the startup catch-up: it refreshes, and records when (the time the test-state
+      // guard, test/stateGuard.ts, reads — it must track the live one).
+      expect(announceStateForTest().lastDiscoveryAt).toBe(0);
       await run();
+      expect(announceStateForTest().lastDiscoveryAt).toBeGreaterThan(0);
       const first = generatedAt();
       expect(first).toBe("2026-09-21T12:00:00.000Z");
       // Straight away again, well inside the gap: it does nothing, so the file is untouched.
@@ -527,6 +535,19 @@ describe("guardedTick", () => {
     let ran = false;
     await guardedTick(async () => void (ran = true));
     expect(ran).toBe(true);
+  });
+
+  // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so each field must
+  // track the live guard.
+  test("announceStateForTest reports a tick in flight and the skips counted behind it", async () => {
+    let resolveFirst!: () => void;
+    const first = guardedTick(() => new Promise<void>((resolve) => (resolveFirst = resolve)));
+    expect(announceStateForTest().tickInFlight).toBe(true);
+    await guardedTick(async () => {}); // skipped: the first is still running
+    expect(announceStateForTest().consecutiveSkips).toBe(1);
+    resolveFirst();
+    await first;
+    expect(announceStateForTest()).toMatchObject({ tickInFlight: false, consecutiveSkips: 0 });
   });
 
   test("a tick that throws still releases the guard for the next one", async () => {

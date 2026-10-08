@@ -276,10 +276,10 @@ describe("beginShutdown (#154)", () => {
   });
 });
 
-// test/setup.ts's restart-state guard decides from this snapshot alone, so each field must track
-// the live module state — a field stuck at its clean value would hide that kind of leak from the
-// guard. The file's afterEach resets everything before the guard looks.
-describe("stateForTest (what the restart-state guard reads)", () => {
+// The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so each field must
+// track the live module state — a field stuck at its clean value would hide that kind of leak from
+// the guard. The file's afterEach resets everything before the guard looks.
+describe("stateForTest (what the test-state guard reads)", () => {
   test("reads clean after a reset", () => {
     expect(stateForTest()).toEqual({
       critical: 0,

@@ -2,7 +2,7 @@
 // Client. Every side effect of checkPluginUpdates is an injected fake. #104 added `restartPending`/
 // `requestRestart` to the deps, so "never restarts without a due schedule" is now enforced
 // BEHAVIORALLY (the restart-spy tests below), not structurally.
-import { describe, expect, test, beforeEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import type { PluginIndex, PluginIndexEntry, PluginRelease, PluginStateEntry, PluginStateFile } from "./contract";
 import {
   compareSemver,
@@ -13,6 +13,7 @@ import {
   deliverPluginNotification,
   checkPluginUpdates,
   resetPluginUpdateStateForTest,
+  pluginUpdateStateForTest,
   parseScheduleTime,
   planPluginAction,
   pinUpdateNow,
@@ -302,6 +303,9 @@ describe("deliverPluginNotification", () => {
 
 describe("checkPluginUpdates", () => {
   beforeEach(resetPluginUpdateStateForTest);
+  // Failed deliveries are counted per process; the test-state guard (test/stateGuard.ts) fails a
+  // test that leaves a count behind.
+  afterEach(resetPluginUpdateStateForTest);
 
   function harness(opts: {
     index: PluginIndex;
@@ -387,10 +391,13 @@ describe("checkPluginUpdates", () => {
       post: async () => { throw new Error("no channel"); },
     });
     await checkPluginUpdates(h.deps); // attempt 1 — no persist
+    // The count the test-state guard (test/stateGuard.ts) reads tracks the live one.
+    expect(pluginUpdateStateForTest().deliveryFailures).toBe(1);
     await checkPluginUpdates(h.deps); // attempt 2 — no persist
     expect(h.state.plugins[0]?.notifiedVersion).toBeUndefined();
     await checkPluginUpdates(h.deps); // attempt 3 — give up, persist
     expect(h.state.plugins[0]?.notifiedVersion).toBe("1.1.0");
+    expect(pluginUpdateStateForTest().deliveryFailures).toBe(0);
   });
 
   test("a fired remind clears remindAt so it doesn't re-fire", async () => {

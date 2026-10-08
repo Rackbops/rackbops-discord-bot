@@ -131,6 +131,12 @@ export function resetPluginRequestsForTest(): void {
   undeletable.clear();
 }
 
+/** What `resetPluginRequestsForTest` resets, for the test-state guard (test/stateGuard.ts).
+ *  `draining` is handed over as is: the guard asks whether it is still pending. */
+export function pluginRequestsStateForTest(): { undeletable: number; draining: Promise<void> } {
+  return { undeletable: undeletable.size, draining };
+}
+
 /** Drain the request mailbox once, serialized against any concurrent drain. Never throws. */
 export function consumePluginRequests(deps: PluginRequestDeps): Promise<void> {
   const run = draining.then(

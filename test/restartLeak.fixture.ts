@@ -1,6 +1,6 @@
-// Run only by test/restartState.test.ts, as a child `bun test` — the `.fixture.ts` name keeps the
+// Run only by test/stateGuard.test.ts, as a child `bun test` — the `.fixture.ts` name keeps the
 // main run's discovery from picking it up. Its first test leaks a handoff on purpose, so the child
-// run shows whether test/setup.ts's restart-state guard is really wired in.
+// run shows whether test/stateGuardHook.ts's test-state guard is really wired in.
 
 import { expect, test } from "bun:test";
 import { beginHandoff, handoffActive } from "../src/restart";
