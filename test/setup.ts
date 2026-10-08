@@ -80,9 +80,10 @@ process.env.ANNOUNCE_CHANNEL_ID ??= "100";
 // #385's leaked handoff made update.test.ts's checkForUpdate answer `busy`, and only a randomized
 // order ever showed it. A preload's afterEach runs after every test in every file, and after that
 // file's own afterEach hooks (measured on Bun 1.4.2), so a leak made inside a test fails that test,
-// whatever the order. One made outside it — by a beforeAll or afterAll, by an afterEach that throws
-// (Bun then skips this hook for that test), or by async work finishing late — lands on whichever test
-// runs next, and goes uncaught if none does (nothing is left to inherit it then). After failing a
+// whatever the order — unless that test's own afterEach throws, since Bun then skips this hook for
+// it. Such a leak, and one made outside a test — by a beforeAll or afterAll, or by async work
+// finishing late — lands on whichever test runs next, and goes uncaught if none does (nothing is
+// left to inherit it then). After failing a
 // test the guard resets the state, so one leak fails one test instead of every test after it.
 afterEach(() => {
   const leaks = restartStateLeaks(stateForTest());

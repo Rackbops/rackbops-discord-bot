@@ -428,10 +428,11 @@ _Avoid_: server list, guild cache
   in every file — after that file's own `afterEach` hooks, measured on Bun 1.4.2 — and fails the
   test if `stateForTest()` differs from what `resetForTest()` leaves, naming each leaked field.
   It then resets, so one leak fails one test rather than every test after it. A leak made inside a
-  test fails that test, whatever the order. One made outside it — by a `beforeAll` or `afterAll`,
-  by an `afterEach` that throws (Bun then skips the guard for that test), or by async work that
-  finishes after its test — is charged to whichever test runs next, possibly in the next file, and
-  goes uncaught if no test runs after it (nothing is left to inherit it then). The exit stub
+  test fails that test, whatever the order — unless that test's own `afterEach` throws, since Bun
+  then skips the guard for it. Such a leak, and one made outside a test — by a `beforeAll` or
+  `afterAll`, or by async work that finishes after its test — is charged to whichever test runs
+  next, possibly in the next file, and goes uncaught if no test runs after it (nothing is left to
+  inherit it then). The exit stub
   (`setExitFn`) is deliberately outside the check: `resetForTest` doesn't own it. Restart state
   can't carry from one test to the next, so clean up by the end of each test — an
   `afterEach(resetForTest)`, as `restart.test.ts` and `redeploy.test.ts` use. The decision logic
