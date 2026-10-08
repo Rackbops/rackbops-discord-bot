@@ -996,7 +996,7 @@ Pip application during acceptance, all bridge records `delivered`; prod, debug a
 touched. The screenshot of the first hosted DM proves visible delivery, not a full-history duplicate
 audit; duplicate behaviour is covered by A3 and A11.
 
-The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) landed after this run; Pip now runs with it, and the section 3 table describes that configuration.
+The release-watcher switch (`WATCHED_REPOS=none`, [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342)) exists as of [#342](https://github.com/Rackbops/rackbops-discord-bot/issues/342); this run predates it, and enabling it on the live Pip instance is a separate operator step whose evidence (the deployed `GIT_SHA` and the `[release] watcher off` boot line) is recorded on #342. The section 3 table describes the configuration this runbook prescribes, not a statement about the live instance.
 
 ### 10. Hosted-Pip handoff
 
