@@ -13,6 +13,7 @@ import {
   resetForTest,
   restartPending,
   setExitFn,
+  stateForTest,
   withCritical,
 } from "./restart";
 
@@ -272,6 +273,62 @@ describe("beginShutdown (#154)", () => {
     expect(restartPending()).toBe(false);
     beginShutdown("SIGTERM");
     expect(restartPending()).toBe(true);
+  });
+});
+
+// test/setup.ts's restart-state guard decides from this snapshot alone, so each field must track
+// the live module state — a field stuck at its clean value would hide that kind of leak from the
+// guard. The file's afterEach resets everything before the guard looks.
+describe("stateForTest (what the restart-state guard reads)", () => {
+  test("reads clean after a reset", () => {
+    expect(stateForTest()).toEqual({
+      critical: 0,
+      pending: undefined,
+      handoff: undefined,
+      shuttingDown: false,
+      idleWaiters: 0,
+      stopListeners: 0,
+      stopNotified: false,
+    });
+  });
+
+  test("critical tracks the open sections", () => {
+    beginCritical();
+    beginCritical();
+    expect(stateForTest().critical).toBe(2);
+  });
+
+  test("pending holds a deferred restart's reason", () => {
+    beginCritical();
+    requestRestart("update");
+    expect(stateForTest().pending).toBe("update");
+  });
+
+  test("handoff holds the active handoff's reason", () => {
+    beginHandoff("redeploy");
+    expect(stateForTest().handoff).toBe("redeploy");
+  });
+
+  test("a shutdown sets shuttingDown and stopNotified", () => {
+    beginShutdown("SIGTERM");
+    expect(stateForTest().shuttingDown).toBe(true);
+    expect(stateForTest().stopNotified).toBe(true);
+  });
+
+  test("idleWaiters counts awaitCriticalIdle calls still waiting", async () => {
+    beginCritical();
+    const idle = awaitCriticalIdle(1000);
+    expect(stateForTest().idleWaiters).toBe(1);
+    endCritical();
+    expect(await idle).toBe(true);
+    expect(stateForTest().idleWaiters).toBe(0);
+  });
+
+  test("stopListeners counts registered listeners", () => {
+    const off = onStopRequested(() => {});
+    expect(stateForTest().stopListeners).toBe(1);
+    off();
+    expect(stateForTest().stopListeners).toBe(0);
   });
 });
 

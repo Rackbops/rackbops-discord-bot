@@ -111,6 +111,30 @@ export function resetForTest(): void {
   stopNotified = false;
 }
 
+/** Everything `resetForTest` resets, as plain values — what the test suite's leak guard reads. */
+export interface RestartStateForTest {
+  critical: number;
+  pending: string | undefined;
+  handoff: string | undefined;
+  shuttingDown: boolean;
+  idleWaiters: number;
+  stopListeners: number;
+  stopNotified: boolean;
+}
+
+/** A read-only snapshot of the state `resetForTest` resets (test/setup.ts's leak guard). */
+export function stateForTest(): RestartStateForTest {
+  return {
+    critical,
+    pending,
+    handoff,
+    shuttingDown,
+    idleWaiters: idleResolvers.length,
+    stopListeners: stopListeners.length,
+    stopNotified,
+  };
+}
+
 /**
  * #248: registers `fn` to run once, the first time this process is asked to stop — a restart request
  * (`requestRestart`) or a shutdown (`beginShutdown`), whichever comes first. The plugin host uses it
