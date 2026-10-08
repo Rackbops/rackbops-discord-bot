@@ -53,6 +53,11 @@ export function resetRoutingWarningsForTest(): void {
   said.clear();
 }
 
+/** What `resetRoutingWarningsForTest` resets, for the test-state guard (test/stateGuard.ts). */
+export function routingWarningsStateForTest(): { said: number } {
+  return { said: said.size };
+}
+
 /** What went wrong, as text that is clipped (an engine's message can echo a hostile key) and cannot throw. */
 function describeFailure(err: unknown): string {
   try {

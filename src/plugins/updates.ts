@@ -551,6 +551,11 @@ export function resetPluginUpdateStateForTest(): void {
   deliveryFailures.clear();
 }
 
+/** What `resetPluginUpdateStateForTest` resets, for the test-state guard (test/stateGuard.ts). */
+export function pluginUpdateStateForTest(): { deliveryFailures: number } {
+  return { deliveryFailures: deliveryFailures.size };
+}
+
 /** Record a version as notified: `notifiedVersion`/`availableVersion` = `to`, and clear any snooze
  *  (a fired remind must not re-fire every tick). */
 function markNotified(state: PluginStateFile, name: string, to: string): PluginStateFile {

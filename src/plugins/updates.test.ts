@@ -13,6 +13,7 @@ import {
   deliverPluginNotification,
   checkPluginUpdates,
   resetPluginUpdateStateForTest,
+  pluginUpdateStateForTest,
   parseScheduleTime,
   planPluginAction,
   pinUpdateNow,
@@ -387,10 +388,13 @@ describe("checkPluginUpdates", () => {
       post: async () => { throw new Error("no channel"); },
     });
     await checkPluginUpdates(h.deps); // attempt 1 — no persist
+    // The count the test-state guard (test/stateGuard.ts) reads tracks the live one.
+    expect(pluginUpdateStateForTest().deliveryFailures).toBe(1);
     await checkPluginUpdates(h.deps); // attempt 2 — no persist
     expect(h.state.plugins[0]?.notifiedVersion).toBeUndefined();
     await checkPluginUpdates(h.deps); // attempt 3 — give up, persist
     expect(h.state.plugins[0]?.notifiedVersion).toBe("1.1.0");
+    expect(pluginUpdateStateForTest().deliveryFailures).toBe(0);
   });
 
   test("a fired remind clears remindAt so it doesn't re-fire", async () => {

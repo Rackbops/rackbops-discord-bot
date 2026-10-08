@@ -385,6 +385,19 @@ export function resetDiscoveryGapForTest(): void {
   lastDiscoveryAt = 0;
 }
 
+/** What `resetTickGuardForTest` and `resetDiscoveryGapForTest` reset, as plain values — what the
+ *  test-state guard reads (test/stateGuard.ts). `tickGeneration` is left out: a tick only ever
+ *  compares it with the generation it took itself, so its starting value changes nothing later. */
+export interface AnnounceStateForTest {
+  tickInFlight: boolean;
+  consecutiveSkips: number;
+  lastDiscoveryAt: number;
+}
+
+export function announceStateForTest(): AnnounceStateForTest {
+  return { tickInFlight, consecutiveSkips, lastDiscoveryAt };
+}
+
 /** One line for the boot log: whether the release watcher is on (`WATCHED_REPOS=none` = off). */
 export function describeReleaseWatch(repos: readonly string[]): string {
   return repos.length === 0

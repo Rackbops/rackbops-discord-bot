@@ -6,7 +6,8 @@ import { ChannelType, type Client, type RESTPostAPIChatInputApplicationCommandsJ
 import type { PluginCommand, PluginIndexEntry } from "../plugins/contract";
 import type { PluginCommandMap } from "../plugins/host";
 import { discoveryPath, type PluginSummary } from "./discovery";
-import { applyRouting, guildJoined, guildLeft, initRouting, refreshDiscovery, resetRoutingForTest, type RoutingContext } from "./live";
+import { settled } from "../../test/stateLeaks";
+import { applyRouting, guildJoined, guildLeft, initRouting, refreshDiscovery, resetRoutingForTest, routingStateForTest, type RoutingContext } from "./live";
 import type { DiscoveryFile } from "./model";
 import { mutateRouting, routingPath } from "./store";
 
@@ -1044,5 +1045,36 @@ describe("a home server the bot is not in (#260)", () => {
     // The read failure is what is reported: a home server the bot "is not in" would be a guess.
     expect(h.logs.error.some((line) => line.includes("could not read the bot's servers"))).toBe(true);
     expect(h.logs.warn).toEqual([]);
+  });
+});
+
+// The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so each field must
+// track the live module. The file's afterEach resets everything before the guard looks.
+describe("routingStateForTest (what the test-state guard reads)", () => {
+  test("initialized tracks initRouting", () => {
+    expect(routingStateForTest().initialized).toBe(false);
+    initRouting(harness().ctx);
+    expect(routingStateForTest().initialized).toBe(true);
+  });
+
+  test("said counts the home-server warnings already said", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    h.world.guilds.delete(HOME);
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(routingStateForTest().said).toBe(1);
+  });
+
+  test("chain is the queue's tail: pending while a registration waits, settled once it is done", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const h = harness({ onPut: () => gate });
+    initRouting(h.ctx);
+    const boot = applyRouting("boot");
+    expect(await settled(routingStateForTest().chain)).toBe(false);
+    release();
+    await boot;
+    expect(await settled(routingStateForTest().chain)).toBe(true);
   });
 });

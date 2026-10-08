@@ -2,11 +2,12 @@
 // no real filesystem. `validate` (the trust boundary) is tested directly for every reject reason;
 // `consumePluginRequests` is tested for order, delete-on-apply, quarantine, one-restart-per-drain,
 // and the single-flight guard.
-import { beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { freshRouting, freshSecrets, repairRouting, repairSecrets, type DiscoveryFile, type RoutingFile } from "../routing/model";
 import type { RoutingRequestDeps } from "../routing/requests";
 import type { PluginIndex, PluginIndexEntry, PluginStateEntry, PluginStateFile } from "./contract";
-import { consumePluginRequests, resetPluginRequestsForTest, validate, type PluginRequestDeps } from "./requests";
+import { settled } from "../../test/stateLeaks";
+import { consumePluginRequests, pluginRequestsStateForTest, resetPluginRequestsForTest, validate, type PluginRequestDeps } from "./requests";
 
 const REQ_DIR = "/data/plugins/requests";
 
@@ -145,6 +146,9 @@ describe("validate (#105 trust boundary)", () => {
 
 describe("consumePluginRequests drain", () => {
   beforeEach(resetPluginRequestsForTest);
+  // A file that could not be deleted is remembered per process; the test-state guard
+  // (test/stateGuard.ts) fails a test that leaves it behind.
+  afterEach(resetPluginRequestsForTest);
 
   function harness(files: Record<string, unknown>, opts: { routing?: RoutingRequestDeps; state?: PluginStateFile } = {}) {
     const fs = new Map<string, string>(Object.entries(files).map(([k, v]) => [k, JSON.stringify(v)]));
@@ -210,6 +214,28 @@ describe("consumePluginRequests drain", () => {
     };
   }
   const wb = (over: object) => ({ plugin: "warbandeer", requestedBy: "email:me@x.com", ...over });
+
+  // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so each field must
+  // track the live module: a drain still running, and a file remembered as undeletable.
+  test("pluginRequestsStateForTest reports a drain in flight and a file that could not be deleted", async () => {
+    const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const readDir = h.deps.readDir;
+    h.deps.readDir = async (dir) => {
+      await gate;
+      return readDir(dir);
+    };
+    h.deps.unlink = async () => {
+      throw Object.assign(new Error("EBUSY: resource busy"), { code: "EBUSY" });
+    };
+    const drain = consumePluginRequests(h.deps);
+    expect(await settled(pluginRequestsStateForTest().draining)).toBe(false);
+    release();
+    await drain;
+    expect(await settled(pluginRequestsStateForTest().draining)).toBe(true);
+    expect(pluginRequestsStateForTest().undeletable).toBe(1);
+  });
 
   test("applies a valid update-now: sets targetVersion, deletes the file, ONE restart", async () => {
     const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) });

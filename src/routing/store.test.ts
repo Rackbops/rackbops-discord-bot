@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DATA_DIR } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, sayWhatWasIgnored, secretsPath } from "./store";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, routingPath, routingWarningsStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -17,6 +17,9 @@ beforeEach(() => {
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  // What a damaged file's read said is remembered per process; the test-state guard
+  // (test/stateGuard.ts) fails a test that leaves it behind.
+  resetRoutingWarningsForTest();
 });
 
 /** Adds a plugin placed in one server -- the smallest change that shows up in a read. */
@@ -586,6 +589,18 @@ describe("readRouting says what it ignored (#260)", () => {
       await readRouting(dir);
     });
     expect(lines).toEqual([]);
+  });
+
+  // The test-state guard (test/stateGuard.ts) decides from this snapshot alone, so it must track
+  // the live record.
+  test("routingWarningsStateForTest counts what has been said", async () => {
+    write(music({ [GUILD]: { commands: "none" } }));
+    expect(routingWarningsStateForTest().said).toBe(0);
+    await said(async () => {
+      await readRouting(dir);
+      await readRouting(dir);
+    });
+    expect(routingWarningsStateForTest().said).toBe(1);
   });
 
   test("the same problem is said again once the record is cleared (the test seam works)", async () => {

@@ -1,4 +1,5 @@
 [test]
 # Runs before any test file is imported. Redirects the data directory away from the checkout —
-# see test/setup.ts for why this cannot be done per-file (#139).
-preload = ["./test/setup.ts"]
+# see test/setup.ts for why this cannot be done per-file (#139). Then the test-state guard, which
+# must come second: the modules it checks read the environment setup.ts primes when they load.
+preload = ["./test/setup.ts", "./test/stateGuardHook.ts"]

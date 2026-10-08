@@ -111,7 +111,7 @@ export function resetForTest(): void {
   stopNotified = false;
 }
 
-/** Everything `resetForTest` resets, as plain values — what the test suite's leak guard reads. */
+/** Everything `resetForTest` resets, as plain values — what the test-state guard reads (test/stateGuard.ts). */
 export interface RestartStateForTest {
   critical: number;
   pending: string | undefined;
@@ -122,7 +122,7 @@ export interface RestartStateForTest {
   stopNotified: boolean;
 }
 
-/** A read-only snapshot of the state `resetForTest` resets (test/setup.ts's leak guard). */
+/** A read-only snapshot of the state `resetForTest` resets, for the test-state guard. */
 export function stateForTest(): RestartStateForTest {
   return {
     critical,
