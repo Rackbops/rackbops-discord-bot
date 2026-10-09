@@ -195,7 +195,7 @@ export interface PluginStateEntry {
   /** Every env key the plugin expects is present. Enabled-but-unconfigured plugins still load. */
   configured: boolean;
   missingEnv: string[];
-  /** Loaded and `activate()` succeeded this boot. */
+  /** Loaded and `activate()` succeeded this boot, within the host's bound (#408). */
   active: boolean;
   /** Why it is not active (unknown name, incompatible host API, download/integrity failure, a throw, an
    *  import or `activate()` that did not finish in time). */
@@ -389,9 +389,11 @@ export interface Plugin {
   /**
    * Runs once, inside the bot's `activate()`, after `takeOver()`. All side effects (files, servers) belong here.
    * The host waits on it for at most `PLUGIN_ACTIVATE_TIMEOUT_MS` (currently 30 s, #408). Past that the plugin
-   * is recorded as failed and stays off until the next restart, exactly as if this had thrown; the call is not
+   * is recorded as failed, the way a throw is, and stays off until the next restart; the call is not
    * cancelled. If it resolves later, the host calls `dispose()` once to release what it set up; if it rejects
-   * later, the host only logs it.
+   * later, the host only logs it. Until #407 lands, slash commands are the exception to "off": the host
+   * dispatches a plugin's commands whether or not it is running, including after that late `dispose()`,
+   * so a command handler must cope with state its `activate()` never finished setting up.
    */
   activate?(): Promise<void>;
   /**
@@ -399,10 +401,10 @@ export interface Plugin {
    * retire, `SIGINT`. Release whatever `activate()` acquired here (servers, handles, timers). Must
    * not throw — the host isolates a throw and continues disposing the rest — and is bounded by the
    * host's own shutdown grace, so a slow or wedged `dispose` loses the remainder of its cleanup
-   * rather than delaying the process past the daemon's own SIGKILL. It also runs once outside a shutdown
-   * (#408), as soon as an `activate()` the host had stopped waiting on resolves: that plugin never ran,
-   * and nothing else would release what it set up. That call is isolated the same way but not bounded,
-   * since nothing waits on it. Optional: a plugin with nothing
+   * rather than delaying the process past the daemon's own SIGKILL. It also runs once, not through that
+   * shutdown path, as soon as an `activate()` the host had stopped waiting on resolves (#408): that plugin
+   * was never marked running, and nothing else would release what it set up. That call is isolated the
+   * same way but not bounded, since nothing waits on it. Optional: a plugin with nothing
    * to release (no servers, no long-lived handles) can omit it.
    */
   dispose?(): Promise<void>;

@@ -8,8 +8,9 @@ edit, and say so if it moved. An independent claims-vs-code audit of this plan r
 and its findings are folded in.
 
 The code in Appendix A is not a sketch. The orchestrator built it in a scratch worktree off `ded55f5` and ran
-`bun run check`, both `ops` typechecks, the full `bun test` (2600 pass, 220 skip, 0 fail), the acceptance
-script (Appendix B) and all 18 mutations (Appendix C, 18 killed). Apply it as written and report any deviation.
+`bun run check`, both `ops` typechecks, the full `bun test`, the acceptance script (Appendix B) and every
+mutation in Appendix C (31 after review round 1, all killed). Apply it as written and report any deviation.
+"Review gate log", below, records what each round found and what changed.
 
 ## Hand-off
 
@@ -109,7 +110,9 @@ before using it.
   review is never propagated. The alternative, if roshne prefers it: drop the `contract.ts` hunks here and
   fold them into the next contract change.
 - **D6. Out of scope, by issue.** #407 (slash commands aren't `running`-gated): until it lands, a timed-out
-  plugin's commands still dispatch, exactly as a plugin's whose `activate()` threw do today. #409
+  plugin's commands still dispatch, as a plugin's whose `activate()` threw do today. There is one
+  difference: a plugin whose late `activate()` resolves is then disposed (D3), so its commands keep
+  dispatching against resources it has released. `contract.ts` tells plugin authors so. #409
   (`disposePlugins` flips `running` only after dispose): this plan does not touch `disposePlugins`'s code, but
   #409 will very likely touch the same single-line `CONTEXT.md` rows (the `host.ts` row, where its "the flip
   stops the gate" claim lives, and the `host.test.ts` row) and perhaps the `LoadedPlugin.running` comment this
@@ -120,6 +123,16 @@ before using it.
   own `p.then(resolve, reject)` (`host.ts:694`) and is not separately tested. #475's `docs-context-md-8`
   (stale `index.ts:144`/`:163` cites in the same gotcha): left for #475; this plan only appends to that
   bullet. A synchronous infinite loop in `activate()` or `createPlugin` can't be bounded from the same thread.
+- **D7. Every catch that describes a plugin's throw does it without throwing (added in review round 1).**
+  Plugin code can throw or reject with anything, including a value `String()` throws on
+  (`Object.create(null)`, "No default value" on Bun) or an Error whose `message` getter throws. Before this
+  change, `activatePlugins`' own catch called `String(err)`, so such a throw escaped `activatePlugins`
+  itself. Later plugins never activated and the rejection left the `ClientReady` listener, which halts boot
+  by another route. The same applied to the import catch, the late paths, `pluginCommandMap`, `pluginTicks`
+  (both called outside `index.ts`'s setup try) and `disposePlugins`. A single `describeThrown` helper in
+  `host.ts` now serves all six sites. It falls back to `(unprintable thrown value)`. `afterLateActivate`'s
+  chain also ends in a catch, so even a throwing logger can't leave an unhandled rejection. Each site has
+  its own test and its own mutation (M19-M27).
 
 ## Acceptance
 
@@ -141,6 +154,9 @@ The issue has no `## Acceptance` section. These are the observable outcomes its 
 - [ ] **A6.** On the real boot path (`ClientReady` → `activate()` → `index.ts:301`), a hung plugin delays boot
       by its bound and then the bot comes up: the plugins after it active, the scheduler started, commands
       registered, `state.json` written. Manual, on the debug instance (V2).
+- [ ] **A7.** (Added in round 1.) A plugin that throws or rejects with a value `String()` can't convert, from
+      its import, `activate()`, `commands`/`ticks` getter, or `dispose()` (late or at shutdown), is still
+      isolated and logged as `(unprintable thrown value)`, and the plugins after it are unaffected.
 
 ## Steps
 
@@ -162,8 +178,8 @@ Paste the output. Expect `exit 1` and both phases `STILL PENDING`, as in "What i
 
 ### 2. Apply the change (Appendix A, plus the `CONTEXT.md` edits below)
 
-Appendix A is the full diff for `src/plugins/host.ts`, `src/plugins/contract.ts` and `src/plugins/host.test.ts`
-(the orchestrator checked that the extracted block applies cleanly to a fresh `ded55f5` tree). Run
+Appendix A is the full diff for `src/plugins/host.ts`, `src/plugins/contract.ts`, `src/plugins/host.test.ts`
+and `src/index.test.ts` (the orchestrator checked that the extracted block applies cleanly to a fresh tree). Run
 `git -C <worktree> apply --check <scratchpad>/408-code.diff`, then the same without `--check`. If `--check`
 fails because a line moved, apply that hunk by hand with Edit and say which.
 In summary:
@@ -175,11 +191,14 @@ In summary:
   `activatePlugins` takes `timeoutMs` and, on a timeout, hands the still-pending call to the new
   `afterLateActivate` and throws into the existing catch, so the log line and `lp.error` come from the one
   place they already did. The `LoadedPlugin.running`/`error` and `LoadResult.errors` comments are updated.
+  Round 1 adds `describeThrown`, used at all six catch sites, and the late chain's terminal catch (D7).
 - `contract.ts`: comments only (D5).
 - `host.test.ts`: an `orHung` helper so a dropped bound fails by name rather than deadlocking (`CONTEXT.md`'s
-  gotcha on tests that can deadlock); three `loadPlugins` tests, six `activatePlugins` tests, and a
+  gotcha on tests that can deadlock), plus an `unprintable()` value. Four `loadPlugins` tests, eleven
+  `activatePlugins` tests, one each for `pluginCommandMap`, `pluginTicks` and `disposePlugins`, and a
   `state.json` consumer-boundary describe.
-- `index.ts`: **no change.** Both calls keep taking the defaults; `index.test.ts`'s ordering pins are untouched.
+- `index.ts`: **no change.** Both calls keep taking the defaults. `index.test.ts` gains one test pinning that
+  boot passes neither call a bound of its own.
 
 `CONTEXT.md`, three edits. Its rows are several KB each, so anchor each Edit on the short substring quoted:
 
@@ -187,9 +206,9 @@ In summary:
    `isolating a throwing import/createPlugin (recorded, skipped, never fatal).` with
    `isolating a throwing import/createPlugin, and an import still unsettled after `PLUGIN_IMPORT_TIMEOUT_MS` (10 s, #408), the same way (recorded, skipped, never fatal).`
    In the same row, replace `` `activatePlugins` runs each `activate()` in order, isolating a throw. `` with
-   `` `activatePlugins` runs each `activate()` in order, isolating a throw, and an `activate()` still unsettled after `PLUGIN_ACTIVATE_TIMEOUT_MS` (30 s, #408) the same way: that plugin stays off this boot, and if its `activate()` finishes later, its `dispose()` runs then (`afterLateActivate`), since `disposePlugins` skips a plugin that never ran. ``
+   `` `activatePlugins` runs each `activate()` in order, isolating a throw, and an `activate()` still unsettled after `PLUGIN_ACTIVATE_TIMEOUT_MS` (30 s, #408) the same way: that plugin stays off this boot (its slash commands excepted, which are not `running`-gated until #407), and if its `activate()` resolves later, its `dispose()` runs then (`afterLateActivate`), since `disposePlugins` skips a plugin that was never marked running. Every catch here that turns what it caught into text (a log line, or `state.json`'s `error`) does it through `describeThrown`, which never throws itself, so even a value `String()` can't convert stays isolated. ``
 2. The `src/plugins/host.test.ts` row. After `activate order + isolation + `running`/`error`;` insert
-   `` **#408:** an import or `activate()` that never settles is given up on at its bound (the bundles and plugins after it still load and activate, and the bound it missed is the `errors`/`error` text, through to `state.json`), the defaults are pinned (`PLUGIN_IMPORT_TIMEOUT_MS` 10 s, `PLUGIN_ACTIVATE_TIMEOUT_MS` 30 s), a late import is dropped, and a late `activate()` is disposed once it lands and not before (a late rejection is only logged, as is a late `dispose()` that throws); ``
+   `` **#408:** an import or `activate()` that never settles is given up on at its bound (the bundles and plugins after it still load and activate, and the bound it missed is the `errors`/`error` text, through to `state.json`), the defaults are pinned (`PLUGIN_IMPORT_TIMEOUT_MS` 10 s, `PLUGIN_ACTIVATE_TIMEOUT_MS` 30 s), a late import is dropped, and a late `activate()` is disposed once it lands and not before (a late rejection is only logged, as is a late `dispose()` that throws), a plugin with no `activate()` still comes up, every catch survives a thrown value `String()` can't convert, and a throwing logger leaves no unhandled rejection; ``
 3. The gotcha **"Plugin ticks are `running`-gated, and `activatePlugins()` runs BEFORE `startScheduler()`."**
    After its last line (`` first — that reintroduces the boot-announcement gap this ordering closes; `index.test.ts` pins it. ``)
    append, indented two spaces like the rest of the bullet:
@@ -259,7 +278,7 @@ bun <scratchpad>/mutate-408.ts <scratchpad>/wt408-mut
 git -C <worktree> worktree remove --force <scratchpad>/wt408-mut
 ```
 
-Expect `18 mutations, 0 survived` and exit 0; paste it. An anchor that is not found prints `??` and counts as
+Expect `31 mutations, 0 survived` and exit 0; paste it. An anchor that is not found prints `??` and counts as
 a survivor: fix the anchor to the code you applied, never loosen the test.
 
 ### 6. Review gate (yours, before the PR)
@@ -305,13 +324,50 @@ message the orchestrator with the PR link and every pasted output. Do not merge:
 | A1 | 2 (`activatePlugins`) | `activatePlugins` > "an activate() that never settles is given up on after timeoutMs: the plugin stays off and the ones after it still activate (#408)" | M5 (bound dropped: hangs), M8 (timed-out plugin marked running), M6 (activate never called) |
 | A2 | 2 (`loadPlugins`) | `loadPlugins` > "an import that never settles is given up on after timeoutMs, and the bundles after it still load (#408)"; "an import that lands after the bound is dropped: createPlugin never runs for it (#408)" | M1 (bound dropped), M2 (sentinel check dropped) |
 | A3 | 2 (constants, defaults) | "real callers get PLUGIN_IMPORT_TIMEOUT_MS, 10 s (#408)"; "real callers get PLUGIN_ACTIVATE_TIMEOUT_MS, 30 s, the same bound as a tick (#408)" | M3, M4, M9, M10 |
-| A4 | 2 (`afterLateActivate`) | "an activate() that finishes after the bound stays off, and is disposed once it does -- not before (#408)"; "an activate() that fails after the bound is logged and not disposed (#408)"; "a dispose() that throws, even synchronously, after a late activate() is logged (#408)" | M7, M11, M12, M13, M14, M15, M16, M17 |
+| A3 (`index.ts` half) | 2 | `index.test.ts` > "boot calls loadPlugins and activatePlugins with no bound of its own (#408)" | M28, M29 |
+| A4 | 2 (`afterLateActivate`) | "an activate() that finishes after the bound stays off, and is disposed once it does -- not before (#408)"; "an activate() that fails after the bound is logged and not disposed (#408)"; "a dispose() that throws synchronously after a late activate() is logged (#408)"; "a late dispose() that rejects with a value String() can't convert is still logged (#408)" (the async case); "a late activate() whose log line throws leaves no unhandled rejection (#408)" | M7, M11, M12, M13, M14, M15, M16, M17, X2, M27 |
 | A5 | 2 | "a plugin that never finishes loading or activating, through to state.json (#408)" > "is recorded active:false with the bound it missed as its error; the plugin after it is active" | M1, M2, M8 |
+| A7 | 2 (`describeThrown`, D7) | `loadPlugins` > "an import that rejects with a value String() can't convert is still isolated, and the bundles after it still load (#408)"; `activatePlugins` > "an activate() that throws a value String() can't convert is isolated, and the plugins after it still activate (#408)", "an activate() that rejects after the bound with a value String() can't convert is still logged (#408)", "a late dispose() that rejects with a value String() can't convert is still logged (#408)"; `pluginCommandMap` > "a commands getter that throws a value String() can't convert is skipped and logged, not thrown (#408)"; `pluginTicks` > "a ticks getter that throws …"; `disposePlugins` > "a dispose that rejects with a value String() can't convert is still logged (#408)" | M19 (the helper), M20-M26 (one per site) |
+| `activate` optional / plain value | 2 | "a plugin with no activate(), or one that returns a plain value, is running (#408)" | X1 (the `Promise.resolve` wrap dropped) |
 | A6 | V2 | none: `activate()` runs only after a real gateway login (`ClientReady`), which no test has | n/a, manual |
 | Sync-throw isolation (behaviour kept; the test is new) | 2 | "a synchronously-throwing activate is isolated the same as an async rejection" | M18 (activate called outside the try) |
 
 The `contract.ts` and `CONTEXT.md` lines are doc-only and carry no mutation. Reviewer 2 checks them against
 the code instead.
+
+## Review gate log
+
+**Round 1** (two adversarial reviewers on `e001d32`; both verdicts NOT SOUND). Every evidenced finding was
+reproduced before it was fixed.
+
+- Failure-mode lens, MAJOR: a value `String()` can't convert, thrown or rejected by a plugin, made the
+  isolating catches throw. That leaves an unhandled rejection on the late paths, and in-bound it makes
+  `activatePlugins` itself reject, halting boot (reproduced: `String(Object.create(null))` throws
+  `TypeError: No default value` on Bun 1.4.2). **Fixed:** D7, A7, M19-M27.
+- Failure-mode lens, MINOR: the contract's "exactly as if this had thrown" was not exact, because a late
+  resolve is disposed and a thrown plugin is not. **Fixed** in the wording.
+- Failure-mode lens, MINOR: `orHung` leaves a 2 s timer armed, and a false "hung" needs a ≥2 s synchronous
+  stall before the first microtask drain. **Declined:** not a realistic flake (the reviewer's own probe:
+  a 2.3 s in-loop stall still returned 3/3).
+- Claims lens, MAJOR: `Promise.resolve(...)` around `activate()` was unguarded. Its mutation X1 survived, and
+  a plugin with no `activate()` would have failed. **Fixed:** new test, X1 killed.
+- Claims lens, MAJOR: the late dispose's async-rejection path was unguarded (X2 survived), and the "even
+  synchronously" test name implied otherwise. **Fixed:** an async-rejecting late dispose is tested, the test
+  is renamed, and X2 is killed.
+- Claims lens, MAJOR: "stays off" / "never ran" in `contract.ts`, `CONTEXT.md` and `afterLateActivate`'s
+  comment ignored that slash commands are not `running`-gated (#407), even after the late dispose.
+  **Fixed** in all three places, and D6.
+- Claims lens, MINOR, all **fixed**:
+  - The `PLUGIN_IMPORT_TIMEOUT_MS` comment covered only a never-settling module, not a slow one, and didn't
+    say the module's top-level side effects still run.
+  - `loadPlugins`' "never ... holding up".
+  - The contract's "outside a shutdown".
+  - The `afterLateActivate` comment's "already says".
+  - `PluginStateEntry.active` didn't mention the bound.
+  - `index.ts`'s `loadPlugins` call was not pinned to pass no bound (now pinned, M28/M29).
+- Claims lens, MINOR: `contract.ts` names `PLUGIN_ACTIVATE_TIMEOUT_MS`, which isn't in the vendored file.
+  **Declined:** `TickCheck`'s doc already names `PLUGIN_TICK_TIMEOUT_MS` the same way, and both give the
+  value ("currently 30 s").
 
 ## V2: the real boot on the debug instance (orchestrator, needs roshne's go-ahead)
 
@@ -417,13 +473,37 @@ live gateway boot itself.
 ## Appendix A -- the change (`git apply`-able, against `ded55f5`)
 
 ```diff
+diff --git a/src/index.test.ts b/src/index.test.ts
+index ff45d74..0416c6d 100644
+--- a/src/index.test.ts
++++ b/src/index.test.ts
+@@ -96,6 +96,16 @@ describe("index.ts wiring", () => {
+     expect(startSched).toBeLessThan(restPut);
+   });
+ 
++  // #408: boot passes neither call a bound of its own, so both take host.ts's defaults
++  // (PLUGIN_IMPORT_TIMEOUT_MS, PLUGIN_ACTIVATE_TIMEOUT_MS), which host.test.ts pins.
++  test("boot calls loadPlugins and activatePlugins with no bound of its own (#408)", () => {
++    const activateFn = source.indexOf("async function activate(");
++    const load = source.indexOf("await loadPlugins(", activateFn);
++    expect(load).toBeGreaterThan(activateFn);
++    expect(source.slice(load, source.indexOf(");", load))).toMatch(/,\s*console,\s*$/); // console is the last argument
++    expect(source.indexOf("await activatePlugins(loadResult.loaded, console);", activateFn)).toBeGreaterThan(activateFn);
++  });
++
+   // #239: registration moved into src/routing/, but with no routing the bot must make EXACTLY the call
+   // it always made. index.ts can't run under test, so the shape of the wiring is pinned in the source.
+   describe("command registration is routed through src/routing (#239)", () => {
 diff --git a/src/plugins/contract.ts b/src/plugins/contract.ts
-index 0d0789d..dd05142 100644
+index 0d0789d..4ac896b 100644
 --- a/src/plugins/contract.ts
 +++ b/src/plugins/contract.ts
-@@ -197,7 +197,8 @@ export interface PluginStateEntry {
+@@ -195,9 +195,10 @@ export interface PluginStateEntry {
+   /** Every env key the plugin expects is present. Enabled-but-unconfigured plugins still load. */
+   configured: boolean;
    missingEnv: string[];
-   /** Loaded and `activate()` succeeded this boot. */
+-  /** Loaded and `activate()` succeeded this boot. */
++  /** Loaded and `activate()` succeeded this boot, within the host's bound (#408). */
    active: boolean;
 -  /** Why it is not active (unknown name, incompatible host API, download/integrity failure, a throw). */
 +  /** Why it is not active (unknown name, incompatible host API, download/integrity failure, a throw, an
@@ -431,7 +511,7 @@ index 0d0789d..dd05142 100644
    error?: string;
    /** Last version the admins were notified about. */
    notifiedVersion?: string;
-@@ -385,14 +386,23 @@ export interface PluginHttpInfo {
+@@ -385,14 +386,25 @@ export interface PluginHttpInfo {
  export interface Plugin {
    commands?: readonly PluginCommand[];
    ticks?: readonly TickCheck[];
@@ -439,9 +519,11 @@ index 0d0789d..dd05142 100644
 +  /**
 +   * Runs once, inside the bot's `activate()`, after `takeOver()`. All side effects (files, servers) belong here.
 +   * The host waits on it for at most `PLUGIN_ACTIVATE_TIMEOUT_MS` (currently 30 s, #408). Past that the plugin
-+   * is recorded as failed and stays off until the next restart, exactly as if this had thrown; the call is not
++   * is recorded as failed, the way a throw is, and stays off until the next restart; the call is not
 +   * cancelled. If it resolves later, the host calls `dispose()` once to release what it set up; if it rejects
-+   * later, the host only logs it.
++   * later, the host only logs it. Until #407 lands, slash commands are the exception to "off": the host
++   * dispatches a plugin's commands whether or not it is running, including after that late `dispose()`,
++   * so a command handler must cope with state its `activate()` never finished setting up.
 +   */
    activate?(): Promise<void>;
    /**
@@ -450,17 +532,26 @@ index 0d0789d..dd05142 100644
     * not throw — the host isolates a throw and continues disposing the rest — and is bounded by the
     * host's own shutdown grace, so a slow or wedged `dispose` loses the remainder of its cleanup
 -   * rather than delaying the process past the daemon's own SIGKILL. Optional: a plugin with nothing
-+   * rather than delaying the process past the daemon's own SIGKILL. It also runs once outside a shutdown
-+   * (#408), as soon as an `activate()` the host had stopped waiting on resolves: that plugin never ran,
-+   * and nothing else would release what it set up. That call is isolated the same way but not bounded,
-+   * since nothing waits on it. Optional: a plugin with nothing
++   * rather than delaying the process past the daemon's own SIGKILL. It also runs once, not through that
++   * shutdown path, as soon as an `activate()` the host had stopped waiting on resolves (#408): that plugin
++   * was never marked running, and nothing else would release what it set up. That call is isolated the
++   * same way but not bounded, since nothing waits on it. Optional: a plugin with nothing
     * to release (no servers, no long-lived handles) can omit it.
     */
    dispose?(): Promise<void>;
 diff --git a/src/plugins/host.test.ts b/src/plugins/host.test.ts
-index 4a6485b..393f769 100644
+index 4a6485b..33eb2d2 100644
 --- a/src/plugins/host.test.ts
 +++ b/src/plugins/host.test.ts
+@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { ButtonStyle, SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
+-import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
++import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile, TickCheck } from "./contract";
+ import { installPlugins, type InstalledPlugin } from "./install";
+ import type { HostDeliveryDeps, LoadedPlugin } from "./host";
+ import { pinsFromState, selectPlugins } from "./registry";
 @@ -16,6 +16,8 @@ import { settled } from "../../test/stateLeaks";
  const {
    createHostApi,
@@ -470,7 +561,7 @@ index 4a6485b..393f769 100644
    pluginCommandMap,
    buildCommandBody,
    autocompleteOptionPaths,
-@@ -125,6 +127,10 @@ function loaded(e: PluginIndexEntry, plugin: Plugin, running = false): LoadedPlu
+@@ -125,6 +127,14 @@ function loaded(e: PluginIndexEntry, plugin: Plugin, running = false): LoadedPlu
    return { entry: e, version: "1.0.0", plugin, running };
  }
  
@@ -478,10 +569,14 @@ index 4a6485b..393f769 100644
 + *  activate() bound fails by name rather than deadlocking into bun's own test timeout. */
 +const orHung = <T>(p: Promise<T>): Promise<T | "hung"> => Promise.race([p, Bun.sleep(2_000).then(() => "hung" as const)]);
 +
++/** #408: a value `String()` throws on ("No default value") -- plugin code can throw or reject with one, and
++ *  every isolating catch in host.ts must still describe it rather than throw again. */
++const unprintable = (): unknown => Object.create(null);
++
  const cmd = (name: string, build?: PluginCommand["build"]): PluginCommand => ({
    name,
    build: build ?? ((b) => b.setDescription(`the ${name} command`)),
-@@ -630,6 +636,47 @@ describe("loadPlugins", () => {
+@@ -630,6 +640,61 @@ describe("loadPlugins", () => {
        "[plugins] createboom: create failed",
      ]);
    });
@@ -515,6 +610,20 @@ index 4a6485b..393f769 100644
 +    expect(result.loaded).toEqual([]);
 +  });
 +
++  test("an import that rejects with a value String() can't convert is still isolated, and the bundles after it still load (#408)", async () => {
++    const { log, calls } = makeLog();
++    const installed: InstalledPlugin[] = [
++      { entry: entry({ name: "odd" }), version: "1.0.0", bundlePath: "/odd" },
++      { entry: entry({ name: "ok" }), version: "1.0.0", bundlePath: "/ok" },
++    ];
++    const importer = (path: string): Promise<PluginModule> =>
++      path === "/odd" ? Promise.reject(unprintable()) : Promise.resolve({ createPlugin: () => ({ commands: [] }) });
++    const result = await loadPlugins(installed, makeHost, importer, log, 20);
++    expect(result.loaded.map((l) => l.entry.name)).toEqual(["ok"]);
++    expect(result.errors).toEqual({ odd: "(unprintable thrown value)" });
++    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual(["[plugins] odd: (unprintable thrown value)"]);
++  });
++
 +  test("real callers get PLUGIN_IMPORT_TIMEOUT_MS, 10 s (#408)", async () => {
 +    expect(PLUGIN_IMPORT_TIMEOUT_MS).toBe(10_000);
 +    const setSpy = spyOn(globalThis, "setTimeout");
@@ -529,7 +638,49 @@ index 4a6485b..393f769 100644
  });
  
  describe("pluginCommandMap", () => {
-@@ -1559,6 +1606,136 @@ describe("activatePlugins", () => {
+@@ -655,6 +720,20 @@ describe("pluginCommandMap", () => {
+     expect([...map.keys()]).toEqual(["hi"]); // bad skipped, good kept
+     expect(calls.some((l) => l.level === "error" && l.message.includes("malformed commands"))).toBe(true);
+   });
++
++  test("a commands getter that throws a value String() can't convert is skipped and logged, not thrown (#408)", () => {
++    const { log, calls } = makeLog();
++    const bad = loaded(entry({ name: "bad" }), { get commands(): readonly PluginCommand[] { throw unprintable(); } });
++    const good = loaded(entry({ name: "good" }), { commands: [cmd("hi")] });
++    let map: ReturnType<typeof pluginCommandMap> = new Map();
++    expect(() => {
++      map = pluginCommandMap([bad, good], [], log);
++    }).not.toThrow();
++    expect([...map.keys()]).toEqual(["hi"]);
++    expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
++      "[plugins] bad: ignoring malformed commands — (unprintable thrown value)",
++    ]);
++  });
+ });
+ 
+ describe("buildCommandBody", () => {
+@@ -809,6 +888,20 @@ describe("pluginTicks", () => {
+     expect(calls.some((l) => l.level === "error" && l.message.includes("malformed ticks"))).toBe(true);
+   });
+ 
++  test("a ticks getter that throws a value String() can't convert is skipped and logged, not thrown (#408)", () => {
++    const { log, calls } = makeLog();
++    const bad = loaded(entry({ name: "bad" }), { get ticks(): readonly TickCheck[] { throw unprintable(); } });
++    const good = loaded(entry({ name: "good" }), { ticks: [{ name: "t", run: async () => {} }] });
++    let checks: ReturnType<typeof pluginTicks> = [];
++    expect(() => {
++      checks = pluginTicks([bad, good], log);
++    }).not.toThrow();
++    expect(checks.map((c) => c.name)).toEqual(["good:t"]);
++    expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
++      "[plugins] bad: ignoring malformed ticks — (unprintable thrown value)",
++    ]);
++  });
++
+   // #217: `timeoutMs` (pluginTicks' third parameter) is the test seam, the same shape as
+   // guardedTick's `watchdogMs`. The 2s `Bun.sleep` sentinel is what a regression that drops the
+   // bound looks like -- a check that never settles -- surfaced as a plain "hung" assertion failure
+@@ -1559,6 +1652,206 @@ describe("activatePlugins", () => {
      expect(lp2.error).toContain("boom");
      expect(lp3.running).toBe(true);
    });
@@ -537,13 +688,13 @@ index 4a6485b..393f769 100644
 +  // #408: an activate() the test settles by hand, after activatePlugins has stopped waiting on it.
 +  const lateActivate = () => {
 +    let resolve: () => void = () => {};
-+    let reject: (err: Error) => void = () => {};
++    let reject: (err: unknown) => void = () => {};
 +    const activate = () =>
 +      new Promise<void>((res, rej) => {
 +        resolve = res;
 +        reject = rej;
 +      });
-+    return { activate, resolve: () => resolve(), reject: (err: Error) => reject(err) };
++    return { activate, resolve: () => resolve(), reject: (err: unknown) => reject(err) };
 +  };
 +
 +  test("an activate() that never settles is given up on after timeoutMs: the plugin stays off and the ones after it still activate (#408)", async () => {
@@ -559,6 +710,17 @@ index 4a6485b..393f769 100644
 +    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
 +      "[plugins] two failed to activate — the bot keeps running without it: activate() did not finish within 20ms",
 +    ]);
++  });
++
++  // `activate` is optional, and plugin code is only type-asserted: no activate(), or one returning a plain
++  // value, must still come up -- what wrapping the call in Promise.resolve() is for.
++  test("a plugin with no activate(), or one that returns a plain value, is running (#408)", async () => {
++    const { log, calls } = makeLog();
++    const none = loaded(entry({ name: "none" }), { commands: [] });
++    const plain = loaded(entry({ name: "plain" }), { activate: (() => 1) as unknown as () => Promise<void> });
++    await activatePlugins([none, plain], log, 20);
++    expect([none.running, none.error, plain.running, plain.error]).toEqual([true, undefined, true, undefined]);
++    expect(calls).toEqual([]);
 +  });
 +
 +  test("a synchronously-throwing activate is isolated the same as an async rejection", async () => {
@@ -603,7 +765,7 @@ index 4a6485b..393f769 100644
 +    ]);
 +  });
 +
-+  test("a dispose() that throws, even synchronously, after a late activate() is logged (#408)", async () => {
++  test("a dispose() that throws synchronously after a late activate() is logged (#408)", async () => {
 +    const { log, calls } = makeLog();
 +    const late = lateActivate();
 +    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: () => { throw new Error("dispose blew up"); } });
@@ -624,6 +786,65 @@ index 4a6485b..393f769 100644
 +      expect(setSpy.mock.calls.some((call) => call[1] === PLUGIN_ACTIVATE_TIMEOUT_MS)).toBe(true);
 +    } finally {
 +      setSpy.mockRestore();
++    }
++  });
++
++  test("an activate() that throws a value String() can't convert is isolated, and the plugins after it still activate (#408)", async () => {
++    const { log, calls } = makeLog();
++    const lp1 = loaded(entry({ name: "odd" }), { activate: async () => { throw unprintable(); } });
++    const lp2 = loaded(entry({ name: "ok" }), { activate: async () => {} });
++    await activatePlugins([lp1, lp2], log, 20);
++    expect(lp1.running).toBe(false);
++    expect(lp1.error).toBe("(unprintable thrown value)");
++    expect(lp2.running).toBe(true);
++    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
++      "[plugins] odd failed to activate — the bot keeps running without it: (unprintable thrown value)",
++    ]);
++  });
++
++  test("an activate() that rejects after the bound with a value String() can't convert is still logged (#408)", async () => {
++    const { log, calls } = makeLog();
++    const late = lateActivate();
++    const lp = loaded(entry({ name: "slow" }), { activate: late.activate });
++    await activatePlugins([lp], log, 20);
++    late.reject(unprintable());
++    await Bun.sleep(0);
++    expect(calls.filter((c) => c.level === "warn").map((c) => c.message)).toEqual([
++      "[plugins] slow failed to activate after the 20ms bound: (unprintable thrown value)",
++    ]);
++  });
++
++  test("a late dispose() that rejects with a value String() can't convert is still logged (#408)", async () => {
++    const { log, calls } = makeLog();
++    const late = lateActivate();
++    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: () => Promise.reject(unprintable()) });
++    await activatePlugins([lp], log, 20);
++    late.resolve();
++    await Bun.sleep(0);
++    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toContain(
++      "[plugins] slow dispose failed — continuing: (unprintable thrown value)",
++    );
++  });
++
++  // afterLateActivate's comment promises its chain never ends in an unhandled rejection -- the process has
++  // no handler for one -- even if the logger itself throws. This is the test that reads that claim.
++  test("a late activate() whose log line throws leaves no unhandled rejection (#408)", async () => {
++    const unhandled: unknown[] = [];
++    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
++    process.on("unhandledRejection", onUnhandled);
++    try {
++      const throwingLog = { info: () => {}, warn: () => { throw new Error("log blew up"); }, error: () => {} };
++      const resolved = lateActivate();
++      const rejected = lateActivate();
++      const a = loaded(entry({ name: "a" }), { activate: resolved.activate });
++      const b = loaded(entry({ name: "b" }), { activate: rejected.activate });
++      await activatePlugins([a, b], throwingLog, 20);
++      resolved.resolve();
++      rejected.reject(new Error("late boom"));
++      await Bun.sleep(50); // past the microtask drain an unhandled rejection is reported after
++      expect(unhandled).toEqual([]);
++    } finally {
++      process.off("unhandledRejection", onUnhandled);
 +    }
 +  });
 +});
@@ -666,8 +887,25 @@ index 4a6485b..393f769 100644
  });
  
  describe("routeInteractionByPrefix", () => {
+@@ -1792,6 +2085,16 @@ describe("disposePlugins (#184)", () => {
+     expect(calls.some((c) => c.level === "error" && c.message.includes("sync-boom"))).toBe(true);
+   });
+ 
++  test("a dispose that rejects with a value String() can't convert is still logged (#408)", async () => {
++    const { log, calls } = makeLog();
++    const odd = loaded(entry({ name: "odd" }), { dispose: () => Promise.reject(unprintable()) }, true);
++    await disposePlugins([odd], log, 50);
++    expect(odd.running).toBe(false);
++    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
++      "[plugins] odd dispose failed — continuing: (unprintable thrown value)",
++    ]);
++  });
++
+   // The mutation this guards: dropping the per-plugin timeout entirely, which would leave this test
+   // hanging on a dispose() that never resolves on its own.
+   test("a dispose that never resolves is bounded by the per-plugin timeout", async () => {
 diff --git a/src/plugins/host.ts b/src/plugins/host.ts
-index 75c9435..cb6d052 100644
+index 75c9435..1534249 100644
 --- a/src/plugins/host.ts
 +++ b/src/plugins/host.ts
 @@ -41,9 +41,9 @@ export interface LoadedPlugin {
@@ -682,8 +920,23 @@ index 75c9435..cb6d052 100644
    error?: string;
  }
  
-@@ -200,26 +200,36 @@ function refuseUnanswerableButtons(message: unknown, deps: HostDeliveryDeps): vo
+@@ -198,32 +198,57 @@ function refuseUnanswerableButtons(message: unknown, deps: HostDeliveryDeps): vo
+   }
+ }
  
++/** What a plugin threw or rejected with, as text for a log line or `state.json`, never itself throwing.
++ *  Plugin code is only type-asserted, so it can throw anything — including a value `String()` can't
++ *  convert (`Object.create(null)`) or an Error whose `message` getter throws — and an isolating catch
++ *  that threw while describing it would end the isolation it exists for (#408). */
++const UNPRINTABLE_THROWN = "(unprintable thrown value)";
++function describeThrown(err: unknown): string {
++  try {
++    return String(err instanceof Error ? err.message : err);
++  } catch {
++    return UNPRINTABLE_THROWN;
++  }
++}
++
  export interface LoadResult {
    loaded: LoadedPlugin[];
 -  /** name -> reason, for bundles whose import or createPlugin threw. */
@@ -693,8 +946,9 @@ index 75c9435..cb6d052 100644
  
 +/** The most `loadPlugins` waits on one bundle's `import()` (#408) before it records that bundle as
 + *  failed and moves on to the next. A bundle is a local file, so in practice only a module whose
-+ *  top-level `await` never settles gets here. The import is not cancelled: if it lands later it is
-+ *  dropped, and `createPlugin` never runs for it. */
++ *  top-level `await` is that slow, or never settles, gets here. The import is not cancelled: whatever
++ *  the module's own top level does still runs, but if it lands later it is dropped, and `createPlugin`
++ *  never runs for it. */
 +export const PLUGIN_IMPORT_TIMEOUT_MS = 10_000;
 +
  /**
@@ -703,7 +957,8 @@ index 75c9435..cb6d052 100644
 - * plugin is recorded in `errors` and left out of `loaded`, never crashing the others or the bot.
 + * (those are `activate()`). A rejecting import, one still unsettled after `timeoutMs` (#408, see
 + * PLUGIN_IMPORT_TIMEOUT_MS), or a throwing `createPlugin` is isolated: that plugin is recorded in
-+ * `errors` and left out of `loaded`, never crashing or holding up the others or the bot.
++ * `errors` and left out of `loaded`, never crashing the others or the bot, and holding them up by
++ * `timeoutMs` at most.
 + * `timeoutMs` is the test seam, like `pluginTicks`': real callers take the default.
   */
  export async function loadPlugins(
@@ -723,7 +978,28 @@ index 75c9435..cb6d052 100644
        const plugin = mod.createPlugin(makeHost(entry));
        loaded.push({ entry, version, plugin, running: false });
      } catch (err) {
-@@ -537,12 +547,30 @@ export function pluginTicks(
+-      const message = err instanceof Error ? err.message : String(err);
++      const message = describeThrown(err);
+       errors[entry.name] = message;
+       log.error(`[plugins] ${entry.name}: ${message}`);
+     }
+@@ -258,7 +283,7 @@ export function pluginCommandMap(
+         map.set(command.name, { entry, command });
+       }
+     } catch (err) {
+-      log.error(`[plugins] ${entry.name}: ignoring malformed commands — ${err instanceof Error ? err.message : String(err)}`);
++      log.error(`[plugins] ${entry.name}: ignoring malformed commands — ${describeThrown(err)}`);
+     }
+   }
+   return map;
+@@ -531,26 +556,75 @@ export function pluginTicks(
+         });
+       }
+     } catch (err) {
+-      log.error(`[plugins] ${lp.entry.name}: ignoring malformed ticks — ${err instanceof Error ? err.message : String(err)}`);
++      log.error(`[plugins] ${lp.entry.name}: ignoring malformed ticks — ${describeThrown(err)}`);
+     }
+   }
    return checks;
  }
  
@@ -757,39 +1033,56 @@ index 75c9435..cb6d052 100644
 +      }
        lp.running = true;
      } catch (err) {
-       lp.error = err instanceof Error ? err.message : String(err);
-@@ -551,6 +579,31 @@ export async function activatePlugins(loaded: readonly LoadedPlugin[], log: Base
+-      lp.error = err instanceof Error ? err.message : String(err);
++      lp.error = describeThrown(err);
+       log.error(`[plugins] ${lp.entry.name} failed to activate — the bot keeps running without it: ${lp.error}`);
+     }
    }
  }
  
 +/**
 + * #408: what happens to an `activate()` that `activatePlugins` stopped waiting on, once it does settle.
-+ * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and interactions
-+ * stay gated off, and this boot's state.json, written after `activatePlugins` returned, already says it
-+ * is not active — a plugin flipping on mid-life would contradict what the panel shows. A RESOLVE means
-+ * `activate()` may have set things up (a server, timers, a database handle) that `disposePlugins` will
-+ * never release, since it disposes only running plugins, so its `dispose()` runs now, isolated like every
-+ * other plugin call (a throw, sync or async, is logged). Nothing awaits it, so it is not bounded. A
++ * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and component, modal
++ * and autocomplete handlers stay gated off, and this boot's state.json records it as not active — a
++ * plugin flipping on mid-life would contradict what the panel shows. (Its slash commands are the
++ * exception: they are not `running`-gated until #407 lands, so they keep dispatching, even after the
++ * dispose below.) A RESOLVE means `activate()` may have set things up (a server, timers, a database
++ * handle) that `disposePlugins` will never release, since it disposes only running plugins, so its
++ * `dispose()` runs now, isolated like every other plugin call (a throw, sync or async, is logged).
++ * Nothing awaits it, so it is not bounded. A
 + * REJECTION is only logged: a plugin whose `activate()` failed has nothing `dispose()` could safely
-+ * release, as for a throw inside the bound.
++ * release, as for a throw inside the bound. Nothing awaits this chain either, and the process has no
++ * `unhandledRejection` handler, so it ends in a catch that drops whatever is left.
 + */
 +function afterLateActivate(lp: LoadedPlugin, call: Promise<unknown>, timeoutMs: number, log: BaseLog): void {
 +  const name = lp.entry.name;
-+  const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-+  void call.then(
-+    () => {
-+      log.warn(`[plugins] ${name} finished activating after the ${timeoutMs}ms bound — it stays off until the next restart; disposing what it set up`);
-+      return Promise.resolve()
-+        .then(() => lp.plugin.dispose?.())
-+        .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${reason(err)}`));
-+    },
-+    (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${reason(err)}`),
-+  );
++  call
++    .then(
++      () => {
++        log.warn(`[plugins] ${name} finished activating after the ${timeoutMs}ms bound — it stays off until the next restart; disposing what it set up`);
++        return Promise.resolve()
++          .then(() => lp.plugin.dispose?.())
++          .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${describeThrown(err)}`));
++      },
++      (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${describeThrown(err)}`),
++    )
++    .catch(() => {
++      // Only a throw from `log` itself reaches here, and there is nowhere left to report it.
++    });
 +}
 +
  /** The most one plugin's `dispose()` gets (#184) — a server close or a handle release is normally
   *  near-instant; this exists only so one wedged plugin can't consume the whole shutdown grace and
   *  starve every other plugin's own dispose. `shutdown.ts` separately bounds the WHOLE
+@@ -590,7 +664,7 @@ export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseL
+           new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+         ]);
+       } catch (err) {
+-        log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${err instanceof Error ? err.message : String(err)}`);
++        log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${describeThrown(err)}`);
+       } finally {
+         lp.running = false;
+       }
 ```
 
 ## Appendix B -- `acceptance-408.ts`
@@ -931,16 +1224,19 @@ process.exit(0);
 ## Appendix C -- `mutate-408.ts`
 
 ```ts
-// Mutation check for #408's changed lines: apply one mutation to src/plugins/host.ts in a scratch worktree, run
-// host.test.ts, record whether the suite FAILED (it must), restore. Usage: bun mutate-408.ts <worktree>
+// Mutation check for #408's changed lines: apply one mutation to src/plugins/host.ts (or src/index.ts) in a
+// scratch worktree, run host.test.ts and index.test.ts, record whether the run FAILED (it must), restore.
+// Usage: bun mutate-408.ts <worktree>    Never point it at a tree anything else is reading.
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const wt = process.argv[2]!;
-const file = join(wt, "src/plugins/host.ts");
-const original = readFileSync(file, "utf8");
+const HOST = "src/plugins/host.ts";
+const INDEX = "src/index.ts";
+const originals = new Map([HOST, INDEX].map((f) => [f, readFileSync(join(wt, f), "utf8")]));
 
-const mutations: { id: string; from: string; to: string }[] = [
+const OLD_DESCRIBE = "err instanceof Error ? err.message : String(err)";
+const mutations: { id: string; from: string; to: string; file?: string }[] = [
   { id: "M1 import unbounded", from: "await within<PluginModule | typeof TIMED_OUT>(importer(bundlePath), timeoutMs, TIMED_OUT)", to: "await importer(bundlePath)" },
   { id: "M2 drop TIMED_OUT check on import", from: "      if (mod === TIMED_OUT) throw new Error(`import() did not finish within ${timeoutMs}ms`);\n", to: "" },
   { id: "M3 import default bound", from: "  timeoutMs = PLUGIN_IMPORT_TIMEOUT_MS,", to: "  timeoutMs = 5_000," },
@@ -951,26 +1247,43 @@ const mutations: { id: string; from: string; to: string }[] = [
   { id: "M8 timed-out plugin marked running", from: "        throw new Error(`activate() did not finish within ${timeoutMs}ms`);", to: "        lp.running = true; continue;" },
   { id: "M9 activate default bound", from: "  timeoutMs = PLUGIN_ACTIVATE_TIMEOUT_MS,", to: "  timeoutMs = 5_000," },
   { id: "M10 activate constant", from: "PLUGIN_ACTIVATE_TIMEOUT_MS = 30_000", to: "PLUGIN_ACTIVATE_TIMEOUT_MS = 60_000" },
-  { id: "M11 late resolve not disposed", from: "        .then(() => lp.plugin.dispose?.())", to: "        .then(() => undefined)" },
-  { id: "M12 late resolve flips running", from: "    () => {\n      log.warn(`[plugins] ${name} finished activating", to: "    () => {\n      lp.running = true;\n      log.warn(`[plugins] ${name} finished activating" },
-  { id: "M13 late reject disposed too", from: "    (err: unknown) => log.warn(`[plugins] ${name} failed to activate after", to: "    (err: unknown) => void lp.plugin.dispose?.() ?? log.warn(`[plugins] ${name} failed to activate after" },
-  { id: "M14 late dispose uncaught", from: "        .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${reason(err)}`));", to: ";" },
-  { id: "M15 sync dispose throw escapes", from: "      return Promise.resolve()\n        .then(() => lp.plugin.dispose?.())", to: "      return Promise.resolve(lp.plugin.dispose?.())" },
-  { id: "M16 disposed at the timeout, not when activate lands", from: "  const name = lp.entry.name;\n  const reason", to: "  void Promise.resolve().then(() => lp.plugin.dispose?.()).catch(() => {});\n  const name = lp.entry.name;\n  const reason" },
+  { id: "M11 late resolve not disposed", from: "          .then(() => lp.plugin.dispose?.())", to: "          .then(() => undefined)" },
+  { id: "M12 late resolve flips running", from: "      () => {\n        log.warn(`[plugins] ${name} finished activating", to: "      () => {\n        lp.running = true;\n        log.warn(`[plugins] ${name} finished activating" },
+  { id: "M13 late reject disposed too", from: "      (err: unknown) => log.warn(`[plugins] ${name} failed to activate after", to: "      (err: unknown) => void lp.plugin.dispose?.() ?? log.warn(`[plugins] ${name} failed to activate after" },
+  { id: "M14 late dispose uncaught", from: "          .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${describeThrown(err)}`));", to: ";" },
+  { id: "M15 sync dispose throw escapes", from: "        return Promise.resolve()\n          .then(() => lp.plugin.dispose?.())", to: "        return Promise.resolve(lp.plugin.dispose?.())" },
+  { id: "M16 disposed at the timeout, not when activate lands", from: "  const name = lp.entry.name;\n  call\n", to: "  void Promise.resolve().then(() => lp.plugin.dispose?.()).catch(() => {});\n  const name = lp.entry.name;\n  call\n" },
+  { id: "M17 late reject unhandled", from: "      (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${describeThrown(err)}`),\n", to: "" },
   { id: "M18 activate called outside the try", from: "  for (const lp of loaded) {\n    try {\n      // A sync throw (or a throwing getter) lands in the catch below, as before.\n      const call = Promise.resolve(lp.plugin.activate?.());\n", to: "  for (const lp of loaded) {\n    const call = Promise.resolve(lp.plugin.activate?.());\n    try {\n" },
-  { id: "M17 late reject unhandled",from: "    (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${reason(err)}`),\n", to: "" },
+  // Round 1 of the review gate: describeThrown, its six call sites, the late chain's terminal catch, and the two
+  // lines reviewer 2 found unguarded (X1, X2).
+  { id: "M19 describeThrown can throw", from: "  try {\n    return String(err instanceof Error ? err.message : err);\n  } catch {\n    return UNPRINTABLE_THROWN;\n  }", to: `  return ${OLD_DESCRIBE};` },
+  { id: "M20 loadPlugins catch", from: "      const message = describeThrown(err);", to: `      const message = ${OLD_DESCRIBE};` },
+  { id: "M21 pluginCommandMap catch", from: "ignoring malformed commands — ${describeThrown(err)}", to: `ignoring malformed commands — \${${OLD_DESCRIBE}}` },
+  { id: "M22 pluginTicks catch", from: "ignoring malformed ticks — ${describeThrown(err)}", to: `ignoring malformed ticks — \${${OLD_DESCRIBE}}` },
+  { id: "M23 activatePlugins catch", from: "      lp.error = describeThrown(err);", to: `      lp.error = ${OLD_DESCRIBE};` },
+  { id: "M24 late reject describe", from: "bound: ${describeThrown(err)}`),", to: `bound: \${${OLD_DESCRIBE}}\`),` },
+  { id: "M25 late dispose describe", from: "${name} dispose failed — continuing: ${describeThrown(err)}", to: `\${name} dispose failed — continuing: \${${OLD_DESCRIBE}}` },
+  { id: "M26 disposePlugins catch", from: "${lp.entry.name} dispose failed — continuing: ${describeThrown(err)}", to: `\${lp.entry.name} dispose failed — continuing: \${${OLD_DESCRIBE}}` },
+  { id: "M27 late chain has no terminal catch", from: "    )\n    .catch(() => {\n      // Only a throw from `log` itself reaches here, and there is nowhere left to report it.\n    });", to: "    );" },
+  { id: "X1 activate result not wrapped", from: "const call = Promise.resolve(lp.plugin.activate?.());", to: "const call = lp.plugin.activate?.() as Promise<unknown>;" },
+  { id: "X2 late dispose not chained", from: "          .then(() => lp.plugin.dispose?.())", to: "          .then(() => { void lp.plugin.dispose?.(); })" },
+  { id: "M28 boot passes loadPlugins a bound", file: INDEX, from: "      console,\n    );\n    // #184: visible", to: "      console,\n      5,\n    );\n    // #184: visible" },
+  { id: "M29 boot passes activatePlugins a bound", file: INDEX, from: "await activatePlugins(loadResult.loaded, console);", to: "await activatePlugins(loadResult.loaded, console, 5);" },
 ];
 
 let survivors = 0;
 try {
   for (const m of mutations) {
-    if (!original.includes(m.from)) {
-      console.log(`?? ${m.id}: anchor not found`);
+    const file = m.file ?? HOST;
+    const original = originals.get(file)!;
+    if (original.split(m.from).length !== 2) {
+      console.log(`?? ${m.id}: anchor not found exactly once in ${file}`);
       survivors += 1;
       continue;
     }
-    writeFileSync(file, original.replace(m.from, m.to));
-    const proc = Bun.spawnSync(["bun", "test", "src/plugins/host.test.ts", "--timeout", "10000"], { cwd: wt, stdout: "pipe", stderr: "pipe" });
+    writeFileSync(join(wt, file), original.replace(m.from, () => m.to));
+    const proc = Bun.spawnSync(["bun", "test", "src/plugins/host.test.ts", "src/index.test.ts", "--timeout", "10000"], { cwd: wt, stdout: "pipe", stderr: "pipe" });
     const out = proc.stdout.toString() + proc.stderr.toString();
     const fails = out.split("\n").filter((l) => l.includes("(fail)")).map((l) => l.trim().replace(/^\(fail\) /, ""));
     const summary = out.match(/(\d+) fail/)?.[0] ?? "?";
@@ -979,9 +1292,10 @@ try {
     console.log(`${killed ? "KILLED " : "SURVIVED"} ${m.id} (exit ${proc.exitCode}, ${summary})`);
     for (const f of fails.slice(0, 4)) console.log(`         - ${f}`);
     if (fails.length === 0 && killed) console.log(`         ${out.split("\n").filter((l) => /error|Unhandled/i.test(l)).slice(0, 2).join(" | ")}`);
+    writeFileSync(join(wt, file), original);
   }
 } finally {
-  writeFileSync(file, original);
+  for (const [file, original] of originals) writeFileSync(join(wt, file), original);
 }
 console.log(`${mutations.length} mutations, ${survivors} survived`);
 process.exit(survivors === 0 ? 0 : 1);

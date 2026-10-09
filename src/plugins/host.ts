@@ -198,6 +198,19 @@ function refuseUnanswerableButtons(message: unknown, deps: HostDeliveryDeps): vo
   }
 }
 
+/** What a plugin threw or rejected with, as text for a log line or `state.json`, never itself throwing.
+ *  Plugin code is only type-asserted, so it can throw anything — including a value `String()` can't
+ *  convert (`Object.create(null)`) or an Error whose `message` getter throws — and an isolating catch
+ *  that threw while describing it would end the isolation it exists for (#408). */
+const UNPRINTABLE_THROWN = "(unprintable thrown value)";
+function describeThrown(err: unknown): string {
+  try {
+    return String(err instanceof Error ? err.message : err);
+  } catch {
+    return UNPRINTABLE_THROWN;
+  }
+}
+
 export interface LoadResult {
   loaded: LoadedPlugin[];
   /** name -> reason, for bundles whose import failed or did not finish in time, or whose createPlugin threw. */
@@ -206,15 +219,17 @@ export interface LoadResult {
 
 /** The most `loadPlugins` waits on one bundle's `import()` (#408) before it records that bundle as
  *  failed and moves on to the next. A bundle is a local file, so in practice only a module whose
- *  top-level `await` never settles gets here. The import is not cancelled: if it lands later it is
- *  dropped, and `createPlugin` never runs for it. */
+ *  top-level `await` is that slow, or never settles, gets here. The import is not cancelled: whatever
+ *  the module's own top level does still runs, but if it lands later it is dropped, and `createPlugin`
+ *  never runs for it. */
 export const PLUGIN_IMPORT_TIMEOUT_MS = 10_000;
 
 /**
  * Imports each installed bundle and runs its `createPlugin(host)` — pure, no side effects yet
  * (those are `activate()`). A rejecting import, one still unsettled after `timeoutMs` (#408, see
  * PLUGIN_IMPORT_TIMEOUT_MS), or a throwing `createPlugin` is isolated: that plugin is recorded in
- * `errors` and left out of `loaded`, never crashing or holding up the others or the bot.
+ * `errors` and left out of `loaded`, never crashing the others or the bot, and holding them up by
+ * `timeoutMs` at most.
  * `timeoutMs` is the test seam, like `pluginTicks`': real callers take the default.
  */
 export async function loadPlugins(
@@ -233,7 +248,7 @@ export async function loadPlugins(
       const plugin = mod.createPlugin(makeHost(entry));
       loaded.push({ entry, version, plugin, running: false });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeThrown(err);
       errors[entry.name] = message;
       log.error(`[plugins] ${entry.name}: ${message}`);
     }
@@ -268,7 +283,7 @@ export function pluginCommandMap(
         map.set(command.name, { entry, command });
       }
     } catch (err) {
-      log.error(`[plugins] ${entry.name}: ignoring malformed commands — ${err instanceof Error ? err.message : String(err)}`);
+      log.error(`[plugins] ${entry.name}: ignoring malformed commands — ${describeThrown(err)}`);
     }
   }
   return map;
@@ -541,7 +556,7 @@ export function pluginTicks(
         });
       }
     } catch (err) {
-      log.error(`[plugins] ${lp.entry.name}: ignoring malformed ticks — ${err instanceof Error ? err.message : String(err)}`);
+      log.error(`[plugins] ${lp.entry.name}: ignoring malformed ticks — ${describeThrown(err)}`);
     }
   }
   return checks;
@@ -573,7 +588,7 @@ export async function activatePlugins(
       }
       lp.running = true;
     } catch (err) {
-      lp.error = err instanceof Error ? err.message : String(err);
+      lp.error = describeThrown(err);
       log.error(`[plugins] ${lp.entry.name} failed to activate — the bot keeps running without it: ${lp.error}`);
     }
   }
@@ -581,27 +596,33 @@ export async function activatePlugins(
 
 /**
  * #408: what happens to an `activate()` that `activatePlugins` stopped waiting on, once it does settle.
- * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and interactions
- * stay gated off, and this boot's state.json, written after `activatePlugins` returned, already says it
- * is not active — a plugin flipping on mid-life would contradict what the panel shows. A RESOLVE means
- * `activate()` may have set things up (a server, timers, a database handle) that `disposePlugins` will
- * never release, since it disposes only running plugins, so its `dispose()` runs now, isolated like every
- * other plugin call (a throw, sync or async, is logged). Nothing awaits it, so it is not bounded. A
+ * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and component, modal
+ * and autocomplete handlers stay gated off, and this boot's state.json records it as not active — a
+ * plugin flipping on mid-life would contradict what the panel shows. (Its slash commands are the
+ * exception: they are not `running`-gated until #407 lands, so they keep dispatching, even after the
+ * dispose below.) A RESOLVE means `activate()` may have set things up (a server, timers, a database
+ * handle) that `disposePlugins` will never release, since it disposes only running plugins, so its
+ * `dispose()` runs now, isolated like every other plugin call (a throw, sync or async, is logged).
+ * Nothing awaits it, so it is not bounded. A
  * REJECTION is only logged: a plugin whose `activate()` failed has nothing `dispose()` could safely
- * release, as for a throw inside the bound.
+ * release, as for a throw inside the bound. Nothing awaits this chain either, and the process has no
+ * `unhandledRejection` handler, so it ends in a catch that drops whatever is left.
  */
 function afterLateActivate(lp: LoadedPlugin, call: Promise<unknown>, timeoutMs: number, log: BaseLog): void {
   const name = lp.entry.name;
-  const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err));
-  void call.then(
-    () => {
-      log.warn(`[plugins] ${name} finished activating after the ${timeoutMs}ms bound — it stays off until the next restart; disposing what it set up`);
-      return Promise.resolve()
-        .then(() => lp.plugin.dispose?.())
-        .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${reason(err)}`));
-    },
-    (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${reason(err)}`),
-  );
+  call
+    .then(
+      () => {
+        log.warn(`[plugins] ${name} finished activating after the ${timeoutMs}ms bound — it stays off until the next restart; disposing what it set up`);
+        return Promise.resolve()
+          .then(() => lp.plugin.dispose?.())
+          .catch((err: unknown) => log.error(`[plugins] ${name} dispose failed — continuing: ${describeThrown(err)}`));
+      },
+      (err: unknown) => log.warn(`[plugins] ${name} failed to activate after the ${timeoutMs}ms bound: ${describeThrown(err)}`),
+    )
+    .catch(() => {
+      // Only a throw from `log` itself reaches here, and there is nowhere left to report it.
+    });
 }
 
 /** The most one plugin's `dispose()` gets (#184) — a server close or a handle release is normally
@@ -643,7 +664,7 @@ export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseL
           new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
         ]);
       } catch (err) {
-        log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${err instanceof Error ? err.message : String(err)}`);
+        log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${describeThrown(err)}`);
       } finally {
         lp.running = false;
       }
