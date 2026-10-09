@@ -62,8 +62,9 @@ request mailbox and applied without a restart.
    outside its channels gets a private reply naming the right ones; a thread counts as its parent.
 8. **The panel may set plugin-declared secret keys, write-only.** A key the Plugin Index marks
    `secret: true` can be written through `env-set`, is never returned by `env-get`, and appears in
-   `env-schema` only as `secret` + `isSet`. Core secrets stay uneditable. This loosens
-   "secrets are never edited by ops tooling" deliberately: needing SSH to give a plugin its API key
+   `env-schema` with its `pattern`, `required` and `source` plus `secret` + `isSet`, never its
+   value. Core secrets stay uneditable. This loosens "secrets are never edited by ops tooling"
+   deliberately: needing SSH to give a plugin its API key
    was half of what made adding one painful, and the panel is already behind Cloudflare Access, an
    email allow-list and the cross-site-write gate. A plugin's admin bundle already runs with the
    panel's authority (#226); write-only keeps a compromised one from *reading* a secret.

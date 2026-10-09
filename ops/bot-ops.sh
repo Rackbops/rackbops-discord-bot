@@ -25,8 +25,8 @@
 #                 Holds one lock on the config dir for its whole run (#227) — restart and recreate
 #                 hold the same lock, so the three never overlap on one instance; a second mutation
 #                 waits up to BOT_OPS_LOCK_WAIT_SECONDS (default 60), then refuses, writing nothing.
-#   env-schema    Print JSON: each env-get key's validation, plus a plugin's WRITE-ONLY secret keys as
-#                 {secret, isSet} — never a value (#205, #240).
+#   env-schema    Print JSON: each env-get key's validation, plus a plugin's WRITE-ONLY secret keys,
+#                 each with its own validation plus {secret, isSet} — never a value (#205, #240).
 #   routing-get   Print JSON {routing, discovery}: the bot's per-plugin routing record and what it can
 #                 see, read from its data dir. A missing or corrupt file is null (#240).
 #   plugin-request  Read one request JSON on stdin and queue it for the bot's mailbox — a plugin
@@ -53,7 +53,7 @@
 #     Edit those by hand with nano on the box. A PLUGIN-declared secret key (the Plugin Index marks
 #     it `secret: true` — e.g. the wow plugin's BLIZZARD_CLIENT_ID / BLIZZARD_CLIENT_SECRET) is
 #     different, on purpose (ADR-0006 decision 8): env-set may WRITE it, and nothing ever reads it
-#     back — env-get never lists it, env-schema says only that it exists and whether it is set, and
+#     back — env-get never lists it, env-schema shows how it is validated and whether it is set, and
 #     no output, error or log line this script writes itself carries its value. (The text it does not
 #     write is `docker compose`'s, which env-set relays as `log` and restart relays as its output: a
 #     message about the env file is withheld whole, and anything else is scrubbed, best effort, of what
