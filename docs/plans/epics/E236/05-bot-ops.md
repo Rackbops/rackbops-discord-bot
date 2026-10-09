@@ -1,4 +1,4 @@
-<!-- Plan for Rackbops/rackbops-discord-bot#240 (Epic #236). Copy of the approved plan comment, https://github.com/Rackbops/rackbops-discord-bot/issues/240#issuecomment-5754929160, as of when it was approved — with the orchestrator's later corrections applied where the text says so (Step 5's "the write is unchanged" is superseded; a coverage-table row was added) and the implementer's "Deviations from the plan" appended at the end. -->
+<!-- Plan for Rackbops/rackbops-discord-bot#240 (Epic #236). Copy of the approved plan comment, https://github.com/Rackbops/rackbops-discord-bot/issues/240#issuecomment-5754929160, as of when it was approved — with the orchestrator's later corrections applied where the text says so (Step 5's "the write is unchanged" is superseded; a coverage-table row was added) and the implementer's "Deviations from the plan" appended at the end. A later correction (2026-10-09, #430) to the "Write-only" bullet's description of `env-schema` is marked where it stands. -->
 
 ## Implementation plan — written by the orchestrating session, to be executed as written
 
@@ -9,7 +9,7 @@ Everything here is in `ops/bot-ops.sh`, `ops/bot-ops.test.ts`, one constant in `
 ### Decided — not open for re-planning
 
 - **Only plugin-declared secret keys become writable.** Core secrets stay absent from every list and refused by `env-set`, exactly as today.
-- **Write-only means write-only:** a secret key's *value* never leaves the script — not in `env-get`, `env-schema`, `env-set`'s result, a `die` message, or stderr. `env-schema` says only that the key exists, that it is secret, and whether it is set.
+- **Write-only means write-only:** a secret key's *value* never leaves the script — not in `env-get`, `env-schema`, `env-set`'s result, a `die` message, or stderr. `env-schema` ~~says only that the key exists, that it is secret, and whether it is set.~~ **Corrected (2026-10-09, #430):** it gives the key's `pattern`, `required` and `source`, that it is secret, and whether it is set, never its value — as Step 3's own jq program says.
 - **Existing output stays byte-compatible.** `env-get`'s object and every existing `env-schema` entry (`{pattern, required, source}`) are unchanged; secret keys are *additional* `env-schema` entries.
 - **No new subcommand for requests** — the four routing actions ride `plugin-request`, the one mailbox writer.
 - **A webhook URL travels on stdin only** and is never echoed; `die` messages for it carry no part of it.
