@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ButtonStyle, SlashCommandBuilder, type MessageComponentInteraction } from "discord.js";
-import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile } from "./contract";
+import type { HostApi, HostStorage, Plugin, PluginCommand, PluginIndex, PluginIndexEntry, PluginModule, PluginStateFile, TickCheck } from "./contract";
 import { installPlugins, type InstalledPlugin } from "./install";
 import type { HostDeliveryDeps, LoadedPlugin } from "./host";
 import { pinsFromState, selectPlugins } from "./registry";
@@ -16,6 +16,8 @@ import { settled } from "../../test/stateLeaks";
 const {
   createHostApi,
   loadPlugins,
+  PLUGIN_IMPORT_TIMEOUT_MS,
+  PLUGIN_ACTIVATE_TIMEOUT_MS,
   pluginCommandMap,
   buildCommandBody,
   autocompleteOptionPaths,
@@ -124,6 +126,14 @@ function entry(over: Partial<PluginIndexEntry> = {}): PluginIndexEntry {
 function loaded(e: PluginIndexEntry, plugin: Plugin, running = false): LoadedPlugin {
   return { entry: e, version: "1.0.0", plugin, running };
 }
+
+/** #408: `p`, or `"hung"` once 2 s pass without it settling -- so a regression that drops the import or
+ *  activate() bound fails by name rather than deadlocking into bun's own test timeout. */
+const orHung = <T>(p: Promise<T>): Promise<T | "hung"> => Promise.race([p, Bun.sleep(2_000).then(() => "hung" as const)]);
+
+/** #408: a value `String()` throws on ("No default value") -- plugin code can throw or reject with one, and
+ *  every isolating catch in host.ts must still describe it rather than throw again. */
+const unprintable = (): unknown => Object.create(null);
 
 const cmd = (name: string, build?: PluginCommand["build"]): PluginCommand => ({
   name,
@@ -630,6 +640,61 @@ describe("loadPlugins", () => {
       "[plugins] createboom: create failed",
     ]);
   });
+
+  test("an import that never settles is given up on after timeoutMs, and the bundles after it still load (#408)", async () => {
+    const { log, calls } = makeLog();
+    const installed: InstalledPlugin[] = [
+      { entry: entry({ name: "stuck" }), version: "1.0.0", bundlePath: "/stuck" },
+      { entry: entry({ name: "ok" }), version: "1.0.0", bundlePath: "/ok" },
+    ];
+    const importer = (path: string): Promise<PluginModule> =>
+      path === "/stuck" ? new Promise<PluginModule>(() => {}) : Promise.resolve({ createPlugin: () => ({ commands: [] }) });
+    const outcome = await orHung(loadPlugins(installed, makeHost, importer, log, 20));
+    if (outcome === "hung") throw new Error("loadPlugins never returned");
+    expect(outcome.loaded.map((l) => l.entry.name)).toEqual(["ok"]);
+    expect(outcome.errors).toEqual({ stuck: "import() did not finish within 20ms" });
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
+      "[plugins] stuck: import() did not finish within 20ms",
+    ]);
+  });
+
+  test("an import that lands after the bound is dropped: createPlugin never runs for it (#408)", async () => {
+    let land: (mod: PluginModule) => void = () => {};
+    let created = 0;
+    const installed: InstalledPlugin[] = [{ entry: entry({ name: "late" }), version: "1.0.0", bundlePath: "/late" }];
+    const result = await orHung(loadPlugins(installed, makeHost, () => new Promise<PluginModule>((resolve) => (land = resolve)), makeLog().log, 20));
+    if (result === "hung") throw new Error("loadPlugins never returned");
+    land({ createPlugin: () => { created += 1; return { commands: [] }; } });
+    await Bun.sleep(0); // let anything still chained on the late import run
+    expect(created).toBe(0);
+    expect(result.loaded).toEqual([]);
+  });
+
+  test("an import that rejects with a value String() can't convert is still isolated, and the bundles after it still load (#408)", async () => {
+    const { log, calls } = makeLog();
+    const installed: InstalledPlugin[] = [
+      { entry: entry({ name: "odd" }), version: "1.0.0", bundlePath: "/odd" },
+      { entry: entry({ name: "ok" }), version: "1.0.0", bundlePath: "/ok" },
+    ];
+    const importer = (path: string): Promise<PluginModule> =>
+      path === "/odd" ? Promise.reject(unprintable()) : Promise.resolve({ createPlugin: () => ({ commands: [] }) });
+    const result = await loadPlugins(installed, makeHost, importer, log, 20);
+    expect(result.loaded.map((l) => l.entry.name)).toEqual(["ok"]);
+    expect(result.errors).toEqual({ odd: "(unprintable thrown value)" });
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual(["[plugins] odd: (unprintable thrown value)"]);
+  });
+
+  test("real callers get PLUGIN_IMPORT_TIMEOUT_MS, 10 s (#408)", async () => {
+    expect(PLUGIN_IMPORT_TIMEOUT_MS).toBe(10_000);
+    const setSpy = spyOn(globalThis, "setTimeout");
+    try {
+      const installed: InstalledPlugin[] = [{ entry: entry({ name: "ok" }), version: "1.0.0", bundlePath: "/ok" }];
+      await loadPlugins(installed, makeHost, async () => ({ createPlugin: () => ({ commands: [] }) }), makeLog().log);
+      expect(setSpy.mock.calls.some((call) => call[1] === PLUGIN_IMPORT_TIMEOUT_MS)).toBe(true);
+    } finally {
+      setSpy.mockRestore();
+    }
+  });
 });
 
 describe("pluginCommandMap", () => {
@@ -654,6 +719,20 @@ describe("pluginCommandMap", () => {
     }).not.toThrow();
     expect([...map.keys()]).toEqual(["hi"]); // bad skipped, good kept
     expect(calls.some((l) => l.level === "error" && l.message.includes("malformed commands"))).toBe(true);
+  });
+
+  test("a commands getter that throws a value String() can't convert is skipped and logged, not thrown (#408)", () => {
+    const { log, calls } = makeLog();
+    const bad = loaded(entry({ name: "bad" }), { get commands(): readonly PluginCommand[] { throw unprintable(); } });
+    const good = loaded(entry({ name: "good" }), { commands: [cmd("hi")] });
+    let map: ReturnType<typeof pluginCommandMap> = new Map();
+    expect(() => {
+      map = pluginCommandMap([bad, good], [], log);
+    }).not.toThrow();
+    expect([...map.keys()]).toEqual(["hi"]);
+    expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
+      "[plugins] bad: ignoring malformed commands — (unprintable thrown value)",
+    ]);
   });
 });
 
@@ -807,6 +886,20 @@ describe("pluginTicks", () => {
     }).not.toThrow();
     expect(checks.map((c) => c.name)).toEqual(["good:t"]); // bad skipped, good kept
     expect(calls.some((l) => l.level === "error" && l.message.includes("malformed ticks"))).toBe(true);
+  });
+
+  test("a ticks getter that throws a value String() can't convert is skipped and logged, not thrown (#408)", () => {
+    const { log, calls } = makeLog();
+    const bad = loaded(entry({ name: "bad" }), { get ticks(): readonly TickCheck[] { throw unprintable(); } });
+    const good = loaded(entry({ name: "good" }), { ticks: [{ name: "t", run: async () => {} }] });
+    let checks: ReturnType<typeof pluginTicks> = [];
+    expect(() => {
+      checks = pluginTicks([bad, good], log);
+    }).not.toThrow();
+    expect(checks.map((c) => c.name)).toEqual(["good:t"]);
+    expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
+      "[plugins] bad: ignoring malformed ticks — (unprintable thrown value)",
+    ]);
   });
 
   // #217: `timeoutMs` (pluginTicks' third parameter) is the test seam, the same shape as
@@ -1559,6 +1652,254 @@ describe("activatePlugins", () => {
     expect(lp2.error).toContain("boom");
     expect(lp3.running).toBe(true);
   });
+
+  // #408: an activate() the test settles by hand, after activatePlugins has stopped waiting on it.
+  const lateActivate = () => {
+    let resolve: () => void = () => {};
+    let reject: (err: unknown) => void = () => {};
+    const activate = () =>
+      new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+    return { activate, resolve: () => resolve(), reject: (err: unknown) => reject(err) };
+  };
+
+  test("an activate() that never settles is given up on after timeoutMs: the plugin stays off and the ones after it still activate (#408)", async () => {
+    const { log, calls } = makeLog();
+    const lp1 = loaded(entry({ name: "one" }), { activate: async () => {} });
+    const lp2 = loaded(entry({ name: "two" }), { activate: () => new Promise<void>(() => {}) });
+    const lp3 = loaded(entry({ name: "three" }), { activate: async () => {} });
+    expect(await orHung(activatePlugins([lp1, lp2, lp3], log, 20))).not.toBe("hung");
+    expect(lp1.running).toBe(true);
+    expect(lp2.running).toBe(false);
+    expect(lp2.error).toBe("activate() did not finish within 20ms");
+    expect(lp3.running).toBe(true);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
+      "[plugins] two failed to activate — the bot keeps running without it: activate() did not finish within 20ms",
+    ]);
+  });
+
+  // `activate` is optional, and plugin code is only type-asserted: no activate(), or one returning a plain
+  // value, must still come up -- what wrapping the call in Promise.resolve() is for.
+  test("a plugin with no activate(), or one that returns a plain value, is running (#408)", async () => {
+    const { log, calls } = makeLog();
+    const none = loaded(entry({ name: "none" }), { commands: [] });
+    const plain = loaded(entry({ name: "plain" }), { activate: (() => 1) as unknown as () => Promise<void> });
+    await activatePlugins([none, plain], log, 20);
+    expect([none.running, none.error, plain.running, plain.error]).toEqual([true, undefined, true, undefined]);
+    expect(calls).toEqual([]);
+  });
+
+  test("a synchronously-throwing activate is isolated the same as an async rejection", async () => {
+    const lp1 = loaded(entry({ name: "one" }), { activate: () => { throw new Error("sync boom"); } });
+    const lp2 = loaded(entry({ name: "two" }), { activate: async () => {} });
+    await activatePlugins([lp1, lp2], makeLog().log, 20);
+    expect(lp1.running).toBe(false);
+    expect(lp1.error).toBe("sync boom");
+    expect(lp2.running).toBe(true);
+  });
+
+  test("an activate() that finishes after the bound stays off, and is disposed once it does -- not before (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    let disposed = 0;
+    let activations = 0;
+    const activate = () => {
+      activations += 1;
+      return late.activate();
+    };
+    const lp = loaded(entry({ name: "slow" }), { activate, dispose: async () => { disposed += 1; } });
+    expect(await orHung(activatePlugins([lp], log, 20))).not.toBe("hung");
+    await Bun.sleep(0);
+    expect(activations).toBe(1); // the late path follows the one call it timed out on, never a second setup
+    expect(disposed).toBe(0); // still activating: a dispose now could run before activate() sets anything up
+    late.resolve();
+    await Bun.sleep(0);
+    expect(disposed).toBe(1);
+    expect(lp.running).toBe(false);
+    expect(lp.error).toBe("activate() did not finish within 20ms"); // this boot's outcome is unchanged
+    expect(calls.filter((c) => c.level === "warn").map((c) => c.message)).toEqual([
+      "[plugins] slow finished activating after the 20ms bound — it stays off until the next restart; disposing what it set up",
+    ]);
+  });
+
+  test("an activate() that fails after the bound is logged and not disposed (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    let disposed = 0;
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: async () => { disposed += 1; } });
+    expect(await orHung(activatePlugins([lp], log, 20))).not.toBe("hung");
+    late.reject(new Error("late boom"));
+    await Bun.sleep(0);
+    expect(disposed).toBe(0);
+    expect(lp.running).toBe(false);
+    expect(lp.error).toBe("activate() did not finish within 20ms"); // only logged: this boot's outcome is unchanged
+    expect(calls.filter((c) => c.level === "warn").map((c) => c.message)).toEqual([
+      "[plugins] slow failed to activate after the 20ms bound: late boom",
+    ]);
+  });
+
+  test("a dispose() that throws synchronously after a late activate() is logged (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: () => { throw new Error("dispose blew up"); } });
+    expect(await orHung(activatePlugins([lp], log, 20))).not.toBe("hung");
+    late.resolve();
+    await Bun.sleep(0);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toContain(
+      "[plugins] slow dispose failed — continuing: dispose blew up",
+    );
+  });
+
+  test("real callers get PLUGIN_ACTIVATE_TIMEOUT_MS, 30 s, the same bound as a tick (#408)", async () => {
+    expect(PLUGIN_ACTIVATE_TIMEOUT_MS).toBe(30_000);
+    expect(PLUGIN_ACTIVATE_TIMEOUT_MS).toBe(PLUGIN_TICK_TIMEOUT_MS);
+    const setSpy = spyOn(globalThis, "setTimeout");
+    try {
+      await activatePlugins([loaded(entry({ name: "ok" }), { activate: async () => {} })], makeLog().log);
+      expect(setSpy.mock.calls.some((call) => call[1] === PLUGIN_ACTIVATE_TIMEOUT_MS)).toBe(true);
+    } finally {
+      setSpy.mockRestore();
+    }
+  });
+
+  test("an activate() that throws a value String() can't convert is isolated, and the plugins after it still activate (#408)", async () => {
+    const { log, calls } = makeLog();
+    const lp1 = loaded(entry({ name: "odd" }), { activate: async () => { throw unprintable(); } });
+    const lp2 = loaded(entry({ name: "ok" }), { activate: async () => {} });
+    await activatePlugins([lp1, lp2], log, 20);
+    expect(lp1.running).toBe(false);
+    expect(lp1.error).toBe("(unprintable thrown value)");
+    expect(lp2.running).toBe(true);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
+      "[plugins] odd failed to activate — the bot keeps running without it: (unprintable thrown value)",
+    ]);
+  });
+
+  test("an activate() that throws an Error whose message getter throws is isolated too (#408)", async () => {
+    const { log } = makeLog();
+    const badMessage = new Error("unused");
+    Object.defineProperty(badMessage, "message", { get: () => { throw new Error("message getter boom"); } });
+    const lp1 = loaded(entry({ name: "odd" }), { activate: async () => { throw badMessage; } });
+    const lp2 = loaded(entry({ name: "ok" }), { activate: async () => {} });
+    await activatePlugins([lp1, lp2], log, 20);
+    expect(lp1.error).toBe("(unprintable thrown value)");
+    expect(lp2.running).toBe(true);
+  });
+
+  test("a late activate() of a plugin with no dispose() logs only that it finished late (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate }); // no dispose(): the wow-plugin shape
+    await activatePlugins([lp], log, 20);
+    calls.length = 0; // drop the timeout line activatePlugins itself logged
+    late.resolve();
+    await Bun.sleep(0);
+    expect(calls).toEqual([
+      { level: "warn", message: "[plugins] slow finished activating after the 20ms bound — it stays off until the next restart; disposing what it set up" },
+    ]);
+  });
+
+  test("an activate() that rejects after the bound with a value String() can't convert is still logged (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate });
+    await activatePlugins([lp], log, 20);
+    late.reject(unprintable());
+    await Bun.sleep(0);
+    expect(calls.filter((c) => c.level === "warn").map((c) => c.message)).toEqual([
+      "[plugins] slow failed to activate after the 20ms bound: (unprintable thrown value)",
+    ]);
+  });
+
+  test("a late dispose() that rejects with a value String() can't convert is still logged (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: () => Promise.reject(unprintable()) });
+    await activatePlugins([lp], log, 20);
+    late.resolve();
+    await Bun.sleep(0);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toContain(
+      "[plugins] slow dispose failed — continuing: (unprintable thrown value)",
+    );
+  });
+
+  // afterLateActivate's comment promises its chain never ends in an unhandled rejection -- the process has
+  // no handler for one -- even if the logger itself throws. This is the test that reads that claim.
+  test("a late activate() whose log line throws leaves no unhandled rejection (#408)", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      // a and b: the late warn throws, on the resolve and the reject path.
+      const throwingWarn = { info: () => {}, warn: () => { throw new Error("warn blew up"); }, error: () => {} };
+      const resolved = lateActivate();
+      const rejected = lateActivate();
+      const a = loaded(entry({ name: "a" }), { activate: resolved.activate });
+      const b = loaded(entry({ name: "b" }), { activate: rejected.activate });
+      await activatePlugins([a, b], throwingWarn, 20);
+      // c: the late dispose fails and the error line reporting it throws -- reached only through the dispose
+      // chain the success handler returns into the terminal catch. (activatePlugins' own catch runs first,
+      // for the timeout, with a log that doesn't throw yet.)
+      let errorThrows = false;
+      const throwingError = {
+        info: () => {},
+        warn: () => {},
+        error: () => {
+          if (errorThrows) throw new Error("error blew up");
+        },
+      };
+      const disposeFails = lateActivate();
+      const c = loaded(entry({ name: "c" }), { activate: disposeFails.activate, dispose: () => Promise.reject(new Error("dispose boom")) });
+      await activatePlugins([c], throwingError, 20);
+      errorThrows = true;
+      disposeFails.resolve();
+      resolved.resolve();
+      rejected.reject(new Error("late boom"));
+      await Bun.sleep(50); // past the microtask drain an unhandled rejection is reported after
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});
+
+// #408, at the consumer boundary: what the boot writes to state.json for a plugin whose import or
+// activate() never settled -- the panel and `bot-ops.sh status` read `active` and `error` from there.
+describe("a plugin that never finishes loading or activating, through to state.json (#408)", () => {
+  test("is recorded active:false with the bound it missed as its error; the plugin after it is active", async () => {
+    const { log } = makeLog();
+    const names = ["stuck-import", "stuck-activate", "ok"];
+    const installed: InstalledPlugin[] = names.map((name) => ({ entry: entry({ name }), version: "1.0.0", bundlePath: `/${name}` }));
+    const importer = (path: string): Promise<PluginModule> => {
+      if (path === "/stuck-import") return new Promise<PluginModule>(() => {});
+      const activate = path === "/stuck-activate" ? () => new Promise<void>(() => {}) : async () => {};
+      return Promise.resolve({ createPlugin: () => ({ activate }) });
+    };
+    const makeHost = (e: PluginIndexEntry): HostApi =>
+      createHostApi({ entry: e, processEnv: {}, dataDir: "/d", baseLog: log, storage: realStorage, announce: async () => {} });
+    const load = await orHung(loadPlugins(installed, makeHost, importer, log, 20));
+    if (load === "hung") throw new Error("loadPlugins never returned");
+    const { loaded: loadedPlugins, errors } = load;
+    expect(await orHung(activatePlugins(loadedPlugins, log, 20))).not.toBe("hung");
+    const state = buildPluginStateFile({
+      selected: installed.map((i) => ({ name: i.entry.name, entry: i.entry })),
+      installed,
+      installSkips: {},
+      fallbacks: {},
+      loaded: loadedPlugins,
+      loadErrors: errors,
+      processEnv: {},
+      previous: { hostApiVersion: 1, writtenAt: "", plugins: [] },
+      now: new Date("2026-10-08T00:00:00.000Z"),
+    });
+    expect(state.plugins.map((p) => ({ name: p.name, active: p.active, error: p.error }))).toEqual([
+      { name: "stuck-import", active: false, error: "import() did not finish within 20ms" },
+      { name: "stuck-activate", active: false, error: "activate() did not finish within 20ms" },
+      { name: "ok", active: true, error: undefined },
+    ]);
+  });
 });
 
 describe("routeInteractionByPrefix", () => {
@@ -1790,6 +2131,16 @@ describe("disposePlugins (#184)", () => {
     expect(syncBoom.running).toBe(false);
     expect(ok.running).toBe(false);
     expect(calls.some((c) => c.level === "error" && c.message.includes("sync-boom"))).toBe(true);
+  });
+
+  test("a dispose that rejects with a value String() can't convert is still logged (#408)", async () => {
+    const { log, calls } = makeLog();
+    const odd = loaded(entry({ name: "odd" }), { dispose: () => Promise.reject(unprintable()) }, true);
+    await disposePlugins([odd], log, 50);
+    expect(odd.running).toBe(false);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
+      "[plugins] odd dispose failed — continuing: (unprintable thrown value)",
+    ]);
   });
 
   // The mutation this guards: dropping the per-plugin timeout entirely, which would leave this test
