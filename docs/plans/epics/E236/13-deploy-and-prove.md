@@ -2,7 +2,11 @@
      it, then prod. Written 2026-09-24 against `main` @ `f5346f9`; every cite below was read from that tree.
      Host facts (nucbox, schema 4 -> 5, flock, the `.bak-schema2` backup) are from the issue's comments, not
      re-checked here. Every host command is run by roshne, one per block, in ONE interactive bash shell
-     (stage 0 sets variables and a function the later blocks use; a new shell means re-running stage 0). -->
+     (stage 0 sets variables and a function the later blocks use; a new shell means re-running stage 0).
+     Corrected 2026-10-09 (#430): the panel-routes bullet and stage 5's last expectation said `env-schema`
+     shows a plugin secret as `{secret, isSet}` alone. At `f5346f9` it already carried the key's `pattern`,
+     `required` and `source` too (`ops/bot-ops.sh:763`, `:776`); the bullet had cited the script header,
+     which was wrong. Both now say so. -->
 
 ## Runbook — deploy per-plugin routing, prove it, then prod
 
@@ -13,7 +17,7 @@
 - **No `routing.json`, or one placing no plugin → `single` mode: exactly today's one PUT to the home guild** (`planRegistration`, `src/routing/register.ts:56-59`; `registerPlan` `:128-131`). It touches no other guild, so the 2026-09-20 hand registration survives stages 1-3 untouched. `discovery.json` is written in both modes (`src/routing/live.ts`), which is where every id in this runbook comes from.
 - **Any placement → `routed` mode: one PUT per guild the bot is in** (`register.ts:61-72`). Each guild gets **the core commands** (`report`, `update`, `plugins`) **plus** every plugin living there. An unplaced plugin lives in the home guild only; a placed one lives **exactly** where its `servers` say (`pluginsForGuild`, `src/routing/resolve.ts:40-50`). So placing `music` in Pathfinder alone would **remove it from home**, and every non-home guild gains the core commands. The seed below therefore places a plugin in every guild whose current list holds its commands, and a predictor refuses to go on if the result would differ from today in any guild.
 - `routing.json` lives in the bot's data volume at `/app/data/routing.json` (`routingPath`, `src/routing/store.ts:28-30`; `state:/app/data`, `docker-compose.yml:44`; `ROUTING_PATH`, `ops/bot-ops.sh:464`). Shape: `{v:1, updatedAt, updatedBy, plugins:{<name>:{servers:{<guildId>:{commands:"all"|[channelIds], postTo?}}}}, webhooks:{}, results:[]}` (`src/routing/model.ts:26-76`). It is read by shape and repaired, never thrown on; anything dropped is logged as `[routing] routing.json: …; it is ignored` (`store.ts:105-109`). A hand-written file takes effect at the next `applyRouting` — here, a restart (`src/index.ts:258-279`).
-- Panel routes: `GET /api/routing` → `bot-ops.sh routing-get` = `{routing, discovery}` (`server.ts:573`); `POST /api/routing`, `POST /api/webhooks` (a pasted URL; the bot asks Discord which channel it is for, `src/routing/requests.ts`), `DELETE /api/webhooks/<channelId>`, `POST /api/discovery/refresh` (`server.ts:2035-2066`). The mailbox is drained every 5 s (`REQUEST_DRAIN_MS`, `src/plugins/drain.ts:11`). A plugin secret goes through `POST /api/env` (`env-set`); `env-get` never lists it and `env-schema` shows only `{secret, isSet}` (`ops/bot-ops.sh` header).
+- Panel routes: `GET /api/routing` → `bot-ops.sh routing-get` = `{routing, discovery}` (`server.ts:573`); `POST /api/routing`, `POST /api/webhooks` (a pasted URL; the bot asks Discord which channel it is for, `src/routing/requests.ts`), `DELETE /api/webhooks/<channelId>`, `POST /api/discovery/refresh` (`server.ts:2035-2066`). The mailbox is drained every 5 s (`REQUEST_DRAIN_MS`, `src/plugins/drain.ts:11`). A plugin secret goes through `POST /api/env` (`env-set`); `env-get` never lists it and `env-schema` shows its `pattern`, `required` and `source` plus `{secret, isSet}`, never its value (`cmd_env_schema`, `ops/bot-ops.sh:763`, `:776`).
 - A command outside its channels gets a private "`/rsetlist` works in <#spotify> here." (`refusalMessage`, `src/routing/gate.ts:74-86`). A post goes through the channel's webhook when `routing.json` has a working one, else as the bot (`src/routing/post.ts:114`).
 
 **Unverified, said once:** that `curl` on nucbox accepts `-H @file` (7.55+); that `DISCORD_TOKEN` in the config `.env` is unquoted (a 401 from stage 4.3 means it is not); that Discord's bulk PUT accepts the normalised capture files used for rollback; that nucbox's `jq` is 1.6+ (`IN`); that compose tags its built images `<project>-bot` / `<project>-admin` (used for image rollback); the music plugin's secret key name. **There is no on-demand way to make `wow` post** (it posts from its own ticks, in the plugins repo), so D3 waits for its next announcement.
@@ -183,7 +187,7 @@ Expect music's Pathfinder entry `{"commands":["<spotify id>"]}`, the webhook's m
 ```bash
 for s in env-get env-schema routing-get status; do printf '%s: ' "$s"; bash /opt/rackbops-discord-bot/bin/bot-ops.sh $s | grep -c -F "$(grep '^SPOTIFY_CLIENT_SECRET=' "$BOT_OPS_CONFIG_DIR/.env" | tail -n1 | cut -d= -f2-)"; done
 ```
-(Swap `SPOTIFY_CLIENT_SECRET` for the key D2 set.) Expect `0` after every subcommand — every bot-ops-backed panel route, and `/api/plugins` reads only `status` + `env-get` (`server.ts:1966-1970`). `env-schema` should still show that key as `{"secret":true,"isSet":true}`.
+(Swap `SPOTIFY_CLIENT_SECRET` for the key D2 set.) Expect `0` after every subcommand — every bot-ops-backed panel route, and `/api/plugins` reads only `status` + `env-get` (`server.ts:1966-1970`). `env-schema` should still show that key with `"secret": true` and `"isSet": true`, beside its `pattern`, `required` and `source`.
 
 **Rollback:** undo each change from the panel (untick / *Anywhere*, *Remove* the webhook). Nothing here restarts the bot.
 

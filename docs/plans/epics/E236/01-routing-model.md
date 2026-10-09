@@ -226,3 +226,13 @@ That last clause is only true if the file is owner-only **from creation**, not `
 **5. The acceptance bullet on a malformed plugin name was mine to fix, not the code's.** `validatePluginRouting` checks one plugin's routing and takes no name; the name's shape belongs to the request layer (#241), which reuses the exported `PLUGIN_NAME_RE`. #237's bullet is corrected; `repairRouting` dropping a malformed name stays, and stays tested.
 
 Epic #236's body carried sentences 1–3 too and is corrected to match.
+
+---
+
+## Later correction — ADR-0006 decision 8 (2026-10-09, #430)
+
+Step 1's decision 8 said a secret key "appears in `env-schema` only as `secret` + `isSet`". That was never true of what shipped: #240's plan (`05-bot-ops.md` Step 3) specifies, and `cmd_env_schema` (`ops/bot-ops.sh:771`, `:784` on `main` @ `55f8959`) emits, each such key as `{pattern, required, source: "plugin", secret: true, isSet}`, never its value. As with the amendments above, Step 1 stays as approved and this supersedes that sentence:
+
+> A key the Plugin Index marks `secret: true` can be written through `env-set`, is never returned by `env-get`, and appears in `env-schema` with its `pattern`, `required` and `source` plus `secret` + `isSet`, never its value.
+
+`docs/adr/0006-per-plugin-routing.md` carries the same correction (#521). The decision is unchanged.
