@@ -781,11 +781,14 @@ other bot. Official documentation, read 2026-10-06 (both pages now live under `d
   Settings**. For Pip use **Guild Install** only, with the scopes `bot` and `applications.commands`.
   Selecting `bot` reveals a **Permissions** menu: leave it empty (permissions integer `0`). Nothing Pip
   does needs a server-wide permission: a DM is `client.users.fetch` + `user.send`
-  (`src/plugins/delivery.ts:36-38`), and the one channel send the core makes on its own, a release post, is
-  off under section 2 (`WATCHED_REPOS=none`). A plugin post to the announce channel needs View Channel and
-  Send Messages in that channel alone, which a per-channel permission overwrite can grant (Discord's
-  [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read 2026-10-08, documents
-  per-channel overwrites; the Permissions menu is the one the Getting Started page above walks into). Leave
+  (`src/plugins/delivery.ts:36-38`), and the core's own channel sends, a release post and the
+  plugin-update fallback after a failed admin DM, are both off under section 2 (`WATCHED_REPOS=none` and an
+  empty `ADMIN_USER_IDS`; section 3's first two rows). If a channel send is ever enabled (the watcher turned
+  on, an admin configured, or a plugin channel delivery once a destination is mapped, section 3), it needs
+  View Channel and Send Messages in that one channel alone, which a per-channel permission overwrite can
+  grant (Discord's [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read
+  2026-10-08, documents per-channel overwrites; the Permissions menu is the one the Getting Started page
+  above walks into). Leave
   **User Install** off. Invite Pip to the one approved server with the install link the
   Installation page gives you.
 - Privileged intents: [Gateway](https://docs.discord.com/developers/topics/gateway) names three,
@@ -810,8 +813,9 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 ```
 
 Then edit the instance's config-dir `.env`: the hand-edited file `install.sh` seeds from `.env.example`
-and never touches again. The rules are the Clerk runbook's step 3 (two `.env` files with different jobs;
-comments on their own lines). **Complete the block below before the first `up`** (section 5). The seeded
+and never touches again. The rules are the Clerk runbook's step 3 for comments (on their own lines) and
+"Bootstrapping a fresh instance (no checkout)" above for why there are two `.env` files with different
+jobs. **Complete the block below before the first `up`** (section 5). The seeded
 placeholders pass the core's `required()` check (`src/config.ts:59-63`), so a token-only edit boots; with
 `DISCORD_SERVER_ID` blank that boot registers `/update`, `/plugins` and `/report` **globally and
 unprefixed**, and once the server is set single-server mode issues its one guild-scoped PUT and never
@@ -825,7 +829,9 @@ DISCORD_TOKEN=<Pip's bot token>
 # Required by the core (src/config.ts:79) but idle under this file: the release watcher is off
 # (WATCHED_REPOS=none) and the service grants no principal a channel post unless an operator assigns one
 # (Rackbops/discord-mcp contracts/config.schema.json:112), and the mcp plugin uses host.post, not
-# host.announce, the one path that targets this channel, so nothing posts here. Use a private channel
+# host.announce, the one host-API path that targets this channel; the core's own two senders to it, the
+# release post and the plugin-update fallback after a failed admin DM, are off under this file (section 3,
+# first two rows). So nothing posts here. Use a private channel
 # in the approved server. If the watcher is ever turned on, give the Pip bot View Channel and Send Messages there by channel
 # overwrite: a post to a channel it cannot see throws before the release is marked seen, and the next
 # 15-minute poll fails the same way, forever (src/announce.ts:95, :508-512; the poll src/announce.ts:28).
@@ -854,12 +860,12 @@ REPORT_ROLE_ID=
 # only: whoever can write the request mailbox on the host needs no entry here and can schedule an update
 # or move the plugin regardless (section 3, scheduled-update row). Moving the plugin with no admin: a
 # mailbox request, which the bot applies and then restarts onto (ops/bot-ops.sh:1244-1278;
-# src/plugins/requests.ts:488-498, :341), run with section 7's BOT_OPS_* variables:
+# src/plugins/requests.ts:497-507, :350), run with section 7's BOT_OPS_* variables:
 #   printf '%s' '{"action":"update-now","plugin":"mcp","version":"<x.y.z>","requestedBy":"operator"}' |
 #     bash /opt/rackbops-discord-bot/bin/bot-ops.sh plugin-request
 # A non-numeric requestedBy keeps the outcome in the log (src/plugins/updates.ts:697-698). The same
 # request with "action":"skip" and the index's newest version silences the warning without moving
-# the plugin (src/plugins/requests.ts:505-507).
+# the plugin (src/plugins/requests.ts:514-516).
 ADMIN_USER_IDS=
 AUTO_UPDATE=false
 BOT_BRANCH=main
@@ -904,20 +910,20 @@ The core still runs next to the plugin. This is every way the host sends somethi
 initiative** under the `.env` above, plus the command paths a member can trigger, so that "Pip's host
 sends nothing unsolicited that reaches a DM" is a cited claim and not an assumption. Not listed, by design:
 the host's other interaction replies, which go only to the person who interacted and only after they did
-(`src/plugins/host.ts:657`, `:681`, and the empty autocomplete response `:755`; `src/commands.ts:200-203`, `:325`). Line numbers are on `f5e7bd7`
+(`src/plugins/host.ts:657`, `:681`, and the empty autocomplete response `:755`; `src/commands.ts:200-203`, `:325`). Line numbers are on `ded55f5`
 (this repository) and `2820afe` (`plugins/mcp` 0.3.1).
 
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
 | Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:427-431` (`describeReleaseWatch`) and `:435-443` (`checkReleases`), the tick check at `:217-222` (15-minute poll `:28`), the boot line `src/index.ts:313` |
 | Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:489-518` (`deliverPluginNotification`; the empty-list return at `:495-498`, the fallback at `:510-517`), `:578-605` (`checkPluginUpdates`); live deliverers `src/announce.ts:308-322` |
-| Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:430`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:488-501`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:357-359`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:419-430` (`validate`), `:488-501` |
+| Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:439`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:497-510`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:357-359`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:428-439` (`validate`), `:497-510` |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:224-228` |
 | `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from members without Discord's Administrator permission (`src/commands.ts:106-107` and `:138`); the handler then refuses anyone not in `ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included. | `src/commands.ts:107` and `:138`; the refusal `:50-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:15-16` |
-| `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:62-68` |
+| `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:66-72` |
 | `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:212`; `src/index.ts:367-382` |
-| Report-backs after an update | Nowhere under this `.env` unless a mailbox request moved the plugin (see why). In general: an ephemeral follow-up where the command was typed, within 15 minutes of it, else a DM, else a channel post (`src/updateReport.ts:101-104`, the window `:13-14`; the follow-up is a raw REST webhook POST, `:128-133`, the one send path outside the Client, `src/client.ts:6-7`). | Delivered only when an owed marker exists: `state.pendingUpdateReport`, set only with a `requester` (the guard `src/update.ts:103-111`, applied at `:303-308`; the one call site constructing a requester is `src/commands.ts:117`), or `state.pendingReport`, set by `/plugins update`, `runDueSchedules` and a mailbox `update-now` (`src/plugins/requests.ts:488-498`). `/pipupdate` and `/pipplugins` refuse here, so the mailbox, which writes only `state.pendingReport` (`src/plugins/requests.ts:489-496`), is the only writer left and `state.pendingUpdateReport` has none; a snowflake `requestedBy` is DMed and any other value is logged (`src/plugins/updates.ts:697-702`: the log at `:697-698`, the DM at `:702`). | `src/index.ts:440` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:444-455` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:684-714`) |
-| Plugin `post` / `dm` / `edit` / `announce` (the host API) | A DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. A channel delivery is refused here: `host.post` is wired (`src/index.ts:191-200`), every channel delivery takes that branch (`plugins/mcp/src/drain.ts:177-190`), and with no `routing.json` it throws "destination is not mapped in that server" before any Discord call (`src/plugins/host.ts:148-150`, `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`. Pip runs no panel, and the bot's own paths map a destination only through a `routing-set` request written to the host mailbox (`ops/bot-ops.sh:1279-1303`, applied at `src/plugins/requests.ts:372`), the same host-side write the scheduled-update row describes; this runbook writes none. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`plugins/mcp/src/drain.ts:196-202`) runs only when `host.post` is not a function, so never here. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives one a restart left `unknown`, `plugins/mcp/src/index.ts:65-80`; the `edit` call `plugins/mcp/src/drain.ts:105`, the DM call `:133`, the channel branch `:177-190`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring); `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`), `:56-62` (`editOwnMessage`); `src/routing/post.ts:60` (`postForPlugin`, the `announce` path) |
+| Report-backs after an update | Nowhere under this `.env` unless a mailbox request moved the plugin (see why). In general: an ephemeral follow-up where the command was typed, within 15 minutes of it, else a DM, else a channel post (`src/updateReport.ts:101-104`, the window `:13-14`; the follow-up is a raw REST webhook POST, `:128-133`, the one send path outside the Client, `src/client.ts:6-7`). | Delivered only when an owed marker exists: `state.pendingUpdateReport`, set only with a `requester` (the guard `src/update.ts:103-111`, applied at `:303-308`; the one call site constructing a requester is `src/commands.ts:117`), or `state.pendingReport`, set by `/plugins update`, `runDueSchedules` and a mailbox `update-now` (`src/plugins/requests.ts:497-507`). `/pipupdate` and `/pipplugins` refuse here, so the mailbox, which writes only `state.pendingReport` (`src/plugins/requests.ts:498-505`), is the only writer left and `state.pendingUpdateReport` has none; a snowflake `requestedBy` is DMed and any other value is logged (`src/plugins/updates.ts:697-702`: the log at `:697-698`, the DM at `:702`). | `src/index.ts:440` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:444-455` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:684-714`) |
+| Plugin `post` / `dm` / `edit` / `announce` (the host API) | A DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. A channel delivery is refused here: `host.post` is wired (`src/index.ts:191-200`), every channel delivery takes that branch (`plugins/mcp/src/drain.ts:177-190`), and with no `routing.json` it throws "destination is not mapped in that server" before any Discord call (`src/plugins/host.ts:148-150`, `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`. Pip runs no panel, and the bot's own paths map a destination only through a `routing-set` request written to the host mailbox (`ops/bot-ops.sh:1279-1303`, applied at `src/plugins/requests.ts:381`), the same host-side write the scheduled-update row describes; this runbook writes none. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`plugins/mcp/src/drain.ts:196-202`) runs only when `host.post` is not a function, so never here. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives one a restart left `unknown`, `plugins/mcp/src/index.ts:65-80`; the `edit` call `plugins/mcp/src/drain.ts:105`, the DM call `:133`, the channel branch `:177-190`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:171-200` (the host wiring); `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`), `:56-62` (`editOwnMessage`); `src/routing/post.ts:60` (`postForPlugin`, the `announce` path) |
 | Guild events | Nothing sent. | `GuildCreate`/`GuildDelete` re-register commands or rewrite discovery. | `src/index.ts:293-294`, `src/routing/live.ts:272-293` |
 | Boot, handoff, ticks | Log lines and files. | A standby that never logs in writes a marker file and exits; the mailbox drain and the discovery refresh write files, not messages. | `src/bootLog.ts`; `src/index.ts:130`, `:458-472`; the 5-second mailbox drain `src/plugins/drain.ts:11`, `:26`, started at `src/index.ts:354-359`; the 60-second backstop `src/announce.ts:230-270` (`pluginRequests`, `discovery`) |
 
@@ -996,7 +1002,9 @@ The command prints `Paired as u-<your Discord id>@pip. Credentials saved to ...`
 bridges are tried first, `src/service/redeem.ts:177`) and the shim saves whatever principal comes back
 (`cli.ts:173-181`), so if the code came from `/agent pair` or `/ragent pair` on another bot by mistake, the
 Pip directory now holds an `@prod`, `@debug` or other non-`@pip` principal while the prod directory still looks untouched:
-`unregister` on that bot and pair again with `/pipagent`. The add-a-bridge runbook ends the same step with a
+`unregister` on that bot, which revokes every token paired through it, the one in the prod directory
+included (discord-mcp README, "Revocation"), then pair again with `/pipagent`, and pair prod again if you
+still use it. The add-a-bridge runbook ends the same step with a
 `whoami` expecting `u-<discord_user_id>@pip` (`deploy/add-bridge.md` section 7, step 5).
 
 ### 7. Health, restart, and logs
@@ -1021,7 +1029,8 @@ version shows.
 
 The probe reads the token from the container's own environment (`docker exec` inherits the create-time
 env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints it. `200` with
-`{"dm":true,...}` says the listener is up, the token the plugin loaded is the file's, and DMs are enabled
+`{"dm":true,...}` says the listener is up, the token the plugin loaded is the one the container was created
+with (a file edited since then needs a recreate), and DMs are enabled
 (`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
 the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:112-121`),
 so it may run in a loop. The failing answers below do count toward that lockout (a bad bearer records a
@@ -1078,7 +1087,7 @@ In this order:
    (`plugins/mcp/src/http.ts:54-57`), and one a restart left `unknown` is re-driven by the plugin's tick
    (`plugins/mcp/src/index.ts:65-80`, `:89-91`), with nothing on Melody consulted; only the `unregister`
    above stops those, because the drain re-checks the registration each time.
-2. **Stop Pip.** `bot-ops.sh` has no stop subcommand (`ops/bot-ops.sh:1361` lists them), so:
+2. **Stop Pip.** `bot-ops.sh` has no stop subcommand (`ops/bot-ops.sh:1362` lists them), so:
 
    ```sh
    docker compose -f /opt/stacks/rackbops-discord-bot-pip/docker-compose.yml -p rackbops-discord-bot-pip stop
@@ -1244,14 +1253,14 @@ with the Pip credential is refused (`ACCESS_DENIED`; proven on the debug bridge,
 just can no longer call one. Renaming
 or deleting `%APPDATA%\discord-mcp-pip` on Melody stops this script instantly and reversibly (it refuses with
 `invalid`, credentials missing, and sends nothing) but revokes nothing: the credential stays valid until
-Rod unregisters.
+Rod unregisters or the service's 90-day inactivity prune removes it.
 
 ---
 
 *Rollback, in the order section 8 gives.* Stop sending (`/pipagent unregister`, then the directory above),
 stop Pip (`docker compose ... stop`), remove the `pip` bridge from the service, and never restore the
-service's state from a snapshot. Only the first step was rehearsed on this deployment (section 9); the
-service-side half was not.
+service's state from a snapshot. Of these, only the directory half of the first step, the disable control,
+was rehearsed on this deployment (section 9); the `unregister`, the stop and the service-side half were not.
 
 ## Admin panel
 
