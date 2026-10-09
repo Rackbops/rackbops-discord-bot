@@ -376,14 +376,18 @@ describe("bot-ops.sh WATCHED_REPOS accepts none (#342, source pins)", () => {
 });
 
 // #430: canonical PLUGINS values (no space around a token, no empty token -- env-set refuses those on
-// purpose, resolveConfig trims them) on which env-set and the bot must agree exactly. Each malformed pin
-// appears in a later token too, since the row repeats its token shape after the first comma.
+// purpose, resolveConfig trims them) on which env-set and the bot must agree exactly. Each malformed
+// token appears both first and in a later token, since the row repeats its token shape after the first
+// comma, and each part of a pin (major, minor, patch, prerelease) has a value that only that part refuses.
 const PLUGINS_CORPUS = [
   "foo", "foo,bar", "a-b,c@0.0.0-rc.1", "foo@1.2.3", "foo@1.2.3-beta.1", "foo@1.2.3-a-b", "foo@01.2.3",
   "foo,foo", "foo@1.0.0,foo@1.0.0", "warbandeer,wow,music", "bar@1.0.0,foo@2.0.0-rc.1",
   "foo@1", "foo@1.2", "foo@1.x", "foo@1.0.0+b", "foo@1.2.3+build.5", "foo@1.2.3-", "foo@1.2.3.4",
-  "foo@1x2x3", "foo@1..3", "foo@v1.2.3", "foo@", "Foo", "1foo",
-  "bar,foo@1", "bar,foo@1.2", "bar,foo@1.0.0+b", "bar,foo@1.2.3-", "bar,foo@1x2x3", "bar,foo@1..3", "bar,Foo",
+  "foo@1x2x3", "foo@1..3", "foo@.2.3", "foo@1.2.", "foo@1.2.3-a+b", "foo@v1.2.3", "foo@", "Foo", "fOo",
+  "1foo", "foo_bar",
+  "bar,foo@1", "bar,foo@1.2", "bar,foo@1.x", "bar,foo@1.0.0+b", "bar,foo@1.2.3+build.5", "bar,foo@1.2.3-",
+  "bar,foo@1.2.3.4", "bar,foo@1x2x3", "bar,foo@1..3", "bar,foo@.2.3", "bar,foo@1.2.", "bar,foo@1.2.3-a+b",
+  "bar,foo@v1.2.3", "bar,foo@", "bar,Foo", "bar,fOo", "bar,1foo", "bar,foo_bar",
   "foo,foo@1.0.0", "foo@1.0.0,foo@2.0.0", "foo@1.0.0,bar,foo", "foo@1.x,foo",
 ];
 /** Whether the bot boots with this PLUGINS value: resolveConfig is what src/config.ts runs at import. */
@@ -429,7 +433,7 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
   test("BOT_OPS_SCHEMA is 7 with its #430 history line", () => {
     expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=7$/m);
     expect(src).toMatch(
-      /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, no plugin in two different tokens, every format judged in the C locale \(#430\)\.$/m,
+      /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, no plugin in two different tokens, every env-set format judged in the C locale \(#430\)\.$/m,
     );
   });
 });
@@ -1289,9 +1293,11 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
 
 // #430: env-set matches every format in the C locale. Under a glibc locale such as en_US.UTF-8, [a-z]
 // and [0-9] are collation ranges that take é or Arabic-Indic digits, which the bot's ASCII-only checks
-// refuse at boot; this runs env-set in such a locale (COLLATING_LOCALE, probed above).
-describe.skipIf(!runnable || COLLATING_LOCALE === null)("bot-ops.sh env-set judges formats in the C locale (#430)", () => {
+// refuse at boot; this runs env-set in such a locale (COLLATING_LOCALE, probed above). It is the only
+// guard on format_matches' `local LC_ALL=C`, so on CI a missing locale fails it instead of skipping it.
+describe.skipIf(!runnable || (COLLATING_LOCALE === null && !process.env.CI))("bot-ops.sh env-set judges formats in the C locale (#430)", () => {
   test("a caller in a collating locale cannot write a value the bot's ASCII checks refuse", async () => {
+    expect(COLLATING_LOCALE, "CI needs a bash locale where [a-z] takes é (en_US.UTF-8), or this guard is gone").not.toBeNull();
     const cases: [string, string, string][] = [
       ["PLUGINS", "café", "PLUGINS=warbandeer\n"],
       ["PLUGINS", "foo@1.2.3-é", "PLUGINS=warbandeer\n"],
@@ -1307,8 +1313,9 @@ describe.skipIf(!runnable || COLLATING_LOCALE === null)("bot-ops.sh env-set judg
         env: base,
         recreated: false,
       });
+      expect(run.stderr, `${key}=${value}`).toContain(`value for '${key}' is invalid`);
     }
-    // The same locale still accepts a valid ASCII pin, so the refusals above are the format check's.
+    // The same locale still accepts a valid ASCII pin, so env-set itself works there.
     const ok = setup("PLUGINS=warbandeer\n");
     expect((await botOps(ok, ["env-set"], "PLUGINS=foo@1.2.3\n", { LC_ALL: COLLATING_LOCALE! })).exitCode).toBe(0);
   }, LONG);

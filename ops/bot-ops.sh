@@ -80,7 +80,7 @@ set -euo pipefail
 #    env-set can turn a plugin on and configure it (#256).
 # 5: adds recreate (#277).
 # 6: WATCHED_REPOS accepts `none` (#342).
-# 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, no plugin in two different tokens, every format judged in the C locale (#430).
+# 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, no plugin in two different tokens, every env-set format judged in the C locale (#430).
 readonly BOT_OPS_SCHEMA=7
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
