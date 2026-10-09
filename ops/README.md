@@ -781,10 +781,11 @@ other bot. Official documentation, read 2026-10-06 (both pages now live under `d
   Settings**. For Pip use **Guild Install** only, with the scopes `bot` and `applications.commands`.
   Selecting `bot` reveals a **Permissions** menu: leave it empty (permissions integer `0`). Nothing Pip
   does needs a server-wide permission: a DM is `client.users.fetch` + `user.send`
-  (`src/plugins/delivery.ts:36-38`), and the core's own channel sends, a release post and the
-  plugin-update fallback after a failed admin DM, are both off under section 2 (`WATCHED_REPOS=none` and an
-  empty `ADMIN_USER_IDS`; section 3's first two rows). If a channel send is ever enabled (the watcher turned
-  on, an admin configured, or a plugin channel delivery once a destination is mapped, section 3), it needs
+  (`src/plugins/delivery.ts:36-38`), and every channel send the core could make on its own is idle under
+  section 2's `.env` (section 3: the release post with `WATCHED_REPOS=none`, the plugin-update fallback
+  with an empty `ADMIN_USER_IDS`, the report-back with no requester). If a channel send is ever enabled (the
+  watcher turned on, an admin configured, or a plugin channel delivery once a destination is mapped,
+  section 3), it needs
   View Channel and Send Messages in that one channel alone, which a per-channel permission overwrite can
   grant (Discord's [Permissions](https://docs.discord.com/developers/topics/permissions) topic, read
   2026-10-08, documents per-channel overwrites; the Permissions menu is the one the Getting Started page
@@ -832,7 +833,7 @@ DISCORD_TOKEN=<Pip's bot token>
 # host.announce, the one host-API path that targets this channel; the core's own two senders to it, the
 # release post and the plugin-update fallback after a failed admin DM, are off under this file (section 3,
 # first two rows). So nothing posts here. Use a private channel
-# in the approved server. If the watcher is ever turned on, give the Pip bot View Channel and Send Messages there by channel
+# in the approved server. If the watcher is ever turned on or an admin configured, give the Pip bot View Channel and Send Messages there by channel
 # overwrite: a post to a channel it cannot see throws before the release is marked seen, and the next
 # 15-minute poll fails the same way, forever (src/announce.ts:95, :508-512; the poll src/announce.ts:28).
 ANNOUNCE_CHANNEL_ID=<channel id>
@@ -1002,9 +1003,10 @@ The command prints `Paired as u-<your Discord id>@pip. Credentials saved to ...`
 bridges are tried first, `src/service/redeem.ts:177`) and the shim saves whatever principal comes back
 (`cli.ts:173-181`), so if the code came from `/agent pair` or `/ragent pair` on another bot by mistake, the
 Pip directory now holds an `@prod`, `@debug` or other non-`@pip` principal while the prod directory still looks untouched:
-`unregister` on that bot, which revokes every token paired through it, the one in the prod directory
-included (discord-mcp README, "Revocation"), then pair again with `/pipagent`, and pair prod again if you
-still use it. The add-a-bridge runbook ends the same step with a
+`unregister` on that bot, which revokes every token paired through that bot alone (if it was prod, the one
+in the prod directory included; discord-mcp README, "Revocation"), then pair again with `/pipagent`. A bot
+you still use after unregistering on it needs `register` and then `pair` again there (a `pair` with no
+registration is refused). The add-a-bridge runbook ends the same step with a
 `whoami` expecting `u-<discord_user_id>@pip` (`deploy/add-bridge.md` section 7, step 5).
 
 ### 7. Health, restart, and logs
