@@ -1704,9 +1704,15 @@ describe("activatePlugins", () => {
     const { log, calls } = makeLog();
     const late = lateActivate();
     let disposed = 0;
-    const lp = loaded(entry({ name: "slow" }), { activate: late.activate, dispose: async () => { disposed += 1; } });
+    let activations = 0;
+    const activate = () => {
+      activations += 1;
+      return late.activate();
+    };
+    const lp = loaded(entry({ name: "slow" }), { activate, dispose: async () => { disposed += 1; } });
     expect(await orHung(activatePlugins([lp], log, 20))).not.toBe("hung");
     await Bun.sleep(0);
+    expect(activations).toBe(1); // the late path follows the one call it timed out on, never a second setup
     expect(disposed).toBe(0); // still activating: a dispose now could run before activate() sets anything up
     late.resolve();
     await Bun.sleep(0);
@@ -1728,6 +1734,7 @@ describe("activatePlugins", () => {
     await Bun.sleep(0);
     expect(disposed).toBe(0);
     expect(lp.running).toBe(false);
+    expect(lp.error).toBe("activate() did not finish within 20ms"); // only logged: this boot's outcome is unchanged
     expect(calls.filter((c) => c.level === "warn").map((c) => c.message)).toEqual([
       "[plugins] slow failed to activate after the 20ms bound: late boom",
     ]);
@@ -1770,6 +1777,30 @@ describe("activatePlugins", () => {
     ]);
   });
 
+  test("an activate() that throws an Error whose message getter throws is isolated too (#408)", async () => {
+    const { log } = makeLog();
+    const badMessage = new Error("unused");
+    Object.defineProperty(badMessage, "message", { get: () => { throw new Error("message getter boom"); } });
+    const lp1 = loaded(entry({ name: "odd" }), { activate: async () => { throw badMessage; } });
+    const lp2 = loaded(entry({ name: "ok" }), { activate: async () => {} });
+    await activatePlugins([lp1, lp2], log, 20);
+    expect(lp1.error).toBe("(unprintable thrown value)");
+    expect(lp2.running).toBe(true);
+  });
+
+  test("a late activate() of a plugin with no dispose() logs only that it finished late (#408)", async () => {
+    const { log, calls } = makeLog();
+    const late = lateActivate();
+    const lp = loaded(entry({ name: "slow" }), { activate: late.activate }); // no dispose(): the wow-plugin shape
+    await activatePlugins([lp], log, 20);
+    calls.length = 0; // drop the timeout line activatePlugins itself logged
+    late.resolve();
+    await Bun.sleep(0);
+    expect(calls).toEqual([
+      { level: "warn", message: "[plugins] slow finished activating after the 20ms bound — it stays off until the next restart; disposing what it set up" },
+    ]);
+  });
+
   test("an activate() that rejects after the bound with a value String() can't convert is still logged (#408)", async () => {
     const { log, calls } = makeLog();
     const late = lateActivate();
@@ -1801,12 +1832,29 @@ describe("activatePlugins", () => {
     const onUnhandled = (reason: unknown) => void unhandled.push(reason);
     process.on("unhandledRejection", onUnhandled);
     try {
-      const throwingLog = { info: () => {}, warn: () => { throw new Error("log blew up"); }, error: () => {} };
+      // a and b: the late warn throws, on the resolve and the reject path.
+      const throwingWarn = { info: () => {}, warn: () => { throw new Error("warn blew up"); }, error: () => {} };
       const resolved = lateActivate();
       const rejected = lateActivate();
       const a = loaded(entry({ name: "a" }), { activate: resolved.activate });
       const b = loaded(entry({ name: "b" }), { activate: rejected.activate });
-      await activatePlugins([a, b], throwingLog, 20);
+      await activatePlugins([a, b], throwingWarn, 20);
+      // c: the late dispose fails and the error line reporting it throws -- reached only through the dispose
+      // chain the success handler returns into the terminal catch. (activatePlugins' own catch runs first,
+      // for the timeout, with a log that doesn't throw yet.)
+      let errorThrows = false;
+      const throwingError = {
+        info: () => {},
+        warn: () => {},
+        error: () => {
+          if (errorThrows) throw new Error("error blew up");
+        },
+      };
+      const disposeFails = lateActivate();
+      const c = loaded(entry({ name: "c" }), { activate: disposeFails.activate, dispose: () => Promise.reject(new Error("dispose boom")) });
+      await activatePlugins([c], throwingError, 20);
+      errorThrows = true;
+      disposeFails.resolve();
       resolved.resolve();
       rejected.reject(new Error("late boom"));
       await Bun.sleep(50); // past the microtask drain an unhandled rejection is reported after

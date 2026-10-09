@@ -388,7 +388,8 @@ export interface Plugin {
   ticks?: readonly TickCheck[];
   /**
    * Runs once, inside the bot's `activate()`, after `takeOver()`. All side effects (files, servers) belong here.
-   * The host waits on it for at most `PLUGIN_ACTIVATE_TIMEOUT_MS` (currently 30 s, #408). Past that the plugin
+   * The host waits on it for at most `PLUGIN_ACTIVATE_TIMEOUT_MS` (currently 30 s, #408): a bound on waiting,
+   * so synchronous work inside it is never cut short, but time spent awaiting counts. Past that the plugin
    * is recorded as failed, the way a throw is, and stays off until the next restart; the call is not
    * cancelled. If it resolves later, the host calls `dispose()` once to release what it set up; if it rejects
    * later, the host only logs it. Until #407 lands, slash commands are the exception to "off": the host
