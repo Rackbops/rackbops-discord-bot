@@ -229,9 +229,13 @@ later").
 
 `DISCORD_SERVER_ID`, `ANNOUNCE_CHANNEL_ID`, `RELEASE_ANNOUNCE_CHANNEL_ID`, `REPORT_ROLE_ID`,
 `ADMIN_USER_IDS`, `WATCHED_REPOS` (a list of `owner/repo`, or the single word `none` to turn release polling off), `AUTO_UPDATE`,
-`BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS`, `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
+`BOT_BRANCH`, `COMMAND_PREFIX`, `PLUGINS` (comma-separated plugin names with no spaces, each optionally pinned as
+`name@x.y.z` or `name@x.y.z-pre`; one plugin may not appear in two different tokens, though an exact repeat such as
+`foo,foo` is accepted because the bot drops it. Every value accepted here boots; the bot also tolerates spaces around tokens
+and empty tokens, which this check refuses), `PLUGIN_INDEX_URL` — listed in `ALLOWED_SPEC`'s own order, the order the admin panel displays
 them in (`DISCORD_SERVER_ID` first deliberately; see `ops/bot-ops.sh`). Each is validated
-against a format regex when it *changes* (see the safety notes below); an empty value clears the
+against a format regex when it *changes* (see the safety notes below), matched in the C locale whatever
+locale the caller runs in (#430: under en_US.UTF-8 `[a-z]` would also take `é`); an empty value clears the
 key back to its documented default.
 
 **Plugin-declared keys** — on top of the static list above, **every plugin in the bot's cached Plugin
