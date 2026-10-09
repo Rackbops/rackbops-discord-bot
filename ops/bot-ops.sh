@@ -80,7 +80,7 @@ set -euo pipefail
 #    env-set can turn a plugin on and configure it (#256).
 # 5: adds recreate (#277).
 # 6: WATCHED_REPOS accepts `none` (#342).
-# 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, one name per plugin (#430).
+# 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, no plugin in two different tokens, every format judged in the C locale (#430).
 readonly BOT_OPS_SCHEMA=7
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
@@ -216,7 +216,7 @@ ALLOWED_SPEC=(
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
   # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
   # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
-  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail is exactly
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:114); the `@version` tail is exactly
   # what resolveConfig accepts (src/config.ts:114: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
   # appear in two different tokens (plugins_name_repeated, #430), since the bot refuses either at boot and env-set would
   # otherwise recreate it into a crash loop.
@@ -957,6 +957,19 @@ recreate_bot() {
   return "$rc"
 }
 
+# #430: env-set judges every FORMAT in the C locale, whichever locale its caller runs in. bash hands
+# `=~` to the C library in the CURRENT locale, and under a glibc locale such as en_US.UTF-8 a bracket
+# range like [a-z] or [0-9] is a collation range that also takes é, ß or Arabic-Indic digits, so an
+# operator's SSH session would write PLUGINS=café (or COMMAND_PREFIX=café), which the bot's ASCII-only
+# checks in src/config.ts refuse at boot. Neither ops/admin/Dockerfile nor the oven/bun:1-slim image it
+# builds on sets a locale, so the panel's env-set already ran this way; C makes an SSH run agree with it.
+# The status is =~'s own: 2 for a pattern that does not compile, which the caller's `!` turns into a
+# refusal.
+format_matches() {
+  local LC_ALL=C
+  [[ "$1" =~ $2 ]]
+}
+
 # #430: true when a PLUGINS value names one plugin in two different tokens ("foo,foo@1.0.0",
 # "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:119-121) and no ERE can
 # say it. An exact repeat ("foo,foo") is not one: config.ts's list() drops repeated tokens first
@@ -1089,7 +1102,7 @@ cmd_env_set() {
       fi
       if [ -z "$val" ]; then
         [ -z "$is_required" ] || die "env-set: '$key' is required and cannot be blank"
-      elif [[ ! "$val" =~ $fmt ]]; then
+      elif ! format_matches "$val" "$fmt"; then
         die "env-set: value for '$key' is invalid"
       elif [ "$key" = PLUGINS ] && plugins_name_repeated "$val"; then
         die "env-set: value for 'PLUGINS' names a plugin more than once"

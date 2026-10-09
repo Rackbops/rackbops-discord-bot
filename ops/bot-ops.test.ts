@@ -52,6 +52,20 @@ const REAL_FLOCK = Bun.which("flock") !== null;
 if (!REAL_FLOCK) {
   console.warn("[bot-ops.test] no real flock on PATH — #227's concurrency tests are CI-only here");
 }
+// #430: a locale in which this box's bash reads [a-z] as a collation range that also takes é (glibc's
+// en_US.UTF-8 does), the only place env-set's C-locale format check is observable. Git Bash has none,
+// so the test that needs one runs only where a glibc bash has it.
+const COLLATING_LOCALE =
+  BASH === null
+    ? null
+    : (["en_US.UTF-8", "en_US.utf8"].find(
+        (loc) =>
+          Bun.spawnSync([BASH, "-c", '[[ "$1" =~ ^[a-z]$ ]]', "probe", "é"], { env: { ...process.env, LC_ALL: loc } })
+            .exitCode === 0,
+      ) ?? null);
+if (COLLATING_LOCALE === null) {
+  console.warn("[bot-ops.test] no collating bash locale (en_US.UTF-8) here — #430's locale test is skipped");
+}
 
 /** A path as the spawned bash (MSYS on Windows) should see it: C:\a\b -> /c/a/b. */
 function bashPath(p: string): string {
@@ -361,14 +375,16 @@ describe("bot-ops.sh WATCHED_REPOS accepts none (#342, source pins)", () => {
   });
 });
 
-// #430: canonical PLUGINS values (no whitespace, no empty token -- env-set refuses those on purpose,
-// resolveConfig trims them) on which env-set and the bot must agree exactly.
+// #430: canonical PLUGINS values (no space around a token, no empty token -- env-set refuses those on
+// purpose, resolveConfig trims them) on which env-set and the bot must agree exactly. Each malformed pin
+// appears in a later token too, since the row repeats its token shape after the first comma.
 const PLUGINS_CORPUS = [
   "foo", "foo,bar", "a-b,c@0.0.0-rc.1", "foo@1.2.3", "foo@1.2.3-beta.1", "foo@1.2.3-a-b", "foo@01.2.3",
-  "foo,foo", "foo@1.0.0,foo@1.0.0", "warbandeer,wow,music",
+  "foo,foo", "foo@1.0.0,foo@1.0.0", "warbandeer,wow,music", "bar@1.0.0,foo@2.0.0-rc.1",
   "foo@1", "foo@1.2", "foo@1.x", "foo@1.0.0+b", "foo@1.2.3+build.5", "foo@1.2.3-", "foo@1.2.3.4",
-  "foo@v1.2.3", "foo@", "Foo", "1foo",
-  "foo,foo@1.0.0", "foo@1.0.0,foo@2.0.0", "foo@1.0.0,bar,foo",
+  "foo@1x2x3", "foo@1..3", "foo@v1.2.3", "foo@", "Foo", "1foo",
+  "bar,foo@1", "bar,foo@1.2", "bar,foo@1.0.0+b", "bar,foo@1.2.3-", "bar,foo@1x2x3", "bar,foo@1..3", "bar,Foo",
+  "foo,foo@1.0.0", "foo@1.0.0,foo@2.0.0", "foo@1.0.0,bar,foo", "foo@1.x,foo",
 ];
 /** Whether the bot boots with this PLUGINS value: resolveConfig is what src/config.ts runs at import. */
 const bootAccepts = (plugins: string): boolean => {
@@ -379,8 +395,9 @@ const bootAccepts = (plugins: string): boolean => {
     return false;
   }
 };
-/** Values naming one plugin in two different tokens: the PLUGINS row matches them, so only the bash
- *  check refuses them. The same walk as plugins_name_repeated: skip an exact repeat token. */
+/** Whether a value names one plugin in two different tokens: what plugins_name_repeated refuses after
+ *  the row, and the same walk (skip an exact repeat token). The row matches most such values in this
+ *  corpus, so for them only the bash check refuses. */
 const repeatsAName = (v: string): boolean => {
   const tokens = new Set<string>();
   const names = new Set<string>();
@@ -400,20 +417,19 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
   const src = readFileSync(BOT_OPS_SH, "utf8");
   const row = src.match(/^\s*'PLUGINS\|(.*)'\s*$/m);
 
-  test("the PLUGINS row accepts a value with no repeated name exactly when resolveConfig does", () => {
+  test("the PLUGINS row, then the repeated-name rule, accepts a value exactly when resolveConfig does", () => {
     expect(row).not.toBeNull();
     const re = new RegExp(row![1]!);
-    const values = PLUGINS_CORPUS.filter((v) => !repeatsAName(v));
     // Both verdicts occur, so a bootAccepts that always threw (or never did) could not pass vacuously.
-    expect(values.some(bootAccepts)).toBe(true);
-    expect(values.some((v) => !bootAccepts(v))).toBe(true);
-    for (const v of values) expect(re.test(v), v).toBe(bootAccepts(v));
+    expect(PLUGINS_CORPUS.some(bootAccepts)).toBe(true);
+    expect(PLUGINS_CORPUS.some((v) => !bootAccepts(v))).toBe(true);
+    for (const v of PLUGINS_CORPUS) expect(re.test(v) && !repeatsAName(v), v).toBe(bootAccepts(v));
   });
 
   test("BOT_OPS_SCHEMA is 7 with its #430 history line", () => {
     expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=7$/m);
     expect(src).toMatch(
-      /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, one name per plugin \(#430\)\.$/m,
+      /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, no plugin in two different tokens, every format judged in the C locale \(#430\)\.$/m,
     );
   });
 });
@@ -1233,6 +1249,21 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
     expect((await botOps(url, ["env-set"], "PLUGIN_INDEX_URL=/opt/p@1,/opt/p@2\n")).exitCode).toBe(0);
   });
 
+  // #430 (the review's ops-bot-ops-sh-2): a manifest format bash cannot compile makes =~ return 2, which
+  // format_matches passes through and env-set's `!` turns into a refusal -- fail closed, never accept.
+  test("a manifest format that does not compile refuses the value, writing nothing (#430)", async () => {
+    const index = wrapIndex([pluginEntry("p", [envKey("P_KEY", "(?:a)")])]);
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { pluginIndex: index });
+    const run = await botOps(fx, ["env-set"], "P_KEY=a\n");
+    const recreated = dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"));
+    expect({ exit: run.exitCode, env: envText(fx), recreated }).toEqual({
+      exit: 1,
+      env: "ANNOUNCE_CHANNEL_ID=11111\n",
+      recreated: false,
+    });
+    expect(run.stderr).toContain("value for 'P_KEY' is invalid");
+  });
+
   test("PLUGIN_INDEX_URL accepts http(s)/file/absolute path; rejects other shapes", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     for (const good of ["https://example.com/plugins.json", "http://x/y", "file:///opt/p.json", "/opt/plugins.json"]) {
@@ -1254,6 +1285,33 @@ describe.skipIf(!runnable)("bot-ops.sh whitelists PLUGINS / PLUGIN_INDEX_URL (#1
     expect(run.stderr).toContain("'WARBANDEER_INGEST_PORT' is not an editable key");
     expect(await envGet(fx)).not.toHaveProperty("WARBANDEER_INGEST_PORT");
   });
+});
+
+// #430: env-set matches every format in the C locale. Under a glibc locale such as en_US.UTF-8, [a-z]
+// and [0-9] are collation ranges that take é or Arabic-Indic digits, which the bot's ASCII-only checks
+// refuse at boot; this runs env-set in such a locale (COLLATING_LOCALE, probed above).
+describe.skipIf(!runnable || COLLATING_LOCALE === null)("bot-ops.sh env-set judges formats in the C locale (#430)", () => {
+  test("a caller in a collating locale cannot write a value the bot's ASCII checks refuse", async () => {
+    const cases: [string, string, string][] = [
+      ["PLUGINS", "café", "PLUGINS=warbandeer\n"],
+      ["PLUGINS", "foo@1.2.3-é", "PLUGINS=warbandeer\n"],
+      ["PLUGINS", "foo@١.٢.٣", "PLUGINS=warbandeer\n"],
+      ["COMMAND_PREFIX", "café", "ANNOUNCE_CHANNEL_ID=11111\n"],
+    ];
+    for (const [key, value, base] of cases) {
+      const fx = setup(base);
+      const run = await botOps(fx, ["env-set"], `${key}=${value}\n`, { LC_ALL: COLLATING_LOCALE! });
+      const recreated = dockerCalls(fx).some((c) => c.includes("up -d --force-recreate"));
+      expect({ exit: run.exitCode, env: envText(fx), recreated }, `${key}=${value}`).toEqual({
+        exit: 1,
+        env: base,
+        recreated: false,
+      });
+    }
+    // The same locale still accepts a valid ASCII pin, so the refusals above are the format check's.
+    const ok = setup("PLUGINS=warbandeer\n");
+    expect((await botOps(ok, ["env-set"], "PLUGINS=foo@1.2.3\n", { LC_ALL: COLLATING_LOCALE! })).exitCode).toBe(0);
+  }, LONG);
 });
 
 describe.skipIf(!runnable)("bot-ops.sh env-get lists plugins' non-secret keys (#101, #256)", () => {
@@ -1753,7 +1811,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     expect(run.stderr).toBe("");
   });
 
-  test("BOT_OPS_SCHEMA matches the acceptance bullet's literal value (schema 7, #430)", () => {
+  test("BOT_OPS_SCHEMA's literal value is 7 (#430)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
