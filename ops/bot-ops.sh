@@ -80,7 +80,8 @@ set -euo pipefail
 #    env-set can turn a plugin on and configure it (#256).
 # 5: adds recreate (#277).
 # 6: WATCHED_REPOS accepts `none` (#342).
-readonly BOT_OPS_SCHEMA=6
+# 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, one name per plugin (#430).
+readonly BOT_OPS_SCHEMA=7
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }
@@ -215,8 +216,11 @@ ALLOWED_SPEC=(
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
   # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
   # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
-  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail allows any npm range char.
-  'PLUGINS|^[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?(,[a-z][a-z0-9-]*(@[0-9][0-9A-Za-z.+-]*)?)*$'
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (registry.ts); the `@version` tail is exactly
+  # what resolveConfig accepts (src/config.ts:114: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
+  # appear in two different tokens (plugins_name_repeated, #430), since the bot refuses either at boot and env-set would
+  # otherwise recreate it into a crash loop.
+  'PLUGINS|^[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?(,[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?)*$'
   # Where the bot fetches the Plugin Index from: an http(s) URL, a file:// URL, or a bare absolute
   # path (config.ts accepts all three; empty clears back to the published default).
   'PLUGIN_INDEX_URL|^(https?://[^[:space:]]+|file://[^[:space:]]+|/[^[:space:]]+)$'
@@ -953,6 +957,26 @@ recreate_bot() {
   return "$rc"
 }
 
+# #430: true when a PLUGINS value names one plugin in two different tokens ("foo,foo@1.0.0",
+# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:119-121) and no ERE can
+# say it. An exact repeat ("foo,foo") is not one: config.ts's list() drops repeated tokens first
+# (src/config.ts:70-77), so it boots, and env-set accepts it too. Only ever called on a value the
+# PLUGINS row already matched, so every token is non-empty and holds no glob character.
+plugins_name_repeated() {
+  local -A seen_tok=() seen_name=()
+  local -a toks
+  local tok name
+  IFS=, read -ra toks <<<"$1"
+  for tok in "${toks[@]}"; do
+    [[ -z "${seen_tok[$tok]+x}" ]] || continue
+    seen_tok["$tok"]=1
+    name="${tok%%@*}"
+    [[ -z "${seen_name[$name]+x}" ]] || return 0
+    seen_name["$name"]=1
+  done
+  return 1
+}
+
 cmd_env_set() {
   need docker; need jq
   guard_no_handoff_in_progress
@@ -1067,6 +1091,8 @@ cmd_env_set() {
         [ -z "$is_required" ] || die "env-set: '$key' is required and cannot be blank"
       elif [[ ! "$val" =~ $fmt ]]; then
         die "env-set: value for '$key' is invalid"
+      elif [ "$key" = PLUGINS ] && plugins_name_repeated "$val"; then
+        die "env-set: value for 'PLUGINS' names a plugin more than once"
       fi
       DIFF["$key"]="$val"
     done

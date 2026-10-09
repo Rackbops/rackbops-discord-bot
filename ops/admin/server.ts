@@ -766,8 +766,9 @@ export const HOST_API_VERSION = 1;
  *  3 = routing-get, the routing / webhook plugin-request actions, write-only plugin secrets (#240).
  *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256).
  *  5 = recreate (#277).
- *  6 = WATCHED_REPOS accepts `none` (#342). */
-export const REQUIRED_BOT_OPS_SCHEMA = 6;
+ *  6 = WATCHED_REPOS accepts `none` (#342).
+ *  7 = PLUGINS accepts only what the bot boots (#430). */
+export const REQUIRED_BOT_OPS_SCHEMA = 7;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed
