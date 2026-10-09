@@ -180,11 +180,11 @@ const repeatsAName = (v: string): boolean => {
 |---|---|---|---|
 | T1 | new `describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pins)")` / `"the PLUGINS row accepts a value with no repeated name exactly when resolveConfig does"` | everywhere (no bash/jq) | extract the row like `:347` (`/^\s*'PLUGINS\|(.*)'\s*$/m`); for every corpus value with `!repeatsAName(v)`: `expect(new RegExp(row).test(v), v).toBe(bootAccepts(v))`. Also assert the filtered corpus holds at least one accept and one refuse, so a `bootAccepts` that always throws cannot pass it vacuously |
 | T2 | same describe / `"BOT_OPS_SCHEMA is 7 with its #430 history line"` | everywhere | `/^readonly BOT_OPS_SCHEMA=7$/m` and the exact `# 7: ...` line from step 1 |
-| T3 | `describe.skipIf(!runnable)` block at `:1132` / new `"env-set accepts a PLUGINS value exactly when the bot boots it (#430)"` (use `LONG`, `:21`) | CI (bash + jq) | for every corpus value, a fresh `setup("PLUGINS=warbandeer\n")`, then `env-set` with `PLUGINS=<v>`. Boot accepts: exit 0, `changed: ["PLUGINS"]`. Boot refuses: ONE combined assertion, so a mutation that lets the value through shows all three facts at once instead of stopping at the exit code (Bun's `expect` throws on its first failure): `expect({ exit: run.exitCode, env: envText(fx), recreated: dockerCalls(fx).some((c) => c.includes("up -d --force-recreate")) }, v).toEqual({ exit: 1, env: "PLUGINS=warbandeer\n", recreated: false })` (the `dockerCalls` idiom is `:3625`'s) |
-| T4 | same block / `"env-set refuses one plugin named in two tokens, naming PLUGINS, and only for PLUGINS (#430)"` | CI | `foo,foo@1.0.0` -> stderr contains exactly `value for 'PLUGINS' names a plugin more than once`; `foo,foo` -> exit 0; and on a `setup("ANNOUNCE_CHANNEL_ID=11111\n")` fixture, `PLUGIN_INDEX_URL=/opt/p@1,/opt/p@2` -> exit 0 (it matches its own row, `ops/bot-ops.sh:222`; pins the `[ "$key" = PLUGINS ]` guard). Feed values on stdin as the other env-set tests do: MSYS bash reads an argv entry starting with `@` as a response file |
-| T5 | existing `:1133` test: add `"foo@1.2"` and `"foo@1.0.0+b"` to its `bad` list (`:1140`) | CI | the issue's own named cases, beside the shape cases already there |
+| T3 | `describe.skipIf(!runnable)` block at `:1132` / new `"env-set accepts a PLUGINS value exactly when the bot boots it (#430)"` (use `LONG`, `:21`) | bash + jq (MILE and CI) | for every corpus value, a fresh `setup("PLUGINS=warbandeer\n")`, then `env-set` with `PLUGINS=<v>`. Boot accepts: exit 0, `changed: ["PLUGINS"]`. Boot refuses: ONE combined assertion, so a mutation that lets the value through shows all three facts at once instead of stopping at the exit code (Bun's `expect` throws on its first failure): `expect({ exit: run.exitCode, env: envText(fx), recreated: dockerCalls(fx).some((c) => c.includes("up -d --force-recreate")) }, v).toEqual({ exit: 1, env: "PLUGINS=warbandeer\n", recreated: false })` (the `dockerCalls` idiom is `:3625`'s) |
+| T4 | same block / `"env-set refuses one plugin named in two tokens, naming PLUGINS, and only for PLUGINS (#430)"` | bash + jq | `foo,foo@1.0.0` -> stderr contains exactly `value for 'PLUGINS' names a plugin more than once`; `foo,foo` -> exit 0; and on a `setup("ANNOUNCE_CHANNEL_ID=11111\n")` fixture, `PLUGIN_INDEX_URL=/opt/p@1,/opt/p@2` -> exit 0 (it matches its own row, `ops/bot-ops.sh:222`; pins the `[ "$key" = PLUGINS ]` guard). Feed values on stdin as the other env-set tests do: MSYS bash reads an argv entry starting with `@` as a response file |
+| T5 | existing `:1133` test: add `"foo@1.2"` and `"foo@1.0.0+b"` to its `bad` list (`:1140`) | bash + jq | the issue's own named cases, beside the shape cases already there |
 | T6 | the #342 source pin `:358-361`: rename to `"the #342 history line stays"`, keep only the `# 6:` assertion (`:360`); T2 now owns the live number | everywhere | -- |
-| T7 | the schema literals the bump turns red: `:1663`, `:1671`, `:1678`, `:1698`, `:1711`, `:1724`, `:1735`, `:1743`, `:1751` (`6` -> `7`), and the two names `:1667` -> `"(schema 7, #430)"`, `:1674` -> `"version reports schema 7 (#430: PLUGINS pins match the bot)"` | CI | all of them sit in `describe.skipIf(!runnable)("bot-ops.sh version (issue #173)")` (`:1655`), so they skip without jq and a missed one first shows on CI; T2 makes the same `=7` assertion everywhere |
+| T7 | the schema literals the bump turns red: `:1663`, `:1671`, `:1678`, `:1698`, `:1711`, `:1724`, `:1735`, `:1743`, `:1751` (`6` -> `7`), and the two names `:1667` -> `"(schema 7, #430)"`, `:1674` -> `"version reports schema 7 (#430: PLUGINS pins match the bot)"` | bash + jq | all of them sit in `describe.skipIf(!runnable)("bot-ops.sh version (issue #173)")` (`:1655`), so they skip on a box without jq; T2 makes the same `=7` assertion everywhere |
 
 `src/config.test.ts` needs no change: its PLUGINS cases (`:271-306`) already pin `resolveConfig`'s
 side, and T1 pairs the two.
@@ -222,15 +222,17 @@ side, and T1 pairs the two.
 | the docs say what is accepted | 4 | manual: the claims reviewer reads each edited line against the code | -- |
 
 **Where the mutations can run.** T1, T2 and `server.test.ts:2563` run on any box. T3, T4, T5 and
-T7 need `bash` and `jq` (`ops/bot-ops.test.ts:41-46`); as of 2026-10-08 MILE has no `jq` on PATH
-(`command -v jq` prints nothing), so there they skip and print `[bot-ops.test] SKIPPING`. For
-M1-M3 and M7, T1 is the local red; M8 is red locally through `server.test.ts:2563`. M4, M5, M6
-and M9 are red only where jq exists:
-
-- if `jq` is on PATH (Rod's call), run them in the scratch worktree like the rest;
-- otherwise push each as its own commit to the PR branch, record the failing CI job and test name,
-  then push the revert. Do it after the gate's last behaviour fix so the merged state is what was
-  mutated, and list the commit pairs in the PR body. The squash merge drops them from `main`.
+T7 need `bash` and `jq` (`ops/bot-ops.test.ts:41-46`). Rod installed `jq` 1.8.2 on MILE on
+2026-10-08 (`winget install jqlang.jq`; `C:\Users\Rod\AppData\Local\Microsoft\WinGet\Links\jq.exe`,
+visible from both Git Bash and PowerShell), so they run locally and every mutation, M4, M5, M6 and
+M9 included, runs in the scratch worktree like the rest. First confirm the suite does not print
+`[bot-ops.test] SKIPPING` (`:44-46`): if it does, `jq` is not on that session's PATH, and that is a
+setup problem to report, not a reason to skip the jq-only mutations. The three `flock` tests stay
+CI-only (`:47-53`). Baseline on `main` @ ded55f5 with that `jq` (orchestrator, 2026-10-08):
+`bun test ops/bot-ops.test.ts` -> `213 pass, 3 skip, 0 fail ... [398.05s]`, no SKIPPING line. At
+~400 s a file, filter each mutation run to the test(s) its row names with `bun test
+ops/bot-ops.test.ts -t "<name>"`, and run the whole file once on the final tree. Linux bash on CI remains the check that counts for glibc ERE: the PR is not
+ready until CI is green.
 
 Run every local mutation in a scratch copy (`git worktree add --detach <path> <sha>`), never in the
 tree the tests or a reviewer are reading; paste the red test's name per row in the PR.
@@ -238,9 +240,9 @@ tree the tests or a reviewer are reading; paste the red test's name per row in t
 ### Checks, gate, PR
 
 - `bun run check`; `bunx tsc --noEmit -p ops/tsconfig.json` (the new `../src/config` import is
-  type-checked there); `bun run check` inside `ops/admin/`; `bun test` from the repo root. On MILE
-  the bot-ops subprocess tests skip without `jq` and the three `flock` tests are CI-only (`:47-53`);
-  say so in the PR. The PR is not ready until CI is green.
+  type-checked there); `bun run check` inside `ops/admin/`; `bun test` from the repo root. With
+  `jq` now on MILE the bot-ops subprocess tests run there; only the three `flock` tests are
+  CI-only (`:47-53`). Say so in the PR. The PR is not ready until CI is green.
 - Review gate: reviewer A on correctness and failure modes (the ERE in bash vs the JS regex in T1;
   `set -euo pipefail` inside `plugins_name_repeated`; the changed-only rule of #44; the exact-repeat
   case; the panel's client-side check compiling the new pattern); reviewer B on claims-vs-code,
@@ -270,5 +272,5 @@ loose pins.
 EXECUTE AS WRITTEN
 Repo: S:\Repos\rackbops-discord-bot (new worktree from origin/main, branch fix/430-plugins-pin-semver). Issue: Rackbops/rackbops-discord-bot#430 (Epic #516).
 Plan: docs/plans/epics/E516/430-plugins-pin.md on branch claude/430-plan: git -C S:\Repos\rackbops-discord-bot show origin/claude/430-plan:docs/plans/epics/E516/430-plugins-pin.md
-Behaviour change: run your own three-reviewer gate (two read-only adversarial reviewers, different lenses), up to four rounds, then report instead of a fifth. Mutation checks in a scratch worktree; the jq-only rows go through CI as the plan says unless jq is on your PATH. Scratch files: task-unique names (pr-body-430.md, commit-msg-430.txt), read back before use. Report the PR link, the pasted checks, the mutation table, the gate's rounds and any deviation. Do not merge.
+Behaviour change: run your own three-reviewer gate (two read-only adversarial reviewers, different lenses), up to four rounds, then report instead of a fifth. Mutation checks in a scratch worktree, all nine locally (jq is installed on MILE; if bot-ops.test.ts prints SKIPPING, stop and report the PATH problem). Scratch files: task-unique names (pr-body-430.md, commit-msg-430.txt), read back before use. Report the PR link, the pasted checks, the mutation table, the gate's rounds and any deviation. Do not merge.
 ```
