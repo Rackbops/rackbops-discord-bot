@@ -254,8 +254,9 @@ not know yet. This is where `WARBANDEER_INGEST_PORT`
 lives now that the connector is the `warbandeer` plugin (issue #100): once the bot has cached the index
 the key is editable, in the same save that sets `PLUGINS=warbandeer`. A plugin's **`secret` keys are
 write-only** (#240, ADR-0006 decision 8): `env-set` accepts them, validated against their `format`
-like any other key, but `env-get` never lists one and `env-schema` reports it only as `secret: true`
-plus `isSet` — see "Plugin secrets are write-only" under the safety notes. A key the deployment
+like any other key, but `env-get` never lists one and `env-schema` reports it as
+`{pattern, required, source: "plugin", secret: true, isSet}`, never its value — see "Plugin secrets
+are write-only" under the safety notes. A key the deployment
 itself owns (a core credential, or a variable `docker-compose.yml` interpolates) or the bot core reads
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
 `HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
@@ -288,8 +289,9 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   key made adding one painful, so `env-set` accepts a key the cached Plugin Index marks `secret:
   true` — for any plugin in the index, on or off (#256) — and nothing ever reads it back. The value appears in no
   output this script emits: not in `env-get` (a secret key is never listed), not in `env-schema`
-  (`secret: true` and `isSet` only), not in `env-set`'s result (it names changed *keys*), not in a
-  refusal message (those name a key, and only one that looks like a variable name), not on stderr,
+  (its `pattern`, `required`, `source`, `secret: true` and `isSet`, never its value), not in
+  `env-set`'s result (it names changed *keys*), not in a refusal message (those name a key, and only
+  one that looks like a variable name), not on stderr,
   and not in `docker`'s argv. These keep that true. (1) A submitted secret is **always written** and
   reported as changed, even with the value it already has: otherwise "no changes" would tell a caller
   its guess was the stored value. The one exception is a blank for a key that is already unset, which
