@@ -96,6 +96,16 @@ describe("index.ts wiring", () => {
     expect(startSched).toBeLessThan(restPut);
   });
 
+  // #408: boot passes neither call a bound of its own, so both take host.ts's defaults
+  // (PLUGIN_IMPORT_TIMEOUT_MS, PLUGIN_ACTIVATE_TIMEOUT_MS), which host.test.ts pins.
+  test("boot calls loadPlugins and activatePlugins with no bound of its own (#408)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const load = source.indexOf("await loadPlugins(", activateFn);
+    expect(load).toBeGreaterThan(activateFn);
+    expect(source.slice(load, source.indexOf(");", load))).toMatch(/,\s*console,\s*$/); // console is the last argument
+    expect(source.indexOf("await activatePlugins(loadResult.loaded, console);", activateFn)).toBeGreaterThan(activateFn);
+  });
+
   // #239: registration moved into src/routing/, but with no routing the bot must make EXACTLY the call
   // it always made. index.ts can't run under test, so the shape of the wiring is pinned in the source.
   describe("command registration is routed through src/routing (#239)", () => {
