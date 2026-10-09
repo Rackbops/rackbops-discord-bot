@@ -966,6 +966,7 @@ recreate_bot() {
 # The status is =~'s own: 2 for a pattern that does not compile, which the caller's `!` turns into a
 # refusal.
 format_matches() {
+  local LC_ALL=C
   [[ "$1" =~ $2 ]]
 }
 
