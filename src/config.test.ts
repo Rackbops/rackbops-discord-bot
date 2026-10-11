@@ -333,6 +333,16 @@ describe("resolveConfig — plugins", () => {
     );
     expect(() => resolveConfig({ ...base, PLUGIN_INDEX_URL: "relative/x.json" })).toThrow(/PLUGIN_INDEX_URL must be/);
   });
+
+  // #436: optional() treats only the empty string as unset, so a whitespace-only value is kept and refused
+  // here, loudly, rather than falling back to the default (install.ts's resolveRegistryBase documents the
+  // contrast for PLUGIN_REGISTRY_URL, which does fall back).
+  test("a blank PLUGIN_INDEX_URL means the default, but a whitespace-only one is kept and refused", () => {
+    expect(resolveConfig({ ...base, PLUGIN_INDEX_URL: "" }).pluginIndexUrl).toBe(
+      "https://raw.githubusercontent.com/Rackbops/rackbops-bot-plugins/main/plugins.json",
+    );
+    expect(() => resolveConfig({ ...base, PLUGIN_INDEX_URL: "   " })).toThrow(/PLUGIN_INDEX_URL must be .* got " {3}"/);
+  });
 });
 
 describe("resolveConfig — HTTP_PORT (#220)", () => {
