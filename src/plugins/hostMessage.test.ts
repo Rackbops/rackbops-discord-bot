@@ -130,14 +130,39 @@ describe("wrapBareUrls", () => {
 describe("validateHostMessage: fixed refusals for every shape check and builder throw (#454)", () => {
   const refuse = (message: unknown, partial = true) => validateHostMessage(message, { partial, pluginName: "p" });
 
-  test("a builder throw on the card is \"card is not valid\": an unparseable or out-of-range colour, a non-boolean inline", () => {
-    for (const card of [
-      { title: "t", color: "#zzz" },
-      { title: "t", color: 0x1000000 },
-      { title: "t", fields: [{ name: "n", value: "v", inline: "yes" }] },
-    ]) {
-      expect(refuse({ card })).toEqual({ ok: false, reason: "card is not valid" });
+  test("a builder throw on the card is \"card is not valid\": a non-boolean inline", () => {
+    expect(refuse({ card: { title: "t", fields: [{ name: "n", value: "v", inline: "yes" }] } })).toEqual({ ok: false, reason: "card is not valid" });
+  });
+
+  // #508: HostCard.color is a number. discord.js's setColor also resolves a name or a hex string, so
+  // "Random" used to be accepted and sent as some colour; anything but a whole 0..0xFFFFFF is refused.
+  test("a card colour that is not a whole number from 0 to 0xFFFFFF", () => {
+    for (const color of ["Random", "#ff0000", "#zzz", 0x1000000, -1, 1.5, Number.NaN, null]) {
+      expect(refuse({ card: { title: "t", color } }), String(color)).toEqual({ ok: false, reason: "card color must be a whole number from 0 to 0xFFFFFF" });
     }
+    for (const color of [0, 0xffffff, 0x5865f2]) expect(refuse({ card: { title: "t", color } }), String(color)).toMatchObject({ ok: true });
+  });
+
+  // #508: whitespace alone shows as nothing, and Discord is expected to refuse it as empty (inferred), so
+  // it is empty here too, with the reason an empty one already gets.
+  test("a card title, a field name or value, or a card-less post's content that is only whitespace is empty", () => {
+    for (const blank of [" ", "   ", "\n\t", "\u3000"]) {
+      expect(refuse({ content: blank }, false), JSON.stringify(blank)).toEqual({ ok: false, reason: "content is empty" });
+      // Beside a card it shows the card; in an edit it may blank the text over one: both kept.
+      expect(refuse({ content: blank, card: { title: "t" } }, false), JSON.stringify(blank)).toMatchObject({ ok: true, payload: { content: blank } });
+      expect(refuse({ content: blank }), JSON.stringify(blank)).toMatchObject({ ok: true, payload: { content: blank } });
+      expect(refuse({ card: { title: blank } }), JSON.stringify(blank)).toEqual({ ok: false, reason: "card title is empty" });
+      expect(refuse({ card: { title: "t", fields: [{ name: blank, value: "v" }] } })).toEqual({
+        ok: false,
+        reason: `card field name must be 1..${LIMITS.CARD_FIELD_NAME_MAX} characters`,
+      });
+      expect(refuse({ card: { title: "t", fields: [{ name: "n", value: blank }] } })).toEqual({
+        ok: false,
+        reason: `card field value must be 1..${LIMITS.CARD_FIELD_VALUE_MAX} characters`,
+      });
+    }
+    // Whitespace around real text is kept as written.
+    expect(refuse({ content: " hi " }, false)).toMatchObject({ ok: true, payload: { content: " hi " } });
   });
 
   test("a builder throw on a link button is \"link button is not valid\"", () => {
@@ -338,6 +363,19 @@ describe("validateHostMessage: links", () => {
       ok: false,
       reason: `link label must be 1..${LIMITS.LINK_LABEL_MAX} characters`,
     });
+  });
+
+  // #508: Discord caps a link button's url at 512; discord.js's builder does not, so a longer one used to
+  // reach Discord and come back as a raw API error.
+  test("a link url longer than LINK_URL_MAX (512) is refused; exactly 512 is accepted", () => {
+    const urlOf = (len: number) => `https://a.example/${"x".repeat(len - "https://a.example/".length)}`;
+    expect(urlOf(512)).toHaveLength(512);
+    expect(validateHostMessage({ links: [{ label: "l", url: urlOf(512) }] }, { partial: true })).toMatchObject({ ok: true });
+    expect(validateHostMessage({ links: [{ label: "l", url: urlOf(513) }] }, { partial: true })).toEqual({
+      ok: false,
+      reason: `link url is longer than ${LIMITS.LINK_URL_MAX}`,
+    });
+    expect(LIMITS.LINK_URL_MAX).toBe(512);
   });
 
   test("an http link is refused", () => {

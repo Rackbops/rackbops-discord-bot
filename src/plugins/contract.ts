@@ -1,8 +1,10 @@
 // The host<->plugin contract — types plus one integer constant, nothing else. This module must stay
 // free of runtime imports and side effects: the Plugin Index (the JSON these types describe) is read
 // at boot BEFORE the discord.js Client exists (intents are frozen at construction, so they have to
-// come from data, never from plugin code), and the plugins repo vendors this file verbatim to
-// type-check plugins against it. Design: docs/adr/0004-plugins-fetched-from-a-published-manifest.md.
+// come from data, never from plugin code), and the plugins repo vendors this file verbatim, as
+// `packages/api/contract.d.ts`, to type-check plugins against it; its `check-contract` script compares
+// that copy byte for byte with this file on `main`, so any edit here, a comment's included, needs a
+// re-vendor there. Design: docs/adr/0004-plugins-fetched-from-a-published-manifest.md.
 import type {
   AutocompleteInteraction,
   ChatInputCommandInteraction,
@@ -310,7 +312,10 @@ export interface HostApi {
    *  host that predates it (#736), so `typeof host.post === "function"` is how a plugin feature-detects. */
   post?(guildId: string, destination: string, message: HostMessage): Promise<HostDelivery>;
   /** DMs `userId`; rejects cleanly (never throws a raw Discord error) when the recipient's DMs are
-   *  closed. Sends as the bot. Optional, like `post` (#736). */
+   *  closed. Sends as the bot. Optional, like `post` (#736). Any other Discord refusal of `post`, `dm`
+   *  or `edit` rejects with an `Error` carrying Discord's message, `name`, `status`, `method` and its
+   *  `code` (a 5xx has none), never the request that was sent (#508; a host before that rejects with
+   *  discord.js's own error, whose `requestBody` holds the message). */
   dm?(userId: string, message: HostMessage): Promise<HostDelivery>;
   /** Edits a message `post`/`dm` delivered. Refuses a message this bot did not author — a plugin
    *  already reaches the live `Client` via `interaction.client`, so per-plugin ownership is not a

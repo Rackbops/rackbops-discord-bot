@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { DiscordAPIError } from "discord.js";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -338,6 +339,28 @@ describe("postForPlugin", () => {
     // Both were tried, and the one that is not thrown is not lost: it is logged.
     expect(h.events).toEqual([`bot:${CHAN_A}:hello`, `bot:${CHAN_B}:hello`]);
     expect(h.logs).toEqual([["error", `[announce] music: could not post to ${CHAN_B}`, errB]]);
+  });
+
+  // #508: the bot path's discord.js error carries the request -- `requestBody.json` is the message -- so
+  // the plugin gets, and the log shows, that error without it (its message and code kept).
+  test("a discord.js error from the bot path reaches the plugin and the log without the request it carried", async () => {
+    const restError = (channelId: string) =>
+      new DiscordAPIError({ message: "Missing Access", code: 50001 }, 50001, 403, "POST", `https://discord.com/api/v10/channels/${channelId}/messages`, {
+        body: { content: "hello" },
+      });
+    const h = harness({ routing: routingFor({ both: true }), bot: async (channelId) => Promise.reject(restError(channelId)) });
+    const thrown = (await postForPlugin("music", "hello", h.deps).catch((err: unknown) => err)) as Error & Record<string, unknown>;
+    expect([thrown.message, thrown.code, "requestBody" in thrown]).toEqual(["Missing Access", 50001, false]);
+    const logged = h.logs[0]?.[2] as Error & Record<string, unknown>;
+    expect([logged.message, logged.code, "requestBody" in logged]).toEqual(["Missing Access", 50001, false]);
+    // One channel posting is a success, and the other's failure is only logged -- cleaned the same way.
+    const partial = harness({
+      routing: routingFor({ both: true }),
+      bot: async (channelId) => (channelId === CHAN_B ? Promise.reject(restError(channelId)) : undefined),
+    });
+    await postForPlugin("music", "hello", partial.deps);
+    const partialLog = partial.logs[0]?.[2] as Error & Record<string, unknown>;
+    expect([partial.logs[0]?.[1], partialLog.code, "requestBody" in partialLog]).toEqual([`[announce] music: could not post to ${CHAN_B}`, 50001, false]);
   });
 
   test("a single target failing logs nothing more than today: the plugin gets the error", async () => {

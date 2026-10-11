@@ -348,13 +348,15 @@ async function activate(c: Client<true>): Promise<void> {
   // stays as the backstop. It is deliberately not part of the tick machinery. Beats do nothing until
   // the boot state write and the boot drain below have landed (`isPluginStateReady`), which is also
   // after `initRouting`, and none starts on the way out. The drain is a critical section, so a restart an
-  // update-now asks for waits for it, as it does for a tick. The stop function it returns is not kept:
+  // update-now asks for waits for it, as it does for a tick -- for at most `REQUEST_DRAIN_TIMEOUT_MS`
+  // (#508), past which the beat logs and lets go. The stop function it returns is not kept:
   // like the scheduler's own interval, this timer lives as long as the process, and every way out of the
   // process ends in `process.exit`.
   startRequestDrain({
     ready: isPluginStateReady,
     restartPending,
-    drain: () => withCritical(() => consumePluginRequests(livePluginRequestDeps())),
+    drain: () => consumePluginRequests(livePluginRequestDeps()),
+    hold: withCritical,
     log: console,
   });
 

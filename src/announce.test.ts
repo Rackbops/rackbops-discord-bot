@@ -25,6 +25,8 @@ const {
   announceStateForTest,
   livePluginRequestDeps,
   livePluginUpdateDeps,
+  PLUGIN_REQUESTS_TICK_WAIT_MS,
+  TICK_WATCHDOG_MS,
 } = await import("./announce");
 const { config } = await import("./config");
 const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routingIdleForTest } = await import("./routing/live");
@@ -115,9 +117,21 @@ describe("the pluginRequests tick check (#241)", () => {
     // and the five-second timer are gated on it. announce.ts holds the flag in module state, so the
     // gate is pinned in the source, as index.ts's wiring is.
     const source = readFileSync(join(import.meta.dir, "announce.ts"), "utf8");
-    expect(source).toMatch(
-      /name: "pluginRequests",\s*run: async \(\) => \{\s*if \(pluginStateReady\) await consumePluginRequests\(livePluginRequestDeps\(\)\);/,
-    );
+    expect(source).toMatch(/name: "pluginRequests",\s*run: async \(\) => \{\s*if \(!pluginStateReady\) return;/);
+  });
+
+  // #508: this check queues behind a timer drain that never settles, inside the tick's critical section,
+  // so it waits through settledWithin's bound (unit-tested in drain.test.ts), as the timer's beats do.
+  test("waits on the drain for at most REQUEST_DRAIN_TIMEOUT_MS, so a hung drain cannot hold the tick's critical section", () => {
+    const source = readFileSync(join(import.meta.dir, "announce.ts"), "utf8");
+    const check = source.slice(source.indexOf('name: "pluginRequests"'), source.indexOf('name: "pluginUpdates"'));
+    expect(check).toMatch(/await settledWithin\(consumePluginRequests\(livePluginRequestDeps\(\)\), PLUGIN_REQUESTS_TICK_WAIT_MS\)\) === "timed-out"/);
+    expect(check).not.toMatch(/await consumePluginRequests\(/); // never awaited bare
+  });
+
+  test("the wait ends well before the tick watchdog, so the tick (not the watchdog) ends it, with room for the checks after it", () => {
+    expect(PLUGIN_REQUESTS_TICK_WAIT_MS).toBe(120_000);
+    expect(TICK_WATCHDOG_MS - PLUGIN_REQUESTS_TICK_WAIT_MS).toBeGreaterThanOrEqual(120_000);
   });
 });
 

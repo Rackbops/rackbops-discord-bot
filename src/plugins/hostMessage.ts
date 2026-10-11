@@ -9,7 +9,10 @@ import type { APIActionRowComponent, APIButtonComponent, APIEmbed } from "discor
 import type { HostButton, HostCard, HostCardField, HostLinkButton, HostMessage } from "./contract";
 
 /** The numbers behind decision 6. `CARD_TOTAL_MAX` is title + description + footer + every field's
- *  name and value, summed -- Discord's own 6000-character embed budget. */
+ *  name and value, summed -- Discord's own 6000-character embed budget. A card's title and a field's
+ *  name and value must not be only whitespace (#508), nor content that would be all a post or DM shows
+ *  (no card): it shows as nothing, and Discord is expected to refuse it as empty after the host has said
+ *  yes (inferred, not run against Discord). */
 export const LIMITS = {
   CONTENT_MAX: 2000,
   CARD_TITLE_MAX: 256,
@@ -21,6 +24,9 @@ export const LIMITS = {
   CARD_TOTAL_MAX: 6000,
   LINKS_MAX: 5,
   LINK_LABEL_MAX: 80,
+  /** Discord's own cap on a link button's url (#508): a longer one passes discord.js's builder and is
+   *  refused only by Discord, as a raw API error. */
+  LINK_URL_MAX: 512,
   BUTTONS_PER_ROW: 5,
   ROWS_MAX: 5,
   BUTTON_LABEL_MAX: 80,
@@ -149,10 +155,15 @@ export function wrapBareUrls(content: string): string {
   );
 }
 
+/** Empty, or only whitespace: what shows as nothing (#508). */
+function isBlank(text: string): boolean {
+  return text.trim().length === 0;
+}
+
 function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok: false; reason: string } {
   if (typeof card !== "object" || card === null) return { ok: false, reason: "card must be an object" };
   const c = card as Partial<HostCard>;
-  if (typeof c.title !== "string" || c.title.length === 0) return { ok: false, reason: "card title is empty" };
+  if (typeof c.title !== "string" || isBlank(c.title)) return { ok: false, reason: "card title is empty" };
   if (c.title.length > LIMITS.CARD_TITLE_MAX) return { ok: false, reason: `card title is longer than ${LIMITS.CARD_TITLE_MAX}` };
   if (c.description !== undefined) {
     if (typeof c.description !== "string") return { ok: false, reason: "card description must be a string" };
@@ -162,6 +173,11 @@ function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok:
   }
   if (c.url !== undefined && (typeof c.url !== "string" || !c.url.startsWith("https://"))) {
     return { ok: false, reason: "card url must be https" };
+  }
+  // #508: `HostCard.color` is a number; discord.js's setColor would also take a name ("Random") or a
+  // hex string, so a non-number is refused here rather than resolved into some colour.
+  if (c.color !== undefined && !(typeof c.color === "number" && Number.isInteger(c.color) && c.color >= 0 && c.color <= 0xffffff)) {
+    return { ok: false, reason: "card color must be a whole number from 0 to 0xFFFFFF" };
   }
   if (c.footer !== undefined) {
     if (typeof c.footer !== "string") return { ok: false, reason: "card footer must be a string" };
@@ -174,10 +190,10 @@ function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok:
   for (const f of rawFields) {
     if (typeof f !== "object" || f === null) return { ok: false, reason: "card field must be an object" };
     const field = f as Partial<HostCardField>;
-    if (typeof field.name !== "string" || field.name.length === 0 || field.name.length > LIMITS.CARD_FIELD_NAME_MAX) {
+    if (typeof field.name !== "string" || isBlank(field.name) || field.name.length > LIMITS.CARD_FIELD_NAME_MAX) {
       return { ok: false, reason: `card field name must be 1..${LIMITS.CARD_FIELD_NAME_MAX} characters` };
     }
-    if (typeof field.value !== "string" || field.value.length === 0 || field.value.length > LIMITS.CARD_FIELD_VALUE_MAX) {
+    if (typeof field.value !== "string" || isBlank(field.value) || field.value.length > LIMITS.CARD_FIELD_VALUE_MAX) {
       return { ok: false, reason: `card field value must be 1..${LIMITS.CARD_FIELD_VALUE_MAX} characters` };
     }
     fields.push({ name: field.name, value: field.value, ...(field.inline !== undefined ? { inline: field.inline } : {}) });
@@ -226,6 +242,7 @@ function validateLinks(links: unknown): { ok: true; value: HostLinkButton[] } | 
     if (typeof link.url !== "string" || !link.url.startsWith("https://")) {
       return { ok: false, reason: "link url must be https" };
     }
+    if (link.url.length > LIMITS.LINK_URL_MAX) return { ok: false, reason: `link url is longer than ${LIMITS.LINK_URL_MAX}` };
     value.push({ label: link.label, url: link.url });
   }
   return { ok: true, value };
@@ -348,6 +365,10 @@ export function validateHostMessage(message: unknown, opts: { partial: boolean; 
     }
     const wrapped = wrapBareUrls(m.content ?? "");
     if (wrapped.length === 0) return { ok: false, reason: "content is empty" };
+    // #508: whitespace alone is empty too where it is all the message would show -- a post or DM with no
+    // card. Not beside a card, and not in an edit, where `" "` is how a plugin blanks the text above the
+    // message's card, which this call cannot see.
+    if (!opts.partial && !hasCard && isBlank(wrapped)) return { ok: false, reason: "content is empty" };
     if (wrapped.length > LIMITS.CONTENT_MAX) return { ok: false, reason: `content is longer than ${LIMITS.CONTENT_MAX} after link wrapping` };
     content = wrapped;
   }

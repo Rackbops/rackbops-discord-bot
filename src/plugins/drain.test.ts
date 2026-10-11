@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { REQUEST_DRAIN_MS, startRequestDrain, type RequestDrainOptions } from "./drain";
+import { REQUEST_DRAIN_MS, REQUEST_DRAIN_TIMEOUT_MS, settledWithin, startRequestDrain, type RequestDrainOptions } from "./drain";
 
 /** A drain whose timer the test turns by hand: `beat()` is one tick of the interval. */
 function harness(over: Partial<RequestDrainOptions> = {}) {
@@ -116,6 +116,131 @@ describe("startRequestDrain", () => {
     await h.tick();
     expect(calls).toBe(2);
     expect(h.errors).toHaveLength(2);
+  });
+
+  // #508: a drain that never settles used to keep `running` set and its critical section held for good:
+  // every later beat returned silently, and every restart -- a /plugins update's included -- waited on it.
+  describe("one drain is waited on, and holds a restart, for at most timeoutMs (#508)", () => {
+    /** A hold that records how many are open, like restart.ts's critical count. */
+    const counting = () => {
+      const held = { open: 0 };
+      const hold = async (work: () => Promise<void>) => {
+        held.open += 1;
+        try {
+          await work();
+        } finally {
+          held.open -= 1;
+        }
+      };
+      return { held, hold };
+    };
+    const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    test("a drain that never settles is let go at the bound: logged, the hold released, and the next beat drains again", async () => {
+      const { held, hold } = counting();
+      let calls = 0;
+      const h = harness({
+        hold,
+        timeoutMs: 20,
+        drain: () => {
+          calls += 1;
+          return new Promise<void>(() => {}); // never settles
+        },
+      });
+      await h.tick();
+      expect(held.open).toBe(1); // held while it runs
+      await h.tick();
+      expect(calls).toBe(1); // a beat inside the bound still skips
+      await settle(40);
+      expect(held.open).toBe(0); // let go at the bound
+      expect(h.errors).toEqual([
+        ["[plugins] request-mailbox drain still running after 0s — no longer waited for (this beat lets go of its hold on a restart); the next beat tries again"],
+      ]);
+      await h.tick();
+      expect(calls).toBe(2); // the next beat drains again
+    });
+
+    test("a drain that settles inside the bound releases the hold then, and logs nothing", async () => {
+      const { held, hold } = counting();
+      const h = harness({ hold, timeoutMs: 1_000 });
+      await h.tick();
+      expect(held.open).toBe(0);
+      expect(h.state.drains).toBe(1);
+      expect(h.errors).toEqual([]);
+    });
+
+    test("a drain that rejects inside the bound is logged as failed and releases the hold", async () => {
+      const { held, hold } = counting();
+      const boom = new Error("Discord is down");
+      const h = harness({ hold, timeoutMs: 1_000, drain: async () => Promise.reject(boom) });
+      await h.tick();
+      expect(held.open).toBe(0);
+      expect(h.errors).toEqual([["[plugins] request-mailbox drain failed", boom]]);
+    });
+
+    test("a drain that rejects after the bound is dropped, not an unhandled rejection or a second log line", async () => {
+      let reject: (err: Error) => void = () => {};
+      const h = harness({
+        timeoutMs: 10,
+        drain: () =>
+          new Promise<void>((_resolve, rej) => {
+            reject = rej;
+          }),
+      });
+      await h.tick();
+      await settle(30);
+      expect(h.errors).toHaveLength(1); // the bound's own line
+      reject(new Error("late"));
+      await settle(10); // an unhandled rejection here would fail the test run
+      expect(h.errors).toHaveLength(1);
+    });
+
+    test("a drain that settles in time leaves no bound timer pending behind it", async () => {
+      const setSpy = spyOn(globalThis, "setTimeout");
+      const clearSpy = spyOn(globalThis, "clearTimeout");
+      try {
+        const h = harness({ timeoutMs: 60_000 });
+        await h.tick();
+        const bound = setSpy.mock.results.find((_r, i) => setSpy.mock.calls[i]?.[1] === 60_000)?.value;
+        expect(bound).toBeDefined();
+        expect(clearSpy.mock.calls.some((call) => call[0] === bound)).toBe(true);
+      } finally {
+        setSpy.mockRestore();
+        clearSpy.mockRestore();
+      }
+    });
+
+    test("the default bound is REQUEST_DRAIN_TIMEOUT_MS, five minutes", async () => {
+      expect(REQUEST_DRAIN_TIMEOUT_MS).toBe(300_000);
+      const setSpy = spyOn(globalThis, "setTimeout");
+      try {
+        const h = harness();
+        await h.tick();
+        expect(setSpy.mock.calls.some((call) => call[1] === REQUEST_DRAIN_TIMEOUT_MS)).toBe(true);
+      } finally {
+        setSpy.mockRestore();
+      }
+    });
+  });
+
+  // The bound itself, which the tick's pluginRequests pass (announce.ts) uses too.
+  describe("settledWithin (#508)", () => {
+    test("settled in time is \"settled\"; still pending at the bound is \"timed-out\"", async () => {
+      expect(await settledWithin(Promise.resolve(), 50)).toBe("settled");
+      expect(await settledWithin(new Promise<void>(() => {}), 10)).toBe("timed-out");
+    });
+
+    test("a rejection inside the bound rejects; one after it is dropped, never unhandled", async () => {
+      const boom = new Error("boom");
+      await expect(settledWithin(Promise.reject(boom), 50)).rejects.toBe(boom);
+      let reject: (err: Error) => void = () => {};
+      const late = new Promise<void>((_resolve, rej) => {
+        reject = rej;
+      });
+      expect(await settledWithin(late, 10)).toBe("timed-out");
+      reject(new Error("late"));
+      await new Promise((resolve) => setTimeout(resolve, 10)); // an unhandled rejection would fail the run
+    });
   });
 
   test("stop stops it", () => {
