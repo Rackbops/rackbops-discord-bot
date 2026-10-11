@@ -12,7 +12,7 @@ const { buildCommandBody } = await import("./plugins/host");
 const target = (command: PluginCommand, running: () => boolean = () => true): PluginCommandTarget => ({ plugin: "demo", command, running });
 const { config } = await import("./config");
 const { shortSha } = await import("./storage");
-const coreBodyFixture = await Bun.file(new URL("./plugins/fixtures/command-body.main.json", import.meta.url)).json();
+const coreBodyFixture = await Bun.file(new URL("./fixtures/command-body.main.json", import.meta.url)).json();
 
 describe("isAdmin", () => {
   test("accepts a user on the allowlist", () => {
@@ -733,7 +733,9 @@ describe("buildCommandBody — core-only identity", () => {
   // The framework must not change the core registration body, AND the plugin-migration removals are
   // pinned here: with no plugins the built body must equal the captured full JSON MINUS every command
   // that is now plugin-provided — the connector's /link + /unlink (#100) and the WoW plugin's
-  // /dmf /reset /status /transmog (#107). fixtures/command-body.main.json is the pre-migration capture.
+  // /dmf /reset /status /transmog (#107). fixtures/command-body.main.json is a hand-maintained snapshot of
+  // the full pre-migration body, kept current when a core command changes (#110, #117, #120 edited it);
+  // its names are unprefixed, so it relies on test/setup.ts clearing COMMAND_PREFIX (#472).
   const NOW_PLUGIN_PROVIDED = ["link", "unlink", "dmf", "reset", "status", "transmog"];
   test("with no plugins, the body equals the fixture minus the now-plugin-provided commands", () => {
     const body = buildCommandBody(config.commandPrefix, commandData, new Map(), { info() {}, warn() {}, error() {} });

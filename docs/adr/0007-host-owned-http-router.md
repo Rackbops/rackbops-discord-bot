@@ -43,6 +43,13 @@ route.
      header. Unset means never trusted, matching decision 3's own fail-closed `HTTP_PORT` rule.
    - `request` is the untouched `Request`, full URL included, for anything else (headers, query,
      body).
+     **Correction (#471, #472):** the plugin gets a `Request` the host rebuilt, not the untouched one:
+     over the buffered body (decision 4), with the client's abort signal, and with `CF-Connecting-IP`
+     and `X-Forwarded-For` set to the vetted client address, so a plugin reading either header cannot
+     be handed a forged one; `Forwarded`, `X-Real-IP`, `True-Client-IP` and `CF-Connecting-IPv6` are
+     removed for the same reason. `Content-Length` and `Transfer-Encoding` describe the body the
+     plugin gets: the buffered length, or neither without a body. The URL, method and every other
+     header are the client's, so `info.clientIp` stays the one vetted address.
    - A plugin never needs to know where it is mounted.
    - Additive and optional, so `HOST_API_VERSION` stays 1.
 3. **The listener is opt-in and belongs to the bot container.** It is controlled by a core

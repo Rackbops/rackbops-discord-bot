@@ -70,6 +70,10 @@ snapshotTree(repoDataDir);
 // them now rely on this preload instead.
 process.env.DISCORD_TOKEN ??= "test-token";
 process.env.ANNOUNCE_CHANNEL_ID ??= "100";
+// #472: cleared, not defaulted -- the suite assumes unprefixed command names (the core-only body fixture
+// among them), and an ambient COMMAND_PREFIX (a shell's, or Bun's .env autoload) used to fail those tests
+// pointing at the fixture. A test that needs a prefix sets one in a child process (commandPrefix.test.ts).
+process.env.COMMAND_PREFIX = "";
 
 // The test-state guard is the NEXT preload (test/stateGuardHook.ts), not this one: it loads modules
 // that read the environment set above when they are first imported, and a static import here would
