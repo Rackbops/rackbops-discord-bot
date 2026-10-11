@@ -2242,6 +2242,72 @@ describe("buildPluginStateFile", () => {
     expect(state.pendingReport).toEqual(previous.pendingReport);
   });
 
+  // #410: an explicit PLUGINS pin is recorded as installedVersion only once it has installed -- a pin that
+  // was skipped at selection or failed to install never replaces the last-good version. (Installed is not
+  // the same as came up: a pin that installed but failed to load or activate is still recorded, pinned
+  // below, the same as any installed version and #104's "updated but failed to start" outcome.)
+  describe("an explicit PLUGINS pin is recorded only when it installed (#410)", () => {
+    const e = entry({ name: "p", version: "1.0.0" });
+    const lastGood: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [{ name: "p", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }],
+    };
+    const build = (over: Partial<Parameters<typeof buildPluginStateFile>[0]>) =>
+      buildPluginStateFile({
+        selected: [{ name: "p", entry: e, pinnedVersion: "1.0.9" }],
+        installed: [],
+        installSkips: {},
+        fallbacks: {},
+        loaded: [],
+        loadErrors: {},
+        processEnv: {},
+        previous: lastGood,
+        now: new Date("2026-10-11T00:00:00.000Z"),
+        ...over,
+      });
+
+    test("a pin that failed to install keeps the previous last-good installedVersion, and names the failure", () => {
+      const state = build({ installSkips: { p: "registry 404 for 1.0.9" } });
+      expect(state.plugins[0]).toMatchObject({ name: "p", installedVersion: "1.0.0", active: false, error: "registry 404 for 1.0.9" });
+    });
+
+    test("a pin skipped at selection is not recorded either: for a host API it needs, or because the index lacks the plugin", () => {
+      const state = build({ selected: [{ name: "p", entry: e, pinnedVersion: "1.0.9", skipped: "needs host API v2, this bot is v1" }] });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.0", error: "needs host API v2, this bot is v1" });
+      const missing = build({ selected: [{ name: "p", pinnedVersion: "1.0.9", skipped: "not in the plugin index" }] });
+      expect(missing.plugins[0]).toMatchObject({ installedVersion: "1.0.0", error: "not in the plugin index" });
+    });
+
+    test("a failed pin with no last-good leaves installedVersion absent rather than inventing one", () => {
+      const state = build({ installSkips: { p: "404" }, previous: { hostApiVersion: 1, writtenAt: "", plugins: [] } });
+      expect(state.plugins[0]?.installedVersion).toBeUndefined();
+    });
+
+    test("a pin that installed but failed to activate is still recorded: installed is what is recorded, not came up", () => {
+      const e109 = entry({ name: "p", version: "1.0.9" });
+      const lp = loaded(e109, {}, false);
+      lp.error = "activate threw";
+      const state = build({
+        selected: [{ name: "p", entry: e109, pinnedVersion: "1.0.9" }],
+        installed: [{ entry: e109, version: "1.0.9", bundlePath: "/a" }],
+        loaded: [lp],
+      });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.9", active: false, error: "activate threw" });
+    });
+
+    test("a pin that installed is recorded", () => {
+      const e109 = entry({ name: "p", version: "1.0.9" });
+      const state = build({
+        selected: [{ name: "p", entry: e109, pinnedVersion: "1.0.9" }],
+        installed: [{ entry: e109, version: "1.0.9", bundlePath: "/a" }],
+        loaded: [loaded(e109, {}, true)],
+      });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.9", active: true });
+      expect(state.plugins[0]?.error).toBeUndefined();
+    });
+  });
+
   test("a required env unset makes the plugin configured:false with missingEnv; error is the first failure", () => {
     const e = entry({ name: "p", env: [{ key: "P_REQ", format: ".*", required: true, description: "d" }] });
     const state = buildPluginStateFile({
@@ -2524,9 +2590,9 @@ describe("readPluginState / writePluginState round-trip", () => {
     });
 
     // A bot that already booted under the bug had the plugin skipped and rewrote state.json. The last-good
-    // must survive that write, or the fix would only help bots that were never hit. (buildPluginStateFile
-    // records an explicit PLUGINS pin as installedVersion in preference to the previous one — host.ts:340 —
-    // so this holds when nothing pins the plugin explicitly, which is what recovery is about.)
+    // must survive that write, or the fix would only help bots that were never hit. (Since #410 it holds
+    // whether or not PLUGINS pins the plugin: buildPluginStateFile records only a version that actually
+    // installed, so a pin that was skipped or failed never replaces the last-good one.)
     test("a boot that SKIPPED the plugin (the pre-#222 outcome) keeps its last-good installedVersion when nothing pins it explicitly, so the next boot recovers it", async () => {
       const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
       try {
@@ -2549,6 +2615,68 @@ describe("readPluginState / writePluginState round-trip", () => {
         expect(written.plugins[0]).toMatchObject({ name: "wow", installedVersion: "1.5.0", active: false, error: HOST_API_SKIP });
         const pins = pinsFromState(written);
         expect(selectPlugins(bumped, [{ name: "wow" }], 1, [], pins)[0]!.skipped).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // #410's three-boot sequence, through real files and the real selection and installer: a typo'd pin must
+    // not outlive itself. Before the fix boot 2 wrote installedVersion 1.0.9, and boot 3 -- pin removed --
+    // reached for 1.0.9 again with no fallback, so the plugin stayed down until an explicit good pin.
+    test("a typo'd PLUGINS pin that fails to install does not outlive the pin: removing it brings the last-good back (#410)", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        const index: PluginIndex = { schemaVersion: 1, generatedAt: "2026-10-11T00:00:00.000Z", plugins: [entry({ name: "foo", version: "1.0.0" })] };
+        mkdirSync(join(dir, "plugins", "foo", "1.0.0", "dist"), { recursive: true });
+        writeFileSync(join(dir, "plugins", "foo", "1.0.0", "dist", "plugin.js"), "v1.0.0"); // the last-good bundle stays cached
+        const fetched: string[] = [];
+        const deps = {
+          fetch: async (url: string) => {
+            fetched.push(url.split("/").pop()!);
+            return new Response("not found", { status: 404 }); // 1.0.9 does not exist
+          },
+          extract: async () => {},
+          now: () => 0,
+          log: makeLog().log,
+        };
+        const boot = async (configured: { name: string; version?: string }[], at: string) => {
+          const previous = await readPluginState(dir, realStorage);
+          const selected = selectPlugins(index, configured, 1, [], pinsFromState(previous));
+          const pins = Object.fromEntries(previous.plugins.map((p) => [p.name, { installedVersion: p.installedVersion, targetVersion: p.targetVersion }]));
+          const result = await installPlugins(selected, dir, pins, deps);
+          const loadedPlugins = result.installed.map((i) => loaded(i.entry, {}, true));
+          await writePluginState({
+            dataDir: dir,
+            storage: realStorage,
+            selected,
+            installed: result.installed,
+            installSkips: result.skips,
+            fallbacks: result.fallbacks,
+            loaded: loadedPlugins,
+            loadErrors: {},
+            processEnv: {},
+            previous,
+            now: () => new Date(at),
+          });
+          return result;
+        };
+
+        // Boot 1: foo comes up on 1.0.0.
+        expect((await boot([{ name: "foo" }], "2026-10-11T01:00:00.000Z")).installed.map((i) => i.version)).toEqual(["1.0.0"]);
+        // Boot 2: PLUGINS=foo@1.0.9, a typo -- the install fails and the plugin is down this boot, as it should be.
+        const boot2 = await boot([{ name: "foo", version: "1.0.9" }], "2026-10-11T02:00:00.000Z");
+        expect(boot2.installed).toEqual([]);
+        expect(fetched).toEqual(["1.0.9"]); // the typo really reached the registry, and failed there
+        const afterTypo = await readPluginState(dir, realStorage);
+        expect(afterTypo.plugins[0]).toMatchObject({ name: "foo", installedVersion: "1.0.0", active: false });
+        expect(afterTypo.plugins[0]?.error).toMatch(/1\.0\.9: 404/);
+        // Boot 3: the operator removes the pin -- foo is back on its last-good 1.0.0, from the cache.
+        fetched.length = 0;
+        const boot3 = await boot([{ name: "foo" }], "2026-10-11T03:00:00.000Z");
+        expect(boot3.installed.map((i) => i.version)).toEqual(["1.0.0"]);
+        expect(boot3.skips).toEqual({});
+        expect(fetched).toEqual([]); // nothing reached for 1.0.9 again
+        expect((await readPluginState(dir, realStorage)).plugins[0]).toMatchObject({ installedVersion: "1.0.0", active: true });
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
