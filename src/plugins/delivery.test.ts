@@ -75,6 +75,36 @@ describe("sendPayloadDm", () => {
     await expect(sendPayloadDm(fakeClient, "999", payload)).rejects.toThrow("recipient cannot be messaged");
   });
 
+  // #455: the code check is what keeps every OTHER Discord refusal from being misreported as closed DMs,
+  // so it is pinned with real DiscordAPIErrors of other codes, not only a plain Error.
+  test("a DiscordAPIError with any other code is rethrown unchanged, not reported as closed DMs", async () => {
+    for (const [code, status, message] of [
+      [40003, 429, "You are opening direct messages too fast"],
+      [50013, 403, "Missing Permissions"],
+      [10013, 404, "Unknown User"],
+    ] as const) {
+      const real = new DiscordAPIError(
+        { message, code },
+        code,
+        status,
+        "POST",
+        "https://discord.com/api/v10/channels/1/messages",
+        { body: undefined, files: undefined },
+      );
+      const fakeUser = {
+        send: async () => {
+          throw real;
+        },
+      };
+      const fakeClient = { users: { fetch: async () => fakeUser } } as unknown as import("discord.js").Client;
+      const thrown = await sendPayloadDm(fakeClient, "999", payload).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      expect(thrown).toBe(real); // the same object, so the caller still sees its code
+    }
+  });
+
   test("any other error propagates as discord.js raised it", async () => {
     const fakeUser = {
       send: async () => {
