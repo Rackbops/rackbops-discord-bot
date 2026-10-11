@@ -3,10 +3,11 @@
 // Pure over injected I/O (fetch/extract/now/log) so it unit-tests with a fake fetch + fixture
 // tarball and never hits the network or the real data dir. No plugin CODE runs here — that is
 // loadPlugins/activatePlugins in host.ts, inside the bot's activate() after takeOver().
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
+import { compareSemver } from "./updates";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 
@@ -26,6 +27,20 @@ export function resolveRegistryBase(env: Record<string, string | undefined>): st
 // resolveRegistryBase in isolation, is actually resolved through it in a fresh process.
 export const REGISTRY_BASE = resolveRegistryBase(process.env);
 const FETCH_TIMEOUT_MS = 30_000;
+/** #497: the largest tarball the installer downloads. A published bundle is one `dist/plugin.js` plus a
+ *  `package.json`, well under a megabyte; the cap is only so a misbehaving registry or mirror cannot
+ *  exhaust the bot's memory at boot, inside the step documented as never crashing it. */
+export const MAX_TARBALL_BYTES = 20 * 1024 * 1024;
+/** #497: the largest registry metadata document the installer reads — one version's manifest, a few
+ *  kilobytes — bounded for the same reason as the tarball. */
+export const MAX_METADATA_BYTES = 1024 * 1024;
+/** #497: the most `tarExtract` waits on `tar` before killing it — a stalled extract otherwise held
+ *  `activate()`, and with it command registration, for good. */
+export const TAR_TIMEOUT_MS = 60_000;
+/** #496: what a version must look like before it is joined into a path, put in a registry URL or
+ *  `rmSync`ed — the same shape `src/config.ts` already requires of a `PLUGINS=name@version` pin. The
+ *  index and `state.json` only promise a string (`version: "latest"`, or a `..` from a corrupt file). */
+export const PLUGIN_VERSION_RE = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/;
 
 interface InstallLog {
   info(message: string): void;
@@ -66,15 +81,92 @@ interface PluginPins {
 }
 
 /** The production `extract`: `tar` flattening the npm tarball's `package/` prefix. `tar` is present
- * in `oven/bun:1-slim` (verified — see the issue's Acceptance). */
-export async function tarExtract(tarPath: string, destDir: string): Promise<void> {
+ * in `oven/bun:1-slim` (verified — see the issue's Acceptance). Bounded by `timeoutMs` (#497), through
+ * `runBounded`. */
+export async function tarExtract(tarPath: string, destDir: string, timeoutMs = TAR_TIMEOUT_MS): Promise<void> {
   mkdirSync(destDir, { recursive: true });
-  const proc = Bun.spawn(
+  await runBounded(
     ["tar", "-xzf", tarPath, "-C", destDir, "--strip-components=1", "package/dist/plugin.js", "package/package.json"],
-    { stdout: "pipe", stderr: "pipe" },
+    timeoutMs,
+    "tar",
   );
-  const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
-  if (exitCode !== 0) throw new Error(`tar exited ${exitCode}: ${stderr.trim()}`);
+}
+
+/** Runs `argv` and resolves once it exits 0; rejects naming `label` on any other exit, with its stderr,
+ *  or once `timeoutMs` passes (#497). On a timeout the process is sent SIGKILL, its stderr read is
+ *  cancelled, and neither its exit nor its stderr closing is waited on: the process dies, but a child it
+ *  forked need not -- `tar -z` blocked opening a FIFO leaves a forked child blocked in `open()` holding
+ *  the stderr pipe, so waiting for that pipe to close would hold the install for good, the very thing
+ *  the bound is for. Exported so install.test.ts can drive the bound with a command that never finishes. */
+export async function runBounded(argv: string[], timeoutMs: number, label: string): Promise<void> {
+  const proc = Bun.spawn(argv, { stdout: "ignore", stderr: "pipe" });
+  const stderrReader = proc.stderr.getReader();
+  const readStderr = async (): Promise<string> => {
+    const decoder = new TextDecoder();
+    let text = "";
+    for (;;) {
+      const { done, value } = await stderrReader.read();
+      if (done) return text + decoder.decode();
+      text += decoder.decode(value, { stream: true });
+    }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<"timed-out">((resolve) => {
+    timer = setTimeout(() => resolve("timed-out"), timeoutMs);
+  });
+  const finished = Promise.all([readStderr(), proc.exited]);
+  let outcome: "timed-out" | [string, number];
+  try {
+    outcome = await Promise.race([finished, timedOut]);
+  } catch (err) {
+    proc.kill("SIGKILL"); // reading its stderr failed: never leave it writing into a dir the caller removes
+    proc.unref();
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+  if (outcome === "timed-out") {
+    proc.kill("SIGKILL");
+    finished.catch(() => {}); // nothing awaits it any more
+    void stderrReader.cancel().catch(() => {}); // not awaited either: the bound waits on nothing the child holds
+    proc.unref(); // never keep the bot alive for a process it gave up on
+    throw new Error(`${label} did not finish within ${timeoutMs}ms`);
+  }
+  const [stderr, exitCode] = outcome;
+  if (exitCode !== 0) throw new Error(`${label} exited ${exitCode}: ${stderr.trim()}`);
+}
+
+/** `res`'s body, or `"too-large"` once it passes `max` bytes (#497): a declared `Content-Length` over
+ *  `max` is refused without reading, and any other body is read with a running count and abandoned the
+ *  moment it passes `max` — the same shape `routeHttpRequest`'s body cap uses (`src/plugins/host.ts`).
+ *  Exported so install.test.ts can drive the boundary with a small `max`. */
+export async function readCapped(res: Response, max: number): Promise<Uint8Array | "too-large"> {
+  const declared = res.headers.get("content-length");
+  if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > max) {
+    await res.body?.cancel().catch(() => {});
+    return "too-large";
+  }
+  if (res.body === null) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      return "too-large";
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  }
+  return bytes;
 }
 
 interface RegistryVersion {
@@ -84,41 +176,71 @@ interface RegistryVersion {
 async function fetchJson(fetchImpl: InstallDeps["fetch"], url: string): Promise<unknown> {
   const res = await fetchImpl(url, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`${url}: ${res.status} ${res.statusText}`);
-  return res.json();
-}
-
-/** Descending compare of dotted numeric versions — enough to pick the newest cached version dir. */
-function compareVersionsDesc(a: string, b: string): number {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pb[i] || 0) - (pa[i] || 0);
-    if (d !== 0) return d;
-  }
-  return 0;
+  const bytes = await readCapped(res, MAX_METADATA_BYTES);
+  if (bytes === "too-large") throw new Error(`${url} is larger than ${MAX_METADATA_BYTES} bytes`);
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 
 /** The newest already-installed version of `name` on disk (a version dir with a built bundle), or
  * undefined. Used only when neither an operator pin nor a `state.json` record is available — so a
  * lost/corrupt state.json reuses what's cached rather than silently upgrading to the index's newer
- * version (the "no silent upgrades" rule; a real version move is #104's explicit action). */
+ * version (the "no silent upgrades" rule; a real version move is #104's explicit action). Only a dir
+ * named like a version counts (a crashed extract's `.staging-*` leftover never does), ordered by
+ * `compareSemver` (#497): `1.10.0` above `1.9.0`, and a release above its own prerelease. */
 function newestCachedVersion(dataDir: string, name: string): string | undefined {
   const pluginDir = join(dataDir, "plugins", name);
   let versions: string[];
   try {
     versions = readdirSync(pluginDir, { withFileTypes: true })
-      .filter(
-        (e) =>
-          e.isDirectory() &&
-          e.name !== "tmp" &&
-          !e.name.startsWith(".") && // a crashed extract's `.staging-*` leftover is never a version
-          existsSync(join(pluginDir, e.name, "dist", "plugin.js")),
-      )
+      .filter((e) => e.isDirectory() && PLUGIN_VERSION_RE.test(e.name) && existsSync(join(pluginDir, e.name, "dist", "plugin.js")))
       .map((e) => e.name);
   } catch {
     return undefined;
   }
-  return versions.sort(compareVersionsDesc)[0];
+  return versions.sort((a, b) => compareSemver(b, a))[0];
+}
+
+/** #498: removes what a killed install leaves behind — a `.staging-*` dir under any `plugins/<name>/`,
+ *  and a tarball in `plugins/tmp/` — before this boot installs anything. Nothing else in the process
+ *  installs, and it runs after `takeOver()`, so no other install can be in flight. Never throws: a
+ *  directory that cannot be listed, or a leftover that cannot be removed, is logged and left, and the
+ *  rest of the sweep goes on. A plugin named `tmp` shares `plugins/tmp/` with the tarballs; both kinds of
+ *  leftover are matched there, and its version dirs match neither. */
+function sweepInstallLeftovers(dataDir: string, log: InstallLog): void {
+  const pluginsDir = join(dataDir, "plugins");
+  const problem = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+  let dirs: Dirent[];
+  try {
+    dirs = readdirSync(pluginsDir, { withFileTypes: true });
+  } catch (err) {
+    // No plugins/ dir yet is a fresh install: nothing to sweep, nothing to say.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") log.warn(`[plugins] could not list ${pluginsDir} to sweep install leftovers: ${problem(err)}`);
+    return;
+  }
+  let removed = 0;
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue;
+    const dirPath = join(pluginsDir, dir.name);
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dirPath, { withFileTypes: true });
+    } catch (err) {
+      log.warn(`[plugins] could not list ${dirPath} to sweep install leftovers: ${problem(err)}`);
+      continue;
+    }
+    for (const e of entries) {
+      const staging = e.isDirectory() && e.name.startsWith(".staging-");
+      const tarball = dir.name === "tmp" && e.isFile() && e.name.endsWith(".tgz");
+      if (!staging && !tarball) continue;
+      try {
+        rmSync(join(dirPath, e.name), { recursive: true, force: true });
+        removed += 1;
+      } catch (err) {
+        log.warn(`[plugins] could not remove the install leftover ${join(dirPath, e.name)}: ${problem(err)}`);
+      }
+    }
+  }
+  if (removed > 0) log.info(`[plugins] removed ${removed} leftover(s) of an interrupted install`);
 }
 
 /** SRI compare: `dist.integrity` is `sha512-<base64>`; hash the tarball bytes and compare base64. */
@@ -204,7 +326,13 @@ export function reconcileManifest(
         .map((e) => e.key)
         .filter((k): k is string => typeof k === "string"),
     );
-    const indexedKeys = new Set(entry.env.map((e) => e.key));
+    // Read defensively, like `manifest.env` above: the index check (src/plugins/index.ts) refuses a
+    // non-object env element, but this function is documented total, so it must not rely on that (#496).
+    const indexedKeys = new Set(
+      (entry.env as unknown[])
+        .map((e) => (typeof e === "object" && e !== null ? (e as { key?: unknown }).key : undefined))
+        .filter((k): k is string => typeof k === "string"),
+    );
     const diverges = declaredKeys.size !== indexedKeys.size || [...declaredKeys].some((k) => !indexedKeys.has(k));
     if (diverges) {
       log.warn(
@@ -230,6 +358,10 @@ async function tryInstallVersion(
   dataDir: string,
   deps: InstallDeps,
 ): Promise<{ ok: true; plugin: InstalledPlugin } | { ok: false; reason: string }> {
+  // #496: before the version touches a path, a URL or an rmSync below.
+  if (!PLUGIN_VERSION_RE.test(version)) {
+    return { ok: false, reason: `${JSON.stringify(version).slice(0, 40)} is not a version (expected major.minor.patch)` };
+  }
   const pluginDir = join(dataDir, "plugins", name);
   const versionDir = join(pluginDir, version);
   // `tar --strip-components=1` drops only the tarball's leading `package/`, so `package/dist/plugin.js`
@@ -243,7 +375,7 @@ async function tryInstallVersion(
   try {
     const meta = (await fetchJson(
       deps.fetch,
-      `${REGISTRY_BASE}/${encodeURIComponent(entry.package)}/${version}`,
+      `${REGISTRY_BASE}/${encodeURIComponent(entry.package)}/${encodeURIComponent(version)}`,
     )) as RegistryVersion;
     const tarball = meta.dist?.tarball;
     const integrity = meta.dist?.integrity;
@@ -252,7 +384,8 @@ async function tryInstallVersion(
     }
     const tarRes = await deps.fetch(tarball, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
     if (!tarRes.ok) return { ok: false, reason: `${tarball}: ${tarRes.status} ${tarRes.statusText}` };
-    const bytes = new Uint8Array(await tarRes.arrayBuffer());
+    const bytes = await readCapped(tarRes, MAX_TARBALL_BYTES);
+    if (bytes === "too-large") return { ok: false, reason: `${tarball} is larger than ${MAX_TARBALL_BYTES} bytes` };
     if (!integrityMatches(bytes, integrity)) {
       return { ok: false, reason: `integrity mismatch for ${entry.package}@${version}` };
     }
@@ -312,6 +445,7 @@ export async function installPlugins(
   const skips: Record<string, string> = {};
   const fallbacks: Record<string, { attempted: string; reason: string }> = {};
 
+  sweepInstallLeftovers(dataDir, deps.log);
   for (const sp of selected) {
     if (sp.skipped || !sp.entry) continue;
     const entry = sp.entry;

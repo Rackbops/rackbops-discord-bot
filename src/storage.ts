@@ -117,9 +117,16 @@ export function tmpPathFor(path: string, pid: number, token: string, counter: nu
  * above already accepts — never a torn or missing file).
  */
 export async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
+  await writeFileAtomic(path, JSON.stringify(data, null, 2));
+}
+
+/** `writeJsonAtomic`'s temp-file-then-rename for text that is already serialized, under the same
+ *  `tmpPathFor` name (pid, `TMP_TOKEN`, counter) and with the same caveats. Shared (#496) so the plugin
+ *  index cache (`src/plugins/index.ts`) gets the #253 cross-process guard instead of keeping a copy. */
+export async function writeFileAtomic(path: string, text: string): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter);
-  await Bun.write(tmp, JSON.stringify(data, null, 2));
+  await Bun.write(tmp, text);
   renameSync(tmp, path);
 }
 

@@ -107,6 +107,108 @@ describe("loadPluginIndex", () => {
     }
   });
 
+  // #496: one bad entry still makes the whole index unusable (the cache is the fallback), but the log
+  // now says "invalid", not "unreachable", and names the first failing check and the entry.
+  describe("an invalid index is named as invalid, with the check and the entry that failed (#496)", () => {
+    const warnsFor = async (body: unknown): Promise<{ source: string; warns: string[] }> => {
+      seedCache(VALID_INDEX);
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => jsonResponse(body) });
+        return { source: result.source, warns: warnSpy.mock.calls.map((c) => String(c[0])) };
+      } finally {
+        warnSpy.mockRestore();
+      }
+    };
+    const entryWith = (over: Record<string, unknown>) => ({ ...VALID_INDEX.plugins[0], ...over });
+
+    test("a bad entry: its position, its name and the check", async () => {
+      const { source, warns } = await warnsFor({ ...VALID_INDEX, plugins: [VALID_INDEX.plugins[0], entryWith({ name: "My_Plugin" })] });
+      expect(source).toBe("cache");
+      expect(warns).toEqual([
+        '[plugins] index invalid (plugins[1] ("My_Plugin"): name is not a plugin name) — using the cached copy from 2026-09-01T00:00:00.000Z',
+      ]);
+    });
+
+    test("a schemaVersion the bot does not know", async () => {
+      const { warns } = await warnsFor({ ...VALID_INDEX, schemaVersion: 2 });
+      expect(warns[0]).toStartWith("[plugins] index invalid (schemaVersion is 2, not 1) —");
+    });
+
+    test("an env element that is not a { key } object is refused here, not thrown on later", async () => {
+      for (const env of [[null], ["KEY"], [{ name: "KEY" }], [{ key: 5 }]]) {
+        const { source, warns } = await warnsFor({ ...VALID_INDEX, plugins: [entryWith({ env })] });
+        expect(source).toBe("cache");
+        expect(warns[0]).toContain('plugins[0] ("warbandeer"): env is not a list of { key } entries');
+      }
+    });
+
+    test("a duplicate name, and an entry that is not an object", async () => {
+      expect((await warnsFor({ ...VALID_INDEX, plugins: [VALID_INDEX.plugins[0], VALID_INDEX.plugins[0]] })).warns[0]).toContain(
+        'plugins[1] ("warbandeer"): duplicate name',
+      );
+      expect((await warnsFor({ ...VALID_INDEX, plugins: [null] })).warns[0]).toContain("plugins[0]: not an object");
+    });
+
+    test("a value is shown as JSON, so a quoted number and an object read as what they are", async () => {
+      expect((await warnsFor({ ...VALID_INDEX, schemaVersion: "1" })).warns[0]).toStartWith(
+        '[plugins] index invalid (schemaVersion is "1", not 1) —',
+      );
+      expect((await warnsFor({ ...VALID_INDEX, schemaVersion: { v: 1 } })).warns[0]).toStartWith(
+        '[plugins] index invalid (schemaVersion is {"v":1}, not 1) —',
+      );
+      expect((await warnsFor({ plugins: [] })).warns[0]).toStartWith("[plugins] index invalid (schemaVersion is undefined, not 1) —");
+    });
+
+    test("a body that is not JSON is named invalid, with the parse error", async () => {
+      seedCache(VALID_INDEX);
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => new Response("not json") });
+        expect(result.source).toBe("cache");
+        expect(String(warnSpy.mock.calls[0]?.[0])).toStartWith("[plugins] index invalid (not JSON: SyntaxError");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a body that stops arriving is named unreachable, not invalid", async () => {
+      seedCache(VALID_INDEX);
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"schemaVersion":'));
+            controller.error(new Error("connection reset"));
+          },
+        });
+        const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => new Response(body) });
+        expect(result.source).toBe("cache");
+        const warn = String(warnSpy.mock.calls[0]?.[0]);
+        expect(warn).toStartWith("[plugins] index unreachable (body read failed: ");
+        expect(warn).toContain("connection reset");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a long name is shown bounded", async () => {
+      const { warns } = await warnsFor({ ...VALID_INDEX, plugins: [entryWith({ name: `X${"y".repeat(500)}` })] });
+      expect(warns[0]!.length).toBeLessThan(250);
+    });
+
+    test("a fetch that got no answer still says unreachable", async () => {
+      seedCache(VALID_INDEX);
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => jsonResponse({}, 503) });
+        expect(String(warnSpy.mock.calls[0]?.[0])).toStartWith("[plugins] index unreachable (HTTP 503) — using the cached copy");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   test("no cache present falls back to an empty index, never throws", async () => {
     const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -133,6 +235,42 @@ describe("loadPluginIndex", () => {
     } finally {
       warnSpy.mockRestore();
     }
+  });
+
+  // #496: the shape check runs on the cached copy too, not only JSON parsing -- a parseable cache that is
+  // not a usable index is refused, with the reason.
+  test("a parseable cache that is not a usable index falls back to empty, naming why", async () => {
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    writeFileSync(cachePath, JSON.stringify({ writtenAt: "2026-09-01T00:00:00.000Z", index: { ...VALID_INDEX, schemaVersion: 7 } }));
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => jsonResponse({}, 500) });
+      expect(result.source).toBe("none");
+      expect(String(warnSpy.mock.calls[0]?.[0])).toContain("cached copy is invalid: schemaVersion is 7, not 1");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  test("a cache with no writtenAt is refused the same way", async () => {
+    mkdirSync(join(dir, "plugins"), { recursive: true });
+    writeFileSync(cachePath, JSON.stringify({ index: VALID_INDEX }));
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await loadPluginIndex("https://example/plugins.json", dir, { fetch: async () => jsonResponse({}, 500) });
+      expect(result.source).toBe("none");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // #496: the cache write goes through storage.ts's shared atomic write, whose temp name carries the
+  // per-process token (#253), instead of a hand-kept copy that had missed it.
+  test("the cache is written through storage.ts's writeFileAtomic, not a copy of it", () => {
+    const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+    expect(source).toMatch(/import \{ writeFileAtomic \} from "\.\.\/storage";/);
+    expect(source).toMatch(/await writeFileAtomic\(path, data\);/);
+    expect(source).not.toMatch(/process\.pid/);
   });
 
   test("an entry with a non-number intents value is treated as invalid shape", async () => {

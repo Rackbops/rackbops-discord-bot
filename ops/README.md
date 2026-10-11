@@ -879,7 +879,7 @@ BOT_BRANCH=main
 # Unpinned on purpose (#375 declined). A fresh install takes the index's version that day and
 # records it in plugins/state.json on the state volume (docker-compose.yml:44); from then on it
 # moves only on a request (the mailbox above, or an explicit name@version pin here followed by
-# bot-ops.sh recreate), never on its own (src/plugins/install.ts:289-293, :318-320). A pin would win
+# bot-ops.sh recreate), never on its own (installPlugins's version resolution, src/plugins/install.ts). A pin would win
 # over the mailbox's target at every boot and so make the mailbox route inert while set. The plugin
 # cites in this block are 0.3.1's (Rackbops/rackbops-bot-plugins 2820afe).
 PLUGINS=mcp
@@ -1031,7 +1031,7 @@ can match an earlier boot while the new process is failing to log in. Expect, in
 /opt/rackbops-discord-bot/pip/.env` (`src/bootLog.ts:28`, printed every boot), `Logged in as pip#<tag>`
 (`src/index.ts:130`) and `[release] watcher off (WATCHED_REPOS=none)`. A `[plugins] mcp@<version>
 downloaded, integrity ok` line, between the login and the `[release]` line, appears only on the first boot of a version on that state volume
-(`src/plugins/install.ts:281`); a cached bundle is reused silently (`:238-242`), so after a `restart` or a
+(`tryInstallVersion`, `src/plugins/install.ts`); a cached bundle is reused silently (its fast path), so after a `restart` or a
 `recreate` on the same version there is no per-plugin line, and `bot-ops.sh status` is where the installed
 version shows.
 

@@ -82,7 +82,7 @@ export function selectPlugins(
     // nothing else (PluginRelease carries no host API). #222: rather than skip a plugin whenever
     // that differs from this bot's, an OLDER version is kept when the current one needs a NEWER
     // host — an older version may still target ours. Every version installPlugins may try must be
-    // provably older than the current one (its resolution, install.ts:306-328: an explicit
+    // provably older than the current one (its resolution, installPlugins' `primary` and `wasTarget`: an explicit
     // PLUGINS pin, and only that; otherwise #104's targetVersion and, should that install fail, the
     // last-good installedVersion). Everything else stays skipped, as before: no pin; a version
     // equal to, newer than, or unorderable against the current one; a current that needs an OLDER

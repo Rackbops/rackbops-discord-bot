@@ -22,8 +22,8 @@ const MESSAGE_LIMIT = 2000; // Discord's hard content cap (mirrors src/report.ts
  * ranks BELOW its release (`1.0.0-rc.1 < 1.0.0`); dotted prerelease identifiers compare numerically
  * when both are numeric, a numeric identifier ranks below an alphanumeric one, otherwise ASCII, and
  * a shorter prerelease ranks below an otherwise-equal longer one (semver §11). Build metadata (`+…`)
- * is ignored. Small and pure — the repo has no semver dep, and install.ts's private comparator is
- * descending and prerelease-blind.
+ * is ignored. Small and pure — the repo has no semver dep; install.ts's `newestCachedVersion` uses it
+ * too (#497).
  */
 export function compareSemver(a: string, b: string): -1 | 0 | 1 {
   const [aMain, aPre] = splitPrerelease(a);

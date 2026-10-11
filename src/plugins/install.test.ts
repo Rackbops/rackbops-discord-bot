@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installPlugins, reconcileManifest, resolveRegistryBase, tarExtract, type InstallDeps } from "./install";
+import { installPlugins, MAX_METADATA_BYTES, MAX_TARBALL_BYTES, readCapped, reconcileManifest, resolveRegistryBase, runBounded, tarExtract, type InstallDeps } from "./install";
 import { HOST_API_VERSION, type PluginIndexEntry } from "./contract";
 import type { SelectedPlugin } from "./registry";
 
@@ -537,6 +537,287 @@ describe("installPlugins", () => {
 // .env.example ships) must resolve like unset, the same rule src/config.ts's optional() already applies
 // to PLUGIN_INDEX_URL. REGISTRY_BASE itself is a module-level constant computed once at import from the
 // real process.env, so it can't be driven per test; resolveRegistryBase is the pure seam that can.
+// #496/#497/#498: install/registry hardening -- versions checked before they reach a path, a cached
+// version chosen by semver, a bounded tarball download, and an interrupted install's leftovers swept.
+describe("installPlugins: hardening (#496, #497, #498)", () => {
+  const seedVersion = (dataDir: string, version: string, name = "demo") => {
+    mkdirSync(join(dataDir, "plugins", name, version, "dist"), { recursive: true });
+    writeFileSync(join(dataDir, "plugins", name, version, "dist", "plugin.js"), `v${version}`);
+  };
+  const noFetch: InstallDeps["fetch"] = async () => {
+    throw new Error("must not fetch");
+  };
+  const deps = (over: Partial<InstallDeps> = {}): InstallDeps => ({ fetch: noFetch, extract: fakeExtract, now: () => 1, log: noopLog, ...over });
+
+  test("a version that is not major.minor.patch is refused before any fetch, path or delete", async () => {
+    await withDataDir(async (dataDir) => {
+      // A bundle outside the plugin dir, where every walking version below lands
+      // (<dataDir>/plugins/demo/<version> resolves to <dataDir>/victim): unchecked, the cache fast path
+      // would load it as the plugin, and a failed extract would rmSync it.
+      mkdirSync(join(dataDir, "victim", "dist"), { recursive: true });
+      writeFileSync(join(dataDir, "victim", "dist", "plugin.js"), "not a plugin");
+      for (const [label, selected, pins] of [
+        ["an index dist-tag", { name: "demo", entry: entry({ version: "latest" }) }, {}],
+        ["an index version that walks out of the plugin dir", { name: "demo", entry: entry({ version: "../../victim" }) }, {}],
+        ["a state.json installedVersion that walks out of the plugin dir", { name: "demo", entry: entry() }, { demo: { installedVersion: "../../victim" } }],
+        ["a release version followed by a walk", { name: "demo", entry: entry() }, { demo: { installedVersion: "1.0.0/../../../victim" } }],
+        ["a prerelease version followed by a walk", { name: "demo", entry: entry() }, { demo: { installedVersion: "1.0.0-a/../../../victim" } }],
+        ["a state.json targetVersion", { name: "demo", entry: entry() }, { demo: { targetVersion: "1.0" } }],
+      ] as const) {
+        const result = await installPlugins([selected as SelectedPlugin], dataDir, pins as Record<string, { installedVersion?: string; targetVersion?: string }>, deps());
+        expect(result.installed, label).toEqual([]);
+        expect(result.skips.demo, label).toMatch(/is not a version \(expected major\.minor\.patch\)$/);
+      }
+      expect(readFileSync(join(dataDir, "victim", "dist", "plugin.js"), "utf8")).toBe("not a plugin");
+    });
+  });
+
+  test("the newest cached version is chosen by semver: 1.10.0 over 1.9.0, a release over its prerelease, and a non-version dir never", async () => {
+    for (const [cached, expected] of [
+      [["1.9.0", "1.10.0"], "1.10.0"],
+      [["1.2.3-rc.1", "1.2.3"], "1.2.3"],
+      [["1.2.3-rc.2", "1.2.3-rc.10"], "1.2.3-rc.10"],
+      [["1.0.0", "latest", "2.0"], "1.0.0"],
+    ] as const) {
+      await withDataDir(async (dataDir) => {
+        for (const v of cached) seedVersion(dataDir, v);
+        const result = await installPlugins([{ name: "demo", entry: entry({ version: "9.0.0" }) }], dataDir, {}, deps());
+        expect(result.installed[0]?.version, cached.join(",")).toBe(expected);
+      });
+    }
+  });
+
+  test("a registry integrity that is not sha512, or is empty, is refused as a mismatch", async () => {
+    const bytes = new TextEncoder().encode("tarball");
+    for (const integrity of [`sha1-${new Bun.CryptoHasher("sha1").update(bytes).digest("base64")}`, `sha256-${new Bun.CryptoHasher("sha256").update(bytes).digest("base64")}`, "", "sha512-"]) {
+      await withDataDir(async (dataDir) => {
+        const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch: makeFetch({ bytes, integrity, calls: [] }) }));
+        expect(result.skips.demo, integrity).toBe("integrity mismatch for @rackbops/plugin-demo@1.0.0");
+      });
+    }
+  });
+
+  test("registry metadata without dist.tarball or dist.integrity is refused", async () => {
+    for (const dist of [{}, { tarball: TARBALL_URL }, { integrity: "sha512-x" }, { tarball: 5, integrity: "sha512-x" }]) {
+      await withDataDir(async (dataDir) => {
+        const fetch: InstallDeps["fetch"] = async () => new Response(JSON.stringify({ dist }));
+        const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+        expect(result.skips.demo).toBe("registry entry for @rackbops/plugin-demo@1.0.0 has no dist.tarball/integrity");
+      });
+    }
+  });
+
+  test("a tarball the registry answers with an error status is refused with that status", async () => {
+    await withDataDir(async (dataDir) => {
+      const fetch: InstallDeps["fetch"] = async (url) =>
+        url === TARBALL_URL ? new Response("boom", { status: 500, statusText: "Internal Server Error" }) : new Response(JSON.stringify({ dist: { tarball: TARBALL_URL, integrity: "sha512-x" } }));
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+      expect(result.skips.demo).toBe(`${TARBALL_URL}: 500 Internal Server Error`);
+    });
+  });
+
+  test("a tarball that declares more than MAX_TARBALL_BYTES is refused without reading it", async () => {
+    await withDataDir(async (dataDir) => {
+      let pulled = 0;
+      const fetch: InstallDeps["fetch"] = async (url) => {
+        if (url !== TARBALL_URL) return new Response(JSON.stringify({ dist: { tarball: TARBALL_URL, integrity: "sha512-x" } }));
+        const body = new ReadableStream<Uint8Array>({ pull: (c) => void (pulled += 1, c.enqueue(new Uint8Array(1024))) });
+        return new Response(body, { headers: { "content-length": String(MAX_TARBALL_BYTES + 1) } });
+      };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+      expect(result.skips.demo).toBe(`${TARBALL_URL} is larger than ${MAX_TARBALL_BYTES} bytes`);
+      expect(pulled).toBeLessThanOrEqual(1); // at most the stream's own first priming pull
+    });
+  });
+
+  test("a tarball of undeclared length is abandoned the moment it passes MAX_TARBALL_BYTES", async () => {
+    await withDataDir(async (dataDir) => {
+      const chunk = new Uint8Array(1024 * 1024);
+      let sent = 0;
+      const fetch: InstallDeps["fetch"] = async (url) => {
+        if (url !== TARBALL_URL) return new Response(JSON.stringify({ dist: { tarball: TARBALL_URL, integrity: "sha512-x" } }));
+        const body = new ReadableStream<Uint8Array>({ pull: (c) => void (sent += chunk.byteLength, c.enqueue(chunk)) }); // endless
+        return new Response(body);
+      };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+      expect(result.skips.demo).toBe(`${TARBALL_URL} is larger than ${MAX_TARBALL_BYTES} bytes`);
+      expect(sent).toBeLessThan(MAX_TARBALL_BYTES + 4 * chunk.byteLength); // stopped, not read to the end
+    });
+  });
+
+  test("registry metadata larger than MAX_METADATA_BYTES is refused before the tarball is fetched", async () => {
+    await withDataDir(async (dataDir) => {
+      const calls: string[] = [];
+      const fetch: InstallDeps["fetch"] = async (url) => {
+        calls.push(url);
+        return new Response(`{"pad":"${"x".repeat(MAX_METADATA_BYTES)}"}`);
+      };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+      expect(result.skips.demo).toMatch(new RegExp(`is larger than ${MAX_METADATA_BYTES} bytes$`));
+      expect(calls).toHaveLength(1);
+    });
+  });
+
+  test("a tarball that arrives in several chunks is reassembled whole: its integrity matches and it installs", async () => {
+    await withDataDir(async (dataDir) => {
+      const parts = ["tar", "ball-", "bytes"].map((p) => new TextEncoder().encode(p));
+      const whole = new TextEncoder().encode("tarball-bytes");
+      const fetch: InstallDeps["fetch"] = async (url) => {
+        if (url !== TARBALL_URL) return new Response(JSON.stringify({ dist: { tarball: TARBALL_URL, integrity: sri(whole) } }));
+        return new Response(new ReadableStream<Uint8Array>({ start: (c) => (parts.forEach((p) => c.enqueue(p)), c.close()) }));
+      };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ fetch }));
+      expect(result.skips).toEqual({});
+      expect(result.installed[0]?.version).toBe("1.0.0");
+    });
+  });
+
+  test("an interrupted install's leftovers are swept before installing: .staging-* dirs and plugins/tmp tarballs", async () => {
+    await withDataDir(async (dataDir) => {
+      seedVersion(dataDir, "1.0.0");
+      mkdirSync(join(dataDir, "plugins", "demo", ".staging-1.0.0-5", "dist"), { recursive: true });
+      mkdirSync(join(dataDir, "plugins", "other", ".staging-2.0.0-6"), { recursive: true });
+      mkdirSync(join(dataDir, "plugins", "tmp"), { recursive: true });
+      writeFileSync(join(dataDir, "plugins", "tmp", "demo-1.0.0-5.tgz"), "partial");
+      writeFileSync(join(dataDir, "plugins", "index.json"), "{}"); // a file at the top level is not a plugin dir
+      const infos: string[] = [];
+      const warns: string[] = [];
+      const log = { info: (m: string) => infos.push(m), warn: (m: string) => warns.push(m), error() {} };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ log }));
+      expect(result.installed[0]?.version).toBe("1.0.0");
+      expect(readdirSync(join(dataDir, "plugins", "demo"))).toEqual(["1.0.0"]);
+      expect(readdirSync(join(dataDir, "plugins", "other"))).toEqual([]);
+      expect(readdirSync(join(dataDir, "plugins", "tmp"))).toEqual([]);
+      expect(existsSync(join(dataDir, "plugins", "index.json"))).toBe(true);
+      expect(infos).toContain("[plugins] removed 3 leftover(s) of an interrupted install");
+      // The top-level file is passed over, not listed as a dir and warned about, wherever it sorts.
+      expect(warns.filter((w) => w.includes("leftover"))).toEqual([]);
+    });
+  });
+
+  test("a plugin named tmp shares plugins/tmp with the tarballs: its staging leftover goes, its versions stay", async () => {
+    await withDataDir(async (dataDir) => {
+      seedVersion(dataDir, "1.0.0", "tmp");
+      mkdirSync(join(dataDir, "plugins", "tmp", ".staging-1.1.0-5"), { recursive: true });
+      writeFileSync(join(dataDir, "plugins", "tmp", "tmp-1.1.0-5.tgz"), "partial");
+      await installPlugins([], dataDir, {}, deps());
+      expect(readdirSync(join(dataDir, "plugins", "tmp"))).toEqual(["1.0.0"]);
+    });
+  });
+
+  test("a fresh data dir with no plugins/ yet has nothing to sweep, says nothing about it, and installs normally", async () => {
+    await withDataDir(async (dataDir) => {
+      const bytes = new TextEncoder().encode("tarball");
+      const lines: string[] = [];
+      const log = { info: (m: string) => lines.push(m), warn: (m: string) => lines.push(m), error() {} };
+      const result = await installPlugins([{ name: "demo", entry: entry() }], dataDir, {}, deps({ log, fetch: makeFetch({ bytes, integrity: sri(bytes), calls: [] }) }));
+      expect(result.installed[0]?.version).toBe("1.0.0");
+      expect(lines.filter((l) => l.includes("leftover"))).toEqual([]);
+    });
+  });
+
+  test("a plugins/ with nothing left over says nothing about a sweep", async () => {
+    await withDataDir(async (dataDir) => {
+      seedVersion(dataDir, "1.0.0");
+      const lines: string[] = [];
+      const log = { info: (m: string) => lines.push(m), warn: (m: string) => lines.push(m), error() {} };
+      await installPlugins([], dataDir, {}, deps({ log }));
+      expect(lines).toEqual([]);
+    });
+  });
+
+  test("a plugins/ that cannot be listed is warned about, and the sweep never throws", async () => {
+    await withDataDir(async (dataDir) => {
+      writeFileSync(join(dataDir, "plugins"), "not a directory");
+      const warns: string[] = [];
+      const log = { info() {}, warn: (m: string) => warns.push(m), error() {} };
+      await expect(installPlugins([], dataDir, {}, deps({ log }))).resolves.toEqual({ installed: [], skips: {}, fallbacks: {} });
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toStartWith(`[plugins] could not list ${join(dataDir, "plugins")} to sweep install leftovers: `);
+    });
+  });
+
+  // tarExtract's bound is runBounded's: a command that never finishes stands in for a stalled tar. The
+  // bound must not wait on anything the command's children hold -- a killed `tar -z` dies, but the child
+  // it forked, blocked opening a FIFO, keeps its stderr pipe open -- so the rejection arrives on time
+  // whatever the children do.
+  test.skipIf(process.platform === "win32")("a command still running at its timeout is rejected on time, naming it", async () => {
+    const started = Date.now();
+    await expect(runBounded(["sleep", "30"], 200, "tar")).rejects.toThrow("tar did not finish within 200ms");
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  test.skipIf(process.platform === "win32")("a command still running at its timeout is killed, not left to finish", async () => {
+    await withDataDir(async (dir) => {
+      const marker = join(dir, "finished");
+      await expect(runBounded(["sh", "-c", `sleep 1; touch '${marker}'`], 200, "tar")).rejects.toThrow("tar did not finish within 200ms");
+      await Bun.sleep(1_500);
+      expect(existsSync(marker)).toBe(false);
+    });
+  });
+
+  // The real stall: tar blocked opening a FIFO nothing writes to. tarExtract must pass its own timeoutMs
+  // through, not the minute-long default.
+  test.skipIf(process.platform === "win32" || Bun.which("mkfifo") === null)("tarExtract gives up on a tar that never finishes after its timeoutMs", async () => {
+    await withDataDir(async (dir) => {
+      const fifo = join(dir, "stalled.tgz");
+      Bun.spawnSync(["mkfifo", fifo]);
+      const started = Date.now();
+      try {
+        await expect(tarExtract(fifo, join(dir, "out"), 300)).rejects.toThrow("tar did not finish within 300ms");
+        expect(Date.now() - started).toBeLessThan(5_000);
+      } finally {
+        // Open the FIFO for writing and close it, so a tar child still blocked opening it sees EOF and exits.
+        try {
+          closeSync(openSync(fifo, constants.O_WRONLY | constants.O_NONBLOCK));
+        } catch {
+          // no reader left: nothing is blocked on it
+        }
+      }
+    });
+  });
+
+  test.skipIf(process.platform === "win32")("a non-zero exit is rejected with the command's stderr", async () => {
+    await expect(runBounded(["sh", "-c", "echo boom >&2; exit 3"], 5_000, "tar")).rejects.toThrow("tar exited 3: boom");
+  });
+
+  test.skipIf(process.platform === "win32")("a zero exit resolves", async () => {
+    await expect(runBounded(["true"], 5_000, "tar")).resolves.toBeUndefined();
+  });
+});
+
+// readCapped's boundary, driven with a small max: the tarball download above uses MAX_TARBALL_BYTES.
+describe("readCapped (#497)", () => {
+  const body = (...sizes: number[]) =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        for (const n of sizes) c.enqueue(new Uint8Array(n).fill(7));
+        c.close();
+      },
+    });
+
+  test("a body of exactly max bytes is read whole, across chunks", async () => {
+    expect(await readCapped(new Response(body(4, 4, 2)), 10)).toEqual(new Uint8Array(10).fill(7));
+  });
+
+  test("one byte over max is refused", async () => {
+    expect(await readCapped(new Response(body(4, 4, 3)), 10)).toBe("too-large");
+  });
+
+  test("a declared Content-Length of exactly max is read; one over is refused", async () => {
+    expect(await readCapped(new Response(body(10), { headers: { "content-length": "10" } }), 10)).toEqual(new Uint8Array(10).fill(7));
+    expect(await readCapped(new Response(body(11), { headers: { "content-length": "11" } }), 10)).toBe("too-large");
+  });
+
+  test("a Content-Length that understates the body is not trusted: the running count still refuses it", async () => {
+    expect(await readCapped(new Response(body(8, 8), { headers: { "content-length": "3" } }), 10)).toBe("too-large");
+  });
+
+  test("no body is zero bytes", async () => {
+    expect(await readCapped(new Response(null), 10)).toEqual(new Uint8Array(0));
+  });
+});
+
 describe("resolveRegistryBase", () => {
   test("a blank value falls back to the default registry", () => {
     expect(resolveRegistryBase({ PLUGIN_REGISTRY_URL: "" })).toBe("https://registry.npmjs.org");
@@ -634,6 +915,20 @@ describe("reconcileManifest", () => {
       );
       const result = reconcileManifest(entry(), "1.0.0", pkgPath, noopLog);
       expect(result.ok).toBe(true);
+    });
+  });
+
+  // #496: documented total, so an index entry's own env element that is not an object (the index check
+  // refuses one, but this must not rely on it) is tolerated rather than thrown on.
+  test("an index entry env element that is null is tolerated without throwing or refusing", () => {
+    withTempDir((dir) => {
+      const path = join(dir, "package.json");
+      writeFileSync(path, JSON.stringify({ botPlugin: { env: [{ key: "A" }] } }));
+      const odd = entry({ env: [null, { key: "A" }] as unknown as PluginIndexEntry["env"] });
+      const { log, warns } = capturingLog();
+      expect(reconcileManifest(odd, "1.0.0", path, log)).toEqual({ ok: true });
+      // The null is skipped, not counted as a key: the remaining keys match, so nothing diverges.
+      expect(warns).toEqual([]);
     });
   });
 

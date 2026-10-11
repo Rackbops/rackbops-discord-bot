@@ -543,8 +543,9 @@ load_plugin_keys() {
   # double as the marker). A key ANY plugin in the index declares secret is secret for every plugin.
   #
   # The `jq -e .` check above only proves valid JSON — NOT that `.index` is an object or that each
-  # `.env` element is one (the bot's own isValidPluginIndex checks only `Array.isArray(env)`, so a
-  # manifest it accepts and caches can still be wrong-shaped here). Guard both shapes inside the
+  # `.env` element is one (the bot refuses a non-object env element since #496, src/plugins/index.ts's
+  # pluginIndexProblem, but a cache an older bot wrote, or a hand-edited one, can still be wrong-shaped
+  # here). Guard both shapes inside the
   # program — a non-object plugin or env entry, or one missing a string key/format, is skipped so the
   # well-formed keys still list — and treat a program error (`.index` being a non-object, which
   # `.index.plugins` can't index) as "index unavailable" via `2>/dev/null` + the `if !`, rather than

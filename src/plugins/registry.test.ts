@@ -138,8 +138,8 @@ describe("selectPlugins", () => {
       expect(result[0]!.skipped).toBe(HOST_API_SKIP);
     });
 
-    // installPlugins uses an explicit PLUGINS pin and only that (install.ts:186-187, and no fallback when one
-    // is set: :199), so state.json's versions are irrelevant once the operator has pinned.
+    // installPlugins uses an explicit PLUGINS pin and only that (its `primary`, and no fallback when one is
+    // set: `wasTarget` requires no pin), so state.json's versions are irrelevant once the operator has pinned.
     test("the explicit PLUGINS pin outranks state.json's versions", () => {
       const lastGood = new Map([["wow", { installedVersion: "1.5.0" }]]);
       expect(selectPlugins(bumped(), [{ name: "wow", version: "2.0.0" }], 1, CORE_COMMANDS, lastGood)[0]!.skipped).toBe(
@@ -150,7 +150,7 @@ describe("selectPlugins", () => {
     });
 
     // installPlugins tries #104's targetVersion first and, if that install fails, falls back to the last-good
-    // installedVersion (install.ts:198-208) — so BOTH must be provably older than the incompatible current.
+    // installedVersion (installPlugins' `wasTarget` fallback) — so BOTH must be provably older than the incompatible current.
     test("a target that can fall back to the last-good is kept only if BOTH are older than the incompatible current", () => {
       const select = (pins: { installedVersion?: string; targetVersion?: string }) =>
         selectPlugins(bumped(), [{ name: "wow" }], 1, CORE_COMMANDS, new Map([["wow", pins]]))[0]!.skipped;
