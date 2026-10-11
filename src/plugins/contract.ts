@@ -325,6 +325,9 @@ export interface PluginCommand {
   /** Bare name. The host hands `build` an ALREADY-NAMED builder (`COMMAND_PREFIX` applied), so a plugin cannot register outside the namespace. */
   name: string;
   build(builder: SlashCommandBuilder): { toJSON(): RESTPostAPIChatInputApplicationCommandsJSONBody };
+  /** Runs the command; called only while the plugin is running (#407). A throw is logged and isolated: the
+   *  host sends a best-effort ephemeral error reply on the plugin's behalf only if it hasn't replied or
+   *  deferred yet, as for `PluginInteractionHandler`. */
   handle(interaction: ChatInputCommandInteraction): Promise<void>;
   /**
    * Answers Discord's picker for an option this command built with `setAutocomplete(true)` (#287). The
@@ -401,9 +404,13 @@ export interface Plugin {
    * so synchronous work inside it is never cut short, but time spent awaiting counts. Past that the plugin
    * is recorded as failed, the way a throw is, and stays off until the next restart; the call is not
    * cancelled. If it resolves later, the host calls `dispose()` once to release what it set up; if it rejects
-   * later, the host only logs it. Until #407 lands, slash commands are the exception to "off": the host
-   * dispatches a plugin's commands whether or not it is running, including after that late `dispose()`,
-   * so a command handler must cope with state its `activate()` never finished setting up.
+   * later, the host only logs it. "Off" covers every dispatch: the host hands nothing to a plugin that is
+   * not running — no tick, HTTP request, slash command (#407), component, modal or autocomplete — and a
+   * plugin stops running the moment its `dispose()` begins (#409), not when it settles. A host from before
+   * #407/#409, with the same `HOST_API_VERSION`, still dispatches slash commands to a plugin that is not
+   * running, keeps it running until `dispose()` settles, and neither isolates nor answers a throw from
+   * `handle()` (it is only logged), so a command handler that must run there should still cope with state
+   * its `activate()` never finished setting up.
    */
   activate?(): Promise<void>;
   /**

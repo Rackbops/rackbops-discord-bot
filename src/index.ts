@@ -41,6 +41,7 @@ import {
   dispatchPluginAutocomplete,
   dispatchPluginInteractionOutcome,
   disposePlugins,
+  findPluginCommand,
   HTTP_MAX_BODY_BYTES,
   loadPlugins,
   mutatePluginState,
@@ -229,9 +230,10 @@ async function activate(c: Client<true>): Promise<void> {
     try {
       if (interaction.isChatInputCommand()) {
         // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
+        // #407: and only while their plugin is running -- handleCommand reads the flag through the lookup.
         outcome = await handleCommand(
           interaction,
-          (bare) => commandMap.get(bare)?.command,
+          (bare) => findPluginCommand(commandMap, loadResult.loaded, bare),
           (bare, chatInput) =>
             gateCommand(
               commandMap.get(bare)?.entry.name,
