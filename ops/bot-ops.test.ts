@@ -1540,8 +1540,9 @@ describe.skipIf(!runnable)("bot-ops.sh status reads running/status/image from on
 });
 
 describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-wrong-shape index (#101, D3)", () => {
-  // The bot's own isValidPluginIndex only checks `Array.isArray(env)`, so a manifest it accepts and
-  // caches can still be wrong-shaped here — and `jq -e .` only proves valid JSON. Without the shape
+  // The bot refuses a non-object env element since #496 (src/plugins/index.ts's pluginIndexProblem),
+  // but a cache an older bot wrote, or a hand-edited one, can still be wrong-shaped here — and `jq -e .`
+  // only proves valid JSON. Without the shape
   // guards in load_plugin_keys these crashed env-get AND env-set (exit 5), breaking the whole panel
   // even for a static-key save. A plugin issue must never crash ops (D3).
   test("a plugin whose env has a NON-OBJECT element: env-get exit 0, no jq error, that entry skipped, siblings still list", async () => {

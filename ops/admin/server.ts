@@ -889,8 +889,8 @@ export interface PluginsView {
 }
 
 /** Parse + shape-validate a fetched Plugin Index (the raw published manifest — top-level `.plugins`,
- *  NOT the bot's cached `{writtenAt, index}` wrapper). null on bad JSON/shape. Mirrors
- *  src/plugins/index.ts's isValidPluginIndex at panel scope. */
+ *  NOT the bot's cached `{writtenAt, index}` wrapper). null on bad JSON/shape. Looser than the bot's
+ *  own check (src/plugins/index.ts's pluginIndexProblem): only what the panel needs to list plugins. */
 export function parsePluginIndex(text: string): PluginIndex | null {
   let data: unknown;
   try {

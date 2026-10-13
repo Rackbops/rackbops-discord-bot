@@ -69,6 +69,10 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    access to `BOT_BRANCH` (`README.md`'s self-update warning). Integrity = HTTPS, an operator-pinned
    `PLUGIN_INDEX_URL`, the npm `dist.integrity` hash verified before anything is imported, and an
    operator-controlled `PLUGINS` list.
+   **Correction (#497):** `dist.integrity` comes from the same registry response as the tarball URL, so
+   it proves the download matches what the registry served — it catches a corrupt or truncated
+   tarball — and not the registry itself, nor a non-HTTPS `PLUGIN_REGISTRY_URL` mirror. The Plugin
+   Index carries no hash of its own; trust in the registry rests on HTTPS.
 5. **Versions are pinned; the bot never upgrades a plugin on its own.** The installed version is
    recorded in `state.json` and a restart reinstalls exactly that. A 15-minute poll of the index
    detects newer versions and *notifies* the admins with what changed (every release between the
