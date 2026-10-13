@@ -323,8 +323,11 @@ describe("index.ts wiring", () => {
       expect(call).toMatch(/ready:\s*isPluginStateReady,/);
       // ...none starts on the way out...
       expect(call).toMatch(/\n\s*restartPending,\n/);
-      // ...and a drain is a critical section, so a restart an update-now asks for waits for it.
-      expect(call).toMatch(/drain:\s*\(\)\s*=>\s*withCritical\(\(\)\s*=>\s*consumePluginRequests\(livePluginRequestDeps\(\)\)\),/);
+      // ...and a drain is a critical section, so a restart an update-now asks for waits for it (held
+      // through `hold`, so the timer's bound on one drain, #508, bounds the hold too).
+      expect(call).toMatch(/drain:\s*\(\)\s*=>\s*consumePluginRequests\(livePluginRequestDeps\(\)\),/);
+      expect(call).toMatch(/hold:\s*withCritical,/);
+      expect(call).not.toMatch(/timeoutMs/); // the default bound, REQUEST_DRAIN_TIMEOUT_MS
       expect(call).toMatch(/log:\s*console,/);
     });
 
