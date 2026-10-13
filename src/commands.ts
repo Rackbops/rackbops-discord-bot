@@ -14,7 +14,7 @@ import { DATA_DIR, readJsonOrFresh, shortSha } from "./storage";
 import { commandNamer } from "./commandNaming";
 import { isPluginStateReady } from "./announce";
 import { loadPluginIndex } from "./plugins";
-import { mutatePluginState } from "./plugins/host";
+import { mutatePluginState, type PluginCommandTarget } from "./plugins/host";
 import {
   renderPluginsList,
   parseScheduleTime,
@@ -296,11 +296,24 @@ const coreByName = new Map(CORE_COMMANDS.map((c) => [c.name, c]));
  */
 export type CommandGate = (bare: string, interaction: ChatInputCommandInteraction) => Promise<string | undefined>;
 
+/** What a plugin command is told when its plugin is not running (#407): activate() has not finished, it
+ *  failed, or the plugin is being disposed. */
+export const PLUGIN_NOT_RUNNING_REPLY = "This command isn't available right now.";
+
+/**
+ * Dispatches one chat-input command. A core row runs as it always has. A plugin command (#407) is
+ * dispatched only while its plugin is `running`, the same gate its ticks, HTTP routes and component,
+ * modal and autocomplete handlers already had: checked before the routing gate, and again after it,
+ * since a dispose may begin while the gate is awaited. A refusal is a private reply. A throw from the
+ * plugin's handler is isolated the way `dispatchPluginInteractionOutcome` isolates a component's: logged
+ * as `[plugins] <name> command /<command> failed`, answered with a best-effort private "Something went
+ * wrong." when the plugin had not replied or deferred, and reported as `error`.
+ */
 export async function handleCommand(
   interaction: ChatInputCommandInteraction,
-  lookup: (bare: string) => PluginCommand | undefined = () => undefined,
+  lookup: (bare: string) => PluginCommandTarget | undefined = () => undefined,
   gate: CommandGate = async () => undefined,
-): Promise<"answered" | "gated" | "unclaimed"> {
+): Promise<"answered" | "gated" | "unclaimed" | "error"> {
   const bare = bareName(interaction.commandName);
   // A core row wins on a name collision (mirrors pluginCommandMap's own rule) and is never gated.
   const core = coreByName.get(bare);
@@ -314,6 +327,7 @@ export async function handleCommand(
     console.warn(`[interaction] no handler for /${interaction.commandName}`);
     return "unclaimed";
   }
+  if (!target.running()) return refuseNotRunning(interaction, target.plugin);
   // A gate that fails must not take the command down: it runs.
   let refusal: string | undefined;
   try {
@@ -325,8 +339,23 @@ export async function handleCommand(
     await interaction.reply({ content: refusal, flags: MessageFlags.Ephemeral });
     return "gated";
   }
-  await target.handle(interaction);
-  return "answered";
+  if (!target.running()) return refuseNotRunning(interaction, target.plugin);
+  try {
+    await target.command.handle(interaction);
+    return "answered";
+  } catch (err) {
+    console.error(`[plugins] ${target.plugin} command /${interaction.commandName} failed`, err);
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+    return "error";
+  }
+}
+
+async function refuseNotRunning(interaction: ChatInputCommandInteraction, plugin: string): Promise<"unclaimed"> {
+  console.warn(`[plugins] ${plugin}: /${interaction.commandName} refused — the plugin is not running`);
+  await interaction.reply({ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral });
+  return "unclaimed";
 }
 
 /**
