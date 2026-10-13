@@ -19,6 +19,7 @@ const {
   PLUGIN_IMPORT_TIMEOUT_MS,
   PLUGIN_ACTIVATE_TIMEOUT_MS,
   pluginCommandMap,
+  findPluginCommand,
   buildCommandBody,
   autocompleteOptionPaths,
   pluginTicks,
@@ -733,6 +734,43 @@ describe("pluginCommandMap", () => {
     expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
       "[plugins] bad: ignoring malformed commands — (unprintable thrown value)",
     ]);
+  });
+});
+
+describe("findPluginCommand (#407)", () => {
+  test("finds the command by bare name, naming the plugin that owns it; undefined for a name no plugin claims", () => {
+    const hello = cmd("hello");
+    const lp = loaded(entry({ name: "greeter" }), { commands: [hello] }, true);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    const found = findPluginCommand(map, [lp], "hello");
+    expect(found?.plugin).toBe("greeter");
+    expect(found?.command).toBe(hello);
+    expect(findPluginCommand(map, [lp], "nope")).toBeUndefined();
+  });
+
+  test("running() reads the owning plugin's flag at call time, not at lookup time", () => {
+    const lp = loaded(entry({ name: "greeter" }), { commands: [cmd("hello")] }, false);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    const found = findPluginCommand(map, [lp], "hello")!;
+    expect(found.running()).toBe(false); // activate() has not finished
+    lp.running = true;
+    expect(found.running()).toBe(true);
+    lp.running = false; // e.g. disposePlugins began
+    expect(found.running()).toBe(false);
+  });
+
+  test("each command answers for its own plugin", () => {
+    const up = loaded(entry({ name: "up" }), { commands: [cmd("a")] }, true);
+    const down = loaded(entry({ name: "down" }), { commands: [cmd("b")] }, false);
+    const map = pluginCommandMap([up, down], [], makeLog().log);
+    expect(findPluginCommand(map, [up, down], "a")?.running()).toBe(true);
+    expect(findPluginCommand(map, [up, down], "b")?.running()).toBe(false);
+  });
+
+  test("a command whose plugin is missing from loaded is never running", () => {
+    const lp = loaded(entry({ name: "greeter" }), { commands: [cmd("hello")] }, true);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    expect(findPluginCommand(map, [], "hello")?.running()).toBe(false);
   });
 });
 
@@ -2208,6 +2246,146 @@ describe("disposePlugins (#184)", () => {
     expect(a.running).toBe(false);
     expect(b.running).toBe(false);
     expect(c.running).toBe(false);
+  });
+});
+
+// #409: `running` goes false when disposal BEGINS, not when dispose() settles -- so for the whole of a
+// slow dispose (up to PLUGIN_DISPOSE_TIMEOUT_MS) no gate hands the plugin anything new. Driven through
+// the real disposePlugins, never by setting the flag by hand.
+describe("disposePlugins: a plugin being disposed is refused by every gate (#409)", () => {
+  /** A running plugin with a command, a tick, a component handler, an autocomplete handler and an http
+   *  handler, whose dispose() stays pending until `finish()` -- and records every call it receives. */
+  const disposing = () => {
+    const reached: string[] = [];
+    let finish = () => {};
+    let runningWhenDisposeCalled: boolean | undefined;
+    const command: PluginCommand = {
+      ...cmd("search"),
+      handle: async () => void reached.push("command"),
+      autocomplete: async (i) => {
+        reached.push("autocomplete");
+        await i.respond([{ name: "x", value: "x" }]);
+      },
+    };
+    const lp = loaded(
+      entry({ name: "busy" }),
+      {
+        commands: [command],
+        ticks: [{ name: "t", run: async () => void reached.push("tick") }],
+        interactions: async () => void reached.push("interaction"),
+        http: async () => {
+          reached.push("http");
+          return new Response("ok");
+        },
+        dispose: () => {
+          runningWhenDisposeCalled = lp.running;
+          return new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+        },
+      },
+      true,
+    );
+    return { lp, reached, finish: () => finish(), runningWhenDisposeCalled: () => runningWhenDisposeCalled };
+  };
+
+  test("running is already false when dispose() is called, and the moment disposePlugins returns its promise", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const pending = disposePlugins([d.lp], log, 5_000);
+    expect(d.lp.running).toBe(false); // synchronously, before anything is awaited
+    await Bun.sleep(0);
+    expect(d.runningWhenDisposeCalled()).toBe(false);
+    d.finish();
+    expect(await orHung(pending)).toBeUndefined();
+    expect(d.lp.running).toBe(false);
+  });
+
+  test("while dispose() is pending: HTTP 503, the command's running() false, component unclaimed, autocomplete empty, tick skipped", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const map = pluginCommandMap([d.lp], [], log);
+    const checks = pluginTicks([d.lp], log);
+    expect(checks).toHaveLength(1); // so the tick half below asserts something
+    const pending = disposePlugins([d.lp], log, 5_000);
+    await Bun.sleep(0); // dispose() has been called and is still pending
+
+    expect((await routeHttpRequest([d.lp], new Request("http://bot.internal/busy/x"), "ip", log)).status).toBe(503);
+    expect(findPluginCommand(map, [d.lp], "search")?.running()).toBe(false);
+    expect(await dispatchPluginInteractionOutcome([d.lp], fakeInteraction("busy:press"), log)).toBe("unclaimed");
+    const responses: unknown[][] = [];
+    const autocomplete = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => void responses.push(choices),
+    };
+    await dispatchPluginAutocomplete({ interaction: autocomplete as never, bare: "search", map, loaded: [d.lp], gate: async () => undefined, log });
+    expect(responses).toEqual([[]]);
+    await checks[0]!.run();
+
+    expect(d.reached).toEqual([]); // nothing reached the plugin while it was being disposed
+    d.finish();
+    await orHung(pending);
+  });
+
+  test("an autocomplete whose gate was still answering when disposal began is not handed to the plugin: empty list", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const map = pluginCommandMap([d.lp], [], log);
+    let pending: Promise<void> | undefined;
+    const responses: unknown[][] = [];
+    const autocomplete = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => void responses.push(choices),
+    };
+    await dispatchPluginAutocomplete({
+      interaction: autocomplete as never,
+      bare: "search",
+      map,
+      loaded: [d.lp],
+      gate: async () => {
+        pending = disposePlugins([d.lp], log, 5_000); // the real disposal begins while the gate is awaited
+        return undefined; // and the gate lets it run here
+      },
+      log,
+    });
+    expect(responses).toEqual([[]]);
+    expect(d.reached).toEqual([]);
+    d.finish();
+    await orHung(pending!);
+  });
+
+  test("every plugin is off before any plugin's dispose() runs, not only its own", async () => {
+    const { log } = makeLog();
+    const seen: Record<string, boolean> = {};
+    const a: LoadedPlugin = loaded(entry({ name: "a" }), { dispose: async () => void (seen.bWhenADisposed = b.running) }, true);
+    const b: LoadedPlugin = loaded(entry({ name: "b" }), { dispose: async () => void (seen.aWhenBDisposed = a.running) }, true);
+    await orHung(disposePlugins([a, b], log, 5_000));
+    expect(seen).toEqual({ bWhenADisposed: false, aWhenBDisposed: false });
+  });
+
+  test("a request whose body was still arriving when disposal began is not handed to the plugin: 503", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    let push: (c: Uint8Array) => void = () => {};
+    let end = () => {};
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (c) => controller.enqueue(c);
+        end = () => controller.close();
+      },
+    });
+    const request = new Request("http://bot.internal/busy/x", { method: "POST", body, duplex: "half" } as RequestInit);
+    const response = routeHttpRequest([d.lp], request, "ip", log, 60_000, 1_024);
+    push(new Uint8Array(10));
+    await Bun.sleep(5);
+    const pending = disposePlugins([d.lp], log, 5_000); // the real disposal, not the flag set by hand
+    end();
+    expect((await response).status).toBe(503);
+    expect(d.reached).toEqual([]);
+    d.finish();
+    await orHung(pending);
   });
 });
 

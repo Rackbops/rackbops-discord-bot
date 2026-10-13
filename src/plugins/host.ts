@@ -41,13 +41,24 @@ export interface LoadedPlugin {
   entry: PluginIndexEntry;
   version: string;
   plugin: Plugin;
-  /** Flipped true by activatePlugins once activate() resolves within its bound; gates this plugin's ticks. */
+  /** Flipped true by activatePlugins once activate() resolves within its bound, and cleared by disposePlugins
+   *  before any dispose() is called (#409). Gates every dispatch into the plugin: ticks, HTTP routes, slash
+   *  commands (#407), and component, modal and autocomplete handlers. */
   running: boolean;
   /** Set if activate() threw or did not finish within its bound (#408). */
   error?: string;
 }
 
 export type PluginCommandMap = Map<string, { entry: PluginIndexEntry; command: PluginCommand }>;
+
+/** #407: one plugin command as `handleCommand` dispatches it -- the command, the name of the plugin that
+ *  owns it, and whether that plugin may take a call. `running()` reads the flag at call time, not at
+ *  lookup time, so a check after an await sees a plugin that stopped (or never started) meanwhile. */
+export interface PluginCommandTarget {
+  plugin: string;
+  command: PluginCommand;
+  running(): boolean;
+}
 
 /** Live deps behind `HostApi.post`/`dm`/`edit`/`destinations` (#736) — I/O kept at the edge
  *  (`src/plugins/delivery.ts` implements the three send/edit functions over a real `Client`; the two
@@ -287,6 +298,20 @@ export function pluginCommandMap(
     }
   }
   return map;
+}
+
+/** #407: the plugin command `bare` names, as a `PluginCommandTarget` over the LoadedPlugin that owns it;
+ *  `undefined` for a name no plugin's command claims. A command whose plugin is not among `loaded` (not
+ *  expected: the map is built from it) is never running. */
+export function findPluginCommand(
+  map: PluginCommandMap,
+  loaded: readonly LoadedPlugin[],
+  bare: string,
+): PluginCommandTarget | undefined {
+  const target = map.get(bare);
+  if (!target) return undefined;
+  const lp = loaded.find((l) => l.entry.name === target.entry.name);
+  return { plugin: target.entry.name, command: target.command, running: () => lp?.running === true };
 }
 
 /** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
@@ -596,11 +621,9 @@ export async function activatePlugins(
 
 /**
  * #408: what happens to an `activate()` that `activatePlugins` stopped waiting on, once it does settle.
- * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and component, modal
- * and autocomplete handlers stay gated off, and this boot's state.json records it as not active — a
- * plugin flipping on mid-life would contradict what the panel shows. (Its slash commands are the
- * exception: they are not `running`-gated until #407 lands, so they keep dispatching, even after the
- * dispose below.) A RESOLVE means `activate()` may have set things up (a server, timers, a database
+ * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes, slash commands (#407)
+ * and component, modal and autocomplete handlers stay gated off, and this boot's state.json records it as
+ * not active — a plugin flipping on mid-life would contradict what the panel shows. A RESOLVE means `activate()` may have set things up (a server, timers, a database
  * handle) that `disposePlugins` will never release, since it disposes only running plugins, so its
  * `dispose()` runs now, isolated like every other plugin call (a throw, sync or async, is logged).
  * Nothing awaits it, so it is not bounded. A
@@ -650,12 +673,15 @@ export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
  * throw — sync or async, including a malformed non-function `dispose` — is isolated exactly like
  * `activatePlugins` isolates a throwing `activate()`, logged and never propagated, and never stops
  * any other plugin's own dispose (`Promise.allSettled`, not `Promise.all`). `running` is flipped
- * false for every plugin this touches regardless of outcome, so `pluginTicks`' running gate stops
- * ticking against a resource that dispose either released or failed to release — a dying handle is
- * not a reason to keep using it. Mutates each LoadedPlugin in place, like `activatePlugins`.
+ * false for every plugin this touches BEFORE any `dispose()` is called (#409), synchronously, so from
+ * the moment disposal begins every running gate — ticks, HTTP routes, slash commands, component, modal
+ * and autocomplete handlers — refuses the plugin, rather than reaching a resource `dispose()` is
+ * releasing, has released, or failed to release: a dying handle is not a reason to keep using it.
+ * Mutates each LoadedPlugin in place, like `activatePlugins`.
  */
 export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number): Promise<void> {
   const running = loaded.filter((lp) => lp.running);
+  for (const lp of running) lp.running = false;
   await Promise.allSettled(
     running.map(async (lp) => {
       try {
@@ -665,8 +691,6 @@ export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseL
         ]);
       } catch (err) {
         log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${describeThrown(err)}`);
-      } finally {
-        lp.running = false;
       }
     }),
   );
@@ -773,7 +797,8 @@ function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
  * #287: answers one autocomplete interaction for the plugin command `bare` — called from index.ts's
  * InteractionCreate handler with the bare command name. Routes to the command's `autocomplete()` only
  * when the owning plugin is `running` and `gate` (the same routing gate as the command itself, #243)
- * lets it run here. Unlike the command, it FAILS CLOSED: a gate that throws or takes longer than
+ * lets it run here; `running` is read again once the gate has answered, since a dispose may begin while
+ * it is awaited (#409, as `handleCommand` does for the command). Unlike the command, it FAILS CLOSED: a gate that throws or takes longer than
  * `AUTOCOMPLETE_GATE_TIMEOUT_MS` gets the empty list — a picker with no suggestions costs nothing, and
  * Discord's 3 s would otherwise run out. Every other path — no such command, no handler, not running,
  * refused here, a throw, a handler still running after `AUTOCOMPLETE_TIMEOUT_MS`, or one that returned
@@ -806,7 +831,7 @@ export async function dispatchPluginAutocomplete(opts: {
         refusal = "the gate failed";
         log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; answering with no suggestions`, err);
       }
-      if (refusal === undefined) {
+      if (refusal === undefined && lp?.running === true) {
         // `respond` is discord.js's prototype method: shadow it with an own property for the call, then
         // take the shadow away again, leaving the object exactly as it was.
         const hadOwn = Object.hasOwn(interaction, "respond");

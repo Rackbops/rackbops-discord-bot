@@ -17,8 +17,8 @@ export type InteractionKind = "command" | "component" | "modal";
 /**
  * - `answered`: a handler ran and returned (what it answered is the handler's business).
  * - `gated`: the routing gate refused a plugin command in this channel (#243).
- * - `unclaimed`: nothing handles it -- no command by that name, or a component/modal no running
- *   plugin claims.
+ * - `unclaimed`: nothing handles it -- no command by that name, a plugin command whose plugin is not
+ *   running (#407, refused privately), or a component/modal no running plugin claims.
  * - `error`: a handler threw; the error itself is logged separately, as before.
  */
 export type InteractionOutcome = "answered" | "gated" | "unclaimed" | "error";
