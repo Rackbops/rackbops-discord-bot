@@ -41,13 +41,24 @@ export interface LoadedPlugin {
   entry: PluginIndexEntry;
   version: string;
   plugin: Plugin;
-  /** Flipped true by activatePlugins once activate() resolves within its bound; gates this plugin's ticks. */
+  /** Flipped true by activatePlugins once activate() resolves within its bound, and cleared by disposePlugins
+   *  before any dispose() is called (#409). Gates every dispatch into the plugin: ticks, HTTP routes, slash
+   *  commands (#407), and component, modal and autocomplete handlers. */
   running: boolean;
   /** Set if activate() threw or did not finish within its bound (#408). */
   error?: string;
 }
 
 export type PluginCommandMap = Map<string, { entry: PluginIndexEntry; command: PluginCommand }>;
+
+/** #407: one plugin command as `handleCommand` dispatches it -- the command, the name of the plugin that
+ *  owns it, and whether that plugin may take a call. `running()` reads the flag at call time, not at
+ *  lookup time, so a check after an await sees a plugin that stopped (or never started) meanwhile. */
+export interface PluginCommandTarget {
+  plugin: string;
+  command: PluginCommand;
+  running(): boolean;
+}
 
 /** Live deps behind `HostApi.post`/`dm`/`edit`/`destinations` (#736) — I/O kept at the edge
  *  (`src/plugins/delivery.ts` implements the three send/edit functions over a real `Client`; the two
@@ -150,7 +161,15 @@ function buildDeliveryApi(
       if (channelId === undefined) throw new Error("destination is not mapped in that server");
       const sent = await deps.sendToChannel(channelId, validated.payload);
       log.info(`post -> ${channelId}`); // never the content
-      return { guildId, channelId, messageId: sent.messageId };
+      // #470: the guild the message actually landed in, as discord.js reports it -- not the caller's own
+      // argument handed back. They differ only if routing maps this destination to a channel elsewhere:
+      // another server's, warned and returned; or one in no server at all (a hand-edited routing.json
+      // naming a DM channel), warned, with the caller's guildId kept, since a post's delivery is never a DM's.
+      if (sent.guildId !== guildId) {
+        const where = sent.guildId === null ? "not in a server" : `in server ${sent.guildId}`;
+        log.warn(`post: the channel mapped for ${JSON.stringify(destination)} in server ${guildId} is ${where}`);
+      }
+      return { guildId: sent.guildId ?? guildId, channelId, messageId: sent.messageId };
     },
     async dm(userId, message) {
       if (!SNOWFLAKE_RE.test(userId)) throw new Error("userId is not a valid id");
@@ -267,19 +286,50 @@ export function pluginCommandMap(
   log: BaseLog,
 ): PluginCommandMap {
   const map: PluginCommandMap = new Map();
-  const claimed = new Set<string>(coreCommandNames);
+  /** name -> who holds it, for the collision warning. */
+  const claimed = new Map<string, string>(coreCommandNames.map((n) => [n, "a core command"]));
+  // #471: every loaded plugin's DECLARED names, reserved up front. #98's pre-load check compares only
+  // declared lists, so an undeclared command (a pinned bundle that differs from its index entry) would
+  // otherwise claim a name another plugin declared, in load order, and knock out that plugin's whole set.
+  // Such a command is dropped on its own, before the checks below, so the outcome is the same whichever
+  // plugin loads first. (`entry.commands` is an array by the index check; read defensively all the same.)
+  const declaredBy = new Map<string, string>();
+  for (const { entry } of loaded) {
+    for (const n of Array.isArray(entry.commands) ? entry.commands : []) if (!declaredBy.has(n)) declaredBy.set(n, entry.name);
+  }
   for (const { entry, plugin } of loaded) {
     try {
       // `plugin.commands` is plugin-controlled and only type-asserted, not validated — a malformed
       // value (non-array, throwing getter) must skip this plugin, never throw out of here.
-      const commands = plugin.commands ?? [];
+      const commands = (plugin.commands ?? []).filter((c) => {
+        const declarer = entry.commands.includes(c.name) ? undefined : declaredBy.get(c.name);
+        if (declarer === undefined) return true;
+        log.warn(`[plugins] ${entry.name}: command "${c.name}" is not in its index entry's commands and plugin "${declarer}" declares it — dropping this command`);
+        return false;
+      });
       const collision = commands.find((c) => claimed.has(c.name));
       if (collision) {
-        log.warn(`[plugins] ${entry.name}: command "${collision.name}" collides with an already-registered command — skipping this plugin's commands`);
+        log.warn(
+          `[plugins] ${entry.name}: command "${collision.name}" collides with ${claimed.get(collision.name)} — skipping this plugin's commands`,
+        );
+        continue;
+      }
+      // #471: and within the plugin's own set, which the check above cannot see (none of its names is
+      // claimed yet) -- a second command of the same name silently replaced the first.
+      const seen = new Set<string>();
+      const duplicate = commands.find((c) => (seen.has(c.name) ? true : (seen.add(c.name), false)));
+      if (duplicate) {
+        log.warn(`[plugins] ${entry.name}: returns two commands named "${duplicate.name}" — skipping this plugin's commands`);
         continue;
       }
       for (const command of commands) {
-        claimed.add(command.name);
+        // Only warned, not dropped: a pinned older bundle can legitimately differ from the index entry,
+        // which describes the current version (the same reason reconcileManifest only warns). One another
+        // plugin declares never gets here (dropped above).
+        if (!entry.commands.includes(command.name)) {
+          log.warn(`[plugins] ${entry.name}: command "${command.name}" is not in its index entry's commands`);
+        }
+        claimed.set(command.name, `plugin "${entry.name}"`);
         map.set(command.name, { entry, command });
       }
     } catch (err) {
@@ -287,6 +337,20 @@ export function pluginCommandMap(
     }
   }
   return map;
+}
+
+/** #407: the plugin command `bare` names, as a `PluginCommandTarget` over the LoadedPlugin that owns it;
+ *  `undefined` for a name no plugin's command claims. A command whose plugin is not among `loaded` (not
+ *  expected: the map is built from it) is never running. */
+export function findPluginCommand(
+  map: PluginCommandMap,
+  loaded: readonly LoadedPlugin[],
+  bare: string,
+): PluginCommandTarget | undefined {
+  const target = map.get(bare);
+  if (!target) return undefined;
+  const lp = loaded.find((l) => l.entry.name === target.entry.name);
+  return { plugin: target.entry.name, command: target.command, running: () => lp?.running === true };
 }
 
 /** #218: every option path (subcommand groups/subcommands walked recursively, space-joined, e.g.
@@ -407,7 +471,7 @@ function withTickTimeout(p: Promise<void>, ms: number, label: string, onTimeout:
  * it runs when a restart is requested or a shutdown begins — aborts every pending call, refuses to
  * start new ones, and releases each hold once its call settles or `graceMs` elapses, whichever is
  * first. The grace is what keeps a tick that ignores its signal from holding a restart forever — and,
- * through `graceElapsed`, from holding the scheduler tick's own critical section past it either: a stop
+ * through `onGraceElapsed`, from holding the scheduler tick's own critical section past it either: a stop
  * that lands while a tick is still inside its `PLUGIN_TICK_TIMEOUT_MS` wait ends that wait at the grace.
  */
 export interface PluginTickControl {
@@ -418,9 +482,14 @@ export interface PluginTickControl {
   stop(reason: string): void;
   /** True once `stop` has run: no new plugin tick call starts. */
   readonly stopping: boolean;
-  /** Resolves once a stop's grace has elapsed (never, until `stop` runs). `pluginTicks` races each wait
-   *  against it, so a tick that ignores its signal delays a stop by the grace at most. */
-  readonly graceElapsed: Promise<void>;
+  /** Calls `onElapsed` once a stop's grace has elapsed — at once if it already has — and returns the
+   *  function that unregisters it. `pluginTicks` races each wait against one of these, so a tick that
+   *  ignores its signal delays a stop by the grace at most. Per call and removed when the call's wait
+   *  ends (#470): racing every 60 s wait against one shared pending promise left a reaction on it per
+   *  run, for the life of the process. Each registration is its own: the same function registered twice
+   *  is called twice, and each remover removes only its own; a throw from one is swallowed, so it cannot
+   *  skip the others. */
+  onGraceElapsed(onElapsed: () => void): () => void;
 }
 
 export function createPluginTickControl(opts: {
@@ -432,10 +501,24 @@ export function createPluginTickControl(opts: {
   const graceMs = opts.graceMs ?? PLUGIN_TICK_ABORT_GRACE_MS;
   const pending = new Set<{ controller: AbortController; release: () => void }>();
   let stopping = false;
-  let markGraceElapsed = () => {};
-  const graceElapsed = new Promise<void>((resolve) => {
-    markGraceElapsed = resolve;
-  });
+  let graceHasElapsed = false;
+  // One record per registration, so the same function registered twice is called twice and each
+  // remover removes only its own.
+  const graceWaiters = new Set<{ onElapsed: () => void }>();
+  /** Runs inside the stop's grace timer, where a throw would end the process (Bun exits on an uncaught
+   *  error) before the rest were called; the one caller resolves a promise, which cannot throw. */
+  const callQuietly = (onElapsed: () => void) => {
+    try {
+      onElapsed();
+    } catch {
+      // nothing to do: the waiter is the caller's, and the grace has elapsed all the same
+    }
+  };
+  const markGraceElapsed = () => {
+    graceHasElapsed = true;
+    for (const waiter of [...graceWaiters]) callQuietly(waiter.onElapsed);
+    graceWaiters.clear();
+  };
   /** A plugin's abort listener runs inside `abort()`. Bun reports a listener's throw as an uncaught
    *  error rather than throwing it here (the contract says listeners must not throw); the try is for
    *  anything that does surface synchronously, so it cannot skip the aborts after it. */
@@ -450,7 +533,15 @@ export function createPluginTickControl(opts: {
     get stopping() {
       return stopping;
     },
-    graceElapsed,
+    onGraceElapsed(onElapsed) {
+      if (graceHasElapsed) {
+        callQuietly(onElapsed);
+        return () => {};
+      }
+      const waiter = { onElapsed };
+      graceWaiters.add(waiter);
+      return () => graceWaiters.delete(waiter);
+    },
     begin() {
       const controller = new AbortController();
       // Past a stop, nothing new may hold it: the grace timer below only covers calls already pending.
@@ -547,10 +638,16 @@ export function pluginTicks(
             // ...and a stop's grace ends the wait too, so this scheduler tick's critical section never
             // outlasts it (a tick still inside its timeout when the stop lands would otherwise hold it
             // for the rest of `timeoutMs`).
-            const outcome = await Promise.race([
-              withTickTimeout(call, timeoutMs, name, abort).then(() => "settled" as const),
-              control.graceElapsed.then(() => "grace" as const),
-            ]);
+            let stopWaitingForGrace = () => {};
+            const graceElapsed = new Promise<"grace">((resolve) => {
+              stopWaitingForGrace = control.onGraceElapsed(() => resolve("grace"));
+            });
+            let outcome: "settled" | "grace";
+            try {
+              outcome = await Promise.race([withTickTimeout(call, timeoutMs, name, abort).then(() => "settled" as const), graceElapsed]);
+            } finally {
+              stopWaitingForGrace();
+            }
             if (outcome === "grace") throw new Error(`plugin tick ${name} abandoned: the stop's grace elapsed`);
           },
         });
@@ -596,11 +693,9 @@ export async function activatePlugins(
 
 /**
  * #408: what happens to an `activate()` that `activatePlugins` stopped waiting on, once it does settle.
- * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes and component, modal
- * and autocomplete handlers stay gated off, and this boot's state.json records it as not active — a
- * plugin flipping on mid-life would contradict what the panel shows. (Its slash commands are the
- * exception: they are not `running`-gated until #407 lands, so they keep dispatching, even after the
- * dispose below.) A RESOLVE means `activate()` may have set things up (a server, timers, a database
+ * The plugin stays off either way: `running` is never set, so its ticks, HTTP routes, slash commands (#407)
+ * and component, modal and autocomplete handlers stay gated off, and this boot's state.json records it as
+ * not active — a plugin flipping on mid-life would contradict what the panel shows. A RESOLVE means `activate()` may have set things up (a server, timers, a database
  * handle) that `disposePlugins` will never release, since it disposes only running plugins, so its
  * `dispose()` runs now, isolated like every other plugin call (a throw, sync or async, is logged).
  * Nothing awaits it, so it is not bounded. A
@@ -650,12 +745,15 @@ export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
  * throw — sync or async, including a malformed non-function `dispose` — is isolated exactly like
  * `activatePlugins` isolates a throwing `activate()`, logged and never propagated, and never stops
  * any other plugin's own dispose (`Promise.allSettled`, not `Promise.all`). `running` is flipped
- * false for every plugin this touches regardless of outcome, so `pluginTicks`' running gate stops
- * ticking against a resource that dispose either released or failed to release — a dying handle is
- * not a reason to keep using it. Mutates each LoadedPlugin in place, like `activatePlugins`.
+ * false for every plugin this touches BEFORE any `dispose()` is called (#409), synchronously, so from
+ * the moment disposal begins every running gate — ticks, HTTP routes, slash commands, component, modal
+ * and autocomplete handlers — refuses the plugin, rather than reaching a resource `dispose()` is
+ * releasing, has released, or failed to release: a dying handle is not a reason to keep using it.
+ * Mutates each LoadedPlugin in place, like `activatePlugins`.
  */
 export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number): Promise<void> {
   const running = loaded.filter((lp) => lp.running);
+  for (const lp of running) lp.running = false;
   await Promise.allSettled(
     running.map(async (lp) => {
       try {
@@ -665,8 +763,6 @@ export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseL
         ]);
       } catch (err) {
         log.error(`[plugins] ${lp.entry.name} dispose failed — continuing: ${describeThrown(err)}`);
-      } finally {
-        lp.running = false;
       }
     }),
   );
@@ -721,9 +817,13 @@ export async function dispatchPluginInteractionOutcome(
     loaded.map((lp) => lp.entry.name),
   );
   const lp = routedName ? loaded.find((l) => l.entry.name === routedName) : undefined;
-  if (!lp?.running || !lp.plugin.interactions) return "unclaimed";
+  if (!lp?.running) return "unclaimed";
   try {
-    await lp.plugin.interactions(interaction);
+    // Plugin-controlled and only type-asserted: read inside the try, so a throwing getter is this
+    // plugin's error, answered like a throwing handler, not a throw out of the dispatcher (#470).
+    const handler = lp.plugin.interactions;
+    if (!handler) return "unclaimed";
+    await handler.call(lp.plugin, interaction);
     return "answered";
   } catch (err) {
     log.error(`[plugins] ${lp.entry.name} interaction failed`, err);
@@ -773,9 +873,12 @@ function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
  * #287: answers one autocomplete interaction for the plugin command `bare` — called from index.ts's
  * InteractionCreate handler with the bare command name. Routes to the command's `autocomplete()` only
  * when the owning plugin is `running` and `gate` (the same routing gate as the command itself, #243)
- * lets it run here. Unlike the command, it FAILS CLOSED: a gate that throws or takes longer than
- * `AUTOCOMPLETE_GATE_TIMEOUT_MS` gets the empty list — a picker with no suggestions costs nothing, and
- * Discord's 3 s would otherwise run out. Every other path — no such command, no handler, not running,
+ * lets it run here; `running` is read again once the gate has answered, since a dispose may begin while
+ * it is awaited (#409, as `handleCommand` does for the command). Unlike the command, a gate that takes
+ * longer than `AUTOCOMPLETE_GATE_TIMEOUT_MS`, or throws, gets the empty list — a picker with no
+ * suggestions costs nothing, and Discord's 3 s would otherwise run out. The production gate
+ * (`gateCommand`) never throws, though: a routing fault it cannot judge LETS the picker run, exactly as
+ * it lets the command run (#470), so in production only the timeout fails closed. Every other path — no such command, no handler, not running,
  * refused here, a throw, a handler still running after `AUTOCOMPLETE_TIMEOUT_MS`, or one that returned
  * without calling `respond` — answers with an empty list, so the picker closes at once instead of
  * failing after Discord's own timeout. A handler that CALLED `respond` without awaiting it is not
@@ -806,7 +909,7 @@ export async function dispatchPluginAutocomplete(opts: {
         refusal = "the gate failed";
         log.error(`[gate] could not decide whether /${interaction.commandName}'s autocomplete may run here; answering with no suggestions`, err);
       }
-      if (refusal === undefined) {
+      if (refusal === undefined && lp?.running === true) {
         // `respond` is discord.js's prototype method: shadow it with an own property for the call, then
         // take the shadow away again, leaving the object exactly as it was.
         const hadOwn = Object.hasOwn(interaction, "respond");
@@ -838,13 +941,33 @@ export const PLUGIN_HTTP_TIMEOUT_MS = 10_000;
 export const HTTP_MAX_BODY_BYTES = 1024 * 1024;
 
 /**
- * `request` with its body read into memory, at most `max` bytes, or `"too-large"`. A declared
- * `Content-Length` over `max` is refused without reading; any other body (chunked included) is read
- * with a running count and abandoned the moment it passes `max`. The plugin gets a new `Request` over
- * the buffered bytes, so what it reads can never exceed the cap.
+ * The `Request` a plugin's handler gets, or `"too-large"`. Always a rebuilt one (#471: never "the
+ * untouched request"):
+ * - its body, if any, read into memory, at most `max` bytes. A declared `Content-Length` over `max` is
+ *   refused without reading; any other body (chunked included) is read with a running count and
+ *   abandoned the moment it passes `max`. The new `Request` is over the buffered bytes, so what the
+ *   plugin reads can never exceed the cap.
+ * - `CF-Connecting-IP` and `X-Forwarded-For` set to `clientIp` (#472): the address the router vetted
+ *   (ADR-0007's #319 amendment), so a plugin that reads either header gets that, never what a caller
+ *   wrote into it to dodge a per-address limit. The other common client-address headers (`Forwarded`,
+ *   `X-Real-IP`, `True-Client-IP`, `CF-Connecting-IPv6`) are removed, for the same reason. Since it is
+ *   always set, `CF-Connecting-IP`'s presence says nothing about whether the request came through
+ *   Cloudflare.
+ * - `Content-Length`/`Transfer-Encoding` describing the body the plugin actually gets: the buffered
+ *   length, or neither when there is no body.
+ * - the client's method, URL, other headers and abort `signal` carried over, so a plugin still hears
+ *   the client hang up.
  */
-async function withBoundedBody(request: Request, max: number): Promise<Request | "too-large"> {
-  if (request.body === null) return request;
+async function forPlugin(request: Request, clientIp: string, max: number): Promise<Request | "too-large"> {
+  const headers = new Headers(request.headers);
+  headers.set("cf-connecting-ip", clientIp);
+  headers.set("x-forwarded-for", clientIp);
+  for (const name of ["forwarded", "x-real-ip", "true-client-ip", "cf-connecting-ipv6"]) headers.delete(name);
+  if (request.body === null) {
+    headers.delete("content-length");
+    headers.delete("transfer-encoding");
+    return new Request(request.url, { method: request.method, headers, signal: request.signal });
+  }
   const declared = request.headers.get("content-length");
   if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > max) return "too-large";
   const reader = request.body.getReader();
@@ -866,10 +989,8 @@ async function withBoundedBody(request: Request, max: number): Promise<Request |
     body.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  const headers = new Headers(request.headers);
   headers.delete("transfer-encoding");
   headers.set("content-length", String(total));
-  // `signal` carried over, so a plugin still hears the client hang up.
   return new Request(request.url, { method: request.method, headers, body, signal: request.signal });
 }
 
@@ -925,9 +1046,9 @@ export async function routeHttpRequest(
   const info = { path: match?.[2] ?? "/", clientIp };
   let bounded: Request | "too-large";
   try {
-    bounded = await withBoundedBody(request, maxBodyBytes);
+    bounded = await forPlugin(request, clientIp, maxBodyBytes);
   } catch {
-    return httpStatus(400, "Bad request"); // the client's body stream failed mid-read
+    return httpStatus(400, "Bad request"); // the client's body stream failed mid-read, or the rebuild refused it
   }
   if (bounded === "too-large") return httpStatus(413, "Request body too large");
   // Again: reading the body can take until Bun's idleTimeout, and the plugin may have been disposed
@@ -1007,14 +1128,19 @@ export function buildPluginStateFile(opts: {
     const prev = previousByName.get(sp.name);
     const installed = installedByName.get(sp.name);
     const loaded = loadedByName.get(sp.name);
-    const installedVersion = installed?.version ?? sp.pinnedVersion ?? prev?.installedVersion;
+    // #410: only a version that actually installed this boot replaces the last-good one. An explicit
+    // `PLUGINS=name@version` pin that failed to install (or was skipped at selection) is NOT recorded
+    // (one that installed but then failed to load or activate still is, like any installed version):
+    // written as installedVersion, it outlived the pin, and once the operator removed the pin the next
+    // boot reached for the same broken version with no last-good fallback, keeping the plugin down.
+    const installedVersion = installed?.version ?? prev?.installedVersion;
     const availableVersion =
       sp.entry && installedVersion && sp.entry.version !== installedVersion ? sp.entry.version : undefined;
     const missingEnv = sp.entry ? missingRequiredEnv(sp.entry, opts.processEnv) : [];
     // First failure along the chain: selection skip -> install skip -> #104 update-fallback (installed
     // on the previous version, target failed) -> load error -> activate error. `targetVersion` is NOT
     // carried forward: it lived for exactly this boot — success promoted it into installedVersion (via
-    // `installed.version` below), failure reverted to the previous, either way it is now consumed.
+    // `installed.version` above), failure reverted to the previous, either way it is now consumed.
     const error =
       sp.skipped ?? opts.installSkips[sp.name] ?? opts.fallbacks[sp.name]?.reason ?? opts.loadErrors[sp.name] ?? loaded?.error;
     const entry: PluginStateEntry = {
@@ -1104,7 +1230,8 @@ export async function writePluginState(opts: {
 }
 
 // The ONE runtime mutator of state.json. The boot writePluginState above is a single whole-file
-// write ordered before any tick (index.ts sets the "state ready" flag only after it); every
+// write ordered before any core tick that touches state.json (#103's update pass waits on the "state
+// ready" flag index.ts sets only after it; plugin ticks can already have run, but never write it); every
 // subsequent runtime change (#103's notifiedVersion, #104's schedules) goes through this shared
 // keyed mutator, which serializes read-modify-write per path so concurrent ticks can't lose an
 // update. A module singleton so all callers share the one per-path queue. (`let` only so
