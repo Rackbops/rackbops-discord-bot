@@ -390,8 +390,8 @@ export interface PluginHttpInfo {
    *  resolved, still percent-encoded). `/<name>//x` arrives as `"//x"`, a protocol-relative URL:
    *  never redirect to it unchecked. */
   path: string;
-  /** `CF-Connecting-IP`, falling back to the socket address, or `"unknown"`. Trustworthy only for
-   *  what really came through Cloudflare's tunnel (ADR-0007 decision 2). */
+  /** `CF-Connecting-IP` when the request came through the deployment's own tunnel, falling back to the
+   *  socket address, or `"unknown"` (ADR-0007 decision 2 and its #319 amendment). */
   clientIp: string;
 }
 
@@ -406,7 +406,10 @@ export interface Plugin {
    * cancelled. If it resolves later, the host calls `dispose()` once to release what it set up; if it rejects
    * later, the host only logs it. "Off" covers every dispatch: the host hands nothing to a plugin that is
    * not running — no tick, HTTP request, slash command (#407), component, modal or autocomplete — and a
-   * plugin stops running the moment its `dispose()` begins (#409), not when it settles. A host from before
+   * plugin stops running the moment its `dispose()` begins (#409), not when it settles. What a plugin
+   * starts in the background — a timer, a listener, a promise nothing awaits — is outside the host's
+   * isolation (#470): an uncaught throw or an unhandled rejection there ends the whole process, every other
+   * plugin with it (Bun's default; the host installs no process-level handler), so contain it. A host from before
    * #407/#409, with the same `HOST_API_VERSION`, still dispatches slash commands to a plugin that is not
    * running, keeps it running until `dispose()` settles, and neither isolates nor answers a throw from
    * `handle()` (it is only logged), so a command handler that must run there should still cope with state
@@ -433,7 +436,12 @@ export interface Plugin {
    * (`info.path`). `request` carries the full URL, headers, query and body, the body already read
    * into memory and capped at 1 MiB (a bigger one is answered `413` before you are called; enforce
    * your own tighter limit). Its host comes from the client's `Host` header, so never build an
-   * absolute URL from it. The host answers for you with `504` once you have taken 10 s (without
+   * absolute URL from it. `CF-Connecting-IP` and `X-Forwarded-For` carry `info.clientIp`: the host
+   * overwrites whatever the client sent in them, and removes `Forwarded`, `X-Real-IP`,
+   * `True-Client-IP` and `CF-Connecting-IPv6` (#472); `Content-Length` is the buffered body's length,
+   * with no `Transfer-Encoding`, and neither is present without a body. Any other header is as the client sent it, and a host from before #472
+   * passes all of them through, so read `info.clientIp`, never a header. The
+   * host answers for you with `504` once you have taken 10 s (without
    * cancelling the call), and with `500` if you throw. Every plugin shares one browser origin: scope a
    * cookie to `Path=/<name>/`. A request is not a critical section: a restart does not wait for it, so
    * write through `HostStorage`. Optional: a plugin that serves no HTTP omits it; a host from before
