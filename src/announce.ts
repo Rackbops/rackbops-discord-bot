@@ -13,6 +13,7 @@ import { loadPluginIndex } from "./plugins";
 import { readPluginState, mutatePluginState } from "./plugins/host";
 import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
+import { settledWithin } from "./plugins/drain";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
 import { readDiscovery } from "./routing/discovery";
 import { applyRouting, refreshDiscovery } from "./routing/live";
@@ -145,7 +146,7 @@ let tickGeneration = 0;
 // `run()` below never settling, which without this bound would leave tickInFlight stuck true
 // forever, silently freezing EVERY future tick — not just the one stuck check, since they all go
 // through this one guard. Generous on purpose: a real tick should finish in well under a minute.
-const TICK_WATCHDOG_MS = 5 * 60 * 1000;
+export const TICK_WATCHDOG_MS = 5 * 60 * 1000;
 
 /**
  * Prevents a tick from starting while the previous one is still running (issue #52 item 1):
@@ -236,7 +237,16 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       // drain and the timer's.
       name: "pluginRequests",
       run: async () => {
-        if (pluginStateReady) await consumePluginRequests(livePluginRequestDeps());
+        if (!pluginStateReady) return;
+        // #508: the consumer is single-flight, so this queues behind a timer drain that never settles, and
+        // the whole tick is one critical section -- unbounded, it held every restart for good (the tick
+        // watchdog frees the next tick, not the critical section). Bounded, like the timer's beats: past
+        // PLUGIN_REQUESTS_TICK_WAIT_MS this tick goes on, and lets go of its hold, without the drain.
+        if ((await settledWithin(consumePluginRequests(livePluginRequestDeps()), PLUGIN_REQUESTS_TICK_WAIT_MS)) === "timed-out") {
+          console.error(
+            `[tick:pluginRequests] the request-mailbox drain is still running after ${PLUGIN_REQUESTS_TICK_WAIT_MS / 1000}s — this tick goes on without it`,
+          );
+        }
       },
     },
     {
@@ -272,6 +282,13 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
     ...extra,
   ];
 }
+
+/** The most the `pluginRequests` check waits on a drain (#508): below `TICK_WATCHDOG_MS`, so this tick
+ *  -- not its watchdog -- ends the wait, with room for the checks after it before the watchdog would
+ *  reopen the guard under them. A drain this tick started itself and that runs longer goes on without
+ *  the tick's hold; its writes are temp-then-rename and its request file is removed only once applied,
+ *  so a restart meanwhile replays it at boot. */
+export const PLUGIN_REQUESTS_TICK_WAIT_MS = 2 * 60 * 1000;
 
 async function onTick(client: Client, extraChecks: TickCheck[]): Promise<void> {
   if (restartPending()) return; // on the way out — don't start work we can't finish

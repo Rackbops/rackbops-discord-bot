@@ -1,15 +1,18 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import type { PluginCommand } from "./plugins/contract";
+import type { PluginCommandTarget } from "./plugins/host";
 
 // `commands.ts` pulls in the `config` singleton, which resolves process.env at import time --
 // the required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { isAdmin, bareName, updateReply, commandData, handleCommand, CORE_COMMANDS, CORE_COMMAND_NAMES, refuseUnlessAdmin } =
+const { isAdmin, bareName, updateReply, commandData, handleCommand, CORE_COMMANDS, CORE_COMMAND_NAMES, refuseUnlessAdmin, PLUGIN_NOT_RUNNING_REPLY } =
   await import("./commands");
 const { buildCommandBody } = await import("./plugins/host");
+/** A plugin command as handleCommand's lookup returns it (#407): owned by plugin "demo", running unless `running` says otherwise. */
+const target = (command: PluginCommand, running: () => boolean = () => true): PluginCommandTarget => ({ plugin: "demo", command, running });
 const { config } = await import("./config");
 const { shortSha } = await import("./storage");
-const coreBodyFixture = await Bun.file(new URL("./plugins/fixtures/command-body.main.json", import.meta.url)).json();
+const coreBodyFixture = await Bun.file(new URL("./fixtures/command-body.main.json", import.meta.url)).json();
 
 describe("isAdmin", () => {
   test("accepts a user on the allowlist", () => {
@@ -300,7 +303,7 @@ describe("CORE_COMMANDS table (#206)", () => {
         },
       } as unknown as PluginCommand;
       const interaction = { commandName: "report" } as unknown as ChatInputCommandInteraction;
-      await handleCommand(interaction, (bare) => (bare === "report" ? pluginCommand : undefined));
+      await handleCommand(interaction, (bare) => (bare === "report" ? target(pluginCommand) : undefined));
       expect(spy).toHaveBeenCalledTimes(1);
       expect(pluginHandleCalled).toBe(false);
     } finally {
@@ -313,7 +316,7 @@ describe("handleCommand — plugin dispatch (default case)", () => {
   test("dispatches a non-core command to the looked-up plugin handler", async () => {
     let handledName: string | undefined;
     const pluginCommand = { name: "hello", handle: async (i: ChatInputCommandInteraction) => { handledName = i.commandName; } } as unknown as PluginCommand;
-    await handleCommand({ commandName: "hello" } as unknown as ChatInputCommandInteraction, (bare) => (bare === "hello" ? pluginCommand : undefined));
+    await handleCommand({ commandName: "hello" } as unknown as ChatInputCommandInteraction, (bare) => (bare === "hello" ? target(pluginCommand) : undefined));
     expect(handledName).toBe("hello");
   });
 
@@ -335,7 +338,7 @@ describe("handleCommand — the channel gate (#243)", () => {
   const plugin = () => {
     const state = { handled: 0 };
     const command = { name: "hello", handle: async () => void (state.handled += 1) } as unknown as PluginCommand;
-    return { state, lookup: (bare: string) => (bare === "hello" ? command : undefined) };
+    return { state, lookup: (bare: string) => (bare === "hello" ? target(command) : undefined) };
   };
   const chatInput = () => {
     const replies: unknown[] = [];
@@ -358,7 +361,7 @@ describe("handleCommand — the channel gate (#243)", () => {
       const { interaction, replies } = chatInput();
       (interaction as unknown as { commandName: string }).commandName = "report";
       // Even a plugin that claims the same name (the core row wins) is never put to the gate.
-      await handleCommand(interaction, () => ({ name: "report", handle: async () => {} }) as unknown as PluginCommand, gate);
+      await handleCommand(interaction, () => target({ name: "report", handle: async () => {} } as unknown as PluginCommand), gate);
       expect(handle).toHaveBeenCalledTimes(1);
       expect(consulted).toBe(0);
       expect(replies).toEqual([]);
@@ -431,6 +434,175 @@ describe("handleCommand — the channel gate (#243)", () => {
       expect(consulted).toBe(0);
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+// #407: a plugin's slash commands get the same `running` gate as its ticks, HTTP routes and component,
+// modal and autocomplete handlers, and a throw from the plugin's handler is isolated the same way a
+// component's is (host.ts's dispatchPluginInteractionOutcome).
+describe("handleCommand — the plugin's running gate and a throwing handler (#407)", () => {
+  const chatInput = (over: Partial<{ replied: boolean; deferred: boolean; reply: (o: unknown) => Promise<unknown> }> = {}) => {
+    const replies: unknown[] = [];
+    const interaction = {
+      commandName: "hello",
+      replied: false,
+      deferred: false,
+      reply: async (options: unknown) => void replies.push(options),
+      ...over,
+    } as unknown as ChatInputCommandInteraction;
+    return { interaction, replies };
+  };
+  const quiet = () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    return { warn, error, restore: () => (warn.mockRestore(), error.mockRestore()) };
+  };
+
+  test("a command whose plugin is not running is refused privately, before the gate, and its handler never runs", async () => {
+    const logs = quiet();
+    try {
+      let handled = 0;
+      let consulted = 0;
+      const command = { name: "hello", handle: async () => void (handled += 1) } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      const outcome = await handleCommand(interaction, () => target(command, () => false), async () => {
+        consulted += 1;
+        return undefined;
+      });
+      expect(outcome).toBe("unclaimed");
+      expect(replies).toEqual([{ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral }]);
+      expect(handled).toBe(0);
+      expect(consulted).toBe(0); // no routing read or channel fetch for a plugin that can't run anyway
+      expect(logs.warn.mock.calls.map((c) => String(c[0]))).toEqual(["[plugins] demo: /hello refused — the plugin is not running"]);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("running is read again after the gate: a plugin that stopped while the gate was awaited is refused", async () => {
+    const logs = quiet();
+    try {
+      let running = true;
+      let handled = 0;
+      const command = { name: "hello", handle: async () => void (handled += 1) } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      const outcome = await handleCommand(interaction, () => target(command, () => running), async () => {
+        running = false; // e.g. disposePlugins began while the gate fetched the channel
+        return undefined;
+      });
+      expect(outcome).toBe("unclaimed");
+      expect(replies).toEqual([{ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral }]);
+      expect(handled).toBe(0);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("the refusal says the command is unavailable, in words: never an empty reply Discord would reject", () => {
+    expect(PLUGIN_NOT_RUNNING_REPLY).toBe("This command isn't available right now.");
+  });
+
+  test("a refusal Discord rejects is not swallowed: it reaches index.ts's catch, as the gate's own refusal does", async () => {
+    const logs = quiet();
+    try {
+      const expired = new Error("Unknown interaction");
+      const command = { name: "hello", handle: async () => {} } as unknown as PluginCommand;
+      const { interaction } = chatInput({ reply: async () => Promise.reject(expired) });
+      await expect(handleCommand(interaction, () => target(command, () => false))).rejects.toBe(expired);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("the handler is called on its command object, with the interaction", async () => {
+    const calls: [unknown, unknown][] = [];
+    const command = {
+      name: "hello",
+      async handle(this: unknown, i: unknown) {
+        calls.push([this, i]);
+      },
+    } as unknown as PluginCommand;
+    const { interaction } = chatInput();
+    await handleCommand(interaction, () => target(command));
+    expect(calls).toEqual([[command, interaction]]);
+  });
+
+  test("a running plugin's command still runs and is answered", async () => {
+    let handled = 0;
+    const command = { name: "hello", handle: async () => void (handled += 1) } as unknown as PluginCommand;
+    const { interaction, replies } = chatInput();
+    expect(await handleCommand(interaction, () => target(command))).toBe("answered");
+    expect(handled).toBe(1);
+    expect(replies).toEqual([]);
+  });
+
+  test("a handler that throws is isolated: logged by plugin and command, answered privately, reported as an error", async () => {
+    const logs = quiet();
+    try {
+      const boom = new Error("state not initialised");
+      const command = { name: "hello", handle: async () => Promise.reject(boom) } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      expect(replies).toEqual([{ content: "Something went wrong.", flags: MessageFlags.Ephemeral }]);
+      expect(logs.error.mock.calls).toEqual([["[plugins] demo command /hello failed", boom]]);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("a handler that throws synchronously is isolated the same way", async () => {
+    const logs = quiet();
+    try {
+      const command = {
+        name: "hello",
+        handle: () => {
+          throw new Error("sync");
+        },
+      } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      expect(replies).toEqual([{ content: "Something went wrong.", flags: MessageFlags.Ephemeral }]);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("a handler that replied or deferred before throwing keeps its reply flow: no second reply", async () => {
+    const logs = quiet();
+    try {
+      const command = { name: "hello", handle: async () => Promise.reject(new Error("late")) } as unknown as PluginCommand;
+      for (const over of [{ replied: true }, { deferred: true }]) {
+        const { interaction, replies } = chatInput(over);
+        expect(await handleCommand(interaction, () => target(command))).toBe("error");
+        expect(replies).toEqual([]);
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("a failed \"Something went wrong.\" reply is swallowed: still an error, never a throw", async () => {
+    const logs = quiet();
+    try {
+      const command = { name: "hello", handle: async () => Promise.reject(new Error("boom")) } as unknown as PluginCommand;
+      const { interaction } = chatInput({ reply: async () => Promise.reject(new Error("Unknown interaction")) });
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test("a core command's throw is not caught here: it still reaches index.ts's own catch", async () => {
+    const reportRow = CORE_COMMANDS.find((c) => c.name === "report")!;
+    const boom = new Error("core");
+    const handle = spyOn(reportRow, "handle").mockImplementation(async () => Promise.reject(boom));
+    try {
+      const { interaction } = chatInput();
+      (interaction as unknown as { commandName: string }).commandName = "report";
+      await expect(handleCommand(interaction)).rejects.toBe(boom);
+    } finally {
+      handle.mockRestore();
     }
   });
 });
@@ -546,10 +718,13 @@ describe("commands.ts — clampReply guards every editReply failure path (#55, #
   test("/plugins <action>'s failure edit is wrapped in clampReply", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
-    // The action (update/remind/skip/cancel) catch is the last one in the file — after it there
-    // is only handleCommand's own dispatch, which has no editReply of its own (#206).
-    const actionCatchIdx = src.lastIndexOf("} catch (err) {");
-    const editIdx = src.indexOf("await interaction.editReply(clampReply(", actionCatchIdx);
+    // The action (update/remind/skip/cancel) catch is the last one in the plugins row, which is the
+    // table's last row: it ends where `commandData` begins. (handleCommand, further down, has a catch
+    // of its own since #407, for a plugin handler's throw; it is not a /plugins failure path.)
+    const block = src.slice(src.indexOf('name: "plugins"'), src.indexOf("export const commandData"));
+    const actionCatchIdx = block.lastIndexOf("} catch (err) {");
+    expect(actionCatchIdx).toBeGreaterThan(-1);
+    const editIdx = block.indexOf("await interaction.editReply(clampReply(", actionCatchIdx);
     expect(editIdx).toBeGreaterThan(actionCatchIdx);
   });
 });
@@ -558,7 +733,9 @@ describe("buildCommandBody — core-only identity", () => {
   // The framework must not change the core registration body, AND the plugin-migration removals are
   // pinned here: with no plugins the built body must equal the captured full JSON MINUS every command
   // that is now plugin-provided — the connector's /link + /unlink (#100) and the WoW plugin's
-  // /dmf /reset /status /transmog (#107). fixtures/command-body.main.json is the pre-migration capture.
+  // /dmf /reset /status /transmog (#107). fixtures/command-body.main.json is a hand-maintained snapshot of
+  // the full pre-migration body, kept current when a core command changes (#110, #117, #120 edited it);
+  // its names are unprefixed, so it relies on test/setup.ts clearing COMMAND_PREFIX (#472).
   const NOW_PLUGIN_PROVIDED = ["link", "unlink", "dmf", "reset", "status", "transmog"];
   test("with no plugins, the body equals the fixture minus the now-plugin-provided commands", () => {
     const body = buildCommandBody(config.commandPrefix, commandData, new Map(), { info() {}, warn() {}, error() {} });

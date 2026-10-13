@@ -11,8 +11,9 @@
 // When the gate itself lets a command through (it could not look at the channel, or it failed) it leaves a
 // `[gate]` line naming the command, and the channel where it can. Core commands never reach it
 // (commands.ts). Chat-input commands are gated, and so is a plugin command's autocomplete (#287, through
-// `dispatchPluginAutocomplete`, which fails CLOSED instead: an empty picker costs nothing); a button or
-// a modal is not -- it belongs to a message that is already in an allowed channel.
+// `dispatchPluginAutocomplete`, which answers an empty picker when this gate is too slow, or throws --
+// though this gate never throws: a fault it cannot judge lets the picker run, as it lets the command run);
+// a button or a modal is not -- it belongs to a message that is already in an allowed channel.
 //
 // `whereOf` is the only function here that touches discord.js objects; everything else is data.
 

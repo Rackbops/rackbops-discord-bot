@@ -535,7 +535,8 @@ describe("installPlugins", () => {
 
 // #281: PLUGIN_REGISTRY_URL="" (what compose's env_file: delivers a bare `KEY=` line as, and what
 // .env.example ships) must resolve like unset, the same rule src/config.ts's optional() already applies
-// to PLUGIN_INDEX_URL. REGISTRY_BASE itself is a module-level constant computed once at import from the
+// to PLUGIN_INDEX_URL -- for the empty string only: the whitespace-only case below falls back here but
+// not for PLUGIN_INDEX_URL (see resolveRegistryBase's doc, #436). REGISTRY_BASE itself is a module-level constant computed once at import from the
 // real process.env, so it can't be driven per test; resolveRegistryBase is the pure seam that can.
 // #496/#497/#498: install/registry hardening -- versions checked before they reach a path, a cached
 // version chosen by semver, a bounded tarball download, and an interrupted install's leftovers swept.

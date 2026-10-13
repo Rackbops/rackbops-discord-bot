@@ -663,7 +663,9 @@ Every command, button press and modal submit writes one line once it is handled 
 `[interaction] command /web user=<id> where=dm outcome=answered 212ms`: the kind, the command (with
 its subcommand) or the customId's plugin prefix, the user's Discord id, `dm` or
 `guild:<id>/channel:<id>`, the outcome (`answered`, `gated` by the routing gate, `unclaimed`, or
-`error`, next to the error's own `[interaction]` or `[plugins] <name> interaction failed` line) and
+`error`, next to the error's own `[interaction]`, `[plugins] <name> command /<command> failed` or
+`[plugins] <name> interaction failed` line; a plugin command refused because its plugin is not running
+is `unclaimed`, next to a `[plugins] <name>: /<command> refused — the plugin is not running` line) and
 how long it took. It never carries an option value, a
 modal field or what the bot answered, so a `/web` sign-in link or a reminder's text never reaches
 the log. `docker logs rackbops-discord-bot-clerk 2>&1 | jq -rR 'fromjson? | .msg | select(test("^\\[interaction\\] (command|component|modal) "))'`

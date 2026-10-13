@@ -11,12 +11,16 @@ import { compareSemver } from "./updates";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 
-/** #281: a blank (or whitespace-only) `PLUGIN_REGISTRY_URL` is unset, the same rule `src/config.ts`'s
- *  `optional()` already applies to `PLUGIN_INDEX_URL` — compose's `env_file:` sets a bare `KEY=` line to
- *  the empty string, and `.env.example` ships PLUGIN_REGISTRY_URL blank, so `??` alone (falling back only
- *  on undefined/null) let a shipped-as-documented instance resolve every plugin metadata URL against a
- *  relative path instead of the registry. Exported so install.test.ts drives it directly rather than only
- *  through the module-level constant below. */
+/** #281: a blank (or whitespace-only) `PLUGIN_REGISTRY_URL` is unset — compose's `env_file:` sets a bare
+ *  `KEY=` line to the empty string, and `.env.example` ships PLUGIN_REGISTRY_URL blank, so `??` alone
+ *  (falling back only on undefined/null) let a shipped-as-documented instance resolve every plugin metadata
+ *  URL against a relative path instead of the registry. This is broader than `src/config.ts`'s `optional()`
+ *  (#436): that treats only the empty string as unset, so a whitespace-only `PLUGIN_INDEX_URL` that
+ *  reaches the process is kept as given and fails that variable's scheme check at boot, while a
+ *  whitespace-only value here falls back to npm. (Compose's `env_file:` and Bun's own `.env` reader
+ *  already trim an unquoted one to empty, so in practice that takes a quoted value or a launch outside
+ *  compose.) Exported so install.test.ts drives it directly rather than only through the module-level constant
+ *  below. */
 export function resolveRegistryBase(env: Record<string, string | undefined>): string {
   return (env.PLUGIN_REGISTRY_URL?.trim() || DEFAULT_REGISTRY).replace(/\/$/, "");
 }

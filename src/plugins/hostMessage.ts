@@ -9,7 +9,10 @@ import type { APIActionRowComponent, APIButtonComponent, APIEmbed } from "discor
 import type { HostButton, HostCard, HostCardField, HostLinkButton, HostMessage } from "./contract";
 
 /** The numbers behind decision 6. `CARD_TOTAL_MAX` is title + description + footer + every field's
- *  name and value, summed -- Discord's own 6000-character embed budget. */
+ *  name and value, summed -- Discord's own 6000-character embed budget. A card's title and a field's
+ *  name and value must not be only whitespace (#508), nor content that would be all a post or DM shows
+ *  (no card): it shows as nothing, and Discord is expected to refuse it as empty after the host has said
+ *  yes (inferred, not run against Discord). */
 export const LIMITS = {
   CONTENT_MAX: 2000,
   CARD_TITLE_MAX: 256,
@@ -21,6 +24,9 @@ export const LIMITS = {
   CARD_TOTAL_MAX: 6000,
   LINKS_MAX: 5,
   LINK_LABEL_MAX: 80,
+  /** Discord's own cap on a link button's url (#508): a longer one passes discord.js's builder and is
+   *  refused only by Discord, as a raw API error. */
+  LINK_URL_MAX: 512,
   BUTTONS_PER_ROW: 5,
   ROWS_MAX: 5,
   BUTTON_LABEL_MAX: 80,
@@ -45,31 +51,119 @@ export interface BuiltPayload {
 
 export type ValidationResult = { ok: true; payload: BuiltPayload } | { ok: false; reason: string };
 
-// Matches a URL that is ALREADY tightly wrapped -- `<` immediately before it, `>` immediately after,
-// nothing else between -- or a bare http(s) URL otherwise. The first alternative must require the
-// brackets to hold nothing but the URL itself: a looser first cut ("<[^>]*>", matching any bracketed
-// span containing a URL anywhere inside it) let a URL sitting mid-sentence inside an UNRELATED
-// bracketed span -- "<click here https://evil.example more text>" -- read as "already wrapped" and
-// pass through untouched, even though the URL there is not adjacent to either bracket and Discord's
-// own <url> suppression syntax requires exactly that adjacency (#736 review). Matching the wrapped
-// form as `<(url)>` closes that: a URL is only ever left alone when the brackets truly hold nothing
-// else, and a URL loose inside a larger bracketed span is still found and wrapped on its own.
-const URL_OR_WRAPPED_RE = /<(https?:\/\/[^\s<>]+)>|(https?:\/\/[^\s<>]+)/g;
+// One left-to-right pass over four alternatives (#453):
+//  1. a code span or block -- a run of backticks, then the same-length run that closes it, Discord's own
+//     inline-code rule (single, double and triple backticks alike, newlines included). Left alone: Discord
+//     does not link a URL inside one, and brackets added there would show in the code.
+//  2. a masked link `[text](url)` -- its destination is wrapped whole, `[text](<url>)` (Discord's own way
+//     to keep a masked link from unfurling), with nothing trimmed and the text left alone; a destination
+//     the plugin already wrapped, `[text](<url>)`, is left alone too.
+//  3. a URL that is ALREADY tightly wrapped -- `<` immediately before it, `>` immediately after, nothing
+//     else between. This must require the brackets to hold nothing but the URL itself: a looser first cut
+//     ("<[^>]*>", matching any bracketed span containing a URL anywhere inside it) let a URL sitting
+//     mid-sentence inside an UNRELATED bracketed span -- "<click here https://evil.example more text>" --
+//     read as "already wrapped" and pass through untouched, even though Discord's own <url> suppression
+//     syntax requires exactly that adjacency (#736 review).
+//  4. a bare URL, which stops before a `](` so it never runs into a masked link's destination.
+// The masked-link, wrapped and bare alternatives match in linear time; the code-span one is quadratic
+// on a long run of unpaired backticks (it tries each run length, scanning ahead for a closer each time),
+// which is why validateHostMessage refuses content over CONTENT_MAX before it gets here -- a few ms at
+// that size.
+const DEST_CHARS = "[^\\s<>()]";
+const MASKED_DEST = `https?:\\/\\/${DEST_CHARS}*(?:\\(${DEST_CHARS}*\\)${DEST_CHARS}*)*`;
+const CONTENT_RE = new RegExp(
+  "(`+)(?:[\\s\\S]*?[^`])?\\1(?!`)" +
+    `|(\\[[^\\[\\]\\n]*\\]\\()(?:<https?:\\/\\/[^\\s<>]+>|(${MASKED_DEST}))\\)` +
+    "|<https?:\\/\\/[^\\s<>]+>" +
+    "|(https?:\\/\\/(?:[^\\s<>\\]]|\\](?!\\())+)",
+  "g",
+);
 
-/** Wraps every bare `http(s)://` run in `<...>` so it does not unfurl, leaving a URL that is already
- *  tightly wrapped (`<url>`, nothing else inside the brackets) untouched. `MessageFlags.SuppressEmbeds`
- *  would also hide the card, so this is the only way to keep a link from unfurling without losing the
- *  card too (decision 5). */
+/** #453: characters that end a sentence rather than belong to a URL when they come last -- `Read
+ *  https://a.example.`, `'https://a.example'`. `!` and `?` are a deliberate trade-off: they end far more
+ *  sentences than URLs (`…/wiki/Oklahoma!` loses its `!`). */
+const SENTENCE_END = new Set([".", ",", ":", ";", "!", "?", "'", '"']);
+/** #453: markdown markers. One that comes last closes markup around the URL only when the same marker
+ *  opened it, right before the URL (`**url**`, `_url_`, `~~url~~`, `||url||`); otherwise it is part of
+ *  the URL -- a YouTube id can end in `_`. (No backtick: one before and one after a URL already make a
+ *  code span, which `CONTENT_RE` leaves alone before this ever runs.) */
+const MARKDOWN_MARKS = new Set(["*", "_", "~", "|"]);
+
+const count = (s: string, ch: string): number => {
+  let n = 0;
+  for (const c of s) if (c === ch) n += 1;
+  return n;
+};
+
+/** Splits a bare `http(s)://` run into the URL and what trails it. Cut off, last first: a `SENTENCE_END`
+ *  character; a markdown marker that `openers` (the markers right before the URL) also holds; and a `)`
+ *  or `]` with no partner inside the URL -- so `(see url)` keeps its `)` outside while
+ *  `https://en.wikipedia.org/wiki/Foo_(bar)` keeps its pair. The scheme's own `/` always stops it. Linear:
+ *  each bracket kind is counted once, then kept current as characters are cut. */
+function splitTrailing(run: string, openers: ReadonlySet<string>): { url: string; rest: string } {
+  let closeParen = count(run, ")");
+  const openParen = count(run, "(");
+  let closeSquare = count(run, "]");
+  const openSquare = count(run, "[");
+  let end = run.length;
+  while (end > 0) {
+    const ch = run[end - 1]!;
+    if (SENTENCE_END.has(ch) || (MARKDOWN_MARKS.has(ch) && openers.has(ch))) {
+      end -= 1;
+    } else if (ch === ")" && closeParen > openParen) {
+      closeParen -= 1;
+      end -= 1;
+    } else if (ch === "]" && closeSquare > openSquare) {
+      closeSquare -= 1;
+      end -= 1;
+    } else {
+      break;
+    }
+  }
+  return { url: run.slice(0, end), rest: run.slice(end) };
+}
+
+/** The markdown markers immediately before `offset` in `text` -- the run that may open markup a URL sits in. */
+function openersBefore(text: string, offset: number): Set<string> {
+  const openers = new Set<string>();
+  for (let i = offset - 1; i >= 0 && MARKDOWN_MARKS.has(text[i]!); i -= 1) openers.add(text[i]!);
+  return openers;
+}
+
+/** Wraps every bare `http(s)://` URL in `<...>` so it does not unfurl, and a masked link's destination as
+ *  `[text](<url>)`, leaving a URL that is already tightly wrapped (`<url>`, nothing else inside the
+ *  brackets) untouched. `MessageFlags.SuppressEmbeds` would also hide the card, so this is the only way
+ *  to keep a link from unfurling without losing the card too (decision 5). Trailing sentence punctuation
+ *  and closing markdown stay outside the brackets (`splitTrailing`), and a URL inside a code span or block
+ *  is left alone (#453). */
 export function wrapBareUrls(content: string): string {
-  return content.replace(URL_OR_WRAPPED_RE, (whole: string, alreadyWrapped: string | undefined, bare: string | undefined) =>
-    alreadyWrapped !== undefined ? whole : `<${bare}>`,
+  return content.replace(
+    CONTENT_RE,
+    (
+      whole: string,
+      _code: string | undefined,
+      maskedPrefix: string | undefined,
+      maskedDest: string | undefined,
+      bare: string | undefined,
+      offset: number,
+    ) => {
+      if (maskedPrefix !== undefined) return maskedDest === undefined ? whole : `${maskedPrefix}<${maskedDest}>)`;
+      if (bare === undefined) return whole; // a code span, or a URL already wrapped
+      const { url, rest } = splitTrailing(bare, openersBefore(content, offset));
+      return `<${url}>${rest}`;
+    },
   );
+}
+
+/** Empty, or only whitespace: what shows as nothing (#508). */
+function isBlank(text: string): boolean {
+  return text.trim().length === 0;
 }
 
 function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok: false; reason: string } {
   if (typeof card !== "object" || card === null) return { ok: false, reason: "card must be an object" };
   const c = card as Partial<HostCard>;
-  if (typeof c.title !== "string" || c.title.length === 0) return { ok: false, reason: "card title is empty" };
+  if (typeof c.title !== "string" || isBlank(c.title)) return { ok: false, reason: "card title is empty" };
   if (c.title.length > LIMITS.CARD_TITLE_MAX) return { ok: false, reason: `card title is longer than ${LIMITS.CARD_TITLE_MAX}` };
   if (c.description !== undefined) {
     if (typeof c.description !== "string") return { ok: false, reason: "card description must be a string" };
@@ -79,6 +173,11 @@ function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok:
   }
   if (c.url !== undefined && (typeof c.url !== "string" || !c.url.startsWith("https://"))) {
     return { ok: false, reason: "card url must be https" };
+  }
+  // #508: `HostCard.color` is a number; discord.js's setColor would also take a name ("Random") or a
+  // hex string, so a non-number is refused here rather than resolved into some colour.
+  if (c.color !== undefined && !(typeof c.color === "number" && Number.isInteger(c.color) && c.color >= 0 && c.color <= 0xffffff)) {
+    return { ok: false, reason: "card color must be a whole number from 0 to 0xFFFFFF" };
   }
   if (c.footer !== undefined) {
     if (typeof c.footer !== "string") return { ok: false, reason: "card footer must be a string" };
@@ -91,10 +190,10 @@ function validateCardShape(card: unknown): { ok: true; value: HostCard } | { ok:
   for (const f of rawFields) {
     if (typeof f !== "object" || f === null) return { ok: false, reason: "card field must be an object" };
     const field = f as Partial<HostCardField>;
-    if (typeof field.name !== "string" || field.name.length === 0 || field.name.length > LIMITS.CARD_FIELD_NAME_MAX) {
+    if (typeof field.name !== "string" || isBlank(field.name) || field.name.length > LIMITS.CARD_FIELD_NAME_MAX) {
       return { ok: false, reason: `card field name must be 1..${LIMITS.CARD_FIELD_NAME_MAX} characters` };
     }
-    if (typeof field.value !== "string" || field.value.length === 0 || field.value.length > LIMITS.CARD_FIELD_VALUE_MAX) {
+    if (typeof field.value !== "string" || isBlank(field.value) || field.value.length > LIMITS.CARD_FIELD_VALUE_MAX) {
       return { ok: false, reason: `card field value must be 1..${LIMITS.CARD_FIELD_VALUE_MAX} characters` };
     }
     fields.push({ name: field.name, value: field.value, ...(field.inline !== undefined ? { inline: field.inline } : {}) });
@@ -143,6 +242,7 @@ function validateLinks(links: unknown): { ok: true; value: HostLinkButton[] } | 
     if (typeof link.url !== "string" || !link.url.startsWith("https://")) {
       return { ok: false, reason: "link url must be https" };
     }
+    if (link.url.length > LIMITS.LINK_URL_MAX) return { ok: false, reason: `link url is longer than ${LIMITS.LINK_URL_MAX}` };
     value.push({ label: link.label, url: link.url });
   }
   return { ok: true, value };
@@ -219,6 +319,8 @@ function buildButtonRows(
     }
     return { ok: true, value: rows };
   } catch {
+    // Not reachable through `validateButtons` today, which hand-checks every constraint `ButtonBuilder`
+    // validates; kept as defence in depth should a discord.js validator tighten.
     return { ok: false, reason: "button is not valid" };
   }
 }
@@ -256,8 +358,17 @@ export function validateHostMessage(message: unknown, opts: { partial: boolean; 
   let content: string | undefined;
   if (!opts.partial || hasContent) {
     if (hasContent && typeof m.content !== "string") return { ok: false, reason: "content must be a string" };
+    // #453: refused before wrapping too -- wrapping never shortens content, so the reason holds, and the
+    // wrapper never sees more than CONTENT_MAX characters of whatever a plugin passed on.
+    if ((m.content ?? "").length > LIMITS.CONTENT_MAX) {
+      return { ok: false, reason: `content is longer than ${LIMITS.CONTENT_MAX} after link wrapping` };
+    }
     const wrapped = wrapBareUrls(m.content ?? "");
     if (wrapped.length === 0) return { ok: false, reason: "content is empty" };
+    // #508: whitespace alone is empty too where it is all the message would show -- a post or DM with no
+    // card. Not beside a card, and not in an edit, where `" "` is how a plugin blanks the text above the
+    // message's card, which this call cannot see.
+    if (!opts.partial && !hasCard && isBlank(wrapped)) return { ok: false, reason: "content is empty" };
     if (wrapped.length > LIMITS.CONTENT_MAX) return { ok: false, reason: `content is longer than ${LIMITS.CONTENT_MAX} after link wrapping` };
     content = wrapped;
   }
