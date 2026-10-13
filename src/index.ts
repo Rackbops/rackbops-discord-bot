@@ -41,6 +41,7 @@ import {
   dispatchPluginAutocomplete,
   dispatchPluginInteractionOutcome,
   disposePlugins,
+  findPluginCommand,
   HTTP_MAX_BODY_BYTES,
   loadPlugins,
   mutatePluginState,
@@ -229,9 +230,10 @@ async function activate(c: Client<true>): Promise<void> {
     try {
       if (interaction.isChatInputCommand()) {
         // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
+        // #407: and only while their plugin is running -- handleCommand reads the flag through the lookup.
         outcome = await handleCommand(
           interaction,
-          (bare) => commandMap.get(bare)?.command,
+          (bare) => findPluginCommand(commandMap, loadResult.loaded, bare),
           (bare, chatInput) =>
             gateCommand(
               commandMap.get(bare)?.entry.name,
@@ -423,8 +425,10 @@ async function activate(c: Client<true>): Promise<void> {
     console.error("[plugins] writing data/plugins/state.json failed", err);
   }
   // #105: drain the request mailbox ONCE, AWAITED, before releasing the tick — so a request dropped
-  // while the bot was down is honoured before any tick or /plugins command can interleave, and the
-  // single-flight consumer never overlaps the first tick's drain. An update-now request restarts here
+  // while the bot was down is honoured before the pluginRequests/pluginUpdates ticks or a /plugins
+  // command can interleave (those two ticks wait on the state-ready flag; the others, plugin ticks
+  // included, already run from startScheduler), and the single-flight consumer never overlaps the
+  // first tick's drain. An update-now request restarts here
   // (exit deferred by nothing at boot → immediate), applying on the next boot; anything queued after
   // is drained by the pluginRequests tick. Swallows its own failures (never blocks startup).
   try {

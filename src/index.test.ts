@@ -223,7 +223,8 @@ describe("index.ts wiring", () => {
       expect(handleCall).toBeGreaterThan(interactionStart);
       expect(source.lastIndexOf("interaction.isChatInputCommand()", handleCall)).toBeGreaterThan(interactionStart);
       const handleBlock = source.slice(handleCall, source.indexOf("} else if", handleCall));
-      expect(handleBlock).toMatch(/\(bare\)\s*=>\s*commandMap\.get\(bare\)\?\.command,/);
+      // #407: the lookup carries the owning plugin's live running flag, over the same map and loaded list.
+      expect(handleBlock).toMatch(/\(bare\)\s*=>\s*findPluginCommand\(commandMap,\s*loadResult\.loaded,\s*bare\),/);
       // whereOf is handed over as a thunk, never awaited here: the gate calls it only when the channel's own
       // id cannot decide, so a plugin with no routing (or a listed channel, or a DM) costs no Discord fetch.
       expect(handleBlock).toMatch(/\(\)\s*=>\s*whereOf\(chatInput,\s*\(id\)\s*=>\s*client\.channels\.fetch\(id\)\)/);

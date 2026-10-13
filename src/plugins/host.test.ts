@@ -19,6 +19,7 @@ const {
   PLUGIN_IMPORT_TIMEOUT_MS,
   PLUGIN_ACTIVATE_TIMEOUT_MS,
   pluginCommandMap,
+  findPluginCommand,
   buildCommandBody,
   autocompleteOptionPaths,
   pluginTicks,
@@ -27,6 +28,7 @@ const {
   createPluginTickControl,
   activatePlugins,
   disposePlugins,
+  PLUGIN_DISPOSE_TIMEOUT_MS,
   buildPluginStateFile,
   readPluginState,
   writePluginState,
@@ -387,7 +389,46 @@ describe("createHostApi: delivery (#736)", () => {
     await expect(host.edit!({ guildId: null, channelId: "bad", messageId: "666" }, { content: "hi" })).rejects.toThrow(
       "delivery is not a valid channel/message id",
     );
+    // #471: the message id is checked too, not only the channel's.
+    await expect(host.edit!({ guildId: null, channelId: CHAN, messageId: "bad" }, { content: "hi" })).rejects.toThrow(
+      "delivery is not a valid channel/message id",
+    );
     expect(calls).toEqual([]);
+  });
+
+  test("post refuses a guildId that is not an id before reading routing (#471)", async () => {
+    const { deps, calls } = fakeDeps();
+    const host = hostWith({ destinations: [{ name: "alerts", description: "d" }], delivery: deps });
+    await expect(host.post!("not-an-id", "alerts", { content: "hi" })).rejects.toThrow("guildId is not a valid id");
+    expect(calls).toEqual([]);
+  });
+
+  // #470: the result names the guild the message landed in, as discord.js reported it, not the caller's
+  // own argument -- they differ only when routing maps the destination to a channel elsewhere.
+  test("post returns the guild the message actually landed in, and warns when routing put it elsewhere", async () => {
+    for (const [landed, returned, warns] of [
+      [HOME, HOME, []],
+      [OTHER, OTHER, [`[feed] post: the channel mapped for "alerts" in server ${HOME} is in server ${OTHER}`]],
+      // A channel in no server: warned, and the caller's guildId kept -- a post's delivery is never a DM's.
+      [null, HOME, [`[feed] post: the channel mapped for "alerts" in server ${HOME} is not in a server`]],
+    ] as const) {
+      const { deps } = fakeDeps({
+        routing: routingWith({ feed: { servers: { [HOME]: { commands: "all", destinations: { alerts: CHAN } } } } }),
+        sendToChannel: async () => ({ messageId: MSG, guildId: landed }),
+      });
+      const { log, calls } = makeLog();
+      const host = createHostApi({
+        entry: entry({ name: "feed", destinations: [{ name: "alerts", description: "d" }] }),
+        processEnv: {},
+        dataDir: "/data",
+        baseLog: log,
+        storage: realStorage,
+        announce: async () => {},
+        delivery: deps,
+      });
+      expect(await host.post!(HOME, "alerts", { content: "hi" }), String(landed)).toEqual({ guildId: returned, channelId: CHAN, messageId: MSG });
+      expect(calls.filter((c) => c.level === "warn").map((c) => c.message), String(landed)).toEqual([...warns]);
+    }
   });
 
   test("edit passes the validated payload through to editOwnMessage, unchanged", async () => {
@@ -700,13 +741,52 @@ describe("loadPlugins", () => {
 describe("pluginCommandMap", () => {
   test("drops a whole plugin's commands on a collision with core or an earlier plugin", () => {
     const { log, calls } = makeLog();
-    const a = loaded(entry({ name: "a" }), { commands: [cmd("x"), cmd("y")] });
-    const b = loaded(entry({ name: "b" }), { commands: [cmd("y")] }); // collides with a's y
-    const c = loaded(entry({ name: "c" }), { commands: [cmd("dmf")] }); // collides with core
+    const a = loaded(entry({ name: "a", commands: ["x", "y"] }), { commands: [cmd("x"), cmd("y")] });
+    const b = loaded(entry({ name: "b", commands: ["y"] }), { commands: [cmd("y")] }); // collides with a's y
+    const c = loaded(entry({ name: "c", commands: ["dmf"] }), { commands: [cmd("dmf")] }); // collides with core
     const map = pluginCommandMap([a, b, c], ["dmf"], log);
     expect([...map.keys()].sort()).toEqual(["x", "y"]); // only a's
     expect(map.get("y")?.entry.name).toBe("a");
-    expect(calls.filter((l) => l.level === "warn")).toHaveLength(2); // b and c dropped
+    expect(calls.filter((l) => l.level === "warn").map((l) => l.message)).toEqual([
+      '[plugins] b: command "y" collides with plugin "a" — skipping this plugin\'s commands',
+      '[plugins] c: command "dmf" collides with a core command — skipping this plugin\'s commands',
+    ]);
+  });
+
+  // #471: the collision check above only sees names already claimed, so a plugin returning the same
+  // name twice slipped past it and the second silently replaced the first.
+  test("a plugin that returns two commands of the same name has its commands skipped, like any collision", () => {
+    const { log, calls } = makeLog();
+    const twice = loaded(entry({ name: "twice", commands: ["x", "y2"] }), { commands: [cmd("x"), cmd("y2"), cmd("x")] }); // not adjacent
+    const fine = loaded(entry({ name: "fine", commands: ["y"] }), { commands: [cmd("y")] });
+    const map = pluginCommandMap([twice, fine], [], log);
+    expect([...map.keys()]).toEqual(["y"]);
+    expect(calls).toEqual([{ level: "warn", message: '[plugins] twice: returns two commands named "x" — skipping this plugin\'s commands' }]);
+  });
+
+  test("a command its index entry does not declare is warned about, but still registered (a pinned older bundle may differ)", () => {
+    const { log, calls } = makeLog();
+    const lp = loaded(entry({ name: "p", commands: ["declared"] }), { commands: [cmd("declared"), cmd("extra")] });
+    const map = pluginCommandMap([lp], [], log);
+    expect([...map.keys()]).toEqual(["declared", "extra"]);
+    expect(calls).toEqual([{ level: "warn", message: '[plugins] p: command "extra" is not in its index entry\'s commands' }]);
+  });
+
+  // #471: #98's pre-load check compares only declared lists, so an undeclared command used to claim its
+  // name in load order and knock out a later plugin that declared that name -- every command of it.
+  test("an undeclared command never takes a name another plugin declares: that one command is dropped, the declarer keeps its set", () => {
+    const a = loaded(entry({ name: "a", commands: ["a1"] }), { commands: [cmd("a1"), cmd("x")] });
+    const b = loaded(entry({ name: "b", commands: ["x", "b1"] }), { commands: [cmd("x"), cmd("b1")] });
+    // Either load order: the undeclared x is dropped on its own, so a keeps a1 whether b loads before or after it.
+    for (const order of [[a, b], [b, a]]) {
+      const { log, calls } = makeLog();
+      const map = pluginCommandMap(order, [], log);
+      const label = order.map((l) => l.entry.name).join(",");
+      expect([...map.entries()].map(([n, t]) => `${n}->${t.entry.name}`).sort(), label).toEqual(["a1->a", "b1->b", "x->b"]);
+      expect(calls, label).toEqual([
+        { level: "warn", message: '[plugins] a: command "x" is not in its index entry\'s commands and plugin "b" declares it — dropping this command' },
+      ]);
+    }
   });
 
   test("a malformed (non-iterable) commands field is skipped, not thrown — other plugins survive", () => {
@@ -733,6 +813,43 @@ describe("pluginCommandMap", () => {
     expect(calls.filter((l) => l.level === "error").map((l) => l.message)).toEqual([
       "[plugins] bad: ignoring malformed commands — (unprintable thrown value)",
     ]);
+  });
+});
+
+describe("findPluginCommand (#407)", () => {
+  test("finds the command by bare name, naming the plugin that owns it; undefined for a name no plugin claims", () => {
+    const hello = cmd("hello");
+    const lp = loaded(entry({ name: "greeter" }), { commands: [hello] }, true);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    const found = findPluginCommand(map, [lp], "hello");
+    expect(found?.plugin).toBe("greeter");
+    expect(found?.command).toBe(hello);
+    expect(findPluginCommand(map, [lp], "nope")).toBeUndefined();
+  });
+
+  test("running() reads the owning plugin's flag at call time, not at lookup time", () => {
+    const lp = loaded(entry({ name: "greeter" }), { commands: [cmd("hello")] }, false);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    const found = findPluginCommand(map, [lp], "hello")!;
+    expect(found.running()).toBe(false); // activate() has not finished
+    lp.running = true;
+    expect(found.running()).toBe(true);
+    lp.running = false; // e.g. disposePlugins began
+    expect(found.running()).toBe(false);
+  });
+
+  test("each command answers for its own plugin", () => {
+    const up = loaded(entry({ name: "up" }), { commands: [cmd("a")] }, true);
+    const down = loaded(entry({ name: "down" }), { commands: [cmd("b")] }, false);
+    const map = pluginCommandMap([up, down], [], makeLog().log);
+    expect(findPluginCommand(map, [up, down], "a")?.running()).toBe(true);
+    expect(findPluginCommand(map, [up, down], "b")?.running()).toBe(false);
+  });
+
+  test("a command whose plugin is missing from loaded is never running", () => {
+    const lp = loaded(entry({ name: "greeter" }), { commands: [cmd("hello")] }, true);
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    expect(findPluginCommand(map, [], "hello")?.running()).toBe(false);
   });
 });
 
@@ -1296,7 +1413,83 @@ describe("pluginTicks", () => {
   test("PLUGIN_TICK_ABORT_GRACE_MS leaves the shutdown grace room for dispose and the gateway close (#248)", async () => {
     const { SHUTDOWN_GRACE_MS } = await import("../shutdown");
     expect(PLUGIN_TICK_ABORT_GRACE_MS).toBe(5_000);
-    expect(PLUGIN_TICK_ABORT_GRACE_MS).toBeLessThan(SHUTDOWN_GRACE_MS);
+    // #471: the room is the claim, so it is what is asserted -- the tick grace and a plugin's dispose bound
+    // together, still short of the whole shutdown grace, leave time for the gateway close.
+    expect(PLUGIN_TICK_ABORT_GRACE_MS + PLUGIN_DISPOSE_TIMEOUT_MS).toBeLessThan(SHUTDOWN_GRACE_MS);
+  });
+
+  // #470: racing every wait against one shared, pending promise left a reaction on it per tick run, for
+  // the life of the process. Each wait now registers its own waiter and removes it when the wait ends.
+  test("each tick wait registers a grace waiter and removes it when the wait ends: nothing accumulates", async () => {
+    const real = createPluginTickControl();
+    let live = 0;
+    let registered = 0;
+    const control = {
+      ...real,
+      get stopping() {
+        return real.stopping;
+      },
+      begin: real.begin,
+      stop: real.stop,
+      onGraceElapsed(onElapsed: () => void) {
+        live += 1;
+        registered += 1;
+        const remove = real.onGraceElapsed(onElapsed);
+        return () => {
+          live -= 1;
+          remove();
+        };
+      },
+    };
+    const lp = loaded(entry({ name: "p" }), { ticks: [{ name: "t", run: async () => {} }, { name: "u", run: async () => Promise.reject(new Error("x")) }] }, true);
+    const checks = pluginTicks([lp], makeLog().log, 1_000, control);
+    for (let i = 0; i < 200; i++) {
+      await checks[0]!.run();
+      await checks[1]!.run().catch(() => {});
+    }
+    expect(registered).toBe(400);
+    expect(live).toBe(0);
+  });
+
+  test("onGraceElapsed after the grace has elapsed calls back at once; one removed before it never runs", async () => {
+    const control = createPluginTickControl({ graceMs: 5 });
+    const calls: string[] = [];
+    const removeEarly = control.onGraceElapsed(() => calls.push("removed"));
+    control.onGraceElapsed(() => calls.push("kept"));
+    removeEarly();
+    control.stop("test");
+    await Bun.sleep(30);
+    control.onGraceElapsed(() => calls.push("late"));
+    expect(calls).toEqual(["kept", "late"]);
+  });
+
+  test("each registration is its own: the same function twice is called twice, and one remover removes only its own", async () => {
+    const control = createPluginTickControl({ graceMs: 5 });
+    let called = 0;
+    const onElapsed = () => void (called += 1);
+    const removeFirst = control.onGraceElapsed(onElapsed);
+    control.onGraceElapsed(onElapsed);
+    control.onGraceElapsed(onElapsed);
+    removeFirst();
+    control.stop("test");
+    await Bun.sleep(30);
+    expect(called).toBe(2);
+  });
+
+  test("a waiter that throws does not skip the waiters after it, nor escape the grace timer", async () => {
+    const control = createPluginTickControl({ graceMs: 5 });
+    const calls: string[] = [];
+    control.onGraceElapsed(() => {
+      throw new Error("waiter");
+    });
+    control.onGraceElapsed(() => calls.push("after"));
+    control.stop("test");
+    await Bun.sleep(30); // a throw out of the timer would fail the test as an uncaught error
+    expect(calls).toEqual(["after"]);
+    // Registered after the grace: called at once, and its throw is swallowed there too.
+    expect(() => control.onGraceElapsed(() => {
+      throw new Error("late waiter");
+    })).not.toThrow();
   });
 
   test("PLUGIN_TICK_TIMEOUT_MS stays under the 60s scheduler tick (#217)", () => {
@@ -1374,6 +1567,27 @@ describe("dispatchPluginAutocomplete (#287)", () => {
     expect(called).toBe(0);
     expect(responses).toEqual([[]]);
     expect(s.calls.some((l) => l.level === "error" && l.message.includes("[gate]"))).toBe(true);
+  });
+
+  // #470: the production gate never throws -- a routing fault it cannot judge lets the picker run, as it
+  // lets the command run -- so "fails closed" holds only for the timeout. Pinned with the real gateCommand.
+  test("with the real gateCommand, a routing read that fails lets the picker run, as it lets the command run", async () => {
+    const { gateCommand } = await import("../routing/gate");
+    let called = 0;
+    const s = setup({ autocomplete: async (i) => { called += 1; await i.respond([{ name: "a", value: "a" }]); } });
+    const { interaction, responses } = fakeAutocomplete();
+    const gate = (bare: string) =>
+      gateCommand(
+        "finder",
+        bare,
+        { guildId: "111111111111111111", channelId: "222222222222222222" },
+        async () => ({ guildId: "111111111111111111", channelId: "222222222222222222" }),
+        async () => Promise.reject(new Error("EIO")),
+        { error: () => {} },
+      );
+    await run(s, interaction, gate);
+    expect(called).toBe(1);
+    expect(responses).toEqual([[{ name: "a", value: "a" }]]);
   });
 
   test("a gate slower than AUTOCOMPLETE_GATE_TIMEOUT_MS gets the empty list in time", async () => {
@@ -1471,7 +1685,7 @@ describe("routeHttpRequest (#220)", () => {
   };
   const req = (path: string, init?: RequestInit) => new Request(`http://bot.internal${path}`, init);
 
-  test("the first path segment names the plugin, and the handler sees the rest, with the untouched request", async () => {
+  test("the first path segment names the plugin, and the handler sees the rest, with the request's url", async () => {
     const music = serving("music");
     const other = serving("warbandeer");
     const res = await routeHttpRequest([other.lp, music.lp], req("/music/spotify/callback?code=x&state=y"), "203.0.113.9", makeLog().log);
@@ -1571,9 +1785,12 @@ describe("routeHttpRequest (#220)", () => {
 
   test("a declared Content-Length over the cap is a 413 without reading the body", async () => {
     const { lp, seen } = serving("music");
+    let pulls = 0;
+    // highWaterMark 0: the stream does not prime itself, so any pull is the router reading it.
+    const body = new ReadableStream<Uint8Array>({ pull: (c) => void (pulls += 1, c.enqueue(new Uint8Array(10))) }, { highWaterMark: 0 });
     const res = await routeHttpRequest(
       [lp],
-      req("/music/x", { method: "POST", body: "x".repeat(2_000), headers: { "content-length": "2000" } }),
+      req("/music/x", { method: "POST", body, headers: { "content-length": "2000" }, duplex: "half" } as RequestInit),
       "ip",
       makeLog().log,
       60_000,
@@ -1581,6 +1798,89 @@ describe("routeHttpRequest (#220)", () => {
     );
     expect(res.status).toBe(413);
     expect(seen).toEqual([]);
+    expect(pulls).toBe(0); // #471: refused on the declared length alone, the stream never read
+  });
+
+  // #472: CF-Connecting-IP and X-Forwarded-For are client-writable; the router already vets the address
+  // into info.clientIp, so the request the plugin gets carries that in both, never what the caller wrote.
+  test("the plugin's request carries the vetted client address in CF-Connecting-IP and X-Forwarded-For, with or without a body", async () => {
+    const got: [string | null, string | null][] = [];
+    const { lp } = serving("music", true, async (request) => {
+      got.push([request.headers.get("cf-connecting-ip"), request.headers.get("x-forwarded-for")]);
+      return new Response("ok");
+    });
+    const forged = { "cf-connecting-ip": "6.6.6.6", "x-forwarded-for": "6.6.6.6, 7.7.7.7" };
+    await routeHttpRequest([lp], req("/music/x", { headers: forged }), "203.0.113.9", makeLog().log);
+    await routeHttpRequest([lp], req("/music/x", { method: "POST", body: "hi", headers: forged }), "203.0.113.9", makeLog().log);
+    await routeHttpRequest([lp], req("/music/x"), "203.0.113.9", makeLog().log);
+    expect(got).toEqual([
+      ["203.0.113.9", "203.0.113.9"],
+      ["203.0.113.9", "203.0.113.9"],
+      ["203.0.113.9", "203.0.113.9"],
+    ]);
+  });
+
+  test("the other client-address headers a caller can write are removed, with or without a body", async () => {
+    const names = ["forwarded", "x-real-ip", "true-client-ip", "cf-connecting-ipv6"];
+    const got: (string | null)[][] = [];
+    const { lp } = serving("music", true, async (request) => {
+      got.push(names.map((n) => request.headers.get(n)));
+      return new Response("ok");
+    });
+    const forged = { forwarded: "for=6.6.6.6", "x-real-ip": "6.6.6.6", "true-client-ip": "6.6.6.6", "cf-connecting-ipv6": "::6" };
+    await routeHttpRequest([lp], req("/music/x", { headers: forged }), "203.0.113.9", makeLog().log);
+    await routeHttpRequest([lp], req("/music/x", { method: "POST", body: "hi", headers: forged }), "203.0.113.9", makeLog().log);
+    expect(got).toEqual([
+      [null, null, null, null],
+      [null, null, null, null],
+    ]);
+  });
+
+  test("the plugin's request keeps the client's method, with or without a body", async () => {
+    const got: string[] = [];
+    const { lp } = serving("music", true, async (request) => {
+      got.push(`${request.method} ${request.body === null ? "-" : await request.text()}`);
+      return new Response("ok");
+    });
+    for (const method of ["DELETE", "HEAD", "OPTIONS"]) await routeHttpRequest([lp], req("/music/x", { method }), "ip", makeLog().log);
+    for (const method of ["PUT", "PATCH", "DELETE"]) await routeHttpRequest([lp], req("/music/x", { method, body: "b" }), "ip", makeLog().log);
+    expect(got).toEqual(["DELETE -", "HEAD -", "OPTIONS -", "PUT b", "PATCH b", "DELETE b"]);
+  });
+
+  test("a bodyless request carries no Content-Length or Transfer-Encoding over its empty body", async () => {
+    let got: (string | null)[] = [];
+    const { lp } = serving("music", true, async (request) => {
+      got = [request.headers.get("content-length"), request.headers.get("transfer-encoding")];
+      return new Response("ok");
+    });
+    await routeHttpRequest([lp], req("/music/x", { headers: { "content-length": "5", "transfer-encoding": "chunked" } }), "ip", makeLog().log);
+    expect(got).toEqual([null, null]);
+  });
+
+  test("a bodyless request still carries the client's abort signal and its other headers", async () => {
+    const controller = new AbortController();
+    let aborted = false;
+    let ua = null as string | null;
+    const { lp } = serving("music", true, async (request) => {
+      ua = request.headers.get("user-agent");
+      request.signal.addEventListener("abort", () => { aborted = true; });
+      controller.abort();
+      return new Response("ok");
+    });
+    await routeHttpRequest([lp], req("/music/x", { signal: controller.signal, headers: { "user-agent": "probe/1" } }), "ip", makeLog().log);
+    expect(aborted).toBe(true);
+    expect(ua).toBe("probe/1");
+  });
+
+  // #471: the path rules ADR-0007 and PluginHttpInfo document, as the URL parser applies them.
+  test("dot segments resolve before the name is matched, percent-encoding is kept, and //x arrives as //x", async () => {
+    const { lp, seen } = serving("music");
+    const statusOf = async (path: string) => (await routeHttpRequest([lp], req(path), "ip", makeLog().log)).status;
+    expect(await statusOf("/music/../x")).toBe(404); // resolves to /x
+    expect(await statusOf("/music/%2e%2e/x")).toBe(404); // an encoded dot segment resolves too
+    expect(await statusOf("/mus%69c/x")).toBe(404); // the name is matched as written, never decoded
+    for (const path of ["/music/a/../b", "/music/./c", "/music//x", "/music/a%2Fb"]) expect(await statusOf(path)).toBe(200);
+    expect(seen.map((s) => s.path)).toEqual(["/b", "/c", "//x", "/a%2Fb"]);
   });
 
   test("a body within the cap, streamed or not, reaches the handler whole, with its headers", async () => {
@@ -2090,6 +2390,38 @@ describe("dispatchPluginInteraction", () => {
   });
 });
 
+// #470: the interactions getter is plugin-controlled, like every other one read here.
+describe("dispatchPluginInteractionOutcome: a throwing interactions getter (#470)", () => {
+  test("is this plugin's error, answered privately, not a throw out of the dispatcher", async () => {
+    const { log, calls } = makeLog();
+    const plugin = {} as Plugin;
+    Object.defineProperty(plugin, "interactions", { get: () => { throw new Error("getter boom"); } });
+    const lp = loaded(entry({ name: "odd" }), plugin, true);
+    const replies: unknown[] = [];
+    const outcome = await dispatchPluginInteractionOutcome([lp], fakeInteraction("odd:x", { reply: async (o) => void replies.push(o) }), log);
+    expect(outcome).toBe("error");
+    expect(replies).toHaveLength(1);
+    expect(calls.some((c) => c.level === "error" && c.message === "[plugins] odd interaction failed")).toBe(true);
+  });
+
+  test("a running plugin that declares no interactions is still unclaimed", async () => {
+    const lp = loaded(entry({ name: "quiet" }), {}, true);
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("quiet:x"), makeLog().log)).toBe("unclaimed");
+  });
+
+  test("the handler is called on its plugin object", async () => {
+    let self: unknown;
+    const plugin: Plugin = {
+      async interactions() {
+        self = this;
+      },
+    };
+    const lp = loaded(entry({ name: "bound" }), plugin, true);
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("bound:x"), makeLog().log)).toBe("answered");
+    expect(self).toBe(plugin);
+  });
+});
+
 describe("disposePlugins (#184)", () => {
   test("calls dispose only for running plugins, and flips running=false for each it disposes", async () => {
     const { log } = makeLog();
@@ -2211,6 +2543,146 @@ describe("disposePlugins (#184)", () => {
   });
 });
 
+// #409: `running` goes false when disposal BEGINS, not when dispose() settles -- so for the whole of a
+// slow dispose (up to PLUGIN_DISPOSE_TIMEOUT_MS) no gate hands the plugin anything new. Driven through
+// the real disposePlugins, never by setting the flag by hand.
+describe("disposePlugins: a plugin being disposed is refused by every gate (#409)", () => {
+  /** A running plugin with a command, a tick, a component handler, an autocomplete handler and an http
+   *  handler, whose dispose() stays pending until `finish()` -- and records every call it receives. */
+  const disposing = () => {
+    const reached: string[] = [];
+    let finish = () => {};
+    let runningWhenDisposeCalled: boolean | undefined;
+    const command: PluginCommand = {
+      ...cmd("search"),
+      handle: async () => void reached.push("command"),
+      autocomplete: async (i) => {
+        reached.push("autocomplete");
+        await i.respond([{ name: "x", value: "x" }]);
+      },
+    };
+    const lp = loaded(
+      entry({ name: "busy" }),
+      {
+        commands: [command],
+        ticks: [{ name: "t", run: async () => void reached.push("tick") }],
+        interactions: async () => void reached.push("interaction"),
+        http: async () => {
+          reached.push("http");
+          return new Response("ok");
+        },
+        dispose: () => {
+          runningWhenDisposeCalled = lp.running;
+          return new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+        },
+      },
+      true,
+    );
+    return { lp, reached, finish: () => finish(), runningWhenDisposeCalled: () => runningWhenDisposeCalled };
+  };
+
+  test("running is already false when dispose() is called, and the moment disposePlugins returns its promise", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const pending = disposePlugins([d.lp], log, 5_000);
+    expect(d.lp.running).toBe(false); // synchronously, before anything is awaited
+    await Bun.sleep(0);
+    expect(d.runningWhenDisposeCalled()).toBe(false);
+    d.finish();
+    expect(await orHung(pending)).toBeUndefined();
+    expect(d.lp.running).toBe(false);
+  });
+
+  test("while dispose() is pending: HTTP 503, the command's running() false, component unclaimed, autocomplete empty, tick skipped", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const map = pluginCommandMap([d.lp], [], log);
+    const checks = pluginTicks([d.lp], log);
+    expect(checks).toHaveLength(1); // so the tick half below asserts something
+    const pending = disposePlugins([d.lp], log, 5_000);
+    await Bun.sleep(0); // dispose() has been called and is still pending
+
+    expect((await routeHttpRequest([d.lp], new Request("http://bot.internal/busy/x"), "ip", log)).status).toBe(503);
+    expect(findPluginCommand(map, [d.lp], "search")?.running()).toBe(false);
+    expect(await dispatchPluginInteractionOutcome([d.lp], fakeInteraction("busy:press"), log)).toBe("unclaimed");
+    const responses: unknown[][] = [];
+    const autocomplete = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => void responses.push(choices),
+    };
+    await dispatchPluginAutocomplete({ interaction: autocomplete as never, bare: "search", map, loaded: [d.lp], gate: async () => undefined, log });
+    expect(responses).toEqual([[]]);
+    await checks[0]!.run();
+
+    expect(d.reached).toEqual([]); // nothing reached the plugin while it was being disposed
+    d.finish();
+    await orHung(pending);
+  });
+
+  test("an autocomplete whose gate was still answering when disposal began is not handed to the plugin: empty list", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    const map = pluginCommandMap([d.lp], [], log);
+    let pending: Promise<void> | undefined;
+    const responses: unknown[][] = [];
+    const autocomplete = {
+      commandName: "search",
+      responded: false,
+      respond: async (choices: unknown[]) => void responses.push(choices),
+    };
+    await dispatchPluginAutocomplete({
+      interaction: autocomplete as never,
+      bare: "search",
+      map,
+      loaded: [d.lp],
+      gate: async () => {
+        pending = disposePlugins([d.lp], log, 5_000); // the real disposal begins while the gate is awaited
+        return undefined; // and the gate lets it run here
+      },
+      log,
+    });
+    expect(responses).toEqual([[]]);
+    expect(d.reached).toEqual([]);
+    d.finish();
+    await orHung(pending!);
+  });
+
+  test("every plugin is off before any plugin's dispose() runs, not only its own", async () => {
+    const { log } = makeLog();
+    const seen: Record<string, boolean> = {};
+    const a: LoadedPlugin = loaded(entry({ name: "a" }), { dispose: async () => void (seen.bWhenADisposed = b.running) }, true);
+    const b: LoadedPlugin = loaded(entry({ name: "b" }), { dispose: async () => void (seen.aWhenBDisposed = a.running) }, true);
+    await orHung(disposePlugins([a, b], log, 5_000));
+    expect(seen).toEqual({ bWhenADisposed: false, aWhenBDisposed: false });
+  });
+
+  test("a request whose body was still arriving when disposal began is not handed to the plugin: 503", async () => {
+    const { log } = makeLog();
+    const d = disposing();
+    let push: (c: Uint8Array) => void = () => {};
+    let end = () => {};
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (c) => controller.enqueue(c);
+        end = () => controller.close();
+      },
+    });
+    const request = new Request("http://bot.internal/busy/x", { method: "POST", body, duplex: "half" } as RequestInit);
+    const response = routeHttpRequest([d.lp], request, "ip", log, 60_000, 1_024);
+    push(new Uint8Array(10));
+    await Bun.sleep(5);
+    const pending = disposePlugins([d.lp], log, 5_000); // the real disposal, not the flag set by hand
+    end();
+    expect((await response).status).toBe(503);
+    expect(d.reached).toEqual([]);
+    d.finish();
+    await orHung(pending);
+  });
+});
+
 describe("buildPluginStateFile", () => {
   const previous: PluginStateFile = {
     hostApiVersion: 1,
@@ -2240,6 +2712,72 @@ describe("buildPluginStateFile", () => {
     expect(state.plugins[0]?.notifiedVersion).toBe("0.9.0");
     expect(state.plugins[0]?.skippedVersion).toBe("0.8.0");
     expect(state.pendingReport).toEqual(previous.pendingReport);
+  });
+
+  // #410: an explicit PLUGINS pin is recorded as installedVersion only once it has installed -- a pin that
+  // was skipped at selection or failed to install never replaces the last-good version. (Installed is not
+  // the same as came up: a pin that installed but failed to load or activate is still recorded, pinned
+  // below, the same as any installed version and #104's "updated but failed to start" outcome.)
+  describe("an explicit PLUGINS pin is recorded only when it installed (#410)", () => {
+    const e = entry({ name: "p", version: "1.0.0" });
+    const lastGood: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [{ name: "p", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }],
+    };
+    const build = (over: Partial<Parameters<typeof buildPluginStateFile>[0]>) =>
+      buildPluginStateFile({
+        selected: [{ name: "p", entry: e, pinnedVersion: "1.0.9" }],
+        installed: [],
+        installSkips: {},
+        fallbacks: {},
+        loaded: [],
+        loadErrors: {},
+        processEnv: {},
+        previous: lastGood,
+        now: new Date("2026-10-11T00:00:00.000Z"),
+        ...over,
+      });
+
+    test("a pin that failed to install keeps the previous last-good installedVersion, and names the failure", () => {
+      const state = build({ installSkips: { p: "registry 404 for 1.0.9" } });
+      expect(state.plugins[0]).toMatchObject({ name: "p", installedVersion: "1.0.0", active: false, error: "registry 404 for 1.0.9" });
+    });
+
+    test("a pin skipped at selection is not recorded either: for a host API it needs, or because the index lacks the plugin", () => {
+      const state = build({ selected: [{ name: "p", entry: e, pinnedVersion: "1.0.9", skipped: "needs host API v2, this bot is v1" }] });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.0", error: "needs host API v2, this bot is v1" });
+      const missing = build({ selected: [{ name: "p", pinnedVersion: "1.0.9", skipped: "not in the plugin index" }] });
+      expect(missing.plugins[0]).toMatchObject({ installedVersion: "1.0.0", error: "not in the plugin index" });
+    });
+
+    test("a failed pin with no last-good leaves installedVersion absent rather than inventing one", () => {
+      const state = build({ installSkips: { p: "404" }, previous: { hostApiVersion: 1, writtenAt: "", plugins: [] } });
+      expect(state.plugins[0]?.installedVersion).toBeUndefined();
+    });
+
+    test("a pin that installed but failed to activate is still recorded: installed is what is recorded, not came up", () => {
+      const e109 = entry({ name: "p", version: "1.0.9" });
+      const lp = loaded(e109, {}, false);
+      lp.error = "activate threw";
+      const state = build({
+        selected: [{ name: "p", entry: e109, pinnedVersion: "1.0.9" }],
+        installed: [{ entry: e109, version: "1.0.9", bundlePath: "/a" }],
+        loaded: [lp],
+      });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.9", active: false, error: "activate threw" });
+    });
+
+    test("a pin that installed is recorded", () => {
+      const e109 = entry({ name: "p", version: "1.0.9" });
+      const state = build({
+        selected: [{ name: "p", entry: e109, pinnedVersion: "1.0.9" }],
+        installed: [{ entry: e109, version: "1.0.9", bundlePath: "/a" }],
+        loaded: [loaded(e109, {}, true)],
+      });
+      expect(state.plugins[0]).toMatchObject({ installedVersion: "1.0.9", active: true });
+      expect(state.plugins[0]?.error).toBeUndefined();
+    });
   });
 
   test("a required env unset makes the plugin configured:false with missingEnv; error is the first failure", () => {
@@ -2524,9 +3062,9 @@ describe("readPluginState / writePluginState round-trip", () => {
     });
 
     // A bot that already booted under the bug had the plugin skipped and rewrote state.json. The last-good
-    // must survive that write, or the fix would only help bots that were never hit. (buildPluginStateFile
-    // records an explicit PLUGINS pin as installedVersion in preference to the previous one — host.ts:340 —
-    // so this holds when nothing pins the plugin explicitly, which is what recovery is about.)
+    // must survive that write, or the fix would only help bots that were never hit. (Since #410 it holds
+    // whether or not PLUGINS pins the plugin: buildPluginStateFile records only a version that actually
+    // installed, so a pin that was skipped or failed never replaces the last-good one.)
     test("a boot that SKIPPED the plugin (the pre-#222 outcome) keeps its last-good installedVersion when nothing pins it explicitly, so the next boot recovers it", async () => {
       const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
       try {
@@ -2549,6 +3087,68 @@ describe("readPluginState / writePluginState round-trip", () => {
         expect(written.plugins[0]).toMatchObject({ name: "wow", installedVersion: "1.5.0", active: false, error: HOST_API_SKIP });
         const pins = pinsFromState(written);
         expect(selectPlugins(bumped, [{ name: "wow" }], 1, [], pins)[0]!.skipped).toBeUndefined();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // #410's three-boot sequence, through real files and the real selection and installer: a typo'd pin must
+    // not outlive itself. Before the fix boot 2 wrote installedVersion 1.0.9, and boot 3 -- pin removed --
+    // reached for 1.0.9 again with no fallback, so the plugin stayed down until an explicit good pin.
+    test("a typo'd PLUGINS pin that fails to install does not outlive the pin: removing it brings the last-good back (#410)", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pluginstate-test-"));
+      try {
+        const index: PluginIndex = { schemaVersion: 1, generatedAt: "2026-10-11T00:00:00.000Z", plugins: [entry({ name: "foo", version: "1.0.0" })] };
+        mkdirSync(join(dir, "plugins", "foo", "1.0.0", "dist"), { recursive: true });
+        writeFileSync(join(dir, "plugins", "foo", "1.0.0", "dist", "plugin.js"), "v1.0.0"); // the last-good bundle stays cached
+        const fetched: string[] = [];
+        const deps = {
+          fetch: async (url: string) => {
+            fetched.push(url.split("/").pop()!);
+            return new Response("not found", { status: 404 }); // 1.0.9 does not exist
+          },
+          extract: async () => {},
+          now: () => 0,
+          log: makeLog().log,
+        };
+        const boot = async (configured: { name: string; version?: string }[], at: string) => {
+          const previous = await readPluginState(dir, realStorage);
+          const selected = selectPlugins(index, configured, 1, [], pinsFromState(previous));
+          const pins = Object.fromEntries(previous.plugins.map((p) => [p.name, { installedVersion: p.installedVersion, targetVersion: p.targetVersion }]));
+          const result = await installPlugins(selected, dir, pins, deps);
+          const loadedPlugins = result.installed.map((i) => loaded(i.entry, {}, true));
+          await writePluginState({
+            dataDir: dir,
+            storage: realStorage,
+            selected,
+            installed: result.installed,
+            installSkips: result.skips,
+            fallbacks: result.fallbacks,
+            loaded: loadedPlugins,
+            loadErrors: {},
+            processEnv: {},
+            previous,
+            now: () => new Date(at),
+          });
+          return result;
+        };
+
+        // Boot 1: foo comes up on 1.0.0.
+        expect((await boot([{ name: "foo" }], "2026-10-11T01:00:00.000Z")).installed.map((i) => i.version)).toEqual(["1.0.0"]);
+        // Boot 2: PLUGINS=foo@1.0.9, a typo -- the install fails and the plugin is down this boot, as it should be.
+        const boot2 = await boot([{ name: "foo", version: "1.0.9" }], "2026-10-11T02:00:00.000Z");
+        expect(boot2.installed).toEqual([]);
+        expect(fetched).toEqual(["1.0.9"]); // the typo really reached the registry, and failed there
+        const afterTypo = await readPluginState(dir, realStorage);
+        expect(afterTypo.plugins[0]).toMatchObject({ name: "foo", installedVersion: "1.0.0", active: false });
+        expect(afterTypo.plugins[0]?.error).toMatch(/1\.0\.9: 404/);
+        // Boot 3: the operator removes the pin -- foo is back on its last-good 1.0.0, from the cache.
+        fetched.length = 0;
+        const boot3 = await boot([{ name: "foo" }], "2026-10-11T03:00:00.000Z");
+        expect(boot3.installed.map((i) => i.version)).toEqual(["1.0.0"]);
+        expect(boot3.skips).toEqual({});
+        expect(fetched).toEqual([]); // nothing reached for 1.0.9 again
+        expect((await readPluginState(dir, realStorage)).plugins[0]).toMatchObject({ installedVersion: "1.0.0", active: true });
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
@@ -2688,7 +3288,7 @@ describe("readPluginState / writePluginState round-trip", () => {
         const boot2State = await readPluginState(dir, realStorage);
         expect(boot2State.plugins[0]).toMatchObject({ name: "p", enabled: false, installedVersion: "1.1.0" });
 
-        // Boot 3: p turned back on — pins built exactly as index.ts:137-139 does.
+        // Boot 3: p turned back on — pins built exactly as index.ts's activate() does.
         const throwingFetch = async (): Promise<Response> => {
           throw new Error("must not fetch — the pinned version is already cached");
         };
