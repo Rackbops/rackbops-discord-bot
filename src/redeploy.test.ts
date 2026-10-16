@@ -2783,6 +2783,23 @@ describe("healOwnName", () => {
     expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
   });
 
+  // A label missing on BOTH sides is not "the same": undefined === undefined must not make two unrelated
+  // containers one service. Each of the two labels is needed on this bot's side, separately.
+  test("a compose label missing on both sides never matches, whichever of the two it is", async () => {
+    const project = "com.docker.compose.project";
+    const service = "com.docker.compose.service";
+    const onlyService = { [service]: "bot" };
+    const onlyProject = { [project]: "warbandeer-discord-debug" };
+    for (const labels of [onlyService, onlyProject]) {
+      const h = harness({
+        self: { ...NEXT, Config: { ...SELF.Config, Labels: labels } },
+        holder: holder({ Config: { ...SELF.Config, Labels: labels } }),
+      });
+      expect(await healOwnName(h.deps), JSON.stringify(labels)).toBe("occupied");
+      expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
+    }
+  });
+
   test("a drifted -next-next name folds back to the base in one hop", async () => {
     const h = harness({ self: { ...SELF, Name: "/warbandeer-discord-next-next" } });
     expect(await healOwnName(h.deps)).toBe("renamed");
@@ -2812,5 +2829,73 @@ describe("healOwnName", () => {
     const h = harness({ self: SELF, holder: holder() });
     await healOwnName(h.deps);
     expect(h.events.filter((e) => e.startsWith("inspect:"))).toEqual([]);
+  });
+});
+
+// The same heal through the REAL docker.ts calls, against a recording `fetch`: the default seams (the un-forced
+// removal, the rename's query, the inspect by NAME) are the ones the injected-seam tests above do not exercise.
+describe("healOwnName — real daemon calls (#547)", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = SELF_SHORT_ID;
+  const HOLDER_ID = "e".repeat(64);
+  let calls: { method: string; path: string; url: string }[] = [];
+  let logSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+    logSpy = spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+    logSpy.mockRestore();
+  });
+
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+  function stubDaemon(holder?: ContainerInspect) {
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ method, path: pathname, url: String(url) });
+      if (pathname === `/containers/${HOSTNAME}/json`) return json({ ...SELF, Name: "/warbandeer-discord-next" });
+      if (pathname === "/containers/warbandeer-discord/json") return holder ? json(holder) : new Response("", { status: 404 });
+      if (method === "DELETE" && pathname === `/containers/${HOLDER_ID}`) return new Response("", { status: 204 });
+      if (method === "POST" && pathname === `/containers/${SELF_ID}/rename`) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  test("a free base name: one inspect of itself, one of the name, then the rename, and no removal", async () => {
+    stubDaemon();
+    expect(await healOwnName()).toBe("renamed");
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      `GET /containers/${HOSTNAME}/json`,
+      "GET /containers/warbandeer-discord/json",
+      `POST /containers/${SELF_ID}/rename`,
+    ]);
+    expect(new URL(calls[2]!.url).searchParams.get("name")).toBe("warbandeer-discord");
+  });
+
+  test("a stopped holder of the same compose service is removed by id, un-forced, before the rename", async () => {
+    stubDaemon({ ...SELF, Id: HOLDER_ID, Name: "/warbandeer-discord", State: { Running: false, Status: "exited", ExitCode: 0 } });
+    expect(await healOwnName()).toBe("renamed");
+    const del = calls.findIndex((c) => c.method === "DELETE");
+    const ren = calls.findIndex((c) => c.path.endsWith("/rename"));
+    expect(calls[del]!.path).toBe(`/containers/${HOLDER_ID}`);
+    expect(new URL(calls[del]!.url).searchParams.get("force")).toBeNull(); // a holder started since the inspect is a 409, not a kill
+    expect(ren).toBeGreaterThan(del);
+  });
+
+  test("a running holder: no removal and no rename reach the daemon", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      stubDaemon({ ...SELF, Id: HOLDER_ID, Name: "/warbandeer-discord", State: { Running: true, Status: "running", ExitCode: 0 } });
+      expect(await healOwnName()).toBe("occupied");
+      expect(calls.some((c) => c.method === "DELETE" || c.path.endsWith("/rename"))).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
