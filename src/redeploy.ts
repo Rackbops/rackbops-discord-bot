@@ -55,11 +55,34 @@ export function canonicalName(inspectedName: string): string {
 /**
  * `canonicalName` without any trailing `-next`: the name the compose file's `container_name` pins (#547). The
  * suffix is reserved for the replacement (`replacementName`), so a name that ends in it is taken to be a
- * replacement that has not taken the canonical name (`namedAfterItsProject` is the exception: a deployment
- * called `...-next`), and a drifted `<name>-next-next` folds back to `<name>`.
+ * replacement that has not taken the canonical name, and a drifted `<name>-next-next` folds back to `<name>`.
+ * `ownName` is what the code asks, because it knows the one deployment that legitimately ends in `-next`.
  */
 export function baseName(inspectedName: string): string {
   return canonicalName(inspectedName).replace(/(?:-next)+$/, "");
+}
+
+const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
+const COMPOSE_SERVICE_LABEL = "com.docker.compose.service";
+
+/** The compose project a container belongs to, from its label (null-safe: Docker can report no labels as `null`). */
+function projectOf(c: ContainerInspect): string | undefined {
+  return c.Config.Labels?.[COMPOSE_PROJECT_LABEL] || undefined;
+}
+
+/**
+ * The name a container is MEANT to carry, which is what a swap's replacement must end up with. `ops/install.sh`
+ * names a deployed instance's container after its compose project (`BOT_OPS_CONTAINER=$PROJECT`) and the
+ * replacement copies the original's labels, so with the project known: the project itself, and `<project>-next`
+ * is its replacement still waiting for the name. That keeps an instance called `next` or `canary-next`
+ * working: `rackbops-discord-bot-next` is its own name (it self-updates, and its replacement is
+ * `rackbops-discord-bot-next-next`), and `baseName` would have taken it for an un-renamed replacement. Anything
+ * else falls back to `baseName`, the reserved-suffix rule: a name that ends in `-next` is a replacement.
+ */
+export function ownName(inspectedName: string, project?: string): string {
+  const current = canonicalName(inspectedName);
+  if (project && (current === project || current === `${project}-next`)) return project;
+  return baseName(inspectedName);
 }
 
 /**
@@ -68,12 +91,14 @@ export function baseName(inspectedName: string): string {
  * once it has run (`completeTakeOver`, #548). Keeping the canonical name is what lets `bot-ops.sh` and the
  * desktop Ops panels, which filter on it, keep working across a swap with no change.
  *
- * Derived from the BASE name (#492): `-next` is a reserved suffix, so a bot that is still named
+ * Derived from the bot's OWN name (#492, `ownName`): `-next` is a reserved suffix, so a bot that is still named
  * `<name>-next` is never asked for `<name>-next-next`, and `redeploy()` REFUSES to run from one rather than
- * target its own name — see its docstring. A drifted `<name>-next-next` folds back to `<name>-next`.
+ * target its own name — see its docstring. A drifted `<name>-next-next` folds back to `<name>-next`. The one
+ * exception is a deployment whose own name ends in `-next` (known from its compose project): its replacement
+ * is `<name>-next`, e.g. `prod-next-next`.
  */
-export function replacementName(inspectedName: string): string {
-  return `${baseName(inspectedName)}-next`;
+export function replacementName(inspectedName: string, project?: string): string {
+  return `${ownName(inspectedName, project)}-next`;
 }
 
 /** A git URL the daemon can fetch a build context from: the whole repo at the target ref
@@ -252,9 +277,11 @@ export interface RedeployOptions {
  * therefore not a return: it starts the retirement wait, and outliving that wait is itself a
  * failure (`stalled`), because the one thing `ready` promised was a stop that never came.
  *
- * Two refusals, both before anything is quiesced or created (#492, #547): a bot whose own name ends in
- * `-next` (the suffix is reserved for the replacement; the message says what to do, and `healOwnName`
- * is what takes the canonical name back at boot), checked on the name alone before the build; and a
+ * Two refusals, both before anything is quiesced or created (#492, #547): a bot that is itself named
+ * `<name>-next` (the suffix is reserved for the replacement; the message says what to do, and `healOwnName`
+ * is what takes the canonical name back at boot), checked on the name and labels alone before the build —
+ * a deployment whose OWN name ends in `-next`, known from its compose project (`ownName`), is not refused
+ * and self-updates into `<name>-next`; and a
  * RUNNING container already holding the replacement's name, checked after the build so one that appeared
  * during it is seen. Nothing is ever force-removed by name.
  */
@@ -271,17 +298,17 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // Nothing was created yet, so there is nothing of ours to remove (#451).
     return { error: `could not inspect own container: ${(err as Error).message}`, replacement: "none" };
   }
-  if (canonicalName(self.Name) !== baseName(self.Name)) {
-    // #547/#492: a bot that is itself `<name>-next` must not sweep or create under that name. Refused here,
-    // before anything is built, on the name alone: no daemon call beyond the self-inspect above, and nothing to
-    // unwind. `docker restart` is only advised where `healOwnName` would act: a swap's replacement (HANDOFF_FROM
-    // set), not one that is named after its compose project, which is the deployment's own name (install.sh).
-    const current = canonicalName(self.Name);
+  const current = canonicalName(self.Name);
+  if (current !== ownName(self.Name, projectOf(self))) {
+    // #547/#492: a bot that is itself `<name>-next` (a replacement that has not taken its name, or a container
+    // that merely ends in the reserved suffix) must not sweep or create under that name. Refused here, before
+    // anything is built, on the name and labels alone: no daemon call beyond the self-inspect above, and nothing
+    // to unwind. A deployment whose OWN name ends in `-next` (its compose project's, as install.sh names it) is
+    // not refused: `ownName` knows it, and its replacement is `<name>-next`.
     return {
-      error:
-        process.env[HANDOFF_FROM_ENV] && !namedAfterItsProject(self)
-          ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
-          : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name (for an install.sh instance, another instance name) and recreate it",
+      error: process.env[HANDOFF_FROM_ENV]
+        ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
+        : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name and recreate it",
       replacement: "none",
     };
   }
@@ -312,7 +339,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     .then((img) => img.Config.Env)
     .catch(() => []);
 
-  const name = replacementName(self.Name);
+  const name = replacementName(self.Name, projectOf(self));
   // #492: whatever holds the replacement's name is inspected here, after the build (so a holder that appeared
   // during it is seen) and before the quiesce. A RUNNING holder is never swept; a stopped one is removed by id
   // below, un-forced, so one that starts in between is a 409 and a reported failure, not a kill.
@@ -1085,19 +1112,6 @@ export async function resolveBootMode(
   }
 }
 
-const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
-const COMPOSE_SERVICE_LABEL = "com.docker.compose.service";
-
-/**
- * Named after its own compose project: `ops/install.sh` names a deployed instance's container after its project
- * (`BOT_OPS_CONTAINER=$PROJECT`), so such a name is the deployment's own, whatever it ends in — `-next` included
- * (instance `next`, `canary-next`). The reserved suffix does not apply to it: `healOwnName` leaves it alone and
- * `redeploy()` does not advise a restart for it. Labels are read null-safely: a container with none has no project.
- */
-function namedAfterItsProject(c: ContainerInspect): boolean {
-  return canonicalName(c.Name) === c.Config.Labels?.[COMPOSE_PROJECT_LABEL];
-}
-
 export type HealOutcome = "canonical" | "renamed" | "occupied" | "unknown";
 
 /** Test seams for {@link healOwnName}; each defaults to the real daemon call. */
@@ -1119,28 +1133,22 @@ export interface HealDeps {
  * RUNNING holder alone and says so. The swap's own stopped original is never that holder: it is
  * `HANDOFF_FROM` itself, and while it exists the boot is `standby` and `completeTakeOver` converges it
  * (remove, rename), so the corpse a failed removal leaves is the standby path's, never this one's.
- * Bounded and best-effort: the boot continues on every outcome. A container named after its own compose
- * project (`namedAfterItsProject`: how `ops/install.sh` names an instance, `-next` included) is never renamed.
- * The limit: that exemption, and the `HANDOFF_FROM` gate, are all that tell a deployment's own `*-next` name
- * from a swap's replacement, so three narrow cases go the wrong way, none reachable through install.sh: a
- * container created by `compose` alone with a `container_name` ending in `-next` that has also self-updated
- * before #547 is indistinguishable and would be renamed; a swap's replacement whose name equals its project
- * label (a hand-written compose with project `foo-next` and `container_name: foo`) is exempt and not healed;
- * and a replacement stuck unrenamed from before #547 for an instance named `P-next` is `P-next-next`, which is
- * healed to `P`, not `P-next`.
+ * Bounded and best-effort: the boot continues on every outcome. The name it takes is `ownName`'s: the compose
+ * project's when the container is that or `<project>-next` (how `ops/install.sh` names an instance, a `-next`
+ * one included), otherwise the name without its `-next` suffixes.
+ * The limit: that rule and the `HANDOFF_FROM` gate are all that tell a deployment's own `*-next` name from a
+ * swap's replacement, so two narrow cases go the wrong way, neither reachable through install.sh: a container
+ * created by `compose` alone with a `container_name` ending in `-next` that is not its project's, and had
+ * already self-updated before #547, is indistinguishable from a replacement and would be renamed; and a
+ * container named exactly `<project>-next` is taken for its project's replacement.
  */
 export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
   const log = deps.log ?? console;
   const run = async (): Promise<HealOutcome> => {
     const self = await (deps.inspectSelf ?? inspectSelf)();
     const current = canonicalName(self.Name);
-    const base = baseName(self.Name);
+    const base = ownName(self.Name, projectOf(self));
     if (current === base) return "canonical";
-    if (namedAfterItsProject(self)) {
-      // An install.sh instance named `next` or `canary-next`: the name is the deployment's own, not a swap's.
-      log.log(`[handoff] this bot is named ${current}, like its compose project — that is its own name, leaving it`);
-      return "canonical";
-    }
     const holder = await (deps.inspect ?? tryInspectContainer)(base);
     if (holder) {
       if (holder.State.Running) {

@@ -451,10 +451,12 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   same compose project and service (which it removes first); with `<name>` RUNNING it leaves both alone and logs
   `two bots on one token` (stop one by hand). A compose-created container renamed to `*-next` by hand is not healed
   (its `/update` is refused with the `container_name` advice instead); a swapped-in container still named
-  `<name>-next` has its `/update` refused with that restart as the advice. An instance whose container is
-  named `-next` after its own compose project (`install.sh next`, `canary-next`) is never renamed and cannot
-  self-update: pick another instance name. A compose-only deployment whose `container_name` ends in `-next` and
-  that had already self-updated before #547 would be renamed at its next boot. (c) Neither yet: wait. An **exited** `<name>-next` blocks
+  `<name>-next` has its `/update` refused with that restart as the advice. An install.sh instance whose
+  name ends in `-next` (`install.sh next`, `canary-next`) keeps it: the bot knows its own name from its compose
+  project, self-updates into `<name>-next`, and a replacement that never took its name is healed to the
+  instance's name. A compose-only deployment whose `container_name` ends in `-next` without being its
+  project's, and that had already self-updated before #547, would be renamed at its next boot (an install-time
+  guard against `-next` instance names is #567). (c) Neither yet: wait. An **exited** `<name>-next` blocks
   nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
   (`docker rm <name>-next` clears it sooner).
 

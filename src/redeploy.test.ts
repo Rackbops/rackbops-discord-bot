@@ -15,6 +15,7 @@ const {
   FIRST_TICK_CAP_MS,
   healOwnName,
   latestTag,
+  ownName,
   redeploy,
   replacementName,
   resolveBootMode,
@@ -90,6 +91,26 @@ describe("naming", () => {
   test("the replacement's name is derived from the base, so a drifted name folds back to <name>-next", () => {
     expect(replacementName("/warbandeer-discord-next")).toBe("warbandeer-discord-next");
     expect(replacementName("/warbandeer-discord-next-next")).toBe("warbandeer-discord-next");
+  });
+
+  // ops/install.sh names a deployed instance's container after its compose project, and the replacement copies
+  // the original's labels: with the project known, an instance whose OWN name ends in -next (`next`,
+  // `canary-next`) is told apart from a replacement that has not taken its name.
+  test("ownName and replacementName know a deployment whose own name ends in -next, from its compose project", () => {
+    const P = "rackbops-discord-bot-next";
+    expect(ownName(`/${P}`, P)).toBe(P); // its own name
+    expect(replacementName(`/${P}`, P)).toBe(`${P}-next`); // so it self-updates, into <name>-next
+    expect(ownName(`/${P}-next`, P)).toBe(P); // its replacement, waiting for the name
+    expect(ownName("/rackbops-discord-bot-prod-next", "rackbops-discord-bot-prod")).toBe("rackbops-discord-bot-prod");
+    expect(ownName("/rackbops-discord-bot-prod", "rackbops-discord-bot-prod")).toBe("rackbops-discord-bot-prod");
+  });
+
+  test("without a matching project the reserved-suffix rule applies: a name ending in -next is a replacement", () => {
+    expect(ownName("/x-next", "unrelated")).toBe("x");
+    expect(ownName("/x-next")).toBe("x");
+    expect(ownName("/x-next", undefined)).toBe("x");
+    expect(ownName("/warbandeer-discord", "warbandeer-discord-debug")).toBe("warbandeer-discord");
+    expect(replacementName("/x", "")).toBe("x-next"); // an empty label is no project
   });
 });
 
@@ -1571,6 +1592,8 @@ describe("redeploy — cleanup always runs", () => {
     /** The answer to a removal of the replacement's name BY NAME (default: the catch-all 404). */
     nameDelete?: () => Response;
   }) {
+    // The name `redeploy()` will derive for its replacement from the self-inspect this stub answers with.
+    const replName = replacementName((o.self ?? SELF).Name, (o.self ?? SELF).Config.Labels?.["com.docker.compose.project"]);
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
@@ -1586,11 +1609,11 @@ describe("redeploy — cleanup always runs", () => {
       if (pathname === `/containers/${HOSTNAME}/json`) {
         return o.selfInspectFails ? new Response("boom", { status: 500 }) : jsonRes(o.self ?? SELF);
       }
-      if (pathname === `/containers/${replacementName(SELF.Name)}/json`) {
+      if (pathname === `/containers/${replName}/json`) {
         pendingAt.leftover = restartPending();
         return o.leftover ? o.leftover() : new Response("", { status: 404 });
       }
-      if (o.nameDelete && method === "DELETE" && pathname === `/containers/${replacementName(SELF.Name)}`) {
+      if (o.nameDelete && method === "DELETE" && pathname === `/containers/${replName}`) {
         return o.nameDelete();
       }
       if (pathname === `/containers/${LEFTOVER_ID}` && method === "DELETE") {
@@ -1755,15 +1778,37 @@ describe("redeploy — cleanup always runs", () => {
     expect(calls.some((c) => c.path === "/build")).toBe(false);
   });
 
-  // An install.sh instance is named after its compose project, and that name is the deployment's own: a restart
-  // would not heal it (the heal leaves it alone), so the advice is the one that can be followed.
-  test("a bot named -next after its compose project is told to pick another name, never to restart", async () => {
+  // The pin for an install.sh instance whose own name ends in -next (instance `next`, `canary-next`): its container
+  // is named after its compose project, so it is NOT a replacement waiting for a name. It self-updates, and its
+  // standby is <name>-next (here rackbops-discord-bot-next-next); nothing refuses it and nothing renames it.
+  const projectNamed = (name: string): ContainerInspect => ({
+    ...SELF,
+    Name: `/${name}`,
+    Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
+  });
+
+  test("a bot whose own -next name is its compose project's still self-updates, into <name>-next", async () => {
     stubDaemon({
-      self: {
-        ...SELF,
-        Name: "/rackbops-discord-bot-next",
-        Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
-      },
+      self: projectNamed("rackbops-discord-bot-next"),
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID; // a swapped-in container that has taken its name: the worst case for a name-only rule
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.outcome).toBe("failed"); // it got as far as the verdict: nothing refused it
+      expect(result.error).toBeUndefined();
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+    const create = calls.find((c) => c.path === "/containers/create");
+    expect(new URL(create!.url).searchParams.get("name")).toBe("rackbops-discord-bot-next-next");
+    expect(calls.some((c) => c.path === "/build")).toBe(true);
+  });
+
+  test("the un-renamed replacement of such an instance is refused with the restart advice (its heal takes the project's name)", async () => {
+    stubDaemon({
+      self: projectNamed("rackbops-discord-bot-next-next"),
       pollReplacement: () => {
         throw new Error("must not poll");
       },
@@ -1772,12 +1817,12 @@ describe("redeploy — cleanup always runs", () => {
     process.env[HANDOFF_FROM_ENV] = SELF_ID;
     try {
       const result = await redeploy("1".repeat(40));
-      expect(result.error).toContain("container_name");
-      expect(result.error).toContain("another instance name");
-      expect(result.error).not.toContain("docker restart");
+      expect(result.replacement).toBe("none");
+      expect(result.error).toContain("docker restart rackbops-discord-bot-next-next");
     } finally {
       delete process.env[HANDOFF_FROM_ENV];
     }
+    expect(calls.some((c) => c.path === "/build")).toBe(false);
   });
 
   // #492: whatever holds the replacement's name is inspected after the build, outside the quiesce.
@@ -1887,6 +1932,22 @@ describe("redeploy — cleanup always runs", () => {
     } finally {
       delete process.env[HANDOFF_FROM_ENV];
     }
+  });
+
+  // The "no id" half of the foreign-holder rule: with an id the removal is forced and a 409 is OUR replacement
+  // (it started, then something held it), reported as remove-failed, never as someone else's container.
+  test("a 409 on the forced cleanup by id is remove-failed, not a foreign holder", async () => {
+    stubDaemon({
+      startFails: true,
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("conflict", { status: 409 }),
+    });
+    const result = await redeploy("9".repeat(40));
+    expect(result.replacement).toBe("remove-failed");
+    expect(result.replacementError).toContain("409");
+    expect(result.error).not.toContain("held by a container I did not start");
   });
 
   // The window between the inspect and the sweep: a stopped leftover that someone starts in it is a 409 on the
@@ -2880,19 +2941,36 @@ describe("healOwnName", () => {
 
   // install.sh names an instance's container after its compose project: an instance called `next` or
   // `canary-next` has a -next name of its own, which a boot that has HANDOFF_FROM must not rename away.
-  test("a container named after its own compose project is never renamed, whatever it ends in", async () => {
-    const own = {
-      ...SELF,
-      Name: "/rackbops-discord-bot-next",
-      Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
-    };
-    const h = harness({ self: own });
+  const projectLabeled = (name: string, project: string): ContainerInspect => ({
+    ...SELF,
+    Name: `/${name}`,
+    Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": project } },
+  });
+
+  test("a container named after its own compose project is its own name, whatever it ends in", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-next", "rackbops-discord-bot-next") });
     expect(await healOwnName(h.deps)).toBe("canonical");
     expect(h.events).toEqual(["inspectSelf"]); // no inspect of the base, no removal, no rename
-    expect(h.logs.filter((l) => l.level === "log")).toHaveLength(1);
-    // The same name WITHOUT the project label is a swap's replacement and is healed.
-    const swapped = harness({ self: { ...own, Config: { ...own.Config, Labels: { ...SELF.Config.Labels } } } });
+    // The same name WITHOUT that project label is a swap's replacement of a compose-only deployment: healed.
+    const swapped = harness({ self: projectLabeled("rackbops-discord-bot-next", "something-else") });
     expect(await healOwnName(swapped.deps)).toBe("renamed");
+    expect(swapped.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot", `rename:${SELF_ID}:rackbops-discord-bot`]);
+  });
+
+  // The pin (b): the real standby case, an install.sh instance's replacement, named <project>-next with the
+  // original's labels (the project is the base name): healed to the project's name.
+  test("a -next container whose compose project is the base name is a replacement and is healed", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-prod-next", "rackbops-discord-bot-prod") });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot-prod", `rename:${SELF_ID}:rackbops-discord-bot-prod`]);
+  });
+
+  // And the replacement of the -next instance itself: <project>-next carries the project <project>, so its heal takes
+  // <project> (the instance's own name), not the base name without its -next.
+  test("the replacement of an instance whose own name ends in -next is healed to that name, not to the base", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-next-next", "rackbops-discord-bot-next") });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot-next", `rename:${SELF_ID}:rackbops-discord-bot-next`]);
   });
 
   test("a holder whose labels are null is another service, not a crash", async () => {
