@@ -301,6 +301,20 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
       expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
     });
 
+    test("T1c: a file that vanishes between exists() and json() also makes a later corruption be said again", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+      expect(storageStateForTest().kept).toBe(1);
+      const vanishing = failJsonRead(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+      try {
+        await readJsonOrFresh(file, () => ({ n: 0 }), "test", { onCorrupt: "keep" });
+      } finally {
+        vanishing.restore();
+      }
+      expect(storageStateForTest().kept).toBe(0);
+    });
+
     test("T2: redactReason keeps the parser's message, which can quote the file, out of the kept-file line", async () => {
       const file = join(dir, "x.json");
       writeFileSync(file, `{ "a": ${BARE} }`);
