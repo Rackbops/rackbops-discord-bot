@@ -1045,6 +1045,23 @@ describe("redeploy — cleanup always runs", () => {
     expect(reads).toBe(3);
   });
 
+  // The handoff deadline runs on the injected clock too: each reading advances it 20 s, so a 60 s deadline is
+  // reached on the second poll. On the real clock it would wait out the 60 s itself and the test would time out.
+  test("the handoff deadline is measured on the injected clock", async () => {
+    let t = Date.now();
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF), // running, never signalling
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      now: () => (t += 20_000),
+      handoffDeadlineMs: 60_000,
+      pollMs: 1,
+    });
+    expect(result.outcome).toBe("timeout");
+    expect(result.error).toBeUndefined();
+  });
+
   // The clock seam: every verdict time comes from `now`. The injected clock is an hour ahead and the
   // replacement's StartedAt is 30 minutes ahead of real time: judged against the injected clock it is the
   // same life (removed); judged against the real clock it would read as a later one (left alone).
