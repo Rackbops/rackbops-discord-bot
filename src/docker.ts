@@ -14,9 +14,14 @@ import { clampUpstreamBody } from "./github";
  *  the same path), so a deployment never sets it; the suite's end-to-end transport test (#459) points a
  *  child process at a socket it serves itself. Deliberately absent from `.env.example`, reserved in
  *  `bot-ops.sh` (never panel-editable, never claimable by a plugin manifest), and cleared by the test
- *  preload so an ambient value cannot aim the suite at a real daemon. A plain environment read, like
- *  HOSTNAME's below. */
-const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
+ *  preload so an ambient value cannot change what the suite asserts. A plain environment read, like
+ *  HOSTNAME's below. An EMPTY value counts as unset (as it does for `BOT_DATA_DIR` and `config.ts`'s
+ *  `optional()`): the operator's whole `.env` reaches this process, and a blank `DOCKER_SOCKET=` line must
+ *  not turn every daemon call into a connection to nowhere. */
+export function resolveDockerSocket(env: Record<string, string | undefined> = process.env): string {
+  return env.DOCKER_SOCKET || "/var/run/docker.sock";
+}
+const DOCKER_SOCKET = resolveDockerSocket();
 const BASE = "http://docker";
 
 // Every daemon call is bounded, so a genuinely hung socket (connected, far end never responds and
@@ -189,9 +194,10 @@ export async function tryInspectContainer(
  * would call every broken build a success.
  *
  * Success is the absence of an error line, nothing more: a stream that was cleanly truncated reads
- * as `ok`, and is caught one call later by `createContainer`'s 404 on the tag that was never made
- * (the classic builder and BuildKit end their streams differently, so no one success marker is safe
- * to require).
+ * as `ok`. Requiring a success marker was considered and declined; such a build surfaces later, not
+ * here — `redeploy()` goes on to prune images, inspect itself, quiesce the scheduler and clear any
+ * leftover replacement, and then `createContainer` 404s on the tag that was never made, reported as `could not
+ * start the replacement: …` (after which `endHandoff()` resumes the scheduler), not as `build failed:`.
  */
 export function parseBuildOutput(body: string): { ok: boolean; error?: string } {
   for (const line of body.split("\n")) {

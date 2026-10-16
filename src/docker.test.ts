@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseBuildOutput, parseContainerId, STOP_TIMEOUT_SEC } from "./docker";
+import { parseBuildOutput, parseContainerId, resolveDockerSocket, STOP_TIMEOUT_SEC } from "./docker";
 import { settleWithin } from "../test/settleWithin";
 import { TEST_DATA_PREFIX } from "../test/sweep";
 
@@ -50,6 +50,19 @@ describe("parseContainerId", () => {
   // Short ids appear all over docker output; only the full 64-hex one identifies a container.
   test("ignores a short id", () => {
     expect(parseContainerId("1 1 0:1 /containers/abc123/hostname /etc/hostname rw")).toBeUndefined();
+  });
+});
+
+// #459: the socket path is a test seam read once at import, so the in-process suite can only pin its default
+// (the `unix` assertions below). The choice itself is this pure function. An EMPTY value is unset: the whole
+// operator `.env` reaches the process, and `unix: ""` would send every call somewhere other than the daemon
+// (both reviewers' probes of Bun 1.4.2 saw it fail, one as a hang until the bound), the very failure the
+// transport pin exists to catch.
+describe("resolveDockerSocket (#459)", () => {
+  test("defaults to /var/run/docker.sock when the variable is unset or empty, and otherwise takes it as given", () => {
+    expect(resolveDockerSocket({})).toBe("/var/run/docker.sock");
+    expect(resolveDockerSocket({ DOCKER_SOCKET: "" })).toBe("/var/run/docker.sock");
+    expect(resolveDockerSocket({ DOCKER_SOCKET: "/srv/d.sock" })).toBe("/srv/d.sock");
   });
 });
 
@@ -506,8 +519,9 @@ describe("the real transport (#459)", () => {
           throw new Error(`fixture ${why}:\n${child.stderr.toString()}\n${child.stdout.toString()}`);
         }
         const last = child.stdout.toString().trim().split("\n").at(-1) ?? "";
-        const run = JSON.parse(last) as { ping: boolean; hang: Bounded; wedge: Bounded };
+        const run = JSON.parse(last) as { ping: boolean; hang: Bounded; wedge: Bounded; wedgeStatus: number };
         expect(run.ping).toBe(true);
+        expect(run.wedgeStatus).toBe(200); // the wedge handler's headers really arrived before it stalled
         for (const [shape, r] of [["hang", run.hang], ["wedge", run.wedge]] as const) {
           expect(r.ok, shape).toBe(false);
           expect(r.message, shape).toMatch(/timed out after 100ms/);

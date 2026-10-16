@@ -41,6 +41,15 @@ async function bounded(id: string): Promise<{ ok: boolean; message?: string; ela
 }
 const hang = await bounded("hang");
 const wedge = await bounded("wedge");
+// Without this the wedge case could silently become a second copy of the hang case (a renamed path in the
+// handler above would send nothing at all): prove the wedge handler really sends its headers, which is the
+// part that distinguishes it. A handler that sent none would leave this fetch waiting, and the parent's
+// spawn timeout kills the child -- red, not green.
+const probe = new AbortController();
+const wedgeResponse = await fetch("http://docker/containers/wedge/json", { unix: socket, signal: probe.signal });
+const wedgeStatus = wedgeResponse.status;
+probe.abort();
+await wedgeResponse.body?.cancel().catch(() => {});
 server.stop(true);
-console.log(JSON.stringify({ ping, hang, wedge }));
+console.log(JSON.stringify({ ping, hang, wedge, wedgeStatus }));
 process.exit(0);
