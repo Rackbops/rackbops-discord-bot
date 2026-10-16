@@ -305,7 +305,13 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
       stall.restore();
     }
     mkdirSync(`${file}.${process.pid}.${TMP_TOKEN}.${next}.tmp`);
-    await expect(writeJsonAtomic(file, { n: 1 })).rejects.toMatchObject({ code: "EISDIR" });
+    const thrown = await writeJsonAtomic(file, { n: 1 }).then(
+      () => undefined,
+      (err: unknown) => err as Error,
+    );
+    // Bun.write's own message, not rmSync's ("Path is a directory: rm returned EISDIR ...").
+    expect(thrown?.message).toMatch(/illegal operation on a directory/);
+    expect(thrown?.message).not.toMatch(/rm returned/);
   });
 
   // classifyReadError calls a read that fails with EISDIR an error, which is only unreachable because

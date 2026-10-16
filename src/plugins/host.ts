@@ -1202,8 +1202,9 @@ export function buildPluginStateFile(opts: {
   return state;
 }
 
-/** Reads the previous state.json (fresh if absent/corrupt) — the source of the preserved bookkeeping
- * fields and of the installed-version pins installPlugins resolves against. */
+/** Reads the previous state.json (fresh if absent/corrupt; rejects on a read error that is neither, #509) —
+ * the source of the preserved bookkeeping fields and of the installed-version pins installPlugins
+ * resolves against. */
 export async function readPluginState(dataDir: string, storage: HostStorage): Promise<PluginStateFile> {
   return storage.readJsonOrFresh<PluginStateFile>(statePath(dataDir), () => ({ ...STATE_FRESH }), "plugins");
 }

@@ -75,7 +75,10 @@ describe("index.ts wiring", () => {
     const write = source.indexOf("await writePluginState({", activateFn);
     for (const pos of [flagInit, read, flagCleared, guard, write]) expect(pos).toBeGreaterThan(activateFn);
     expect(flagInit).toBeLessThan(read);
-    expect(source.slice(read + readStmt.length, flagCleared).trim()).toBe(""); // cleared right after the read
+    // Cleared right AFTER the read, nothing in between. (`slice` with an end before its start is "", so the
+    // ordering has to be asserted on its own: a flag cleared before the read would pass the gap check.)
+    expect(flagCleared).toBeGreaterThan(read);
+    expect(source.slice(read + readStmt.length, flagCleared).trim()).toBe("");
     expect(guard).toBeLessThan(write);
     expect(source.slice(guard, write)).toMatch(/\} else \{\s*$/); // the write is the guard's else
   });

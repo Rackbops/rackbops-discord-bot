@@ -373,7 +373,10 @@ async function activate(c: Client<true>): Promise<void> {
     // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
     // same route with the same body, and its result is `single` -- so the line below is unchanged.
     // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
-    // and when it is skipped), into the catch below.
+    // and when it is skipped), into the catch below. So is a routing read that fails for a reason other
+    // than a parse error (#509): `applyRouting` reads routing first, outside any try, and `readJsonOrFresh`
+    // rethrows such a fault -- it lands in the same catch, under its registration headline, with the real
+    // error printed after it.
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),
