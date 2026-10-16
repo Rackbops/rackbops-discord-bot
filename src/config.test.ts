@@ -145,6 +145,8 @@ describe("resolveConfig", () => {
       expect(() => resolveConfig({ ...base, WATCHED_REPOS: `acme/ok,${bad}` })).toThrow(
         `WATCHED_REPOS must be "none" or a comma-separated list of owner/repo, got "${bad}"`,
       );
+      // The none hint belongs to the none spellings only: an unconditional hint would tell every typo about it.
+      expect(() => resolveConfig({ ...base, WATCHED_REPOS: `acme/ok,${bad}` })).not.toThrow(/lowercase word none/);
     }
     expect(resolveConfig({ ...base, WATCHED_REPOS: "Acme/Thing.js, x_y/z-w" }).watchedRepos).toEqual(["Acme/Thing.js", "x_y/z-w"]);
   });

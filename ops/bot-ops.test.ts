@@ -438,6 +438,48 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
   });
 });
 
+// #494 item 10: the WATCHED_REPOS twin of the PLUGINS pin above. env-set's row is the stricter reader (it also
+// refuses a space or an empty token, which resolveConfig trims), so the invariant is one-way: every value the
+// row accepts must boot. Each character-class member appears in the owner and in the repo part on its own, so
+// narrowing the bot's class in either part refuses something env-set accepted.
+const WATCHED_REPOS_CORPUS = [
+  "none", "None", "NONE", "nonE", "foo", "foo/", "/foo", "a/b/c", "a//b", "a b/c", "a/b c", "a/b@1", "a/b#c", "ünï/cøde",
+  "a/b", "A/B", "0/9", "a.b/c", "a/b.c", "a_b/c", "a/b_c", "a-b/c", "a/b-c", "0a/c", "a/b0", "Acme.js/thing_2-x", "a.b.c/d.e.f",
+  "a/b,c/d", "a/b,c/d,e/f", "a/b,None", "None,a/b", "none,a/b", "a/b,none", "a/b,foo", "a/b,,c/d", "a/b,", ",a/b", "a/b, c/d",
+  "",
+];
+/** Whether the bot boots with this WATCHED_REPOS value: resolveConfig is what src/config.ts runs at import. */
+const bootAcceptsRepos = (repos: string): boolean => {
+  try {
+    resolveConfig({ DISCORD_TOKEN: "x", ANNOUNCE_CHANNEL_ID: "11111", WATCHED_REPOS: repos });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+describe("bot-ops.sh WATCHED_REPOS row agrees with what the bot boots (#494, source pin)", () => {
+  const row = readFileSync(BOT_OPS_SH, "utf8").match(/^\s*'WATCHED_REPOS\|(.*)'\s*$/m);
+
+  test("every value the WATCHED_REPOS row accepts boots, so env-set accepts => the bot boots", () => {
+    expect(row).not.toBeNull();
+    const re = new RegExp(row![1]!);
+    // Both verdicts occur on both sides, so a bootAcceptsRepos that always threw (or never did) cannot pass vacuously.
+    expect(WATCHED_REPOS_CORPUS.some((v) => re.test(v))).toBe(true);
+    expect(WATCHED_REPOS_CORPUS.some((v) => !re.test(v) && !bootAcceptsRepos(v))).toBe(true);
+    expect(WATCHED_REPOS_CORPUS.some(bootAcceptsRepos)).toBe(true);
+    for (const v of WATCHED_REPOS_CORPUS) if (re.test(v)) expect(bootAcceptsRepos(v), v).toBe(true);
+  });
+
+  test("the corpus is not vacuous: None/NONE and a slash-less word are refused by the row AND by the bot", () => {
+    const re = new RegExp(row![1]!);
+    for (const v of ["None", "NONE", "foo", "a/b/c"]) {
+      expect(re.test(v), v).toBe(false);
+      expect(bootAcceptsRepos(v), v).toBe(false);
+    }
+  });
+});
+
 describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINER, no fallback (issue #41)", () => {
   test("BOT_OPS_PROJECT unset dies naming it, before touching docker", async () => {
     const fx = setup("");

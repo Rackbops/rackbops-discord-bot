@@ -121,9 +121,16 @@ describe("canonicalAddress", () => {
       ["FD00:0:0:0:0:0:0:1", "fd00::1"],
       ["2001:DB8::0001", "2001:db8::1"],
       ["64:ff9b::1.2.3.4", "64:ff9b::102:304"], // an embedded IPv4 tail comes out in hex
-      ["FE80::1%ETH0", "fe80::1%eth0"], // a zone id the URL parser refuses: left as typed, lowercased
+      // The hex fold, with bytes above 15 and 4-digit groups (a fold that masks, shifts or matches too little
+      // gets `::ffff:a00:5`, whose bytes are all below 16, right by accident).
+      ["::ffff:ac12:1", "172.18.0.1"],
+      ["::ffff:c0a8:101", "192.168.1.1"],
+      ["::ffff:ffff:ffff", "255.255.255.255"],
+      ["FE80::1%ETH0", "fe80::1"], // a zone id is dropped: Bun reports a link-local peer without one
+      ["fe80::b1c9:ea7d:c0c5:bd23%8", "fe80::b1c9:ea7d:c0c5:bd23"],
       ["10.0.0.5", "10.0.0.5"],
       ["cloudflared", "cloudflared"],
+      ["Not-An-Address", "Not-An-Address"], // anything that is not an IPv6 literal passes through untouched
     ];
     for (const [input, expected] of table) expect(canonicalAddress(input)).toBe(expected);
   });
@@ -162,6 +169,12 @@ describe("createTrustedProxy -- IPv6 spellings (#494)", () => {
     const compressed = createTrustedProxy({ host: "cloudflared", lookup: async () => ["fd00::1"] });
     await compressed.refresh();
     expect(compressed.isTrusted("FD00:0:0:0:0:0:0:1")).toBe(true);
+
+    // `dns.lookup` returns a link-local address WITH its zone (`...%8`); Bun reports the peer without one.
+    const zoned = createTrustedProxy({ host: "cloudflared", lookup: async () => ["fe80::b1c9:ea7d:c0c5:bd23%8"] });
+    await zoned.refresh();
+    expect(zoned.isTrusted("fe80::b1c9:ea7d:c0c5:bd23")).toBe(true);
+    expect(zoned.isTrusted("fe80::b1c9:ea7d:c0c5:bd24")).toBe(false);
 
     const mappedHex = createTrustedProxy({ host: "cloudflared", lookup: async () => ["::ffff:a00:5"] });
     await mappedHex.refresh();
@@ -214,6 +227,32 @@ describe("createTrustedProxy -- failures, logging and the boot bound (#493)", ()
     expect(calls).toBe(3);
   });
 
+  // No backoff, by decision: a name that never resolves is retried every REFRESH_RETRY_MS under traffic, which
+  // is one lookup per 5 s and one warning in total. Pinned so "only the first failure retries soon" is not
+  // mistaken for a harmless variant.
+  test("repeated failures keep retrying every retry window, and warn once", async () => {
+    let calls = 0;
+    let now = 0;
+    const warns: string[] = [];
+    const proxy = createTrustedProxy({
+      host: "cloudflared",
+      lookup: async () => {
+        calls += 1;
+        throw new Error("ENOTFOUND");
+      },
+      now: () => now,
+      log: { log: () => {}, warn: (m: string) => warns.push(m) },
+    });
+    await proxy.refresh(); // t=0: the first failure
+    for (const [t, expected] of [[4_999, 1], [5_000, 2], [9_999, 2], [10_000, 3], [14_999, 3], [15_000, 4]] as const) {
+      now = t;
+      proxy.isTrusted("10.0.0.99");
+      await Bun.sleep(0);
+      expect(calls, `t=${t}`).toBe(expected);
+    }
+    expect(warns).toHaveLength(1);
+  });
+
   test("a failure is warned once per streak, and the recovery logged once", async () => {
     const outcomes = ["ok", "fail", "fail", "ok", "ok"];
     const logs: string[] = [];
@@ -264,6 +303,34 @@ describe("createTrustedProxy -- failures, logging and the boot bound (#493)", ()
     expect(warns.some((w) => w.includes("has not resolved after 50ms"))).toBe(true);
     await Bun.sleep(700);
     expect(proxy.isTrusted("10.0.0.5")).toBe(true); // the late lookup replaced the set
+  });
+
+  test("a lookup that answers inside the bound leaves no late warning behind", async () => {
+    const warns: string[] = [];
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5"], log: { log: () => {}, warn: (m: string) => warns.push(m) } });
+    await proxy.refresh(50);
+    expect(proxy.isTrusted("10.0.0.5")).toBe(true);
+    // Mutation: a bound whose timer is never cleared fires its "has not resolved" warning 50 ms later, after
+    // a perfectly healthy boot.
+    await Bun.sleep(120);
+    expect(warns).toEqual([]);
+  });
+
+  // The old code cleared `inFlight` from the body's own `finally`, which ran BEFORE `inFlight` was assigned when
+  // `lookup` threw synchronously, leaving a settled promise there for good: no later lookup ever ran.
+  test("a lookup that throws synchronously does not wedge later refreshes", async () => {
+    let calls = 0;
+    const proxy = createTrustedProxy({
+      host: "cloudflared",
+      lookup: ((): Promise<string[]> => {
+        calls += 1;
+        throw new Error("sync boom");
+      }) as (host: string) => Promise<string[]>,
+      log: { log: () => {}, warn: () => {} },
+    });
+    await proxy.refresh();
+    await proxy.refresh();
+    expect(calls).toBe(2);
   });
 
   test("a miss while a timed-out boot lookup is still running does not start a second lookup", async () => {

@@ -371,9 +371,25 @@ describe("selectPlugins -- privileged gateway intents (#493)", () => {
     expect(skipped).toContain("GuildMembers");
     expect(skipped).toContain("MessageContent");
     expect(skipped).toContain("privileged gateway intents ");
+    // The whole reason, as the panel and state.json show it.
+    expect(skipped).toBe("declares the privileged gateway intents GuildMembers, MessageContent (in [32770]), which the host never requests");
+    const single = index([entry({ name: "p", intents: [GatewayIntentBits.MessageContent] })]);
+    expect(selectPlugins(single, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBe(
+      "declares the privileged gateway intent MessageContent (in [32768]), which the host never requests",
+    );
     // A non-privileged intent (GuildMessages) is selected as before.
     const plain = index([entry({ name: "p", intents: [GatewayIntentBits.GuildMessages] })]);
     expect(selectPlugins(plain, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBeUndefined();
+  });
+
+  test("a privileged intent is found wherever it sits among the declared intents", () => {
+    // Mutation: reading only the first declared intent leaves a realistic entry like this one selected.
+    for (const intents of [[GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], [GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessages], [1, 512, 4096, GatewayIntentBits.GuildPresences]]) {
+      const idx = index([entry({ name: "p", intents })]);
+      expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped, intents.join(",")).toMatch(/privileged gateway intent/);
+    }
+    const idx = index([entry({ name: "p", intents: [GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] })]);
+    expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toContain("MessageContent");
   });
 
   test("the privileged bits are discord.js's", () => {

@@ -159,7 +159,8 @@ export function resolveConfig(env: Env): Config {
   // #319: the tunnel sidecar CF-Connecting-IP is trusted from. Unset or blank means never trusted
   // -- fail closed, the same rule #220's own HTTP_PORT above uses. A hostname (letters, digits, `.`, `_`,
   // `-` -- a compose service name may carry an underscore) or an IP literal as `node:net`'s `isIP` reads
-  // it: IPv6 in any spelling, **without** brackets, which `dns.lookup` cannot resolve (a tunnel running
+  // it: IPv6 in any spelling (a zone id is accepted and ignored), **without** brackets, which `dns.lookup`
+  // cannot resolve (a tunnel running
   // on the host reaches the container via the bridge gateway's address rather than a compose service
   // name). `clientIp.ts` canonicalizes both sides of the comparison (#494).
   const trustedProxyHost = optional("TRUSTED_PROXY_HOST");
