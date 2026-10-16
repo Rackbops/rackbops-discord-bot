@@ -827,7 +827,7 @@ Then edit the instance's config-dir `.env`: the hand-edited file `install.sh` se
 and never touches again. The rules are the Clerk runbook's step 3 for comments (on their own lines) and
 "Bootstrapping a fresh instance (no checkout)" above for why there are two `.env` files with different
 jobs. **Complete the block below before the first `up`** (section 5). The seeded
-placeholders pass the core's `required()` check (`src/config.ts:59-63`), so a token-only edit boots; with
+placeholders pass the core's `required()` check (`src/config.ts:61-65`), so a token-only edit boots; with
 `DISCORD_SERVER_ID` blank that boot registers `/update`, `/plugins` and `/report` **globally and
 unprefixed**, and once the server is set single-server mode issues its one guild-scoped PUT and never
 clears the global list (`src/routing/register.ts:43`, `:72`, `:143`: `clearGlobal` exists only in routed
@@ -837,7 +837,7 @@ runbook writes it.
 
 ```sh
 DISCORD_TOKEN=<Pip's bot token>
-# Required by the core (src/config.ts:79) but idle under this file: the release watcher is off
+# Required by the core (src/config.ts:81) but idle under this file: the release watcher is off
 # (WATCHED_REPOS=none) and the service grants no principal a channel post unless an operator assigns one
 # (Rackbops/discord-mcp contracts/config.schema.json:112), and the mcp plugin uses host.post, not
 # host.announce, the one host-API path that targets this channel; the core's own two senders to it, the
@@ -854,7 +854,7 @@ RELEASE_ANNOUNCE_CHANNEL_ID=
 DISCORD_SERVER_ID=<server id>
 # Every command is prefixed, core ones included (src/commandNaming.ts:15-16, used at :22-23;
 # src/commands.ts:61-67): /pipagent register|pair|unregister, /pipupdate, /pipplugins, /pipreport.
-# 1-20 chars of [a-z0-9_-] (src/config.ts:97-103). The service's bridge entry must carry the same
+# 1-20 chars of [a-z0-9_-] (src/config.ts:99-105). The service's bridge entry must carry the same
 # value as its commandPrefix (section 4). The debug bot's prefix `r` (/ragent) is the precedent:
 # Rackbops/discord-mcp deploy/config.multi-bridge.example.json:8.
 COMMAND_PREFIX=pip
@@ -889,7 +889,7 @@ BOT_BRANCH=main
 PLUGINS=mcp
 PLUGIN_INDEX_URL=
 # The host router (ADR-0007): the bridge answers under /mcp/ on this port, inside the compose network
-# only. Any port 1-65535 (src/config.ts:139-141): nothing else listens inside Pip's container and no
+# only. Any port 1-65535 (src/config.ts:154-156): nothing else listens inside Pip's container and no
 # host port is published (docker-compose.yml has no ports:), so "free" constrains nothing; it must
 # equal the port in the service's bridge url (section 4). 8794 is what the live instance uses.
 HTTP_PORT=8794
@@ -904,7 +904,7 @@ discord-mcp's add-a-bridge runbook, section 3, generates it and appends the `MCP
 this file, and the service's `DISCORD_MCP_BRIDGE_TOKEN_PIP` to its own `app.env`; Pip is then recreated
 so the new key is read (section 4). Never leave a blank `MCP_BRIDGE_TOKEN=` line as a placeholder: Compose
 makes it the empty string, not unset, the host copies plugin keys raw (`src/plugins/host.ts:85`, unlike
-the core's `optional()` at `src/config.ts:65-68`, which is what makes `KEY=` mean "off" for core keys),
+the core's `optional()` at `src/config.ts:67-70`, which is what makes `KEY=` mean "off" for core keys),
 the plugin treats only `undefined` as unconfigured (`plugins/mcp/src/http.ts:187`), and it then answers
 `401` to every bearer, the service's correct one included (`plugins/mcp/src/auth.ts:66-69`), each one
 counting toward the plugin's per-IP lockout (`:63-67`) -- which an unauthenticated probe cannot tell from
@@ -926,7 +926,7 @@ the host's other interaction replies, which go only to the person who interacted
 
 | Path | Where it goes under this `.env` | Why it is bounded | Evidence |
 |---|---|---|---|
-| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:87`, `:159`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:427-431` (`describeReleaseWatch`) and `:435-443` (`checkReleases`), the tick check at `:217-222` (15-minute poll `:28`), the boot line `src/index.ts:321` |
+| Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:89`, `:176`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:427-431` (`describeReleaseWatch`) and `:435-443` (`checkReleases`), the tick check at `:217-222` (15-minute poll `:28`), the boot line `src/index.ts:321` |
 | Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:489-518` (`deliverPluginNotification`; the empty-list return at `:495-498`, the fallback at `:510-517`), `:578-605` (`checkPluginUpdates`); live deliverers `src/announce.ts:308-322` |
 | Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:439`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:497-510`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:357-359`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:428-439` (`validate`), `:497-510` |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:224-228` |
@@ -1044,7 +1044,7 @@ env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints i
 `{"dm":true,...}` says the listener is up, the token the plugin loaded is the one the container was created
 with (a file edited since then needs a recreate), and DMs are enabled
 (`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
-the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:112-121`),
+the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:175-184`),
 so it may run in a loop. The failing answers below do count toward that lockout (a bad bearer records a
 failure, `auth.ts:66-67`; more than ten in a minute answers `429`, `auth.ts:8-12`), so read them by hand
 rather than looping. Any other answer:
@@ -1057,7 +1057,7 @@ rather than looping. Any other answer:
   (`plugins/mcp/src/http.ts:187`), for example appended to the `.env` without the recreate (section 5).
 - `503 Unavailable`, plain text: the host router's own answer for a plugin that loaded but is not running
   (`src/plugins/host.ts:841`, `:861`): `activate()` threw and the log has a line beginning `[plugins] mcp
-  failed to activate` (`host.ts:547-549`). `src/http.ts:36` answers the same while the listener is
+  failed to activate` (`host.ts:547-549`). `src/http.ts:40` answers the same while the listener is
   closing.
 - `404 Not found`: the plugin never loaded (`host.ts:839`). Either `PLUGINS` does not name `mcp` (the boot
   log then says `[plugins] index: <source>, 0 selected, 0 skipped`, `src/index.ts:88`), or it was selected

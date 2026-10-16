@@ -16,9 +16,13 @@ export type HostHttpHandler = (request: Request, clientIp: string) => Promise<Re
  * becomes Bun's `maxRequestBodySize`, which bounds only a body that declares its length;
  * `routeHttpRequest` enforces the same cap on every body, chunked included.
  *
- * `stop()` answers every request that arrives afterwards with `503` and `Connection: close` —
- * `server.stop()` alone only closes the listening socket, and cloudflared keeps its connections to the
- * origin alive, so without this a plugin being disposed could still be handed new requests.
+ * `stop()` answers every request that still reaches `fetch` afterwards with `503` and `Connection: close`.
+ * Measured on Bun 1.4.2 (Windows, and Linux in CI): `server.stop()` also closes an idle kept-alive
+ * connection (cloudflared keeps its connections to the origin open) before another request can ride
+ * it, so in practice nothing arrives; this check is the backstop for a request a different Bun version or
+ * platform would still hand over, so a plugin being disposed is never handed a new request.
+ * `http.test.ts` pins what holds either way: the handler never runs again, and a request on the same
+ * connection ends in a 503 or a closed socket, never a hang.
  */
 export function startHostHttp(opts: {
   port: number;
