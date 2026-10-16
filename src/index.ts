@@ -204,6 +204,8 @@ client.once(
  * every event to both sessions, so a standby that registered these would double each reply.
  */
 async function activate(c: Client<true>): Promise<void> {
+  // DEMO BRANCH ONLY (#548 acceptance): a build that logs in and then dies in activate(). Never merge.
+  throw new Error("#548 demo: this build throws in activate() on purpose");
   const rest = new REST().setToken(config.discordToken);
 
   // Plugin setup — install and load BEFORE command registration (the builders come from the bundles)
