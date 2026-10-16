@@ -42,7 +42,8 @@ describe("jsonLogLine (#324)", () => {
   });
 
   // #545: the interaction handler's catch logs `withoutRequest(err)`. Under LOG_FORMAT=json the line is built by
-  // util.format, which prints a REST error's `url` (the interaction token) and `requestBody` (the reply) in full.
+  // util.format, which prints a REST error's `url` (the interaction token) in full, and its `requestBody` too when
+  // the body is flat (a webhook route's; a callback's nested body folds past util.format's depth).
   for (const route of ["callback", "webhook"] as const) {
     test(`a cleaned REST error's line names its code and status, never the url or the body (#545, ${route})`, () => {
       const { token, marker, error } = replyFailure(route);

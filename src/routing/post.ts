@@ -5,7 +5,7 @@
 //
 // The governing rule: with no routing, the call is exactly today's -- one post, as the bot, to the
 // default channel, and a failure there propagates (a discord.js REST error without the request it
-// carried, #508; anything else unchanged).
+// carried, #508; an error with no request in it unchanged).
 //
 // A webhook URL is a secret (it is a bearer credential for the channel). It comes out of
 // `routing.secrets.json` only to be handed to `executeWebhook`, and it is never put in a log line, an
@@ -56,8 +56,8 @@ function usableWebhook(routing: RoutingFile, channelId: string): WebhookMeta | u
  *
  * It rejects only when EVERY target failed, with the first error (the others are logged) -- both through
  * `withoutRequest`, so a discord.js REST error carries no `requestBody` (#508); an error that carries
- * no request is unchanged (bar a cause chain nested past five levels). A plugin that sees a rejection typically posts again on its next tick, and that would post
- * again to the channels that DID get the message -- every minute, for as long as one channel stays
+ * no request is unchanged (bar a `cause` or `errors` chain nested past five levels). A plugin that sees a rejection typically posts again on its next
+ * tick, and that would post again to the channels that DID get the message -- every minute, for as long as one channel stays
  * unreachable. With one target (the case with no routing) this is exactly today's behaviour: the failure
  * propagates.
  */

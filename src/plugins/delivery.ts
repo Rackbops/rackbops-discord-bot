@@ -14,7 +14,7 @@ const CANNOT_MESSAGE_USER = 50007;
  * a DM's text, a card -- nor `rawError` or `url`, so a plugin that logs the rejection whole
  * (`host.log.error("dm failed", err)`, which under LOG_FORMAT=json is `util.format`ted in full) logs
  * none of it. `code` is kept as is, since a plugin tells
- * Discord's answers apart by it (10013 "Unknown User"). An error that carries no request (see below) is returned as it is, bar a cause chain nested past the last level followed.
+ * Discord's answers apart by it (10013 "Unknown User"). An error that carries no request (see below) is returned as it is, bar a `cause` or `errors` chain nested past the last level followed.
  *
  * The host's own log sites use it too (#545): a failed reply to an interaction carries the interaction
  * token in `url` and the reply in `requestBody`, so index.ts's handler, the plugin command, interaction and
@@ -33,13 +33,13 @@ const CANNOT_MESSAGE_USER = 50007;
  * down: a wrapper that holds a request-carrying error comes back as a plain copy of itself (message, name,
  * stack, `code`; its other properties are not kept) with the cleaned error in its place, and what hangs
  * below the last level followed is cut off, not left unexamined (also from an error that carries no request:
- * a plain cause chain longer than that comes back as a truncated copy). Any other error comes back as it is.
+ * a plain `cause` or `errors` chain longer than that comes back as a truncated copy). Any other error comes back as it is.
  * Not followed: any other property that might hold an error.
  *
  * It fails closed and never throws -- it runs inside `catch` blocks, where a throw would cost the user's
  * "Something went wrong." reply and hide the real error. An error it cannot read (a throwing accessor, a
  * Proxy that throws) or that takes more than `MAX_NODES` visits to walk (the error itself counts, and one reached twice
- * counts twice) is replaced by a fixed placeholder.
+ * counts twice), or whose `errors` array is longer than the visits left, is replaced by a fixed placeholder.
  */
 export function withoutRequest(err: unknown): unknown {
   try {
