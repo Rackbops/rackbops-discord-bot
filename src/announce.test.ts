@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,6 +35,8 @@ const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routin
 const { DATA_DIR } = await import("./storage");
 const { writeDiscovery } = await import("./routing/discovery");
 const { rmSync: removePath } = await import("node:fs");
+const { state } = await import("./state");
+const { requestRestart, setExitFn, resetForTest: resetRestartForTest, RESTART_EXIT_CODE } = await import("./restart");
 
 describe("livePluginRequestDeps (#241)", () => {
   test("carries the routing deps, wired to the real routing modules and the bot's own data dir", async () => {
@@ -457,6 +459,81 @@ describe("checkReleases (#342)", () => {
     expect(calls).toEqual(["a/b", "c/d"]);
     errorSpy.mockRestore();
   });
+
+  // #439: the 15-minute cadence is the gate at tickChecks' `releases` check plus the stamp checkReleases takes on
+  // entry; shouldPollReleases is pinned in isolation above, this drives the two links. #438: the stamp is taken at
+  // poll START (before the first fetch goes out), which is what keeps a later tick from re-entering a walk that is
+  // still running, whatever the tick watchdog does to the guard.
+  test("the releases tick check polls at startup, not again inside the gap, and again once the gap has elapsed (#439, #438)", async () => {
+    const GAP_MS = 15 * 60 * 1000;
+    const T0 = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    let stampedAtFirstFetch: number | undefined;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      stampedAtFirstFetch ??= announceStateForTest().lastReleasePollAt;
+      return new Response("not found", { status: 404 });
+    }) as unknown as typeof fetch);
+    try {
+      setSystemTime(new Date(T0));
+      const releases = tickChecks(client, []).find((c) => c.name === "releases")!;
+      const polls = () => fetchSpy.mock.calls.length;
+      const perPoll = config.watchedRepos.length;
+      expect(perPoll).toBeGreaterThan(0);
+
+      await releases.run(); // startup catch-up: lastReleasePollAt was 0
+      expect(polls()).toBe(perPoll);
+      expect(announceStateForTest().lastReleasePollAt).toBe(T0);
+      expect(stampedAtFirstFetch).toBe(T0); // stamped before the first fetch went out (#438)
+
+      await releases.run(); // straight away again: nothing
+      setSystemTime(new Date(T0 + GAP_MS - 1));
+      await releases.run(); // one ms short of the gap: still nothing
+      expect(polls()).toBe(perPoll);
+      expect(announceStateForTest().lastReleasePollAt).toBe(T0);
+
+      setSystemTime(new Date(T0 + GAP_MS));
+      await releases.run(); // the gap elapsed: polls every repo once more, and re-stamps
+      expect(polls()).toBe(2 * perPoll);
+      expect(announceStateForTest().lastReleasePollAt).toBe(T0 + GAP_MS);
+    } finally {
+      setSystemTime();
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+    }
+  });
+
+  // #437: the unreachable path leaves the repo's seen-id list as it was, so when the repo answers again the
+  // releases it published meanwhile ARE announced (oldest first) -- only a repo with no list seeds silently.
+  test("a repo that was unreachable announces what was published meanwhile once it answers again (#437)", async () => {
+    const repo = "rackbops/came-back-probe";
+    const sent: string[] = [];
+    const fakeClient = {
+      channels: { fetch: async () => ({ isSendable: () => true, send: async (m: string) => void sent.push(m) }) },
+    } as unknown as Client;
+    const gh = (id: number) => ({ id, name: `v${id}`, tag_name: `v${id}`, html_url: `https://example.test/r/${id}`, draft: false, prerelease: false });
+    let answer = () => new Response("not found", { status: 404 });
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => answer()) as unknown as typeof fetch);
+    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    state.seenReleaseIds[repo] = [1, 2];
+    try {
+      await checkReleases(fakeClient, [repo]); // unreachable: skipped, list untouched, nothing posted
+      expect(state.seenReleaseIds[repo]).toEqual([1, 2]);
+      expect(sent).toEqual([]);
+
+      answer = () => new Response(JSON.stringify([gh(4), gh(3), gh(2), gh(1)]), { status: 200 });
+      await checkReleases(fakeClient, [repo]); // back: 3 and 4 were published meanwhile -> announced, oldest first
+      expect(sent).toEqual(["📦 New release: **v3**\nhttps://example.test/r/3", "📦 New release: **v4**\nhttps://example.test/r/4"]);
+      expect(state.seenReleaseIds[repo]).toEqual([1, 2, 3, 4]); // recorded id by id through the real persist callback
+      // The "at most the newest 15" in the comment and CONTEXT.md is this request's page size, so pin it.
+      const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+      expect(urls).toHaveLength(2);
+      for (const url of urls) expect(url).toBe(`https://api.github.com/repos/${repo}/releases?per_page=15`);
+    } finally {
+      delete state.seenReleaseIds[repo]; // `state` is the shared singleton (dataIsolation.test.ts does the same)
+      fetchSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+    }
+  });
 });
 
 // The rest of the poll state the test-state guard (test/stateGuard.ts) reads; each field must track
@@ -503,6 +580,78 @@ describe("announceStateForTest's poll state", () => {
       for (const spy of quiet) spy.mockRestore();
     }
   });
+
+  // #460: pluginUpdates is gated on the boot state.json write having landed; the test above pins the ready half.
+  test("the pluginUpdates check does nothing before markPluginStateReady: no stamp, no index fetch (#460)", async () => {
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch);
+    try {
+      expect(announceStateForTest().pluginStateReady).toBe(false);
+      await tickChecks({} as unknown as Client, []).find((c) => c.name === "pluginUpdates")!.run().catch(() => {});
+      expect(announceStateForTest().lastPluginPollAt).toBe(0);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  // #460: the autoUpdate check is gated on AUTO_UPDATE and on its own 15-minute gap (no startup special case:
+  // lastUpdatePollAt = 0 is simply older than any gap); the lastUpdatePollAt test above pins that it stamps when on.
+  test("the autoUpdate check does nothing with AUTO_UPDATE off, and polls once per 15-minute gap with it on (#460)", async () => {
+    const GAP_MS = 15 * 60 * 1000;
+    const T0 = Date.UTC(2026, 0, 1, 0, 0, 0, 0);
+    const realAuto = config.autoUpdate;
+    const realSha = config.gitSha;
+    config.gitSha = undefined; // checkForUpdate answers "disabled" at once, with no network call (as in the test above)
+    try {
+      const autoUpdate = tickChecks({} as unknown as Client, []).find((c) => c.name === "autoUpdate")!;
+      setSystemTime(new Date(T0));
+      config.autoUpdate = false;
+      await autoUpdate.run();
+      expect(announceStateForTest().lastUpdatePollAt).toBe(0); // off: not even stamped
+
+      config.autoUpdate = true;
+      await autoUpdate.run();
+      expect(announceStateForTest().lastUpdatePollAt).toBe(T0);
+      setSystemTime(new Date(T0 + GAP_MS - 1));
+      await autoUpdate.run();
+      expect(announceStateForTest().lastUpdatePollAt).toBe(T0); // inside the gap: skipped
+      setSystemTime(new Date(T0 + GAP_MS));
+      await autoUpdate.run();
+      expect(announceStateForTest().lastUpdatePollAt).toBe(T0 + GAP_MS); // the gap elapsed: polled again
+    } finally {
+      setSystemTime();
+      config.autoUpdate = realAuto;
+      config.gitSha = realSha;
+    }
+  });
+
+  // #438: the self-update stamp is taken at poll START, before checkForUpdate's first GitHub call goes out -- the
+  // same property the releases test pins, and what the github.ts header relies on. With a sha set, checkForUpdate
+  // (update.ts) reaches fetchLatestBotSha's fetch; the stub throws, checkForUpdate's finally clears its in-flight
+  // latch, and the check rejects -- swallowed here (nothing is logged on this path).
+  test("the autoUpdate check stamps before its first fetch (#438)", async () => {
+    const realAuto = config.autoUpdate;
+    const realSha = config.gitSha;
+    config.autoUpdate = true;
+    config.gitSha = "0123456789abcdef0123456789abcdef01234567";
+    let stampedAtFetch: number | undefined;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      stampedAtFetch ??= announceStateForTest().lastUpdatePollAt;
+      throw new Error("offline");
+    }) as unknown as typeof fetch);
+    try {
+      expect(announceStateForTest().lastUpdatePollAt).toBe(0);
+      await tickChecks({} as unknown as Client, []).find((c) => c.name === "autoUpdate")!.run().catch(() => {});
+      expect(fetchSpy).toHaveBeenCalled();
+      expect(stampedAtFetch).toBeGreaterThan(0); // already stamped when the first GitHub call went out
+    } finally {
+      fetchSpy.mockRestore();
+      config.autoUpdate = realAuto;
+      config.gitSha = realSha;
+    }
+  });
 });
 
 describe("describeReleaseWatch (#342)", () => {
@@ -513,9 +662,10 @@ describe("describeReleaseWatch (#342)", () => {
 });
 
 // Scoped to runTick's isolation guarantee (issue #43). checkReleases is exported with injectable deps
-// (#342) and tested above; the remaining core checks (checkAutoUpdate, and the plugin-request/update
-// passes) call real discord.js / GitHub APIs and aren't exported, so this exercises the actual
-// extracted isolation mechanism onTick delegates to, rather than mocking discord.js's Client end-to-end.
+// (#342) and tested above; the remaining core checks call real discord.js / GitHub APIs and their gates
+// are driven through tickChecks and startScheduler (#439, #460: the cadence tests above, the restart-safety
+// describe below; the pluginRequests gate stays a source pin, above), so this exercises the actual extracted
+// isolation mechanism onTick delegates to, rather than mocking discord.js's Client end-to-end.
 describe("runTick", () => {
   test("a throwing check doesn't stop the rest from running", async () => {
     const ran: string[] = [];
@@ -629,6 +779,84 @@ describe("startScheduler returns the first tick's promise (#548)", () => {
       globalThis.setInterval = realSetInterval;
       config.watchedRepos = realRepos;
     }
+  });
+});
+
+// #460: onTick is not exported; startScheduler fires the first tick synchronously and returns its promise (above),
+// which is how these reach it. The two lines pinned here are the ones restart.ts's header relies on: no new tick
+// once a restart/handoff/shutdown is pending, and the whole tick is one critical section.
+describe("onTick's restart safety (#460)", () => {
+  afterEach(() => {
+    resetTickGuardForTest();
+    resetDiscoveryGapForTest();
+    resetPollStateForTest();
+    resetRestartForTest(); // clears `pending` and any armed deferral
+  });
+
+  // Stands up one scheduler tick with every real-network check quiet. The exit stub is each test's own (installed
+  // around the call), so a check can read the exits list while the tick is still running.
+  const tickWith = async (extra: TickCheck[], arrange: () => void = () => {}): Promise<void> => {
+    const realRepos = config.watchedRepos;
+    config.watchedRepos = []; // the release check polls nothing, but still stamps when it RUNS
+    const realSetInterval = globalThis.setInterval;
+    globalThis.setInterval = ((_fn: unknown, _ms: number) => 0) as unknown as typeof setInterval; // recorded, not started
+    const quiet = [spyOn(console, "error").mockImplementation(() => {}), spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch);
+    try {
+      arrange();
+      await startScheduler({} as unknown as Client, extra); // the first tick's own promise (#548)
+    } finally {
+      fetchSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+      globalThis.setInterval = realSetInterval;
+      config.watchedRepos = realRepos;
+    }
+  };
+
+  test("a tick started while a restart is pending runs no check at all -- not even the core ones", async () => {
+    const exits: number[] = [];
+    const restoreExit = setExitFn((code) => void exits.push(code));
+    let ran = false;
+    try {
+      await tickWith(
+        [{ name: "extra", run: async () => void (ran = true) }],
+        () => requestRestart("pending before the tick"), // critical depth 0: exits (into the stub) at once, stays pending
+      );
+    } finally {
+      restoreExit();
+    }
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+    expect(ran).toBe(false);
+    expect(announceStateForTest().lastReleasePollAt).toBe(0); // the releases check did not run either
+  });
+
+  test("a restart requested by a check lands only once the whole tick's critical section has closed", async () => {
+    const exits: number[] = [];
+    const restoreExit = setExitFn((code) => void exits.push(code));
+    let exitedBeforeCheckEnded: boolean | undefined;
+    let exitedBeforeLaterCheck: boolean | undefined;
+    try {
+      await tickWith([
+        {
+          name: "restarter",
+          run: async () => {
+            requestRestart("a check wants a restart"); // inside the tick's critical section: deferred, not exited
+            await Bun.sleep(5);
+            exitedBeforeCheckEnded = exits.length > 0;
+          },
+        },
+        // Runs after the restarter has returned. With ONE section around the whole tick the exit is still deferred
+        // here; a section per check would have closed (and exited) when the restarter ended.
+        { name: "later", run: async () => void (exitedBeforeLaterCheck = exits.length > 0) },
+      ]);
+    } finally {
+      restoreExit();
+    }
+    expect(exitedBeforeCheckEnded).toBe(false); // deferred: the tick holds the critical section
+    expect(exitedBeforeLaterCheck).toBe(false); // and still deferred after that check ended: one section for the whole tick
+    expect(exits).toEqual([RESTART_EXIT_CODE]); // and landed when the tick's section closed (endCritical -> doExit)
   });
 });
 
