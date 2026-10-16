@@ -174,7 +174,7 @@ describe("applyRouting", () => {
     expect((await applyRouting("boot")).mode).toBe("single");
     expect(a.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
 
-    // ...and one that will not even parse (it is moved aside and read as fresh).
+    // ...and one that will not even parse (it is left in place and read as fresh).
     resetRoutingForTest();
     writeFileSync(routingPath(dir), "{ not json");
     const b = harness();

@@ -47,7 +47,7 @@ export function secretsPath(dataDir: string): string {
 // One writer at a time ACROSS containers rests on a single fact, not on these queues (#478): during a handoff the
 // replacement writes nothing until `takeOver` has stopped the original (`ready.ts` runs `takeOver` before `activate`,
 // and every production caller of `mutateRouting`/`mutateSecrets` -- the mailbox, `markWebhookBroken` -- is wired
-// inside `activate`, the mailbox drain gated on `markPluginStateReady`). The ORIGINAL's side is not a guarantee:
+// inside `activate`: the boot mailbox drain and the gated tick both run there). The ORIGINAL's side is not a guarantee:
 // `beginHandoff` does not await in-flight work, so a `markWebhookBroken` can still write from the original during the
 // overlap, and the stop waits for criticals only up to `graceMs` before the daemon's SIGKILL -- a write cut there is
 // the `.tmp` file `sweepSecretsTemp` removes at the next boot. No cross-process lock is taken (declined).
@@ -174,7 +174,7 @@ function requireFile<T>(value: T, caller: string): T {
  *
  * The first write in a process that would drop something the operator typed (`droppedByRepair`) keeps the file as it
  * was at `routing.json.before-repair-<ms>` (#477), once per path; a copy that fails is said and the write goes ahead.
- * `droppedByRepair` reports placements, not bookkeeping: a stray key, a `v: 2` file, `results` entries or a
+ * `droppedByRepair` reports placements, not bookkeeping: a stray key, the `v` marker (rewritten as `v: 1`), `results` entries or a
  * non-string `broken`/`updatedAt`/`updatedBy` are dropped on write with no copy. Refusing to write while something
  * would be dropped is declined: one hand typo would block every panel change.
  */

@@ -314,7 +314,7 @@ describe("index.ts wiring", () => {
     // #479: a stale secrets temp file holds a webhook URL; nothing writes at boot, so it is swept right before the
     // routing store is first used. The call sits inside activate(), immediately before initRouting.
     test("sweepSecretsTemp(DATA_DIR) runs inside activate(), right before initRouting", () => {
-      const sweep = source.indexOf("sweepSecretsTemp(DATA_DIR);", activateFn);
+      const sweep = source.indexOf("\n    sweepSecretsTemp(DATA_DIR);", activateFn) + 5; // past "\n" and the 4-space indent, so a commented-out call does not count; at line start: a commented-out call does not count
       expect(sweep).toBeGreaterThan(activateFn);
       expect(sweep).toBeLessThan(initCall);
       expect(source.slice(sweep + "sweepSecretsTemp(DATA_DIR);".length, initCall).trim()).toBe("");
