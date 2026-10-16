@@ -5,7 +5,7 @@ import { config } from "./config";
 import { prefixedName } from "./commandNaming";
 import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
-import { fetchReleases, decideReleaseAnnouncements, createReachabilityLog, type Release } from "./github";
+import { clampReply, fetchReleases, decideReleaseAnnouncements, createReachabilityLog, RELEASES_PER_PAGE, type Release } from "./github";
 import { checkForUpdate } from "./update";
 import { restartPending, requestRestart, withCritical } from "./restart";
 import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator } from "./storage";
@@ -27,6 +27,10 @@ export const TICK_MS = 60 * 1000;
 // operator list — there is no release cron in this fork), so poll on a flat cadence like the
 // self-update check, plus once at startup to catch anything published while the bot was offline.
 const RELEASE_POLL_GAP_MS = 15 * 60 * 1000;
+
+/** The most of a release's name the announcement shows (#499): past it, `clampReply`'s suffix. A name is free text
+ *  on GitHub; unbounded, one long enough would make every post for that repo fail and block the newer ones. */
+export const RELEASE_NAME_MAX = 200;
 
 // Bot commits land at any hour, so this polls on a flat cadence too.
 const UPDATE_POLL_GAP_MS = 15 * 60 * 1000;
@@ -461,6 +465,13 @@ export async function checkReleases(
   // Poll each watched repo independently: one repo's fetch failure (e.g. a bad name → 404)
   // must not starve the others' announcements on this tick.
   for (const repo of repos) {
+    // #499 item 6: a restart or shutdown pending mid-walk ends the walk here, between repos, instead of racing the
+    // drain's grace through the ones left; they are polled by the next walk (the next boot's startup catch-up, or
+    // the next 15-minute poll when this process carries on after a failed handoff).
+    if (restartPending()) {
+      console.log(`[release] a restart or shutdown is pending — stopping the walk before ${repo}`);
+      return;
+    }
     try {
       await checkRepo(repo);
     } catch (err) {
@@ -494,10 +505,25 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
   if (releaseReachability.observe(repo, true) === "recovered") {
     console.log(`[release] ${repo} is reachable again`);
   }
-  await commitReleaseAnnouncements(releases, state.seenReleaseIds[repo], {
-    announce: (release) => announce(client, "release", `📦 New release: **${release.name}**\n${release.url}`),
-    persist: async (seen) => {
-      state.seenReleaseIds[repo] = seen;
+  const seen = state.seenReleaseIds[repo];
+  // #499 item 5: one page per poll. A whole page of new releases on a repo we have polled before means older ones
+  // may exist that were never fetched and never will be (they are not recorded either). Keyed on the page size the
+  // request asked for; a page padded with drafts (dropped by fetchReleases) can slip under it, which is accepted,
+  // and the line repeats each poll while the posts below keep failing, since the list does not advance.
+  if (seen !== undefined && releases.length >= RELEASES_PER_PAGE && releases.every((r) => !seen.includes(r.id))) {
+    console.warn(
+      `[release] ${repo}: every one of the ${releases.length} releases on the page is new — anything older was not fetched and will not be announced`,
+    );
+  }
+  await commitReleaseAnnouncements(releases, seen, {
+    announce: (release) =>
+      announce(
+        client,
+        "release",
+        `📦 New ${release.prerelease ? "pre-release" : "release"}: **${clampReply(release.name, RELEASE_NAME_MAX)}**\n${release.url}`,
+      ),
+    persist: async (committed) => {
+      state.seenReleaseIds[repo] = committed;
       await saveState();
     },
   });
@@ -511,7 +537,9 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
  *
  * Commits each id right after its announce succeeds, rather than saving `nextSeen` once after
  * the whole batch — a throw partway through a multi-release burst must not discard the ids of
- * releases already posted, or the next poll re-announces them.
+ * releases already posted, or the next poll re-announces them. Among what remains at-least-once
+ * (#499; CONTEXT.md's Behavior section lists the rest): an exit in the instant between a post and
+ * its save, or a save that fails, re-posts that one release next poll.
  */
 export async function commitReleaseAnnouncements(
   releases: Release[],

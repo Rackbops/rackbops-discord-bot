@@ -10,10 +10,11 @@ const {
   fetchReleases,
   createReachabilityLog,
   githubHeaders,
+  RELEASES_PER_PAGE,
 } = await import("./github");
 const { config } = await import("./config");
 
-const rel = (id: number) => ({ id, name: `v${id}`, tag: `v${id}`, url: `https://x/${id}` });
+const rel = (id: number) => ({ id, name: `v${id}`, tag: `v${id}`, url: `https://x/${id}`, prerelease: false });
 
 describe("clampUpstreamBody", () => {
   test("passes short text through unchanged", () => {
@@ -236,7 +237,7 @@ describe("decideReleaseAnnouncements", () => {
 
 describe("fetchReleases", () => {
   const realFetch = globalThis.fetch;
-  const stub = (impl: () => Promise<Response> | Response) => {
+  const stub = (impl: (url: string) => Promise<Response> | Response) => {
     globalThis.fetch = impl as unknown as typeof fetch;
   };
   afterEach(() => {
@@ -259,13 +260,37 @@ describe("fetchReleases", () => {
   test("maps the API payload and drops drafts", async () => {
     stub(() => json([apiRelease(2), apiRelease(1, { draft: true })]));
     expect(await fetchReleases("owner/repo")).toEqual([
-      { id: 2, name: "v2", tag: "v2", url: "https://x/2" },
+      { id: 2, name: "v2", tag: "v2", url: "https://x/2", prerelease: false },
     ]);
+  });
+
+  // #499 item 5: the "newest 15" the docs and the page-overflow warning rest on is this one request's page size.
+  test("asks for one page of RELEASES_PER_PAGE (15) releases (#499)", async () => {
+    let asked = "";
+    stub((url) => {
+      asked = String(url);
+      return json([]);
+    });
+    await fetchReleases("owner/repo");
+    expect(RELEASES_PER_PAGE).toBe(15);
+    expect(asked).toBe("https://api.github.com/repos/owner/repo/releases?per_page=15");
   });
 
   test("an unnamed release falls back to its tag", async () => {
     stub(() => json([apiRelease(1, { name: null })]));
     expect((await fetchReleases("owner/repo"))?.[0]?.name).toBe("v1");
+  });
+
+  // #499 item 8: `??` falls back on null only, and an empty-string name rendered as `****` in the announcement.
+  test("an empty-string name falls back to its tag, like a null one (#499)", async () => {
+    stub(() => json([apiRelease(1, { name: "" })]));
+    expect((await fetchReleases("owner/repo"))?.[0]?.name).toBe("v1");
+  });
+
+  // #499 item 7: the flag used to be parsed and dropped, so a v2.0.0-rc.1 announced as a plain release.
+  test("carries the pre-release flag through (#499)", async () => {
+    stub(() => json([apiRelease(2, { prerelease: true }), apiRelease(1)]));
+    expect((await fetchReleases("owner/repo"))?.map((r) => r.prerelease)).toEqual([true, false]);
   });
 
   // The whole point of the null: a repo the token can't see must not throw once a minute.
@@ -290,6 +315,43 @@ describe("fetchReleases", () => {
       );
     });
   }
+
+  // #500 item 10: GitHub answers a primary rate-limit hit with a 403 or a 429 and `x-ratelimit-remaining: 0`
+  // (unauthenticated: 60 requests an hour per address). The message names the reset time and the fix; any other
+  // 403 or 429 (a permission refusal, a secondary limit) keeps the bare status message.
+  describe("the rate limit (#500 item 10)", () => {
+    const limited = (status: number, headers: Record<string, string>) => new Response("", { status, headers });
+    const RESET_EPOCH = "1760616000"; // 2025-10-16T12:00:00Z
+
+    for (const status of [403, 429]) {
+      test(`a ${status} with x-ratelimit-remaining 0 names its reset time and GITHUB_TOKEN`, async () => {
+        stub(() => limited(status, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": RESET_EPOCH }));
+        const err = await fetchReleases("owner/repo").then(
+          () => undefined,
+          (e: Error) => e,
+        );
+        expect(err?.message).toContain("rate limit exhausted");
+        expect(err?.message).toContain("owner/repo");
+        expect(err?.message).toContain("resets at 2025-10-16T12:00:00.000Z");
+        expect(err?.message).toContain("GITHUB_TOKEN");
+      });
+    }
+
+    test("a 403 that is not the limit keeps the bare message: remaining is not 0, or the headers are absent", async () => {
+      stub(() => limited(403, { "x-ratelimit-remaining": "42", "x-ratelimit-reset": RESET_EPOCH }));
+      await expect(fetchReleases("owner/repo")).rejects.toThrow("GitHub releases query failed for owner/repo: 403");
+      stub(() => limited(403, {}));
+      await expect(fetchReleases("owner/repo")).rejects.toThrow("GitHub releases query failed for owner/repo: 403");
+    });
+
+    // A reset header that is missing or not a time must not print 1970 or throw a RangeError from toISOString.
+    for (const reset of [undefined, "", "soon", "0"]) {
+      test(`remaining 0 with reset ${JSON.stringify(reset)} says the reset time is unknown`, async () => {
+        stub(() => limited(403, { "x-ratelimit-remaining": "0", ...(reset === undefined ? {} : { "x-ratelimit-reset": reset }) }));
+        await expect(fetchReleases("owner/repo")).rejects.toThrow("resets at an unknown time; set GITHUB_TOKEN");
+      });
+    }
+  });
 });
 
 describe("createReachabilityLog", () => {
