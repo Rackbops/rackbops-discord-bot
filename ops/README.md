@@ -83,7 +83,8 @@ carry a webhook URL is deleted, not moved to `rejected/`, if it is refused. The 
 run the five update actions on an **already-installed** plugin and those four routing ones; it can't
 enable a new plugin (that stays `PLUGINS=`-only) or run anything else — the routing actions, described
 below, change where a plugin lives, not which plugins run. `requestedBy` is the panel identity
-(`email:<addr>` or `token`), recorded in `state.json` and shown by `/plugins list`; a panel-origin
+(`email:<addr>` or `token`), recorded in `state.json` and, for a scheduled update, shown by `/plugins list` (an
+update-now's requester is kept only on the transient pending report); a panel-origin
 update logs its outcome rather than DMing (there's no Discord user to reach — the panel shows it).
 
 **Routing requests (#240, ADR-0006).** The same mailbox carries four more actions, which change where
@@ -1620,7 +1621,7 @@ the bot enforce, so a bad or hostile body is a `400` here), then sets `requested
 `token` on the bearer path), and shells `bot-ops.sh plugin-request` to drop the file in the mailbox.
 The bot applies it within seconds (its mailbox timer; the 60s tick is the backstop) exactly as it does a `/plugins` command — an
 **Update now** or a due **Schedule** restarts the bot to install; the identity is recorded in
-`state.json` and shown in `/plugins list`, but because it isn't a Discord user id the bot **logs** the
+`state.json` (and, for a scheduled update, shown in `/plugins list`), but because it isn't a Discord user id the bot **logs** the
 outcome rather than trying to DM it. An update whose latest version needs a newer bot than this one
 shows a "needs a newer bot" note and offers no install button (the bot would reject it anyway). See
 "Plugin request mailbox" above for the file format and the `rejected/` quarantine.
