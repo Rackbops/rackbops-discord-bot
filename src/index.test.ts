@@ -154,6 +154,16 @@ describe("index.ts wiring", () => {
       expect(timer).toBeGreaterThan(-1);
       // loadPluginIndex is the first top-level await; every import has evaluated before the timer is created.
       expect(timer).toBeLessThan(source.indexOf("await loadPluginIndex("));
+      // And nothing awaits between the last import and the timer: no boot await may sit ahead of it.
+      const lastImport = source.lastIndexOf("\nimport ");
+      const afterImports = source.indexOf(";\n", lastImport) + 2;
+      expect(afterImports).toBeGreaterThan(2);
+      expect(afterImports).toBeLessThan(timer);
+      const code = source
+        .slice(afterImports, timer)
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("//"));
+      expect(code.join("\n")).not.toContain("await ");
       expect(source).toMatch(/const verifyTimer =\s*\n\s*bootMode\(process\.env\) === "standby"/);
       expect((source.match(/const verifyTimer =/g) ?? []).length).toBe(1);
       expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);
