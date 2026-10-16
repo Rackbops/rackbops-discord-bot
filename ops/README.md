@@ -446,7 +446,11 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   is), re-point `:latest` the same way, and `recreate`. (b) The bot is up and the log has `[handoff] could not take the name` or `could not remove
   the stopped original`: the swap finished but the rename did not. If `docker ps -a` still lists `<name>` (the
   stopped original), `docker rm <name>` (a plain `rm` refuses a running container); if it is already gone, skip
-  that. Then `docker rename <name>-next <name>`. (c) Neither yet: wait. An **exited** `<name>-next` blocks
+  that. Then `docker rename <name>-next <name>`. Since #547 `docker restart <name>-next` does the same at boot
+  for a container a self-update created: it takes `<name>` when that is free, or held by a STOPPED container of the
+  same compose project and service (which it removes first); with `<name>` RUNNING it leaves both alone and logs
+  `two bots on one token` (stop one by hand). A compose-created container renamed to `*-next` by hand is not healed,
+  and while a bot is still named `<name>-next` its `/update` is refused with that restart as the advice. (c) Neither yet: wait. An **exited** `<name>-next` blocks
   nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
   (`docker rm <name>-next` clears it sooner).
 

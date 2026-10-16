@@ -147,6 +147,34 @@ describe("index.ts wiring", () => {
       expect((source.match(/stepAside\(/g) ?? []).length).toBe(1);
       expect(source).toMatch(/import \{[^}]*\bdetectRollback\b[^}]*\bfinishProbation\b[^}]*\bstepAside\b[^}]*\} from "\.\/redeploy";/);
     });
+
+    // #492/#494: the standby's 90 s verify budget counts from module top, not from after the boot awaits.
+    test("the verify timer is armed from the raw env before the first boot await", () => {
+      const timer = source.indexOf("const verifyTimer =");
+      expect(timer).toBeGreaterThan(-1);
+      // loadPluginIndex is the first top-level await; every import has evaluated before the timer is created.
+      expect(timer).toBeLessThan(source.indexOf("await loadPluginIndex("));
+      expect(source).toMatch(/const verifyTimer =\s*\n\s*bootMode\(process\.env\) === "standby"/);
+      expect((source.match(/const verifyTimer =/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);
+    });
+
+    // #547: a raw standby the daemon downgraded has nothing to verify against; a swapped-in container whose
+    // rename never landed takes its name here. Both right after the rollback check, before the Client logs in.
+    test("a daemon-downgraded standby clears the timer and heals its name, right after resolveBootMode", () => {
+      const resolved = source.indexOf("await resolveBootMode(process.env);");
+      const attach = source.indexOf("client.once(");
+      expect(resolved).toBeGreaterThan(-1);
+      const between = source.slice(resolved, attach);
+      const rollback = between.indexOf("detectRollback(process.env)");
+      const clear = between.indexOf('if (mode === "normal") clearTimeout(verifyTimer);');
+      const heal = between.indexOf('if (mode === "normal" && bootMode(process.env) === "standby") await healOwnName();');
+      expect(rollback).toBeGreaterThan(-1);
+      expect(clear).toBeGreaterThan(rollback);
+      expect(heal).toBeGreaterThan(clear); // the timer is cleared before the heal's own wait begins
+      expect((source.match(/healOwnName\(/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/import \{[^}]*\bhealOwnName\b[^}]*\} from "\.\/redeploy";/);
+    });
   });
 
   test("installs+loads plugins inside activate() before rest.put, and activates before the scheduler", () => {

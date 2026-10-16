@@ -32,7 +32,12 @@ export const HANDOFF_RESTART_RETRIES_ENV = "HANDOFF_RESTART_RETRIES";
 export const HANDOFF_DEADLINE_MS = 120_000;
 
 /** The replacement's own budget for reaching a gateway login. Inside the deadline above, so a
- *  replacement that gives up says so — the original learns why instead of just timing out. */
+ *  replacement that gives up says so — the original learns why instead of just timing out.
+ *
+ *  The arithmetic (#492): the replacement arms its timer at `index.ts`'s module top, so these 90 s count from
+ *  there, and `loadPluginIndex`'s 5 s and `resolveBootMode`'s 10 s bound run inside them. The original's
+ *  `HANDOFF_DEADLINE_MS` counts from its `startContainer`, so the margin is 30 s less the container's own
+ *  start latency and import time. */
 export const VERIFY_DEADLINE_MS = 90_000;
 
 /**
