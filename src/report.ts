@@ -14,6 +14,10 @@ import { clampReply, createIssue, ensureLabel, sliceUtf16 } from "./github";
 const REPORT_LABEL = "automated";
 const MODAL_PREFIX = "report:"; // modal customId = report:<project>
 
+/** #504 item 13: what `/report` says in a DM (reachable only under a global registration). Without a `member` there
+ *  is no role to read, and "you lack the role" would be the wrong answer. */
+export const REPORT_DM_REFUSAL = "This command works only in a server channel.";
+
 /** Issue body: the reporter's text plus a traceability footer naming the Discord user by
  * plain username (never a pingable mention) and `command`, the registered name the report was
  * filed through (`COMMAND_PREFIX` included, e.g. `pipreport`). Pure — unit-tested. */
@@ -74,6 +78,10 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
     });
     return;
   }
+  if (!interaction.member) {
+    await interaction.reply({ content: REPORT_DM_REFUSAL, flags: MessageFlags.Ephemeral });
+    return;
+  }
   if (!hasReportRole(interaction)) {
     await interaction.reply({
       content: "You don't have the role required to file reports.",
@@ -119,7 +127,8 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
  * public message — an `@everyone` typed into the modal must render as text, not fire.
  *
  * The gate runs again here (#448), before `deferReply` and before any network call: the same
- * configuration and role checks as `handleReportCommand`, refusing ephemerally. The command's gate is the
+ * configuration and role checks as `handleReportCommand`, refusing ephemerally (a submit with no `member` gets
+ * the role refusal; the DM wording, `REPORT_DM_REFUSAL`, is the command's, #504). The command's gate is the
  * user-facing one; this is defence in depth, because this code cannot verify that Discord scopes a modal
  * submission to the interaction that showed it (CONTEXT.md already says a forged `modal_submit` can carry any
  * `customId`), and whether a roleless account can actually forge one is left unverified. It also closes what
