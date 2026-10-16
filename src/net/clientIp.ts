@@ -16,15 +16,24 @@ export interface TrustedProxy {
   isTrusted(peerAddress: string): boolean;
   /** Re-resolves `host` and replaces the cached address set. Never throws -- a transient DNS
    *  failure leaves the existing set (if any) in place rather than revoking trust that was already
-   *  established, or crashing a plugin's `activate()` over a momentarily-unreachable resolver. */
-  refresh(): Promise<void>;
+   *  established, or crashing a plugin's `activate()` over a momentarily-unreachable resolver; it is
+   *  logged once per failure streak (#493). With `timeoutMs`, resolves after at most that long even if
+   *  the lookup has not answered; the lookup keeps running and the set is replaced when it does. */
+  refresh(timeoutMs?: number): Promise<void>;
 }
 
 /** Re-resolution is capped at once per this window, triggered by a cache miss in `isTrusted`
  *  (never by a timer) -- compose can recreate the tunnel sidecar with a new address at any time,
  *  but a hot loop of misses (an attacker deliberately varying its own address) must not turn into a
- *  hot loop of DNS lookups either. */
+ *  hot loop of DNS lookups either. A successful lookup re-arms this full window. */
 const REFRESH_THROTTLE_MS = 60_000;
+/** After a FAILED lookup the next miss may retry this soon (#493): a sidecar that is not up yet at boot is
+ *  trusted within seconds of appearing, not a minute, while a hot loop of misses still cannot become a hot loop
+ *  of lookups (one in flight at a time, and never sooner than this). */
+const REFRESH_RETRY_MS = 5_000;
+/** How long `index.ts` waits on the boot-time refresh before it starts the listener anyway (#493). The lookup
+ *  keeps running and trust lands when it does; requests meanwhile are untrusted (fail closed). */
+export const PROXY_BOOT_REFRESH_TIMEOUT_MS = 2_000;
 
 async function defaultLookup(host: string): Promise<string[]> {
   const results = await dnsLookup(host, { all: true });
@@ -32,20 +41,51 @@ async function defaultLookup(host: string): Promise<string[]> {
 }
 
 /**
- * Normalizes an IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) down to its plain IPv4 form. Found
- * during round-2 gate testing: `Bun.serve` with no explicit `hostname` (every call site in this
- * repo) binds dual-stack, and an IPv4 peer connecting to that listener is reported by
- * `srv.requestIP()` in mapped notation -- confirmed directly (`bun -e` against a real listener),
- * not assumed. `dns.promises.lookup` never returns that notation for an IPv4 result, so without
- * this the trusted-address Set and the peer address `isTrusted` is asked to check would never
- * match for a real IPv4 tunnel sidecar: the whole fix would silently never engage. Applied on BOTH
- * sides of the comparison (the resolved set and the incoming peer) so it doesn't matter which form
- * either one happens to arrive in. Anything else (a real IPv6 address, an already-plain IPv4 one)
- * passes through unchanged.
+ * One spelling per address, so the resolved set and the peer `isTrusted` is asked about compare equal
+ * whichever form either arrives in.
+ *
+ * An IPv4-mapped IPv6 address (`::ffff:x.x.x.x`) comes down to its plain IPv4 form. Found during round-2
+ * gate testing: `Bun.serve` with no explicit `hostname` (every call site in this repo) binds dual-stack,
+ * and an IPv4 peer connecting to that listener is reported by `srv.requestIP()` in mapped notation --
+ * confirmed directly (`bun -e` against a real listener), not assumed. `dns.promises.lookup` never returns
+ * that notation for an IPv4 result, so without this the trusted-address Set and the peer address
+ * `isTrusted` is asked to check would never match for a real IPv4 tunnel sidecar: the whole fix would
+ * silently never engage.
+ *
+ * Any other IPv6 literal is canonicalized through the URL parser (#494): lowercase, zeros compressed, an
+ * embedded IPv4 tail in hex, so an operator's `FD00::1` or `fd00:0:0:0:0:0:0:1` equals the compressed form
+ * `srv.requestIP` reports. The WHATWG host parser is the one IPv6 normalizer the runtime ships; it refuses
+ * a zone id, so that is dropped first (Bun 1.4.2 on Windows reports a link-local peer without one, so a zone
+ * could never match; dropping it on both sides makes the comparison hold whichever way a platform reports
+ * it). Applied on BOTH sides of the comparison. Anything else (a plain IPv4 address, a hostname) passes
+ * through unchanged.
  */
-function canonicalAddress(address: string): string {
+export function canonicalAddress(address: string): string {
+  // First, and on its own: the dotted mapped form is what Bun reports for every IPv4 peer, so the common
+  // request skips the URL parse below (which would reach the same answer through the hex fold).
   const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(address);
-  return mapped?.[1] ?? address;
+  if (mapped) return mapped[1]!;
+  if (isIP(address) !== 6) return address;
+  // A zone id (`fe80::1%eth0`, `fe80::1%8`) is dropped: `isIP` accepts it and `dns.lookup` returns it, but Bun
+  // reports a link-local peer WITHOUT one (probed on Bun 1.4.2, Windows), so a zone could never match the peer.
+  // Dropped on both sides, the comparison holds whichever way a platform reports it.
+  const zoneAt = address.indexOf("%");
+  const bare = zoneAt === -1 ? address : address.slice(0, zoneAt);
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${bare}]/`).hostname.slice(1, -1);
+  } catch {
+    return bare.toLowerCase();
+  }
+  // An IPv4-mapped address the parser rendered in hex (`::ffff:a00:5`, from `::ffff:a00:5` itself or from
+  // `0:0:0:0:0:ffff:10.0.0.5`) is the same peer Bun reports as `::ffff:10.0.0.5`: back to dotted IPv4.
+  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(canonical);
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1]!, 16);
+    const lo = parseInt(hexMapped[2]!, 16);
+    return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
+  }
+  return canonical;
 }
 
 /**
@@ -53,33 +93,50 @@ function canonicalAddress(address: string): string {
  * (env `TRUSTED_PROXY_HOST`; see `.env.example` for the deployed example value). `undefined` means
  * "not configured": `isTrusted` always returns `false` and the header is never honored -- fail
  * closed, matching every other unconfigured-feature rule in this repo. `opts.lookup`/`opts.now` are
- * test seams; production always resolves real DNS and reads the real clock.
+ * test seams; production always resolves real DNS and reads the real clock. `opts.log` receives the
+ * proxy's own lines: the first successful resolve, a failure (once per streak), the recovery, and a boot
+ * refresh that hit its bound (#493).
  */
 export function createTrustedProxy(opts: {
   host: string | undefined;
   lookup?: (host: string) => Promise<string[]>;
   now?: () => number;
+  log?: Pick<Console, "log" | "warn">;
 }): TrustedProxy {
-  const host = opts.host;
+  const { host, log } = opts;
   const lookup = opts.lookup ?? defaultLookup;
   const now = opts.now ?? Date.now;
   let addresses = new Set<string>();
-  let lastRefreshAt = -Infinity;
+  let nextRefreshAt = -Infinity;
   let inFlight: Promise<void> | undefined;
+  let failing = false;
+  let everResolved = false;
 
   function doRefresh(): Promise<void> {
     if (host === undefined) return Promise.resolve();
     if (inFlight) return inFlight;
-    lastRefreshAt = now();
-    inFlight = (async () => {
+    nextRefreshAt = now() + REFRESH_THROTTLE_MS; // stamped before the await: one lookup in flight at a time
+    const run = (async () => {
       try {
         addresses = new Set((await lookup(host)).map(canonicalAddress));
-      } catch {
-        // Leave `addresses` as it was -- see the interface doc comment.
-      } finally {
-        inFlight = undefined;
+        // A success keeps the full-window stamp set above; only a failure shortens it (below).
+        if (!everResolved || failing) log?.log(`[http] TRUSTED_PROXY_HOST "${host}" resolved to ${addresses.size} address(es)`);
+        everResolved = true;
+        failing = false;
+      } catch (err) {
+        // Leave `addresses` as it was -- see the interface doc comment. Say so once per streak, and let a
+        // miss retry soon (#493).
+        nextRefreshAt = now() + REFRESH_RETRY_MS;
+        if (!failing) log?.warn(`[http] TRUSTED_PROXY_HOST "${host}" did not resolve (${err}); CF-Connecting-IP stays untrusted until it does`);
+        failing = true;
       }
     })();
+    // Cleared AFTER the assignment settles, never from inside the body: a `lookup` that threw synchronously
+    // used to run the body's `finally` before `inFlight` was even assigned, leaving a settled promise there
+    // for good and no later lookup ever running.
+    inFlight = run.finally(() => {
+      inFlight = undefined;
+    });
     return inFlight;
   }
 
@@ -90,10 +147,21 @@ export function createTrustedProxy(opts: {
       // Fire-and-forget: THIS call still answers from the address set as it stood when the
       // request arrived. The miss that triggers a refresh is itself still correctly untrusted --
       // refreshing can only help a LATER request, never retroactively change this one's answer.
-      if (!trusted && now() - lastRefreshAt >= REFRESH_THROTTLE_MS) void doRefresh();
+      if (!trusted && now() >= nextRefreshAt) void doRefresh();
       return trusted;
     },
-    refresh: doRefresh,
+    refresh(timeoutMs?: number): Promise<void> {
+      const run = doRefresh();
+      if (timeoutMs === undefined) return run;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const bound = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          log?.warn(`[http] TRUSTED_PROXY_HOST "${host}" has not resolved after ${timeoutMs}ms; starting with CF-Connecting-IP untrusted until it does`);
+          resolve();
+        }, timeoutMs);
+      });
+      return Promise.race([run.finally(() => clearTimeout(timer)), bound]);
+    },
   };
 }
 
@@ -105,9 +173,11 @@ export function createTrustedProxy(opts: {
  * a request over an already-closed socket).
  *
  * A repeated header collapses to one comma-joined string per the Fetch `Headers` contract; only
- * the FIRST value is honored, the same defensive convention as a standard `X-Forwarded-For` chain
- * -- Cloudflare's edge only ever sets this header once for a request that genuinely transited it,
- * so a second value can only be something a caller appended trying to look like an earlier hop.
+ * the FIRST value is honored. Cloudflare's edge sets this header exactly once for a request that
+ * transited it, so a second value can only be something a caller appended. (This is not an
+ * `X-Forwarded-For` chain, where the trustworthy hop is the LAST one your own proxy appended;
+ * `CF-Connecting-IP` is single-valued by contract, which is why first-wins is right here and would
+ * be wrong there.)
  */
 export function clientIpFrom(req: Request, peerAddress: string | undefined, proxy: TrustedProxy): string {
   if (peerAddress !== undefined && proxy.isTrusted(peerAddress)) {

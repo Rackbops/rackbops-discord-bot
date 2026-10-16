@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { parseBuildOutput, parseContainerId } from "./docker";
+import { parseBuildOutput, parseContainerId, STOP_TIMEOUT_SEC } from "./docker";
 import { settleWithin } from "../test/settleWithin";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
@@ -359,6 +359,14 @@ describe("daemon calls", () => {
     expect(calls[0]!.url).toContain("/containers/abc123/update");
     expect(calls[0]!.body).toBeDefined();
     expect(JSON.parse(calls[0]!.body!)).toEqual({ RestartPolicy: { Name: "no" } });
+  });
+
+  // shutdown.test.ts derives its margin from STOP_TIMEOUT_SEC; this is what makes that the number a
+  // stop actually sends, so the margin is measured against the real bound and not a restated literal.
+  test("stopContainer's default grace is STOP_TIMEOUT_SEC, on the wire", async () => {
+    stub(() => new Response("", { status: 204 }));
+    await stopContainer("abc");
+    expect(new URL(calls[0]!.url, "http://docker").searchParams.get("t")).toBe(String(STOP_TIMEOUT_SEC));
   });
 
   // Both are "the state we wanted" — treating them as errors would abort a handoff over a

@@ -15,6 +15,7 @@ import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
+import { createReadyHandler } from "./ready";
 import {
   awaitCriticalIdle,
   beginCritical,
@@ -55,7 +56,7 @@ import {
 } from "./plugins/host";
 import { startHostHttp } from "./http";
 import { describeInteraction, interactionLogLine, type InteractionOutcome } from "./interactionLog";
-import { createTrustedProxy } from "./net/clientIp";
+import { createTrustedProxy, PROXY_BOOT_REFRESH_TIMEOUT_MS } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
 import { describePlugins, readDiscovery } from "./routing/discovery";
@@ -71,9 +72,10 @@ const pluginIndexResult = await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)
 // older version — rather than explicitly pinned, which needs no state — can be kept when the index
 // moves to a version declaring a different host API (all a hostApiVersion in the index describes is
 // its current version). This is a second read of the file activate() reads for installPlugins, kept
-// separate on purpose: activate()'s read sits inside its own try/catch, while this one is total —
-// pinsFromState accepts any parsed shape, and readPluginState already degrades a corrupt file to
-// fresh (moving it aside once, here, instead of in activate()).
+// separate on purpose: activate()'s read sits inside its own try/catch, while this one is not —
+// pinsFromState accepts any parsed shape, and readPluginState degrades a corrupt file to fresh (moving
+// it aside once, here, instead of in activate()), but a read that fails for another reason (EACCES, EIO)
+// is rethrown by readJsonOrFresh (#509) and fails the boot here, with the real error in the log.
 const bootStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 const installedPins = pinsFromState(await readPluginState(DATA_DIR, bootStorage));
 const selectedPlugins = selectPlugins(
@@ -127,16 +129,23 @@ process.on("SIGINT", shutdownHandler);
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);
 
-client.once(Events.ClientReady, async (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
-  clearTimeout(verifyTimer);
-  // A completed gateway login is the verification bar: process-alive proves nothing, and this
-  // is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
-  // crash-proof — a retire failure exits this process rather than falling through to `activate`,
-  // so a doomed handoff can never leave two live bots on the shared token.
-  if (mode === "standby") await takeOver(process.env[HANDOFF_FROM_ENV]!);
-  await activate(c);
-});
+// A completed gateway login is the verification bar: process-alive proves nothing, and this
+// is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
+// crash-proof — a retire failure exits this process rather than falling through to `activate`,
+// so a doomed handoff can never leave two live bots on the shared token. The order (clear the verify
+// timer, takeOver only in standby, then activate) lives in `src/ready.ts`, where `ready.test.ts` drives
+// it (#435); index.test.ts pins that this call is the only thing attached to ClientReady.
+client.once(
+  Events.ClientReady,
+  createReadyHandler({
+    mode,
+    takeOver: () => takeOver(process.env[HANDOFF_FROM_ENV]!),
+    activate,
+    clearVerifyTimer: () => clearTimeout(verifyTimer),
+    log: console,
+    describe: (c) => `Logged in as ${c.user.tag}`,
+  }),
+);
 
 /**
  * Everything that makes this process *the* bot. Held back until the handoff completes so the
@@ -152,12 +161,17 @@ async function activate(c: Client<true>): Promise<void> {
   // outer try degrades ANY unexpected failure to core-only registration — a plugin never crashes boot.
   const storage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
   let previousState: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
+  // #509: true while the read below has not succeeded. readJsonOrFresh rethrows a read that failed for a
+  // reason other than corruption, and the catch further down swallows it -- so `previousState` is then the
+  // empty default, "could not read", not "nothing there", and the boot write must not build the file from it.
+  let previousStateUnread = true;
   let installResult: InstallResult = { installed: [], skips: {}, fallbacks: {} };
   let loadResult: LoadResult = { loaded: [], errors: {} };
   let commandMap: PluginCommandMap = new Map();
   let commandBody = commandData;
   try {
     previousState = await readPluginState(DATA_DIR, storage);
+    previousStateUnread = false;
     // Per-plugin pins: the last-good installedVersion plus #104's transient targetVersion (an explicit
     // /plugins update the next boot should try, falling back to installedVersion if it can't install).
     const pins = Object.fromEntries(
@@ -321,15 +335,18 @@ async function activate(c: Client<true>): Promise<void> {
   // the bot down.
   if (config.httpPort !== undefined) {
     try {
-      // #319: resolved (or explicitly never-trusted) before the listener binds, so the very first
-      // request sees the real address set rather than an empty one racing the first refresh.
-      const proxy = createTrustedProxy({ host: config.trustedProxyHost });
+      // #319: resolved (or explicitly never-trusted) before the listener binds, so the first request sees the
+      // real address set when the sidecar answers within the bound. #493: bounded, so a sidecar that cannot be
+      // resolved yet (a first `up`, a host reboot) delays command registration and the ready flag by at most
+      // PROXY_BOOT_REFRESH_TIMEOUT_MS, not by the resolver's own timeout; the lookup keeps running and trust
+      // lands when it does -- fail closed meanwhile. Failures and recoveries are logged by the proxy itself.
+      const proxy = createTrustedProxy({ host: config.trustedProxyHost, log: console });
       if (config.trustedProxyHost === undefined) {
         console.log(
           "[http] TRUSTED_PROXY_HOST is not set -- CF-Connecting-IP will never be trusted; every caller shares one rate-limit budget",
         );
       } else {
-        await proxy.refresh();
+        await proxy.refresh(PROXY_BOOT_REFRESH_TIMEOUT_MS);
       }
       const loaded = loadResult.loaded;
       const http = startHostHttp({
@@ -367,7 +384,10 @@ async function activate(c: Client<true>): Promise<void> {
     // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
     // same route with the same body, and its result is `single` -- so the line below is unchanged.
     // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
-    // and when it is skipped), into the catch below.
+    // and when it is skipped), into the catch below. So is a routing read that fails for a reason other
+    // than a parse error (#509): `applyRouting` reads routing first, outside any try, and `readJsonOrFresh`
+    // rethrows such a fault -- it lands in the same catch, under its registration headline, with the real
+    // error printed after it.
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),
@@ -406,19 +426,23 @@ async function activate(c: Client<true>): Promise<void> {
   }
 
   try {
-    await writePluginState({
-      dataDir: DATA_DIR,
-      storage,
-      selected: selectedPlugins,
-      installed: installResult.installed,
-      installSkips: installResult.skips,
-      fallbacks: installResult.fallbacks,
-      loaded: loadResult.loaded,
-      loadErrors: loadResult.errors,
-      processEnv: process.env,
-      previous: previousState,
-      now: () => new Date(),
-    });
+    if (previousStateUnread) {
+      console.error("[plugins] data/plugins/state.json could not be read, so it is left as it is this boot (not rewritten)");
+    } else {
+      await writePluginState({
+        dataDir: DATA_DIR,
+        storage,
+        selected: selectedPlugins,
+        installed: installResult.installed,
+        installSkips: installResult.skips,
+        fallbacks: installResult.fallbacks,
+        loaded: loadResult.loaded,
+        loadErrors: loadResult.errors,
+        processEnv: process.env,
+        previous: previousState,
+        now: () => new Date(),
+      });
+    }
   } catch (err) {
     // A data/plugins/state.json write failure (a full/read-only volume) is bookkeeping for ops
     // tooling — it must not crash a bot that is otherwise up and serving.

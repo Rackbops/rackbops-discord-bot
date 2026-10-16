@@ -216,8 +216,8 @@ ALLOWED_SPEC=(
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
   # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
   # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
-  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:114); the `@version` tail is exactly
-  # what resolveConfig accepts (src/config.ts:114: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:116); the `@version` tail is exactly
+  # what resolveConfig accepts (src/config.ts:116: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
   # appear in two different tokens (plugins_name_repeated, #430), since the bot refuses either at boot and env-set would
   # otherwise recreate it into a crash loop.
   'PLUGINS|^[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?(,[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?)*$'
@@ -309,8 +309,8 @@ declare -A RESERVED_KEYS=(
   # Group 3 (#278): read by the bot core process, not edited by the panel.
   [GITHUB_REPO]=1              # src/config.ts: the repo self-update and release polling anchor to
   [PLUGIN_REGISTRY_URL]=1      # src/plugins/install.ts: where plugin bundles are downloaded from
-  [BOT_DATA_DIR]=1             # src/storage.ts: the bot's data directory
-  [NODE_ENV]=1                 # src/storage.ts: `test` makes an unset BOT_DATA_DIR a boot error
+  [BOT_DATA_DIR]=1             # src/dataDir.ts: the bot's data directory (src/storage.ts's DATA_DIR)
+  [NODE_ENV]=1                 # src/dataDir.ts: under bun test (NODE_ENV=test, or a test-file entry) an unset BOT_DATA_DIR is a boot error
   [HANDOFF_FROM]=1             # src/handoff.ts: the raw standby instruction, set by the redeploy machinery (#46 checks the named container)
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
@@ -972,9 +972,9 @@ format_matches() {
 }
 
 # #430: true when a PLUGINS value names one plugin in two different tokens ("foo,foo@1.0.0",
-# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:119-121) and no ERE can
+# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:121-123) and no ERE can
 # say it. An exact repeat ("foo,foo") is not one: config.ts's list() drops repeated tokens first
-# (src/config.ts:70-77), so it boots, and env-set accepts it too. Only ever called on a value the
+# (src/config.ts:72-79), so it boots, and env-set accepts it too. Only ever called on a value the
 # PLUGINS row already matched, so every token is non-empty and holds no glob character.
 plugins_name_repeated() {
   local -A seen_tok=() seen_name=()

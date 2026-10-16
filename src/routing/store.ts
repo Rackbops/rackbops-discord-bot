@@ -1,5 +1,6 @@
 // Reading and writing `routing.json` and `routing.secrets.json`. Both READ through `storage.ts`'s
-// `readJsonOrFresh` (a corrupt file is moved aside, never thrown on); `routing.json` also WRITES
+// `readJsonOrFresh` (a corrupt file is moved aside, not thrown on; a read that fails for another reason,
+// EACCES or EIO, is rethrown, #509); `routing.json` also WRITES
 // through its serialized read-modify-write. `routing.secrets.json` writes itself, because it has to
 // be created owner-only and `writeJsonAtomic` gives its temp file the process default mode.
 // Nothing here reads `DATA_DIR`: every function takes the directory it is to use, so a test points
@@ -114,7 +115,8 @@ export function sayWhatWasIgnored(raw: unknown): void {
  * The routing file as the bot should act on it. A missing file is fresh; an unparseable one is
  * moved aside (`routing.json.corrupt-<timestamp>`) and read as fresh, as `readJsonOrFresh` does for
  * every data file; a parseable file of the wrong shape is repaired down to whatever in it is valid.
- * Never throws.
+ * Throws only when the read itself fails for a reason other than a parse error (EACCES, EIO:
+ * `readJsonOrFresh` rethrows those, #509).
  *
  * The repair is tolerant and silent (`repairRouting` is pure); what it dropped is worked out beside it
  * (`droppedByRepair`) and said HERE, at the I/O edge, once per distinct message: a plugin placed in a
