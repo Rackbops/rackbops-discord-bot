@@ -111,6 +111,9 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       // Inside a critical section so the restart waits for the reply to be delivered.
       await withCritical(async () => {
+        // One reply, built first and clamped once (#505 item 7, #503 item 3): the failure path's text used to be the
+        // only one through clampReply, while a failed swap's reply carries the daemon's error text unbounded.
+        let content: string;
         try {
           const { decision, latestSha, reason, redeploy } = await checkForUpdate({
             force: true,
@@ -122,14 +125,35 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
               interactionToken: interaction.token,
             },
           });
-          await interaction.editReply(
-            updateReply(decision, latestSha, { runningSha: config.gitSha, reason, redeploy }),
+          content = clampReply(
+            updateReply(decision, latestSha, {
+              runningSha: config.gitSha,
+              reason,
+              redeploy,
+              commandName: interaction.commandName,
+            }),
           );
         } catch (err) {
           // #503 item 11: the failure used to be swallowed into the reply alone, leaving `outcome=answered` and no
           // trace. withoutRequest: a failed reply carries the interaction token and the reply text (#545).
           console.warn(`[update] /${interaction.commandName} failed`, withoutRequest(err));
-          await interaction.editReply(clampReply(`⚠️ Update check failed: ${(err as Error).message}`));
+          content = clampReply(`⚠️ Update check failed: ${(err as Error).message}`);
+        }
+        try {
+          await interaction.editReply(content);
+        } catch (err) {
+          // #503 item 2: Discord accepts the reply for 15 minutes after the command, and a build can run that long
+          // (docker.ts's BUILD_TIMEOUT_MS), so the reply to a long failed swap can arrive after the token died. The
+          // requester is known: tell them by DM, whatever made the edit fail. A DM that fails too rejects out of here,
+          // as the double failure did before: on the swap path index.ts logs it and the interaction line says `error`;
+          // on the exit-75 path, when this is the last open critical section, the restart's exit fires as it closes,
+          // ahead of that catch, so nothing logs the DM's own failure there (the warn below records the refused edit)
+          // and the post-boot report is what reaches the requester.
+          console.warn(
+            `[update] /${interaction.commandName}: the reply was refused — sending it by DM`,
+            withoutRequest(err),
+          );
+          await interaction.user.send(content);
         }
       });
     },
@@ -385,21 +409,35 @@ async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promis
 }
 
 /**
+ * A failed or timed-out swap's text (`handoffFailureMessage`) puts the daemon's error ahead of the verdict ("I stayed on
+ * the current build", the `-next` container to remove by hand); unbounded, a long error pushed the verdict past the
+ * whole-reply clamp (#505 item 7). A stalled swap's text puts the error last, where the clamp only keeps the reply
+ * bounded. 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause.
+ */
+const DAEMON_ERROR_MAX = 600;
+
+/**
  * `runningSha` is passed in rather than read off the `config` singleton: config resolves
  * process.env at import time and is shared across the whole bun test process, so a formatter
  * that reaches into it can only be tested by winning a race against whichever test file
  * imports config first.
+ *
+ * `commandName` is the `/update` command as this instance registered it (`interaction.commandName`, prefix
+ * included); the `busy` text names it, and falls back to the bare `update` when a caller has no interaction.
  */
 export function updateReply(
   decision: UpdateDecision,
   latestSha: string,
-  o: { runningSha?: string; reason?: DisabledReason; redeploy?: RedeployResult } = {},
+  o: { runningSha?: string; reason?: DisabledReason; redeploy?: RedeployResult; commandName?: string } = {},
 ): string {
   const short = shortSha(latestSha);
   const running = o.runningSha ? shortSha(o.runningSha) : undefined;
   switch (decision) {
     case "busy":
-      return "⏳ An update is already in progress — I'll report how it went; ask again after that.";
+      // #449: the refused caller is never recorded, so nothing is promised to them, and the wait is not called short
+      // (a build runs up to 15 minutes). The clause is true whichever call is in flight: a /update reports to its own
+      // requester, and anything else that answers busy (the AUTO tick) has no requester to report to.
+      return `⏳ An update or restart is already in progress — ask again once it has finished (a /${o.commandName ?? "update"} that started it reports back to whoever ran it).`;
     case "disabled":
       // Two ways to end up here, and they need different things from the operator: bake a
       // GIT_SHA, versus push the branch you built from (nazumods/wow#871).
@@ -426,9 +464,12 @@ export function updateReply(
             : "failed";
         return handoffFailureMessage(kind, {
           targetSha: latestSha,
-          error: o.redeploy.error,
+          error: o.redeploy.error === undefined ? undefined : clampReply(o.redeploy.error, DAEMON_ERROR_MAX),
           replacement: o.redeploy.replacement,
-          replacementError: o.redeploy.replacementError,
+          replacementError:
+            o.redeploy.replacementError === undefined
+              ? undefined
+              : clampReply(o.redeploy.replacementError, DAEMON_ERROR_MAX),
         });
       }
       // No "if I come back on the same build…" caveat: the bot answers that itself now,
