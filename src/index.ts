@@ -327,10 +327,11 @@ async function activate(c: Client<true>): Promise<void> {
   // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
   // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
-  // #541: a shutdown that began during activation has already disposed what was running, and the loop
-  // refused the rest. Writing state.json, draining the mailbox, binding HTTP and sending the update
-  // report-back now would record and announce a boot that never happened (the report would say "failed
-  // to start" for a plugin the shutdown refused). Stop here; the pending report survives to the next boot.
+  // #541: a shutdown began during activation. disposePlugins has run, or runs as soon as the drain ends,
+  // and the loop refuses every plugin it had not started by then (one already running is disposed). Writing
+  // state.json, draining the mailbox, binding HTTP and sending the update report-back now would record and
+  // announce a boot that never happened (the report would say "failed to start" for a plugin the shutdown
+  // refused). Stop here; the pending report survives to the next boot.
   // Shutdown only (not restartPending, which is also true for a handoff): a handoff that began meanwhile
   // can still fail and leave this process running, and it must then have booted; a pending restart exits
   // by itself.

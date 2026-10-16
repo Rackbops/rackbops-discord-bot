@@ -104,10 +104,15 @@ describe("index.ts wiring", () => {
     const block = source.slice(guard, source.indexOf("\n  }\n", guard));
     expect(block).toMatch(/console\.warn\("\[plugins\] shutdown in progress — the rest of activation is skipped"\);\s*return;$/);
     // Shutdown only: restartPending() is also true for a handoff, which can fail and leave this process running
-    // (half-booted, if the boot had been skipped), and for a pending restart, which exits by itself. It is handed
-    // on as a function elsewhere in index.ts, never called here; isShuttingDown() has this one call site.
-    expect((source.match(/\bisShuttingDown\(\)/g) ?? []).length).toBe(1);
-    expect(/\brestartPending\(\)/.test(source)).toBe(false);
+    // (half-booted, if the boot had been skipped), and for a pending restart, which exits by itself. Checked on the
+    // CODE of the guard's own stretch (comment lines dropped), so a comment that names either cannot fail it.
+    const code = source
+      .slice(activated, guard + block.length)
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    expect((code.match(/\bisShuttingDown\(\)/g) ?? []).length).toBe(1);
+    expect(/\brestartPending\(\)/.test(code)).toBe(false);
   });
 
   // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads

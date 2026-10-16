@@ -41,8 +41,8 @@ export interface LoadedPlugin {
   entry: PluginIndexEntry;
   version: string;
   plugin: Plugin;
-  /** Flipped true by activatePlugins once activate() resolves within its bound and no shutdown has begun
-   *  (#541), and cleared by disposePlugins before any dispose() is called (#409). Gates every dispatch into
+  /** Flipped true by activatePlugins once activate() resolves within its bound and disposePlugins has not
+   *  begun (#541), and cleared by disposePlugins before any dispose() is called (#409). Gates every dispatch into
    *  the plugin: ticks, HTTP routes, slash commands (#407), and component, modal and autocomplete handlers. */
   running: boolean;
   /** Set if activate() threw or did not finish within its bound (#408), or a shutdown began before or
