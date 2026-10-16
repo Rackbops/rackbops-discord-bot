@@ -280,7 +280,7 @@ export async function redeploy(
     // Cleans up by NAME when there is no id (#130). `createContainer` is now timeout-bounded, so it
     // can abort while the daemon goes on to create the container anyway — a slow-then-recovering
     // daemon is exactly the case that bound exists for. `replacementId` is then never assigned, and
-    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` (created or running,
+    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` (`created`,
     // so not an exited leftover) that bot-ops.sh reads as "a swap is still in progress" until some
     // LATER redeploy's leftover sweep above runs
     // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the

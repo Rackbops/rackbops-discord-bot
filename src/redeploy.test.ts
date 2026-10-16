@@ -881,7 +881,7 @@ describe("redeploy — cleanup always runs", () => {
 
   // #130: createContainer is timeout-bounded now, so it can abort while the daemon goes on to
   // create the container anyway. redeploy() never learns the id, so an id-only cleanup would skip
-  // the orphan — and a lingering `<name>-next` (created or running; an exited one no longer blocks
+  // the orphan — and a lingering `<name>-next` (`created`; an exited one no longer blocks
   // the guard since #490) reads to bot-ops.sh as "a swap is still in
   // progress", refusing restart/env-set until some later redeploy's leftover sweep runs, which the
   // anti-loop suppression can defer indefinitely for the same sha. Cleanup must fall back to the

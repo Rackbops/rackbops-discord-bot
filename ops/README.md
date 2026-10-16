@@ -27,7 +27,7 @@ time, not silently written.
 | `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
 | `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. **SSH-only since #277**: the admin panel's Restart button calls `recreate` instead. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted`. **#227:** holds the same config-dir lock `env-set`/`recreate` do for its whole run, so it queues behind one already in progress rather than overlapping it |
-| `recreate` | `up -d --force-recreate` on its own, with no value submitted first — the same recreate `env-set` runs after a save, exposed as its own subcommand (#277) so a recreate a previous `env-set` started but the panel never saw finish (a kill, a 504) can be re-attempted from the panel with one click. `{"ok": bool, "recreated": true, "log": string}`, `log` relayed the same way `restart`'s and `env-set`'s are; exits with compose's status. Refused while a `<name>-next` container is alive (running, restarting, paused or created); an exited leftover does not block it (#490), and `restart` and `env-set` follow the same rule (see *A refused restart, env-set or recreate that says finishing*, under Safety notes) |
+| `recreate` | `up -d --force-recreate` on its own, with no value submitted first — the same recreate `env-set` runs after a save, exposed as its own subcommand (#277) so a recreate a previous `env-set` started but the panel never saw finish (a kill, a 504) can be re-attempted from the panel with one click. `{"ok": bool, "recreated": true, "log": string}`, `log` relayed the same way `restart`'s and `env-set`'s are; exits with compose's status. Refused while a `<name>-next` container is alive (running, restarting, paused, removing or created); an exited leftover does not block it (#490), and `restart` and `env-set` follow the same rule (see *A refused restart, env-set or recreate that says finishing*, under Safety notes) |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every plugin in the cached Plugin Index, whether or not the plugin is in `PLUGINS` (#256) |
 | `env-set` | Read `KEY=VALUE` lines from **stdin**, refuse any key outside the whitelist, diff each remaining one against the effective value, validate the format of only the ones that change, back up `.env`, apply those changes, then `up -d --force-recreate` to load them. **#227:** holds an exclusive lock on the config dir for the whole run (the read, the diff, the backup, the rewrite and the recreate) — a second `env-set`/`restart`/`recreate` on the same instance waits up to `BOT_OPS_LOCK_WAIT_SECONDS` (default 60s), then refuses, having written nothing, rather than racing this one |
 | `env-schema` | JSON of the same keys as `env-get`, each with the ERE `pattern` `env-set` validates against, whether it is `required` (refuses blank), and its `source` (`core` static whitelist or a plugin's manifest in the cached index, on or off, #256); then one row per plugin **secret** key, `{pattern, required, source: "plugin", secret: true, isSet}` — that it exists and whether it is set, never what it holds (#240) |
@@ -412,23 +412,23 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   from the box's checkout and roll the bot back on every settings edit.
 - These subcommands keep working across a self-update: the replacement container takes the
   original's name as it retires it, so `BOT_OPS_CONTAINER` still resolves and needs no change.
-- **A refused `restart`, `env-set` or `recreate` that says *finishing*** (#490, #548). All three refuse while
-  a `<name>-next` container is **alive** (running, restarting, paused, removing or created), because a
-  recreate then starts a second bot on the one Discord token. If `<name>` itself is running the message says
-  *in progress*: a swap is under way, retry in a minute. If `<name>` is **not** running it says *finishing*:
-  the new build is in its probation (seconds after it logs in), is crash-looping in it, or came up but never
-  took the name. Tell them apart by the log, not by a clock (a cold plugin install can legitimately take
-  longer than a minute):
-  `docker ps -a --filter name='^/<name>' --format '{{.Names}} {{.State}}'` and `docker logs --tail 50 <name>-next`.
-  (a) The log shows repeated boots (`Logged in as …`, then a crash, again and again), or the state flips
-  through `restarting`: the new build is crash-looping in its probation. `docker start <name>` brings the old
-  build back, and the new container steps aside and stays stopped. (b) The log ends in
-  `[handoff] could not take the name` or `could not remove the stopped original` and the bot is up: the swap
-  finished but the rename did not. `docker rm -f <name>` (the stopped corpse), then
-  `docker rename <name>-next <name>`. (c) Neither yet: wait; the probation is still running. An **exited**
-  `<name>-next` blocks nothing: it is a leftover of a swap a reboot interrupted, and the next self-update
-  sweeps it (`docker rm <name>-next` clears it sooner). A `<name>-next` stuck in *created* (a process death
-  between its create and its start) does block; `docker rm <name>-next` clears that too.
+- **A refused `restart`, `env-set` or `recreate`** (#490). All three refuse while a `<name>-next` container
+  is **alive** (running, restarting, paused, removing or created), because a recreate then may start a second
+  bot on the one Discord token (not verified without a daemon). If `<name>` itself is running the message says
+  *in progress*: a swap is under way, so retry in a minute. If it persists and the `-next` container is
+  *created*, a process died between its create and its start: `docker rm <name>-next` clears it. If `<name>`
+  is **not** running the message says *finishing*: the swap is between stopping the original and taking its
+  name, or it finished without taking it (the new bot stays named `<name>-next` beside the stopped original).
+  Tell the cases apart by the state and by the replacement's log, not by a clock:
+  `docker ps -a --filter name='^/<name>' --format '{{.Names}} {{.State}}'` and
+  `docker logs <name>-next 2>&1 | grep '\[handoff\]'`. (a) The new build keeps crashing (repeated
+  `Logged in as …` boots in the log, or the state flipping through `restarting`) and the old container is still
+  there: roll back with `docker rm -f <name>-next`, then `docker start <name>`. (b) The bot is up and the log
+  has `[handoff] could not take the name` or `could not remove the stopped original`: the swap finished but
+  the rename did not. `docker rm <name>` (the stopped original; a plain `rm` refuses a running container),
+  then `docker rename <name>-next <name>`. (c) Neither yet: wait. An **exited** `<name>-next` blocks nothing: it
+  is a leftover of a swap a reboot interrupted, and the next self-update sweeps it (`docker rm <name>-next`
+  clears it sooner).
 
 ## Enabling a panel + choosing a bot (debug/prod)
 

@@ -95,8 +95,8 @@ function setup(
     /** The simulated canonical-named container's real docker state:
      *  - "running" (the default whenever nextState is set): matches a bare `docker ps` (no `-a`) AND
      *    `docker ps -a`, same as a real running container.
-     *  - "stopped": past retireOriginal's stop but not removed (a stopped corpse, or the original kept
-     *    for the new build's probation, #548) — matches ONLY `docker ps -a`, not a bare `docker ps`,
+     *  - "stopped": past retireOriginal's stop but not removed (a stopped corpse) — matches ONLY
+     *    `docker ps -a`, not a bare `docker ps`,
      *    same as a real stopped-but-present container. The guard's running-check must stay a bare
      *    `docker ps`; this state is what catches an edit that adds `-a` to it.
      *  - "gone": fully removed. Matches neither.
@@ -154,8 +154,9 @@ function setup(
   // set, with `-a` so it sees even a not-yet-started replacement; it asks for `{{.State}}`, #490),
   // one for the bare canonical name.
   // That second query's `-a` (or lack of it) has to be respected for real, not just its filter
-  // text — that's the exact flag the guard's whole self-heal/no-lockout design rests on, so the
-  // shim tracks it explicitly rather than answering the same way regardless.
+  // text — the guard's running-check must stay a bare `ps` (a stopped corpse is NOT running), so the
+  // shim tracks it explicitly rather than answering the same way regardless. The "-next" query's `-a`
+  // is honoured the same way (a created or exited container only shows with `-a`).
   const hasDashA = `[[ " $* " == *" -a "* ]]`;
   const answersCanonicalQuery =
     originalState === "running" ? "true" : originalState === "stopped" ? hasDashA : "false";
@@ -243,7 +244,13 @@ function setup(
               ? [`  echo "Cannot connect to the Docker daemon" >&2; exit 1`]
               : [
                   `  if [[ "$*" == *'{{.State}}'* ]]; then`,
-                  ...opts.nextState.split("\n").map((state) => `    printf '%s\\n' ${JSON.stringify(state)}`),
+                  ...opts.nextState
+                    .split("\n")
+                    .map((state) =>
+                      ["running", "restarting", "paused"].includes(state)
+                        ? `    printf '%s\\n' ${JSON.stringify(state)}`
+                        : `    ${hasDashA} && printf '%s\\n' ${JSON.stringify(state)}`,
+                    ),
                   `  else printf '%s\\n' "probe-container-next"; fi`,
                 ]),
             `elif [[ "$1" == "ps" ]] && [[ "$*" == *"probe-container"* ]]; then`,
@@ -1095,7 +1102,7 @@ describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on
 // refuses, and whether the canonical name is still running only chooses the message; an exited
 // leftover does not refuse.
 describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is mid-flight (issue #51)", () => {
-  test("restart refuses when a <container>-next container exists and the original is still running", async () => {
+  test("restart refuses when <container>-next is running and the original is still running", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "running", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
@@ -1106,7 +1113,7 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
     expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
   });
 
-  test("env-set refuses when a <container>-next container exists and the original is still running — .env untouched, no backup", async () => {
+  test("env-set refuses when <container>-next is running and the original is still running — .env untouched, no backup", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "running", originalState: "running" });
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).not.toBe(0);
@@ -1127,26 +1134,27 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
   });
 });
 
-// #490 and #548 reversed what this describe pinned under #51. Then, a running "<container>-next" beside a
-// stopped or absent canonical was only ever a cosmetic rename failure (retireOriginal tolerates a failed
-// remove/rename and never retries), so the guard let restart/env-set through rather than lock the operator
-// out forever. Since #548 the original is kept STOPPED for the new build's probation, and the live bot runs as
-// "<container>-next" beside the corpse that holds the canonical name — every swap's normal state for a few
-// seconds — and a recreate there is exactly the two-bots race the guard exists to stop (the same state as a
-// live bot never renamed back, #547). So that state now REFUSES, with a message that points at the runbook.
-// What does not refuse any more is an EXITED (or dead) "-next": a leftover of a swap a reboot interrupted,
-// which nothing will retire and the next self-update sweeps (#490 item 2); a lockout there never ends.
-// "created" still refuses on purpose: every swap passes through it for the length of the start call.
+// #490 reversed what this describe pinned under #51. Then, a running "<container>-next" beside a stopped or
+// absent canonical was only ever a cosmetic rename failure (retireOriginal tolerates a failed remove/rename and
+// never retries), so the guard let restart/env-set through rather than lock the operator out forever. That
+// state is the live bot sitting beside the stopped original: the instant between retireOriginal's stop and its
+// rename today, a swap whose remove or rename failed (#547, the live bot stays "-next"), and the probation
+// window #548 adds. A recreate there may start a second bot beside the live one, which is exactly the race the
+// guard exists to stop, so that state now REFUSES, with a message that points at the runbook. What does not
+// refuse any more is an EXITED (or dead) "-next": a leftover of a swap a reboot interrupted, which nothing will
+// retire and the next self-update sweeps (#490 item 2); a lockout there never ends. "created" still refuses on
+// purpose: every swap passes through it for the length of the start call.
 describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, and ignores an exited leftover (#490, #548)", () => {
   const STOPPED = { nextState: "running", originalState: "stopped" } as const;
 
-  // G1-G4: the probation window and the never-renamed bot (a running -next, the canonical not running).
+  // A running -next beside a canonical that is not running: the swap is finishing (or never took the name).
   test("restart refuses when <container>-next is running and the original is a stopped corpse — the probation window", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", STOPPED);
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is finishing");
-    expect(run.stderr).toContain("is running and 'probe-container' is not running");
+    expect(run.stderr).toContain("container 'probe-container-next' is running and 'probe-container' is not running");
+    expect(run.stderr).toContain("try again in a minute");
     expect(dockerCalls(fx).some((c) => c.includes("compose"))).toBe(false);
   });
 
@@ -1175,9 +1183,12 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(run.stderr).toContain("a self-update is finishing");
     expect(run.stderr).toContain("docker logs probe-container-next");
     expect(run.stderr).toContain("see ops/README.md");
+    // The rollback is the two-command form (it holds whether or not the new build has stepped aside).
+    expect(run.stderr).toContain("'docker rm -f probe-container-next' then 'docker start probe-container'");
+    expect(run.stderr).toContain("with the old container still there");
   });
 
-  // G5-G6 (+ recreate): an exited -next is a leftover, not a swap in flight.
+  // An exited -next is a leftover, not a swap in flight.
   test("restart proceeds when <container>-next is exited and the original runs — a leftover of an interrupted swap", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "exited", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
@@ -1200,27 +1211,29 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("up -d --force-recreate"))).toBe(true);
   });
 
-  // G7: created refuses on purpose.
+  // created refuses on purpose.
   test("a created-but-never-started <container>-next still refuses — every swap passes through that state", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "created", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
     expect(run.stderr).toContain("is created");
+    expect(run.stderr).toContain("try again once it completes; if it persists, see ops/README.md");
   });
 
-  // G8: one read, with {{.State}}.
+  // One read, with {{.State}}.
   test("the guard reads the -next state with one `ps -a` and {{.State}}, not the name", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "exited", originalState: "running" });
     await botOps(fx, ["restart"]);
     const nextCalls = dockerCalls(fx).filter((c) => c.includes("-next"));
     expect(nextCalls).toHaveLength(1);
     expect(nextCalls[0]).toContain("ps -a");
+    expect(nextCalls[0]).toContain("name=^/probe-container-next$");
     expect(nextCalls[0]).toContain("{{.State}}");
     expect(nextCalls[0]).not.toContain("{{.Names}}");
   });
 
-  // G9: every state that is not exited/dead is alive.
+  // Every state that is not exited/dead is alive.
   for (const state of ["restarting", "paused", "removing"]) {
     test(`restart refuses when <container>-next is ${state} and the original runs`, async () => {
       const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: state, originalState: "running" });
@@ -1237,13 +1250,21 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(run.exitCode).toBe(0);
   });
 
-  // G10: the name filter is a regex, so more than one match is possible; one alive line refuses.
+  // The name filter is a regex, so more than one match is possible; one alive line refuses.
   test("two matches fail closed: one alive line among exited ones refuses", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "exited\nrunning", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
     expect(run.stderr).toContain("a self-update is in progress");
     expect(run.stderr).toContain("is running and");
+  });
+
+  test("with two alive matches the message names the first, on one line", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "running\nrestarting", originalState: "running" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("is running and");
+    expect(run.stderr).not.toContain("restarting");
   });
 
   // A `docker ps` that errors (a down daemon) reads as "no -next" and the guard passes, as it always did: the
@@ -1253,6 +1274,7 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "!error", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).toBe(0);
+    expect(run.stderr).not.toContain("Cannot connect"); // the query's own stderr stays out of the operator's output
     expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("restart"))).toBe(true);
   });
 
