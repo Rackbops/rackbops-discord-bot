@@ -978,7 +978,9 @@ describe("redeploy — cleanup always runs", () => {
       },
       removeReplacement: () => new Response("", { status: 204 }),
     });
-    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 80, pollMs: 10 });
+    // 300 ms, not tighter: the first (failing) poll must finish well inside the deadline, or it would itself be
+    // the timeout and carry its error on a loaded CI box.
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 300, pollMs: 10 });
     expect(result.outcome).toBe("timeout");
     expect(result.error).toBeUndefined();
   });
@@ -1037,6 +1039,30 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled"); // never "timeout": what the replacement said outranks the poll
     expect(result.error).toBeUndefined();
+  });
+
+  // The same window for a `failed` the replacement wrote: its own word beats "never reported in", and its own
+  // reason beats the poll's last daemon error (this poll's inspect fails too). It is reported as `failed`
+  // straight away, NOT through the ready path, whose first marker check would wait out a whole `pollMs`.
+  test("a failed written during a poll that decides timeout is reported as failed, with the replacement's own reason", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          await writeMarker({ status: "failed", sha: "4646464", error: "gateway login refused", at: Date.now() });
+          return new Response("boom", { status: 500 });
+        }
+        return jsonRes(SELF);
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const startedAt = Date.now();
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 1000 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBe("gateway login refused");
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(wasRemovalAttempted()).toBe(true);
   });
 
   // The re-read applies to every verdict but `ready`, not only to a timeout: here the deciding poll sees the
@@ -1369,6 +1395,7 @@ describe("redeploy — cleanup always runs", () => {
       removeReplacement: () => new Response("", { status: 404 }),
       afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
     });
+    const startedAt = Date.now();
     const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(handoffActive()).toBe(false);
@@ -1376,6 +1403,9 @@ describe("redeploy — cleanup always runs", () => {
     // reported as stalled — a guard keyed on outcome === "ready" alone would wrongly skip removal
     // once the outcome demotes to "stalled" here.
     expect(wasRemovalAttempted()).toBe(true);
+    // `pollMs` reaches the retirement wait too (RedeployOptions): a wait that ignored it would sleep the real
+    // 2 s poll interval before its single check.
+    expect(Date.now() - startedAt).toBeLessThan(1500);
   });
 
   // #160 change 5, defence in depth (Docker itself can no longer produce this once the standby's
@@ -1465,6 +1495,36 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("8".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // The baseline is the START of the deciding observation, not the moment the verdict was reached: a restart
+  // while that poll's inspect was in flight happened after we began looking, so the verdict ("exited") was
+  // about an earlier life and the new one is left alone. A baseline taken when the poll returned would put
+  // this StartedAt (20 ms into a 40 ms inspect) before it and remove a bot that is up.
+  test("a restart while the deciding poll's inspect was in flight is a later life, left alone", async () => {
+    let pollCount = 0;
+    let t0 = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          t0 = Date.now();
+          await Bun.sleep(40);
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        }
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(t0 + 20).toISOString() },
+        });
+      },
+      removeReplacement: () => {
+        throw new Error("must not attempt removal — the replacement restarted while we were looking");
+      },
+    });
+    const result = await redeploy("a".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(wasRemovalAttempted()).toBe(false);
+    expect(result.replacement).toBe("left");
   });
 
   // #434, the tie: `>` is a strictly-later test. A StartedAt equal to the verdict's own time is the SAME

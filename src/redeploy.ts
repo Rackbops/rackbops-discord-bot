@@ -348,13 +348,19 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     if (outcome !== "ready") {
       // Row 15 of the handoff state table: a `ready` written after that poll's marker read and before its
       // verdict would otherwise lose to `timeout` or `failed`. What the replacement SAID outranks what the
-      // poll saw, so read once more before acting on anything else. A `ready` that lands after THIS read
+      // poll saw, so read once more before acting on anything else. A `ready` that lands after THIS re-read
       // (before the removal below) is the residual window: the generation guard's inspect plus the removal
       // call — milliseconds against a healthy daemon, up to two sequential 60 s call bounds against a hanging one.
       const late = await read();
       if (late?.status === "ready") {
         console.warn(`[redeploy] the replacement signalled ready as the poll decided ${outcome} — honouring it`);
         outcome = "ready";
+        pollError = undefined;
+      } else if (late?.status === "failed") {
+        // It gave up in that window: its own word beats "never reported in", and its own reason (read back
+        // from the marker below) beats the poll's last daemon error.
+        console.warn(`[redeploy] the replacement signalled failed as the poll decided ${outcome} — reporting that`);
+        outcome = "failed";
         pollError = undefined;
       }
     }
@@ -390,12 +396,12 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     }
   } catch (err) {
     // The #37 safety net. A failed inspect no longer reaches here (awaitHandoff catches it per poll,
-    // and `readMarker` never throws), so this is for something new: a throw from the retirement wait or
-    // the clock. It must not escape uncaught — left unguarded, the rejection propagated straight through
-    // `applyUpdate` -> `checkForUpdate` and skipped everything below, including `endHandoff()`,
-    // quiescing the bot forever. It still un-quiesces on every exit, and it judges the replacement
-    // against the moment it fired (#431): a throw late in a long wait must not leave the guard comparing
-    // against the pre-poll time.
+    // and `readMarker` never throws; the retirement wait has no throwing call either), so this is for
+    // something new: a throw from a test seam, the clock, or code added later. It must not escape
+    // uncaught — left unguarded, the rejection propagated straight through `applyUpdate` ->
+    // `checkForUpdate` and skipped everything below, including `endHandoff()`, quiescing the bot forever.
+    // It still un-quiesces on every exit, and it judges the replacement against the moment it fired
+    // (#431): a throw late in a long wait must not leave the guard comparing against the pre-poll time.
     pollError = (err as Error).message;
     console.error(`[redeploy] handoff decision failed: ${pollError} — reclaiming`);
     outcome = "failed";
@@ -435,7 +441,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       replacement = "left";
       console.warn(`[redeploy] replacement restarted after we decided ${outcome} — leaving it alone`);
     } else {
-      // The window left open: a `ready` written after the marker read above and before this call — the
+      // The window left open: a `ready` written after the re-read in the try above and before this call — the
       // guard's inspect plus this removal, milliseconds against a healthy daemon, up to two sequential 60 s
       // call bounds against a hanging one — removes a replacement mid-retire. `none` when the daemon already
       // had nothing by that id (#451): the requester must not hear "removed" for what was never there.
