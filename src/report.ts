@@ -14,6 +14,10 @@ import { clampReply, createIssue, ensureLabel, sliceUtf16 } from "./github";
 const REPORT_LABEL = "automated";
 const MODAL_PREFIX = "report:"; // modal customId = report:<project>
 
+/** #504 item 13: what `/report` says in a DM (reachable only under a global registration). Without a `member` there
+ *  is no role to read, and "you lack the role" would be the wrong answer. */
+export const REPORT_DM_REFUSAL = "This command works only in a server channel.";
+
 /** Issue body: the reporter's text plus a traceability footer naming the Discord user by
  * plain username (never a pingable mention) and `command`, the registered name the report was
  * filed through (`COMMAND_PREFIX` included, e.g. `pipreport`). Pure — unit-tested. */
@@ -72,6 +76,10 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
       content: `\`/${interaction.commandName}\` isn't configured — an admin must set \`REPORT_ROLE_ID\` and \`GITHUB_TOKEN\`.`,
       flags: MessageFlags.Ephemeral,
     });
+    return;
+  }
+  if (!interaction.member) {
+    await interaction.reply({ content: REPORT_DM_REFUSAL, flags: MessageFlags.Ephemeral });
     return;
   }
   if (!hasReportRole(interaction)) {

@@ -1,4 +1,5 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { expectCleanedLog, printed, replyFailure } from "../test/restError";
 import type { PluginCommand } from "./plugins/contract";
@@ -12,7 +13,10 @@ const { buildCommandBody } = await import("./plugins/host");
 /** A plugin command as handleCommand's lookup returns it (#407): owned by plugin "demo", running unless `running` says otherwise. */
 const target = (command: PluginCommand, running: () => boolean = () => true): PluginCommandTarget => ({ plugin: "demo", command, running });
 const { config } = await import("./config");
-const { shortSha } = await import("./storage");
+const { shortSha, DATA_DIR } = await import("./storage");
+const { markPluginStateReady, resetPollStateForTest } = await import("./announce");
+const { setExitFn, resetForTest: resetRestartForTest, restartPending, RESTART_EXIT_CODE } = await import("./restart");
+const { HOST_API_VERSION } = await import("./plugins/contract");
 const coreBodyFixture = await Bun.file(new URL("./fixtures/command-body.main.json", import.meta.url)).json();
 
 describe("isAdmin", () => {
@@ -341,12 +345,27 @@ describe("handleCommand — plugin dispatch (default case)", () => {
     expect(handledName).toBe("hello");
   });
 
-  test("warns and resolves when neither a core case nor a plugin matches", async () => {
+  test("a command neither a core row nor a plugin claims is answered privately, and warned once (#504)", async () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const replies: unknown[] = [];
+    const interaction = { commandName: "nope", reply: async (o: unknown) => void replies.push(o) } as unknown as ChatInputCommandInteraction;
     try {
-      expect(await handleCommand({ commandName: "nope" } as unknown as ChatInputCommandInteraction, () => undefined)).toBe("unclaimed");
+      expect(await handleCommand(interaction, () => undefined)).toBe("unclaimed");
+      expect(replies).toEqual([{ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral }]);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(String(warn.mock.calls[0]?.[0])).toContain("no handler for /nope");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // T1b
+  test("an unclaimed command's refusal Discord rejects is not swallowed, like refuseNotRunning's (#504)", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const expired = new Error("Unknown interaction");
+    const interaction = { commandName: "nope", reply: async () => Promise.reject(expired) } as unknown as ChatInputCommandInteraction;
+    try {
+      await expect(handleCommand(interaction, () => undefined)).rejects.toBe(expired);
     } finally {
       warn.mockRestore();
     }
@@ -698,6 +717,43 @@ describe("handleCommand — /update", () => {
     expect(seen.replied?.content).toBe("⛔ No admins are configured — set `ADMIN_USER_IDS` to enable `/update`.");
     expect(seen.deferred).toBe(false);
   });
+
+  // T4
+  test("a failed update check is logged, not only replied (#503 item 11)", async () => {
+    const realSha = config.gitSha;
+    const edits: string[] = [];
+    let fetchSpy: ReturnType<typeof spyOn> | undefined;
+    let warn: ReturnType<typeof spyOn> | undefined;
+    let pushedAdmin = false;
+    try {
+      config.adminUserIds.push("999");
+      pushedAdmin = true;
+      config.gitSha = "0123456789abcdef0123456789abcdef01234567"; // past the "disabled" early return, to the fetch
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch);
+      warn = spyOn(console, "warn").mockImplementation(() => {});
+      const interaction = {
+        commandName: "update",
+        user: { id: "999" },
+        channelId: "c1",
+        applicationId: "app",
+        token: "tok",
+        deferReply: async () => {},
+        editReply: async (content: string) => void edits.push(content),
+      } as unknown as ChatInputCommandInteraction;
+      await handleCommand(interaction);
+      expect(edits).toEqual(["⚠️ Update check failed: offline"]);
+      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[update] /update failed"); // typed: `warn` is a possibly-undefined spy
+      expect(failed).toBeDefined();
+      expect((failed![1] as Error).message).toBe("offline");
+    } finally {
+      warn?.mockRestore();
+      fetchSpy?.mockRestore();
+      config.gitSha = realSha;
+      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+    }
+  });
 });
 
 describe("handleCommand — /plugins", () => {
@@ -714,25 +770,63 @@ describe("handleCommand — /plugins", () => {
     expect(seen.deferred).toBe(false); // gated before any I/O — the gate covers update/remind/skip/cancel too
   });
 
-  // #104 update-now restart ordering. The handler does real network/state I/O (loadPluginIndex,
-  // mutatePluginState), so — like index.test.ts's boot-order guard — this pins the critical ordering
-  // by source-scan: the pin write + reply must sit INSIDE withCritical and BEFORE requestRestart, so
-  // the exit (deferred to the critical section's end) can't beat the state write or the reply.
-  test("update-now writes the pin inside withCritical, before requestRestart (source guard)", async () => {
+  // T5: /plugins list's catch logs too. The index fetch fails (loadPluginIndex falls back and warns itself); the
+  // state read is real; the deferred reply's edit is rejected once, as an expired token would be.
+  test("a failed /plugins list is logged without the token, not only replied (#503 item 11)", async () => {
+    const edits: string[] = [];
+    const failure = replyFailure("webhook");
+    let editCalls = 0;
+    let fetchSpy: ReturnType<typeof spyOn> | undefined;
+    let warn: ReturnType<typeof spyOn> | undefined;
+    let pushedAdmin = false;
+    try {
+      config.adminUserIds.push("999");
+      pushedAdmin = true;
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch);
+      warn = spyOn(console, "warn").mockImplementation(() => {});
+      const interaction = {
+        commandName: "plugins",
+        user: { id: "999" },
+        channelId: "c1",
+        options: { getSubcommand: () => "list" },
+        deferReply: async () => {},
+        editReply: async (content: string) => {
+          editCalls += 1;
+          if (editCalls === 1) throw failure.error; // the list reply: token expired
+          edits.push(content);
+        },
+      } as unknown as ChatInputCommandInteraction;
+      await handleCommand(interaction);
+      expect(edits).toEqual(["⚠️ Couldn't list plugins: Unknown interaction"]);
+      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins list failed");
+      expect(failed).toBeDefined();
+      expectCleanedLog(failed!, failure);
+    } finally {
+      warn?.mockRestore();
+      fetchSpy?.mockRestore();
+      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+    }
+  });
+
+  // #104/#503 item 10 update-now ordering, pinned by source-scan beside the end-to-end test below: the pin write,
+  // the restart request and the reply must all sit INSIDE withCritical, in that order -- the write awaited before
+  // the restart is requested, the restart requested before the reply goes out.
+  test("update-now writes the pin, then requests the restart, then replies, inside withCritical (source guard)", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
     const block = src.slice(src.indexOf("if (result.restart)"));
     const wc = block.indexOf("withCritical(");
-    // Require the `await` on the pin write — without it the deferred exit could beat the state write.
     const mutate = block.indexOf("await mutatePluginState(DATA_DIR, result.mutate)");
-    const reply = block.indexOf("await interaction.editReply(result.reply)");
     const restart = block.indexOf("requestRestart(");
-    for (const [label, pos] of Object.entries({ wc, mutate, reply, restart })) {
+    const reply = block.indexOf("await interaction.editReply(result.reply)");
+    for (const [label, pos] of Object.entries({ wc, mutate, restart, reply })) {
       expect(pos, `${label} present`).toBeGreaterThan(-1);
     }
     expect(wc).toBeLessThan(mutate); // wrapped in the critical section
-    expect(mutate).toBeLessThan(reply); // pin written (awaited) before the reply
-    expect(reply).toBeLessThan(restart); // …and the restart is requested last
+    expect(mutate).toBeLessThan(restart); // pin written (awaited) before the restart is requested
+    expect(restart).toBeLessThan(reply); // …and the reply goes out after it (a rejected reply cannot skip it)
   });
 
   // The write subcommands must refuse until the boot state.json write has landed (isPluginStateReady),
@@ -758,6 +852,145 @@ describe("handleCommand — /plugins", () => {
     const src = readFileSync(new URL("./commands.ts", import.meta.url), "utf8");
     const call = src.slice(src.indexOf("planPluginAction(action, {"));
     expect(call).toContain("enabled: stateEntry.enabled,");
+  });
+});
+
+// #503 item 10: the one path that pins a version and restarts, driven for real. State and index are the shapes
+// plugins/updates.test.ts's helpers build; the data dir is test/setup.ts's per-run BOT_DATA_DIR. The exit is stubbed:
+// in production the process is gone the moment the critical section closes, which is why the failed reply must be
+// logged inside it (and why no "Couldn't act" edit follows).
+describe("handleCommand — /plugins update now (#503 item 10)", () => {
+  const statePath = `${DATA_DIR}/plugins/state.json`;
+  const indexCache = `${DATA_DIR}/plugins/index.json`;
+  const indexBody = {
+    schemaVersion: 1,
+    generatedAt: "2026-10-16T00:00:00.000Z",
+    plugins: [{ name: "demo", package: "@rackbops/plugin-demo", version: "1.1.0", description: "demo", hostApiVersion: HOST_API_VERSION, commands: [], env: [], releases: [] }],
+  };
+  const stateBody = {
+    hostApiVersion: HOST_API_VERSION,
+    writtenAt: "",
+    plugins: [{ name: "demo", enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true }],
+  };
+
+  afterEach(() => {
+    resetRestartForTest();
+    resetPollStateForTest();
+    rmSync(statePath, { force: true });
+    rmSync(indexCache, { force: true });
+  });
+
+  test("a reply Discord rejects after the pin is written still restarts the bot, is logged without the token, and gets no second edit", async () => {
+    const exits: number[] = [];
+    const edits: string[] = [];
+    let editCalls = 0;
+    let pendingAtReply: boolean | undefined;
+    const failure = replyFailure("webhook"); // editReply PATCHes the interaction's webhook
+    let restoreExit = () => {};
+    let fetchSpy: ReturnType<typeof spyOn> | undefined;
+    let warn: ReturnType<typeof spyOn> | undefined;
+    let log: ReturnType<typeof spyOn> | undefined;
+    let pushedAdmin = false;
+    try {
+      mkdirSync(`${DATA_DIR}/plugins`, { recursive: true });
+      writeFileSync(statePath, JSON.stringify(stateBody));
+      markPluginStateReady();
+      config.adminUserIds.push("999");
+      pushedAdmin = true;
+      restoreExit = setExitFn((code) => void exits.push(code));
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+        new Response(JSON.stringify(indexBody), { status: 200 })) as unknown as typeof fetch);
+      warn = spyOn(console, "warn").mockImplementation(() => {});
+      log = spyOn(console, "log").mockImplementation(() => {});
+      const interaction = {
+        commandName: "plugins",
+        user: { id: "999" },
+        channelId: "c1",
+        options: {
+          getSubcommand: () => "update",
+          getString: (name: string) => (name === "name" ? "demo" : null),
+          getInteger: () => null,
+        },
+        deferReply: async () => {},
+        editReply: async (content: string) => {
+          editCalls += 1;
+          if (editCalls === 1) {
+            pendingAtReply = restartPending(); // #503 item 10: the restart must already be requested here
+            throw failure.error; // the "Updating … now" reply: token expired
+          }
+          edits.push(content);
+        },
+      } as unknown as ChatInputCommandInteraction;
+
+      expect(await handleCommand(interaction)).toBe("answered");
+      // The restart was requested BEFORE the reply went out, inside the critical section, and landed when it closed
+      // -- although the reply failed.
+      expect(pendingAtReply).toBe(true);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+      // No second edit was attempted (a "Couldn't act" edit would be false; in production the process is gone).
+      expect(edits).toEqual([]);
+      // The pin and the report are on disk.
+      const written = JSON.parse(readFileSync(statePath, "utf8"));
+      expect(written.plugins[0]).toMatchObject({ name: "demo", targetVersion: "1.1.0" });
+      expect(written.pendingReport).toMatchObject({ plugin: "demo", toVersion: "1.1.0", userId: "999" });
+      // Logged inside the section, without the token or the reply (#503 item 11, #545).
+      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m).startsWith("[plugins] /plugins update: the update is pinned and the bot is restarting, but the reply failed"));
+      expect(failed).toBeDefined();
+      expectCleanedLog(failed!, failure);
+    } finally {
+      warn?.mockRestore();
+      log?.mockRestore();
+      fetchSpy?.mockRestore();
+      restoreExit();
+      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+    }
+  });
+
+  // T6: the action catch (#503 item 11). An unparseable state.json does not reach it (readJsonOrFresh moves a corrupt
+  // file aside and reads it as fresh), so the failure driven here is the reply: /plugins remind mutates, no restart.
+  test("a /plugins action whose reply Discord rejects is logged without the token, then answered with the failure", async () => {
+    const edits: string[] = [];
+    const failure = replyFailure("webhook");
+    let editCalls = 0;
+    let fetchSpy: ReturnType<typeof spyOn> | undefined;
+    let warn: ReturnType<typeof spyOn> | undefined;
+    let pushedAdmin = false;
+    try {
+      mkdirSync(`${DATA_DIR}/plugins`, { recursive: true });
+      writeFileSync(statePath, JSON.stringify(stateBody));
+      markPluginStateReady();
+      config.adminUserIds.push("999");
+      pushedAdmin = true;
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+        new Response(JSON.stringify(indexBody), { status: 200 })) as unknown as typeof fetch);
+      warn = spyOn(console, "warn").mockImplementation(() => {});
+      const interaction = {
+        commandName: "plugins",
+        user: { id: "999" },
+        channelId: "c1",
+        options: {
+          getSubcommand: () => "remind",
+          getString: (name: string) => (name === "name" ? "demo" : null),
+          getInteger: () => null,
+        },
+        deferReply: async () => {},
+        editReply: async (content: string) => {
+          editCalls += 1;
+          if (editCalls === 1) throw failure.error;
+          edits.push(content);
+        },
+      } as unknown as ChatInputCommandInteraction;
+
+      expect(await handleCommand(interaction)).toBe("answered");
+      expect(edits).toEqual(["⚠️ Couldn't act on the plugin: Unknown interaction"]);
+      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins remind failed");
+      expect(failed).toBeDefined();
+      expectCleanedLog(failed!, failure);
+    } finally {
+      warn?.mockRestore();
+      fetchSpy?.mockRestore();
+      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+    }
   });
 });
 

@@ -126,6 +126,9 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
             updateReply(decision, latestSha, { runningSha: config.gitSha, reason, redeploy }),
           );
         } catch (err) {
+          // #503 item 11: the failure used to be swallowed into the reply alone, leaving `outcome=answered` and no
+          // trace. withoutRequest: a failed reply carries the interaction token and the reply text (#545).
+          console.warn(`[update] /${interaction.commandName} failed`, withoutRequest(err));
           await interaction.editReply(clampReply(`⚠️ Update check failed: ${(err as Error).message}`));
         }
       });
@@ -188,7 +191,8 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
           await interaction.editReply(renderPluginsList(state, index, new Date()));
         } catch (err) {
           // Match the /update deferred convention: a failure edits the deferred reply with an
-          // error rather than leaving the admin's "thinking…" hanging.
+          // error rather than leaving the admin's "thinking…" hanging. Logged first (#503 item 11).
+          console.warn(`[plugins] /${interaction.commandName} list failed`, withoutRequest(err));
           await interaction.editReply(clampReply(`⚠️ Couldn't list plugins: ${(err as Error).message}`));
         }
         return;
@@ -263,19 +267,30 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         });
 
         if (result.restart) {
-          // `update` NOW: mirror /update — mutate + reply inside withCritical so the exit (deferred by
-          // the critical section) lands only after the pin write and the reply have gone out.
+          // `update` NOW: pin write, then requestRestart, then the reply, all inside withCritical: the exit is
+          // deferred to the section's end, so the write and the reply still land before it. The restart is requested
+          // BEFORE the reply (#503 item 10): a reply Discord rejects (an expired token) used to throw past the
+          // requestRestart, leaving the pin and the report on disk with no restart requested and the admin told
+          // "Couldn't act". Inside the section the order costs nothing -- it only defers. A reply that fails AFTER the
+          // request is logged here and swallowed: the process exits for the restart when this section closes, so the
+          // outer catch below usually cannot run (only another open critical section would still defer the exit) and
+          // could not send anything true.
           const { from, to } = result.restart;
           await withCritical(async () => {
             if (result.mutate) await mutatePluginState(DATA_DIR, result.mutate);
-            await interaction.editReply(result.reply);
             requestRestart(`plugin update: ${name} ${from} → ${to}`);
+            try {
+              await interaction.editReply(result.reply);
+            } catch (err) {
+              console.warn(`[plugins] /${interaction.commandName} ${sub}: the update is pinned and the bot is restarting, but the reply failed`, withoutRequest(err));
+            }
           });
         } else {
           if (result.mutate) await mutatePluginState(DATA_DIR, result.mutate);
           await interaction.editReply(result.reply);
         }
       } catch (err) {
+        console.warn(`[plugins] /${interaction.commandName} ${sub} failed`, withoutRequest(err)); // #503 item 11
         await interaction.editReply(clampReply(`⚠️ Couldn't act on the plugin: ${(err as Error).message}`));
       }
     },
@@ -298,14 +313,15 @@ const coreByName = new Map(CORE_COMMANDS.map((c) => [c.name, c]));
 export type CommandGate = (bare: string, interaction: ChatInputCommandInteraction) => Promise<string | undefined>;
 
 /** What a plugin command is told when its plugin is not running (#407): activate() has not finished, it
- *  failed, or the plugin is being disposed. */
+ *  failed, or the plugin is being disposed -- and, since #504, what a command nothing handles at all is told. */
 export const PLUGIN_NOT_RUNNING_REPLY = "This command isn't available right now.";
 
 /**
  * Dispatches one chat-input command. A core row runs as it always has. A plugin command (#407) is
  * dispatched only while its plugin is `running`, the same gate its ticks, HTTP routes and component,
  * modal and autocomplete handlers already had: checked before the routing gate, and again after it,
- * since a dispose may begin while the gate is awaited. A refusal is a private reply. A throw from the
+ * since a dispose may begin while the gate is awaited. A refusal -- the plugin not running, or no handler at
+ * all (#504) -- is a private reply. A throw from the
  * plugin's handler is isolated the way `dispatchPluginInteractionOutcome` isolates a component's: logged
  * as `[plugins] <name> command /<command> failed`, answered with a best-effort private "Something went
  * wrong." when the plugin had not replied or deferred, and reported as `error`.
@@ -322,12 +338,9 @@ export async function handleCommand(
     await core.handle(interaction);
     return "answered";
   }
-  // The lookup is keyed by bare name, and a name that matches neither just warns rather than silently dropping.
+  // The lookup is keyed by bare name; a name that matches neither is answered privately (#504), never dropped.
   const target = lookup(bare);
-  if (!target) {
-    console.warn(`[interaction] no handler for /${interaction.commandName}`);
-    return "unclaimed";
-  }
+  if (!target) return refuseUnclaimed(interaction);
   if (!target.running()) return refuseNotRunning(interaction, target.plugin);
   // A gate that fails must not take the command down: it runs.
   let refusal: string | undefined;
@@ -357,6 +370,16 @@ export async function handleCommand(
 
 async function refuseNotRunning(interaction: ChatInputCommandInteraction, plugin: string): Promise<"unclaimed"> {
   console.warn(`[plugins] ${plugin}: /${interaction.commandName} refused — the plugin is not running`);
+  await interaction.reply({ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral });
+  return "unclaimed";
+}
+
+/** #504 item 12: a command Discord still lists but nothing here handles -- its plugin is gone or did not load
+ *  this boot (until `rest.put` lands), or the name is stale -- is answered privately, like one whose plugin is not
+ *  running, instead of Discord's "The application did not respond" three seconds later. Awaited like
+ *  `refuseNotRunning`'s reply: one Discord rejects reaches index.ts's catch. */
+async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promise<"unclaimed"> {
+  console.warn(`[interaction] no handler for /${interaction.commandName}`);
   await interaction.reply({ content: PLUGIN_NOT_RUNNING_REPLY, flags: MessageFlags.Ephemeral });
   return "unclaimed";
 }
