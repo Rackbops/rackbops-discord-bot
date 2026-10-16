@@ -9,7 +9,7 @@ import {
 } from "discord.js";
 import { config, repoForProject } from "./config";
 import { prefixedName } from "./commandNaming";
-import { clampReply, createIssue, ensureLabel } from "./github";
+import { clampReply, createIssue, ensureLabel, sliceUtf16 } from "./github";
 
 const REPORT_LABEL = "automated";
 const MODAL_PREFIX = "report:"; // modal customId = report:<project>
@@ -39,13 +39,17 @@ export function reportAnnouncement(o: {
   const head = `📋 **${o.username}** filed **${o.repo}#${o.number}** — ${o.url}\n**${o.title}**\n`;
   const room = MESSAGE_LIMIT - head.length;
   if (o.description.length <= room) return head + o.description;
-  return head + o.description.slice(0, Math.max(0, room - TRUNCATED.length)) + TRUNCATED;
+  // sliceUtf16, not slice (#445): a cut inside an emoji must not leave a lone high surrogate in a public message.
+  return head + sliceUtf16(o.description, Math.max(0, room - TRUNCATED.length)) + TRUNCATED;
 }
 
 /** Does the interacting member hold the configured REPORT_ROLE_ID? Reads roles straight from
  * the interaction payload (no privileged Members intent), handling both a cached role manager
- * and the raw string[] of an uncached member. */
-function hasReportRole(interaction: ChatInputCommandInteraction): boolean {
+ * and the raw string[] of an uncached member. Reached from the command and, since #448, from the
+ * modal submit; no `member` (a DM) holds no role. */
+function hasReportRole(interaction: {
+  member: ChatInputCommandInteraction["member"] | ModalSubmitInteraction["member"];
+}): boolean {
   if (!config.reportRoleId) return false;
   const roles = interaction.member?.roles;
   if (!roles) return false;
@@ -103,25 +107,48 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
 }
 
 /**
- * Modal submit → create the GitHub issue in the mapped repo, then say so **in the channel the
- * report was filed from** (nazumods/wow#870).
+ * Modal submit → re-check the gate, create the GitHub issue in the mapped repo, then say so **in the
+ * channel the report was filed from** (nazumods/wow#870).
  *
  * The outcome is deliberately not ephemeral: the point is transparency about what's been
- * reported, so the confirmation is the announcement. The refusals above stay private, since a
+ * reported, so the confirmation is the announcement. The refusals stay private, since a
  * missing role or an unconfigured bot is the reporter's own business and not an issue anyone
  * else needs to see.
  *
  * `allowedMentions: { parse: [] }` because the description is now free text on its way into a
  * public message — an `@everyone` typed into the modal must render as text, not fire.
  *
- * No `hasReportRole` re-check here (#55): Discord scopes a modal submission to the interaction
- * that showed it, so a member can't submit a modal `/report` popped for someone else — the gate
- * in `handleReportCommand` above is the only enforcement point that can actually be reached, and
- * it stays sufficient. A role revoked in the (typically seconds-long) window between showing the
- * modal and submitting it is an accepted, pre-existing race, not introduced or fixed here.
+ * The gate runs again here (#448), before `deferReply` and before any network call: the same
+ * configuration and role checks as `handleReportCommand`, refusing ephemerally. The command's gate is the
+ * user-facing one; this is defence in depth, because this code cannot verify that Discord scopes a modal
+ * submission to the interaction that showed it (CONTEXT.md already says a forged `modal_submit` can carry any
+ * `customId`), and whether a roleless account can actually forge one is left unverified. It also closes what
+ * used to be an accepted race, a role revoked between showing the modal and submitting it. The project fence
+ * stays first: it is what makes the project safe to log.
  *
- * A modal submit carries no `commandName`, so the issue footer's command name is built from
- * `config.commandPrefix` — the same prefix `/report` was registered under — read at submit time.
+ * Three steps, three outcomes (#445, #503):
+ *  1. The label is best-effort. `ensureLabel` never throws; when it cannot confirm the label the issue is
+ *     filed without it, and the log says so.
+ *  2. The issue. Only a failure HERE says "Couldn't file the issue", and only because nothing is KNOWN to have
+ *     been filed: a create that timed out, or answered with a body that could not be read, may still have
+ *     committed, and a retry would then file it twice.
+ *  3. The announcement. The issue exists whatever happens in this step, so a failure here is logged and falls
+ *     back to a minimal public edit naming the issue; if that fails too it is logged at error level and nothing
+ *     else is attempted (the deferred reply expires; the issue exists, and the log says so). A first edit that
+ *     Discord applied but whose answer the client lost is overwritten by the fallback.
+ *
+ * Refusals and failures write a `[report]` line (#503 item 11, the `/report` half): the two gate refusals name
+ * the user id and the project; the label shortfall, a create-issue failure, a failed announcement edit and a
+ * failed fallback edit name the repo (and the issue number once there is one). The label shortfall also has
+ * `ensureLabel`'s own warning. None carries the title, the description or the username. Not logged here: the
+ * unknown-project refusal (its project string is attacker-controlled until `repoForProject` has accepted it),
+ * and anything that throws out of the handler — a rejected `deferReply`, a field read, the "Couldn't file" edit
+ * itself — which `index.ts`'s dispatcher logs as an `[interaction]` error. The create-issue message is clamped
+ * to 300 characters plus an ellipsis for the log (the public reply keeps `clampReply`'s default).
+ *
+ * A modal submit carries no `commandName`, so the command name — the issue footer's and the not-configured
+ * refusal's — is built from `config.commandPrefix`, the same prefix `/report` was registered under, read at
+ * submit time.
  */
 export async function handleReportModal(interaction: ModalSubmitInteraction): Promise<void> {
   const project = interaction.customId.slice(MODAL_PREFIX.length);
@@ -131,22 +158,62 @@ export async function handleReportModal(interaction: ModalSubmitInteraction): Pr
     return;
   }
 
+  // #448: the same gate as the command, as defence in depth. Before deferReply and before any network call;
+  // ephemeral, like the command's refusals.
+  const command = prefixedName(config.commandPrefix, "report");
+  if (!config.reportRoleId || !config.githubToken) {
+    console.warn(`[report] refused a modal submit for ${project} from ${interaction.user.id}: not configured`);
+    await interaction.reply({
+      content: `\`/${command}\` isn't configured — an admin must set \`REPORT_ROLE_ID\` and \`GITHUB_TOKEN\`.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  if (!hasReportRole(interaction)) {
+    console.warn(`[report] refused a modal submit for ${project} from ${interaction.user.id}: no report role`);
+    await interaction.reply({
+      content: "You don't have the role required to file reports.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   const title = interaction.fields.getTextInputValue("title");
   const description = interaction.fields.getTextInputValue("description");
   const username = interaction.user.username;
   await interaction.deferReply();
+  // Step 1 of 3 (#445, #503): the label is best-effort; without it the issue is filed unlabelled.
+  const labelled = await ensureLabel(repo, REPORT_LABEL);
+  if (!labelled) console.warn(`[report] filing in ${repo} without the ${REPORT_LABEL} label (could not be confirmed)`);
+  // Step 2: the issue. Only a failure HERE means the report is not known to have been filed.
+  let issue: { number: number; url: string };
   try {
-    await ensureLabel(repo, REPORT_LABEL);
-    const body = reportBody(description, username, prefixedName(config.commandPrefix, "report"));
-    const issue = await createIssue(repo, title, body, [REPORT_LABEL]);
+    const body = reportBody(description, username, command);
+    issue = await createIssue(repo, title, body, labelled ? [REPORT_LABEL] : []);
+  } catch (err) {
+    const message = (err as Error).message;
+    console.warn(`[report] could not file an issue in ${repo}: ${clampReply(message, 300)}`);
+    await interaction.editReply({
+      content: clampReply(`⚠️ Couldn't file the issue: ${message}`),
+      allowedMentions: { parse: [] },
+    });
+    return;
+  }
+  // Step 3: the announcement. The issue exists whatever happens here, so a failure must never say it does not.
+  try {
     await interaction.editReply({
       content: reportAnnouncement({ repo, number: issue.number, url: issue.url, title, description, username }),
       allowedMentions: { parse: [] },
     });
   } catch (err) {
-    await interaction.editReply({
-      content: clampReply(`⚠️ Couldn't file the issue: ${(err as Error).message}`),
-      allowedMentions: { parse: [] },
-    });
+    console.warn(`[report] filed ${repo}#${issue.number} but the announcement edit failed: ${(err as Error).message}`);
+    await interaction
+      .editReply({
+        content: clampReply(`📋 **${username}** filed **${repo}#${issue.number}** — ${issue.url}`),
+        allowedMentions: { parse: [] },
+      })
+      .catch((again: unknown) =>
+        console.error(`[report] the fallback edit for ${repo}#${issue.number} failed too: ${(again as Error).message}`),
+      );
   }
 }
