@@ -356,9 +356,10 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
         console.warn(`[redeploy] the replacement signalled ready as the poll decided ${outcome} — honouring it`);
         outcome = "ready";
         pollError = undefined;
-      } else if (late?.status === "failed") {
-        // It gave up in that window: its own word beats "never reported in", and its own reason (read back
-        // from the marker below) beats the poll's last daemon error.
+      } else if (late?.status === "failed" && outcome !== "failed") {
+        // The poll said `timeout` but the replacement gave up in that window: its own word beats "never
+        // reported in", and its own reason (read back from the marker below) beats the poll's last daemon
+        // error. A poll that already decided `failed` from this very marker has nothing to correct.
         console.warn(`[redeploy] the replacement signalled failed as the poll decided ${outcome} — reporting that`);
         outcome = "failed";
         pollError = undefined;

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { ContainerInspect, ImageSummary } from "./docker";
 import type { HandoffMarker } from "./handoff";
 
@@ -1012,10 +1012,18 @@ describe("redeploy — cleanup always runs", () => {
       removeReplacement: () => new Response("", { status: 204 }),
       afterStart: () => writeMarker({ status: "failed", sha: "3434343", error: "gateway login refused", at: Date.now() }),
     });
-    const result = await redeploy("a".repeat(40));
-    expect(result.outcome).toBe("failed");
-    expect(result.error).toBe("gateway login refused");
-    expect(wasRemovalAttempted()).toBe(true);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await redeploy("a".repeat(40));
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("gateway login refused");
+      expect(wasRemovalAttempted()).toBe(true);
+      // The poll decided this `failed` itself, so the late re-read has nothing to report: no "signalled
+      // failed" warning, which would read as a race that did not happen.
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("signalled failed"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   // Row 15 of the handoff state table: the marker is read at the top of a poll and the verdict is computed
@@ -1039,6 +1047,26 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled"); // never "timeout": what the replacement said outranks the poll
     expect(result.error).toBeUndefined();
+  });
+
+  // A verdict the poll already decided as `ready` is acted on as it stands: the marker is read by the poll and
+  // once at the end, and not a third time by the late re-read (which exists for every OTHER verdict).
+  test("a poll that decides ready does not re-read the marker", async () => {
+    let reads = 0;
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      deadlineMs: 60,
+      pollMs: 15,
+      readMarker: async () => {
+        reads++;
+        return { status: "ready", sha: "5656565", at: Date.now() };
+      },
+    });
+    expect(result.outcome).toBe("stalled"); // the retirement wait reads the module's marker: the file is empty
+    expect(reads).toBe(2);
   });
 
   // The same window for a `failed` the replacement wrote: its own word beats "never reported in", and its own

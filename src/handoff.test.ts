@@ -182,6 +182,12 @@ describe("handoffFailureMessage", () => {
       expect(failed).toContain("by hand");
       expect(failed).not.toContain("removed it");
 
+      // A refused removal with no answer from the daemon still reads as a sentence.
+      const unexplained = handoffFailureMessage(outcome, { targetSha: sha, replacement: "remove-failed" });
+      expect(unexplained).toContain("could not remove it:");
+      expect(unexplained).not.toContain("undefined");
+      expect(unexplained).not.toContain("()");
+
       // Absent: no claim about the container at all.
       const unknown = handoffFailureMessage(outcome, { targetSha: sha });
       for (const claim of ["removed it", "left it alone", "could not remove", "nothing was left"]) {
