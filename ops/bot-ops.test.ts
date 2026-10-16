@@ -87,8 +87,10 @@ function setup(
   opts: {
     /** The simulated `<container>-next` replacement's docker state: when set, the shim answers the guard's
      *  `docker ps -a --filter name=^/<container>-next$` with a `{{.State}}` format as that state
-     *  ("running", "exited", "created", ...) and with a `{{.Names}}` format as the name. A value with a
-     *  newline answers several lines (the name filter is a regex, so several matches are possible).
+     *  ("running", "exited", "created", ...), honouring `-a` (only a running, restarting or paused state
+     *  shows without it). A `{{.Names}}` format gets the name unconditionally; nothing in ops/ asks the
+     *  `-next` query that way any more. A value with a newline answers several lines (the name filter is a
+     *  regex, so several matches are possible).
      *  "!error" makes the query itself fail (exit 1, as a down daemon would). Absent → no `-next`
      *  container at all. */
     nextState?: string;
@@ -1135,20 +1137,20 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
 });
 
 // #490 reversed what this describe pinned under #51. Then, a running "<container>-next" beside a stopped or
-// absent canonical was only ever a cosmetic rename failure (retireOriginal tolerates a failed remove/rename and
-// never retries), so the guard let restart/env-set through rather than lock the operator out forever. That
-// state is the live bot sitting beside the stopped original: the instant between retireOriginal's stop and its
-// rename today, a swap whose remove or rename failed (#547, the live bot stays "-next"), and the probation
-// window #548 adds. A recreate there may start a second bot beside the live one, which is exactly the race the
-// guard exists to stop, so that state now REFUSES, with a message that points at the runbook. What does not
-// refuse any more is an EXITED (or dead) "-next": a leftover of a swap a reboot interrupted, which nothing will
-// retire and the next self-update sweeps (#490 item 2); a lockout there never ends. "created" still refuses on
-// purpose: every swap passes through it for the length of the start call.
-describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, and ignores an exited leftover (#490, #548)", () => {
+// absent canonical was taken for a cosmetic rename failure (retireOriginal tolerates a failed remove/rename;
+// only a later boot of the replacement retries it), so the guard let restart/env-set through rather than lock
+// the operator out forever. That state is the live bot sitting beside the stopped original: the instant between
+// retireOriginal's stop and its rename, and a swap whose remove or rename failed (#547, the live bot stays
+// "-next"). A recreate there may start a second bot beside the live one (not verified without a daemon), which
+// is the race the guard exists to stop, so that state now REFUSES, with a message that points at the runbook.
+// What does not refuse any more is an EXITED (or dead) "-next": a leftover of a swap that was interrupted or
+// failed, which nothing will retire and the next self-update sweeps (#490 item 2); a lockout there never ends.
+// "created" still refuses on purpose: every swap passes through it for the length of the start call.
+describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, and ignores an exited leftover (#490)", () => {
   const STOPPED = { nextState: "running", originalState: "stopped" } as const;
 
   // A running -next beside a canonical that is not running: the swap is finishing (or never took the name).
-  test("restart refuses when <container>-next is running and the original is a stopped corpse — the probation window", async () => {
+  test("restart refuses when <container>-next is running and the original is a stopped corpse", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", STOPPED);
     const run = await botOps(fx, ["restart"]);
     expect(run.exitCode).not.toBe(0);
@@ -1183,9 +1185,12 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(run.stderr).toContain("a self-update is finishing");
     expect(run.stderr).toContain("docker logs probe-container-next");
     expect(run.stderr).toContain("see ops/README.md");
-    // The rollback is the two-command form (it holds whether or not the new build has stepped aside).
+    // The rollback is the two-command form: remove the new build's container, then start the old one.
     expect(run.stderr).toContain("'docker rm -f probe-container-next' then 'docker start probe-container'");
     expect(run.stderr).toContain("with the old container still there");
+    // The rollback restarts the OLD build, but :latest already names the new one (takeOver tagged it), and a
+    // recreate reuses whatever is tagged: the message has to say so.
+    expect(run.stderr).toContain("':latest' must be re-pointed at it before any recreate");
   });
 
   // An exited -next is a leftover, not a swap in flight.

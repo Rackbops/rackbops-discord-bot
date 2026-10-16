@@ -363,11 +363,10 @@ declare -A RESERVED_KEYS=(
 #     flight (the pre-verification wait and the verified-but-not-yet-retired wait: nothing has
 #     touched the original yet). With the canonical name NOT running the swap is between stopping the
 #     original and taking its name, or it finished without taking it (the live bot stays "-next"
-#     beside the stopped original, #547), and #548's probation for the new build will lengthen that
-#     window. A recreate there may start a second bot beside the live one (not verified without a
-#     daemon), which the old signal ("-next" exists AND the canonical name runs) let through. It is
-#     refused with a pointer to the runbook in ops/README.md, which tells the cases apart by state
-#     and by the replacement's log.
+#     beside the stopped original, #547). A recreate there may start a second bot beside the live one
+#     (not verified without a daemon), which the old signal ("-next" exists AND the canonical name
+#     runs) let through. It is refused with a pointer to the runbook in ops/README.md, which tells the
+#     cases apart by state and by the replacement's log.
 # The name filter is a regex, so more than one line is possible; one alive line is enough to refuse
 # (fail closed). A `docker ps` that errors on the "-next" query reads as "no -next" and the guard
 # passes, as it always did; one that errors on the canonical query reads as "not running" and fails
@@ -386,7 +385,7 @@ guard_no_handoff_in_progress() {
   if docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
     die "a self-update is in progress (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is still running) — try again once it completes; if it persists, see ops/README.md"
   fi
-  die "a self-update is finishing (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is not running) — try again in a minute; if it persists, read 'docker logs ${CONTAINER}-next' and see ops/README.md (a new build that keeps crashing, with the old container still there: 'docker rm -f ${CONTAINER}-next' then 'docker start ${CONTAINER}' rolls back; one that is up but never took the name: rename it)"
+  die "a self-update is finishing (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is not running) — try again in a minute; if it persists, read 'docker logs ${CONTAINER}-next' and see ops/README.md (a new build that keeps crashing, with the old container still there: 'docker rm -f ${CONTAINER}-next' then 'docker start ${CONTAINER}' brings the old build back, and ':latest' must be re-pointed at it before any recreate, see ops/README.md; one that is up but never took the name: rename it)"
 }
 
 # #227: one exclusive lock per config dir around every mutation of it (env-set's read-modify-write
