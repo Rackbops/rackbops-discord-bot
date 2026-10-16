@@ -1288,6 +1288,49 @@ function sameComposeService(a: ContainerInspect, b: ContainerInspect): boolean {
   return Boolean(project(a)) && project(a) === project(b) && Boolean(service(a)) && service(a) === service(b);
 }
 
+/** What `<name>-next` is, as far as a boot resolving a swap record cares (#450). */
+export type ReplacementProbe =
+  /** Running or restarting: a swap in flight. */
+  | { kind: "alive"; name: string; status: string }
+  /** Exists but will not take over by itself: exited, dead, or created and never started. */
+  | { kind: "stopped"; name: string; status: string }
+  | { kind: "absent"; name: string }
+  /** No daemon, a timeout, or an inspect that failed: nothing can be concluded. */
+  | { kind: "unknown"; name: string; error: string };
+
+/** Test seams for {@link probeReplacement}; each defaults to the real daemon call (the `HealDeps` shape). */
+export interface ProbeDeps {
+  inspectSelf?: typeof inspectSelf;
+  inspect?: typeof tryInspectContainer;
+}
+
+/**
+ * One bounded look at this container's replacement name (#450), for `update.ts`'s `resolveUpdateAttempt`: the own
+ * inspect (for the name, as `redeploy()` derives it) and one inspect by that name, together under the same bound
+ * `resolveBootMode` uses. Any failure is `unknown`, never a throw. Only a boot that finds a swap record calls it,
+ * so an ordinary boot still never touches the socket.
+ */
+export async function probeReplacement(deps: ProbeDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<ReplacementProbe> {
+  let name = "the replacement";
+  try {
+    return await withTimeout(
+      (async () => {
+        const self = await (deps.inspectSelf ?? inspectSelf)();
+        name = replacementName(self.Name, projectOf(self));
+        const found = await (deps.inspect ?? tryInspectContainer)(name);
+        if (!found) return { kind: "absent", name } as const;
+        const status = found.State.Status;
+        return found.State.Running || status === "restarting"
+          ? ({ kind: "alive", name, status } as const)
+          : ({ kind: "stopped", name, status } as const);
+      })(),
+      timeoutMs,
+    );
+  } catch (err) {
+    return { kind: "unknown", name, error: (err as Error).message };
+  }
+}
+
 /** Test seams for {@link detectRollback} and {@link stepAside}. */
 export interface RollbackDeps {
   inspect?: (id: string) => Promise<ContainerInspect | undefined>;

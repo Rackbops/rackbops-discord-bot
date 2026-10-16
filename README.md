@@ -103,13 +103,15 @@ Behavior:
 - A second `/update` while a swap or another update check is in flight is **refused**, not queued — it would otherwise tear down the in-flight replacement or overwrite the first requester's follow-up. The refusal promises nothing: only the `/update` that started the attempt gets its report.
 - The retirement wait has an end: if a replacement verifies but then never manages to retire the original (daemon trouble mid-swap), the original reclaims after 3 minutes and reports, rather than sitting quiesced until someone notices.
 - Without the daemon socket the bot exits with code **75** instead (distinct from a crash, so a supervisor can tell an update apart from a failure).
-- **Once it's back up, it messages whoever ran `/update`** with the build it actually came back on, and which of three things happened:
+- **Once it's back up, it messages whoever ran `/update`** with the build it actually came back on, and which of five things happened:
   - ✅ **updated** — came back on the build it was picking up.
   - ⚠️ **no-op** — came back on the *same* build it left on, i.e. nothing was rebuilt. This is the failure that otherwise looks exactly like success: a container recreated without `--build` comes back happily on the old image and logs a clean startup. (With the socket mounted this shouldn't happen — the bot builds the image itself.)
-  - ❓ **unexpected** — came back on some third build, so something else deployed in between.
+  - ⚠️ **interrupted** — came back on the same build because the process restarted before the new build had taken over (a reboot, an OOM kill, a `bot-ops.sh restart` or the panel's Restart during the build), or because the swap was rolled back; nothing changed, and the next `/update` or automatic check tries again. If a stopped `<name>-next` was left behind, the next update removes it. (If the bot cannot ask the daemon whether a `<name>-next` is still alive, it keeps the report for its next start instead of guessing. Once it has decided the swap did not take, that verdict is saved with the report that swap armed, so a restart before the message is sent does not turn it into a "no-op". A `/update` taken in the seconds while the bot is still starting is reported by its own restart, not by the start-up report.)
+  - ❓ **unexpected** — came back on some third build, so something else deployed in between (a redeploy by hand, or an automatic update).
+  - ❓ **unknown** — came back with no `GIT_SHA` baked in, so it cannot tell.
 - That follow-up survives the restart (it's recorded in `data/state.json`, not held in memory), and it tries the original command's reply first, then a DM, then the channel. An expired reply token, closed DMs, or a deleted channel just log — they never hold up or crash startup.
 - Only a restart **`/update` asked for** produces a follow-up. An `AUTO_UPDATE` exit, a host reboot, or a plain `docker compose up` stays silent.
-- If the bot exits to update and comes back on the same build, it says so once in the log and **stops trying** — a misconfigured deploy produces a warning, not a restart loop. `/update` overrides that suppression.
+- If the bot exits to update and comes back on the same build, it says so once per pending build in the log (per process: a restart says it again once, and so does a new failed swap on the same build; naming the failed swap when there was one) and **stops trying** — a misconfigured deploy produces a warning, not a restart loop. `/update` overrides that suppression.
 - Without `GIT_SHA` — or with one the remote has never seen — self-update reports itself disabled rather than guessing, and says which of the two it is.
 
 ## Plugin updates
@@ -257,7 +259,7 @@ settings in the dashboard.
 | `src/docker.ts` | Docker Engine API client over the daemon socket |
 | `src/updateReport.ts` | The follow-up after a `/update` restart: which build it came back on |
 | `src/restart.ts` | Graceful restart, deferred past in-flight announcements (a plugin tick is aborted and waited on for 5 s at most, #248; the whole wait ends after 30 minutes unless a swap is in progress, #512) |
-| `src/state.ts` | `data/state.json`: release-announcement dedup state, plus the self-update guard (`attemptedUpdateToSha`) and the owed `/update` follow-up (`pendingUpdateReport`) |
+| `src/state.ts` | `data/state.json`: release-announcement dedup state, plus the self-update guard (`attemptedUpdateToSha`), the owed `/update` follow-up (`pendingUpdateReport`) and the record of a socket-path swap in progress (`swapInFlight`) |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
 | `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), handed to plugins as `HostApi.storage`/`dataDir` |
 | `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |

@@ -15,6 +15,24 @@ export interface PendingUpdateReport {
   applicationId?: string; // with interactionToken, addresses the follow-up webhook route
   interactionToken?: string; // valid ~15 min from the interaction
   requestedAt: number; // ms epoch, so boot can tell a fresh restart from a week-old one
+  // #450: set by the boot that found the swap this report was armed for never took over (`resolveUpdateAttempt`), in the
+  // same save that clears the swap record -- so the verdict is on disk with the report it describes, and a boot that dies
+  // before delivering it still reports `interrupted`, not the "image wasn't rebuilt" a bare `noop` would say.
+  interrupted?: true;
+}
+
+/**
+ * A socket-path self-update this container started and has not resolved (#450): written in the same save that
+ * arms `attemptedUpdateToSha`/`pendingUpdateReport`, before the build; cleared when `redeploy()` returns (the swap
+ * failed) or by the next boot's `resolveUpdateAttempt` (`update.ts`), which reads it to tell a swap that landed
+ * (this is the new build), one still in flight (the original restarted beside a live `<name>-next`) and one that was
+ * interrupted (nothing took over) apart -- the exit-75 path never writes it, so its absence means "what the two
+ * markers say is the whole story".
+ */
+export interface SwapInFlight {
+  fromSha: string; // the build that started the swap
+  toSha: string; // the build it was swapping to
+  startedAt: number; // ms epoch, for the log
 }
 
 // Persisted so a restart does not re-announce a release whose save landed (CONTEXT.md's Behavior section lists what can still repeat one).
@@ -31,6 +49,7 @@ export interface BotState {
   // `data/wow.json`, so the frozen values can be older than the plugin's.
   attemptedUpdateToSha?: string; // sha we last exited to update to; guards against an exit loop
   pendingUpdateReport?: PendingUpdateReport; // /update follow-up owed on next boot; consumed once
+  swapInFlight?: SwapInFlight; // #450: a socket-path swap from before its build until redeploy() returns or the next boot resolves it
 }
 
 const RELEASE_ID_CAP = 100;
