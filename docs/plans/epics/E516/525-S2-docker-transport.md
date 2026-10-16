@@ -3,6 +3,8 @@ the docker-restart doc drift. Written by the orchestrating session on 2026-10-16
 Every file:line below was read from that tree; the implementer re-reads each one on the tree it works from
 and corrects any that moved. -->
 
+> Amended 2026-10-16 after the gate on PR #554: the key is `BOT_DOCKER_SOCKET` (reviewer A: a generic `DOCKER_SOCKET` copied from another stack's `.env` would redirect the transport), an empty value is unset, and `resolveDockerSocket(env)` is exported; the text below was renamed accordingly.
+
 ## Implementation plan -- #525 bundle S2: `src/docker.ts`'s transport pin, `parseBuildOutput`, the docker-restart drift
 
 Children: **#459** and **#513** (items 9, 10, 11). One PR. A behaviour change (a socket-path seam read at
@@ -51,7 +53,7 @@ keeps one writer at a time.
 
 ### Decisions (defaults, named so the gate can contest them)
 
-1. **The socket path becomes a test seam read once at import:** `const DOCKER_SOCKET = process.env.DOCKER_SOCKET
+1. **The socket path becomes a test seam read once at import:** `const BOT_DOCKER_SOCKET = process.env.BOT_DOCKER_SOCKET
    ?? "/var/run/docker.sock"` (not exported: nothing would import it, and the in-process pin asserts the
    literal). Like `BOT_DATA_DIR` it is deliberately absent from `.env.example`: the compose file always mounts
    the host's daemon at `/var/run/docker.sock` inside the container (`entrypoint.sh:13` hard-codes the same
@@ -105,11 +107,11 @@ keeps one writer at a time.
    *  `bot-ops.sh` (never panel-editable, never claimable by a plugin manifest), and cleared by the test
    *  preload so an ambient value cannot aim the suite at a real daemon. A plain environment read, like
    *  HOSTNAME's below. */
-  const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
+  const BOT_DOCKER_SOCKET = process.env.BOT_DOCKER_SOCKET ?? "/var/run/docker.sock";
   const BASE = "http://docker";
   ```
 
-  and `:96` -> `unix: DOCKER_SOCKET`.
+  and `:96` -> `unix: BOT_DOCKER_SOCKET`.
 - `parseBuildOutput` (`:184-197`):
 
   ```ts
@@ -142,13 +144,13 @@ keeps one writer at a time.
   ```ts
   // #459: the daemon socket path is a test seam (src/docker.ts). Cleared, not defaulted: an ambient value
   // would aim every stubbed-fetch assertion and, worse, the real transport test's child at a real daemon.
-  delete process.env.DOCKER_SOCKET;
+  delete process.env.BOT_DOCKER_SOCKET;
   ```
 
 - `ops/bot-ops.sh`, `RESERVED_KEYS` group 3, after the `HOSTNAME` line (`:318`):
 
   ```bash
-    [DOCKER_SOCKET]=1            # src/docker.ts: the daemon socket path, a test seam (#459) -- set by nothing in a deployment, and no plugin may claim it
+    [BOT_DOCKER_SOCKET]=1            # src/docker.ts: the daemon socket path, a test seam (#459) -- set by nothing in a deployment, and no plugin may claim it
   ```
 
   No schema bump (decision 1). The `CORE_SETTINGS` behaviour table in `ops/bot-ops.test.ts` (grep
@@ -159,16 +161,16 @@ keeps one writer at a time.
 
 ```ts
 // Child-process fixture for src/docker.test.ts's real-transport test (#459). Not a test file itself: the
-// parent spawns it with DOCKER_SOCKET pointing at a path this process serves, it drives src/docker.ts's
+// parent spawns it with BOT_DOCKER_SOCKET pointing at a path this process serves, it drives src/docker.ts's
 // REAL fetch over that socket, prints one JSON object on stdout, and exits.
 //
-// Why a child: src/docker.ts reads DOCKER_SOCKET once at import and the suite runs in one process with one
+// Why a child: src/docker.ts reads BOT_DOCKER_SOCKET once at import and the suite runs in one process with one
 // module registry, so the path cannot be changed for one test; and the point is the real `fetch(url,
 // { unix })` plus the real abort, which every in-process test stubs away. Expects from the parent:
-// DOCKER_SOCKET, and the inherited test env (src/docker.ts imports ./github, which imports ./config, so
+// BOT_DOCKER_SOCKET, and the inherited test env (src/docker.ts imports ./github, which imports ./config, so
 // DISCORD_TOKEN and ANNOUNCE_CHANNEL_ID must be set -- the preload sets them in the parent's process.env).
-const socket = process.env.DOCKER_SOCKET;
-if (!socket) throw new Error("DOCKER_SOCKET must be set by the parent");
+const socket = process.env.BOT_DOCKER_SOCKET;
+if (!socket) throw new Error("BOT_DOCKER_SOCKET must be set by the parent");
 
 const server = Bun.serve({
   unix: socket,
@@ -221,7 +223,7 @@ process.exit(0);
 | # | Test | Pins |
 |---|---|---|
 | D1 | `daemon calls` / the `unix` assertions above (#459) | every stubbed call carries `unix: "/var/run/docker.sock"` |
-| D2 | new `describe("the real transport (#459)")` / "the real fetch reaches a unix socket at DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound" | a temp dir named like the suite's own (`mkdtempSync(join(tmpdir(), `${TEST_DATA_PREFIX}${process.pid}-`))`, as `commandPrefix.test.ts:32` does, so the preload's sweep catches a leftover) and `const socket = join(dir, "d.sock")` (short: Linux caps a socket path near 108 bytes); `Bun.spawnSync([process.execPath, "test/dockerSocketChild.ts"], { cwd: <repo root>, env: { ...process.env, DOCKER_SOCKET: socket }, stdout: "pipe", stderr: "pipe", timeout: 20_000 })` inside `try`/`finally` with `rmSync(dir, { recursive: true, force: true })` (a child the timeout kills leaves the `.sock` file behind; the auditor reproduced that); exit 0 (else throw with stderr, as `commandPrefix.test.ts:52-57` does); parse the last stdout line: `ping === true`; `hang.ok === false` with `hang.message` matching `/timed out after 100ms/` and `hang.elapsedMs < 1_000`; the same three for `wedge`; test timeout `30_000`. Runs on both platforms (probed on Windows, both shapes; CI's Linux is the one that matters) |
+| D2 | new `describe("the real transport (#459)")` / "the real fetch reaches a unix socket at BOT_DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound" | a temp dir named like the suite's own (`mkdtempSync(join(tmpdir(), `${TEST_DATA_PREFIX}${process.pid}-`))`, as `commandPrefix.test.ts:32` does, so the preload's sweep catches a leftover) and `const socket = join(dir, "d.sock")` (short: Linux caps a socket path near 108 bytes); `Bun.spawnSync([process.execPath, "test/dockerSocketChild.ts"], { cwd: <repo root>, env: { ...process.env, BOT_DOCKER_SOCKET: socket }, stdout: "pipe", stderr: "pipe", timeout: 20_000 })` inside `try`/`finally` with `rmSync(dir, { recursive: true, force: true })` (a child the timeout kills leaves the `.sock` file behind; the auditor reproduced that); exit 0 (else throw with stderr, as `commandPrefix.test.ts:52-57` does); parse the last stdout line: `ping === true`; `hang.ok === false` with `hang.message` matching `/timed out after 100ms/` and `hang.elapsedMs < 1_000`; the same three for `wedge`; test timeout `30_000`. Runs on both platforms (probed on Windows, both shapes; CI's Linux is the one that matters) |
 | D3 | "the bound table names every exported daemon call" (#513 item 10) | `const mod = await import("./docker"); const asyncExports = Object.entries(mod).filter(([, v]) => typeof v === "function" && (v as Function).constructor.name === "AsyncFunction").map(([k]) => k).sort(); expect(asyncExports).toEqual(everyDaemonCall.map(([n]) => n).sort())` (reference `everyDaemonCall` from inside the describe where it lives; the test's comment says a daemon call written as a plain function returning `bounded(...)` would have to be added by hand) |
 | D4 | `parseBuildOutput` / "a line that parses to null, a number or a string is noise, and an error after it is still reported" (#513 item 9) | `parseBuildOutput('null\n42\n"x"\n{"stream":"ok"}')` -> `{ ok: true }`; `parseBuildOutput('null\n{"error":"boom","errorDetail":{"message":"boom"}}')` -> `{ ok: false, error: "boom" }` |
 
@@ -240,7 +242,7 @@ process.exit(0);
   not one of these since #277: it is a `recreate`, compose `--force-recreate`, a fresh container with no
   `HANDOFF_FROM` at all.)"
 - `ops/README.md:264` (the sentence listing the hand-set reserved core keys) and `CONTEXT.md:1323-1332`
-  (the `RESERVED_KEYS` description): add `DOCKER_SOCKET` (#459, "set by nothing in a deployment: the
+  (the `RESERVED_KEYS` description): add `BOT_DOCKER_SOCKET` (#459, "set by nothing in a deployment: the
   compose file mounts the daemon at the default path; a test seam"). Read `ops/README.md:333-341` too and add
   it there only if that passage enumerates the keys.
 - `CONTEXT.md` File Map rows and gotchas (after S1 is on `main`; grep each row on a short unique substring
@@ -253,7 +255,7 @@ process.exit(0);
     `describe(`/`test(` names for `beginShutdown`, `stateForTest`, `onStopRequested` (#248) and add one clause
     each.
   - `:188` (`src/docker.ts` row; grep `Minimal Docker Engine API client`): "over `/var/run/docker.sock` via
-    Bun's `fetch(url, { unix })`" -> "over `DOCKER_SOCKET` (`/var/run/docker.sock`; a test seam like
+    Bun's `fetch(url, { unix })`" -> "over `BOT_DOCKER_SOCKET` (`/var/run/docker.sock`; a test seam like
     `BOT_DATA_DIR`, never an operator knob, reserved in `bot-ops.sh`, cleared by the test preload, #459) via
     Bun's `fetch(url, { unix })`"; the export list gains `inspectContainer`/`tryInspectContainer` (404 ->
     `undefined`), `updateContainer` (the restart policy, #160), `inspectImage` and `STOP_TIMEOUT_SEC` (#513
@@ -263,7 +265,7 @@ process.exit(0);
     first; keep it.
   - `:189` (`src/docker.test.ts` row): "a **table driving all 14 exported daemon calls**" -> "a **table
     driving every exported daemon call** (a test compares the table with the module's async exports, #513)";
-    append the real-transport child test (#459: `test/dockerSocketChild.ts`, spawned with `DOCKER_SOCKET`
+    append the real-transport child test (#459: `test/dockerSocketChild.ts`, spawned with `BOT_DOCKER_SOCKET`
     pointing at a `Bun.serve({ unix })` it starts itself -- the real `fetch` answers the ping, and a hanging
     and a wedged inspect are both cut by the bound) and the `parseBuildOutput` noise cases.
   - `:192` (`src/redeploy.ts` row, #513 item 11's third copy; S1 edits this row too, so after S1): "every
@@ -271,7 +273,7 @@ process.exit(0);
     crash loop)" -> "every later in-place restart of the swapped-in container (`bot-ops.sh restart`, a
     reboot, a crash loop; not the ops panel's Restart, which recreates since #277)".
   - `:457` (the Gotchas paragraph on the preload): if it lists what `test/setup.ts` sets and clears, add the
-    `DOCKER_SOCKET` clear beside `COMMAND_PREFIX`; if it does not enumerate, leave it.
+    `BOT_DOCKER_SOCKET` clear beside `COMMAND_PREFIX`; if it does not enumerate, leave it.
   - `:791-792` (the #46 gotcha; the quote wraps, anchor on one line): "(`bot-ops.sh restart`, the ops panel's
     Restart, a host reboot, a daemon restart, a crash loop under `unless-stopped`)" -> "(`bot-ops.sh restart`,
     a host reboot, a daemon restart, a crash loop under `unless-stopped`; not the ops panel's Restart, which
@@ -284,9 +286,9 @@ process.exit(0);
 
 | Outcome | Step | Test | Mutation that must turn it red |
 |---|---|---|---|
-| every daemon call goes over the unix socket | 1 | D1, D2 | M1: delete `unix: DOCKER_SOCKET` from `api()` (D1's `unix` undefined; D2's ping false: the child's fetch goes to TCP `http://docker`) |
+| every daemon call goes over the unix socket | 1 | D1, D2 | M1: delete `unix: BOT_DOCKER_SOCKET` from `api()` (D1's `unix` undefined; D2's ping false: the child's fetch goes to TCP `http://docker`) |
 | the socket path is the seam, with the documented default | 1, 2 | D1, D2 | M2: hard-code `"/var/run/docker.sock"` and ignore the env (D2 red: the child never reaches its own socket); M3: change the default string (D1 red) |
-| an ambient `DOCKER_SOCKET` cannot reach the suite | 2 | D1 | M4: delete the `delete process.env.DOCKER_SOCKET` line, with `DOCKER_SOCKET=/x` exported in the mutation run's shell (D1's literal assertion red) |
+| an ambient `BOT_DOCKER_SOCKET` cannot reach the suite | 2 | D1 | M4: delete the `delete process.env.BOT_DOCKER_SOCKET` line, with `BOT_DOCKER_SOCKET=/x` exported in the mutation run's shell (D1's literal assertion red) |
 | the key is reserved, so no manifest can claim it | 2 | the existing `ops/bot-ops.test.ts:3659` scan, which turns red the moment `docker.ts` reads an unreserved key | M5: drop the `RESERVED_KEYS` line (that scan red; runs on every platform, no bash needed) |
 | a hanging and a wedged unix call are cut by the bound, for real | 1, 3 | D2 | M6: replace `bounded`'s `setTimeout`/`AbortController` with no signal at all (`api()` gets `undefined`): D2's child never prints, the spawn's 20 s timeout kills it (`exitedDueToTimeout`), red, not a hang |
 | a non-object JSON line is noise | 1 | D4 | M7: delete the whole guard, or only its `=== null` half (the `null` line throws a TypeError); the `typeof` half alone is an equivalent mutant (decision 3) |
@@ -303,7 +305,7 @@ tests or a reviewer are reading; D2 spawns one short child per run.
   production meaning is Linux's; name CI's run as the evidence for it. The PR is not ready until CI is green.
 - Review gate: reviewer A on correctness and failure modes (the env read at import against the module's
   config-free rule; the socket path length on Linux; the child's `server.stop(true)` and exit; whether
-  anything in production could ever set `DOCKER_SOCKET`; the `parseBuildOutput` guard against the classic
+  anything in production could ever set `BOT_DOCKER_SOCKET`; the `parseBuildOutput` guard against the classic
   builder's and BuildKit's real stream lines); reviewer B on claims-vs-code, walking the coverage table,
   every edited comment and the `CONTEXT.md` rows against the merged tree. Both read-only, both handed the
   merged tree and the two issues. Fix or decline every evidenced finding in writing; re-run the gate on the
