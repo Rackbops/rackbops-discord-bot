@@ -13,8 +13,8 @@ import { startScheduler, describeReleaseWatch, announceTo, isPluginStateReady, m
 import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
-import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
-import { detectRollback, finishProbation, resolveBootMode, stepAside, takeOver } from "./redeploy";
+import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
+import { detectRollback, finishProbation, healOwnName, resolveBootMode, stepAside, takeOver } from "./redeploy";
 import { createReadyHandler } from "./ready";
 import {
   awaitCriticalIdle,
@@ -67,6 +67,29 @@ import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/liv
 import { gateCommand, whereOf } from "./routing/gate";
 import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
 import { readRouting, readSecrets } from "./routing/store";
+
+// A standby that never reaches ClientReady must say so rather than sit there: the original is
+// holding its announcements, waiting on exactly this answer. Saying it beats being timed out —
+// the requester gets the reason instead of a shrug. Cleared the moment the login lands.
+//
+// Armed HERE, from the raw env, before the first boot await (#492, #494): every import has evaluated by this
+// point, and `loadPluginIndex` (5 s), `readPluginState` and `resolveBootMode` (10 s) all run inside the 90 s now,
+// instead of before it. The original's 120 s `HANDOFF_DEADLINE_MS` counts from its `startContainer`, so the
+// margin is 30 s less the container's own start latency and import time (src/handoff.ts). A raw standby the daemon
+// later downgrades to normal (the original is gone) has nothing to verify against and is cleared below.
+const verifyTimer =
+  bootMode(process.env) === "standby"
+    ? setTimeout(async () => {
+        console.error("[handoff] no gateway login — giving up so the original can resume");
+        await writeMarker({
+          status: "failed",
+          sha: config.gitSha,
+          error: "the replacement never completed a gateway login",
+          at: Date.now(),
+        });
+        process.exit(1);
+      }, VERIFY_DEADLINE_MS)
+    : undefined;
 
 // The boot-time half of plugin support: read the manifest and pick intents before the Client
 // exists (intents are frozen at construction) — no plugin code runs until #99's activate().
@@ -145,6 +168,12 @@ const mode = await resolveBootMode(process.env);
 // #548: a standby whose original is RUNNING although this container has taken over before was rolled
 // back by the operator (`docker start <name>`); it steps aside instead of stopping the original again.
 if (mode === "standby" && (await detectRollback(process.env))) await stepAside();
+// A raw standby the daemon downgraded (the original is confirmed gone) has nothing to verify against.
+if (mode === "normal") clearTimeout(verifyTimer);
+// #547: a swapped-in container whose rename never landed converges here; an ordinary boot (no HANDOFF_FROM)
+// still never touches the socket. Every restart of a swapped-in container pays this one bounded inspect
+// (10 s at most), because HANDOFF_FROM never clears from its env.
+if (mode === "normal" && bootMode(process.env) === "standby") await healOwnName();
 
 // A completed gateway login is the verification bar for STOPPING the original: process-alive proves
 // nothing, and this is the first moment the new build has demonstrated it can actually do its job.
@@ -523,22 +552,5 @@ async function activate(c: Client<true>): Promise<void> {
     log: console,
   }).catch((err) => console.error("[plugins] report-back", err));
 }
-
-// A standby that never reaches ClientReady must say so rather than sit there: the original is
-// holding its announcements, waiting on exactly this answer. Saying it beats being timed out —
-// the requester gets the reason instead of a shrug. Cleared the moment the login lands.
-const verifyTimer =
-  mode === "standby"
-    ? setTimeout(async () => {
-        console.error("[handoff] no gateway login — giving up so the original can resume");
-        await writeMarker({
-          status: "failed",
-          sha: config.gitSha,
-          error: "the replacement never completed a gateway login",
-          at: Date.now(),
-        });
-        process.exit(1);
-      }, VERIFY_DEADLINE_MS)
-    : undefined;
 
 await client.login(config.discordToken);

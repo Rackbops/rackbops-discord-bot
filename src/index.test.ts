@@ -179,6 +179,53 @@ describe("index.ts wiring", () => {
       expect((source.match(/stepAside\(/g) ?? []).length).toBe(1);
       expect(source).toMatch(/import \{[^}]*\bdetectRollback\b[^}]*\bfinishProbation\b[^}]*\bstepAside\b[^}]*\} from "\.\/redeploy";/);
     });
+
+    // #492/#494: the standby's 90 s verify budget counts from module top, not from after the boot awaits.
+    test("the verify timer is armed from the raw env before the first boot await", () => {
+      const timer = source.indexOf("const verifyTimer =");
+      expect(timer).toBeGreaterThan(-1);
+      // loadPluginIndex is the first top-level await; every import has evaluated before the timer is created.
+      expect(timer).toBeLessThan(source.indexOf("await loadPluginIndex("));
+      // And nothing awaits between the last import and the timer: no boot await may sit ahead of it.
+      const lastImport = source.lastIndexOf("\nimport ");
+      const afterImports = source.indexOf(";\n", lastImport) + 2;
+      expect(afterImports).toBeGreaterThan(2);
+      expect(afterImports).toBeLessThan(timer);
+      const code = source
+        .slice(afterImports, timer)
+        .split("\n")
+        .filter((line) => !line.trim().startsWith("//"));
+      expect(code.join("\n")).not.toContain("await ");
+      expect(source).toMatch(/const verifyTimer =\s*\n\s*bootMode\(process\.env\) === "standby"/);
+      expect((source.match(/const verifyTimer =/g) ?? []).length).toBe(1);
+      // What the timer does when it fires, and when: the 90 s budget, a `failed` marker for the original, exit 1.
+      const timerBlock = source.slice(timer, source.indexOf("    : undefined;", timer));
+      expect(timerBlock).toContain("}, VERIFY_DEADLINE_MS)");
+      expect(timerBlock).toContain("await writeMarker({"); // awaited: the exit must not race the marker write
+      expect(timerBlock).toContain('status: "failed"');
+      expect(timerBlock).toContain("process.exit(1);");
+      expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);
+    });
+
+    // #547: a raw standby the daemon downgraded has nothing to verify against; a swapped-in container whose
+    // rename never landed takes its name here. Both right after the rollback check, before the Client logs in.
+    test("a daemon-downgraded standby clears the timer and heals its name, right after resolveBootMode", () => {
+      const resolved = source.indexOf("await resolveBootMode(process.env);");
+      const attach = source.indexOf("client.once(");
+      expect(resolved).toBeGreaterThan(-1);
+      const between = source.slice(resolved, attach);
+      const rollback = between.indexOf("detectRollback(process.env)");
+      const clear = between.indexOf('if (mode === "normal") clearTimeout(verifyTimer);');
+      const heal = between.indexOf('if (mode === "normal" && bootMode(process.env) === "standby") await healOwnName();');
+      expect(rollback).toBeGreaterThan(-1);
+      expect(clear).toBeGreaterThan(rollback);
+      expect(heal).toBeGreaterThan(clear); // the timer is cleared before the heal's own wait begins
+      expect((source.match(/healOwnName\(/g) ?? []).length).toBe(1);
+      // The timer is cleared in exactly two places: the ready handler (the login landed) and the downgrade above.
+      // A third, unconditional one would silently disable standby verification.
+      expect((source.match(/clearTimeout\(verifyTimer\)/g) ?? []).length).toBe(2);
+      expect(source).toMatch(/import \{[^}]*\bhealOwnName\b[^}]*\} from "\.\/redeploy";/);
+    });
   });
 
   test("installs+loads plugins inside activate() before rest.put, and activates before the scheduler", () => {
