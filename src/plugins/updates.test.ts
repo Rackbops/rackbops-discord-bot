@@ -12,6 +12,7 @@ import {
   renderPluginsList,
   deliverPluginNotification,
   checkPluginUpdates,
+  MAX_DELIVERY_ATTEMPTS,
   resetPluginUpdateStateForTest,
   pluginUpdateStateForTest,
   parseScheduleTime,
@@ -28,6 +29,7 @@ import {
   type PluginNotifyDeliverers,
   type PluginReportDeps,
   type PluginUpdateDeps,
+  type ScheduledEntry,
 } from "./updates";
 
 function rel(version: string, o: { publishedAt?: string; notes?: string; url?: string } = {}): PluginRelease {
@@ -383,23 +385,50 @@ describe("checkPluginUpdates", () => {
     /** Simulate a concurrent `/plugins cancel` winning the serialized queue: clear every `scheduled`
      *  from `current` just before the first mutate runs, so the arbiter closure sees it cancelled. */
     cancelRace?: boolean;
+    /** The re-schedule twin of `cancelRace` (#502 item 14): swap the named fields of every `scheduled` just before the
+     *  first mutate runs, so the arbiter's version and time re-checks (not only its `!cur?.scheduled`) are exercised. */
+    rescheduleRace?: { version?: string; at?: string; requestedBy?: string };
+    /** Make the n-th (1-based) mutate call reject with the returned error instead of applying (#440's isolation). */
+    mutateStateError?: (call: number) => Error | undefined;
+    /** Make the n-th mutate call RUN the mutator (so the arbiter's closure variables are set) and then reject without
+     *  committing, as a save that fails after the decision was made does. */
+    mutateStateFailsAfterRun?: (call: number) => Error | undefined;
     pluginsCommand?: string;
   }) {
     const dms: string[] = [];
     const dmContents: string[] = [];
     const posts: string[] = [];
     const restarts: string[] = [];
+    const warns: string[] = [];
+    const errors: string[] = [];
     let current = opts.state;
     const mutations: PluginStateFile[] = [];
     let indexLoads = 0;
     let raceApplied = false;
+    let mutateCalls = 0;
     const deps: PluginUpdateDeps = {
       loadIndex: async () => { indexLoads++; return opts.index; },
       readState: async () => current,
       mutateState: async (mutate) => {
+        mutateCalls++;
+        const failure = opts.mutateStateError?.(mutateCalls);
+        if (failure) throw failure;
         if (opts.cancelRace && !raceApplied) {
           raceApplied = true;
           current = { ...current, plugins: current.plugins.map((p) => { const n = { ...p }; delete n.scheduled; return n; }) };
+        }
+        if (opts.rescheduleRace && !raceApplied) {
+          raceApplied = true;
+          const swap = opts.rescheduleRace;
+          current = {
+            ...current,
+            plugins: current.plugins.map((p) => (p.scheduled ? { ...p, scheduled: { ...p.scheduled, ...swap } } : p)),
+          };
+        }
+        const late = opts.mutateStateFailsAfterRun?.(mutateCalls);
+        if (late) {
+          mutate(current); // the decision is made (closure variables set); the result is never committed
+          throw late;
         }
         current = mutate(current);
         mutations.push(current);
@@ -412,11 +441,11 @@ describe("checkPluginUpdates", () => {
       hostApiVersion: 1,
       pluginsCommand: opts.pluginsCommand ?? "plugins",
       now: () => NOW,
-      log: { info() {}, warn() {}, error() {} },
+      log: { info() {}, warn: (m) => void warns.push(m), error: (m) => void errors.push(m) },
       restartPending: () => opts.restartPending ?? false,
       requestRestart: (reason) => { restarts.push(reason); },
     };
-    return { deps, dms, dmContents, posts, restarts, mutations, get state() { return current; }, get indexLoads() { return indexLoads; } };
+    return { deps, dms, dmContents, posts, restarts, warns, errors, mutations, get state() { return current; }, get indexLoads() { return indexLoads; } };
   }
 
   // The consumer boundary for the prefixed name: what the tick actually DMs is built from
@@ -476,11 +505,88 @@ describe("checkPluginUpdates", () => {
     expect(h.state.plugins[0]?.remindAt).toBeUndefined();
   });
 
-  test("with no admins: warns, delivers nothing, records nothing (a later admin still gets it)", async () => {
+  // #444: the exemption is about the retry CAP, so it is pinned across the cap and the later admin's DM is asserted,
+  // which is the property the test's name claims. (The old one-tick test did fail with the guard deleted, but only
+  // through the test-state guard's leftover failure count, not on any assertion of its own.)
+  test("with no admins: warns, delivers nothing, records nothing across the retry cap (a later admin still gets it)", async () => {
     const h = harness({ index: index([entry("a", "1.1.0")]), state: state([stateEntry("a", "1.0.0")]), adminUserIds: [] });
-    await checkPluginUpdates(h.deps);
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS + 1; i++) await checkPluginUpdates(h.deps);
     expect(h.dms).toHaveLength(0);
     expect(h.state.plugins[0]?.notifiedVersion).toBeUndefined();
+    expect(pluginUpdateStateForTest().deliveryFailures).toBe(0); // nothing was counted toward the cap
+    h.deps.adminUserIds.push("admin1");
+    await checkPluginUpdates(h.deps);
+    expect(h.dms).toEqual(["admin1"]);
+    expect(h.state.plugins[0]?.notifiedVersion).toBe("1.1.0");
+  });
+
+  // #440: one plugin's failed notice (here a rejecting save) is logged and the next plugin still gets its notice.
+  test("one plugin's failing notice does not stop the others'", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0", { releases: [rel("1.1.0")] }), entry("b", "2.1.0", { releases: [rel("2.1.0")] })]),
+      state: state([stateEntry("a", "1.0.0"), stateEntry("b", "2.0.0")]),
+      mutateStateError: (call) => (call === 1 ? new Error("disk full") : undefined), // plugin a's markNotified
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.dms).toEqual(["admin1", "admin1"]); // both DMed
+    expect(h.state.plugins.find((p) => p.name === "b")?.notifiedVersion).toBe("2.1.0");
+    expect(h.state.plugins.find((p) => p.name === "a")?.notifiedVersion).toBeUndefined(); // its save failed
+    expect(h.errors).toHaveLength(1);
+    expect(h.errors[0]).toContain("update notice for a 1.1.0 failed");
+  });
+
+  // #440/#442: any throw of the notice pass leaves the due schedules to the `finally`. No production path hands the pass a
+  // malformed release any more (loadPluginIndex validates fetched and cached copies alike), so the harness feeds one
+  // straight in as a stand-in for whatever else may throw there.
+  test("a due schedule still fires when the notice pass throws on a malformed release", async () => {
+    const bad = { ...entry("a", "1.1.0"), releases: [null] } as unknown as PluginIndexEntry;
+    const h = harness({
+      index: index([bad]),
+      state: state([stateEntry("a", "1.0.0"), stateEntry("b", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+    });
+    await expect(checkPluginUpdates(h.deps)).rejects.toBeInstanceOf(TypeError);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.restarts[0]).toContain("b");
+    expect(h.state.plugins.find((p) => p.name === "b")?.targetVersion).toBe("1.1.0");
+  });
+
+  // The pass's own failure is what the caller sees; a failure of the schedule look after it is logged, not substituted.
+  test("when the notice pass and the schedule look both fail, the pass's error is thrown and the other logged", async () => {
+    const h = harness({ index: index([]), state: state([]) });
+    h.deps.loadIndex = async () => {
+      throw new Error("index unreachable");
+    };
+    h.deps.readState = async () => {
+      throw new Error("state unreadable");
+    };
+    await expect(checkPluginUpdates(h.deps)).rejects.toThrow("index unreachable");
+    expect(h.errors.some((e) => e.includes("running the due scheduled updates failed after the notice pass did"))).toBe(true);
+  });
+  test("when only the schedule look fails, its error is thrown", async () => {
+    const h = harness({ index: index([]), state: state([]) });
+    let reads = 0;
+    h.deps.readState = async () => {
+      if (++reads > 1) throw new Error("state unreadable");
+      return state([]);
+    };
+    await expect(checkPluginUpdates(h.deps)).rejects.toThrow("state unreadable");
+  });
+
+  // #501 item 8: the DM failure's cause is in the warning, and the give-up line points at where the causes are.
+  test("a DM failure's cause is logged, and the give-up line names the command and where the causes are", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0")]),
+      dm: async () => { throw new Error("Cannot send messages to this user"); },
+      post: async () => { throw new Error("no channel"); },
+      pluginsCommand: "pipplugins",
+    });
+    for (let i = 0; i < MAX_DELIVERY_ATTEMPTS; i++) await checkPluginUpdates(h.deps);
+    expect(h.warns.some((w) => w.includes("Cannot send messages to this user"))).toBe(true);
+    const giveUp = h.errors.find((e) => e.includes("gave up notifying about a 1.1.0"));
+    expect(giveUp).toContain("the causes are in the log lines above");
+    expect(giveUp).toContain("/pipplugins list still shows the update");
+    expect(giveUp).not.toContain("a restart tries again");
   });
 
   test("never restarts WITHOUT a due schedule — a plain newer version only notifies (#104 guard)", async () => {
@@ -544,6 +650,9 @@ describe("checkPluginUpdates", () => {
     expect(h.restarts).toHaveLength(0);
     expect(h.state.plugins[0]?.scheduled).toMatchObject({ version: "1.1.0" });
     expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+    // #442 / the `:654` pre-filter: the arbiter must not even run (and so not rewrite state.json) for a schedule
+    // that is not due, or every minute's look would write the file for every plugin with a pending schedule.
+    expect(h.mutations).toHaveLength(0);
   });
 
   test("a due schedule defers while a restart is already pending (autoUpdate won the tick)", async () => {
@@ -568,6 +677,193 @@ describe("checkPluginUpdates", () => {
     expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
     expect(h.state.plugins[0]?.scheduled).toBeUndefined(); // the cancel cleared it
     expect(h.state.pendingReport).toBeUndefined();
+  });
+
+  // #502 item 14: the cancel race above clears `scheduled` and so exercises only `!cur?.scheduled`; these swap it for a
+  // re-schedule, which is what the arbiter's version and time re-checks are for.
+  test("a re-schedule to another version that wins the race stops the stale fire (the version re-check)", async () => {
+    const h = harness({
+      // The index stays at the scheduled version, so no notice runs first and the arbiter's mutate is the FIRST one,
+      // the one the race is applied to.
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      rescheduleRace: { version: "1.2.0" },
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.state.plugins[0]?.scheduled).toMatchObject({ version: "1.2.0" }); // the newer schedule is kept
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+  });
+
+  test("a re-schedule to a later time that wins the race stops the stale fire (the time re-check)", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      rescheduleRace: { at: "2026-09-05T18:00:00.000Z" }, // after NOW
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.state.plugins[0]?.scheduled).toMatchObject({ version: "1.1.0", at: "2026-09-05T18:00:00.000Z" });
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+  });
+
+  // #441: a due schedule whose version is already installed (or older) is dropped inside the arbiter, not fired.
+  test("a due schedule whose version is already installed is dropped, not fired: no restart, no pin, the requester told", async () => {
+    for (const installed of ["1.1.0", "1.2.0"]) {
+      const h = harness({
+        index: index([entry("a", installed)]),
+        state: state([stateEntry("a", installed, scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      });
+      await checkPluginUpdates(h.deps);
+      expect(h.restarts, installed).toHaveLength(0);
+      expect(h.state.plugins[0]?.scheduled, installed).toBeUndefined();
+      expect(h.state.plugins[0]?.targetVersion, installed).toBeUndefined();
+      expect(h.state.pendingReport, installed).toBeUndefined();
+      expect(h.warns.some((w) => w.includes(`dropped the scheduled update to 1.1.0 — ${installed} is already installed`)), installed).toBe(true);
+      expect(h.dms, installed).toEqual([SNOWFLAKE]);
+      expect(h.dmContents[0], installed).toContain("was dropped");
+    }
+  });
+
+  test("a dropped schedule does not stop the walk: the next plugin's due schedule still fires", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0"), entry("b", "1.1.0")]),
+      state: state([
+        stateEntry("a", "1.1.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")), // moot
+        stateEntry("b", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")), // due
+      ]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.restarts[0]).toContain("b");
+    expect(h.state.plugins.find((p) => p.name === "a")?.scheduled).toBeUndefined();
+    expect(h.state.plugins.find((p) => p.name === "b")?.targetVersion).toBe("1.1.0");
+  });
+
+  test("a dropped schedule asked for from the panel is logged but not DMed (no futile users.fetch)", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.1.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z", "email:me@x.com"))]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.dms).toEqual([]);
+    expect(h.warns.some((w) => w.includes("dropped the scheduled update to 1.1.0"))).toBe(true);
+    expect(h.state.plugins[0]?.scheduled).toBeUndefined();
+  });
+
+  test("a failing DM about a dropped schedule is swallowed: the pass resolves and the next plugin still fires", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0"), entry("b", "1.1.0")]),
+      state: state([
+        stateEntry("a", "1.1.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")),
+        stateEntry("b", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")),
+      ]),
+      dm: async () => { throw new Error("closed DMs"); },
+    });
+    await checkPluginUpdates(h.deps); // resolves
+    expect(h.restarts).toHaveLength(1);
+    expect(h.restarts[0]).toContain("b");
+  });
+
+  // The arbiter's view of the schedule names the recipient, not the pre-read: a re-schedule by someone else lands
+  // between the read and the mutate, and the DM about the dropped schedule goes to THAT requester.
+  test("the dropped schedule's DM goes to the requester the arbiter saw", async () => {
+    const OTHER = "300000000000000000";
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.1.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      rescheduleRace: { requestedBy: OTHER },
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.dms).toEqual([OTHER]);
+  });
+
+  // The look at the schedules is isolated per plugin like the notice pass: one entry that cannot be judged, or one
+  // failing save, does not starve the others' due schedules on every look.
+  test("a schedule whose version is not a string is dropped, and the next plugin's due schedule still fires", async () => {
+    const corrupt = { scheduled: { version: 110, at: "2026-09-05T11:00:00.000Z", requestedBy: SNOWFLAKE } } as unknown as Partial<PluginStateEntry>;
+    const h = harness({
+      index: index([entry("b", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", corrupt), stateEntry("b", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.warns.some((w) => w.includes("a: dropped the scheduled update") && w.includes("is not a version"))).toBe(true);
+    expect(h.state.plugins.find((p) => p.name === "a")?.scheduled).toBeUndefined();
+    expect(h.restarts).toHaveLength(1);
+    expect(h.restarts[0]).toContain("b");
+  });
+
+  test("a failing save for one plugin's schedule is logged and the next plugin's due schedule still fires", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0"), entry("b", "1.1.0")]),
+      state: state([
+        stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")),
+        stateEntry("b", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z")),
+      ]),
+      mutateStateError: (call) => (call === 1 ? new Error("disk full") : undefined), // plugin a's arbiter
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.errors.some((e) => e.includes("a: running its scheduled update failed"))).toBe(true);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.restarts[0]).toContain("b");
+  });
+
+  // A save that fails AFTER the arbiter decided to fire must not restart the bot onto a pin that was never saved, nor
+  // send the heads-up: the schedule is still on file and the next look fires it.
+  test("a save that fails after the arbiter ran restarts nothing and DMs nobody; the next look fires it", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      mutateStateFailsAfterRun: (call) => (call === 1 ? new Error("disk full") : undefined),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.dms).toEqual([]);
+    expect(h.state.plugins[0]?.scheduled).toMatchObject({ version: "1.1.0" });
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(h.errors.some((e) => e.includes("a: running its scheduled update failed"))).toBe(true);
+    await checkPluginUpdates(h.deps); // the next look
+    expect(h.restarts).toHaveLength(1);
+    expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
+  });
+
+  // The heads-up DM goes to the requester the arbiter fired for (the one the boot report-back goes to), as the drop's DM does.
+  test("the heads-up DM goes to the requester the arbiter saw", async () => {
+    const OTHER = "300000000000000000";
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "2026-09-05T11:00:00.000Z"))]),
+      rescheduleRace: { requestedBy: OTHER },
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.dms).toEqual([OTHER]);
+    expect(h.state.pendingReport).toMatchObject({ userId: OTHER });
+  });
+
+  // plugin-updates-9: a hand-edited `at` that is not a date used to fire on the next look (`now < NaN` is false).
+  test("a schedule whose time is not a date is dropped and logged, not fired", async () => {
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", scheduled("1.1.0", "garbage"))]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.state.plugins[0]?.scheduled).toBeUndefined();
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(h.warns.some((w) => w.includes("is not a date"))).toBe(true);
+  });
+
+  // #502 item 12: the schedule carries the channel it was requested from, and the fire hands it to the report-back.
+  test("a due schedule's pendingReport carries the channel it was scheduled from", async () => {
+    const withChannel: ScheduledEntry = { version: "1.1.0", at: "2026-09-05T11:00:00.000Z", requestedBy: SNOWFLAKE, channelId: "chan1" };
+    const h = harness({
+      index: index([entry("a", "1.1.0")]),
+      state: state([stateEntry("a", "1.0.0", { scheduled: withChannel })]),
+    });
+    await checkPluginUpdates(h.deps);
+    expect(h.restarts).toHaveLength(1);
+    expect(h.state.pendingReport).toMatchObject({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, channelId: "chan1" });
   });
 
   test("a scheduled version is not re-notified while it waits (scheduled suppression)", async () => {
@@ -598,6 +894,15 @@ describe("parseScheduleTime (#104)", () => {
   test("an ISO-8601 datetime with an offset is taken as-is", () => {
     expect(ok(parseScheduleTime("2026-09-06T18:30-07:00", now)).toISOString()).toBe("2026-09-07T01:30:00.000Z");
     expect(ok(parseScheduleTime("2026-09-06T09:00:00Z", now)).toISOString()).toBe("2026-09-06T09:00:00.000Z");
+  });
+  // #442 (plugin-updates-9): HH:MM rolls to tomorrow, but an ISO time already behind us would have fired at the next look.
+  test("an ISO-8601 time at or before now is refused as already passed; one second later is taken", () => {
+    for (const past of ["2020-01-01T00:00:00Z", "2026-09-05T12:00:00.000Z"]) {
+      const r = parseScheduleTime(past, now); // the second equals `now`
+      expect("error" in r, past).toBe(true);
+      if ("error" in r) expect(r.error).toContain("already passed");
+    }
+    expect(ok(parseScheduleTime("2026-09-05T12:00:01Z", now)).toISOString()).toBe("2026-09-05T12:00:01.000Z");
   });
   test("garbage, and an offset-less ISO string (ambiguous), are rejected with the two forms", () => {
     for (const bad of ["later", "25:00", "18:99", "2026-09-06T18:30", "6pm"]) {
@@ -635,15 +940,37 @@ describe("planPluginAction (#104)", () => {
     expect(after.plugins[0]?.targetVersion).toBe("1.1.0");
     expect(after.pendingReport).toMatchObject({ plugin: "a", toVersion: "1.1.0", userId: "admin1", channelId: "chan1" });
   });
+  // #441, the command path: an update-now supersedes a schedule already pending for the version it pins.
+  test("update now drops a pending schedule for the version it pins", () => {
+    const r = planPluginAction({ kind: "update" }, base());
+    const pending = { version: "1.1.0", at: "2026-09-05T18:00:00.000Z", requestedBy: "admin1" };
+    const after = r.mutate!(state([stateEntry("a", "1.0.0", { scheduled: pending })])).plugins[0]!;
+    expect(after.scheduled).toBeUndefined();
+    expect(after.targetVersion).toBe("1.1.0");
+  });
   test("update at:<time> schedules and does NOT restart", () => {
     const at = new Date("2026-09-05T18:00:00.000Z");
     const r = planPluginAction({ kind: "update", at }, base());
     expect(r.restart).toBeUndefined();
+    // base() carries the channel the command ran in; the schedule keeps it for the report-back's channel fallback (#502).
+    expect(applied(r).scheduled as ScheduledEntry | undefined).toEqual({ version: "1.1.0", at: at.toISOString(), requestedBy: "admin1", channelId: "chan1" });
+  });
+  test("update at:<time> from a context with no channel stores no channelId", () => {
+    const at = new Date("2026-09-05T18:00:00.000Z");
+    const r = planPluginAction({ kind: "update", at }, base({ channelId: undefined }));
     expect(applied(r).scheduled).toEqual({ version: "1.1.0", at: at.toISOString(), requestedBy: "admin1" });
   });
   test("remind sets remindAt now+days", () => {
     const r = planPluginAction({ kind: "remind", days: 3 }, base());
     expect(applied(r).remindAt).toBe(new Date("2026-09-08T12:00:00.000Z").toISOString());
+  });
+  // #501 item 4: the remind branch passes the version it is about to snooze, so a skip is lifted and the snooze holds.
+  test("remind after a skip clears the skip and acknowledges the version (the command path)", () => {
+    const r = planPluginAction({ kind: "remind", days: 3 }, base());
+    const after = r.mutate!(state([stateEntry("a", "1.0.0", { skippedVersion: "1.1.0" })])).plugins[0]!;
+    expect(after.skippedVersion).toBeUndefined();
+    expect(after.notifiedVersion).toBe("1.1.0");
+    expect(after.remindAt).toBe(new Date("2026-09-08T12:00:00.000Z").toISOString());
   });
   test("skip sets skippedVersion to the available version", () => {
     expect(applied(planPluginAction({ kind: "skip" }, base())).skippedVersion).toBe("1.1.0");
@@ -805,13 +1132,70 @@ describe("version-parameterized builders (#105 — shared by planPluginAction + 
       at: "2026-01-01T00:00:00Z",
       requestedBy: "u",
     });
-    expect(remindLater("a", "2026-02-02T00:00:00Z")(seed()).plugins[0]?.remindAt).toBe("2026-02-02T00:00:00Z");
+    const reminded = remindLater("a", "2026-02-02T00:00:00Z", "1.1.0")(seed()).plugins[0];
+    expect(reminded?.remindAt).toBe("2026-02-02T00:00:00Z");
+    expect(reminded?.notifiedVersion).toBe("1.1.0"); // #501 item 4: the snooze acknowledges the version it is for
+  });
+  // #502 item 12: the channel is stored only when there is one.
+  test("scheduleUpdate stores the channel it is given, and none when there is none", () => {
+    expect(scheduleUpdate("a", "1.1.0", "2026-01-01T00:00:00Z", "200863115821318144", "chan1")(seed()).plugins[0]?.scheduled as ScheduledEntry | undefined).toEqual({
+      version: "1.1.0",
+      at: "2026-01-01T00:00:00Z",
+      requestedBy: "200863115821318144",
+      channelId: "chan1",
+    });
+    expect(scheduleUpdate("a", "1.1.0", "2026-01-01T00:00:00Z", "u")(seed()).plugins[0]?.scheduled).not.toHaveProperty("channelId");
+  });
+  // #501 item 4, as a composition: a remind after a skip is a change of mind, and the snooze then actually holds.
+  test("remindLater after skipVersion: the skip is gone, the snooze holds until it is due, then reminds", () => {
+    const AT = "2026-09-08T12:00:00.000Z";
+    const reminded = remindLater("a", AT, "1.1.0")(skipVersion("a", "1.1.0")(state([stateEntry("a", "1.0.0")])));
+    expect(reminded.plugins[0]).toMatchObject({ remindAt: AT, notifiedVersion: "1.1.0" });
+    expect(reminded.plugins[0]?.skippedVersion).toBeUndefined();
+    const idx = index([entry("a", "1.1.0")]);
+    expect(decidePluginUpdates(reminded, idx, 1, NOW).map((d) => d.action)).toEqual(["none"]); // before AT: holds
+    expect(decidePluginUpdates(reminded, idx, 1, new Date(Date.parse(AT) + 1000)).map((d) => d.action)).toEqual(["remind"]);
+    // Before this change a remind on a version nobody had been told about was followed by a notify that wiped the snooze.
+    const unnotified = remindLater("a", AT, "1.1.0")(state([stateEntry("a", "1.0.0")]));
+    expect(decidePluginUpdates(unnotified, idx, 1, NOW).map((d) => d.action)).toEqual(["none"]);
+  });
+  // A stale remind (a mailbox request naming an older version) must not turn the snooze of a newer, already-notified
+  // version into a fresh notice, nor lift a skip of some other version.
+  test("remindLater never steps the acknowledged version back, and lifts only a skip of its own version", () => {
+    const AT = "2026-09-08T12:00:00.000Z";
+    const seeded = state([stateEntry("a", "1.0.0", { notifiedVersion: "1.2.0", skippedVersion: "1.1.0" })]);
+    const stale = remindLater("a", AT, "1.0.5")(seeded);
+    expect(stale.plugins[0]).toMatchObject({ remindAt: AT, notifiedVersion: "1.2.0", skippedVersion: "1.1.0" });
+    // the snooze of the notified 1.2.0 still holds, so the next tick stays quiet until AT
+    expect(decidePluginUpdates(stale, index([entry("a", "1.2.0")]), 1, NOW).map((d) => d.action)).toEqual(["none"]);
+    // a NEWER version is acknowledged
+    expect(remindLater("a", AT, "1.3.0")(seeded).plugins[0]?.notifiedVersion).toBe("1.3.0");
+    // and the skip of the version being reminded about is the one that goes
+    expect(remindLater("a", AT, "1.1.0")(seeded).plugins[0]?.skippedVersion).toBeUndefined();
+  });
+  test("a release with no notes prints no 'undefined' in the notice (#440 lets `notes` be absent)", () => {
+    const bare = { version: "1.1.0", publishedAt: "2026-09-05T12:00:00.000Z" } as unknown as PluginRelease;
+    const [d] = decidePluginUpdates(state([stateEntry("a", "1.0.0")]), index([entry("a", "1.1.0", { releases: [bare] })]), 1, NOW);
+    expect(d).toBeDefined();
+    const message = notificationMessage(d!, 1, "plugins");
+    expect(message).toContain("**1.1.0** (2026-09-05)");
+    expect(message).not.toContain("undefined");
   });
   test("pinUpdateNow sets targetVersion + pendingReport; cancelPending clears scheduled + targetVersion", () => {
     const report = { plugin: "a", toVersion: "9.9.9", userId: "u", requestedAt: 0 };
     const after = pinUpdateNow("a", "9.9.9", report)(seed());
     expect(after.plugins[0]?.targetVersion).toBe("9.9.9");
     expect(after.pendingReport).toEqual(report);
+    // #441: an update-now supersedes a pending schedule for the plugin (a later fire would restart for nothing).
+    const withSched = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "x", requestedBy: "u" } }), stateEntry("b", "1.0.0", { scheduled: { version: "2.0.0", at: "y", requestedBy: "u" } })]);
+    const pinned = pinUpdateNow("a", "9.9.9", report)(withSched);
+    expect(pinned.plugins[0]?.scheduled).toBeUndefined();
+    expect(pinned.plugins[0]?.targetVersion).toBe("9.9.9");
+    expect(pinned.plugins[1]?.scheduled).toMatchObject({ version: "2.0.0" }); // another plugin's schedule is untouched
+    // ...but a schedule for a NEWER version than the pin is still the admin's wish after it, and is kept.
+    const newer = state([stateEntry("a", "1.0.0", { scheduled: { version: "10.0.0", at: "x", requestedBy: "u" } })]);
+    expect(pinUpdateNow("a", "9.9.9", report)(newer).plugins[0]?.scheduled).toMatchObject({ version: "10.0.0" });
+    expect(pinUpdateNow("a", "10.0.0", report)(newer).plugins[0]?.scheduled).toBeUndefined(); // the same version: superseded
     const seeded = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "x", requestedBy: "u" }, targetVersion: "1.1.0" })]);
     const cleared = cancelPending("a")(seeded).plugins[0];
     expect(cleared?.scheduled).toBeUndefined();
