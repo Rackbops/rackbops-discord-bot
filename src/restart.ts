@@ -21,6 +21,12 @@
 // it as running "on the way out" and lists a `docker stop`, a self-update's retire and SIGINT; a requested
 // restart is not among them, and this path is deliberately left as it is (#512 item 4, declined).
 //
+// Exit hooks (#446): `onBeforeExit` registers a function that runs once, synchronously, right before the
+// process exits -- `doExit` below for a requested restart, and `runExitHooks` (called by `index.ts`'s shutdown
+// `exit`, after the drain) for a stop -- so a log line that would otherwise be lost can be written first. The
+// interaction handler's line for a command that ends the process (`/update`, `/plugins ... update ... now`) is
+// the one user. `beginShutdown` does not run them: an interaction that finishes during the drain logs its own outcome.
+//
 // A plugin tick holds its own unit of the critical section for as long as its call is pending, even
 // past PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #248). A restart request or a shutdown notifies the
 // `onStopRequested` listeners below; the plugin host's listener aborts every pending tick's
@@ -61,6 +67,9 @@ let idleResolvers: (() => void)[] = [];
 // #248: called once, the first time the process is asked to stop (see onStopRequested).
 let stopListeners: ((reason: string) => void)[] = [];
 let stopNotified = false;
+// #446: run once, synchronously, right before this process exits (see onBeforeExit / runExitHooks). Cleared by
+// `resetForTest`.
+let exitHooks: (() => void)[] = [];
 
 /**
  * #154: how much of `critical`'s current depth is the handoff's own, permanently-open holder —
@@ -134,6 +143,7 @@ export function resetForTest(): void {
   idleResolvers = [];
   stopListeners = [];
   stopNotified = false;
+  exitHooks = [];
 }
 
 /** Everything `resetForTest` resets, as plain values — what the test-state guard reads (test/stateGuard.ts). */
@@ -146,6 +156,7 @@ export interface RestartStateForTest {
   stopListeners: number;
   stopNotified: boolean;
   deferralArmed: boolean;
+  exitHooks: number;
 }
 
 /** A read-only snapshot of the state `resetForTest` resets, for the test-state guard. */
@@ -159,6 +170,7 @@ export function stateForTest(): RestartStateForTest {
     stopListeners: stopListeners.length,
     stopNotified,
     deferralArmed: deferralTimer !== undefined,
+    exitHooks: exitHooks.length,
   };
 }
 
@@ -184,6 +196,34 @@ function notifyStop(reason: string): void {
       listener(reason);
     } catch (err) {
       console.error("[restart] a stop listener threw (continuing)", err);
+    }
+  }
+}
+
+/**
+ * #446: registers `fn` to run once, synchronously, immediately before the process exits for a requested
+ * restart (`doExit`) or at the end of a shutdown (`runExitHooks`, called by the shutdown handler's `exit`);
+ * returns an unsubscribe. A hook that throws is logged and never stops the exit or the other hooks. Hooks
+ * run in registration order. Only an exit that goes through `doExit` or the shutdown handler's `exit` runs
+ * them: any other deliberate `process.exit` loses the line of every interaction in flight, so route it
+ * through one of those. A crash or a SIGKILL runs none.
+ */
+export function onBeforeExit(fn: () => void): () => void {
+  exitHooks.push(fn);
+  return () => {
+    exitHooks = exitHooks.filter((h) => h !== fn);
+  };
+}
+
+/** Runs and empties the hooks. Exported for the shutdown handler's `exit` (`index.ts`); `doExit` calls it too. */
+export function runExitHooks(): void {
+  const hooks = exitHooks;
+  exitHooks = [];
+  for (const hook of hooks) {
+    try {
+      hook();
+    } catch (err) {
+      console.error("[restart] an exit hook threw (continuing)", err);
     }
   }
 }
@@ -349,5 +389,6 @@ function armDeferral(reason: string, deferralMaxMs: number): void {
 function doExit(reason: string): void {
   clearDeferral();
   console.log(`[restart] exiting (${RESTART_EXIT_CODE}): ${reason}`);
+  runExitHooks();
   exitFn(RESTART_EXIT_CODE);
 }
