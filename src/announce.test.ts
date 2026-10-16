@@ -26,6 +26,8 @@ const {
   livePluginRequestDeps,
   livePluginUpdateDeps,
   PLUGIN_REQUESTS_TICK_WAIT_MS,
+  startScheduler,
+  TICK_MS,
   TICK_WATCHDOG_MS,
 } = await import("./announce");
 const { config } = await import("./config");
@@ -576,6 +578,57 @@ describe("runTick", () => {
       errorSpy.mockRestore();
     }
     expect(ran).toEqual(["first"]);
+  });
+});
+
+// #548: a standby's probation waits on the scheduler's FIRST tick, so startScheduler hands that tick's promise
+// back. It must settle only once the tick's checks have run, and it must never reject (a rejection would end
+// the process from inside the ready handler).
+describe("startScheduler returns the first tick's promise (#548)", () => {
+  afterEach(() => {
+    resetTickGuardForTest();
+    resetDiscoveryGapForTest();
+    resetPollStateForTest();
+  });
+
+  test("it settles after the first tick's checks ran, and a throwing check does not reject it", async () => {
+    const realRepos = config.watchedRepos;
+    config.watchedRepos = []; // WATCHED_REPOS=none: the release check polls nothing
+    const realSetInterval = globalThis.setInterval;
+    const intervals: number[] = [];
+    // The repeating tick is recorded, not started: a real one would outlive the test.
+    globalThis.setInterval = ((_fn: unknown, ms: number) => (intervals.push(ms), 0)) as unknown as typeof setInterval;
+    const quiet = [spyOn(console, "error").mockImplementation(() => {}), spyOn(console, "warn").mockImplementation(() => {})];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const ran: string[] = [];
+      const first = startScheduler({} as unknown as Client, [
+        { name: "slow", run: async () => (await gate, void ran.push("slow")) },
+        {
+          name: "boom",
+          run: async () => {
+            ran.push("boom");
+            throw new Error("check failed");
+          },
+        },
+      ]);
+      expect(intervals).toEqual([TICK_MS]); // the repeating tick is still scheduled
+      // Mutation: returning an already-settled promise instead of the tick's own settles here, with `ran` empty.
+      expect(await Promise.race([first.then(() => "settled"), Bun.sleep(40).then(() => "pending")])).toBe("pending");
+      expect(ran).toEqual([]);
+      release();
+      await first; // resolves, does not reject, although the "boom" check threw
+      expect(ran).toEqual(["slow", "boom"]);
+    } finally {
+      fetchSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+      globalThis.setInterval = realSetInterval;
+      config.watchedRepos = realRepos;
+    }
   });
 });
 

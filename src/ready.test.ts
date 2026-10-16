@@ -21,6 +21,9 @@ function harness(mode: "standby" | "normal", overrides: Partial<ReadyDeps<Client
       order.push("activate");
       activated.push(c);
     },
+    afterActivate: async () => {
+      order.push("afterActivate");
+    },
     clearVerifyTimer: () => {
       order.push("clear");
     },
@@ -37,11 +40,43 @@ function harness(mode: "standby" | "normal", overrides: Partial<ReadyDeps<Client
 }
 
 describe("createReadyHandler (#435)", () => {
-  test("standby: logs the login, clears the verify timer, takes over, then activates — in that order", async () => {
+  test("standby: logs the login, clears the verify timer, takes over, activates, then ends probation — in that order", async () => {
     const { handler, order } = harness("standby");
     await handler({ id: "a" });
-    // Mutation: swapping takeOver and activate, or moving the clear after either, changes this list.
-    expect(order).toEqual(["log", "clear", "takeOver", "activate"]);
+    // Mutation: swapping takeOver and activate, moving the clear after either, or running afterActivate
+    // before activate (#548: the original is removed only once the new build has run) changes this list.
+    expect(order).toEqual(["log", "clear", "takeOver", "activate", "afterActivate"]);
+  });
+
+  // #548: probation's end is AFTER activate has settled, not merely started.
+  test("afterActivate runs only after activate has settled", async () => {
+    let finishActivate!: () => void;
+    const activateSettled = new Promise<void>((resolve) => {
+      finishActivate = resolve;
+    });
+    const { handler, order } = harness("standby", {
+      activate: async () => {
+        order.push("activate:start");
+        await activateSettled;
+        order.push("activate:done");
+      },
+    });
+    const running = handler({ id: "a" });
+    await Bun.sleep(10);
+    expect(order).toEqual(["log", "clear", "takeOver", "activate:start"]);
+    finishActivate();
+    await running;
+    expect(order).toEqual(["log", "clear", "takeOver", "activate:start", "activate:done", "afterActivate"]);
+  });
+
+  test("an activate that rejects means afterActivate never runs, and the rejection reaches the caller", async () => {
+    const { handler, order } = harness("standby", {
+      activate: async () => {
+        throw new Error("activate blew up");
+      },
+    });
+    await expect(handler({ id: "a" })).rejects.toThrow("activate blew up");
+    expect(order).not.toContain("afterActivate"); // the original stays stopped-but-kept: docker start is the way back
   });
 
   test("activate waits for a slow takeOver to settle before it runs", async () => {
@@ -62,17 +97,20 @@ describe("createReadyHandler (#435)", () => {
     expect(order).toEqual(["log", "clear", "takeOver:start"]);
     finishTakeOver();
     await running;
-    expect(order).toEqual(["log", "clear", "takeOver:start", "takeOver:done", "activate"]);
+    expect(order).toEqual(["log", "clear", "takeOver:start", "takeOver:done", "activate", "afterActivate"]);
   });
 
-  test("normal: never calls takeOver, and still clears the timer before activating", async () => {
+  test("normal: never calls takeOver or afterActivate, and still clears the timer before activating", async () => {
     const { handler, order } = harness("normal", {
       takeOver: async () => {
         throw new Error("takeOver must not run in normal mode");
       },
+      afterActivate: async () => {
+        throw new Error("afterActivate must not run in normal mode");
+      },
     });
     await handler({ id: "a" });
-    // Mutation: dropping the mode === "standby" gate makes takeOver throw here.
+    // Mutation: dropping the mode === "standby" gate on either makes it throw here.
     expect(order).toEqual(["log", "clear", "activate"]);
   });
 

@@ -7,6 +7,17 @@ tree; the implementer re-reads each one on the tree it works from and corrects a
 
 ## Implementation plan -- #525 bundle S3a: keep the original until the new build has run
 
+> **Status: implemented in PR #557, with the deviations below. Where this plan and the code disagree, the code
+> wins.** (1) The removal in `completeTakeOver` is NOT forced (a forced one would kill and delete an original the
+> operator started during the tag call); a refused removal looks again and steps aside. (2) Decision 4 ("a
+> recreate during probation makes the replacement step aside") is false: a `recreate`/`env-set` creates a new
+> container id that nothing follows, so two bots could run; S3b-1 (#490 item 2's guard, since landed) refuses `bot-ops.sh` `recreate`, `env-set` and `restart` while `-next` is alive, a plain `compose up -d` is unguarded. (3) The
+> rollback to recommend is `docker stop <name>-next`, then `docker start <name>`; a bare `docker start` overlaps
+> until the replacement looks. (4) `detectRollback` ignores a standby with no `HANDOFF_RESTART_POLICY` in its env
+> (a pre-#160 standby). (5) `completeTakeOver` steps aside before it tags (a rolled-back-from build must not
+> become `:latest`) and returns early while the process is shutting down (`isShuttingDown()`). (6) `takeOver`
+> looks once more before it writes `ready`.
+
 Children: **#548** (option 1), and items 5, 7 and 9 of **#490** (item 9 is also `docker-restart-5` in #512,
 closed there by reference). One PR. A behaviour change at the heart of the self-update swap, so the
 **three-reviewer gate** applies: you plus two read-only adversarial reviewers with different lenses, up to

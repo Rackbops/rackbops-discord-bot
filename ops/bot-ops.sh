@@ -313,6 +313,7 @@ declare -A RESERVED_KEYS=(
   [NODE_ENV]=1                 # src/dataDir.ts: under bun test (NODE_ENV=test, or a test-file entry) an unset BOT_DATA_DIR is a boot error
   [HANDOFF_FROM]=1             # src/handoff.ts: the raw standby instruction, set by the redeploy machinery (#46 checks the named container)
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
+  [HANDOFF_RESTART_RETRIES]=1  # src/redeploy.ts: the original's on-failure retry cap, carried with the policy (#490)
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
   [BOT_DOCKER_SOCKET]=1        # src/docker.ts: the daemon socket path, a test seam (#459) -- set by nothing in a deployment, and no plugin may claim it
   [SHARDS]=1                   # discord.js Client (src/client.ts builds it with no shard options): the shards it serves
@@ -354,8 +355,9 @@ declare -A RESERVED_KEYS=(
 #     start run back to back), which is the first instant of the early window this guard was written
 #     for: an env-set force-recreate landing while "-next" exists but has written nothing yet would
 #     recreate the untouched original under a brand-new container id, orphaning the replacement's own
-#     HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats it as "already gone"
-#     and skips the rename WITHOUT throwing, so the replacement still goes live: two live bots, and
+#     HANDOFF_FROM reference; retireOriginal then 404s on that stale id and treats it as "already
+#     gone", and completeTakeOver later finds no original to take the name from and skips the rename
+#     WITHOUT throwing, so the replacement still goes live: two live bots, and
 #     the recreated one is still on the OLD image. Treating "created" as a leftover would reopen that
 #     race on every swap to spare a lockout that needs a process death inside the same gap; that one
 #     is cleared with `docker rm <container>-next` (ops/README.md).
@@ -385,7 +387,7 @@ guard_no_handoff_in_progress() {
   if docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
     die "a self-update is in progress (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is still running) — try again once it completes; if it persists, see ops/README.md"
   fi
-  die "a self-update is finishing (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is not running) — try again in a minute; if it persists, read 'docker logs ${CONTAINER}-next' and see ops/README.md (a new build that keeps crashing, with the old container still there: 'docker rm -f ${CONTAINER}-next' then 'docker start ${CONTAINER}' brings the old build back, and ':latest' must be re-pointed at it before any recreate, see ops/README.md; one that is up but never took the name: rename it)"
+  die "a self-update is finishing (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is not running) — try again in a minute; if it persists, read 'docker logs ${CONTAINER}-next' and see ops/README.md (rolling back a new build that keeps crashing, or one that is up but never took the name)"
 }
 
 # #227: one exclusive lock per config dir around every mutation of it (env-set's read-modify-write
