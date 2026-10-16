@@ -1332,6 +1332,53 @@ describe("handleCommand — /plugins driven end to end: update now (#503 item 10
     }
   });
 
+  // L6 (#502 item 13): the list's caller, end to end. Two plugins with the same newer version, one needing another host
+  // API: a caller that passed a constant that equals neither (0, say) would print the caveat for BOTH, and one plugin
+  // alone could not tell that from the right constant.
+  test("L6: /plugins list passes the bot's host API: only the plugin that needs another one says 'needs a newer bot'", async () => {
+    const edits: string[] = [];
+    let fetchSpy: ReturnType<typeof spyOn> | undefined;
+    let pushedAdmin = false;
+    try {
+      const entryFor = (name: string, hostApiVersion: number) => ({
+        name, package: `@rackbops/plugin-${name}`, version: "1.1.0", description: name, hostApiVersion, commands: [], env: [], releases: [],
+      });
+      const index = {
+        schemaVersion: 1,
+        generatedAt: "2026-10-16T00:00:00.000Z",
+        plugins: [entryFor("demo", HOST_API_VERSION + 1), entryFor("ok", HOST_API_VERSION)],
+      };
+      const state = {
+        hostApiVersion: HOST_API_VERSION,
+        writtenAt: "",
+        plugins: ["demo", "ok"].map((name) => ({ name, enabled: true, installedVersion: "1.0.0", configured: true, missingEnv: [], active: true })),
+      };
+      mkdirSync(`${DATA_DIR}/plugins`, { recursive: true });
+      writeFileSync(statePath, JSON.stringify(state));
+      markPluginStateReady();
+      config.adminUserIds.push("999");
+      pushedAdmin = true;
+      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+        new Response(JSON.stringify(index), { status: 200 })) as unknown as typeof fetch);
+      const interaction = {
+        commandName: "plugins",
+        user: { id: "999" },
+        channelId: "c1",
+        options: { getSubcommand: () => "list", getString: () => null, getInteger: () => null },
+        deferReply: async () => {},
+        editReply: async (content: string) => void edits.push(content),
+      } as unknown as ChatInputCommandInteraction;
+
+      expect(await handleCommand(interaction)).toBe("answered");
+      expect(edits).toHaveLength(1);
+      expect(edits[0]).toContain("**demo** — installed 1.0.0 → 1.1.0 available (needs a newer bot)");
+      expect(edits[0]).toContain("**ok** — installed 1.0.0 → 1.1.0 available\n");
+    } finally {
+      fetchSpy?.mockRestore();
+      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+    }
+  });
+
   // T6: the action catch (#503 item 11). An unparseable state.json does not reach it (readJsonOrFresh moves a corrupt
   // file aside and reads it as fresh), so the failure driven here is the reply: /plugins remind mutates, no restart.
   // The log comes BEFORE the failure reply: when that reply is rejected too (`rejections` 2), the line is the only

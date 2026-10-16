@@ -12,6 +12,7 @@ import {
   renderPluginsList,
   deliverPluginNotification,
   checkPluginUpdates,
+  cutUtf16,
   MAX_DELIVERY_ATTEMPTS,
   resetPluginUpdateStateForTest,
   pluginUpdateStateForTest,
@@ -21,6 +22,7 @@ import {
   scheduleUpdate,
   remindLater,
   skipVersion,
+  sliceUtf16,
   cancelPending,
   isDiscordUserId,
   decidePluginReportOutcome,
@@ -195,6 +197,32 @@ describe("notificationMessage", () => {
     );
     expect(msg.length).toBeLessThanOrEqual(2000);
   });
+  // #563's class on the notice: the hard cap is a cut like the list's, and the release url (the index only checks it is
+  // a string) can sit at it, so it must not end inside a pair.
+  // The same class in the notes budget (reviewer A, U3 gate): an emoji-heavy changelog cut to fit the notice. Four
+  // consecutive offsets so the cut meets both parities of the emoji run.
+  test("the release-notes clamp never ends inside a surrogate pair", () => {
+    for (let k = 1500; k < 1504; k++) {
+      const msg = notificationMessage(
+        { ...base, to: "2.0.0", compatible: true, action: "notify", releases: [rel("2.0.0", { notes: "x".repeat(k) + "🙂".repeat(400) })] },
+        1,
+        "plugins",
+      );
+      expect(msg.length, `k=${k}`).toBeLessThanOrEqual(2000);
+      expect(msg, `k=${k}`).toContain("full notes: "); // the notes WERE clamped
+      expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(msg), `k=${k}`).toBe(false);
+    }
+  });
+  test("the hard cap never ends inside a surrogate pair", () => {
+    const make = (url: string) =>
+      notificationMessage({ ...base, name: "a".repeat(1800), compatible: true, action: "notify", releases: [rel("1.1.0", { url })] }, 1, "plugins");
+    const marker = "full notes: ";
+    const urlAt = make("u").indexOf(marker) + marker.length;
+    expect(urlAt).toBeGreaterThan(marker.length); // the marker was found (-1 + its length would make the test vacuous)
+    const msg = make("u".repeat(1999 - urlAt) + "🙂" + "z".repeat(10)); // the high surrogate lands at unit 1999, the last one kept
+    expect(msg.length).toBeLessThanOrEqual(2000);
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(msg)).toBe(false);
+  });
 });
 
 describe("renderPluginsList", () => {
@@ -209,7 +237,7 @@ describe("renderPluginsList", () => {
       entry("b", "2.1.0"),
       entry("c", "3.1.0"),
     ]);
-    const out = renderPluginsList(s, idx, NOW);
+    const out = renderPluginsList(s, idx, NOW, 1);
     expect(out).toContain("**a** — installed 1.0.0 → 1.1.0 available");
     expect(out).toContain("shiny");
     expect(out).toContain("**b** — installed 2.0.0 → 2.1.0 available (skipped)");
@@ -221,30 +249,261 @@ describe("renderPluginsList", () => {
   });
   test("shows a pending scheduled update (#104), so /plugins cancel has something visible to act on", () => {
     const s = state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" } })]);
-    const out = renderPluginsList(s, index([entry("a", "1.1.0")]), NOW);
+    const out = renderPluginsList(s, index([entry("a", "1.1.0")]), NOW, 1);
     const scheduledTs = Math.floor(Date.parse("2026-09-06T00:00:00.000Z") / 1000);
     expect(out).toContain(`update to 1.1.0 scheduled <t:${scheduledTs}:R>`);
   });
   test("empty state → a plain line", () => {
-    expect(renderPluginsList(state([]), index([]), NOW)).toBe("No plugins installed.");
+    expect(renderPluginsList(state([]), index([]), NOW, 1)).toBe("No plugins installed.");
   });
   test("clamps a long list to Discord's cap", () => {
     const plugins = Array.from({ length: 12 }, (_, i) => stateEntry(`p${i}`, "1.0.0"));
     const entries = Array.from({ length: 12 }, (_, i) => entry(`p${i}`, "2.0.0", { releases: [rel("2.0.0", { notes: "y".repeat(400) })] }));
-    const out = renderPluginsList(state(plugins), index(entries), NOW);
+    const out = renderPluginsList(state(plugins), index(entries), NOW, 1);
     expect(out.length).toBeLessThanOrEqual(2000);
     expect(out).toContain("… (list truncated)");
   });
+  // #502 item 13: the list says what the notice and /plugins update say about the same version.
+  test("L3: a newer version that needs another host API says so; one for this host does not", () => {
+    const s = state([stateEntry("a", "1.0.0"), stateEntry("b", "1.0.0")]);
+    const out = renderPluginsList(s, index([entry("a", "2.0.0", { hostApiVersion: 2 }), entry("b", "2.0.0")]), NOW, 1);
+    expect(out).toContain("**a** — installed 1.0.0 → 2.0.0 available (needs a newer bot)");
+    // no caveat for the compatible one: its first line is exactly this
+    expect(out.split("\n").find((l) => l.startsWith("• **b**"))).toBe("• **b** — installed 1.0.0 → 2.0.0 available");
+    // "Differs", not "is higher": the notice and /plugins update say the same of any host API but this bot's.
+    const older = renderPluginsList(state([stateEntry("a", "1.0.0")]), index([entry("a", "2.0.0", { hostApiVersion: 1 })]), NOW, 2);
+    expect(older).toContain("**a** — installed 1.0.0 → 2.0.0 available (needs a newer bot)");
+  });
+
+  // #418: the schedule line names who asked for it (ops/README says a scheduled update's requestedBy is shown by /plugins list).
+  describe("a pending schedule names its requester (#418)", () => {
+    const at = "2026-09-06T00:00:00.000Z";
+    const listFor = (requestedBy: string, extra: Partial<PluginStateEntry> = {}) =>
+      renderPluginsList(state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at, requestedBy }, ...extra })]), index([entry("a", "1.1.0")]), NOW, 1);
+    test("L5: a Discord user is a mention, a panel identity is text", () => {
+      expect(listFor("200863115821318144")).toContain("(requested by <@200863115821318144>)");
+      expect(listFor("email:me@x.com")).toContain("(requested by email:me@x.com)");
+      expect(listFor("token")).toContain("(requested by token)");
+    });
+    test("L5: a long requester is cut to 80 units, a multi-line one is one line, a blank one is '?'", () => {
+      expect(listFor("x".repeat(200))).toContain(`(requested by ${"x".repeat(79)}…)`);
+      expect(listFor("first\nsecond  third")).toContain("(requested by first second third)");
+      expect(listFor("")).toContain("(requested by ?)");
+      expect(listFor("  \n ")).toContain("(requested by ?)");
+    });
+    // A hand-edited state.json can hold anything: a missing or null requester reads as '?' (never "undefined"/"null")
+    // and the list does not throw. (Other non-string values print as their text, which is not asserted.)
+    test("L5: a requester that is not a string (a hand-edited state.json) reads as '?' or as its text, never 'undefined'", () => {
+      const lines = (requestedBy: unknown) =>
+        renderPluginsList(
+          state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at, requestedBy } as unknown as ScheduledEntry })]),
+          index([entry("a", "1.1.0")]),
+          NOW,
+          1,
+        );
+      expect(lines(undefined)).toContain("(requested by ?)");
+      expect(lines(null)).toContain("(requested by ?)");
+      expect(lines(undefined)).not.toContain("undefined");
+    });
+    test("L5: the 80-unit cut of a requester does not split an emoji either (through the list, not only the helper)", () => {
+      const out = listFor("x".repeat(78) + "🙂tail"); // the high surrogate is unit 78: the cut at 79 kept would end on it
+      expect(out).toContain(`(requested by ${"x".repeat(78)}…)`);
+      expect(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(out)).toBe(false);
+    });
+    test("L5: an off plugin's paused schedule names it too", () => {
+      const out = renderPluginsList(
+        state([stateEntry("p", "1.0.0", { enabled: false, scheduled: { version: "1.1.0", at, requestedBy: "email:me@x.com" } })]),
+        index([entry("p", "2.0.0")]),
+        NOW,
+        1,
+      );
+      expect(out).toContain("⏳ update to 1.1.0 scheduled");
+      expect(out).toContain("(requested by email:me@x.com)");
+    });
+    test("L5: the schedule line FOLLOWS the release note, as it always did", () => {
+      const out = renderPluginsList(
+        state([stateEntry("a", "1.0.0", { scheduled: { version: "1.1.0", at, requestedBy: "email:me@x.com" } })]),
+        index([entry("a", "1.1.0", { releases: [rel("1.1.0", { notes: "shiny" })] })]),
+        NOW,
+        1,
+      );
+      expect(out.indexOf("shiny")).toBeGreaterThan(-1);
+      expect(out.indexOf("shiny")).toBeLessThan(out.indexOf("⏳"));
+    });
+  });
+
+  // #563: the clamp. Discord's cap is 2000 units; the tail is appended only when something was dropped.
+  describe("a list over Discord's cap (#563)", () => {
+    const TRUNC = "\n… (list truncated)";
+    const CAP = 2000 - TRUNC.length; // 1981
+    const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+    // An active plugin with no index entry: its first line is `24 + name` units. With an index entry at 2.0.0: `42 + name`.
+    const bare = (name: string) => stateEntry(name, "1.0.0");
+    const withNote = (name: string, note: string) => ({
+      plugin: stateEntry(name, "1.0.0"),
+      entry: entry(name, "2.0.0", { releases: [rel("2.0.0", { notes: note })] }),
+    });
+    const lineOf = (name: string) => `• **${name}** — installed 1.0.0 → 2.0.0 available`;
+    const render = (plugins: PluginStateEntry[], entries: PluginIndexEntry[] = []) => renderPluginsList(state(plugins), index(entries), NOW, 1);
+
+    test("L4a: a boundary emoji in a FIRST line is dropped whole, never split", () => {
+      const name = "x".repeat(CAP - 2 - 4) + "🙂" + "y".repeat(50); // the high surrogate lands at CAP - 2: the last unit the cut would keep
+      const out = render([bare(name)]);
+      expect(out.length).toBeLessThanOrEqual(2000);
+      expect(lone.test(out)).toBe(false);
+      expect(out.endsWith(TRUNC)).toBe(true);
+      expect(out.length).toBe(1999); // 1980 kept (the pair backed off) + the tail; a plain slice would give 2000 and a lone \ud83d
+    });
+
+    test("L4b: twelve plugins, the last one down: its '— not running' line survives the clamp", () => {
+      const plugins: PluginStateEntry[] = [];
+      const entries: PluginIndexEntry[] = [];
+      for (let i = 0; i < 12; i++) {
+        const { plugin, entry: e } = withNote(`p${i}`, "y".repeat(300));
+        plugins.push(i === 11 ? { ...plugin, active: false, error: "boom" } : plugin);
+        entries.push(e);
+      }
+      const out = render(plugins, entries);
+      expect(out.length).toBeLessThanOrEqual(2000);
+      expect(out).toContain("• **p11** — installed 1.0.0 → 2.0.0 available — not running (first error: boom)");
+      expect(out.endsWith(TRUNC)).toBe(true);
+    });
+
+    test("L4c: cutUtf16 and sliceUtf16 never end inside a pair", () => {
+      expect(cutUtf16("a🙂bc", 3)).toBe("a…"); // the cut index lands on the high surrogate and backs off
+      expect(cutUtf16("abc", 3)).toBe("abc");
+      expect(cutUtf16("abcd", 3)).toBe("ab…");
+      expect(sliceUtf16("a🙂", 2)).toBe("a"); // the back-off
+      expect(sliceUtf16("ab🙂", 2)).toBe("ab"); // control: the cut index is before the pair
+      // The ends of the high-surrogate range (U+10000 is D800 DC00, U+10FFFF is DBFF DFFF), as code units so the
+      // source holds no invisible characters; then the units just outside it, which do not back off: D7FF (below),
+      // DC00 (a LOW surrogate) and E000 (above).
+      const units = (...codes: number[]) => String.fromCharCode(...codes);
+      expect(sliceUtf16(`a${units(0xd800, 0xdc00)}`, 2)).toBe("a");
+      expect(sliceUtf16(`a${units(0xdbff, 0xdfff)}`, 2)).toBe("a");
+      for (const code of [0xd7ff, 0xdc00, 0xe000]) expect(sliceUtf16(`a${units(code)}b`, 2), code.toString(16)).toBe(`a${units(code)}`);
+    });
+
+    test("L4d: when the first lines fit the cap but not with the tail, they go out bare (no note, no tail)", () => {
+      const name = "n".repeat(1948);
+      const { plugin, entry: e } = withNote(name, "y".repeat(300));
+      const out = render([plugin], [e]);
+      expect(out).toBe(lineOf(name));
+      expect(out.length).toBe(1990);
+    });
+
+    test("L4e: when even the first lines overflow, whole first lines from the top: no partial line", () => {
+      const a = "a".repeat(1060);
+      const b = "b".repeat(1060);
+      const out = render([bare(a), bare(b)]);
+      expect(out).toBe(`• **${a}** — installed 1.0.0${TRUNC}`);
+      expect(out).not.toContain("b");
+    });
+
+    test("L4f: the per-note cut does not split a pair either (a list that fits)", () => {
+      const { plugin, entry: e } = withNote("a", "🙂".repeat(200));
+      const out = render([plugin], [e]);
+      expect(lone.test(out)).toBe(false);
+      // The note block (its 23-unit header line, then the emoji) is cut at 300: the pair across unit 300 is dropped whole.
+      expect(out.slice(out.indexOf("\n") + 1)).toHaveLength(299);
+      expect(out.endsWith(TRUNC)).toBe(false);
+    });
+
+    test("L4g: after the first lines, notes are kept in list order while they fit", () => {
+      const names = ["k", "m", "n"].map((c) => c.repeat(356));
+      const notes = ["Q", "R", "S"].map((c) => c.repeat(300));
+      const rows = names.map((n, i) => withNote(n, notes[i]!));
+      const out = render(rows.map((r) => r.plugin), rows.map((r) => r.entry));
+      expect(out).toContain("Q".repeat(277));
+      expect(out).toContain("R".repeat(277));
+      expect(out).not.toContain("S");
+      expect(out.length).toBe(1817);
+      expect(out.endsWith(TRUNC)).toBe(true);
+    });
+
+    test("L4i: a note that does not fit is skipped, and a later, smaller one is still kept (a greedy fill)", () => {
+      const names = ["a", "b", "c"].map((c) => c.repeat(540)); // first lines 582 each: room = 1981 - 1748 = 233
+      const big = withNote(names[0]!, "A".repeat(300)); // renders as 301 units: does not fit
+      const tinyB = withNote(names[1]!, "B"); // 25 units
+      const tinyC = withNote(names[2]!, "C");
+      const out = render([big.plugin, tinyB.plugin, tinyC.plugin], [big.entry, tinyB.entry, tinyC.entry]);
+      expect(out).not.toContain("A");
+      expect(out).toContain("**2.0.0** (2026-09-05)\nB");
+      expect(out).toContain("**2.0.0** (2026-09-05)\nC");
+      expect(out.endsWith(TRUNC)).toBe(true);
+    });
+
+    test("L4j: tier 3 cuts by line, so a kept plugin's own schedule line can fall past the cut", () => {
+      const a = "a".repeat(1900); // first line 1924, its schedule line follows it: 1924 + ~75 > CAP
+      const plugin = { ...bare(a), scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "email:me@x.com" } };
+      const out = render([plugin, bare("b")]);
+      expect(out).toBe(`• **${a}** — installed 1.0.0${TRUNC}`);
+      expect(out).not.toContain("⏳");
+    });
+
+    test("L4g2: a schedule line still follows the note in the progressive tier", () => {
+      const names = ["k", "m", "n"].map((c) => c.repeat(356));
+      const notes = ["Q", "R", "S"].map((c) => c.repeat(300));
+      const rows = names.map((n, i) => withNote(n, notes[i]!));
+      const plugins = rows.map((r, i) =>
+        i === 0 ? { ...r.plugin, scheduled: { version: "2.0.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "email:me@x.com" } } : r.plugin,
+      );
+      const out = render(plugins, rows.map((r) => r.entry));
+      expect(out.indexOf("Q")).toBeGreaterThan(-1);
+      expect(out.indexOf("Q")).toBeLessThan(out.indexOf("⏳"));
+    });
+
+    // One case per operator of the tier boundaries.
+    test("L4h-1: a list of exactly 2000 units is returned whole, with no tail", () => {
+      const { plugin, entry: e } = withNote("n".repeat(1657), "y".repeat(300));
+      const out = render([plugin], [e]);
+      expect(out.length).toBe(2000);
+      expect(out).not.toContain("list truncated");
+      expect(out).toContain("y".repeat(277));
+    });
+    test("L4h-2: first lines of exactly the cap still get the tail", () => {
+      const name = "n".repeat(1939);
+      const { plugin, entry: e } = withNote(name, "y".repeat(300));
+      const out = render([plugin], [e]);
+      expect(out).toBe(lineOf(name) + TRUNC);
+      expect(out.length).toBe(2000);
+    });
+    test("L4h-3: first lines of exactly 2000 go out bare", () => {
+      const name = "n".repeat(1958);
+      const { plugin, entry: e } = withNote(name, "y".repeat(300));
+      const out = render([plugin], [e]);
+      expect(out).toBe(lineOf(name));
+      expect(out.length).toBe(2000);
+    });
+    test("L4h-4: a note that fills the room exactly is kept", () => {
+      const a = withNote("a".repeat(800), "y".repeat(300));
+      const b = withNote("b".repeat(795), "z".repeat(300));
+      const out = render([a.plugin, b.plugin], [a.entry, b.entry]);
+      expect(out.startsWith(lineOf("a".repeat(800)))).toBe(true);
+      expect(out).toContain("y".repeat(277));
+      expect(out.endsWith(`\n${lineOf("b".repeat(795))}${TRUNC}`)).toBe(true);
+      expect(out).not.toContain("z");
+      expect(out.length).toBe(2000);
+    });
+    test("L4h-5: a first line of exactly the cap, then another plugin: the break right after it is the cut", () => {
+      const a = "a".repeat(1957);
+      const out = render([bare(a), bare("b")]);
+      expect(out).toBe(`• **${a}** — installed 1.0.0${TRUNC}`);
+      expect(out.length).toBe(2000);
+    });
+  });
+
   // #225: an off entry shows only that it's off and its pin — no "available" line even when the
   // index offers something newer, and a pending (paused) schedule still shows.
   test("an off plugin shows off and its installed version, a pending schedule, and nothing else", () => {
-    const noSchedule = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false })]), index([entry("p", "2.0.0")]), NOW);
+    const noSchedule = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false })]), index([entry("p", "2.0.0")]), NOW, 1);
     expect(noSchedule.split("\n")[0]).toMatch(/^• \*\*p\*\* — off \(installed 1\.0\.0\)$/);
     expect(noSchedule).not.toContain("available");
     const withSchedule = renderPluginsList(
       state([stateEntry("p", "1.0.0", { enabled: false, scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" } })]),
       index([entry("p", "2.0.0")]),
       NOW,
+      1,
     );
     const scheduledTs = Math.floor(Date.parse("2026-09-06T00:00:00.000Z") / 1000);
     expect(withSchedule).toContain(`⏳ update to 1.1.0 scheduled <t:${scheduledTs}:R>`);
@@ -254,7 +513,7 @@ describe("renderPluginsList", () => {
   // #544: a plugin that failed to install, load or activate this boot (`active: false`) says so on its
   // first line, with its error as one short line — not only in the panel and `bot-ops.sh status`.
   describe("a plugin that is not running (#544)", () => {
-    const firstLine = (s: PluginStateEntry, idx: PluginIndex = index([])) => renderPluginsList(state([s]), idx, NOW).split("\n")[0];
+    const firstLine = (s: PluginStateEntry, idx: PluginIndex = index([])) => renderPluginsList(state([s]), idx, NOW, 1).split("\n")[0];
     // The text inside the marker's parentheses.
     const parenthesised = (line: string | undefined) => /^• \*\*a\*\* — installed 1\.0\.0 — not running \(first error: (.*)\)$/.exec(line ?? "")?.[1];
 
@@ -290,12 +549,12 @@ describe("renderPluginsList", () => {
       }
     });
     test("a running plugin carries no marker, configured or not", () => {
-      expect(renderPluginsList(state([stateEntry("a", "1.0.0")]), index([]), NOW)).toBe("• **a** — installed 1.0.0");
-      expect(renderPluginsList(state([stateEntry("a", "1.0.0", { configured: false, missingEnv: ["TOKEN"] })]), index([]), NOW)).not.toContain("not running");
+      expect(renderPluginsList(state([stateEntry("a", "1.0.0")]), index([]), NOW, 1)).toBe("• **a** — installed 1.0.0");
+      expect(renderPluginsList(state([stateEntry("a", "1.0.0", { configured: false, missingEnv: ["TOKEN"] })]), index([]), NOW, 1)).not.toContain("not running");
     });
     test("the marker sits after the available version and before the release note", () => {
       const idx = index([entry("a", "1.1.0", { releases: [rel("1.1.0", { notes: "shiny" })] })]);
-      const out = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e" })]), idx, NOW);
+      const out = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e" })]), idx, NOW, 1);
       const lines = out.split("\n");
       expect(lines[0]).toBe("• **a** — installed 1.0.0 → 1.1.0 available — not running (first error: e)");
       expect(lines.slice(1).join("\n")).toContain("shiny");
@@ -303,18 +562,18 @@ describe("renderPluginsList", () => {
     });
     test("a pending schedule still follows on its own line", () => {
       const scheduled = { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" };
-      const lines = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e", scheduled })]), index([]), NOW).split("\n");
+      const lines = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e", scheduled })]), index([]), NOW, 1).split("\n");
       expect(lines[0]).toBe("• **a** — installed 1.0.0 — not running (first error: e)");
       expect(lines[1]).toContain("⏳ update to 1.1.0 scheduled");
     });
     test("an off plugin that is not running still reads only off", () => {
-      const out = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false, active: false, error: "e" })]), index([]), NOW);
+      const out = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false, active: false, error: "e" })]), index([]), NOW, 1);
       expect(out.split("\n")[0]).toMatch(/^• \*\*p\*\* — off \(installed 1\.0\.0\)$/);
       expect(out).not.toContain("not running");
     });
     test("many down plugins with long errors still fit Discord's cap (the clamp predates #544; the marker must not break it)", () => {
       const plugins = Array.from({ length: 40 }, (_, i) => stateEntry(`p${i}`, "1.0.0", { active: false, error: "z".repeat(500) }));
-      const out = renderPluginsList(state(plugins), index([]), NOW);
+      const out = renderPluginsList(state(plugins), index([]), NOW, 1);
       expect(out.length).toBeLessThanOrEqual(2000);
       expect(out).toContain("… (list truncated)");
     });
@@ -1209,19 +1468,35 @@ describe("version-parameterized builders (#105 — shared by planPluginAction + 
 });
 
 describe("reportPluginUpdateOutcome (#104)", () => {
-  function reportHarness(opts: { state: PluginStateFile; dm?: () => Promise<void> }) {
+  function reportHarness(opts: {
+    state: PluginStateFile;
+    dm?: () => Promise<void>;
+    /** Swap `pendingReport` for this one just before the first mutate runs (#501 item 11): a report written by the
+     *  request drain, the schedule tick or a /plugins update between the read and the clear. */
+    raceReport?: PluginStateFile["pendingReport"];
+  }) {
     let current = opts.state;
+    let raced = false;
     const dms: string[] = [];
     const channels: string[] = [];
     const errors: string[] = [];
+    // The pending report as it stood at the moment each delivery was attempted (#443): the clear must already be done.
+    const seenAtDm: PluginStateFile["pendingReport"][] = [];
+    const seenAtChannel: PluginStateFile["pendingReport"][] = [];
     const deps: PluginReportDeps = {
       readState: async () => current,
-      mutateState: async (mutate) => { current = mutate(current); },
-      dmUser: async (_id, content) => { if (opts.dm) await opts.dm(); dms.push(content); },
-      postChannel: async (_c, _u, content) => { channels.push(content); },
+      mutateState: async (mutate) => {
+        if (opts.raceReport && !raced) {
+          raced = true;
+          current = { ...current, pendingReport: opts.raceReport };
+        }
+        current = mutate(current);
+      },
+      dmUser: async (_id, content) => { seenAtDm.push(current.pendingReport); if (opts.dm) await opts.dm(); dms.push(content); },
+      postChannel: async (_c, _u, content) => { seenAtChannel.push(current.pendingReport); channels.push(content); },
       log: { info() {}, warn() {}, error: (m) => errors.push(m) },
     };
-    return { deps, dms, channels, errors, get state() { return current; } };
+    return { deps, dms, channels, errors, seenAtDm, seenAtChannel, get state() { return current; } };
   }
   const withReport = (report: PluginStateFile["pendingReport"], entry = stateEntry("a", "1.1.0", { active: true })) =>
     ({ ...state([entry]), pendingReport: report });
@@ -1232,13 +1507,15 @@ describe("reportPluginUpdateOutcome (#104)", () => {
     expect(h.dms).toHaveLength(0);
   });
   const SNOWFLAKE = "200863115821318144";
-  test("clears pendingReport BEFORE delivering, then DMs the requester", async () => {
+  test("L1: clears pendingReport BEFORE delivering, then DMs the requester", async () => {
     const h = reportHarness({ state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, requestedAt: 0 }) });
     await reportPluginUpdateOutcome(h.deps);
     expect(h.state.pendingReport).toBeUndefined();
     expect(h.dms[0]).toContain("is now 1.1.0");
+    // #443: at the moment of the DM the report was already gone (a clear moved below the delivery leaves it set).
+    expect(h.seenAtDm).toEqual([undefined]);
   });
-  test("a failed DM still leaves pendingReport cleared (never re-fires) and falls back to the channel", async () => {
+  test("L1: a failed DM still leaves pendingReport cleared (never re-fires) and falls back to the channel", async () => {
     const h = reportHarness({
       state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, channelId: "chan1", requestedAt: 0 }),
       dm: async () => { throw new Error("closed DMs"); },
@@ -1246,6 +1523,33 @@ describe("reportPluginUpdateOutcome (#104)", () => {
     await reportPluginUpdateOutcome(h.deps);
     expect(h.state.pendingReport).toBeUndefined(); // cleared before delivery — no boot-loop re-fire
     expect(h.channels[0]).toContain("is now 1.1.0");
+    expect(h.seenAtDm).toEqual([undefined]); // ...and already cleared when the failing DM was tried
+    expect(h.seenAtChannel).toEqual([undefined]); // ...and when the channel fallback went out
+  });
+  // #501 item 11: the clear deletes only the report that was read. A newer one written between the read and the clear
+  // (the 5 s request drain, a due schedule on the 60 s tick, a /plugins update) survives to be delivered next time; the
+  // DM that goes out is still the ORIGINAL report's. One case per conjunct of the guard.
+  test("L2a: a report for ANOTHER plugin written meanwhile (same requestedAt) survives the clear", async () => {
+    const raced = { plugin: "b", toVersion: "2.0.0", userId: SNOWFLAKE, requestedAt: 0 };
+    const h = reportHarness({
+      state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, requestedAt: 0 }),
+      raceReport: raced,
+    });
+    await reportPluginUpdateOutcome(h.deps);
+    expect(h.state.pendingReport).toEqual(raced);
+    expect(h.dms).toHaveLength(1);
+    expect(h.dms[0]).toContain("is now 1.1.0");
+  });
+  test("L2b: a newer report for the SAME plugin (another requestedAt) written meanwhile survives the clear", async () => {
+    const raced = { plugin: "a", toVersion: "1.2.0", userId: SNOWFLAKE, requestedAt: 5 };
+    const h = reportHarness({
+      state: withReport({ plugin: "a", toVersion: "1.1.0", userId: SNOWFLAKE, requestedAt: 0 }),
+      raceReport: raced,
+    });
+    await reportPluginUpdateOutcome(h.deps);
+    expect(h.state.pendingReport).toEqual(raced);
+    expect(h.dms).toHaveLength(1);
+    expect(h.dms[0]).toContain("is now 1.1.0");
   });
   test("a PANEL-origin request (non-snowflake requestedBy) clears the report + logs, never DMs", async () => {
     const h = reportHarness({ state: withReport({ plugin: "a", toVersion: "1.1.0", userId: "email:me@x.com", requestedAt: 0 }) });
