@@ -204,7 +204,9 @@ function notifyStop(reason: string): void {
  * #446: registers `fn` to run once, synchronously, immediately before the process exits for a requested
  * restart (`doExit`) or at the end of a shutdown (`runExitHooks`, called by the shutdown handler's `exit`);
  * returns an unsubscribe. A hook that throws is logged and never stops the exit or the other hooks. Hooks
- * run in registration order.
+ * run in registration order. Only an exit that goes through `doExit` or the shutdown handler's `exit` runs
+ * them: any other deliberate `process.exit` loses the line of every interaction in flight, so route it
+ * through one of those. A crash or a SIGKILL runs none.
  */
 export function onBeforeExit(fn: () => void): () => void {
   exitHooks.push(fn);

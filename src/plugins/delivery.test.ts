@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { format } from "node:util";
-import { DiscordAPIError, HTTPError } from "discord.js";
+import { DiscordAPIError, HTTPError, RateLimitError, REST, Routes } from "discord.js";
 import { editOwnMessage, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./delivery";
 import type { BuiltPayload } from "./hostMessage";
 
@@ -180,6 +180,120 @@ describe("withoutRequest (#508)", () => {
     const plain = new Error("network blip");
     expect(withoutRequest(plain)).toBe(plain);
     for (const value of ["text", 5, null, undefined, { requestBody: secret }]) expect(withoutRequest(value)).toBe(value);
+  });
+
+  // #545: a reply that never reached Discord (refused, reset, DNS) is no REST error at all on Bun: a bare
+  // TypeError with no `requestBody`, whose `path` is the full request URL -- the interaction token in it.
+  describe("a call that never reached Discord, and wrappers around a request-carrying error (#545)", () => {
+    const token = `token-${crypto.randomUUID()}`;
+    const url = `http://127.0.0.1:9/v10/interactions/5/${token}/callback`;
+    const networkError = () => Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused", path: url, errno: 0 });
+    const printedAll = (value: unknown) => [format("x", value), Bun.inspect(value), JSON.stringify(value)].join("\n");
+
+    test("a bare network error whose path is the request URL is cleaned: name, message and code kept, path dropped", () => {
+      const original = networkError();
+      expect(printedAll(original)).toContain(token); // the control
+      const clean = withoutRequest(original) as Error & Record<string, unknown>;
+      expect(clean).not.toBe(original);
+      expect([clean.name, clean.message, clean.code]).toEqual(["TypeError", original.message, "ConnectionRefused"]);
+      for (const key of ["path", "errno", "url", "requestBody"]) expect(key in clean, key).toBe(false);
+      expect(printedAll(clean)).not.toContain(token);
+    });
+
+    test("a real REST call to a port nothing listens on is cleaned the same way", async () => {
+      const server = Bun.serve({ port: 0, fetch: () => new Response("") });
+      const port = server.port;
+      await server.stop(true);
+      const rest = new REST({ version: "10", api: `http://127.0.0.1:${port}`, timeout: 3000, retries: 0 });
+      const realToken = `token-${crypto.randomUUID()}`;
+      const thrown = await rest.post(Routes.interactionCallback("5", realToken), { body: { type: 4, data: { content: marker } }, auth: false }).then(
+        () => undefined,
+        (err: unknown) => err,
+      );
+      expect(thrown).toBeInstanceOf(Error);
+      expect(printedAll(thrown)).toContain(realToken); // the control: the uncleaned error prints the token
+      const clean = withoutRequest(thrown);
+      expect(clean).not.toBe(thrown);
+      expect(printedAll(clean)).not.toContain(realToken);
+      expect(printedAll(clean)).not.toContain(marker);
+    });
+
+    test("a RateLimitError (a url, no requestBody) is cleaned", () => {
+      const rateLimited = new RateLimitError({
+        timeToReset: 1, limit: 5, method: "POST", hash: "h", url: `https://discord.com/api/v10/webhooks/2/${token}`, route: "/webhooks/:id/:token", majorParameter: "2", global: false, retryAfter: 1, sublimitTimeout: 0, scope: "user",
+      });
+      expect(printedAll(rateLimited)).toContain(token);
+      const clean = withoutRequest(rateLimited) as Error & Record<string, unknown>;
+      expect(clean.name).toBe(rateLimited.name);
+      expect(printedAll(clean)).not.toContain(token);
+    });
+
+    test("an error whose path or url is not an http(s) URL (an fs error's path) is returned as is", () => {
+      const fsError = Object.assign(new Error("ENOENT: no such file or directory, open '/data/x.json'"), { code: "ENOENT", path: "/data/x.json", syscall: "open", errno: -2 });
+      expect(withoutRequest(fsError)).toBe(fsError);
+      const odd = Object.assign(new Error("x"), { url: 5, path: ["http://a"] });
+      expect(withoutRequest(odd)).toBe(odd);
+    });
+
+    test("a wrapper whose cause is a request-carrying error is returned as a copy with the cleaned cause", () => {
+      const inner = discordError();
+      const wrapper = new Error("reply failed", { cause: inner });
+      Object.assign(wrapper, { code: "E_WRAPPED" });
+      const clean = withoutRequest(wrapper) as Error & Record<string, unknown>;
+      expect(clean).not.toBe(wrapper);
+      expect([clean.name, clean.message, clean.code, clean.stack]).toEqual([wrapper.name, "reply failed", "E_WRAPPED", wrapper.stack]);
+      expect(clean.cause).toBeInstanceOf(Error);
+      expect(clean.cause).not.toBe(inner);
+      // the control: the wrapper prints its cause whole (a nested body is folded past util.format's depth, so the
+      // request itself is what is looked for)
+      expect(printedAll(wrapper)).toContain("requestBody:");
+      for (const request of ["requestBody:", "rawError:"]) expect(printedAll(clean)).not.toContain(request);
+      expect(format("x", clean)).toContain("DiscordAPIError[50001]");
+      expect(wrapper.cause).toBe(inner); // the original is untouched
+    });
+
+    test("a cause that is a network error, three levels down, is cleaned too", () => {
+      const wrapper = new Error("a", { cause: new Error("b", { cause: new Error("c", { cause: networkError() }) }) });
+      expect(printedAll(wrapper)).toContain(token);
+      expect(printedAll(withoutRequest(wrapper))).not.toContain(token);
+    });
+
+    test("an AggregateError is cleaned member by member, keeping the class, the message and the clean members", () => {
+      const fine = new Error("fine");
+      const aggregate = new AggregateError([fine, discordError(), networkError()], "several failed");
+      const clean = withoutRequest(aggregate) as AggregateError;
+      expect(clean).toBeInstanceOf(AggregateError);
+      expect(clean.message).toBe("several failed");
+      expect(clean.errors).toHaveLength(3);
+      expect(clean.errors[0]).toBe(fine);
+      expect(printedAll(aggregate)).toContain("requestBody:"); // the control
+      expect(printedAll(clean)).not.toContain("requestBody:");
+      expect(printedAll(clean)).not.toContain(token);
+    });
+
+    test("an error with no request-carrying cause comes back as it is, and a cause cycle ends", () => {
+      const plain = new Error("x", { cause: new Error("y") });
+      expect(withoutRequest(plain)).toBe(plain);
+      const loop = new Error("loop");
+      loop.cause = loop;
+      expect(withoutRequest(loop)).toBe(loop);
+      const aggregateLoop = new AggregateError([], "agg");
+      (aggregateLoop.errors as unknown[]).push(aggregateLoop);
+      expect(withoutRequest(aggregateLoop)).toBe(aggregateLoop);
+    });
+
+    test("a request-carrying error is found up to five levels down, and a chain longer than that is left alone", () => {
+      const wrapped = (levels: number) => {
+        let deep: unknown = discordError();
+        for (let i = 0; i < levels; i += 1) deep = new Error(`level ${i}`, { cause: deep });
+        return deep;
+      };
+      const five = wrapped(5);
+      expect(printedAll(five)).toContain("requestBody:");
+      expect(printedAll(withoutRequest(five))).not.toContain("requestBody:");
+      const six = wrapped(6);
+      expect(withoutRequest(six)).toBe(six); // past the bound: returned unchanged, not half-cleaned
+    });
   });
 
   // Every Discord call each one makes -- the fetches as well as the send or edit that carries the body.

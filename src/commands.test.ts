@@ -592,6 +592,27 @@ describe("handleCommand — the plugin's running gate and a throwing handler (#4
     }
   });
 
+  // The same on Bun when the reply never reached Discord: a bare TypeError whose `path` is the request URL.
+  test("a network failure from the reply is logged without the interaction token either (#545)", async () => {
+    const logs = quiet();
+    try {
+      const { token } = replyFailure();
+      const failure = Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), {
+        code: "ConnectionRefused",
+        path: `https://discord.com/api/v10/interactions/1/${token}/callback`,
+      });
+      expect(printed([failure]).join("\n")).toContain(token); // the control
+      const command = { name: "hello", handle: async () => Promise.reject(failure) } as unknown as PluginCommand;
+      const { interaction } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      const call = logs.error.mock.calls[0]!;
+      expect(printed(call).join("\n")).not.toContain(token);
+      expect((call[1] as { code?: string }).code).toBe("ConnectionRefused");
+    } finally {
+      logs.restore();
+    }
+  });
+
   test("a handler that throws synchronously is isolated the same way", async () => {
     const logs = quiet();
     try {

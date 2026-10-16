@@ -1,9 +1,11 @@
 // #328: one log line per interaction, written by index.ts's InteractionCreate handler, so every
 // command, button press and modal submit shows in the log -- for every plugin, with no plugin
 // changing. Before this, only an exception reached the log (`[interaction]`), so a command that
-// answered normally left no trace at all. The line is written once the interaction is handled or, for
-// a command that ends the process (`/update`, `/plugins ... update ... now`, a self-update's retire),
-// right before the process exits (#446, `createInteractionLine`): never twice, and never not at all.
+// answered normally left no trace at all. The line is written once the interaction is handled or, when
+// the process exits before the handler returns (`/update` and `/plugins ... update ... now` end it
+// inside their handler; so does a self-update's retire), right before that exit (#446,
+// `createInteractionLine`): never twice. An exit this process does not choose -- a crash, or the
+// daemon's SIGKILL after `docker stop`'s grace -- runs no hook and leaves no line.
 //
 // What a line may carry is deliberately narrow: the kind, the command's name (with its subcommand
 // group and subcommand, which are names from the command's own definition), or a component's or

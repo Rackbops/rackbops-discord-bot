@@ -19,17 +19,54 @@ const CANNOT_MESSAGE_USER = 50007;
  * The host's own log sites use it too (#545): a failed reply to an interaction carries the interaction
  * token in `url` and the reply in `requestBody`, so index.ts's handler, the plugin command, interaction and
  * autocomplete dispatchers, the `/update` report's delivery and `host.log.error` all log this view. The
- * `host.log.error` wrapper cleans only the LOGGED copy; the plugin's own error object is untouched. A
- * `RateLimitError` (`url`, no `requestBody`) passes the gate below unchanged and is unreachable at those
- * sites, since `rejectOnRateLimit` is unset.
+ * `host.log.error` wrapper cleans only the LOGGED copy; the plugin's own error object is untouched.
+ *
+ * What counts as carrying the request (`carriesRequest`): `requestBody` (a `DiscordAPIError`, an `HTTPError`),
+ * or an `http(s)://` URL in `url` (also a `RateLimitError`, which has no `requestBody`) or in `path` -- the
+ * bare `TypeError` Bun throws when the call never reached Discord (connection refused or reset, DNS), whose
+ * `path` is the full request URL, the interaction token in it. A `path` that is not a URL (an `fs` error's) is
+ * left alone. The error is also followed through `cause` and an `AggregateError`'s `errors`, up to
+ * `MAX_CAUSE_DEPTH` deep: a wrapper that holds a request-carrying error is returned as a plain copy of
+ * itself (message, name, stack, `code`) with the cleaned error in its place, and any other error comes back
+ * as it is. Not followed: any other property that might hold an error.
  */
 export function withoutRequest(err: unknown): unknown {
-  if (!(err instanceof Error) || !("requestBody" in err)) return err;
-  const { code, status, method } = err as Error & { code?: unknown; status?: unknown; method?: unknown };
-  const clean = Object.assign(new Error(err.message), { status, method }, code === undefined ? {} : { code });
-  clean.name = err.name;
-  clean.stack = err.stack;
-  return clean;
+  return clean(err, 0);
+}
+
+/** How many `cause`/`errors` levels `withoutRequest` follows. A cycle in them ends here. */
+const MAX_CAUSE_DEPTH = 5;
+
+const isHttpUrl = (value: unknown): boolean => typeof value === "string" && /^https?:\/\//i.test(value);
+
+function carriesRequest(err: Error): boolean {
+  const { url, path } = err as Error & { url?: unknown; path?: unknown };
+  return "requestBody" in err || isHttpUrl(url) || isHttpUrl(path);
+}
+
+function clean(err: unknown, depth: number): unknown {
+  if (!(err instanceof Error)) return err;
+  const { code } = err as Error & { code?: unknown };
+  if (carriesRequest(err)) {
+    const { status, method } = err as Error & { status?: unknown; method?: unknown };
+    const copy = Object.assign(new Error(err.message), { status, method }, code === undefined ? {} : { code });
+    copy.name = err.name;
+    copy.stack = err.stack;
+    return copy;
+  }
+  if (depth >= MAX_CAUSE_DEPTH) return err;
+  const { cause } = err as Error & { cause?: unknown };
+  const cleanCause = cause === undefined ? undefined : clean(cause, depth + 1);
+  const inner = err instanceof AggregateError && Array.isArray(err.errors) ? (err.errors as unknown[]) : undefined;
+  const cleanInner = inner?.map((e) => clean(e, depth + 1));
+  const changed = cleanCause !== cause || (inner !== undefined && cleanInner!.some((e, i) => e !== inner[i]));
+  if (!changed) return err;
+  const copy = err instanceof AggregateError ? new AggregateError(cleanInner ?? [], err.message) : new Error(err.message);
+  copy.name = err.name;
+  copy.stack = err.stack;
+  if (code !== undefined) Object.assign(copy, { code });
+  if (cause !== undefined) Object.assign(copy, { cause: cleanCause });
+  return copy;
 }
 
 /** Runs one delivery's Discord calls, rejecting with `withoutRequest`'s view of whatever they throw. */

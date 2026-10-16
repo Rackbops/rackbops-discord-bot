@@ -244,13 +244,13 @@ async function activate(c: Client<true>): Promise<void> {
   // where takeOver() has already stopped the original and this delay lands inside the no-bot window.
   client.on(Events.InteractionCreate, async (interaction) => {
     // #328: one line per command, component press or modal submit (autocomplete is skipped: it fires on
-    // every keystroke), written once the interaction is handled. Only names and ids -- never an option
-    // value, a field or a reply (src/interactionLog.ts).
+    // every keystroke), written once the interaction is handled (or, below, at the exit). Only names and
+    // ids -- never an option value, a field or a reply (src/interactionLog.ts).
     const facts = describeInteraction(interaction);
     let outcome: InteractionOutcome = "answered";
-    // #446: exactly one line per interaction -- once it is handled, or from the exit hook when the handler
-    // itself ends the process (a requested restart, or the replacement stopping this container) before it
-    // returns. `line` writes at most once, whichever comes first (src/interactionLog.ts).
+    // #446: at most one line per interaction -- once it is handled, or from the exit hook when the process
+    // exits (a requested restart, or the replacement stopping this container) before the handler returns.
+    // `line` writes at most once, whichever comes first (src/interactionLog.ts).
     const line = createInteractionLine(facts, (l) => console.info(l));
     const offExit = facts ? onBeforeExit(() => line("exiting")) : () => {};
     try {

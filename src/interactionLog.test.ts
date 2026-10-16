@@ -135,6 +135,16 @@ describe("createInteractionLine (#446)", () => {
     expect(written).toEqual([]);
   });
 
+  test("the default clock is the real one: a line written after a wait reports at least that wait", async () => {
+    const written: string[] = [];
+    const line = createInteractionLine(facts, (l) => written.push(l));
+    await Bun.sleep(40);
+    line("answered");
+    const ms = Number(/ (\d+)ms$/.exec(written[0] ?? "")?.[1]);
+    expect(ms).toBeGreaterThanOrEqual(30);
+    expect(ms).toBeLessThan(5_000);
+  });
+
   test("the duration runs from when the writer was made, not from when it is called", () => {
     const written: string[] = [];
     const line = createInteractionLine(facts, (l) => written.push(l), clock(5, 50_005));
@@ -204,6 +214,7 @@ describe("createInteractionLine (#446)", () => {
       try {
         const running = handle(written, () => new Promise<void>((resolve) => (finish = resolve)));
         beginShutdown("SIGTERM");
+        expect(written).toEqual([]); // not at the signal: the drain may yet let it finish and write its own outcome
         runExitHooks();
         expect(written).toEqual([exitingLine]);
         finish();
