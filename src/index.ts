@@ -15,6 +15,7 @@ import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { resolveBootMode, takeOver } from "./redeploy";
+import { createReadyHandler } from "./ready";
 import {
   awaitCriticalIdle,
   beginCritical,
@@ -128,16 +129,23 @@ process.on("SIGINT", shutdownHandler);
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);
 
-client.once(Events.ClientReady, async (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
-  clearTimeout(verifyTimer);
-  // A completed gateway login is the verification bar: process-alive proves nothing, and this
-  // is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
-  // crash-proof — a retire failure exits this process rather than falling through to `activate`,
-  // so a doomed handoff can never leave two live bots on the shared token.
-  if (mode === "standby") await takeOver(process.env[HANDOFF_FROM_ENV]!);
-  await activate(c);
-});
+// A completed gateway login is the verification bar: process-alive proves nothing, and this
+// is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
+// crash-proof — a retire failure exits this process rather than falling through to `activate`,
+// so a doomed handoff can never leave two live bots on the shared token. The order (clear the verify
+// timer, takeOver only in standby, then activate) lives in `src/ready.ts`, where `ready.test.ts` drives
+// it (#435); index.test.ts pins that this call is the only thing attached to ClientReady.
+client.once(
+  Events.ClientReady,
+  createReadyHandler({
+    mode,
+    takeOver: () => takeOver(process.env[HANDOFF_FROM_ENV]!),
+    activate,
+    clearVerifyTimer: () => clearTimeout(verifyTimer),
+    log: console,
+    describe: (c) => `Logged in as ${c.user.tag}`,
+  }),
+);
 
 /**
  * Everything that makes this process *the* bot. Held back until the handoff completes so the

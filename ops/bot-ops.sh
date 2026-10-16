@@ -309,8 +309,8 @@ declare -A RESERVED_KEYS=(
   # Group 3 (#278): read by the bot core process, not edited by the panel.
   [GITHUB_REPO]=1              # src/config.ts: the repo self-update and release polling anchor to
   [PLUGIN_REGISTRY_URL]=1      # src/plugins/install.ts: where plugin bundles are downloaded from
-  [BOT_DATA_DIR]=1             # src/storage.ts: the bot's data directory
-  [NODE_ENV]=1                 # src/storage.ts: `test` makes an unset BOT_DATA_DIR a boot error
+  [BOT_DATA_DIR]=1             # src/dataDir.ts: the bot's data directory (src/storage.ts's DATA_DIR)
+  [NODE_ENV]=1                 # src/dataDir.ts: under bun test (NODE_ENV=test, or a test-file entry) an unset BOT_DATA_DIR is a boot error
   [HANDOFF_FROM]=1             # src/handoff.ts: the raw standby instruction, set by the redeploy machinery (#46 checks the named container)
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker

@@ -1,6 +1,6 @@
 // Boot-time Plugin Index fetch, with a cache — no plugin code loads here. Deliberately dependency-
 // free of src/config.ts (src/plugins/* stays that way; see CONTEXT.md). The cache write goes through
-// src/storage.ts's writeFileAtomic, a config-free leaf that imports only node:* (#496: it used to be a
+// src/storage.ts's writeFileAtomic, a config-free leaf that imports only node:* and ./dataDir (#496: it used to be a
 // copy here, which missed #253's per-process token).
 import { join } from "node:path";
 import { writeFileAtomic } from "../storage";
