@@ -300,6 +300,14 @@ export function restartPending(): boolean {
   return pending !== undefined || handoff !== undefined || shuttingDown;
 }
 
+/** True once `beginShutdown` has run, i.e. a SIGTERM/SIGINT arrived and the process is draining. Unlike
+ *  `restartPending`, neither a pending restart nor an in-flight handoff of THIS process sets it (#548:
+ *  the replacement's probation must keep completing while its own first tick starts a redeploy, and must
+ *  stop completing when it is being stopped). */
+export function isShuttingDown(): boolean {
+  return shuttingDown;
+}
+
 /**
  * #154: marks the process as shutting down — folded into `restartPending()` so `onTick`'s own
  * `if (restartPending()) return` guard (`announce.ts`) starts no new tick once a signal has
