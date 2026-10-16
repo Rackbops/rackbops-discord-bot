@@ -1137,16 +1137,18 @@ export interface HealDeps {
  * `HANDOFF_FROM` itself, and while it exists the boot is `standby` and `completeTakeOver` converges it
  * (remove, rename), so the corpse a failed removal leaves is the standby path's, never this one's.
  * Bounded and best-effort: the boot continues on every outcome. The name it takes is `ownName`'s: the compose
- * project's when the container is that or `<project>-next` (how `ops/install.sh` names an instance, a `-next`
- * one included), otherwise the name without its `-next` suffixes.
+ * project's when the container is that or `<project>-next` (how `ops/install.sh` names an instance, a pre-#567
+ * `-next` one included), otherwise the name without its `-next` suffixes.
  * The limits: that rule and the `HANDOFF_FROM` gate are all that tell a deployment's own `*-next` name from a
- * swap's replacement, so three narrow cases go the wrong way, none reachable through a new install.sh
- * instance: a container created by `compose` alone with a `container_name` ending in `-next` that is not its
+ * swap's replacement, so three narrow cases go the wrong way, the first two not reachable through a new
+ * install.sh instance, the third only beside a pre-#567 `X-next`, which install.sh warns about:
+ * a container created by `compose` alone with a `container_name` ending in `-next` that is not its
  * project's, and had already self-updated before #547, is indistinguishable from a replacement and would be
  * renamed; a replacement whose name equals its project label (a hand-written compose with project `foo-next`
  * and `container_name: foo`, so the replacement `foo-next`) is taken for its own name and not healed; and
  * instances `X` and `X-next` on one daemon are not told apart by the sweep or by `bot-ops.sh`'s guard
- * (#567 refuses to install the second).
+ * (#567: `install.sh` refuses a new `X-next` and warns a new `X` beside a legacy `X-next`; two pre-#567
+ * instances are not detected).
  */
 export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
   const log = deps.log ?? console;

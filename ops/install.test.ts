@@ -7,7 +7,7 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,7 @@ function extractLine(pattern: RegExp, what: string): string {
 }
 
 const RESOLVE_DEPLOY_IDENTITY = extractFunction("resolve_deploy_identity");
+const CHECK_INSTANCE_NAME = extractFunction("check_instance_name");
 
 function resolveBash(): string | null {
   if (process.platform === "win32") {
@@ -639,6 +640,7 @@ async function runBranchGate(branch: string, thirdArg?: string): Promise<FetchPr
     'die() { echo "install: $*" >&2; exit 1; }',
     "need() { :; }",
     "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
+    "check_instance_name() { :; }", // #567: the slice calls it; unstubbed it is a 127 that fails the four tests below for the wrong reason
     "bootstrap_dir() { :; }",
     "mkdir() { :; }", // stubbed: the real one would try to mkdir /opt/... without privileges
     "chown() { :; }",
@@ -1064,4 +1066,137 @@ test("docker-compose.yml's admin comment says scope, not secrecy (issue #231)", 
   expect(envIdx).toBeGreaterThan(adminIdx);
   const adminBlock = compose.slice(adminIdx, envIdx);
   expect(adminBlock).toContain("Scope, not secrecy");
+});
+
+// ---------------------------------------------------------------------------
+// #567: a NEW instance named `next` or `*-next` is refused; a re-run only warns; a new `X` beside a legacy `X-next`
+// warns. `<container>-next` is the name a self-update gives its replacement (src/redeploy.ts, replacementName), so
+// instance `prod-next` owns the container name instance `prod`'s swap creates. check_instance_name is extracted from
+// the live script like resolve_deploy_identity above; the "existing instance" and "sibling" facts are real
+// directories in a temp dir, passed in as the paths main() would have derived.
+// ---------------------------------------------------------------------------
+const NAME_SCRIPT = [
+  "set -euo pipefail",
+  'die() { echo "install: $*" >&2; exit 1; }',
+  'INSTANCE="$PROBE_INSTANCE"',
+  'CONFIG_DIR="$PROBE_CONFIG_DIR"',
+  'STACK_DIR="$PROBE_STACK_DIR"',
+  'PROJECT="rackbops-discord-bot-$INSTANCE"',
+  CHECK_INSTANCE_NAME,
+  "check_instance_name",
+  'echo "ok $INSTANCE"',
+].join("\n");
+
+interface NameDirs {
+  configDir: string;
+  stackDir: string;
+}
+
+async function runName(instance: string, dirs: NameDirs): Promise<Run> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    PROBE_INSTANCE: instance,
+    PROBE_CONFIG_DIR: dirs.configDir,
+    PROBE_STACK_DIR: dirs.stackDir,
+  };
+  const proc = Bun.spawn([BASH!, "-c", NAME_SCRIPT], { stdout: "pipe", stderr: "pipe", env: env as Record<string, string> });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+/** A temp root with forward slashes (Git Bash on Windows reads those), and the two paths main() derives for `instance`. */
+async function withInstanceDirs(instance: string, body: (dirs: NameDirs) => Promise<void>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "install-name-")).replaceAll("\\", "/");
+  try {
+    await body({ configDir: `${root}/config/${instance}`, stackDir: `${root}/stacks/rackbops-discord-bot-${instance}` });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-next, and warns otherwise (#567)", () => {
+  test("a new prod-next (neither directory exists) dies, naming the container and the issue", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout.trim()).toBe("");
+      expect(r.stderr).toContain("would be 'rackbops-discord-bot-prod-next', which ends in -next");
+      expect(r.stderr).toContain("(#567)");
+    });
+  });
+
+  test("a re-run on an existing prod-next (config dir present) only warns and continues", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      mkdirSync(dirs.configDir, { recursive: true });
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe("ok prod-next");
+      expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
+      // Quoted, so the unstripped name ('...-prod-next') cannot satisfy it: this is the container it collides WITH.
+      expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+    });
+  });
+
+  test("a re-run with only the stack dir present is an existing instance too", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      mkdirSync(dirs.stackDir, { recursive: true });
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe("ok prod-next");
+      expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
+      expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+    });
+  });
+
+  test("the bare name next is refused when new, and warned (naming rackbops-discord-bot) when it exists", async () => {
+    await withInstanceDirs("next", async (dirs) => {
+      const refused = await runName("next", dirs);
+      expect(refused.exitCode).toBe(1);
+      expect(refused.stderr).toContain("would be 'rackbops-discord-bot-next'");
+      mkdirSync(dirs.configDir, { recursive: true });
+      const rerun = await runName("next", dirs);
+      expect(rerun.exitCode).toBe(0);
+      expect(rerun.stdout.trim()).toBe("ok next");
+      expect(rerun.stderr).toContain("container is 'rackbops-discord-bot'");
+    });
+  });
+
+  test("only the suffix counts: prod, nextgen, prodnext and next-prod install silently", async () => {
+    for (const name of ["prod", "nextgen", "prodnext", "next-prod"]) {
+      await withInstanceDirs(name, async (dirs) => {
+        const r = await runName(name, dirs);
+        expect(r.exitCode, name).toBe(0);
+        expect(r.stdout.trim(), name).toBe(`ok ${name}`);
+        expect(r.stderr, name).toBe("");
+      });
+    }
+  });
+
+  test("a new prod beside a legacy prod-next (either of its directories) warns and continues", async () => {
+    for (const sibling of ["config", "stack"] as const) {
+      await withInstanceDirs("prod", async (dirs) => {
+        mkdirSync(sibling === "config" ? `${dirs.configDir}-next` : `${dirs.stackDir}-next`, { recursive: true });
+        const r = await runName("prod", dirs);
+        expect(r.exitCode, sibling).toBe(0);
+        expect(r.stdout.trim(), sibling).toBe("ok prod");
+        expect(r.stderr, sibling).toContain("WARNING: an instance 'prod-next' already exists");
+        expect(r.stderr, sibling).toContain("(#567)");
+      });
+    }
+  });
+});
+
+// Source check, no bash needed: main() must call it after PROJECT is set (the message names it) and before anything
+// is created (a refusal writes nothing). Searches for the call LINE, so the definition and the comments don't count.
+test("install.sh calls check_instance_name after PROJECT is set and before anything is created (#567)", () => {
+  const iProject = installShSource.indexOf('PROJECT="rackbops-discord-bot-$INSTANCE"');
+  const iBoot = installShSource.indexOf('bootstrap_dir "$CONFIG_DIR"');
+  const iCall = installShSource.search(/^ {2}check_instance_name$/m);
+  for (const [name, i] of Object.entries({ iProject, iBoot, iCall })) expect(i, `${name} present`).toBeGreaterThan(-1);
+  expect(iCall).toBeGreaterThan(iProject);
+  expect(iCall).toBeLessThan(iBoot);
 });

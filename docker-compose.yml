@@ -30,10 +30,10 @@ services:
     # on the same host.
     # A name ending in `-next` is reserved for the self-update's replacement (#547, #492): a bot with such a
     # name refuses to self-update, and a swapped-in container whose rename never landed takes the canonical name
-    # back at its next boot. An ops/install.sh instance called `next` or `canary-next` is the exception: its
+    # back at its next boot. An ops/install.sh instance installed before #567 with a name like `next` or `canary-next` is the exception: its
     # container is named after its compose project (BOT_OPS_CONTAINER=$PROJECT), which the bot reads from its
     # labels, so that name is its own and it self-updates into `<name>-next`, unless a sibling instance owns that
-    # name (instances `prod` and `prod-next` cannot share a daemon; an install-time guard is #567). A
+    # name (instances `prod` and `prod-next` cannot share a daemon; `ops/install.sh` refuses a new `*-next` instance and warns on a re-run or on a new sibling, #567). A
     # compose-only deployment with a `-next` name that is not its project's and has already self-updated before
     # #547 would be renamed at its next boot.
     container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}
