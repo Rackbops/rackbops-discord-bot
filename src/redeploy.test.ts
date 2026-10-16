@@ -995,10 +995,25 @@ describe("redeploy — cleanup always runs", () => {
     });
     const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 200, deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled"); // ready honoured, then the retirement wait elapsed — not "failed"
+    expect(result.error).toBeUndefined(); // the poll's 500 belongs to no verdict: it is only named on a timeout
     const inspects = calls.filter((c) => c.method === "GET" && c.path === `/containers/${REPLACEMENT_ID}/json`);
     expect(inspects.length).toBe(2); // the one deciding poll, then the pre-removal inspect
     expect(wasRemovalAttempted()).toBe(true);
     expect(handoffActive()).toBe(false);
+  });
+
+  // The replacement's own reason outranks the poll's last daemon error: a `failed` marker decided this poll
+  // although its inspect failed too, and what the requester reads is the replacement's reason.
+  test("a failed marker's own reason is reported, not the poll's last daemon error", async () => {
+    stubDaemon({
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "failed", sha: "3434343", error: "gateway login refused", at: Date.now() }),
+    });
+    const result = await redeploy("a".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBe("gateway login refused");
+    expect(wasRemovalAttempted()).toBe(true);
   });
 
   // Row 15 of the handoff state table: the marker is read at the top of a poll and the verdict is computed
@@ -1022,6 +1037,25 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled"); // never "timeout": what the replacement said outranks the poll
     expect(result.error).toBeUndefined();
+  });
+
+  // The re-read applies to every verdict but `ready`, not only to a timeout: here the deciding poll sees the
+  // replacement EXITED (a `failed` verdict) while its `ready` is being written, and `ready` still wins.
+  test("a ready written during a poll that decides failed beats that verdict too", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          await writeMarker({ status: "ready", sha: "4545454", at: Date.now() });
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 0 } });
+        }
+        return jsonRes(SELF);
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled"); // the ready path ran (its retirement wait elapsed), not "failed"
   });
 
   // The re-read goes through the `readMarker` seam like the poll's reads do (the retirement wait keeps the

@@ -326,9 +326,11 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
 
   let outcome: HandoffOutcome;
   // #431: the verdict's own time, the baseline the generation guard below compares the replacement's
-  // later StartedAt against. Sampled before the poll, replaced by the poll's own observation, re-sampled
-  // after the retirement wait and in the backstop catch — never left at epoch 0, which made the guard
-  // read EVERY running replacement as a later life and skip the removal.
+  // later StartedAt against. Replaced by the poll's own observation, re-sampled after the retirement wait
+  // and in the backstop catch — never left at epoch 0, which made the guard read EVERY running replacement
+  // as a later life and skip the removal. The pre-poll value here is a default no path reads today (the
+  // poll's return and the catch both assign before the guard does); it stays so a path added later that
+  // forgets to assign sees a real time, not epoch 0.
   let observedAt = now();
   let pollError: string | undefined;
   try {
@@ -348,7 +350,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // verdict would otherwise lose to `timeout` or `failed`. What the replacement SAID outranks what the
       // poll saw, so read once more before acting on anything else. A `ready` that lands after THIS read
       // (before the removal below) is the residual window: the generation guard's inspect plus the removal
-      // call — milliseconds against a healthy daemon, up to one 60 s call bound against a hanging one.
+      // call — milliseconds against a healthy daemon, up to two sequential 60 s call bounds against a hanging one.
       const late = await read();
       if (late?.status === "ready") {
         console.warn(`[redeploy] the replacement signalled ready as the poll decided ${outcome} — honouring it`);
@@ -434,8 +436,8 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       console.warn(`[redeploy] replacement restarted after we decided ${outcome} — leaving it alone`);
     } else {
       // The window left open: a `ready` written after the marker read above and before this call — the
-      // guard's inspect plus this removal, milliseconds against a healthy daemon, up to one 60 s call
-      // bound against a hanging one — removes a replacement mid-retire. `none` when the daemon already
+      // guard's inspect plus this removal, milliseconds against a healthy daemon, up to two sequential 60 s
+      // call bounds against a hanging one — removes a replacement mid-retire. `none` when the daemon already
       // had nothing by that id (#451): the requester must not hear "removed" for what was never there.
       replacement = (await removeContainer(replacementId, true)) ? "removed" : "none";
     }
