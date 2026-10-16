@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { settleWithin } from "../test/settleWithin";
 
 const { fetchReleases, createIssue, ensureLabel, GITHUB_TIMEOUT_MS } = await import("./github");
@@ -88,14 +88,22 @@ describe("every GitHub call is timeout-bounded", () => {
     }
   }
 
-  // Best-effort by contract: it warns rather than throwing on a bad status. What matters is that
-  // it SETTLES — an unbounded hang here stalls /report just as hard as a throw would.
+  // Best-effort by contract (#445, #503): it warns and reports `false` rather than throwing. What matters
+  // is that it SETTLES — an unbounded hang here stalls /report just as hard as a throw would — and that
+  // the timeout reads as "could not confirm the label", not as a rejection.
   test(
-    "ensureLabel settles rather than hanging",
+    "ensureLabel settles rather than hanging, and reports the label unconfirmed",
     async () => {
       config.githubToken = "test-token";
       globalThis.fetch = neverAnswers();
-      await settleWithin(ensureLabel("owner/repo", "bug", TINY), "ensureLabel");
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const r = await settleWithin(ensureLabel("owner/repo", "bug", TINY), "ensureLabel");
+        expect(r).toEqual({ ok: true, v: false });
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
     },
     2000,
   );
@@ -183,5 +191,58 @@ describe("every GitHub call is timeout-bounded", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+/**
+ * `ensureLabel` answers whether the label exists afterwards and never throws (#445, #503 item 7): `/report`
+ * files the issue without the label rather than fail over it. Mutation: removing the `try`/`catch` makes the
+ * rejected-fetch row throw; returning `true` for every status makes the 500 row wrong.
+ */
+describe("ensureLabel reports whether the label exists, and never throws", () => {
+  const realFetch = globalThis.fetch;
+  const realToken = config.githubToken;
+  let warn: ReturnType<typeof spyOn<Console, "warn">>;
+  beforeEach(() => {
+    config.githubToken = "test-token";
+    warn = spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    config.githubToken = realToken;
+    warn.mockRestore();
+  });
+
+  test("201 (created) and 422 (already there) are true, with no warning", async () => {
+    for (const status of [201, 422]) {
+      globalThis.fetch = (() => Promise.resolve(new Response("{}", { status }))) as unknown as typeof fetch;
+      expect(await ensureLabel("owner/repo", "bug")).toBe(true);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  test("another status is false, with one warning naming it", async () => {
+    globalThis.fetch = (() => Promise.resolve(new Response("nope", { status: 500 }))) as unknown as typeof fetch;
+    expect(await ensureLabel("owner/repo", "bug")).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain("500");
+  });
+
+  test("a rejected fetch is false, with one warning, and never throws", async () => {
+    globalThis.fetch = (() => Promise.reject(new TypeError("fetch failed"))) as unknown as typeof fetch;
+    expect(await ensureLabel("owner/repo", "bug")).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]![0])).toContain("fetch failed");
+  });
+
+  test("without a token it is true and sends nothing", async () => {
+    config.githubToken = undefined;
+    let fetched = 0;
+    globalThis.fetch = (() => {
+      fetched++;
+      return Promise.resolve(new Response("{}", { status: 201 }));
+    }) as unknown as typeof fetch;
+    expect(await ensureLabel("owner/repo", "bug")).toBe(true);
+    expect(fetched).toBe(0);
   });
 });
