@@ -109,7 +109,7 @@ export const state: BotState = await loadStateFrom(STATE_FILE);
  * into it until the volume is fixed (#509): the alternative, a silent fresh state, would re-announce
  * every release and then overwrite a file that may be intact. The move-aside is itself best-effort:
  * a failed rename is logged, not thrown — losing the forensic copy is still better than a crash loop.
- * There is no `fsync` (#510), so a host power loss is outside what the temp+rename write covers.
+ * There is no `fsync` (#510; the routing secrets file is no exception, #479), so a host power loss is outside what the temp+rename write covers.
  */
 export async function loadStateFrom(path: string): Promise<BotState> {
   const raw = await readJsonOrFresh<unknown>(path, () => undefined, "state");

@@ -20,6 +20,7 @@ import {
 } from "./live";
 import type { DiscoveryFile } from "./model";
 import { mutateRouting, routingPath } from "./store";
+import { resetKeptCorruptForTest } from "../storage";
 
 const HOME = "111111111111111111";
 const OTHER = "222222222222222222";
@@ -37,6 +38,8 @@ beforeEach(() => {
 // running.
 afterEach(() => {
   resetRoutingForTest();
+  // A routing file that will not parse is kept in place by a read and remembered (#477).
+  resetKeptCorruptForTest();
   rmSync(dir, { recursive: true, force: true });
 });
 
