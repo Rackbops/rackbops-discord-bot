@@ -130,7 +130,7 @@ function fakeModalSubmit(o: {
   return { interaction, calls, marks };
 }
 
-/** #503 item 11 / T14: a log line names the user id and a known project key, never what the reporter wrote. */
+/** #503 item 11: a log line never carries what the reporter wrote -- the title, the description or the username. */
 function expectNoReportTextInLog(marks: { title: string; description: string; username: string }): void {
   for (const line of [...warns, ...errors]) {
     expect(line).not.toContain(marks.title);
@@ -146,10 +146,10 @@ describe("/report names itself by its registered (prefixed) name", () => {
   test("the not-configured refusal names the command the user typed", async () => {
     config.reportRoleId = undefined;
     for (const typed of ["pipreport", "rreport", "report"]) {
-      let replied: { content?: string } | undefined;
+      let replied: { content?: string; flags?: unknown } | undefined;
       const interaction = {
         commandName: typed,
-        reply: async (o: { content?: string }) => {
+        reply: async (o: { content?: string; flags?: unknown }) => {
           replied = o;
         },
       } as unknown as ChatInputCommandInteraction;
@@ -157,6 +157,7 @@ describe("/report names itself by its registered (prefixed) name", () => {
       expect(replied?.content).toBe(
         `\`/${typed}\` isn't configured — an admin must set \`REPORT_ROLE_ID\` and \`GITHUB_TOKEN\`.`,
       );
+      expect(replied?.flags).toBe(MessageFlags.Ephemeral); // a refusal is the reporter's own business
       if (typed !== "report") expect(replied?.content).not.toContain("`/report`");
     }
   });
@@ -216,6 +217,11 @@ describe("handleReportCommand — the role gate and the modal", () => {
 
   // Mutation: setMaxLength(1200) on the title, or dropping `required`, fails the field assertions.
   test("the modal is report:<project> with the Title and Description fields", async () => {
+    // The custom id carries the project the user chose, not a constant: the submit routes on it.
+    const other = fakeCommand({ member: { roles: [ROLE] }, project: "abm" });
+    await handleReportCommand(other.interaction);
+    expect((other.calls.modals[0] as { custom_id: string }).custom_id).toBe("report:abm");
+
     const { interaction, calls } = fakeCommand({ member: { roles: [ROLE] }, project: "wow" });
     await handleReportCommand(interaction);
 
@@ -257,6 +263,23 @@ describe("handleReportModal — the outcome a channel sees (#447, #445)", () => 
     expect(errors).toEqual([]);
   });
 
+  // Discord wants an acknowledgement within 3 s and the label call alone may take 10: the defer has to come first.
+  // Mutation: moving deferReply below ensureLabel leaves the interaction unacknowledged for the whole round trip.
+  test("the interaction is deferred before the first network call", async () => {
+    const { interaction, calls } = fakeModalSubmit({ customId: "report:wow" });
+    const deferredAtFirstFetch: boolean[] = [];
+    const seen = stubGithub();
+    const stubbed = globalThis.fetch;
+    globalThis.fetch = ((...args: Parameters<typeof fetch>) => {
+      deferredAtFirstFetch.push(calls.deferred);
+      return stubbed(...args);
+    }) as typeof fetch;
+    await handleReportModal(interaction);
+
+    expect(seen.urls.length).toBeGreaterThan(0);
+    expect(deferredAtFirstFetch[0]).toBe(true);
+  });
+
   // #445. Mutation: moving the announcement edit back inside the create-issue `try` makes the catch say
   // "Couldn't file the issue" about an issue that exists.
   test("the issue is created and the announcement edit then rejects: the channel is told it was filed, not that it failed", async () => {
@@ -275,8 +298,28 @@ describe("handleReportModal — the outcome a channel sees (#447, #445)", () => 
       allowedMentions: { parse: [] },
     });
     for (const edit of calls.edits) expect((edit as { content: string }).content).not.toContain("Couldn't file");
-    expect(warns.filter((w) => w.includes("announcement edit failed"))).toHaveLength(1);
+    // The warning is the only record of the Discord failure when the fallback succeeds: it names the issue and why.
+    const failed = warns.filter((w) => w.includes("announcement edit failed"));
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toContain(`${WOW_REPO}#7`);
+    expect(failed[0]).toContain("edit rejected");
     expectNoReportTextInLog(marks);
+  });
+
+  // Mutation: removing the clamp around the fallback's content lets an over-long name past Discord's cap.
+  // (A real username is at most 32 characters; the fake can say anything, which is what lets the clamp be pinned.)
+  test("the fallback edit is clamped like every other public edit", async () => {
+    stubGithub();
+    const { interaction, calls } = fakeModalSubmit({
+      customId: "report:wow",
+      username: "u".repeat(3000),
+      editOutcomes: ["reject", "ok"],
+    });
+    await handleReportModal(interaction);
+
+    const fallback = (calls.edits[1] as { content: string }).content;
+    expect(fallback.length).toBeLessThanOrEqual(1901); // clampReply's 1900 plus its ellipsis
+    expect(fallback.endsWith("…")).toBe(true);
   });
 
   // Mutation: dropping the fallback's `.catch` lets the second rejection escape the handler.
@@ -357,7 +400,7 @@ describe("handleReportModal — the gate on a submit (#448)", () => {
     config.reportRoleId = undefined;
     config.commandPrefix = "pip";
     const seen = stubGithub();
-    const { interaction, calls } = fakeModalSubmit({ customId: "report:wow" });
+    const { interaction, calls, marks } = fakeModalSubmit({ customId: "report:wow" });
     await handleReportModal(interaction);
 
     expect(calls.replied?.content).toBe(
@@ -368,12 +411,16 @@ describe("handleReportModal — the gate on a submit (#448)", () => {
     expect(seen.urls).toEqual([]);
     expect(warns).toHaveLength(1);
     expect(warns[0]).toContain("not configured");
+    // The line identifies the submit: who, and for which (known) project.
+    expect(warns[0]).toContain(marks.userId);
+    expect(warns[0]).toContain("wow");
+    expectNoReportTextInLog(marks);
   });
 
   test("a submit while the token is not configured is refused the same way", async () => {
     config.githubToken = undefined;
     const seen = stubGithub();
-    const { interaction, calls } = fakeModalSubmit({ customId: "report:wow" });
+    const { interaction, calls, marks } = fakeModalSubmit({ customId: "report:wow" });
     await handleReportModal(interaction);
 
     expect(calls.replied?.content).toContain("isn't configured");
@@ -381,6 +428,23 @@ describe("handleReportModal — the gate on a submit (#448)", () => {
     expect(calls.deferred).toBe(false);
     expect(seen.urls).toEqual([]);
     expect(warns).toHaveLength(1);
+    expect(warns[0]).toContain(marks.userId);
+    expect(warns[0]).toContain("wow");
+  });
+
+  // The project fence runs first, so the refusals above only ever log a KNOWN project key. Mutation: moving the gate
+  // above the fence would let a roleless submit with a forged customId write its attacker-controlled text to the log.
+  test("a roleless submit for an unknown project is refused as unknown, and nothing is logged", async () => {
+    const seen = stubGithub();
+    const forged = "report:evil\n[report] forged line";
+    const { interaction, calls } = fakeModalSubmit({ customId: forged, member: { roles: [] } });
+    await handleReportModal(interaction);
+
+    expect(calls.replied?.content).toContain("Unknown project");
+    expect(calls.deferred).toBe(false);
+    expect(seen.urls).toEqual([]);
+    expect(warns).toEqual([]);
+    expect(errors).toEqual([]);
   });
 });
 
@@ -448,10 +512,9 @@ describe("handleReportModal — upstream failure clamping (#55, #186)", () => {
     const edited = calls.edited as { content: string };
     expect(edited.content.length).toBeLessThan(1950); // clampReply's 1900-char budget + prefix/suffix
     expect(edited.content.endsWith("…")).toBe(true);
-    // The log line is clamped to 300 characters, not the public reply's 1900.
+    // The log line carries the message clamped to 300 characters plus the ellipsis, not the public reply's 1900.
     const logged = warns.filter((w) => w.includes("could not file an issue"));
-    expect(logged).toHaveLength(1);
-    expect(logged[0]!.length).toBeLessThan(450);
+    expect(logged).toEqual([`[report] could not file an issue in ${WOW_REPO}: ${"y".repeat(300)}…`]);
     expectNoReportTextInLog(marks);
   });
 

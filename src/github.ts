@@ -205,7 +205,7 @@ export async function createIssue(
 }
 
 /** Idempotently ensure a label exists: `true` when it does afterwards (201 created; 422, which with a constant
- *  name and colour is GitHub's "already exists" answer here), `false` when it could not be confirmed (another
+ *  name and colour reads as "already exists" here — GitHub documents it only as "validation failed"), `false` when it could not be confirmed (another
  *  status, a network error, the timeout) — logged, never thrown, so a caller can file without the label rather
  *  than fail the report over it (#445, #503). `true` without a token too: create-issue cannot run without one
  *  either, and the caller refuses earlier. */

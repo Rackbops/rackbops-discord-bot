@@ -129,16 +129,22 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
  * Three steps, three outcomes (#445, #503):
  *  1. The label is best-effort. `ensureLabel` never throws; when it cannot confirm the label the issue is
  *     filed without it, and the log says so.
- *  2. The issue. Only a failure HERE says "Couldn't file the issue": nothing was filed.
+ *  2. The issue. Only a failure HERE says "Couldn't file the issue", and only because nothing is KNOWN to have
+ *     been filed: a create that timed out, or answered with a body that could not be read, may still have
+ *     committed, and a retry would then file it twice.
  *  3. The announcement. The issue exists whatever happens in this step, so a failure here is logged and falls
  *     back to a minimal public edit naming the issue; if that fails too it is logged at error level and nothing
- *     else is attempted (the deferred reply expires; the issue exists, and the log says so).
+ *     else is attempted (the deferred reply expires; the issue exists, and the log says so). A first edit that
+ *     Discord applied but whose answer the client lost is overwritten by the fallback.
  *
- * Every refusal and failure writes one `[report]` line (#503 item 11, the `/report` half) — except the
- * unknown-project refusal, whose project string is attacker-controlled until `repoForProject` has accepted it.
- * None carries the title, the description or the username; the user id and a known project key are all that
- * identify the submit. The create-issue message is clamped to 300 characters for the log (the public reply
- * keeps `clampReply`'s default).
+ * Refusals and failures write a `[report]` line (#503 item 11, the `/report` half): the two gate refusals name
+ * the user id and the project; the label shortfall, a create-issue failure, a failed announcement edit and a
+ * failed fallback edit name the repo (and the issue number once there is one). The label shortfall also has
+ * `ensureLabel`'s own warning. None carries the title, the description or the username. Not logged here: the
+ * unknown-project refusal (its project string is attacker-controlled until `repoForProject` has accepted it),
+ * and anything that throws out of the handler — a rejected `deferReply`, a field read, the "Couldn't file" edit
+ * itself — which `index.ts`'s dispatcher logs as an `[interaction]` error. The create-issue message is clamped
+ * to 300 characters plus an ellipsis for the log (the public reply keeps `clampReply`'s default).
  *
  * A modal submit carries no `commandName`, so the command name — the issue footer's and the not-configured
  * refusal's — is built from `config.commandPrefix`, the same prefix `/report` was registered under, read at
@@ -179,7 +185,7 @@ export async function handleReportModal(interaction: ModalSubmitInteraction): Pr
   // Step 1 of 3 (#445, #503): the label is best-effort; without it the issue is filed unlabelled.
   const labelled = await ensureLabel(repo, REPORT_LABEL);
   if (!labelled) console.warn(`[report] filing in ${repo} without the ${REPORT_LABEL} label (could not be confirmed)`);
-  // Step 2: the issue. Only a failure HERE means the report was not filed.
+  // Step 2: the issue. Only a failure HERE means the report is not known to have been filed.
   let issue: { number: number; url: string };
   try {
     const body = reportBody(description, username, command);
