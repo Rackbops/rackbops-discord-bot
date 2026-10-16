@@ -1,8 +1,23 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonWriter, createKeyedJsonMutator, DATA_DIR, readJsonOrFresh, resolveDataDir, shortSha, SHORT_SHA_LEN, tmpPathFor, writeJsonAtomic } from "./storage";
+import { stallBunWrite } from "../test/stallBunWrite";
+import { failJsonRead, tempNameRegExp } from "../test/storageProbes";
+import {
+  classifyReadError,
+  createJsonWriter,
+  createKeyedJsonMutator,
+  DATA_DIR,
+  moveCorruptAside,
+  readJsonOrFresh,
+  resolveDataDir,
+  shortSha,
+  SHORT_SHA_LEN,
+  TMP_TOKEN,
+  tmpPathFor,
+  writeJsonAtomic,
+} from "./storage";
 
 describe("createKeyedJsonMutator idle (what the test-state guard reads)", () => {
   test("settles only once every update queued so far has, on every path", async () => {
@@ -24,6 +39,69 @@ describe("createKeyedJsonMutator idle (what the test-state guard reads)", () => 
 
   test("with nothing queued it is already settled", async () => {
     await expect(createKeyedJsonMutator().idle()).resolves.toBeUndefined();
+  });
+});
+
+// #511: the per-path queue map used to keep one settled entry per path for the life of the process.
+// The prune runs two microtasks after an update's own promise settles (`next` -> `tail` -> the
+// `.then` that deletes), so a test that awaits an update lets those two ticks pass before it looks.
+describe("createKeyedJsonMutator pruning (#511)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "keyed-mutator-prune-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const fresh = () => ({ n: 0 });
+  const bump = (c: { n: number }) => ({ n: c.n + 1 });
+  const settleTicks = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  test("forgets a path once its queue settles, and holds it while an update is in flight", async () => {
+    const m = createKeyedJsonMutator<{ n: number }>();
+    const a = join(dir, "a.json");
+    expect(m.pendingPaths()).toBe(0);
+    await m.update(a, fresh, bump, "a");
+    await settleTicks();
+    expect(m.pendingPaths()).toBe(0);
+    const stall = stallBunWrite();
+    try {
+      void m.update(a, fresh, bump, "a").catch(() => {});
+      await stall.reached;
+      expect(m.pendingPaths()).toBe(1);
+    } finally {
+      stall.restore();
+    }
+    // The stuck update never settles; it is this test's own mutator, so nothing else waits on it.
+  });
+
+  test("a path with a second update still queued is not forgotten when the first settles", async () => {
+    const m = createKeyedJsonMutator<{ n: number }>();
+    const a = join(dir, "a.json");
+    const p1 = m.update(a, fresh, bump, "a");
+    const p2 = m.update(a, fresh, bump, "a");
+    await p1;
+    await settleTicks();
+    expect(m.pendingPaths()).toBe(1); // p2's queue is the current one; p1's prune must not delete it
+    await p2;
+    await settleTicks();
+    expect(m.pendingPaths()).toBe(0);
+    expect(JSON.parse(readFileSync(a, "utf8"))).toEqual({ n: 2 });
+  });
+
+  test("an update that rejects still clears its path", async () => {
+    const m = createKeyedJsonMutator<{ n: number }>();
+    const a = join(dir, "a.json");
+    await expect(
+      m.update(a, fresh, () => {
+        throw new Error("mutate blew up");
+      }, "a"),
+    ).rejects.toThrow("mutate blew up");
+    await settleTicks();
+    expect(m.pendingPaths()).toBe(0);
   });
 });
 
@@ -119,9 +197,15 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("absent file resolves the fresh value, not an error", async () => {
-    const result = await readJsonOrFresh(join(dir, "x.json"), () => ({ n: 0 }), "test");
-    expect(result).toEqual({ n: 0 });
+  test("absent file resolves the fresh value, not an error, and logs nothing", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await readJsonOrFresh(join(dir, "x.json"), () => ({ n: 0 }), "test");
+      expect(result).toEqual({ n: 0 });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   test("a well-formed file round-trips through writeJsonAtomic/readJsonOrFresh", async () => {
@@ -147,7 +231,7 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     expect(corruptFiles.length).toBe(1);
   });
 
-  test("a truncated/malformed-JSON file loads fresh, not a throw", async () => {
+  test("a truncated/malformed-JSON file loads fresh and is moved aside, not a throw", async () => {
     const file = join(dir, "x.json");
     writeFileSync(file, '{"n": 1, "list": [1, 2');
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
@@ -157,12 +241,111 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     } finally {
       errorSpy.mockRestore();
     }
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(dir).filter((f) => f.includes(".corrupt-")).length).toBe(1);
   });
 
-  test("writeJsonAtomic never leaves a .tmp file behind on success", async () => {
+  // #509 item 2: only a file that parsed badly is "corrupt". A read that fails for another reason may
+  // be an intact file behind an environment fault; returning fresh would let the next write overwrite
+  // it, and moving it aside would hide the fault. Bun.file is stubbed to throw what EIO throws, since
+  // a real EIO cannot be provoked here.
+  test("a read that fails for a reason other than corruption is rethrown, and nothing is moved aside", async () => {
+    const file = join(dir, "x.json");
+    writeFileSync(file, '{"n": 7}');
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const failing = failJsonRead(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }));
+    try {
+      await expect(readJsonOrFresh(file, () => ({ n: 0 }), "test")).rejects.toThrow(/EIO/);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const message = String(errorSpy.mock.calls[0]![0]);
+      expect(message).toContain("could not be read");
+      expect(message).not.toContain("starting fresh");
+    } finally {
+      failing.restore();
+      errorSpy.mockRestore();
+    }
+    expect(readFileSync(file, "utf8")).toBe('{"n": 7}'); // still there, untouched
+    expect(readdirSync(dir).filter((f) => f.includes(".corrupt-"))).toEqual([]);
+  });
+
+  test("a file that vanished between exists() and json() reads fresh, with no log and nothing moved aside", async () => {
+    const file = join(dir, "x.json");
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const failing = failJsonRead(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+    try {
+      expect(await readJsonOrFresh(file, () => ({ n: 0 }), "test")).toEqual({ n: 0 });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      failing.restore();
+      errorSpy.mockRestore();
+    }
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test("writeJsonAtomic leaves no *.tmp entry in the directory on success", async () => {
     const file = join(dir, "x.json");
     await writeJsonAtomic(file, { n: 1 });
-    expect(existsSync(`${file}.tmp`)).toBe(false);
+    expect(readdirSync(dir)).toEqual(["x.json"]);
+  });
+
+  // #509 item 3: a rename that fails (a directory sits where the file should go: EPERM on Windows,
+  // EISDIR on POSIX — only that it throws is asserted) must take its temp file with it, because the
+  // counter means a retry never reuses the name and the orphan would stay for good.
+  test("a write that cannot complete leaves no temp file behind", async () => {
+    const file = join(dir, "x.json");
+    mkdirSync(file);
+    await expect(writeJsonAtomic(file, { n: 1 })).rejects.toThrow();
+    expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+  });
+
+  // The other half of #509 item 3: a Bun.write that fails AFTER creating its temp file (a full disk
+  // leaves the partial file behind), which the rename-only case above never reaches.
+  test("a Bun.write that fails after creating its temp file leaves nothing behind", async () => {
+    const file = join(dir, "x.json");
+    const spy = spyOn(Bun, "write").mockImplementation((async (path: unknown) => {
+      writeFileSync(String(path), '{"half');
+      throw new Error("ENOSPC: no space left on device");
+    }) as never);
+    try {
+      await expect(writeJsonAtomic(file, { n: 1 })).rejects.toThrow(/ENOSPC/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  // The cleanup is best-effort: when it fails too (EBUSY/EPERM on Windows), the error worth throwing is
+  // the write's. A directory sits where the next write's temp file goes: Bun.write fails EISDIR and the
+  // cleanup's rmSync fails as well (ERR_FS_EISDIR -- removing a directory needs `recursive`). The next
+  // temp name is read off a stalled write first, since the counter is private to the module.
+  test("the cleanup's own failure does not mask the error that caused it", async () => {
+    const file = join(dir, "x.json");
+    const stall = stallBunWrite();
+    let next: number;
+    try {
+      void writeJsonAtomic(file, { n: 0 }).catch(() => {});
+      await stall.reached;
+      next = Number(String(stall.calls[0]![0]).match(/\.(\d+)\.tmp$/)![1]) + 1;
+    } finally {
+      stall.restore();
+    }
+    mkdirSync(`${file}.${process.pid}.${TMP_TOKEN}.${next}.tmp`);
+    const thrown = await writeJsonAtomic(file, { n: 1 }).then(
+      () => undefined,
+      (err: unknown) => err as Error,
+    );
+    // Bun.write's own message, not rmSync's ("Path is a directory: rm returned EISDIR ...").
+    expect(thrown?.message).toMatch(/illegal operation on a directory/);
+    expect(thrown?.message).not.toMatch(/rm returned/);
+  });
+
+  // classifyReadError calls a read that fails with EISDIR an error, which is only unreachable because
+  // Bun's exists() is false for a directory (probed on Windows); this keeps a Bun or platform that
+  // answers differently from turning a directory at the path into a boot-time crash loop unseen.
+  test("a directory where the file should be reads as absent", async () => {
+    const file = join(dir, "x.json");
+    mkdirSync(file);
+    expect(await readJsonOrFresh(file, () => ({ n: 0 }), "test")).toEqual({ n: 0 });
   });
 
   test("100 concurrent saves through one writer leave a parseable, uncorrupted file", async () => {
@@ -211,13 +394,95 @@ describe("tmpPathFor (#253)", () => {
   });
 });
 
-// writeJsonAtomic's own temp-path construction is source-pinned rather than driven through two real
-// processes (which would need two real pids) — the no-collision guarantee itself is on tmpPathFor
-// above, already proven pure; this just confirms writeJsonAtomic actually calls it, with the
-// module's real TMP_TOKEN and the shared tmpCounter, not a hand-rolled template that dropped one.
-describe("writeJsonAtomic uses tmpPathFor with the module token (#253, source pin)", () => {
-  test("the temp-path line calls tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter)", () => {
-    const src = readFileSync(new URL("./storage.ts", import.meta.url), "utf8");
-    expect(src).toContain("tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter)");
+// The no-collision guarantee itself is on tmpPathFor above, proven pure. These two pin the rest of the
+// chain (#509 item 5): that the write really goes to a name carrying the module's own TMP_TOKEN (the
+// old pin grepped the source text for the call, so `const TMP_TOKEN = "x"` kept it green), and that
+// the token is per process, not a constant.
+describe("writeJsonAtomic's temp name carries the per-process TMP_TOKEN (#253)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "warbandeer-storage-token-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("TMP_TOKEN is eight hex chars, and the name the write is given is <path>.<pid>.<TMP_TOKEN>.<n>.tmp", async () => {
+    expect(TMP_TOKEN).toMatch(/^[0-9a-f]{8}$/);
+    const file = join(dir, "x.json");
+    const stall = stallBunWrite();
+    try {
+      void writeJsonAtomic(file, { n: 1 }).catch(() => {});
+      await stall.reached;
+      expect(String(stall.calls[0]![0])).toMatch(tempNameRegExp(file));
+    } finally {
+      stall.restore();
+    }
+  });
+
+  test("TMP_TOKEN differs between two processes", () => {
+    const repoRoot = join(import.meta.dir, "..");
+    const tokens = [0, 1].map(() => {
+      const child = Bun.spawnSync([process.execPath, "-e", 'import("./src/storage").then((m) => console.log(m.TMP_TOKEN))'], {
+        cwd: repoRoot,
+        env: process.env, // carries BOT_DATA_DIR, so the child's own DATA_DIR resolves
+        timeout: 20_000,
+      });
+      expect(child.exitCode).toBe(0);
+      return child.stdout.toString().trim();
+    });
+    for (const t of tokens) expect(t).toMatch(/^[0-9a-f]{8}$/);
+    expect(tokens[0]).not.toBe(tokens[1]);
+    expect(tokens).not.toContain(TMP_TOKEN);
+  });
+});
+
+describe("classifyReadError", () => {
+  test("a SyntaxError is corrupt, ENOENT is absent, anything else is an error", () => {
+    expect(classifyReadError(new SyntaxError("Unexpected end of JSON input"))).toBe("corrupt");
+    expect(classifyReadError(Object.assign(new Error("gone"), { code: "ENOENT" }))).toBe("absent");
+    expect(classifyReadError({ code: "ENOENT" })).toBe("absent");
+    expect(classifyReadError(Object.assign(new Error("denied"), { code: "EACCES" }))).toBe("error");
+    expect(classifyReadError(Object.assign(new Error("is a directory"), { code: "EISDIR" }))).toBe("error");
+    expect(classifyReadError(new Error("no code at all"))).toBe("error");
+    expect(classifyReadError("a string")).toBe("error");
+    expect(classifyReadError(null)).toBe("error");
+  });
+});
+
+describe("moveCorruptAside", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "warbandeer-storage-aside-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("logs the reason and the new name, and moves the file aside", () => {
+    const file = join(dir, "x.json");
+    writeFileSync(file, "not json");
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      moveCorruptAside(file, "test", "because I said so");
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(String(errorSpy.mock.calls[0]![0])).toContain("because I said so");
+      expect(String(errorSpy.mock.calls[1]![0])).toContain(".corrupt-");
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(dir).filter((f) => f.includes(".corrupt-")).length).toBe(1);
+  });
+
+  test("a failed rename is logged, not thrown", () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(() => moveCorruptAside(join(dir, "never-existed.json"), "test", "x")).not.toThrow();
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(String(errorSpy.mock.calls[1]![0])).toContain("couldn't move");
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });

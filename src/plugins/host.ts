@@ -198,7 +198,14 @@ function buildDeliveryApi(
         log.warn("destinations: could not read routing; reporting none");
         return [];
       }
-      const discovery = await deps.readDiscovery();
+      // #509: `readJsonOrFresh` now rethrows a read that fails for a reason other than a parse error, so
+      // discovery gets the same guard routing has above -- the list is still useful with ids for names.
+      let discovery: DiscoveryFile | null = null;
+      try {
+        discovery = await deps.readDiscovery();
+      } catch {
+        log.warn("destinations: could not read discovery; naming servers by id");
+      }
       const guildName = (guildId: string): string => discovery?.guilds.find((g) => g.id === guildId)?.name ?? guildId;
       return mappedDestinations(routing, name)
         .filter((d) => declared.has(d.destination))
@@ -1195,8 +1202,9 @@ export function buildPluginStateFile(opts: {
   return state;
 }
 
-/** Reads the previous state.json (fresh if absent/corrupt) — the source of the preserved bookkeeping
- * fields and of the installed-version pins installPlugins resolves against. */
+/** Reads the previous state.json (fresh if absent/corrupt; rejects on a read error that is neither, #509) —
+ * the source of the preserved bookkeeping fields and of the installed-version pins installPlugins
+ * resolves against. */
 export async function readPluginState(dataDir: string, storage: HostStorage): Promise<PluginStateFile> {
   return storage.readJsonOrFresh<PluginStateFile>(statePath(dataDir), () => ({ ...STATE_FRESH }), "plugins");
 }

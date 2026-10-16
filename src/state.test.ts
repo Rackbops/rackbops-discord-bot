@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stallBunWrite } from "../test/stallBunWrite";
 import { settled } from "../test/stateLeaks";
+import { failJsonRead, tempNameRegExp } from "../test/storageProbes";
+import { config } from "./config";
 import type { BotState } from "./state";
+import { DATA_DIR } from "./storage";
 
 // state.ts imports the `config` singleton (resolved from process.env at import time) -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
   botStateForTest,
+  capSeenReleaseIds,
   createStateWriter,
+  isRawBotState,
   loadStateFrom,
   normalizeSeenReleaseIds,
   resetBotStateForTest,
@@ -93,6 +98,52 @@ describe("botStateForTest / resetBotStateForTest", () => {
     await botStateForTest().writes;
     expect(saved).toBe(true);
   });
+
+  // #457: the cap is wired into the real save path, not just correct as a pure function. The probe repo
+  // is taken back out and saved again, so the file left under the test data dir carries nothing of it.
+  test("saveState caps the live history before it writes", async () => {
+    state.seenReleaseIds["cap/probe"] = Array.from({ length: 150 }, (_, i) => i);
+    try {
+      await saveState();
+      const written = JSON.parse(readFileSync(join(DATA_DIR, "state.json"), "utf8"));
+      expect(written.seenReleaseIds["cap/probe"]).toHaveLength(100);
+      expect(written.seenReleaseIds["cap/probe"][0]).toBe(50);
+    } finally {
+      delete state.seenReleaseIds["cap/probe"];
+      await saveState();
+    }
+  });
+});
+
+describe("capSeenReleaseIds (#457)", () => {
+  test("keeps the newest 100 of 150, per repo, in place", () => {
+    const ids = { "a/b": Array.from({ length: 150 }, (_, i) => i), "c/d": [1] };
+    const same = capSeenReleaseIds(ids);
+    expect(same).toBe(ids); // in place: every importer holds `state`
+    expect(ids["a/b"]).toEqual(Array.from({ length: 100 }, (_, i) => i + 50));
+    expect(ids["c/d"]).toEqual([1]);
+  });
+});
+
+describe("isRawBotState (#509)", () => {
+  test.each([
+    ["an empty object", {}, true],
+    ["a legacy global number list", { seenReleaseIds: [1] }, true],
+    ["a map of number lists", { seenReleaseIds: { "a/b": [1] } }, true],
+    ["a key the core no longer defines", { attemptedUpdateToSha: "x" }, true],
+    ["a map value of null", { seenReleaseIds: { "a/b": null } }, false],
+    ["a null seenReleaseIds (read as absent, as it always was)", { seenReleaseIds: null }, true],
+    ["a string seenReleaseIds", { seenReleaseIds: "abc" }, false],
+    ["a number seenReleaseIds", { seenReleaseIds: 42 }, false],
+    ["a boolean seenReleaseIds", { seenReleaseIds: true }, false],
+    ["a list of strings", { seenReleaseIds: ["1"] }, false],
+    ["a list of lists", { seenReleaseIds: [[1, 2]] }, false],
+    ["null", null, false],
+    ["a number", 42, false],
+    ["a list", [], false],
+  ])("%s", (_name, raw, expected) => {
+    expect(isRawBotState(raw)).toBe(expected);
+  });
 });
 
 describe("normalizeSeenReleaseIds", () => {
@@ -118,9 +169,10 @@ describe("normalizeSeenReleaseIds", () => {
 
 // Real file I/O against a temp dir — never the actual data/state.json — for the two failure
 // modes issue #42 fixed: a corrupt file crashing the top-level `await` at import, and two
-// overlapping writers tearing the file. `loadState`/`saveState` themselves stay bound to the
-// real STATE_FILE and untested here directly; loadStateFrom/saveStateTo/createStateWriter are
-// the same code they delegate to, extracted so it's testable against a path we control.
+// overlapping writers tearing the file. `loadState` stays bound to the real STATE_FILE; `saveState` is
+// driven for real by `dataIsolation.test.ts` (under the test data dir) and by the cap test below;
+// loadStateFrom/saveStateTo/createStateWriter are the same code they delegate to, extracted so it's
+// testable against a path we control.
 describe("loadStateFrom / saveStateTo / createStateWriter", () => {
   let dir: string;
   beforeEach(() => {
@@ -130,9 +182,70 @@ describe("loadStateFrom / saveStateTo / createStateWriter", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("absent file resolves fresh state, not an error", async () => {
-    const result = await loadStateFrom(join(dir, "state.json"));
-    expect(result).toEqual({ seenReleaseIds: {} });
+  test("absent file resolves fresh state, not an error, and logs nothing", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await loadStateFrom(join(dir, "state.json"));
+      expect(result).toEqual({ seenReleaseIds: {} });
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // `null` loaded as an empty map before the shape check (the normalizer's `??`), and still does: the
+  // other keys, `attemptedUpdateToSha` among them, must not be moved aside with the file.
+  test("a null seenReleaseIds loads as an empty map and keeps the file's other keys", async () => {
+    const file = join(dir, "state.json");
+    writeFileSync(file, '{"seenReleaseIds":null,"attemptedUpdateToSha":"abc"}');
+    expect(await loadStateFrom(file)).toEqual({ seenReleaseIds: {}, attemptedUpdateToSha: "abc" });
+    expect(existsSync(file)).toBe(true);
+  });
+
+  // #457: only the pure normalizer was tested, so a wrong repo at the call site stayed green.
+  test("migrates a legacy global array under config.githubRepo", async () => {
+    const file = join(dir, "state.json");
+    writeFileSync(file, '{"seenReleaseIds":[1,2]}');
+    expect(await loadStateFrom(file)).toEqual({ seenReleaseIds: { [config.githubRepo]: [1, 2] } });
+  });
+
+  // #509 item 8: these all parse, so they used to load (or load as {}) and then break every saveState
+  // (`null.slice`), or silently drop the file's contents.
+  test.each([
+    ["a null map value", '{"seenReleaseIds":{"a/b":null}}'],
+    ["a string seenReleaseIds", '{"seenReleaseIds":"abc"}'],
+    ["a number", "42"],
+    ["a list", "[]"],
+    ["null", "null"],
+  ])("a parseable file that is not a state object (%s) is moved aside and loads fresh", async (_name, text) => {
+    const file = join(dir, "state.json");
+    writeFileSync(file, text);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(await loadStateFrom(file)).toEqual({ seenReleaseIds: {} });
+      expect(errorSpy.mock.calls.some((c) => String(c[0]).includes("not a state object"))).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(dir).filter((f) => f.includes(".corrupt-")).length).toBe(1);
+  });
+
+  // loadStateFrom delegates to readJsonOrFresh, so a read that fails for a reason other than corruption
+  // surfaces here too (the top-level await in state.ts then fails the boot) instead of moving the file.
+  test("a read error that is not corruption propagates, and nothing is moved aside", async () => {
+    const file = join(dir, "state.json");
+    writeFileSync(file, '{"seenReleaseIds":{}}');
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const failing = failJsonRead(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }));
+    try {
+      await expect(loadStateFrom(file)).rejects.toThrow(/EIO/);
+    } finally {
+      failing.restore();
+      errorSpy.mockRestore();
+    }
+    expect(readFileSync(file, "utf8")).toBe('{"seenReleaseIds":{}}');
+    expect(readdirSync(dir).filter((f) => f.includes(".corrupt-"))).toEqual([]);
   });
 
   test("preserves unknown/legacy keys (e.g. a removed feature's dedup key) across load→save", async () => {
@@ -179,10 +292,23 @@ describe("loadStateFrom / saveStateTo / createStateWriter", () => {
     }
   });
 
-  test("saveStateTo never leaves a .tmp file behind on success", async () => {
+  test("saveStateTo leaves no *.tmp entry in the directory on success", async () => {
     const file = join(dir, "state.json");
     await saveStateTo(file, { seenReleaseIds: {} });
-    expect(existsSync(`${file}.tmp`)).toBe(false);
+    expect(readdirSync(dir)).toEqual(["state.json"]);
+  });
+
+  // #510 item 9: it used to write a fixed `${path}.tmp`, with none of storage.ts's per-process token.
+  test("saveStateTo writes through writeJsonAtomic's temp name, not a fixed .tmp", async () => {
+    const file = join(dir, "state.json");
+    const stall = stallBunWrite();
+    try {
+      void saveStateTo(file, { seenReleaseIds: {} }).catch(() => {});
+      await stall.reached;
+      expect(String(stall.calls[0]![0])).toMatch(tempNameRegExp(file));
+    } finally {
+      stall.restore();
+    }
   });
 
   // Issue #42's own probe: 160/300 overlapping bare-Bun.write pairs left invalid JSON. This is
