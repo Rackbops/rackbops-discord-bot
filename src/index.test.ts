@@ -162,14 +162,18 @@ describe("index.ts wiring", () => {
     // "reportPluginUpdateOutcome(" (…report P lugin…, not …report U pdate…), so the scan above finds
     // the /update report, and this finds the plugin one.
     const markReady = source.indexOf("markPluginStateReady(", activateFn);
+    const writeState = source.indexOf("await writePluginState({", activateFn);
     const pluginReport = source.indexOf("reportPluginUpdateOutcome(", activateFn);
-    for (const pos of [install, load, interactionOn, activatePlugins, startSched, restPut, report, markReady, pluginReport])
+    for (const pos of [install, load, interactionOn, activatePlugins, startSched, restPut, report, markReady, writeState, pluginReport])
       expect(pos).toBeGreaterThan(-1);
     expect(install).toBeLessThan(restPut); // builders come from the bundles
     expect(load).toBeLessThan(restPut);
     expect(activatePlugins).toBeLessThan(startSched); // #107: activate first so the scheduler's first synchronous tick runs plugin ticks (running=true) at boot
     expect(activatePlugins).toBeLessThan(report);
     expect(markReady).toBeLessThan(pluginReport); // report-back clears its marker via the now-live mutator
+    // #460: the pluginUpdates tick (and /plugins' writes) are gated on pluginStateReady precisely so they cannot
+    // race this one-time whole-file write; the flag must flip only after it.
+    expect(writeState).toBeLessThan(markReady);
     // #59/#143: neither the interaction handler nor plugin activation/the scheduler depends on
     // command registration having completed — attaching/starting them first cuts the "no handler,
     // no ticks" window (worst on a self-update handoff) by the rest.put round-trip.

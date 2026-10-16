@@ -11,10 +11,20 @@ import { config } from "./config";
  * *serially* (`announce.ts`), so a tick's **GitHub-fetch** budget is
  * `N_repos x TIMEOUT + 2 x TIMEOUT (the update check) + 2 x 5s (the plugin index)` — at 10s,
  * `10N + 30` seconds. Five repos is 80s. It stays strictly under `TICK_WATCHDOG_MS` (300s) up to
- * **26** repos; 27 hits it exactly and 28 exceeds it. Past that the watchdog releases
- * `tickInFlight` while the tick is still inside `checkReleases`, the next tick starts, and two
- * generations race the same un-persisted `seenReleaseIds` — the duplicate-announcement bug #87
- * closed. Adding many more watched repos means revisiting this number.
+ * **26** repos; 27 hits it exactly and 28 exceeds it. Past that, a tick whose every GitHub call hangs to
+ * its timeout outlives the watchdog, which logs and frees `tickInFlight` (from about 30 repos the tick is
+ * still inside `checkReleases` at that point). The next tick then starts, and the two generations do not
+ * redo each other's work: each gap-gated core check (releases, self-update, plugin updates, discovery)
+ * stamps its poll time at poll START and is gated on a 15-minute gap (`announce.ts`), so the new
+ * generation skips the releases walk the hung tick stamped on entry, runs -- if their own gaps have
+ * elapsed -- the later checks the hung tick never reached and stamps them, and the hung tick's tail then
+ * skips those in turn; the request drain is single-flight and a plugin tick whose previous call is still
+ * running is skipped (#217). Two `checkReleases` walks overlap only once one walk itself outlasts
+ * `RELEASE_POLL_GAP_MS` (900s) -- about 90 repos ALL hanging to the timeout -- and even then each id is
+ * persisted right after its announce, so an overlap can re-announce at most one repo's pending releases
+ * (usually one), never every repo's (#438). What a tick past the watchdog does cost is the watchdog's
+ * error line and a generation running beside the hung one's tail. Adding many watched repos still means
+ * revisiting this budget.
  *
  * Deliberately "GitHub-fetch budget" and not "the tick's worst case": the same tick can also spend
  * discord.js REST retries per announced release, and on the `restart` path a whole `redeploy()`

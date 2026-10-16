@@ -484,8 +484,11 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
           `skipping it quietly until it answers again`,
       );
     }
-    // Leave its seen-id list untouched, so a repo that comes back seeds silently rather
-    // than announcing everything published while it was invisible.
+    // Leave its seen-id list untouched: when the repo answers again, commitReleaseAnnouncements announces
+    // what was published meanwhile (the non-draft releases on the one page fetchReleases reads -- at most the
+    // newest 15 -- that are not in the list, oldest first), and only a repo with NO list, its first-ever poll,
+    // seeds silently (#437). A 404 that passes (a token that could not see the repo for a while; GitHub 404s
+    // a private repo it cannot read) must not cost real announcements.
     return;
   }
   if (releaseReachability.observe(repo, true) === "recovered") {
