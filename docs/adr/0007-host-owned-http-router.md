@@ -57,9 +57,10 @@ route.
    - Unset means no listener at all: ADR-0001's fail-closed rule.
    - It starts inside `activate()`, after `takeOver()`, so a standby never binds it (the standby
      invariant in `CONTEXT.md`). Shutdown stops it before plugins are disposed: the `disposePlugins`
-     closure `index.ts` hands to `shutdown.ts` calls `stopHttp()` first. From then on every request
-     is answered `503` with `Connection: close`, including one on a connection cloudflared kept
-     alive.
+     closure `index.ts` hands to `shutdown.ts` calls `stopHttp()` first. From then on no new request
+     reaches a plugin: on Bun 1.4.2 `server.stop()` also closes an idle connection cloudflared kept
+     alive (measured on Windows and in Linux CI, #494), and `startHostHttp` answers any request Bun
+     still hands over `503` with `Connection: close`.
    - `docker-compose.yml` publishes no host port for it; the only way in is the instance's tunnel.
    - The admin panel stays its own container, on its own hostname.
 4. **The host bounds and isolates every request, as it does a tick or an interaction.**

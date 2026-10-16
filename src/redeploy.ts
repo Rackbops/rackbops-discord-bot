@@ -840,8 +840,9 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * the env *says* — and `HANDOFF_FROM` is baked into the replacement's env at creation time and
  * never cleared, since container env is immutable. So it still reads "standby" on every later
  * in-place restart of the very container that already completed the handoff: `bot-ops.sh
- * restart`, the ops panel's Restart, a reboot, a daemon restart, or a crash loop under
- * `unless-stopped` — all of them, forever, against an original that's long gone.
+ * restart`, a reboot, a daemon restart, or a crash loop under `unless-stopped` — all of them,
+ * forever, against an original that's long gone. (The ops panel's Restart is not one of these since
+ * #277: it is a `recreate`, compose `--force-recreate`, a fresh container with no `HANDOFF_FROM` at all.)
  *
  * This confirms the instruction against the daemon before honoring it: standby only counts while
  * the named original still *exists*. Deliberately existence, not the original's live running

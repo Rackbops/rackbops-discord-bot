@@ -200,8 +200,9 @@ describe("awaitCriticalIdle (the live handoff exemption, #154)", () => {
   // A section that opens AFTER the handoff began — the 5-min watchdog releasing tickInFlight
   // mid-window, or a plugin tick — is exactly as unrelated to the handoff's own holder as one that
   // was already open before it. `beginHandoff()` is only ever called from inside exactly one
-  // withCritical (redeploy.ts:256, reached via checkForUpdate under withCritical in both
-  // announce.ts:225 and commands.ts:124), so critical is always >= 1 — never 0 — at that instant;
+  // `withCritical`: the one call site in `redeploy()`, reached via `checkForUpdate` under the
+  // `withCritical` of `announce.ts`'s `onTick` (which wraps the whole tick) and of `commands.ts`'s
+  // `/update` handler. So critical is always >= 1 — never 0 — at that instant;
   // this test opens that holder section first, matching the real invariant.
   test("waits for a critical section opened AFTER the handoff began, then resolves true", async () => {
     beginCritical(); // the handoff's own holder — open before beginHandoff, as it always is in production

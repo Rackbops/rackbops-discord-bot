@@ -216,8 +216,8 @@ ALLOWED_SPEC=(
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
   # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
   # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
-  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:114); the `@version` tail is exactly
-  # what resolveConfig accepts (src/config.ts:114: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:116); the `@version` tail is exactly
+  # what resolveConfig accepts (src/config.ts:116: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
   # appear in two different tokens (plugins_name_repeated, #430), since the bot refuses either at boot and env-set would
   # otherwise recreate it into a crash loop.
   'PLUGINS|^[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?(,[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?)*$'
@@ -315,6 +315,7 @@ declare -A RESERVED_KEYS=(
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
   [HANDOFF_RESTART_RETRIES]=1  # src/redeploy.ts: the original's on-failure retry cap, carried with the policy (#490)
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
+  [BOT_DOCKER_SOCKET]=1        # src/docker.ts: the daemon socket path, a test seam (#459) -- set by nothing in a deployment, and no plugin may claim it
   [SHARDS]=1                   # discord.js Client (src/client.ts builds it with no shard options): the shards it serves
   [SHARD_COUNT]=1              # discord.js Client: the shard count
   [SHARDING_MANAGER]=1         # discord.js Client: makes client.shard a ShardClientUtil
@@ -979,9 +980,9 @@ format_matches() {
 }
 
 # #430: true when a PLUGINS value names one plugin in two different tokens ("foo,foo@1.0.0",
-# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:119-121) and no ERE can
+# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:121-123) and no ERE can
 # say it. An exact repeat ("foo,foo") is not one: config.ts's list() drops repeated tokens first
-# (src/config.ts:70-77), so it boots, and env-set accepts it too. Only ever called on a value the
+# (src/config.ts:72-79), so it boots, and env-set accepts it too. Only ever called on a value the
 # PLUGINS row already matched, so every token is non-empty and holds no glob character.
 plugins_name_repeated() {
   local -A seen_tok=() seen_name=()
