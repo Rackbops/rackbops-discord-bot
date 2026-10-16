@@ -6,7 +6,7 @@
 // only picks up new code if whatever supervises the container supplies a rebuilt image. See README.
 //
 // A restart requested while an announcement or a state write is in flight is
-// deferred until the critical section unwinds, so `data/state.json` is never
+// deferred until the critical section unwinds (for at most RESTART_DEFERRAL_MAX_MS, see below), so `data/state.json` is never
 // truncated mid-write and no announcement is half-posted. Since #154 the same is true of an
 // EXTERNAL stop, not just a self-requested restart: `shutdown.ts`'s `SIGTERM`/`SIGINT` handler
 // awaits the same critical section (bounded by `SHUTDOWN_GRACE_MS`, kept meaningfully under
@@ -17,8 +17,9 @@
 // the stuck depth in the log, unless a handoff is active (the original must stay alive through a swap),
 // when it waits another round. And a shutdown owns the exit: once one is in progress, a pending restart's
 // section closing releases the shutdown's drain instead of exiting 75 ahead of `disposePlugins` and
-// `destroyClient`. A requested restart does not itself run the plugins' `dispose()`: `contract.ts` promises
-// it for a `docker stop`, a self-update's retire and SIGINT, not for this path (#512 item 4, declined).
+// `destroyClient`. A requested restart does not itself run the plugins' `dispose()`: `contract.ts` documents
+// it as running "on the way out" and lists a `docker stop`, a self-update's retire and SIGINT; a requested
+// restart is not among them, and this path is deliberately left as it is (#512 item 4, declined).
 //
 // A plugin tick holds its own unit of the critical section for as long as its call is pending, even
 // past PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #248). A restart request or a shutdown notifies the

@@ -420,11 +420,16 @@ describe("daemon calls", () => {
         expect(paths()).toEqual([`/containers/${SHORT}/json`, `/containers/${ID_A}/json`]);
         expect(mountinfo.calls).toBe(1);
         expect(warnSpy).toHaveBeenCalledTimes(1);
+        // names the hostname and the first 12 characters of the id it wrongly resolved to
+        expect(String(warnSpy.mock.calls[0]![0])).toContain(`HOSTNAME ${SHORT} resolved to another container (ffffffffffff)`);
       } finally {
         warnSpy.mockRestore();
       }
     });
 
+    // Deliberate, and declined as a gap (see inspectSelf's docblock): a 12-hex hostname is taken for Docker's own
+    // short id, so a hostname pinned to a SIBLING's 12-hex id prefix would pass this too. Reading mountinfo on the
+    // common path to tell them apart would also turn the redeploy harnesses red inside a container.
     test("a short-id hostname whose answer matches is accepted without reading mountinfo", async () => {
       process.env.HOSTNAME = SHORT;
       const id = SHORT + "0".repeat(52);
@@ -434,6 +439,61 @@ describe("daemon calls", () => {
       expect(self.Id).toBe(id);
       expect(paths()).toEqual([`/containers/${SHORT}/json`]);
       expect(mountinfo.calls).toBe(0);
+    });
+
+    // The short-id rule is exactly 12 hex characters, anchored, and a PREFIX of the answer's id: not "any 12
+    // characters", not a hex string of another length, not an id that merely contains the hostname.
+    test("a 12-character hostname that is not hex is a pinned name, checked against mountinfo", async () => {
+      process.env.HOSTNAME = "discord-bots";
+      answering({ "/containers/discord-bots/json": ID_A });
+      const mountinfo = reader(mountinfoFor(ID_A));
+      const self = await inspectSelf(1000, mountinfo.read);
+      expect(self.Id).toBe(ID_A);
+      expect(paths()).toEqual(["/containers/discord-bots/json"]); // accepted as itself: no fallback GET
+      expect(mountinfo.calls).toBe(1); // compared with mountinfo, which a short-id hostname would not have read
+    });
+
+    test.each([
+      ["13 hex characters", "abcdef0123456"],
+      ["64 hex characters", "f".repeat(64)],
+    ])("a hostname of %s is a pinned name, not a short id, even when the answer's id starts with it", async (_name, host) => {
+      process.env.HOSTNAME = host;
+      answering({ [`/containers/${host}/json`]: host.padEnd(64, "0"), [`/containers/${ID_A}/json`]: ID_A });
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
+        expect(self.Id).toBe(ID_A); // mountinfo says otherwise, so the answer is a sibling's
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a short-id hostname that only appears inside the answer's id is not a prefix of it", async () => {
+      process.env.HOSTNAME = SHORT;
+      answering({ [`/containers/${SHORT}/json`]: "1" + SHORT + "0".repeat(51), [`/containers/${ID_A}/json`]: ID_A });
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
+        expect(self.Id).toBe(ID_A);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a 200 without an Id (a broken proxy) is a mismatch, not a TypeError", async () => {
+      process.env.HOSTNAME = SHORT;
+      stub((url) =>
+        new URL(url).pathname === `/containers/${ID_A}/json`
+          ? new Response(JSON.stringify({ Id: ID_A }), { status: 200 })
+          : new Response("{}", { status: 200 }),
+      );
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
+        expect(self.Id).toBe(ID_A);
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     test("a pinned hostname that resolves to a sibling is rejected when mountinfo names another id", async () => {
@@ -482,6 +542,27 @@ describe("daemon calls", () => {
       try {
         await expect(inspectSelf(1000, reader("1 1 0:1 / / rw").read)).rejects.toThrow(/cannot determine own container id/);
       } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // Every other test injects the reader, so without this a wrong default (an empty string, a misspelt path)
+    // would turn the identity check into "accept" and break the fallback leg with the suite green.
+    test("the default reader is /proc/self/mountinfo", async () => {
+      process.env.HOSTNAME = "bot";
+      answering({ "/containers/bot/json": ID_F, [`/containers/${ID_A}/json`]: ID_A });
+      const paths_ = [] as string[];
+      const fileSpy = spyOn(Bun, "file").mockImplementation(((path: string) => {
+        paths_.push(String(path));
+        return { text: async () => mountinfoFor(ID_A) };
+      }) as never);
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000);
+        expect(paths_).toEqual(["/proc/self/mountinfo"]);
+        expect(self.Id).toBe(ID_A); // the sibling was rejected on what that file said
+      } finally {
+        fileSpy.mockRestore();
         warnSpy.mockRestore();
       }
     });

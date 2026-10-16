@@ -103,6 +103,7 @@ describe("requestRestart", () => {
 describe("a deferred restart's deadline (#512)", () => {
   test("a deferred restart exits anyway once the deadline passes, and says so", async () => {
     const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
     try {
       beginCritical();
       requestRestart("test", 20);
@@ -115,8 +116,11 @@ describe("a deferred restart's deadline (#512)", () => {
       const line = String(errorSpy.mock.calls[0]![0]);
       expect(line).toContain("did not finish within 20ms");
       expect(line).toContain("critical depth 1");
+      // the exit carries the reason the restart was requested with
+      expect(logSpy.mock.calls.some((c) => String(c[0]).includes("exiting (75): test"))).toBe(true);
     } finally {
       errorSpy.mockRestore();
+      logSpy.mockRestore();
     }
   });
 
@@ -172,6 +176,20 @@ describe("a deferred restart's deadline (#512)", () => {
     endCritical();
     expect(exits).toEqual([]); // not 75: the handler goes on to dispose the plugins, close the gateway and exit 0
     expect(await idle).toBe(true);
+  });
+
+  // The reachable ordering: the SIGTERM handler has begun the shutdown and a tick, inside its section, then
+  // asks for a restart (the case with nothing open cannot happen: every caller holds a section).
+  test("a restart requested after a shutdown began, with a section open, arms no deadline and exits nothing", async () => {
+    beginCritical();
+    beginShutdown("SIGTERM");
+    requestRestart("test", 20);
+    expect(stateForTest().pending).toBe("test");
+    expect(stateForTest().deferralArmed).toBe(false);
+    await Bun.sleep(60);
+    expect(exits).toEqual([]);
+    endCritical();
+    expect(exits).toEqual([]);
   });
 
   test("a shutdown that begins while a deferral is armed disarms it", async () => {

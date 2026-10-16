@@ -155,6 +155,11 @@ export function parseContainerId(mountinfo: string): string | undefined {
  * A mismatch, like a non-ok answer, falls through to the mountinfo leg. Where mountinfo cannot be read
  * (not Docker) or names no container (a plain host), a pinned hostname's answer stands, as before.
  *
+ * Not covered, declined (#512 item 2): a hostname pinned to a SIBLING's 12-hex id prefix. It is
+ * indistinguishable from Docker's own short id without reading mountinfo on the common path, which would
+ * also turn the redeploy harnesses red for anyone running the suite inside a container. A pinned NAME
+ * (the issue's usual case) is covered.
+ *
  * `readMountinfo` is injectable so a test needs no `Bun.file` swap; it is read at most once per call.
  */
 export async function inspectSelf(
@@ -184,15 +189,19 @@ export async function inspectSelf(
       const res = await api(`/containers/${encodeURIComponent(host)}/json`, s);
       if (res.ok) {
         const answer = (await res.json()) as ContainerInspect;
+        // A 200 without a string Id (a broken proxy) is a mismatch, not a TypeError.
+        const answerId = typeof answer?.Id === "string" ? answer.Id : "";
         const isSelf = /^[0-9a-f]{12}$/.test(host)
-          ? answer.Id.startsWith(host)
-          : ((await ownId()) ?? answer.Id) === answer.Id;
+          ? answerId.startsWith(host)
+          : ((await ownId()) ?? answerId) === answerId;
         if (isSelf) return answer;
-        console.warn(`[docker] HOSTNAME ${host} resolved to another container (${answer.Id.slice(0, 12)}); using mountinfo`);
+        console.warn(`[docker] HOSTNAME ${host} resolved to another container (${answerId.slice(0, 12)}); using mountinfo`);
       }
     }
     const id = await ownId();
-    if (!id) throw new Error("cannot determine own container id (not running under Docker?)");
+    if (!id) {
+      throw new Error("cannot determine own container id (not running under Docker, or HOSTNAME resolved to another container and mountinfo names none)");
+    }
     return (await (await ok(`/containers/${encodeURIComponent(id)}/json`, s)).json()) as ContainerInspect;
   });
 }
