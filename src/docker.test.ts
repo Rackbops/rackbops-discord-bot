@@ -62,6 +62,8 @@ describe("resolveDockerSocket (#459)", () => {
     expect(resolveDockerSocket({})).toBe("/var/run/docker.sock");
     expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "" })).toBe("/var/run/docker.sock");
     expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "/srv/d.sock" })).toBe("/srv/d.sock");
+    // The generic name (a line copied from another stack's .env) must not redirect anything: why the key is BOT_-prefixed.
+    expect(resolveDockerSocket({ DOCKER_SOCKET: "/other/d.sock" })).toBe("/var/run/docker.sock");
   });
 });
 
