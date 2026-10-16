@@ -542,7 +542,8 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
  * releases already posted, or the next poll re-announces them. Among what remains at-least-once
  * (#499; CONTEXT.md's Behavior section lists the rest): an exit in the instant between a post and
  * its save, or a save that fails and is followed by a restart before a later save succeeds, re-posts
- * that one release (the id is already in memory, so the same process does not post it twice).
+ * the releases whose saves had not landed (the ids are already in memory, so the same process does not
+ * post them twice).
  */
 export async function commitReleaseAnnouncements(
   releases: Release[],

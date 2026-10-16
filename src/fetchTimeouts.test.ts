@@ -18,7 +18,7 @@ const { config } = await import("./config");
  * all `await res.json()` after the fetch resolves — a bound that covered only the request would
  * miss it. (It doesn't: `AbortSignal.timeout` stays armed through the body read.)
  */
-describe("every GitHub call is timeout-bounded, and every HTTP fetch in src/ carries a signal", () => {
+describe("every GitHub call is timeout-bounded, and every fetch(/fetchFn(/fetchImpl(/deps.fetch( call in src/ carries a signal", () => {
   // Every call takes an overridable timeout so each can be driven — and mutated —
   // independently, without waiting out the real 10s bound.
   const TINY = 20;
@@ -141,7 +141,7 @@ describe("every GitHub call is timeout-bounded, and every HTTP fetch in src/ car
   // `globalThis.fetch(`, `Bun.fetch(`, `fetch (`, an alias (`const f = fetch`), or a new helper name is not seen
   // at all (the count pin of eleven cannot help there), `ops/` is not scanned, and a `signal` word inside the
   // arguments only has to appear, even in a comment or an unrelated key.
-  test("no HTTP fetch anywhere in src/ is missing a signal", async () => {
+  test("no fetch(, fetchFn(, fetchImpl( or deps.fetch( call in src/ is missing a signal", async () => {
     // Paren-balanced, not a regex: these calls close with `});`, and a first attempt at this
     // matching `\n\s*\);` found ZERO of them — so the loop body never ran and the test passed
     // vacuously while a deliberately-added unbounded sixth call sat right there. Hence the

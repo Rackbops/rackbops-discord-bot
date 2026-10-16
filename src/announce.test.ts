@@ -582,7 +582,7 @@ describe("checkReleases (#342)", () => {
   // #499 item 5: one page per poll. A whole page of releases that are all new, on a repo we have polled before, means
   // older ones may exist that were never fetched; the poll says so. Four things pinned here: it warns at a full page,
   // not at 14; not on a first poll (the seed); not when any release on the page is already seen.
-  test("a whole page of new releases on a repo polled before warns that older ones were not fetched (#499)", async () => {
+  test("a whole page of new releases on a repo polled before warns that older ones may not have been fetched (#499)", async () => {
     const repo = "rackbops/page-probe";
     const { fakeClient, sent } = recordingClient();
     let answer: unknown[] = [];
@@ -687,6 +687,35 @@ describe("checkReleases (#342)", () => {
     }
   });
 
+  // The docs say a save that fails does not make the SAME process post a release twice: persist records the id in
+  // memory before saveState runs. Only a restart before a later save succeeds re-posts it. Swapping those two lines
+  // (save first, record after) would re-post the release on every poll while saves keep failing.
+  test("a save that fails does not make the same process re-post the release on the next poll (#499)", async () => {
+    const repo = "rackbops/save-fail-probe";
+    const { fakeClient, sent } = recordingClient();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify([gh(3), gh(2), gh(1)]), { status: 200 })) as unknown as typeof fetch);
+    const writeSpy = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    state.seenReleaseIds[repo] = [1];
+    try {
+      await checkReleases(fakeClient, [repo]); // posts v2; its save fails, which stops this poll and is logged
+      expect(sent).toEqual(["📦 New release: **v2**\nhttps://example.test/r/2"]);
+      expect(errorSpy).toHaveBeenCalled();
+      expect(state.seenReleaseIds[repo]).toEqual([1, 2]); // recorded in memory although the save failed
+      await checkReleases(fakeClient, [repo]); // the next poll posts v3 and NOT v2 again
+      expect(sent).toEqual(["📦 New release: **v2**\nhttps://example.test/r/2", "📦 New release: **v3**\nhttps://example.test/r/3"]);
+    } finally {
+      writeSpy.mockRestore();
+      delete state.seenReleaseIds[repo];
+      await saveState();
+      fetchSpy.mockRestore();
+      errorSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+    }
+  });
+
   // #499 item 6: a restart or shutdown pending mid-walk ends the walk between repos instead of racing the drain's grace
   // through the ones left (the next walk -- the next boot's startup catch-up -- polls them). The complement, with no
   // restart pending, is "calls checkRepo once per repo" above.
@@ -712,7 +741,7 @@ describe("checkReleases (#342)", () => {
     }
   });
 
-  // #499 items 7 and 8: a pre-release is announced as one (the final release later posts again, as itself), and the
+  // #499 items 7 and 8: a pre-release is announced as one (a separate final release posts again, as itself; one promoted in place keeps its id and does not), and the
   // name is bounded, so one huge name cannot make every post for the repo fail and block the newer releases.
   test("a pre-release is announced as one, and a long name is clamped (#499)", async () => {
     const repo = "rackbops/pre-probe";
