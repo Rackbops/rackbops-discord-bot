@@ -73,6 +73,12 @@ describe("resolveConfig", () => {
     expect(() => resolveConfig({ ANNOUNCE_CHANNEL_ID: "100" })).toThrow(/DISCORD_TOKEN/);
   });
 
+  // #494 item 11: `required()` refuses a BLANK value like an unset one; a blank DISCORD_TOKEN must not reach login.
+  test("a blank required var is refused like a missing one", () => {
+    expect(() => resolveConfig({ DISCORD_TOKEN: "", ANNOUNCE_CHANNEL_ID: "100" })).toThrow(/DISCORD_TOKEN/);
+    expect(() => resolveConfig({ DISCORD_TOKEN: "t", ANNOUNCE_CHANNEL_ID: "" })).toThrow(/ANNOUNCE_CHANNEL_ID/);
+  });
+
   test("command prefix defaults to empty and passes through when set", () => {
     expect(resolveConfig(base).commandPrefix).toBe("");
     expect(resolveConfig({ ...base, COMMAND_PREFIX: "r_" }).commandPrefix).toBe("r_");
@@ -80,6 +86,13 @@ describe("resolveConfig", () => {
 
   test("rejects an uppercase / invalid COMMAND_PREFIX", () => {
     expect(() => resolveConfig({ ...base, COMMAND_PREFIX: "R_" })).toThrow(/COMMAND_PREFIX/);
+  });
+
+  // #494 item 11: the {1,20} cap was untested at its edge (Discord caps a command name at 32, and the prefix
+  // shares it with the name).
+  test("COMMAND_PREFIX is capped at 20 characters", () => {
+    expect(resolveConfig({ ...base, COMMAND_PREFIX: "a".repeat(20) }).commandPrefix).toBe("a".repeat(20));
+    expect(() => resolveConfig({ ...base, COMMAND_PREFIX: "a".repeat(21) })).toThrow(/COMMAND_PREFIX/);
   });
 
   test("REPORT_ROLE_ID is optional and passes through", () => {
@@ -114,11 +127,28 @@ describe("resolveConfig", () => {
     ).toEqual(["nazumods/wow", "roshne/ActionBarMaster"]);
   });
 
-  test("WATCHED_REPOS=none turns the release watcher off: watchedRepos is empty", () => {
+  test("WATCHED_REPOS=none turns the release watcher off; any other spelling of none is refused by name", () => {
     expect(resolveConfig({ ...base, WATCHED_REPOS: "none" }).watchedRepos).toEqual([]);
     expect(resolveConfig({ ...base, WATCHED_REPOS: " none " }).watchedRepos).toEqual([]);
-    // Only the exact lowercase word is the switch; anything else keeps today's list parsing.
-    expect(resolveConfig({ ...base, WATCHED_REPOS: "NONE" }).watchedRepos).toEqual(["NONE"]);
+    // Only the exact lowercase word is the switch (#342); `NONE`/`None` used to become the repo `NONE` that
+    // GitHub 404s every tick (#494), so they are refused, with the reason.
+    for (const bad of ["NONE", "None"]) {
+      expect(() => resolveConfig({ ...base, WATCHED_REPOS: bad })).toThrow(/only the lowercase word none/);
+      expect(() => resolveConfig({ ...base, WATCHED_REPOS: bad })).toThrow(new RegExp(`got "${bad}"`));
+    }
+  });
+
+  // #494 item 10. The class is the one ops/bot-ops.sh's env-set row already enforces, so a value env-set
+  // accepts still boots.
+  test("a WATCHED_REPOS entry that is not owner/repo is refused, naming it", () => {
+    for (const bad of ["foo", "a/b/c", "acme/", "/thing", "acme/thing beta"]) {
+      expect(() => resolveConfig({ ...base, WATCHED_REPOS: `acme/ok,${bad}` })).toThrow(
+        `WATCHED_REPOS must be "none" or a comma-separated list of owner/repo, got "${bad}"`,
+      );
+      // The none hint belongs to the none spellings only: an unconditional hint would tell every typo about it.
+      expect(() => resolveConfig({ ...base, WATCHED_REPOS: `acme/ok,${bad}` })).not.toThrow(/lowercase word none/);
+    }
+    expect(resolveConfig({ ...base, WATCHED_REPOS: "Acme/Thing.js, x_y/z-w" }).watchedRepos).toEqual(["Acme/Thing.js", "x_y/z-w"]);
   });
 
   test("none mixed into a WATCHED_REPOS list is refused by name", () => {
@@ -370,14 +400,16 @@ describe("resolveConfig -- TRUSTED_PROXY_HOST (#319)", () => {
     expect("trustedProxyHost" in resolveConfig({ ...base, TRUSTED_PROXY_HOST: "" })).toBe(false);
   });
 
-  test("a compose hostname or an IP literal (v4 or v6) is accepted verbatim", () => {
-    for (const value of ["cloudflared", "172.18.0.1", "fd00::1"]) {
+  // #494 item 9: an underscore is legal in a compose service name; an IPv6 literal is accepted in any spelling
+  // (clientIp.ts canonicalizes both sides of the comparison), but never in brackets, which `dns.lookup` cannot resolve.
+  test("a compose hostname or an IP literal (v4 or v6, any spelling) is accepted verbatim", () => {
+    for (const value of ["cloudflared", "cloud_flared", "172.18.0.1", "fd00::1", "FD00::1", "fd00:0:0:0:0:0:0:1", "::ffff:10.0.0.5", "fe80::1%8", "fe80::b1c9:ea7d:c0c5:bd23%Ethernet"]) {
       expect(resolveConfig({ ...base, TRUSTED_PROXY_HOST: value }).trustedProxyHost).toBe(value);
     }
   });
 
   test("anything that isn't a hostname or IP address is refused at boot, naming the value", () => {
-    for (const bad of ["tunnel host", "a/b"]) {
+    for (const bad of ["tunnel host", "a/b", "[fd00::1]", "fd00::1:"]) {
       expect(() => resolveConfig({ ...base, TRUSTED_PROXY_HOST: bad })).toThrow(
         `TRUSTED_PROXY_HOST must be a hostname or IP address, got "${bad}"`,
       );

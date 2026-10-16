@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 export interface Config {
   discordToken: string;
   announceChannelId: string;
@@ -131,6 +133,19 @@ export function resolveConfig(env: Env): Config {
     );
   }
 
+  // #494: each entry is `owner/repo` -- the class ops/bot-ops.sh's env-set row already enforces, so a value
+  // env-set accepts still boots; a hand-edited .env with `None`, a bare word or a path used to become a repo
+  // GitHub 404s every tick. Only the lowercase word `none` is the switch (#342); any other case is refused by
+  // name with a hint rather than guessed at.
+  const REPO_SHAPE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+  const badRepo = releaseWatchOff ? undefined : watchedRepos.find((r) => !REPO_SHAPE.test(r));
+  if (badRepo !== undefined) {
+    throw new Error(
+      `WATCHED_REPOS must be "none" or a comma-separated list of owner/repo, got "${badRepo}"` +
+        (badRepo.toLowerCase() === "none" ? " (only the lowercase word none switches the release watcher off)" : ""),
+    );
+  }
+
   // #220: the host's HTTP router (ADR-0007). Unset or blank means no listener — fail closed.
   const httpPortRaw = optional("HTTP_PORT");
   let httpPort: number | undefined;
@@ -142,11 +157,13 @@ export function resolveConfig(env: Env): Config {
   }
 
   // #319: the tunnel sidecar CF-Connecting-IP is trusted from. Unset or blank means never trusted
-  // -- fail closed, the same rule #220's own HTTP_PORT above uses. A hostname or an IP literal
-  // (IPv6 included, since a tunnel running on the host reaches the container via the bridge
-  // gateway's address rather than a compose service name).
+  // -- fail closed, the same rule #220's own HTTP_PORT above uses. A hostname (letters, digits, `.`, `_`,
+  // `-` -- a compose service name may carry an underscore) or an IP literal as `node:net`'s `isIP` reads
+  // it: IPv6 in any spelling (a zone id is accepted and ignored), **without** brackets, which `dns.lookup`
+  // cannot resolve (a tunnel running on the host reaches the container via the bridge gateway's address
+  // rather than a compose service name). `clientIp.ts` canonicalizes both sides of the comparison (#494).
   const trustedProxyHost = optional("TRUSTED_PROXY_HOST");
-  if (trustedProxyHost !== undefined && !/^[A-Za-z0-9.:[\]-]+$/.test(trustedProxyHost)) {
+  if (trustedProxyHost !== undefined && isIP(trustedProxyHost) === 0 && !/^[A-Za-z0-9_.-]+$/.test(trustedProxyHost)) {
     throw new Error(`TRUSTED_PROXY_HOST must be a hostname or IP address, got "${trustedProxyHost}"`);
   }
 
