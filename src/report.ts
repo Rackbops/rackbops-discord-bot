@@ -127,7 +127,8 @@ export async function handleReportCommand(interaction: ChatInputCommandInteracti
  * public message — an `@everyone` typed into the modal must render as text, not fire.
  *
  * The gate runs again here (#448), before `deferReply` and before any network call: the same
- * configuration and role checks as `handleReportCommand`, refusing ephemerally. The command's gate is the
+ * configuration and role checks as `handleReportCommand`, refusing ephemerally (a submit with no `member` gets
+ * the role refusal; the DM wording, `REPORT_DM_REFUSAL`, is the command's, #504). The command's gate is the
  * user-facing one; this is defence in depth, because this code cannot verify that Discord scopes a modal
  * submission to the interaction that showed it (CONTEXT.md already says a forged `modal_submit` can carry any
  * `customId`), and whether a roleless account can actually forge one is left unverified. It also closes what

@@ -272,9 +272,9 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
           // BEFORE the reply (#503 item 10): a reply Discord rejects (an expired token) used to throw past the
           // requestRestart, leaving the pin and the report on disk with no restart requested and the admin told
           // "Couldn't act". Inside the section the order costs nothing -- it only defers. A reply that fails AFTER the
-          // request is logged here and swallowed: the process exits for the restart when this section closes, so the
-          // outer catch below usually cannot run (only another open critical section would still defer the exit) and
-          // could not send anything true.
+          // request is logged here and swallowed: the restart is already requested, so a "Couldn't act" edit would
+          // be false (and the process exits for the restart when this section closes, so it could not be sent). The
+          // outer catch below therefore only sees what throws BEFORE the restart is requested: the pin write.
           const { from, to } = result.restart;
           await withCritical(async () => {
             if (result.mutate) await mutatePluginState(DATA_DIR, result.mutate);
@@ -321,10 +321,10 @@ export const PLUGIN_NOT_RUNNING_REPLY = "This command isn't available right now.
  * dispatched only while its plugin is `running`, the same gate its ticks, HTTP routes and component,
  * modal and autocomplete handlers already had: checked before the routing gate, and again after it,
  * since a dispose may begin while the gate is awaited. A refusal -- the plugin not running, or no handler at
- * all (#504) -- is a private reply. A throw from the
- * plugin's handler is isolated the way `dispatchPluginInteractionOutcome` isolates a component's: logged
- * as `[plugins] <name> command /<command> failed`, answered with a best-effort private "Something went
- * wrong." when the plugin had not replied or deferred, and reported as `error`.
+ * all (#504) -- is a private reply. A throw from the plugin's handler is isolated the way
+ * `dispatchPluginInteractionOutcome` isolates a component's: logged as `[plugins] <name> command /<command>
+ * failed`, answered with a best-effort private "Something went wrong." when the plugin had not replied or
+ * deferred, and reported as `error`.
  */
 export async function handleCommand(
   interaction: ChatInputCommandInteraction,

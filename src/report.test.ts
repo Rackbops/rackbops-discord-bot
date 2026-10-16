@@ -215,7 +215,7 @@ describe("handleReportCommand — the role gate and the modal", () => {
     expect(dm.calls.replied?.flags).toBe(MessageFlags.Ephemeral);
   });
 
-  test("the DM refusal says what to do, in words: never an empty reply Discord would reject (#504)", () => {
+  test("the DM refusal's text is pinned: never an empty reply Discord would reject (#504)", () => {
     expect(REPORT_DM_REFUSAL).toBe("This command works only in a server channel.");
   });
 

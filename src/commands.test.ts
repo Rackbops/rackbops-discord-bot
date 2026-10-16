@@ -15,7 +15,7 @@ const target = (command: PluginCommand, running: () => boolean = () => true): Pl
 const { config } = await import("./config");
 const { shortSha, DATA_DIR } = await import("./storage");
 const { markPluginStateReady, resetPollStateForTest } = await import("./announce");
-const { setExitFn, resetForTest: resetRestartForTest, restartPending, RESTART_EXIT_CODE } = await import("./restart");
+const { setExitFn, resetForTest: resetRestartForTest, restartPending, stateForTest, RESTART_EXIT_CODE } = await import("./restart");
 const { HOST_API_VERSION } = await import("./plugins/contract");
 const coreBodyFixture = await Bun.file(new URL("./fixtures/command-body.main.json", import.meta.url)).json();
 
@@ -754,6 +754,53 @@ describe("handleCommand — /update", () => {
       if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
     }
   });
+
+  // The catch strips the request off a failed reply (#545) and logs BEFORE it replies (#503 item 11): when the failure
+  // reply is rejected too, that line is the only record of what went wrong. Mutations: logging the raw error leaks
+  // the interaction token; moving the log below the reply loses it when the reply throws.
+  test("a /update whose reply Discord rejects is logged without the token, even when the failure reply is rejected too", async () => {
+    for (const rejections of [1, 2]) {
+      const realSha = config.gitSha;
+      const failure = replyFailure("webhook");
+      const edits: string[] = [];
+      let editCalls = 0;
+      let warn: ReturnType<typeof spyOn> | undefined;
+      let pushedAdmin = false;
+      try {
+        config.adminUserIds.push("999");
+        pushedAdmin = true;
+        config.gitSha = ""; // "disabled": no fetch, and a reply to send
+        warn = spyOn(console, "warn").mockImplementation(() => {});
+        const interaction = {
+          commandName: "update",
+          user: { id: "999" },
+          channelId: "c1",
+          applicationId: "app",
+          token: "tok",
+          deferReply: async () => {},
+          editReply: async (content: string) => {
+            editCalls += 1;
+            if (editCalls <= rejections) throw failure.error;
+            edits.push(content);
+          },
+        } as unknown as ChatInputCommandInteraction;
+        if (rejections === 1) {
+          expect(await handleCommand(interaction)).toBe("answered");
+          expect(edits).toEqual(["⚠️ Update check failed: Unknown interaction"]);
+        } else {
+          await expect(handleCommand(interaction)).rejects.toBe(failure.error);
+          expect(edits).toEqual([]);
+        }
+        const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[update] /update failed");
+        expect(failed).toBeDefined();
+        expectCleanedLog(failed!, failure);
+      } finally {
+        warn?.mockRestore();
+        config.gitSha = realSha;
+        if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+      }
+    }
+  });
 });
 
 describe("handleCommand — /plugins", () => {
@@ -772,41 +819,50 @@ describe("handleCommand — /plugins", () => {
 
   // T5: /plugins list's catch logs too. The index fetch fails (loadPluginIndex falls back and warns itself); the
   // state read is real; the deferred reply's edit is rejected once, as an expired token would be.
-  test("a failed /plugins list is logged without the token, not only replied (#503 item 11)", async () => {
-    const edits: string[] = [];
-    const failure = replyFailure("webhook");
-    let editCalls = 0;
-    let fetchSpy: ReturnType<typeof spyOn> | undefined;
-    let warn: ReturnType<typeof spyOn> | undefined;
-    let pushedAdmin = false;
-    try {
-      config.adminUserIds.push("999");
-      pushedAdmin = true;
-      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
-        throw new Error("offline");
-      }) as unknown as typeof fetch);
-      warn = spyOn(console, "warn").mockImplementation(() => {});
-      const interaction = {
-        commandName: "plugins",
-        user: { id: "999" },
-        channelId: "c1",
-        options: { getSubcommand: () => "list" },
-        deferReply: async () => {},
-        editReply: async (content: string) => {
-          editCalls += 1;
-          if (editCalls === 1) throw failure.error; // the list reply: token expired
-          edits.push(content);
-        },
-      } as unknown as ChatInputCommandInteraction;
-      await handleCommand(interaction);
-      expect(edits).toEqual(["⚠️ Couldn't list plugins: Unknown interaction"]);
-      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins list failed");
-      expect(failed).toBeDefined();
-      expectCleanedLog(failed!, failure);
-    } finally {
-      warn?.mockRestore();
-      fetchSpy?.mockRestore();
-      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+  // The log comes BEFORE the failure reply: when that reply is rejected too (`rejections` 2), the line is the only
+  // record of the original failure. Mutation: moving the warn below the reply loses it.
+  test("a failed /plugins list is logged without the token, even when the failure reply is rejected too (#503 item 11)", async () => {
+    for (const rejections of [1, 2]) {
+      const edits: string[] = [];
+      const failure = replyFailure("webhook");
+      let editCalls = 0;
+      let fetchSpy: ReturnType<typeof spyOn> | undefined;
+      let warn: ReturnType<typeof spyOn> | undefined;
+      let pushedAdmin = false;
+      try {
+        config.adminUserIds.push("999");
+        pushedAdmin = true;
+        fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+          throw new Error("offline");
+        }) as unknown as typeof fetch);
+        warn = spyOn(console, "warn").mockImplementation(() => {});
+        const interaction = {
+          commandName: "plugins",
+          user: { id: "999" },
+          channelId: "c1",
+          options: { getSubcommand: () => "list" },
+          deferReply: async () => {},
+          editReply: async (content: string) => {
+            editCalls += 1;
+            if (editCalls <= rejections) throw failure.error; // the list reply: token expired
+            edits.push(content);
+          },
+        } as unknown as ChatInputCommandInteraction;
+        if (rejections === 1) {
+          await handleCommand(interaction);
+          expect(edits).toEqual(["⚠️ Couldn't list plugins: Unknown interaction"]);
+        } else {
+          await expect(handleCommand(interaction)).rejects.toBe(failure.error);
+          expect(edits).toEqual([]);
+        }
+        const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins list failed");
+        expect(failed).toBeDefined();
+        expectCleanedLog(failed!, failure);
+      } finally {
+        warn?.mockRestore();
+        fetchSpy?.mockRestore();
+        if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+      }
     }
   });
 
@@ -859,7 +915,7 @@ describe("handleCommand — /plugins", () => {
 // plugins/updates.test.ts's helpers build; the data dir is test/setup.ts's per-run BOT_DATA_DIR. The exit is stubbed:
 // in production the process is gone the moment the critical section closes, which is why the failed reply must be
 // logged inside it (and why no "Couldn't act" edit follows).
-describe("handleCommand — /plugins update now (#503 item 10)", () => {
+describe("handleCommand — /plugins driven end to end: update now (#503 item 10) and an action's failure (#503 item 11)", () => {
   const statePath = `${DATA_DIR}/plugins/state.json`;
   const indexCache = `${DATA_DIR}/plugins/index.json`;
   const indexBody = {
@@ -885,6 +941,7 @@ describe("handleCommand — /plugins update now (#503 item 10)", () => {
     const edits: string[] = [];
     let editCalls = 0;
     let pendingAtReply: boolean | undefined;
+    let reasonAtReply: string | undefined;
     const failure = replyFailure("webhook"); // editReply PATCHes the interaction's webhook
     let restoreExit = () => {};
     let fetchSpy: ReturnType<typeof spyOn> | undefined;
@@ -916,6 +973,7 @@ describe("handleCommand — /plugins update now (#503 item 10)", () => {
           editCalls += 1;
           if (editCalls === 1) {
             pendingAtReply = restartPending(); // #503 item 10: the restart must already be requested here
+            reasonAtReply = stateForTest().pending;
             throw failure.error; // the "Updating … now" reply: token expired
           }
           edits.push(content);
@@ -926,6 +984,7 @@ describe("handleCommand — /plugins update now (#503 item 10)", () => {
       // The restart was requested BEFORE the reply went out, inside the critical section, and landed when it closed
       // -- although the reply failed.
       expect(pendingAtReply).toBe(true);
+      expect(reasonAtReply).toBe("plugin update: demo 1.0.0 → 1.1.0"); // names the plugin and the pinned versions
       expect(exits).toEqual([RESTART_EXIT_CODE]);
       // No second edit was attempted (a "Couldn't act" edit would be false; in production the process is gone).
       expect(edits).toEqual([]);
@@ -948,48 +1007,61 @@ describe("handleCommand — /plugins update now (#503 item 10)", () => {
 
   // T6: the action catch (#503 item 11). An unparseable state.json does not reach it (readJsonOrFresh moves a corrupt
   // file aside and reads it as fresh), so the failure driven here is the reply: /plugins remind mutates, no restart.
+  // The log comes BEFORE the failure reply: when that reply is rejected too (`rejections` 2), the line is the only
+  // record of the original failure. Mutation: moving the warn below the reply loses it.
   test("a /plugins action whose reply Discord rejects is logged without the token, then answered with the failure", async () => {
-    const edits: string[] = [];
-    const failure = replyFailure("webhook");
-    let editCalls = 0;
-    let fetchSpy: ReturnType<typeof spyOn> | undefined;
-    let warn: ReturnType<typeof spyOn> | undefined;
-    let pushedAdmin = false;
-    try {
-      mkdirSync(`${DATA_DIR}/plugins`, { recursive: true });
-      writeFileSync(statePath, JSON.stringify(stateBody));
-      markPluginStateReady();
-      config.adminUserIds.push("999");
-      pushedAdmin = true;
-      fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
-        new Response(JSON.stringify(indexBody), { status: 200 })) as unknown as typeof fetch);
-      warn = spyOn(console, "warn").mockImplementation(() => {});
-      const interaction = {
-        commandName: "plugins",
-        user: { id: "999" },
-        channelId: "c1",
-        options: {
-          getSubcommand: () => "remind",
-          getString: (name: string) => (name === "name" ? "demo" : null),
-          getInteger: () => null,
-        },
-        deferReply: async () => {},
-        editReply: async (content: string) => {
-          editCalls += 1;
-          if (editCalls === 1) throw failure.error;
-          edits.push(content);
-        },
-      } as unknown as ChatInputCommandInteraction;
+    for (const rejections of [1, 2]) {
+      const edits: string[] = [];
+      const failure = replyFailure("webhook");
+      let editCalls = 0;
+      let fetchSpy: ReturnType<typeof spyOn> | undefined;
+      let warn: ReturnType<typeof spyOn> | undefined;
+      let pushedAdmin = false;
+      try {
+        mkdirSync(`${DATA_DIR}/plugins`, { recursive: true });
+        writeFileSync(statePath, JSON.stringify(stateBody));
+        markPluginStateReady();
+        config.adminUserIds.push("999");
+        pushedAdmin = true;
+        fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+          new Response(JSON.stringify(indexBody), { status: 200 })) as unknown as typeof fetch);
+        warn = spyOn(console, "warn").mockImplementation(() => {});
+        const interaction = {
+          commandName: "plugins",
+          user: { id: "999" },
+          channelId: "c1",
+          options: {
+            getSubcommand: () => "remind",
+            getString: (name: string) => (name === "name" ? "demo" : null),
+            getInteger: () => null,
+          },
+          deferReply: async () => {},
+          editReply: async (content: string) => {
+            editCalls += 1;
+            if (editCalls <= rejections) throw failure.error;
+            edits.push(content);
+          },
+        } as unknown as ChatInputCommandInteraction;
 
-      expect(await handleCommand(interaction)).toBe("answered");
-      expect(edits).toEqual(["⚠️ Couldn't act on the plugin: Unknown interaction"]);
-      const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins remind failed");
-      expect(failed).toBeDefined();
-      expectCleanedLog(failed!, failure);
-    } finally {
-      warn?.mockRestore();
-      fetchSpy?.mockRestore();
-      if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+        if (rejections === 1) {
+          expect(await handleCommand(interaction)).toBe("answered");
+          expect(edits).toEqual(["⚠️ Couldn't act on the plugin: Unknown interaction"]);
+        } else {
+          await expect(handleCommand(interaction)).rejects.toBe(failure.error);
+          expect(edits).toEqual([]);
+        }
+        const failed = warn.mock.calls.find(([m]: unknown[]) => String(m) === "[plugins] /plugins remind failed");
+        expect(failed).toBeDefined();
+        expectCleanedLog(failed!, failure);
+      } finally {
+        warn?.mockRestore();
+        fetchSpy?.mockRestore();
+        if (pushedAdmin) config.adminUserIds.splice(config.adminUserIds.indexOf("999"), 1);
+        resetRestartForTest();
+        resetPollStateForTest();
+        rmSync(statePath, { force: true });
+        rmSync(indexCache, { force: true });
+      }
     }
   });
 });
