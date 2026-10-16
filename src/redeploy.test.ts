@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import type { ContainerInspect, ImageSummary } from "./docker";
 import type { HandoffMarker } from "./handoff";
 
@@ -781,7 +781,7 @@ describe("redeploy — cleanup always runs", () => {
    * the two calls the fix touches: the handoff poll, and the final removal of the replacement.
    */
   function stubDaemon(o: {
-    pollReplacement: () => Response;
+    pollReplacement: () => Response | Promise<Response>;
     removeReplacement: () => Response;
     /** Runs (awaited) when the replacement is started — before `awaitHandoff` ever polls, so a
      *  marker written here is guaranteed on disk for the very first poll to see. Used by the
@@ -805,13 +805,18 @@ describe("redeploy — cleanup always runs", () => {
     /** Makes `POST /containers/create` abort the way docker.ts's timeout bound does — the daemon
      *  may still have created the container, but redeploy() never learns its id (#130). */
     createTimesOut?: boolean;
+    /** Makes the hostname lookup `inspectSelf()` tries first answer 500, so `redeploy()` fails at its very
+     *  first daemon call (the mountinfo fallback then fails too: absent off Linux, no container id on it). */
+    selfInspectFails?: boolean;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
       calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
-      if (pathname === `/containers/${HOSTNAME}/json`) return jsonRes(SELF);
+      if (pathname === `/containers/${HOSTNAME}/json`) {
+        return o.selfInspectFails ? new Response("boom", { status: 500 }) : jsonRes(SELF);
+      }
       if (pathname === "/build") {
         pendingAt.build = restartPending();
         if (o.buildFails) {
@@ -911,18 +916,339 @@ describe("redeploy — cleanup always runs", () => {
     expect(handoffActive()).toBe(false);
   });
 
-  // The crux of the fix: a rejection from `tryInspectContainer` mid-poll (a dropped socket, one
-  // 500) used to propagate straight out of `redeploy()`, skipping `endHandoff()` entirely.
-  test("a daemon error during the handoff poll still ends the handoff", async () => {
+  // The crux of #37's fix was that a rejection from `tryInspectContainer` mid-poll (a dropped socket,
+  // one 500) must not skip `endHandoff()`. Since #433 it is stronger: a failed inspect is not a verdict
+  // at all. The poll goes on with the replacement's state unknown, and the next answer decides.
+  // The verdict here is the second poll's `exited`; the third answer is the pre-removal inspect. Its
+  // StartedAt sits after the pre-poll sample (so a guard left comparing against that sample, or epoch 0,
+  // would read it as a later life and skip the removal, #431) but before the deciding poll's own
+  // observation (so the guard rightly sees the same life and removes).
+  test("a single failed inspect mid-poll is tolerated — the next poll decides, the 500 is not the verdict, and the verdict's own time is what the guard uses", async () => {
+    let pollCount = 0;
+    let t1 = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        pollCount++;
+        if (pollCount === 1) {
+          t1 = Date.now();
+          return new Response("boom", { status: 500 });
+        }
+        if (pollCount === 2) return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(t1 + 5).toISOString() },
+        });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), { pollMs: 30 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBeUndefined(); // the 500 did not become the verdict
+    expect(pollCount).toBe(3); // the failed poll, the deciding poll, the pre-removal inspect
+    expect(wasRemovalAttempted()).toBe(true);
+    expect(result.replacement).toBe("removed");
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The cost of that, pinned: a daemon that answers every poll with an error holds the original for the
+  // whole handoff deadline, and the deadline still ends it — with the last error named, not a false
+  // "failed" — instead of the first 500 aborting a swap that may be healthy.
+  test("every poll failing until the handoff deadline is a timeout that names the last error; the handoff ends and the replacement is removed", async () => {
     stubDaemon({
       pollReplacement: () => new Response("boom", { status: 500 }),
-      removeReplacement: () => new Response("", { status: 404 }),
+      removeReplacement: () => new Response("", { status: 204 }),
     });
-    const result = await redeploy("a".repeat(40));
-    expect(handoffActive()).toBe(false);
-    expect(wasRemovalAttempted()).toBe(true);
-    expect(result.outcome).toBe("failed");
+    const startedAt = Date.now();
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 50, pollMs: 10 });
+    expect(result.outcome).toBe("timeout");
     expect(result.error).toContain("500");
+    expect(wasRemovalAttempted()).toBe(true); // the guard's own inspect also fails and "proceeds as usual"
+    expect(handoffActive()).toBe(false);
+    // Both seams reach the poll: a 50 ms deadline polled every 10 ms ends in well under the real 2 s poll
+    // interval, which a poll that ignored `pollMs` would need to see even one deadline check.
+    expect(Date.now() - startedAt).toBeLessThan(1500);
+  });
+
+  test("an error the daemon recovered from is not blamed for a timeout", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        pollCount++;
+        if (pollCount === 1) return new Response("boom", { status: 500 });
+        return jsonRes(SELF); // running, never signalling
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    // 300 ms, not tighter: the first (failing) poll must finish well inside the deadline, or it would itself be
+    // the timeout and carry its error on a loaded CI box.
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 300, pollMs: 10 });
+    expect(result.outcome).toBe("timeout");
+    expect(result.error).toBeUndefined();
+  });
+
+  // #433: the marker is read before the inspect in every poll, and a `ready` it holds decides that very
+  // poll. Counting the GETs is the assertion: with the marker ignored on a failed inspect the poll would
+  // wait out the whole deadline (and the late re-read would rescue the outcome after ~13 more polls),
+  // so a count past 2 means this poll did not decide.
+  test("a ready marker decides in the same poll as a failed inspect — one poll, not a wait for the deadline", async () => {
+    stubDaemon({
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
+    });
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 200, deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled"); // ready honoured, then the retirement wait elapsed — not "failed"
+    expect(result.error).toBeUndefined(); // the poll's 500 belongs to no verdict: it is only named on a timeout
+    const inspects = calls.filter((c) => c.method === "GET" && c.path === `/containers/${REPLACEMENT_ID}/json`);
+    expect(inspects.length).toBe(2); // the one deciding poll, then the pre-removal inspect
+    expect(wasRemovalAttempted()).toBe(true);
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The replacement's own reason outranks the poll's last daemon error: a `failed` marker decided this poll
+  // although its inspect failed too, and what the requester reads is the replacement's reason.
+  test("a failed marker's own reason is reported, not the poll's last daemon error", async () => {
+    stubDaemon({
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "failed", sha: "3434343", error: "gateway login refused", at: Date.now() }),
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await redeploy("a".repeat(40));
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("gateway login refused");
+      expect(wasRemovalAttempted()).toBe(true);
+      // The poll decided this `failed` itself, so the late re-read has nothing to report: no "signalled
+      // failed" warning, which would read as a race that did not happen.
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("signalled failed"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // Row 15 of the handoff state table: the marker is read at the top of a poll and the verdict is computed
+  // after the inspect returns, so a `ready` written in between used to lose to `timeout`. Here the deadline
+  // is already past (0 ms) and the replacement writes `ready` while that very poll's inspect is in flight:
+  // the poll decides `timeout`; the re-read in redeploy() must turn it into the ready path. That poll's own
+  // inspect fails too, so the poll holds a "last daemon error" that belonged to a timeout that did not happen.
+  test("a ready written during the deciding poll beats the deadline, and the poll's last error is not blamed for it", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          await writeMarker({ status: "ready", sha: "4444444", at: Date.now() });
+          return new Response("boom", { status: 500 });
+        }
+        return jsonRes(SELF);
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled"); // never "timeout": what the replacement said outranks the poll
+    expect(result.error).toBeUndefined();
+  });
+
+  // A verdict the poll already decided as `ready` is acted on as it stands: the marker is read by the poll and
+  // once at the end, and not a third time by the late re-read (which exists for every OTHER verdict).
+  test("a poll that decides ready does not re-read the marker", async () => {
+    let reads = 0;
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      deadlineMs: 60,
+      pollMs: 15,
+      readMarker: async () => {
+        reads++;
+        return { status: "ready", sha: "5656565", at: Date.now() };
+      },
+    });
+    expect(result.outcome).toBe("stalled"); // the retirement wait reads the module's marker: the file is empty
+    expect(reads).toBe(2);
+  });
+
+  // The same window for a `failed` the replacement wrote: its own word beats "never reported in", and its own
+  // reason beats the poll's last daemon error (this poll's inspect fails too). It is reported as `failed`
+  // straight away, NOT through the ready path, whose first marker check would wait out a whole `pollMs`.
+  test("a failed written during a poll that decides timeout is reported as failed, with the replacement's own reason", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          await writeMarker({ status: "failed", sha: "4646464", error: "gateway login refused", at: Date.now() });
+          return new Response("boom", { status: 500 });
+        }
+        return jsonRes(SELF);
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const startedAt = Date.now();
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 0, deadlineMs: 60, pollMs: 1000 });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toBe("gateway login refused");
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // The re-read applies to every verdict but `ready`, not only to a timeout: here the deciding poll sees the
+  // replacement EXITED (a `failed` verdict) while its `ready` is being written, and `ready` still wins.
+  test("a ready written during a poll that decides failed beats that verdict too", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          await writeMarker({ status: "ready", sha: "4545454", at: Date.now() });
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 0 } });
+        }
+        return jsonRes(SELF);
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), { deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled"); // the ready path ran (its retirement wait elapsed), not "failed"
+  });
+
+  // The re-read goes through the `readMarker` seam like the poll's reads do (the retirement wait keeps the
+  // module's, so the file stays empty): read 1 is the poll's, read 2 the late re-read, read 3 the final one.
+  test("the late re-read and the final marker read both go through the marker seam", async () => {
+    let reads = 0;
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      handoffDeadlineMs: 0,
+      deadlineMs: 60,
+      pollMs: 15,
+      readMarker: async () => {
+        reads++;
+        return reads === 2 ? { status: "ready", sha: "5555555", at: Date.now() } : undefined;
+      },
+    });
+    expect(result.outcome).toBe("stalled");
+    expect(reads).toBe(3);
+  });
+
+  // The handoff deadline runs on the injected clock too: each reading advances it 20 s, so a 60 s deadline is
+  // reached on the second poll. On the real clock it would wait out the 60 s itself and the test would time out.
+  // The injected clock starts at epoch 0, so any reading taken from the real clock instead (the start of the
+  // wait, or the elapsed time) would be 1.7e12 ms away from the others and the deadline would never be reached.
+  test("the handoff deadline is measured on the injected clock", async () => {
+    let t = 0;
+    stubDaemon({
+      pollReplacement: () => jsonRes(SELF), // running, never signalling
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      now: () => (t += 20_000),
+      handoffDeadlineMs: 60_000,
+      pollMs: 1,
+    });
+    expect(result.outcome).toBe("timeout");
+    expect(result.error).toBeUndefined();
+    // Two polls and the pre-removal inspect: the first poll (40 s elapsed) waits, the second (80 s) is the
+    // deadline. An elapsed time read off the real clock instead would be past 60 s at once and stop at poll 1.
+    const inspects = calls.filter((c) => c.method === "GET" && c.path === `/containers/${REPLACEMENT_ID}/json`);
+    expect(inspects.length).toBe(3);
+  });
+
+  // The clock seam: every verdict time comes from `now`. The injected clock is an hour ahead and the
+  // replacement's StartedAt is 30 minutes ahead of real time: judged against the injected clock it is the
+  // same life (removed); judged against the real clock it would read as a later one (left alone).
+  describe("the verdict time comes from the injected clock", () => {
+    const T = Date.now();
+    const FUTURE = T + 3_600_000;
+    const runningSince = (ms: number) =>
+      jsonRes({
+        ...SELF,
+        State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(ms).toISOString() },
+      });
+
+    test("a verdict decided by a poll", async () => {
+      let pollCount = 0;
+      stubDaemon({
+        pollReplacement: () => {
+          pollCount++;
+          if (pollCount === 1) return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+          return runningSince(T + 1_800_000);
+        },
+        removeReplacement: () => new Response("", { status: 204 }),
+      });
+      const result = await redeploy("a".repeat(40), { now: () => FUTURE });
+      expect(result.outcome).toBe("failed");
+      expect(result.replacement).toBe("removed");
+    });
+
+    test("a ready demoted after the retirement wait", async () => {
+      stubDaemon({
+        pollReplacement: () => runningSince(T + 1_800_000),
+        removeReplacement: () => new Response("", { status: 204 }),
+        afterStart: () => writeMarker({ status: "ready", sha: "1010101", at: Date.now() }),
+      });
+      const result = await redeploy("a".repeat(40), { now: () => FUTURE, deadlineMs: 60, pollMs: 15 });
+      expect(result.outcome).toBe("stalled");
+      expect(result.replacement).toBe("removed");
+    });
+
+    test("the backstop catch", async () => {
+      stubDaemon({
+        pollReplacement: () => runningSince(T + 1_800_000),
+        removeReplacement: () => new Response("", { status: 204 }),
+      });
+      let reads = 0;
+      const result = await redeploy("a".repeat(40), {
+        now: () => FUTURE,
+        readMarker: async () => {
+          if (++reads === 1) throw new Error("marker read blew up"); // only the poll's read; the final one answers
+          return undefined;
+        },
+      });
+      expect(result.outcome).toBe("failed");
+      expect(result.replacement).toBe("removed");
+    });
+  });
+
+  // The #37 safety net still ends the handoff, and since #431 it judges the replacement against the
+  // moment it fired. Nothing the daemon stubs do reaches it any more, so the `readMarker` seam throws on
+  // the third poll's read. Polls 1-2 see a running replacement with no StartedAt (waiting); the pre-removal
+  // inspect finds one whose StartedAt is after poll 1 but long before the catch fired.
+  test("the #37 backstop still ends the handoff and judges the replacement against the moment it fired, not the pre-poll time", async () => {
+    let inspectCount = 0;
+    let t1 = 0;
+    let reads = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        inspectCount++;
+        if (inspectCount === 1) t1 = Date.now();
+        if (inspectCount <= 2) return jsonRes(SELF); // running, no StartedAt: still waiting
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(t1 + 5).toISOString() },
+        });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("a".repeat(40), {
+      pollMs: 30,
+      readMarker: async () => {
+        reads++;
+        if (reads === 3) throw new Error("marker read blew up");
+        // The final read finds a failed marker with a reason of its own: the backstop's own reason still
+        // leads the result (`pollError ?? marker?.error`).
+        if (reads === 4) return { status: "failed", error: "the replacement's own reason", at: Date.now() };
+        return undefined;
+      },
+    });
+    expect(result.outcome).toBe("failed");
+    expect(result.error).toContain("marker read blew up");
+    expect(wasRemovalAttempted()).toBe(true); // the catch's observedAt is after t1 + 5; the pre-poll time is not
+    expect(handoffActive()).toBe(false);
+    expect(reads).toBe(4); // three poll reads (the third threw), then the final marker read through the seam
   });
 
   // Same gap, the other unguarded call: a 409 removing the replacement at the very end must not
@@ -1101,6 +1427,7 @@ describe("redeploy — cleanup always runs", () => {
       removeReplacement: () => new Response("", { status: 404 }),
       afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
     });
+    const startedAt = Date.now();
     const result = await redeploy("3".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(handoffActive()).toBe(false);
@@ -1108,6 +1435,9 @@ describe("redeploy — cleanup always runs", () => {
     // reported as stalled — a guard keyed on outcome === "ready" alone would wrongly skip removal
     // once the outcome demotes to "stalled" here.
     expect(wasRemovalAttempted()).toBe(true);
+    // `pollMs` reaches the retirement wait too (RedeployOptions): a wait that ignored it would sleep the real
+    // 2 s poll interval before its single check.
+    expect(Date.now() - startedAt).toBeLessThan(1500);
   });
 
   // #160 change 5, defence in depth (Docker itself can no longer produce this once the standby's
@@ -1124,11 +1454,14 @@ describe("redeploy — cleanup always runs", () => {
           return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
         }
         // +5ms guarantees this strictly postdates observedAt regardless of clock resolution —
-        // observedAt was sampled synchronously before the first poll's Promise.all, microseconds
-        // before this closure runs on the SECOND (pre-removal) call.
+        // observedAt was sampled synchronously before the first poll's marker read and inspect,
+        // microseconds before this closure runs on the SECOND (pre-removal) call. Written the way
+        // Docker writes it, with a nanosecond fraction (nine digits): if `Date.parse` read that as
+        // NaN the guard would never skip, and this test would go red (#434).
+        const nanos = `${new Date(Date.now() + 5).toISOString().slice(0, -1)}000000Z`;
         return jsonRes({
           ...SELF,
-          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(Date.now() + 5).toISOString() },
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: nanos },
         });
       },
       removeReplacement: () => {
@@ -1138,12 +1471,13 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("9".repeat(40));
     expect(result.outcome).toBe("failed");
     expect(wasRemovalAttempted()).toBe(false);
+    expect(result.replacement).toBe("left"); // and the requester is told so (#451)
   });
 
-  // The boundary the mutation table calls out explicitly: Running + a StartedAt that is AT OR
-  // BEFORE the decision (the ordinary "stalled" case — the replacement never restarted, it's the
-  // SAME life we just judged) must still be removed, not false-positive skipped.
-  test("a replacement whose StartedAt is at-or-before the decision is still removed, not a false-positive skip", async () => {
+  // A Running replacement whose StartedAt is WELL BEFORE the decision (the ordinary "stalled" case —
+  // the replacement never restarted, it's the SAME life we just judged) must still be removed, not
+  // false-positive skipped. The tie and the not-running cases have their own tests below (#434).
+  test("a replacement whose StartedAt is well before the decision is still removed, not a false-positive skip", async () => {
     const stableStartedAt = new Date(Date.now() - 60_000).toISOString(); // well before observedAt
     stubDaemon({
       pollReplacement: () =>
@@ -1193,6 +1527,161 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("8".repeat(40), { deadlineMs: 60, pollMs: 15 });
     expect(result.outcome).toBe("stalled");
     expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // The baseline is the START of the deciding observation, not the moment the verdict was reached: a restart
+  // while that poll's inspect was in flight happened after we began looking, so the verdict ("exited") was
+  // about an earlier life and the new one is left alone. A baseline taken when the poll returned would put
+  // this StartedAt (20 ms into a 40 ms inspect) before it and remove a bot that is up.
+  test("a restart while the deciding poll's inspect was in flight is a later life, left alone", async () => {
+    let pollCount = 0;
+    let t0 = 0;
+    stubDaemon({
+      pollReplacement: async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          t0 = Date.now();
+          await Bun.sleep(40);
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        }
+        return jsonRes({
+          ...SELF,
+          State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(t0 + 20).toISOString() },
+        });
+      },
+      removeReplacement: () => {
+        throw new Error("must not attempt removal — the replacement restarted while we were looking");
+      },
+    });
+    const result = await redeploy("a".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(wasRemovalAttempted()).toBe(false);
+    expect(result.replacement).toBe("left");
+  });
+
+  // #434, the tie: `>` is a strictly-later test. A StartedAt equal to the verdict's own time is the SAME
+  // life, not a later one, and is removed; `>=` would leave a replacement alone that it should remove. The
+  // clock is fixed (`now`) so the two timestamps are equal by construction; the retirement wait still
+  // runs on real time, so the test ends because `ready` is on disk and that wait elapses (stalled).
+  test("a StartedAt equal to the verdict time is the same life, removed — a tie is not a later generation", async () => {
+    const T = Date.now();
+    stubDaemon({
+      pollReplacement: () =>
+        jsonRes({ ...SELF, State: { Running: true, Status: "running", ExitCode: 0, StartedAt: new Date(T).toISOString() } }),
+      removeReplacement: () => new Response("", { status: 204 }),
+      afterStart: () => writeMarker({ status: "ready", sha: "6666666", at: Date.now() }),
+    });
+    const result = await redeploy("6".repeat(40), { now: () => T, deadlineMs: 60, pollMs: 15 });
+    expect(result.outcome).toBe("stalled");
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // #434, the Running conjunct: a later StartedAt on a container that is NOT running is a corpse of an
+  // earlier life, not a bot "genuinely up and serving" — it is removed. Before this test deleting
+  // `State.Running === true` from the guard left every test green.
+  test("a later StartedAt on a container that is not running is removed, not left alone", async () => {
+    let pollCount = 0;
+    stubDaemon({
+      pollReplacement: () => {
+        pollCount++;
+        if (pollCount === 1) return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        return jsonRes({
+          ...SELF,
+          State: {
+            Running: false,
+            Status: "exited",
+            ExitCode: 1,
+            StartedAt: new Date(Date.now() + 5_000).toISOString(),
+          },
+        });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("7".repeat(40));
+    expect(result.outcome).toBe("failed");
+    expect(wasRemovalAttempted()).toBe(true);
+    expect(result.replacement).toBe("removed");
+  });
+
+  // #451: the result says what became of the `<name>-next` container, so the requester is never told "I
+  // removed it" about something that was never there, was left alone, or could not be removed.
+  describe("what became of the replacement", () => {
+    const exited = () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+    const mustNotPoll = () => {
+      throw new Error("must not poll — redeploy() returns before the handoff");
+    };
+
+    // The fallback inspect also fails here (see `selfInspectFails`), so assert the result, not the reason.
+    test("nothing was created when the own-container inspect fails", async () => {
+      stubDaemon({
+        pollReplacement: mustNotPoll,
+        removeReplacement: () => new Response("", { status: 204 }),
+        selfInspectFails: true,
+      });
+      const result = await redeploy("a".repeat(40));
+      expect(result.error).toContain("could not inspect own container");
+      expect(result.replacement).toBe("none");
+    });
+
+    test("nothing was created when the build fails", async () => {
+      stubDaemon({
+        pollReplacement: mustNotPoll,
+        removeReplacement: () => new Response("", { status: 204 }),
+        buildFails: true,
+      });
+      const result = await redeploy("b".repeat(40));
+      expect(result.error).toContain("build failed");
+      expect(result.replacement).toBe("none");
+    });
+
+    test("a start failure whose cleanup removes the container reports it removed", async () => {
+      stubDaemon({
+        pollReplacement: mustNotPoll,
+        removeReplacement: () => new Response("", { status: 204 }),
+        startFails: true,
+      });
+      const result = await redeploy("c".repeat(40));
+      expect(result.error).toContain("could not start the replacement");
+      expect(result.replacement).toBe("removed");
+    });
+
+    test("a start failure whose cleanup finds nothing by that id reports none, not removed", async () => {
+      stubDaemon({
+        pollReplacement: mustNotPoll,
+        removeReplacement: () => new Response("", { status: 404 }),
+        startFails: true,
+      });
+      const result = await redeploy("d".repeat(40));
+      expect(result.replacement).toBe("none");
+    });
+
+    test("a start failure whose cleanup is refused reports remove-failed with the daemon's answer", async () => {
+      stubDaemon({
+        pollReplacement: mustNotPoll,
+        removeReplacement: () => new Response("daemon blip", { status: 500 }),
+        startFails: true,
+      });
+      const result = await redeploy("e".repeat(40));
+      expect(result.error).toContain("could not start the replacement");
+      expect(result.replacement).toBe("remove-failed");
+      expect(result.replacementError).toContain("500");
+      expect(handoffActive()).toBe(false);
+    });
+
+    test("a failed swap whose removal the daemon refuses (409) reports remove-failed", async () => {
+      stubDaemon({ pollReplacement: exited, removeReplacement: () => new Response("removal in progress", { status: 409 }) });
+      const result = await redeploy("f".repeat(40));
+      expect(result.outcome).toBe("failed");
+      expect(result.replacement).toBe("remove-failed");
+      expect(result.replacementError).toContain("409");
+    });
+
+    test("a failed swap whose replacement is removed reports removed; one already gone reports none", async () => {
+      stubDaemon({ pollReplacement: exited, removeReplacement: () => new Response("", { status: 204 }) });
+      expect((await redeploy("1".repeat(40))).replacement).toBe("removed");
+      stubDaemon({ pollReplacement: exited, removeReplacement: () => new Response("", { status: 404 }) });
+      expect((await redeploy("2".repeat(40))).replacement).toBe("none");
+    });
   });
 });
 
