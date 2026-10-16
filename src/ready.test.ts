@@ -44,6 +44,27 @@ describe("createReadyHandler (#435)", () => {
     expect(order).toEqual(["log", "clear", "takeOver", "activate"]);
   });
 
+  test("activate waits for a slow takeOver to settle before it runs", async () => {
+    let finishTakeOver!: () => void;
+    const takeOverSettled = new Promise<void>((resolve) => {
+      finishTakeOver = resolve;
+    });
+    const { handler, order } = harness("standby", {
+      takeOver: async () => {
+        order.push("takeOver:start");
+        await takeOverSettled;
+        order.push("takeOver:done");
+      },
+    });
+    const running = handler({ id: "a" });
+    await Bun.sleep(10);
+    // Mutation: dropping the `await` on takeOver (or firing it with `void`) lets activate start here.
+    expect(order).toEqual(["log", "clear", "takeOver:start"]);
+    finishTakeOver();
+    await running;
+    expect(order).toEqual(["log", "clear", "takeOver:start", "takeOver:done", "activate"]);
+  });
+
   test("normal: never calls takeOver, and still clears the timer before activating", async () => {
     const { handler, order } = harness("normal", {
       takeOver: async () => {

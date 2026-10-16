@@ -114,7 +114,10 @@ describe("the module body, in a subprocess (#458, #493)", () => {
         PLUGINS: "",
         PLUGIN_INDEX_URL: "https://plugins.invalid/plugins.json",
       });
-      // Mutation: reintroducing `await import("./storage")` into bootLog.ts lets ./config throw first.
+      // Mutation: deleting either boot console.log, or moving `import "./bootLog"` below `./config` in
+      // index.ts, fails here. A reintroduced top-level await is the next test's: ESM no longer orders
+      // ./config after a suspended bootLog, but on Bun 1.4.2 (Windows) the data-dir line still printed in
+      // every run measured, so only that source check sees the regression there.
       expect(r.code).not.toBe(0);
       expect(r.stdout.some((line) => line.startsWith("[boot] env file:"))).toBe(true);
       expect(r.stdout).toContain(describeDataDir(tmp));

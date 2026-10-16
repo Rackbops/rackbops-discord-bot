@@ -64,7 +64,8 @@ describe("resolveDataDir", () => {
     for (const entry of ["/x/foo.test.ts", "C:\\x\\foo.test.tsx", "/x/foo.spec.js", "/x/foo_test.mts", "/x/foo_spec.cjs"]) {
       expect(() => resolveDataDir({ NODE_ENV: "production" }, entry)).toThrow(/BOT_DATA_DIR must be set/);
     }
-    for (const entry of ["/x/foo.ts", "/x/test.ts", "/x/testing.ts", "/x/foo.test.md"]) {
+    // The `$` anchor: a test-looking directory in the path must not make a production entry a test run.
+    for (const entry of ["/x/foo.ts", "/x/test.ts", "/x/testing.ts", "/x/foo.test.md", "/srv/proj.spec.js/src/index.ts", "/x/foo.test.ts.d/index.ts"]) {
       expect(resolveDataDir({ NODE_ENV: "production" }, entry)).toBe(join(import.meta.dir, "..", "data"));
     }
   });

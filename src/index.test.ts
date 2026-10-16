@@ -79,6 +79,8 @@ describe("index.ts wiring", () => {
       // call) fails the next three assertions.
       expect((source.match(/client\.once\(\s*Events\.ClientReady,/g) ?? []).length).toBe(1);
       expect((source.match(/Events\.ClientReady/g) ?? []).length).toBe(1);
+      // The call is the listener's handler itself, not a value built beside it (`void [createReadyHandler(...)]`).
+      expect(source).toMatch(/client\.once\(\s*Events\.ClientReady,\s*createReadyHandler\(\{/);
       expect(source).not.toMatch(/Events\.ClientReady,\s*async/);
       const start = source.indexOf("createReadyHandler({");
       expect(start).toBeGreaterThan(-1);

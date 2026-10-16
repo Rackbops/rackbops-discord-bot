@@ -415,8 +415,9 @@ _Avoid_: server list, guild cache
   preload: Bun runs every test file in one process with one module registry, so per-file
   `process.env` priming is first-importer-wins and a single new unprimed file sorting first would
   silently revert the whole protection. Note the preload is rooted at the repo — `bunfig.toml` is
-  not walked up to, so `ops/admin`'s own package does not get it. Harmless today (no `ops/**` test
-  imports `src/`), and the bun-test refusal (`NODE_ENV=test`, or a `*.test.*` entry file,
+  not walked up to, so `ops/admin`'s own package does not get it. Harmless today (no `ops/admin`
+  test imports `src/`; `ops/bot-ops.test.ts` imports only `src/config` and `src/routing/model`, which
+  read no data dir), and the bun-test refusal (`NODE_ENV=test`, or a `*.test.*` entry file,
   `src/dataDir.ts`) makes it fail loudly rather than corrupt if one
   ever does — but **run the suite from the repo root**. **#252:** the preload's cleanup of a
   previous run's `rackbops-bot-test-data-*` directory is bounded by LIVENESS AND AGE (a directory
@@ -983,7 +984,7 @@ _Avoid_: server list, guild cache
   PR scoped itself to `storage.ts`), so `data/plugins/index.json` alone kept the pid+counter name
   through the handoff. Since #496 it writes through `storage.ts`'s `writeFileAtomic` — the same
   `tmpPathFor` name `writeJsonAtomic` uses, for text that is already serialized — so the token covers
-  it too; `storage.ts` imports only `node:*`, so `src/plugins/*` stays free of `config.ts`.
+  it too; `storage.ts` imports only `node:*` and the `node:path`-only leaf `./dataDir`, so `src/plugins/*` stays free of `config.ts`.
   In-process races are unaffected either way — `createJsonWriter`/`createKeyedJsonMutator` still own
   that, unchanged.
 - **A second `/update` mid-swap answers `busy`** — the guard sits at the top of

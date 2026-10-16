@@ -11,7 +11,7 @@ import { resolveDataDir } from "./dataDir";
 export const SHORT_SHA_LEN = 7;
 
 /** The short form of a git sha used in logs, messages and image tags — always `SHORT_SHA_LEN`
- *  characters. A config-free leaf (this module imports only `node:*`) so `handoff.ts` can use it
+ *  characters. A config-free leaf (this module imports only `node:*` and `./dataDir`, itself `node:path`-only) so `handoff.ts` can use it
  *  without pulling in `./config`, which it must stay free of (it runs before config is guaranteed
  *  resolved during a handoff). */
 export function shortSha(sha: string): string {
