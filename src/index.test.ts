@@ -58,13 +58,69 @@ describe("index.ts wiring", () => {
     expect(selectArgs).toMatch(/CORE_COMMAND_NAMES,\s*installedPins,?\s*$/);
   });
 
-  test("no plugin code loads at module-eval — the bundle import() is inside activate(), after takeOver", () => {
+  // #509: readJsonOrFresh now rethrows a read that fails for a reason other than corruption, and
+  // activate()'s catch swallows it and goes on core-only with an EMPTY previousState. The boot write
+  // builds the whole file from `previous`, so without this guard it would replace an intact
+  // data/plugins/state.json (every pin, snooze and pending report) with one built from nothing -- worse
+  // than the old move-aside, which at least left a .corrupt copy. index.ts can't run under test, so the
+  // wiring is pinned: the flag starts true, is cleared straight after the read, and the write sits in
+  // the guard's else.
+  test("the boot state write is skipped when activate()'s read of the previous state did not succeed (#509)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const flagInit = source.indexOf("let previousStateUnread = true;", activateFn);
+    const readStmt = "previousState = await readPluginState(DATA_DIR, storage);";
+    const read = source.indexOf(readStmt, activateFn);
+    const flagCleared = source.indexOf("previousStateUnread = false;", activateFn);
+    const guard = source.indexOf("if (previousStateUnread) {", activateFn);
+    const write = source.indexOf("await writePluginState({", activateFn);
+    for (const pos of [flagInit, read, flagCleared, guard, write]) expect(pos).toBeGreaterThan(activateFn);
+    expect(flagInit).toBeLessThan(read);
+    // Cleared right AFTER the read, nothing in between. (`slice` with an end before its start is "", so the
+    // ordering has to be asserted on its own: a flag cleared before the read would pass the gap check.)
+    expect(flagCleared).toBeGreaterThan(read);
+    expect(source.slice(read + readStmt.length, flagCleared).trim()).toBe("");
+    expect(guard).toBeLessThan(write);
+    expect(source.slice(guard, write)).toMatch(/\} else \{\s*$/); // the write is the guard's else
+  });
+
+  // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads
+  // at module-eval, which nothing but the source can show.
+  test("no plugin code loads at module-eval — the bundle import() is inside activate()", () => {
     const activateFn = source.indexOf("async function activate(");
     const dynImport = source.indexOf("import(pathToFileURL");
     expect(activateFn).toBeGreaterThan(-1);
     expect(dynImport).toBeGreaterThan(activateFn); // the only dynamic import is inside activate()
     // the top-level boot block (before activate) must run NO dynamic import
     expect(source.slice(0, activateFn)).not.toMatch(/\bimport\(/);
+  });
+
+  // #435: the order itself (clear the verify timer, takeOver only in standby, then activate) is driven by
+  // ready.test.ts against src/ready.ts. What a test of ready.ts cannot see is whether index.ts hands the
+  // real pieces to it and attaches nothing else to ClientReady, so that is pinned here.
+  describe("the ClientReady handler is createReadyHandler (#435)", () => {
+    test("index.ts wires mode, takeOver, activate, the verify timer, the console and the login line into one createReadyHandler call, and attaches nothing else to ClientReady", () => {
+      expect(source).toMatch(/import \{ createReadyHandler \} from "\.\/ready";/);
+      // Mutation: restoring an inline `async (c) => {...}` handler (and dropping the createReadyHandler
+      // call) fails the next three assertions.
+      expect((source.match(/client\.once\(\s*Events\.ClientReady,/g) ?? []).length).toBe(1);
+      expect((source.match(/Events\.ClientReady/g) ?? []).length).toBe(1);
+      // The call is the listener's handler itself, not a value built beside it (`void [createReadyHandler(...)]`).
+      expect(source).toMatch(/client\.once\(\s*Events\.ClientReady,\s*createReadyHandler\(\{/);
+      expect(source).not.toMatch(/Events\.ClientReady,\s*async/);
+      const start = source.indexOf("createReadyHandler({");
+      expect(start).toBeGreaterThan(-1);
+      const call = source.slice(start, source.indexOf("\n  }),", start));
+      expect(call).toMatch(/\n\s*mode,\n/);
+      expect(call).toContain("takeOver: () => takeOver(process.env[HANDOFF_FROM_ENV]!),");
+      expect(call).toMatch(/\n\s*activate,\n/);
+      expect(call).toContain("clearVerifyTimer: () => clearTimeout(verifyTimer),");
+      expect(call).toContain("log: console,");
+      // The line operators grep for (ops/README.md, "Logged in as").
+      expect(call).toContain("describe: (c) => `Logged in as ${c.user.tag}`,");
+      // takeOver is called from exactly one place, and never un-gated by an inline `await takeOver(`.
+      expect((source.match(/takeOver\(process\.env\[HANDOFF_FROM_ENV\]!\)/g) ?? []).length).toBe(1);
+      expect(source).not.toMatch(/await takeOver\(/);
+    });
   });
 
   test("installs+loads plugins inside activate() before rest.put, and activates before the scheduler", () => {

@@ -16,8 +16,8 @@
 // the critical section until it settles or PLUGIN_TICK_ABORT_GRACE_MS (5 s, under this grace) elapses —
 // so the drain waits for a tick to bail, and a tick that ignores its signal can't hold it past that.
 //
-// A pure factory so index.ts's own wiring is a one-line `process.on(signal, handler)` and every
-// branch here is exercised with fakes — no real process, timers, or Discord client.
+// A pure factory so `index.ts`'s own wiring is two `process.on(signal, handler)` lines sharing one
+// handler and every branch here is exercised with fakes — no real process, timers, or Discord client.
 
 /**
  * The TOTAL budget for a real signal, from the moment it's received to the moment `exit(0)` is
@@ -110,14 +110,26 @@ export function createShutdownHandler(deps: ShutdownDeps): (signal: string) => P
       return;
     }
     draining = true;
-    deps.beginShutdown(signal);
+    // #510: neither throws today (notifyStop catches its listeners, awaitCriticalIdle never rejects), but
+    // the exit below must be reached whatever this phase does — otherwise `draining` stays true and the
+    // process sits until the daemon's SIGKILL. Guarded separately, so a throwing beginShutdown still drains.
+    try {
+      deps.beginShutdown(signal);
+    } catch (err) {
+      deps.log.error("[shutdown] beginShutdown failed (draining anyway)", err);
+    }
     deps.log.log(`[shutdown] ${signal} received — draining in-flight work (up to ${deps.graceMs}ms)`);
     const startedAt = Date.now();
-    const drained = await deps.awaitIdle(deps.graceMs);
+    let drained: boolean | undefined; // undefined: awaitIdle threw, and the line below has said so
+    try {
+      drained = await deps.awaitIdle(deps.graceMs);
+    } catch (err) {
+      deps.log.error("[shutdown] the drain failed (continuing to dispose and exit)", err);
+    }
     const elapsedMs = Date.now() - startedAt;
-    if (drained) {
+    if (drained === true) {
       deps.log.log(`[shutdown] drained in ${elapsedMs}ms — exiting`);
-    } else {
+    } else if (drained === false) {
       deps.log.error(`[shutdown] grace elapsed after ${elapsedMs}ms — exiting with work still in flight`);
     }
     // #184: bound disposePlugins to whatever's left of graceMs after the drain, same nesting rule
