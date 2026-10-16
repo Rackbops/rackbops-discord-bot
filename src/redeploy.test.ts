@@ -1062,6 +1062,10 @@ describe("redeploy — cleanup always runs", () => {
     });
     expect(result.outcome).toBe("timeout");
     expect(result.error).toBeUndefined();
+    // Two polls and the pre-removal inspect: the first poll (40 s elapsed) waits, the second (80 s) is the
+    // deadline. An elapsed time read off the real clock instead would be past 60 s at once and stop at poll 1.
+    const inspects = calls.filter((c) => c.method === "GET" && c.path === `/containers/${REPLACEMENT_ID}/json`);
+    expect(inspects.length).toBe(3);
   });
 
   // The clock seam: every verdict time comes from `now`. The injected clock is an hour ahead and the
