@@ -9,7 +9,14 @@
 
 import { clampUpstreamBody } from "./github";
 
-const SOCKET = "/var/run/docker.sock";
+/** The daemon socket. A TEST SEAM, not an operator knob (compare `BOT_DATA_DIR`): the compose file always
+ *  mounts the host's daemon at this path inside the container (entrypoint.sh fixes the socket's group up at
+ *  the same path), so a deployment never sets it; the suite's end-to-end transport test (#459) points a
+ *  child process at a socket it serves itself. Deliberately absent from `.env.example`, reserved in
+ *  `bot-ops.sh` (never panel-editable, never claimable by a plugin manifest), and cleared by the test
+ *  preload so an ambient value cannot aim the suite at a real daemon. A plain environment read, like
+ *  HOSTNAME's below. */
+const DOCKER_SOCKET = process.env.DOCKER_SOCKET ?? "/var/run/docker.sock";
 const BASE = "http://docker";
 
 // Every daemon call is bounded, so a genuinely hung socket (connected, far end never responds and
@@ -93,7 +100,7 @@ export interface CreateContainerSpec {
 
 /** One daemon request under a caller-supplied signal. Always called from inside `bounded`. */
 async function api(path: string, signal: AbortSignal, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${BASE}${path}`, { ...init, unix: SOCKET, signal });
+  return fetch(`${BASE}${path}`, { ...init, unix: DOCKER_SOCKET, signal });
 }
 
 async function ok(path: string, signal: AbortSignal, init: RequestInit = {}): Promise<Response> {
@@ -180,18 +187,28 @@ export async function tryInspectContainer(
  * A build is a stream of JSONL progress objects that ends 200 whether or not it worked —
  * the failure is *inside* the body, as an `{"error": …}` line. Reading the status alone
  * would call every broken build a success.
+ *
+ * Success is the absence of an error line, nothing more: a stream that was cleanly truncated reads
+ * as `ok`, and is caught one call later by `createContainer`'s 404 on the tag that was never made
+ * (the classic builder and BuildKit end their streams differently, so no one success marker is safe
+ * to require).
  */
 export function parseBuildOutput(body: string): { ok: boolean; error?: string } {
   for (const line of body.split("\n")) {
     if (!line.trim()) continue;
-    let parsed: { error?: string; errorDetail?: { message?: string } };
+    let parsed: unknown;
     try {
       parsed = JSON.parse(line);
     } catch {
       continue; // a partial/non-JSON line is progress noise, not a verdict
     }
-    const error = parsed.errorDetail?.message ?? parsed.error;
-    if (error) return { ok: false, error };
+    // Valid JSON that is not an object is noise too (#513). `null` is the one such value whose property
+    // read below would throw a TypeError out of buildImage; a number or a string reads as undefined and is
+    // skipped here only for clarity.
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const { error, errorDetail } = parsed as { error?: string; errorDetail?: { message?: string } };
+    const message = errorDetail?.message ?? error;
+    if (message) return { ok: false, error: message };
   }
   return { ok: true };
 }
