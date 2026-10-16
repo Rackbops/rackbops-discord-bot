@@ -31,8 +31,11 @@ describe("resolveDataDir", () => {
   // The default is still one hop up from src/ — the mutation this guards is a wrong hop count.
   // Driven through the pure resolver with an explicit env, since the live DATA_DIR is the test
   // override (see dataIsolation.test.ts) and can no longer be compared against the checkout path.
+  //
+  // The entry is passed explicitly (a non-test file): under `bun test` the default entry is the test file,
+  // which `resolveDataDir` rightly refuses (#510), so the live process.argv[1] cannot stand in for it.
   test("defaults to the repo's data/ directory when nothing overrides it", () => {
-    expect(resolveDataDir({})).toBe(join(import.meta.dir, "..", "data"));
+    expect(resolveDataDir({}, "/app/src/index.ts")).toBe(join(import.meta.dir, "..", "data"));
   });
 
   test("an absolute override wins", () => {
@@ -48,13 +51,34 @@ describe("resolveDataDir", () => {
   });
 
   test("an empty override falls through rather than resolving to nothing", () => {
-    expect(resolveDataDir({ BOT_DATA_DIR: "" })).toBe(join(import.meta.dir, "..", "data"));
+    expect(resolveDataDir({ BOT_DATA_DIR: "" }, "/app/src/index.ts")).toBe(join(import.meta.dir, "..", "data"));
   });
 
   // Without this, a preload that silently fails to run would drop straight back to the checkout
-  // and re-corrupt the developer's state.json with the whole suite green.
-  test("under bun test with no override it refuses instead of using the checkout", () => {
-    expect(() => resolveDataDir({ NODE_ENV: "test" })).toThrow(/BOT_DATA_DIR must be set/);
+  // and re-corrupt the developer's state.json with the whole suite green. Bun sets NODE_ENV=test only
+  // when the shell exported none (#510), so the entry file is the second signal.
+  test("under bun test with no override it refuses instead of using the checkout — by NODE_ENV, or by the entry file whatever NODE_ENV says", () => {
+    expect(() => resolveDataDir({ NODE_ENV: "test" }, "/app/src/index.ts")).toThrow(/BOT_DATA_DIR must be set/);
+    // Mutation: deleting the TEST_ENTRY half of the check, or narrowing the regex to /\.test\.ts$/, turns
+    // one of these green-when-it-should-throw.
+    for (const entry of ["/x/foo.test.ts", "C:\\x\\foo.test.tsx", "/x/foo.spec.js", "/x/foo_test.mts", "/x/foo_spec.cjs"]) {
+      expect(() => resolveDataDir({ NODE_ENV: "production" }, entry)).toThrow(/BOT_DATA_DIR must be set/);
+    }
+    for (const entry of ["/x/foo.ts", "/x/test.ts", "/x/testing.ts", "/x/foo.test.md"]) {
+      expect(resolveDataDir({ NODE_ENV: "production" }, entry)).toBe(join(import.meta.dir, "..", "data"));
+    }
+  });
+
+  test("the live run is recognised through the default entry", () => {
+    // Under `bun test` process.argv[1] is a test file -- this one, or the first file Bun discovered in a
+    // whole-suite run -- so a shell exporting NODE_ENV=production gets no checkout either.
+    expect(process.argv[1]).toMatch(/[._](test|spec)\.[cm]?[jt]sx?$/);
+    expect(() => resolveDataDir({ NODE_ENV: "production" })).toThrow(/BOT_DATA_DIR must be set/);
+  });
+
+  test("an absolute override wins under bun test too", () => {
+    const abs = process.platform === "win32" ? "C:\\tmp\\elsewhere" : "/tmp/elsewhere";
+    expect(resolveDataDir({ BOT_DATA_DIR: abs, NODE_ENV: "test" }, "/x/foo.test.ts")).toBe(abs);
   });
 
   test("the live DATA_DIR is the override, never the checkout", () => {
