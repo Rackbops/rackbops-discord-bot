@@ -42,11 +42,17 @@ import { config } from "./config";
  */
 export const GITHUB_TIMEOUT_MS = 10_000;
 
+/** One page of a repo's releases per poll (#499): the newest `RELEASES_PER_PAGE`, drafts dropped afterwards.
+ *  `checkRepoReleases` warns when a whole page is new, since anything older is never fetched. */
+export const RELEASES_PER_PAGE = 15;
+
 export interface Release {
   id: number;
   name: string;
   tag: string;
   url: string;
+  /** GitHub's pre-release flag; the announcement says "pre-release" for one (#499). */
+  prerelease: boolean;
 }
 
 /**
@@ -54,15 +60,27 @@ export interface Release {
  * `GITHUB_TOKEN` can't see it (GitHub deliberately 404s a private repo rather than 403ing it,
  * so the two are indistinguishable from here). That is a standing condition, not a blip, so it
  * returns rather than throws and lets the caller skip the repo quietly; every other failure —
- * 403 rate-limit, 401 bad token, 5xx — still throws, so a real outage stays loud. A repo with
- * no releases answers 200 with `[]`, so it never reaches the 404 path.
+ * a rate-limit hit (a 403 or 429 with `x-ratelimit-remaining: 0`, whose message names the reset time
+ * and `GITHUB_TOKEN`, #500), 401 bad token, 5xx — still throws, so a real outage stays loud. A repo
+ * with no releases answers 200 with `[]`, so it never reaches the 404 path.
  */
 export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<Release[] | null> {
-  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=15`, {
+  const res = await fetch(`https://api.github.com/repos/${repo}/releases?per_page=${RELEASES_PER_PAGE}`, {
     headers: githubHeaders(),
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (res.status === 404) return null;
+  if ((res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0") {
+    // #500 item 10: GitHub answers a primary rate-limit hit with a 403 or a 429 and `x-ratelimit-remaining: 0`
+    // (its REST docs); the unauthenticated limit is 60 requests an hour per address. Say when it resets and what
+    // lifts it, instead of a bare status per repo per poll.
+    const reset = Number(res.headers.get("x-ratelimit-reset"));
+    const resetAt = new Date(reset * 1000);
+    // A missing, non-numeric, zero or out-of-range (Infinity, 1e20: an Invalid Date, which toISOString throws on) value
+    // is "unknown", never a thrown RangeError that would swallow this message.
+    const at = reset > 0 && !Number.isNaN(resetAt.getTime()) ? resetAt.toISOString() : "an unknown time";
+    throw new Error(`GitHub rate limit exhausted (releases query for ${repo}) — resets at ${at}; set GITHUB_TOKEN to raise it`);
+  }
   if (!res.ok) throw new Error(`GitHub releases query failed for ${repo}: ${res.status}`);
   const data = (await res.json()) as {
     id: number;
@@ -74,11 +92,14 @@ export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS)
   }[];
   return data
     .filter((r) => !r.draft)
-    .map((r) => ({ id: r.id, name: r.name ?? r.tag_name, tag: r.tag_name, url: r.html_url }));
+    // `||` and a trim, not `??` (#499): an empty or blank name is as nameless as a null one, and would render as `****`.
+    .map((r) => ({ id: r.id, name: r.name?.trim() || r.tag_name, tag: r.tag_name, url: r.html_url, prerelease: r.prerelease }));
 }
 
 export interface ReleaseAnnouncements {
-  /** Releases to post now, oldest-first (so a burst reads in publish order). */
+  /** Releases to post now, oldest-first: GitHub's list reversed (newest first in practice; the API docs name no
+   *  sort key), which is publish order for ordinary tagging and not necessarily for a release cut later from an
+   *  older commit. */
   toAnnounce: Release[];
   /** The repo's new seen-id list to persist. */
   nextSeen: number[];
