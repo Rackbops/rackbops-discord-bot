@@ -2538,7 +2538,7 @@ describe("redeploy — cleanup always runs", () => {
 
   // `dead` is as gone as `exited`.
   test("a dead replacement after ready is died, with its status and exit code", async () => {
-    const result = await awaitRetirementFailure(REPLACEMENT_ID, 3_600_000, 5, async (id) => ({
+    const result = await awaitRetirementFailure(REPLACEMENT_ID, 2_000, 5, async (id) => ({
       ...SELF,
       Id: id,
       State: { Running: false, Status: "dead", ExitCode: 137 },
