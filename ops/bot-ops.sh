@@ -313,6 +313,7 @@ declare -A RESERVED_KEYS=(
   [NODE_ENV]=1                 # src/dataDir.ts: under bun test (NODE_ENV=test, or a test-file entry) an unset BOT_DATA_DIR is a boot error
   [HANDOFF_FROM]=1             # src/handoff.ts: the raw standby instruction, set by the redeploy machinery (#46 checks the named container)
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
+  [HANDOFF_RESTART_RETRIES]=1  # src/redeploy.ts: the original's on-failure retry cap, carried with the policy (#490)
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
   [SHARDS]=1                   # discord.js Client (src/client.ts builds it with no shard options): the shards it serves
   [SHARD_COUNT]=1              # discord.js Client: the shard count
@@ -338,7 +339,7 @@ declare -A RESERVED_KEYS=(
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
 # "<container>-next" before it takes the canonical name over. Recreating or restarting the
-# ORIGINAL while that container exists races retireOriginal's own stop/remove/rename and can leave
+# ORIGINAL while that container exists races the swap's own stop and (later) remove/rename and can leave
 # two bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
 # operator can just retry once the swap finishes (usually well under a minute).
 #
@@ -348,14 +349,15 @@ declare -A RESERVED_KEYS=(
 #     "-next" already exists but hasn't written anything yet — an env-set force-recreate landing
 #     there would recreate the untouched original under a brand-new container id, orphaning the
 #     replacement's own HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats
-#     it as "already gone" (its documented tolerant path), and skips the rename WITHOUT throwing —
-#     so the replacement still goes live. Two live bots, and the recreated one is still on the OLD
-#     image (:latest isn't retagged until takeOver verifies).
+#     it as "already gone" (its documented tolerant path), and completeTakeOver then has no original
+#     to take the name from, so it skips the rename WITHOUT throwing — so the replacement still goes
+#     live. Two live bots, and the recreated one is still on the OLD image (:latest isn't retagged
+#     until completeTakeOver, after the new build has run).
 #   - Too LATE a signal (checked only via a marker file, tried and reverted once already) means the
-#     container's existence outlives the marker: retireOriginal tolerates its own post-stop
-#     remove/rename failing (a stopped original corpse still holding the canonical name, or the
-#     resulting name conflict) and never retries — "cosmetic," per its own comment, since the bot
-#     is up and serving either way. Guarding on a marker that's already been cleared by then would
+#     container's existence outlives the marker: completeTakeOver tolerates its own remove/rename
+#     failing (a stopped original corpse still holding the canonical name, or the resulting name
+#     conflict) and never retries until a later standby boot — "cosmetic," per its own comment,
+#     since the bot is up and serving either way. Guarding on a marker that's already been cleared by then would
 #     wrongly allow past that safe point, but guarding on one that hasn't been WRITTEN yet wrongly
 #     refuses nothing during the dangerous window above — no single read of that file can tell the
 #     two apart, since both look identical (absent) from outside.
@@ -363,14 +365,18 @@ declare -A RESERVED_KEYS=(
 # What actually distinguishes "still unresolved" from "resolved, rename just didn't stick" is
 # whether the ORIGINAL itself is still running. It stays running for the entire pre-verification
 # wait and the entire verified-but-not-yet-retired wait (nothing has touched it yet in either), and
-# retireOriginal's own comment calls its stop "the point of no return" — every step after that
-# (remove, rename) is best-effort and non-fatal on failure. So: refuse only while "-next" exists
-# AND the canonical name still resolves to a RUNNING container. A narrow gap remains between that
-# stop and the remainder of the cleanup finishing (typically milliseconds — two more daemon calls)
-# where this allows through; unlike the window above, both containers agree on the SAME already-
-# verified image there (tagLatest runs before the stop), so the worst case is a brief, self-
-# resolving overlap rather than a stale-code split-brain — the same class of accepted residual risk
-# as issue #51's own item 1.
+# retireOriginal's stop is the point after which the original can no longer reclaim; since #548 the
+# remaining steps (tag :latest, remove, rename) are completeTakeOver's, run only after the new build
+# has finished activate() and its first tick, and are best-effort and non-fatal on failure. So:
+# refuse only while "-next" exists AND the canonical name still resolves to a RUNNING container. A
+# gap remains between that stop and the end of that probation (seconds to a minute, no longer
+# milliseconds) where this allows through, because the canonical name is the stopped original then;
+# the guard's LOGIC is untouched here (S3b-1 makes it refuse while a RUNNING "-next" exists). In that
+# gap :latest still names the OLD image (tagLatest now runs AFTER the stop, in completeTakeOver), so a
+# recreate landing there starts the old build beside the live replacement; the replacement finds the
+# original running when probation ends (completeTakeOver, or its next boot's detectRollback) and
+# steps aside, so the overlap is bounded by the probation instead of persisting as a split-brain —
+# the same class of accepted residual risk as issue #51's own item 1.
 #
 # Formerly a known, DECLINED residual risk (tracked on #85, now HANDLED by #160, not by this
 # guard): retireOriginal's own stopContainer call on a genuine first attempt used to be unguarded

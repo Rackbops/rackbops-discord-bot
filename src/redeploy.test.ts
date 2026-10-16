@@ -8,6 +8,9 @@ const {
   buildCreateSpec,
   buildRemote,
   canonicalName,
+  completeTakeOver,
+  detectRollback,
+  finishProbation,
   latestTag,
   redeploy,
   replacementName,
@@ -15,9 +18,11 @@ const {
   retireOriginal,
   selectImagesToPrune,
   shaTag,
+  stepAside,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV } = await import("./handoff");
+const { clearMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV, HANDOFF_RESTART_RETRIES_ENV } =
+  await import("./handoff");
 const { handoffActive, restartPending, resetForTest } = await import("./restart");
 const { SHORT_SHA_LEN } = await import("./storage");
 
@@ -281,6 +286,41 @@ describe("buildCreateSpec", () => {
     ]);
   });
 
+  // #490 item 9: an `on-failure` original's retry cap rides along, so the restore does not turn "retry 5
+  // times" into "retry forever" (Docker reads a missing cap as unlimited). Only for `on-failure` with a
+  // positive cap -- never a `MaximumRetryCount: 0`, which Docker also reads as unlimited.
+  test("carries an on-failure retry cap for takeOver to restore, and nothing for any other policy", () => {
+    const withPolicy = (RestartPolicy: { Name: string; MaximumRetryCount?: number }) =>
+      buildCreateSpec({ ...SELF, HostConfig: { ...SELF.HostConfig, RestartPolicy } }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
+    const retries = (s: { Env: string[] }) => s.Env.filter((e) => e.startsWith(`${HANDOFF_RESTART_RETRIES_ENV}=`));
+    expect(retries(withPolicy({ Name: "on-failure", MaximumRetryCount: 5 }))).toEqual([`${HANDOFF_RESTART_RETRIES_ENV}=5`]);
+    expect(withPolicy({ Name: "on-failure", MaximumRetryCount: 5 }).Env).toContain(`${HANDOFF_RESTART_POLICY_ENV}=on-failure`);
+    // Mutation: pushing the cap for every policy puts a retries line on these.
+    expect(retries(withPolicy({ Name: "unless-stopped", MaximumRetryCount: 5 }))).toEqual([]);
+    expect(retries(withPolicy({ Name: "always" }))).toEqual([]);
+    expect(retries(withPolicy({ Name: "on-failure", MaximumRetryCount: 0 }))).toEqual([]);
+    expect(retries(withPolicy({ Name: "on-failure" }))).toEqual([]);
+    expect(retries(spec)).toEqual([]);
+  });
+
+  test("never stacks a second HANDOFF_RESTART_RETRIES when one is already set", () => {
+    const chained = buildCreateSpec(
+      {
+        ...SELF,
+        Config: { ...SELF.Config, Env: [...SELF.Config.Env, `${HANDOFF_RESTART_RETRIES_ENV}=99`] },
+        HostConfig: { ...SELF.HostConfig, RestartPolicy: { Name: "on-failure", MaximumRetryCount: 3 } },
+      },
+      { image: "img:abc1234", handoffFrom: "newer", oldImageEnv: [] },
+    );
+    expect(chained.Env.filter((e) => e.startsWith(`${HANDOFF_RESTART_RETRIES_ENV}=`))).toEqual([`${HANDOFF_RESTART_RETRIES_ENV}=3`]);
+    // And a stale one is dropped when the original's policy no longer has a cap.
+    const stale = buildCreateSpec(
+      { ...SELF, Config: { ...SELF.Config, Env: [...SELF.Config.Env, `${HANDOFF_RESTART_RETRIES_ENV}=99`] } },
+      { image: "img:abc1234", handoffFrom: "newer", oldImageEnv: [] },
+    );
+    expect(stale.Env.filter((e) => e.startsWith(`${HANDOFF_RESTART_RETRIES_ENV}=`))).toEqual([]);
+  });
+
   // Found on the debug box: the swapped-in bot ran with bun as PID 1 because compose's
   // `init: true` is container config, not image config, and wasn't carried over.
   test("keeps init, so the replacement still runs under docker-init", () => {
@@ -348,13 +388,12 @@ describe("buildCreateSpec", () => {
 describe("takeOver", () => {
   const ID = "b".repeat(64);
 
-  test("announces ready, tags :latest, restores the policy, retires the original, clears the marker — and never exits", async () => {
+  test("announces ready, restores the policy, retires the original, clears the marker — and never exits", async () => {
     const order: string[] = [];
     const exits: number[] = [];
     let retired: string | undefined;
     await takeOver(ID, {
       write: async (m) => void order.push(`write:${m.status}`),
-      tagLatest: async () => void order.push("tag"),
       restorePolicy: async () => void order.push("restore"),
       retire: async (id) => void (order.push("retire"), (retired = id)),
       clear: async () => void order.push("clear"),
@@ -362,41 +401,20 @@ describe("takeOver", () => {
     });
     // Order is load-bearing: `ready` must be written *before* the retire — that write is what
     // stops the original counting toward its deadline and removing a replacement that has in fact
-    // verified — the :latest tag and the restart-policy restore both land before the retire too,
-    // since they both act on this (still-live) container's own state, no different in kind from
-    // the write. #160: restore must come after tag and before retire specifically — a restore
-    // that ran only after the original's stop would be a permanent zero-bots outage if the
-    // transport dropped in that window (see takeOver's own docstring). Assert the exact sequence,
-    // so a reorder — the guard for that whole hazard — can't slip through green.
-    expect(order).toEqual(["write:ready", "tag", "restore", "retire", "clear"]);
+    // verified — and the restart-policy restore lands before the retire too, since it acts on this
+    // (still-live) container's own state, no different in kind from the write. #160: restore must
+    // come before retire specifically — a restore that ran only after the original's stop would be a
+    // permanent zero-bots outage if the transport dropped in that window (see takeOver's own
+    // docstring). Assert the exact sequence, so a reorder — the guard for that whole hazard — can't
+    // slip through green. #548: no `:latest` tag here any more -- it follows probation, in
+    // completeTakeOver -- so a `retire` that throws can never leave `:latest` on a build the requester
+    // was told was not deployed (#490 item 7).
+    expect(order).toEqual(["write:ready", "restore", "retire", "clear"]);
     expect(retired).toBe(ID);
     expect(exits).toEqual([]);
   });
 
-  // Issue #39's other half: tagging :latest is best-effort — a tag-API hiccup must not turn a
-  // genuinely successful handoff into a reported failure. The retire and clear still have to run.
-  test("a tagLatest failure doesn't abort the takeover — retire and clear still run, no failed marker", async () => {
-    const writes: HandoffMarker[] = [];
-    const exits: number[] = [];
-    let retired: string | undefined;
-    let cleared = false;
-    await takeOver(ID, {
-      write: async (m) => void writes.push(m),
-      tagLatest: async () => {
-        throw new Error("daemon: tag conflict");
-      },
-      restorePolicy: async () => {},
-      retire: async (id) => void (retired = id),
-      clear: async () => void (cleared = true),
-      exit: (code) => void exits.push(code),
-    });
-    expect(retired).toBe(ID);
-    expect(cleared).toBe(true);
-    expect(exits).toEqual([]);
-    expect(writes.some((m) => m.status === "failed")).toBe(false);
-  });
-
-  // #160: unlike tagLatest, a restorePolicy failure is NOT best-effort — a swallowed failure would
+  // #160: a restorePolicy failure is NOT best-effort — a swallowed failure would
   // leave the SURVIVING bot on RestartPolicy:"no" forever, silently, until a host reboot doesn't
   // bring it back and someone notices weeks later. So this must behave exactly like a retire
   // failure: failed marker, exit(1), and — critically — retire/clear never run at all, since the
@@ -409,7 +427,6 @@ describe("takeOver", () => {
     let cleared = false;
     await takeOver(ID, {
       write: async (m) => void writes.push(m),
-      tagLatest: async () => {},
       restorePolicy: async () => {
         throw new Error("daemon: update rejected");
       },
@@ -434,7 +451,6 @@ describe("takeOver", () => {
     let cleared = false;
     await takeOver(ID, {
       write: async (m) => void writes.push(m),
-      tagLatest: async () => {},
       restorePolicy: async () => {},
       retire: async () => {
         throw new Error("daemon unreachable");
@@ -456,7 +472,6 @@ describe("takeOver", () => {
       write: async () => {
         throw new Error("disk full");
       },
-      tagLatest: async () => {},
       restorePolicy: async () => {},
       retire: async () => void 0,
       exit: (code) => void exits.push(code),
@@ -471,7 +486,6 @@ describe("takeOver", () => {
     const exits: number[] = [];
     await takeOver(ID, {
       write: async () => void 0,
-      tagLatest: async () => {},
       restorePolicy: async () => {},
       retire: async () => {
         throw null;
@@ -485,10 +499,9 @@ describe("takeOver", () => {
 // #160's actual guard against the permanent-outage hazard: the effects-injection tests above only
 // prove the CALLING order of whichever functions were passed in — they say nothing about the real
 // HTTP verbs the DEFAULT effects (restoreOriginalRestartPolicy, retireOriginal) issue against the
-// daemon. This drives takeOver with real defaults for restorePolicy/retire (only write/clear/
-// tagLatest are stubbed, to keep this hermetic and avoid touching the real marker file) through a
-// stubbed globalThis.fetch, recording call order — the same harness shape as the retireOriginal
-// describe below.
+// daemon. This drives takeOver with real defaults for restorePolicy/retire (only write/clear are
+// stubbed, to keep this hermetic and avoid touching the real marker file) through a stubbed
+// globalThis.fetch, recording call order — the same harness shape as the retireOriginal describe below.
 describe("takeOver — real daemon calls (the ordering guard for the whole hazard, #160)", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
@@ -505,12 +518,14 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
   beforeEach(() => {
     process.env.HOSTNAME = HOSTNAME;
     process.env[HANDOFF_RESTART_POLICY_ENV] = "unless-stopped";
+    delete process.env[HANDOFF_RESTART_RETRIES_ENV];
     calls = [];
   });
   afterEach(() => {
     globalThis.fetch = realFetch;
     delete process.env.HOSTNAME;
     delete process.env[HANDOFF_RESTART_POLICY_ENV];
+    delete process.env[HANDOFF_RESTART_RETRIES_ENV];
   });
 
   function stubDaemon() {
@@ -524,9 +539,45 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
       if (pathname === `/containers/${ORIGINAL_ID}/stop`) return new Response("", { status: 204 });
       if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return new Response("", { status: 204 });
       if (pathname.endsWith("/rename")) return new Response("", { status: 204 });
+      // #548: recorded rather than thrown on, so a tag call during takeOver is VISIBLE to the pin below
+      // (an unstubbed throw would be swallowed by a best-effort `.catch`).
+      if (pathname.startsWith("/images/") && pathname.endsWith("/tag")) return new Response("", { status: 201 });
       throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
     }) as unknown as typeof fetch;
   }
+
+  // #548: takeOver ends at the STOP. The removal, the name and `:latest` are completeTakeOver's, after the
+  // new build has run -- so a takeOver that also tagged, removed or renamed would leave nothing to start
+  // again, which is the bug.
+  test("takeOver stops the original and never tags, removes or renames", async () => {
+    stubDaemon();
+    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {} });
+    expect(calls.some((c) => c.method === "POST" && c.path === `/containers/${ORIGINAL_ID}/stop`)).toBe(true);
+    expect(calls.filter((c) => c.method === "DELETE")).toEqual([]);
+    expect(calls.filter((c) => c.path.endsWith("/rename"))).toEqual([]);
+    expect(calls.filter((c) => c.path.endsWith("/tag"))).toEqual([]);
+  });
+
+  // #490 item 9: the cap is restored with the policy, for `on-failure` only.
+  test("restores on-failure with its retry cap, and any other policy by name alone", async () => {
+    const restored = async (policy: string, retries?: string) => {
+      calls = [];
+      process.env[HANDOFF_RESTART_POLICY_ENV] = policy;
+      if (retries === undefined) delete process.env[HANDOFF_RESTART_RETRIES_ENV];
+      else process.env[HANDOFF_RESTART_RETRIES_ENV] = retries;
+      stubDaemon();
+      await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {} });
+      const call = calls.find((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
+      return JSON.parse(call!.body!);
+    };
+    expect(await restored("on-failure", "5")).toEqual({ RestartPolicy: { Name: "on-failure", MaximumRetryCount: 5 } });
+    // Mutation: passing the cap for every policy puts a MaximumRetryCount on this one.
+    expect(await restored("unless-stopped", "5")).toEqual({ RestartPolicy: { Name: "unless-stopped" } });
+    // Mutation: dropping the cap restores bare `on-failure`, which Docker reads as unlimited.
+    for (const junk of [undefined, "0", "abc", "", "-2", "1.5"]) {
+      expect(await restored("on-failure", junk), String(junk)).toEqual({ RestartPolicy: { Name: "on-failure" } });
+    }
+  });
 
   // THE guard for the whole hazard the ⚠️ section describes: a reorder that moved the restore back
   // to after the stop would pass every effects-injection test above (which only checks the ORDER
@@ -537,7 +588,6 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
     await takeOver(ORIGINAL_ID, {
       write: async () => {},
       clear: async () => {},
-      tagLatest: async () => {},
       exit: () => {
         throw new Error("must not exit on the happy path");
       },
@@ -553,7 +603,7 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
   test("restores the env-carried policy name onto self, distinct from the fallback value", async () => {
     process.env[HANDOFF_RESTART_POLICY_ENV] = "always";
     stubDaemon();
-    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {}, tagLatest: async () => {} });
+    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {} });
     const updateCall = calls.find((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
     expect(updateCall?.body).toBeDefined();
     expect(JSON.parse(updateCall!.body!)).toEqual({ RestartPolicy: { Name: "always" } });
@@ -562,14 +612,14 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
   test("falls back to unless-stopped when HANDOFF_RESTART_POLICY is absent from the env", async () => {
     delete process.env[HANDOFF_RESTART_POLICY_ENV];
     stubDaemon();
-    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {}, tagLatest: async () => {} });
+    await takeOver(ORIGINAL_ID, { write: async () => {}, clear: async () => {} });
     const updateCall = calls.find((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/update`);
     expect(JSON.parse(updateCall!.body!)).toEqual({ RestartPolicy: { Name: "unless-stopped" } });
   });
 
   // A restore that fails at the DAEMON level (not just an injected-effect throw) must still block
   // the stop — proves the real default restorePolicy effect propagates a real HTTP failure rather
-  // than swallowing it the way tagLatest's real effect is allowed to.
+  // than swallowing it the way completeTakeOver's best-effort steps are allowed to.
   test("a real daemon failure on the update call blocks the stop from ever being attempted", async () => {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
@@ -585,7 +635,6 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
     await takeOver(ORIGINAL_ID, {
       write: async (m) => void writes.push(m),
       clear: async () => void (cleared = true),
-      tagLatest: async () => {},
       exit: (code) => void exits.push(code),
     });
     expect(exits).toEqual([1]);
@@ -596,14 +645,15 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
 });
 
 // A retire against the same original can run more than once with nothing left alive to reclaim if
-// it fails: a prior removeContainer failure below leaves a stopped-but-not-removed corpse a later
-// standby boot retries takeOver -> retireOriginal against, and separately HANDOFF_FROM never
-// clears from a swapped-in container's own env, so a boot path that still honors it against an id
-// since fully removed lands here too. The stop has to tell a genuine first attempt (original still
-// running — a failure must propagate, since the original is alive to reclaim) from both of those
-// (already stopped, or already gone entirely — a failure is just a daemon hiccup re-confirming
-// what's already true, and must degrade like every other post-stop step instead of crashing the
-// sole live bot).
+// it fails: since #548 the stopped-but-not-removed corpse is the NORMAL state between a login and the
+// end of probation (retireOriginal only STOPS; completeTakeOver removes and renames afterwards), so a
+// build that crashes in probation restarts as a standby and retries takeOver -> retireOriginal against
+// it, and separately HANDOFF_FROM never clears from a swapped-in container's own env, so a boot path
+// that still honors it against an id since fully removed lands here too. The stop has to tell a genuine
+// first attempt (original still running — a failure must propagate, since the original is alive to
+// reclaim) from both of those (already stopped, or already gone entirely — a failure is just a daemon
+// hiccup re-confirming what's already true, and must degrade instead of crashing the sole live bot).
+// In every case nothing here removes or renames: that is completeTakeOver's, tested below.
 describe("retireOriginal", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = "self-container-id";
@@ -648,21 +698,39 @@ describe("retireOriginal", () => {
     }) as unknown as typeof fetch;
   }
 
+  // #548: what a retire leaves behind is the STOPPED original -- no removal, no rename. Every case below
+  // ends in this check (a regression that put the removal back into the stop would turn them all red).
+  const touchedNothingButTheStop = () => {
+    expect(calls.filter((c) => c.method === "DELETE")).toEqual([]);
+    expect(calls.filter((c) => c.path.endsWith("/rename"))).toEqual([]);
+  };
+
   test("a first attempt against a running original propagates a genuine stop failure", async () => {
     stubDaemon({
       inspectOriginal: () => new Response(JSON.stringify(runningOriginal), { status: 200 }),
       stopOriginal: () => new Response("daemon blip", { status: 500 }),
     });
     await expect(retireOriginal(ORIGINAL_ID)).rejects.toThrow(/500/);
+    touchedNothingButTheStop();
   });
 
-  test("a retry against an already-stopped corpse tolerates a genuine stop failure and still removes it", async () => {
+  test("a live original is stopped, and the stopped original is left alone: no DELETE, no rename (#548)", async () => {
+    stubDaemon({
+      inspectOriginal: () => new Response(JSON.stringify(runningOriginal), { status: 200 }),
+      stopOriginal: () => new Response("", { status: 204 }),
+    });
+    await retireOriginal(ORIGINAL_ID);
+    expect(calls.filter((c) => c.method === "POST" && c.path === `/containers/${ORIGINAL_ID}/stop`)).toHaveLength(1);
+    touchedNothingButTheStop();
+  });
+
+  test("a retry against an already-stopped corpse tolerates a genuine stop failure and nothing more", async () => {
     stubDaemon({
       inspectOriginal: () => new Response(JSON.stringify(stoppedCorpse), { status: 200 }),
       stopOriginal: () => new Response("daemon blip", { status: 500 }),
     });
     await retireOriginal(ORIGINAL_ID); // must not throw
-    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+    touchedNothingButTheStop();
   });
 
   // The expected 304 (already stopped) is tolerated by stopContainer itself either way — pinning
@@ -673,7 +741,7 @@ describe("retireOriginal", () => {
       stopOriginal: () => new Response("", { status: 304 }),
     });
     await retireOriginal(ORIGINAL_ID);
-    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+    touchedNothingButTheStop();
   });
 
   // An original that's already fully gone (removed, not just stopped) is a third "nothing left to
@@ -688,7 +756,7 @@ describe("retireOriginal", () => {
       stopOriginal: () => new Response("daemon blip", { status: 500 }),
     });
     await retireOriginal(ORIGINAL_ID); // must not throw
-    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+    touchedNothingButTheStop();
   });
 
   test("an original that no longer exists at all still returns cleanly on the expected 404", async () => {
@@ -697,6 +765,7 @@ describe("retireOriginal", () => {
       stopOriginal: () => new Response("not found", { status: 404 }),
     });
     await retireOriginal(ORIGINAL_ID); // must not throw
+    touchedNothingButTheStop();
   });
 
   // #160: with the replacement's own RestartPolicy now "no" until takeOver restores it, a stop
@@ -727,7 +796,7 @@ describe("retireOriginal", () => {
     }) as unknown as typeof fetch;
     await retireOriginal(ORIGINAL_ID); // must NOT throw — the late-stop re-inspect confirms it's down
     expect(inspectCallCount).toBeGreaterThanOrEqual(2); // proves the re-inspect actually ran, not a fluke
-    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`)).toBe(true);
+    touchedNothingButTheStop(); // it proceeds as the ordinary path does: the removal follows probation
   });
 
   test("a stop that throws while the original is STILL confirmed running rethrows — a genuine failure, not a slow one", async () => {
@@ -742,6 +811,379 @@ describe("retireOriginal", () => {
     }) as unknown as typeof fetch;
     await expect(retireOriginal(ORIGINAL_ID)).rejects.toThrow(/500/);
     expect(calls.some((c) => c.method === "DELETE")).toBe(false); // never reached the remove step
+  });
+});
+
+// #548: the swap's last step, run by the replacement once `activate()` has returned and the first tick has
+// settled. The effects are injected here; the real HTTP verbs are the next describe's.
+describe("completeTakeOver", () => {
+  const ORIGINAL = "f".repeat(64);
+  const corpse: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL,
+    Name: "/warbandeer-discord",
+    State: { Running: false, Status: "exited", ExitCode: 0 },
+  };
+  const asideSentinel = new Error("stepped aside");
+  const logged = { warn: [] as string[], error: [] as string[] };
+  const real = { warn: console.warn, error: console.error, log: console.log };
+
+  beforeEach(() => {
+    logged.warn = [];
+    logged.error = [];
+    console.warn = (...a: unknown[]) => void logged.warn.push(a.join(" "));
+    console.error = (...a: unknown[]) => void logged.error.push(a.join(" "));
+    console.log = () => {};
+  });
+  afterEach(() => {
+    console.warn = real.warn;
+    console.error = real.error;
+    console.log = real.log;
+  });
+
+  function effects(order: string[], o: Record<string, unknown> = {}) {
+    return {
+      inspect: async () => (order.push("inspect"), corpse as ContainerInspect | undefined),
+      tagLatest: async () => void order.push("tag"),
+      remove: async (id: string, force?: boolean) => void order.push(`remove:${id}:${force}`),
+      rename: async (name: string) => void order.push(`rename:${name}`),
+      stepAside: async (): Promise<never> => {
+        order.push("aside");
+        throw asideSentinel;
+      },
+      ...o,
+    };
+  }
+
+  test("reads the name, tags :latest, removes the stopped original, takes its name — in that order, and never throws", async () => {
+    const order: string[] = [];
+    await completeTakeOver(ORIGINAL, effects(order));
+    // The name is read BEFORE the removal (nothing can be read off a removed container), the tag lands before
+    // the removal, and the rename names the canonical container (no leading slash).
+    expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:true`, "rename:warbandeer-discord"]);
+    expect(logged.warn).toEqual([]);
+    expect(logged.error).toEqual([]);
+  });
+
+  test("a tagLatest failure still removes and renames, and is only logged", async () => {
+    const order: string[] = [];
+    await completeTakeOver(
+      ORIGINAL,
+      effects(order, {
+        tagLatest: async () => {
+          order.push("tag");
+          throw new Error("daemon: tag conflict");
+        },
+      }),
+    );
+    expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:true`, "rename:warbandeer-discord"]);
+    expect(logged.error).toHaveLength(1);
+    expect(logged.error[0]).toContain("tag conflict");
+  });
+
+  test("a removal failure still attempts the rename, and a rename failure is only logged", async () => {
+    const order: string[] = [];
+    await completeTakeOver(
+      ORIGINAL,
+      effects(order, {
+        remove: async () => {
+          order.push("remove");
+          throw new Error("rm refused");
+        },
+        rename: async () => {
+          order.push("rename");
+          throw new Error("name in use");
+        },
+      }),
+    );
+    expect(order).toEqual(["inspect", "tag", "remove", "rename"]);
+    expect(logged.warn).toHaveLength(2);
+    expect(logged.warn[0]).toContain("rm refused");
+    expect(logged.warn[1]).toContain("name in use");
+  });
+
+  test("an inspect failure keeps everything: no tag, no removal, no rename", async () => {
+    const order: string[] = [];
+    await completeTakeOver(
+      ORIGINAL,
+      effects(order, {
+        inspect: async () => {
+          order.push("inspect");
+          throw new Error("daemon blip");
+        },
+      }),
+    );
+    // Without the inspect there is no telling whether the operator rolled back, and no name to rename to:
+    // a later standby boot finds the corpse and runs this again.
+    expect(order).toEqual(["inspect"]);
+    expect(logged.warn).toHaveLength(1);
+    expect(logged.warn[0]).toContain("daemon blip");
+  });
+
+  test("a running original is a rollback: step aside before tagging, remove nothing", async () => {
+    const order: string[] = [];
+    const running = { ...corpse, State: { Running: true, Status: "running", ExitCode: 0 } };
+    await expect(
+      completeTakeOver(ORIGINAL, effects(order, { inspect: async () => (order.push("inspect"), running) })),
+    ).rejects.toBe(asideSentinel);
+    // `:latest` must not move onto a build the operator just rolled back from.
+    expect(order).toEqual(["inspect", "aside"]);
+    expect(logged.error).toHaveLength(1);
+    expect(logged.error[0]).toContain("rolled back");
+  });
+
+  test("an original that is already gone: tag it, nothing to rename, the removal is harmless", async () => {
+    const order: string[] = [];
+    await completeTakeOver(ORIGINAL, effects(order, { inspect: async () => (order.push("inspect"), undefined) }));
+    expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:true`]);
+    expect(logged.warn).toEqual([]);
+  });
+});
+
+// #548, #490 items 5 and 7: the same step against the REAL HTTP verbs, through a stubbed fetch that records
+// each call's URL -- the earlier retire tests answered every DELETE and rename with 204 and recorded only the
+// path and method, so dropping `force=1`, the try/catch, the rename or the right name all stayed green.
+describe("completeTakeOver — real daemon calls", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = "self-container-id";
+  const ORIGINAL_ID = "9".repeat(64);
+  let calls: { path: string; method: string; url: string }[] = [];
+  const stopped: ContainerInspect = {
+    ...SELF,
+    Id: ORIGINAL_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: false, Status: "exited", ExitCode: 0 },
+  };
+  const real = { warn: console.warn, error: console.error, log: console.log };
+  let warns: string[] = [];
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+    warns = [];
+    console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
+    console.error = () => {};
+    console.log = () => {};
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+    console.warn = real.warn;
+    console.error = real.error;
+    console.log = real.log;
+  });
+
+  function stubDaemon(o: { original?: () => Response; remove?: () => Response; rename?: () => Response } = {}) {
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ path: pathname, method, url: String(url) });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname === `/containers/${ORIGINAL_ID}/json`) return (o.original ?? (() => new Response(JSON.stringify(stopped), { status: 200 })))();
+      if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return (o.remove ?? (() => new Response("", { status: 204 })))();
+      if (pathname.endsWith("/rename")) return (o.rename ?? (() => new Response("", { status: 204 })))();
+      if (pathname.startsWith("/images/") && pathname.endsWith("/tag")) return new Response("", { status: 201 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+  const idx = (pred: (c: { path: string; method: string }) => boolean) => calls.findIndex(pred);
+  const isDelete = (c: { path: string; method: string }) => c.method === "DELETE" && c.path === `/containers/${ORIGINAL_ID}`;
+  const isRename = (c: { path: string; method: string }) => c.path.endsWith("/rename");
+  const isTag = (c: { path: string; method: string }) => c.path.startsWith("/images/") && c.path.endsWith("/tag");
+
+  test("the tag lands before the original's DELETE, the DELETE carries force=1, and the rename names the canonical container", async () => {
+    stubDaemon();
+    await completeTakeOver(ORIGINAL_ID);
+    const tag = idx(isTag);
+    const del = idx(isDelete);
+    const ren = idx(isRename);
+    expect(tag).toBeGreaterThanOrEqual(0);
+    expect(del).toBeGreaterThan(tag); // Mutation: tagging after the removal turns this red.
+    expect(ren).toBeGreaterThan(del);
+    // Mutation: dropping `force` from the removal; renaming to the inspected name with its leading slash.
+    expect(new URL(calls[del]!.url).searchParams.get("force")).toBe("1");
+    expect(calls[ren]!.path).toBe(`/containers/${SELF_ID}/rename`); // this container takes the name
+    expect(new URL(calls[ren]!.url).searchParams.get("name")).toBe("warbandeer-discord");
+    // The tag moves :latest onto this build's own image.
+    expect(new URL(calls[tag]!.url).searchParams.get("tag")).toBe("latest");
+  });
+
+  test("a DELETE 500 on the stopped original still renames, and only warns", async () => {
+    stubDaemon({ remove: () => new Response("busy", { status: 500 }) });
+    await completeTakeOver(ORIGINAL_ID); // must not throw
+    expect(idx(isRename)).toBeGreaterThanOrEqual(0);
+    expect(warns.some((w) => w.includes("could not remove the stopped original"))).toBe(true);
+  });
+
+  test("a rename 409 is tolerated: one warning, no throw", async () => {
+    stubDaemon({ rename: () => new Response("name already in use", { status: 409 }) });
+    await completeTakeOver(ORIGINAL_ID); // must not throw
+    expect(warns.filter((w) => w.includes("could not take the name"))).toHaveLength(1);
+  });
+
+  test("an original already gone (404) means no rename and no throw; the tag still lands", async () => {
+    stubDaemon({ original: () => new Response("not found", { status: 404 }) });
+    await completeTakeOver(ORIGINAL_ID);
+    expect(idx(isTag)).toBeGreaterThanOrEqual(0);
+    expect(calls.filter(isRename)).toEqual([]);
+  });
+
+  test("an original that is running again is left alone: no tag, no DELETE, no rename", async () => {
+    stubDaemon({ original: () => new Response(JSON.stringify({ ...stopped, State: { Running: true, Status: "running", ExitCode: 0 } }), { status: 200 }) });
+    const sentinel = new Error("stepped aside");
+    await expect(
+      completeTakeOver(ORIGINAL_ID, {
+        stepAside: async () => {
+          throw sentinel;
+        },
+      }),
+    ).rejects.toBe(sentinel);
+    expect(calls.filter(isTag)).toEqual([]);
+    expect(calls.filter(isDelete)).toEqual([]);
+    expect(calls.filter(isRename)).toEqual([]);
+  });
+});
+
+// #548: probation's end. A first tick can contain a 15-minute build, so the wait is capped.
+describe("finishProbation", () => {
+  const real = { log: console.log };
+  let said: string[] = [];
+  beforeEach(() => {
+    said = [];
+    console.log = (...a: unknown[]) => void said.push(a.join(" "));
+  });
+  afterEach(() => {
+    console.log = real.log;
+  });
+
+  test("waits for the first tick, then completes", async () => {
+    let settle!: () => void;
+    const firstTick = new Promise<void>((resolve) => (settle = resolve));
+    const completed: string[] = [];
+    const done = finishProbation("orig", firstTick, { capMs: 60_000, sleep: () => new Promise<void>(() => {}), complete: async (id) => void completed.push(id) });
+    await Bun.sleep(10);
+    // Mutation: dropping the await on the race (or racing nothing) completes while the tick is still pending.
+    expect(completed).toEqual([]);
+    settle();
+    await done;
+    expect(completed).toEqual(["orig"]);
+    expect(said.some((l) => l.includes("first tick settled"))).toBe(true);
+  });
+
+  test("a first tick that never settles is capped", async () => {
+    const completed: string[] = [];
+    const started = Date.now();
+    await finishProbation("orig", new Promise<void>(() => {}), { capMs: 20, complete: async (id) => void completed.push(id) });
+    expect(completed).toEqual(["orig"]);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(said.some((l) => l.includes("first tick capped"))).toBe(true);
+  });
+
+  test("a first tick that rejects still ends probation (it ran), and finishProbation does not throw", async () => {
+    const completed: string[] = [];
+    await finishProbation("orig", Promise.reject(new Error("tick blew up")), { capMs: 60_000, sleep: () => new Promise<void>(() => {}), complete: async (id) => void completed.push(id) });
+    expect(completed).toEqual(["orig"]);
+  });
+});
+
+// #548: at a standby boot, is the original RUNNING although this container has taken over before?
+describe("detectRollback", () => {
+  const ENV = { [HANDOFF_FROM_ENV]: "orig" };
+  const running = { ...SELF, State: { Running: true, Status: "running", ExitCode: 0 } };
+  const stopped = { ...SELF, State: { Running: false, Status: "exited", ExitCode: 0 } };
+  const selfWith = (Name?: string): ContainerInspect => ({ ...SELF, HostConfig: { ...SELF.HostConfig, RestartPolicy: Name === undefined ? undefined : { Name } } });
+  const real = { warn: console.warn };
+  let warns: string[] = [];
+  beforeEach(() => {
+    warns = [];
+    console.warn = (...a: unknown[]) => void warns.push(a.join(" "));
+  });
+  afterEach(() => {
+    console.warn = real.warn;
+  });
+
+  test("a running original and an own policy other than no is a rollback", async () => {
+    for (const own of ["unless-stopped", "always", "on-failure"]) {
+      expect(await detectRollback(ENV, { inspect: async () => running, inspectSelf: async () => selfWith(own) }), own).toBe(true);
+    }
+  });
+
+  test("a first attempt (own policy no, or empty) is never a rollback, however the original looks", async () => {
+    // Mutation: dropping the own-policy check makes a swap in flight step aside.
+    expect(await detectRollback(ENV, { inspect: async () => running, inspectSelf: async () => selfWith("no") })).toBe(false);
+    expect(await detectRollback(ENV, { inspect: async () => running, inspectSelf: async () => selfWith("") })).toBe(false);
+    expect(await detectRollback(ENV, { inspect: async () => running, inspectSelf: async () => selfWith(undefined) })).toBe(false);
+    // A stopped original never needs this container's own policy looked up.
+    let selfCalls = 0;
+    expect(await detectRollback(ENV, { inspect: async () => stopped, inspectSelf: async () => (selfCalls++, selfWith("always")) })).toBe(false);
+    expect(selfCalls).toBe(0);
+  });
+
+  test("a stopped or gone original is not a rollback; a failing or hanging inspect is not either", async () => {
+    expect(await detectRollback(ENV, { inspect: async () => undefined, inspectSelf: async () => selfWith("always") })).toBe(false);
+    expect(
+      await detectRollback(ENV, {
+        inspect: async () => {
+          throw new Error("daemon blip");
+        },
+        inspectSelf: async () => selfWith("always"),
+      }),
+    ).toBe(false);
+    expect(warns).toHaveLength(1);
+    expect(await detectRollback(ENV, { inspect: () => new Promise<never>(() => {}), inspectSelf: async () => selfWith("always") }, 20)).toBe(false);
+  });
+
+  test("no HANDOFF_FROM never touches the daemon", async () => {
+    let calls = 0;
+    const inspect = async () => (calls++, running);
+    expect(await detectRollback({}, { inspect, inspectSelf: async () => selfWith("always") })).toBe(false);
+    expect(await detectRollback({ [HANDOFF_FROM_ENV]: "" }, { inspect, inspectSelf: async () => selfWith("always") })).toBe(false);
+    expect(calls).toBe(0);
+  });
+});
+
+// #548: the replacement stops ITSELF through the daemon, so the stop is explicit (exempt from unless-stopped) and
+// the container stays down; the SIGTERM it then receives drains through index.ts's shutdown handler.
+describe("stepAside", () => {
+  const real = { error: console.error };
+  let errors: string[] = [];
+  beforeEach(() => {
+    errors = [];
+    console.error = (...a: unknown[]) => void errors.push(a.join(" "));
+  });
+  afterEach(() => {
+    console.error = real.error;
+  });
+
+  test("stops its own id through the daemon, and exits 1 only if no signal arrives", async () => {
+    const stopped: string[] = [];
+    const exits: number[] = [];
+    // The stop goes out and the grace wait is pending: no exit yet.
+    void stepAside({ inspectSelf: async () => SELF, stop: async (id) => void stopped.push(id), exit: (c) => void exits.push(c), sleep: () => new Promise<void>(() => {}) });
+    await Bun.sleep(10);
+    expect(stopped).toEqual([SELF_ID]);
+    expect(exits).toEqual([]);
+    // With the grace elapsed and no SIGTERM, it gives up and exits 1.
+    void stepAside({ inspectSelf: async () => SELF, stop: async () => {}, exit: (c) => void exits.push(c), sleep: async () => {} });
+    await Bun.sleep(10);
+    expect(exits).toEqual([1]);
+  });
+
+  test("a stop that fails exits 1 at once, without waiting out the grace", async () => {
+    const exits: number[] = [];
+    let slept = false;
+    void stepAside({
+      inspectSelf: async () => SELF,
+      stop: async () => {
+        throw new Error("daemon down");
+      },
+      exit: (c) => void exits.push(c),
+      sleep: async () => void (slept = true),
+    });
+    await Bun.sleep(10);
+    expect(exits).toEqual([1]);
+    expect(slept).toBe(false);
+    expect(errors).toHaveLength(2); // the "stepping aside" line, then why it exits instead
   });
 });
 

@@ -23,6 +23,11 @@ export const HANDOFF_FROM_ENV = "HANDOFF_FROM";
  *  still inspectable by the time the replacement gets around to reading it. */
 export const HANDOFF_RESTART_POLICY_ENV = "HANDOFF_RESTART_POLICY";
 
+/** Set on the replacement only, beside {@link HANDOFF_RESTART_POLICY_ENV}, and only when the ORIGINAL's policy
+ *  was `on-failure` with a positive `MaximumRetryCount`: that cap, so `takeOver` restores the whole policy and
+ *  not just its name (#490). Absent for every other policy, and from a standby created by an older original. */
+export const HANDOFF_RESTART_RETRIES_ENV = "HANDOFF_RESTART_RETRIES";
+
 /** How long the original waits for the replacement to prove itself before writing it off. */
 export const HANDOFF_DEADLINE_MS = 120_000;
 

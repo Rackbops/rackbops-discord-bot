@@ -259,7 +259,7 @@ like any other key, but `env-get` never lists one and `env-schema` reports it as
 are write-only" under the safety notes. A key the deployment
 itself owns (a core credential, or a variable `docker-compose.yml` interpolates) or the bot core reads
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
-`HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
+`HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HANDOFF_RESTART_RETRIES`, `HOSTNAME`, and the four shard variables the discord.js
 `Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`, and the HTTP
 router's `HTTP_PORT` (#220) and `TRUSTED_PROXY_HOST` (#319), and `LOG_FORMAT` (#324) — all `RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
 spellings of each proxy variable, since Bun's `fetch` honours upper- and lower-case alike
@@ -332,7 +332,7 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   deployment or the bot core owns — the core credentials, the access and admin settings, every variable
   `docker-compose.yml` interpolates, the settings the core reads that the panel does not edit
   (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
-  `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
+  `HANDOFF_RESTART_POLICY`, `HANDOFF_RESTART_RETRIES`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
   `SHARDING_MANAGER_MODE`, #278; the HTTP router's `HTTP_PORT`, #220, and `TRUSTED_PROXY_HOST`, #319; `LOG_FORMAT`, #324), and the variables that act on the core's own outbound calls or on a
   tool it spawns — both spellings of each proxy variable (`HTTP_PROXY`/`http_proxy`,
   `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`) and `TAR_OPTIONS` (#280) — is
@@ -411,7 +411,10 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   tagged — including one a `/update` self-deploy (nazumods/wow#879) just built. Adding `--build` would rebuild
   from the box's checkout and roll the bot back on every settings edit.
 - These subcommands keep working across a self-update: the replacement container takes the
-  original's name as it retires it, so `BOT_OPS_CONTAINER` still resolves and needs no change.
+  original's name once its own start-up and first tick are through (#548), so `BOT_OPS_CONTAINER` still
+  resolves and needs no change — for those seconds `status` and `logs` show the stopped original under the
+  canonical name and the live bot is `<name>-next`; a build that crashes in that window is rolled back with
+  `docker start <name>`, which makes the new container step aside.
 
 ## Enabling a panel + choosing a bot (debug/prod)
 
@@ -547,7 +550,9 @@ In the Cloudflare Zero Trust dashboard, create a tunnel for this instance (Netwo
 create -> Docker connector) and copy its token: it goes into `.env` in the next step. Give it one
 public hostname, `clerk.<domain>`, with the service `http://rackbops-discord-bot-clerk:8080` --
 the container **name**, not the `bot` alias a self-update's replacement also carries (see
-`HTTP_PORT` in `.env.example`). Put a Cloudflare Access application in front of the hostname
+`HTTP_PORT` in `.env.example`). A self-update's replacement takes that name when its probation ends
+(its start-up and first tick are through, #548), so through the tunnel the router is reachable again
+from then on. Put a Cloudflare Access application in front of the hostname
 (Access -> Applications -> self-hosted, `clerk.<domain>`): Google sign-in with an allow policy
 listing the people who may use the web area, plus a service token and a Service Auth policy for
 the uptime monitor, which checks `/tracker/healthz` through the gate. Each friend is added to the

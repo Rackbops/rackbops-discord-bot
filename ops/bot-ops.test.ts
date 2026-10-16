@@ -3675,7 +3675,7 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
     expect(files.length).toBeGreaterThan(20);
     expect(read.size).toBeGreaterThanOrEqual(15); // can't pass vacuously
     // the reads the scan must see, or its regexes have rotted
-    for (const key of ["DISCORD_TOKEN", "GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HOSTNAME", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY"]) {
+    for (const key of ["DISCORD_TOKEN", "GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HOSTNAME", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY", "HANDOFF_RESTART_RETRIES"]) {
       expect(read.has(key), `the scan should see ${key}`).toBe(true);
     }
     expect([...read].filter(([k]) => !allowedKeys.has(k) && !reserved.has(k)).map(([k, f]) => `${k} (${f})`)).toEqual([]);
@@ -3712,6 +3712,7 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
     "NODE_ENV",
     "HANDOFF_FROM",
     "HANDOFF_RESTART_POLICY",
+    "HANDOFF_RESTART_RETRIES",
     "HOSTNAME",
     "SHARDS",
     "SHARD_COUNT",

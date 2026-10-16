@@ -125,3 +125,9 @@ route.
   as it retires the original (`replacementName`, `src/redeploy.ts`). The tunnel routes by that
   canonical name, so requests keep reaching the original until the swap, and the replacement from
   then on. That is the same as the plugins' own servers today.
+  **Amended 2026-10-16 (#548):** the name moves later. The original is stopped at the replacement's
+  login but kept, and the replacement takes the canonical name (`completeTakeOver`) only after
+  `activate()` has returned and the first scheduler tick has settled (60 s cap). Its listener binds
+  earlier, inside `activate()`, but is reachable through the tunnel by name only from the rename on:
+  for the tail of `activate()` plus the first tick the route points at the stopped original. That is
+  the cost of keeping the original as a one-command rollback.
