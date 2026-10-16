@@ -615,16 +615,19 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
       throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
     }) as unknown as typeof fetch;
     const exits: number[] = [];
+    const slept: number[] = [];
     // The DEFAULT stepAside too, with only its exit and grace wait injected (the grace never ends, so the call
     // never returns, like the real one). Mutation: a default that does nothing leaves no POST .../stop on this
-    // container and lets the takeover go ahead.
+    // container and lets the takeover go ahead; one that drops `stepAsideDeps` leaves the REAL 30 s grace and
+    // `process.exit(1)` armed, which the recorded grace below catches as an assertion.
     void takeOver(ORIGINAL_ID, {
       write: async () => {},
       clear: async () => {},
       exit: (code) => void exits.push(code),
-      stepAsideDeps: { exit: (code) => void exits.push(code), sleep: () => new Promise<void>(() => {}) },
+      stepAsideDeps: { exit: (code) => void exits.push(code), sleep: (ms) => (slept.push(ms), new Promise<void>(() => {})) },
     });
     await Bun.sleep(40);
+    expect(slept).toEqual([STEP_ASIDE_GRACE_MS]);
     expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       `GET /containers/${ORIGINAL_ID}/json`,
       `GET /containers/${HOSTNAME}/json`,
@@ -1202,8 +1205,13 @@ describe("completeTakeOver — real daemon calls", () => {
   test("an original that is running again is left alone: no tag, no DELETE, no rename, and this container stops itself", async () => {
     stubDaemon({ original: () => new Response(JSON.stringify({ ...stopped, State: { Running: true, Status: "running", ExitCode: 0 } }), { status: 200 }) });
     const exits: number[] = [];
-    void completeTakeOver(ORIGINAL_ID, { stepAsideDeps: { exit: (c) => void exits.push(c), sleep: () => new Promise<void>(() => {}) } });
+    const slept: number[] = [];
+    void completeTakeOver(ORIGINAL_ID, {
+      stepAsideDeps: { exit: (c) => void exits.push(c), sleep: (ms) => (slept.push(ms), new Promise<void>(() => {})) },
+    });
     await Bun.sleep(30);
+    // Mutation: a default that drops `stepAsideDeps` leaves the real grace wait and `process.exit(1)` armed.
+    expect(slept).toEqual([STEP_ASIDE_GRACE_MS]);
     expect(calls.filter((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/stop`)).toHaveLength(1);
     expect(calls.filter(isTag)).toEqual([]);
     expect(calls.filter(isDelete)).toEqual([]);
