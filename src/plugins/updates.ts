@@ -169,12 +169,12 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
 }
 
 /** #544: an entry's `error`, fit for one reply line: whitespace collapsed, cut to `max` characters with an
- *  ellipsis (never inside a surrogate pair). `undefined` for anything that is not a non-blank string, so a
- *  hand-edited state.json cannot break the list. */
+ *  ellipsis (never inside a surrogate pair). Falsy (`undefined` for a non-string, `""` for a blank one) for
+ *  anything that is not a non-blank string, which is how both callers test it, so a hand-edited state.json
+ *  cannot break the list. */
 function shortError(error: unknown, max = 120): string | undefined {
   if (typeof error !== "string") return undefined;
   const oneLine = error.replace(/\s+/g, " ").trim();
-  if (oneLine === "") return undefined;
   if (oneLine.length <= max) return oneLine;
   const cutAt = max - 1;
   const code = oneLine.charCodeAt(cutAt - 1);
