@@ -3235,11 +3235,14 @@ describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => 
     expect(resolveAdminBundleUrl(null, "warbandeer")).toBeNull();
   });
   // #465 item 8: the unpinned branch is held to the plugin's own published package on the CDN, as the pinned branch is,
-  // not merely the host. Mutation: the prefix check dropped (a /gh/ URL or another package's is accepted); the check
-  // done on the raw string instead of the normalised URL (the traversal case).
+  // not merely the host. Mutations: the prefix check dropped (a /gh/ URL or another package's is accepted); the check
+  // done on the raw string instead of the normalised URL (the traversal case); the prefix without its closing `@`
+  // (a package that merely starts with this one's name).
   test("the unpinned URL must sit under the plugin's own published package, not merely on the host (#465 item 8)", () => {
     expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/gh/x/y@main/a.js"), "warbandeer")).toBeNull();
     expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-other@1.0.0/dist/admin.js"), "warbandeer")).toBeNull();
+    // ... including one whose name merely STARTS with this package's (the prefix ends at the `@`).
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer-evil@1.0.0/dist/admin.js"), "warbandeer")).toBeNull();
     // A traversal out of the own package is another path once the URL is normalised.
     expect(
       resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/../../../gh/x/y@main/a.js"), "warbandeer"),
