@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,6 +36,7 @@ const {
   mutatePluginState,
   pluginHostStateForTest,
   resetPluginHostForTest,
+  resetPluginDisposingForTest,
   routeInteractionByPrefix,
   dispatchPluginInteraction,
   dispatchPluginInteractionOutcome,
@@ -97,6 +98,61 @@ describe("pluginHostStateForTest", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // #541: disposePlugins sets a flag that makes activatePlugins refuse every plugin, and publishes the
+  // activation run it waits for. Both are guarded state, with a flag-only reset for a test's own cleanup.
+  describe("the disposing flag and the activation run (#541)", () => {
+    afterEach(() => resetPluginDisposingForTest());
+
+    test("the flag is set synchronously by disposePlugins, before its first await", async () => {
+      expect(pluginHostStateForTest().disposing).toBe(false);
+      const pending = disposePlugins([], makeLog().log, 10);
+      expect(pluginHostStateForTest().disposing).toBe(true); // not "after the first await": activatePlugins reads it after each of its own
+      await pending;
+      expect(pluginHostStateForTest().disposing).toBe(true); // never cleared by production code
+    });
+
+    // The flag-only reset is a test's own cleanup, so it must leave an activation the test leaked visible to the
+    // guard; only the guard's own reset (resetPluginHostForTest) forgets a run.
+    test("resetPluginDisposingForTest clears only the flag; resetPluginHostForTest also forgets an activation run", async () => {
+      const held = heldActivate();
+      const run = activatePlugins([loaded(entry({ name: "held" }), { activate: held.activate })], makeLog().log, 5_000);
+      await held.started;
+      expect(await settled(pluginHostStateForTest().activation)).toBe(false); // the run in flight
+      await disposePlugins([], makeLog().log, 10); // gives up on it after 10 ms
+      expect(pluginHostStateForTest().disposing).toBe(true);
+
+      resetPluginDisposingForTest();
+      expect(pluginHostStateForTest().disposing).toBe(false);
+      expect(await settled(pluginHostStateForTest().activation)).toBe(false); // still the run in flight: the guard would see it
+
+      await disposePlugins([], makeLog().log, 10);
+      expect(pluginHostStateForTest().disposing).toBe(true);
+      resetPluginHostForTest();
+      expect(pluginHostStateForTest().disposing).toBe(false);
+      expect(await settled(pluginHostStateForTest().activation)).toBe(true); // forgotten, though the run itself is still going
+
+      held.resolve(); // let the run finish (the flag is down again, so the plugin simply comes up)
+      await run;
+    });
+
+    // CONTEXT.md: resetPluginHostForTest is not for a test's own cleanup, because it replaces the write queue
+    // and would hide a leaked write from the guard. The flag-only reset exists so cleanup can avoid that.
+    test("resetPluginDisposingForTest leaves the state.json write queue alone", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "host-state-flag-reset-"));
+      const stall = stallBunWrite();
+      try {
+        void mutatePluginState(dir, (s) => s);
+        await stall.reached;
+        resetPluginDisposingForTest();
+        expect(await settled(pluginHostStateForTest().writes)).toBe(false); // the stuck write is still what the guard waits on
+      } finally {
+        stall.restore();
+        resetPluginHostForTest(); // what the guard does once it has waited
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });
 
 function makeLog() {
@@ -150,6 +206,23 @@ const orHung = <T>(p: Promise<T>): Promise<T | "hung"> => Promise.race([p, Bun.s
 /** #408: a value `String()` throws on ("No default value") -- plugin code can throw or reject with one, and
  *  every isolating catch in host.ts must still describe it rather than throw again. */
 const unprintable = (): unknown => Object.create(null);
+
+/** #541: an activate() the test settles by hand, that also says when it was CALLED -- `started` resolves
+ *  then, so a test waits on the call itself, not on a sleep. */
+const heldActivate = () => {
+  let resolve: () => void = () => {};
+  let reject: (err: unknown) => void = () => {};
+  let start: () => void = () => {};
+  const started = new Promise<void>((res) => (start = res));
+  const activate = () => {
+    start();
+    return new Promise<void>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+  };
+  return { activate, started, resolve: () => resolve(), reject: (err: unknown) => reject(err) };
+};
 
 const cmd = (name: string, build?: PluginCommand["build"]): PluginCommand => ({
   name,
@@ -2244,6 +2317,176 @@ describe("activatePlugins", () => {
   });
 });
 
+// #541: a SIGTERM during boot. disposePlugins runs while activatePlugins is still going; the plugin whose
+// activate() is pending must be released once it settles, none after it may come up, and the shutdown must
+// wait (bounded) for that, since activate() holds no critical section and exit(0) follows within seconds.
+describe("a shutdown during plugin activation (#541)", () => {
+  afterEach(() => resetPluginDisposingForTest());
+
+  test("a plugin whose activate() settles after a shutdown began is disposed before the shutdown returns, left off, and none after it is activated", async () => {
+    const { log, calls } = makeLog();
+    const events: string[] = [];
+    const held = heldActivate();
+    let thirdActivated = false;
+    const lp1 = loaded(entry({ name: "one" }), { activate: async () => {}, dispose: async () => { events.push("one disposed"); } });
+    // Takes a moment (a server close, a flush): the shutdown must wait for it, not just for it to be started.
+    const lp2 = loaded(entry({ name: "two" }), {
+      activate: held.activate,
+      dispose: async () => { await Bun.sleep(20); events.push("two disposed"); },
+    });
+    const lp3 = loaded(entry({ name: "three" }), {
+      activate: async () => { thirdActivated = true; },
+      dispose: async () => { events.push("three disposed"); },
+    });
+    const run = activatePlugins([lp1, lp2, lp3], log, 10_000);
+    await held.started; // one is up, two's activate() is pending
+    expect(lp1.running).toBe(true);
+    const shutdown = disposePlugins([lp1, lp2, lp3], log, 2_000).then(() => events.push("shutdown returned"));
+    held.resolve();
+    await Promise.all([run, shutdown]);
+    expect(events.at(-1)).toBe("shutdown returned"); // the late dispose was awaited, not left to race the exit
+    expect(events.filter((e) => e === "two disposed")).toHaveLength(1);
+    expect(events.filter((e) => e === "one disposed")).toHaveLength(1);
+    expect(events).not.toContain("three disposed");
+    expect([lp1.running, lp2.running, lp3.running]).toEqual([false, false, false]);
+    expect(lp2.error).toBe("shutdown began during activate()");
+    expect(thirdActivated).toBe(false);
+    expect(lp3.error).toBe("shutdown began before activate() ran");
+    expect(calls).toEqual([
+      { level: "warn", message: "[plugins] two finished activating after a shutdown began — disposing what it set up" },
+      { level: "warn", message: "[plugins] three not activated — a shutdown began first" },
+    ]);
+  });
+
+  test("a shutdown that began before activation started activates none of the plugins, and every one carries its own error", async () => {
+    const { log, calls } = makeLog();
+    let activated = 0;
+    const lp1 = loaded(entry({ name: "one" }), { activate: async () => { activated += 1; } });
+    const lp2 = loaded(entry({ name: "two" }), { activate: async () => { activated += 1; } });
+    await disposePlugins([], log, 10);
+    await activatePlugins([lp1, lp2], log, 20);
+    expect(activated).toBe(0);
+    expect([lp1.running, lp1.error]).toEqual([false, "shutdown began before activate() ran"]);
+    expect([lp2.running, lp2.error]).toEqual([false, "shutdown began before activate() ran"]); // the loop visits them all, it does not stop at the first
+    expect(calls).toEqual([
+      { level: "warn", message: "[plugins] one not activated — a shutdown began first" },
+      { level: "warn", message: "[plugins] two not activated — a shutdown began first" },
+    ]);
+  });
+
+  test("a dispose() that throws after a late activation is logged, and the shutdown still returns", async () => {
+    const { log, calls } = makeLog();
+    const held = heldActivate();
+    const lp = loaded(entry({ name: "two" }), { activate: held.activate, dispose: async () => { throw new Error("dispose boom"); } });
+    const run = activatePlugins([lp], log, 10_000);
+    await held.started;
+    const shutdown = disposePlugins([lp], log, 2_000);
+    held.resolve();
+    await expect(Promise.all([run, shutdown])).resolves.toBeDefined();
+    expect(lp.running).toBe(false);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual(["[plugins] two dispose failed — continuing: dispose boom"]);
+  });
+
+  test("a plugin whose activate() REJECTS after a shutdown began is recorded as failed, and not disposed", async () => {
+    const { log, calls } = makeLog();
+    const held = heldActivate();
+    let disposed = 0;
+    const lp = loaded(entry({ name: "two" }), { activate: held.activate, dispose: async () => { disposed += 1; } });
+    const run = activatePlugins([lp], log, 10_000);
+    await held.started;
+    const shutdown = disposePlugins([lp], log, 2_000);
+    held.reject(new Error("boom"));
+    await Promise.all([run, shutdown]);
+    expect(disposed).toBe(0); // a plugin whose activate() failed has nothing dispose() could safely release
+    expect([lp.running, lp.error]).toEqual([false, "boom"]);
+    expect(calls.filter((c) => c.level === "error").map((c) => c.message)).toEqual([
+      "[plugins] two failed to activate — the bot keeps running without it: boom",
+    ]);
+  });
+
+  test("disposePlugins waits for the activation in flight, but only for its own bound", async () => {
+    const { log } = makeLog();
+    const held = heldActivate();
+    const lp = loaded(entry({ name: "wedged" }), { activate: held.activate });
+    const run = activatePlugins([lp], log, 10_000);
+    await held.started;
+    const t0 = performance.now();
+    expect(await orHung(disposePlugins([lp], log, 50))).not.toBe("hung");
+    const waited = performance.now() - t0;
+    expect(waited).toBeGreaterThanOrEqual(40); // it waited for the wedged activate()...
+    expect(waited).toBeLessThan(1_500); // ...and gave up on it, as on a wedged dispose()
+    expect(await settled(pluginHostStateForTest().activation)).toBe(false); // the plugin is still activating
+    held.resolve(); // let it finish, so the run does not outlive the test
+    await run;
+    expect(lp.error).toBe("shutdown began during activate()");
+  });
+
+  // shutdown.ts caps the whole disposePlugins call at 3 s, and each step here is bounded at 2 s in production:
+  // run one after the other they could total 4 s and outlast it, so the wait runs alongside the disposals.
+  test("the wait runs alongside the disposals, so the whole call costs one bound, not two", async () => {
+    const { log } = makeLog();
+    const held = heldActivate();
+    const wedgedDispose = loaded(entry({ name: "one" }), { dispose: () => new Promise<void>(() => {}) }, true);
+    const lp = loaded(entry({ name: "two" }), { activate: held.activate });
+    const run = activatePlugins([lp], log, 10_000);
+    await held.started;
+    const t0 = performance.now();
+    await disposePlugins([wedgedDispose, lp], log, 400); // the dispose gives up at 400 ms, the activation wait too
+    const took = performance.now() - t0;
+    expect(took).toBeGreaterThanOrEqual(370);
+    expect(took).toBeLessThan(650); // one after the other it would be ~800
+    held.resolve();
+    await run;
+  });
+
+  // The late dispose runs inside the loop, so if it never settled the run would never end and no later plugin
+  // would be visited. The bound is a parameter (like the activate bound) so this does not take 2 s.
+  test("a late dispose() that never settles is given up on after its own bound, so the run still ends", async () => {
+    const { log } = makeLog();
+    const held = heldActivate();
+    const lp = loaded(entry({ name: "two" }), { activate: held.activate, dispose: () => new Promise<void>(() => {}) });
+    const run = activatePlugins([lp], log, 10_000, 50); // the late dispose gets 50 ms
+    await held.started;
+    await disposePlugins([], log, 10); // the shutdown gives up on the wait; the loop carries on without it
+    held.resolve();
+    expect(await orHung(run)).not.toBe("hung");
+    expect([lp.running, lp.error]).toEqual([false, "shutdown began during activate()"]);
+  });
+
+  // `activation` is what disposePlugins waits on, "settled, never rejecting". A throwing logger makes the run
+  // itself reject (the pre-start warn is outside the loop's try), which must not reach the shutdown's wait.
+  test("a run that rejects is published as settled, so the shutdown's wait still resolves", async () => {
+    const throwingWarn = { info: () => {}, warn: () => { throw new Error("log boom"); }, error: () => {} };
+    await disposePlugins([], makeLog().log, 10); // a shutdown already began, so the first plugin's warn fires
+    const lp = loaded(entry({ name: "one" }), { activate: async () => {} });
+    await expect(activatePlugins([lp], throwingWarn, 20)).rejects.toThrow("log boom");
+    expect(await settled(pluginHostStateForTest().activation)).toBe(true);
+    await expect(disposePlugins([], makeLog().log, 50)).resolves.toBeUndefined();
+  });
+
+  test("nothing is waited for once boot has finished", async () => {
+    const { log } = makeLog();
+    const lp = loaded(entry({ name: "one" }), { activate: async () => {}, dispose: async () => {} });
+    await activatePlugins([lp], log, 20);
+    const t0 = performance.now();
+    await disposePlugins([lp], log, 1_000);
+    expect(performance.now() - t0).toBeLessThan(500);
+  });
+
+  test("a plugin that timed out and resolves after a shutdown began is disposed once, by the late path", async () => {
+    const { log } = makeLog();
+    const held = heldActivate();
+    let disposed = 0;
+    const lp = loaded(entry({ name: "slow" }), { activate: held.activate, dispose: async () => { disposed += 1; } });
+    await activatePlugins([lp], log, 20); // gives up on it after 20 ms
+    await disposePlugins([lp], log, 50);
+    held.resolve();
+    await Bun.sleep(0);
+    expect(disposed).toBe(1); // afterLateActivate's dispose; the loop's own post-settle check is not reached on this path
+    expect(lp.running).toBe(false);
+  });
+});
+
 // #408, at the consumer boundary: what the boot writes to state.json for a plugin whose import or
 // activate() never settled -- the panel and `bot-ops.sh status` read `active` and `error` from there.
 describe("a plugin that never finishes loading or activating, through to state.json (#408)", () => {
@@ -2512,6 +2755,9 @@ describe("dispatchPluginInteractionOutcome: a throwing interactions getter (#470
 });
 
 describe("disposePlugins (#184)", () => {
+  // #541: disposePlugins sets the flag that makes activatePlugins refuse every plugin; put it back (the guard flags it).
+  afterEach(() => resetPluginDisposingForTest());
+
   test("calls dispose only for running plugins, and flips running=false for each it disposes", async () => {
     const { log } = makeLog();
     const disposed: string[] = [];
@@ -2636,6 +2882,8 @@ describe("disposePlugins (#184)", () => {
 // slow dispose (up to PLUGIN_DISPOSE_TIMEOUT_MS) no gate hands the plugin anything new. Driven through
 // the real disposePlugins, never by setting the flag by hand.
 describe("disposePlugins: a plugin being disposed is refused by every gate (#409)", () => {
+  afterEach(() => resetPluginDisposingForTest()); // #541, as in the describe above
+
   /** A running plugin with a command, a tick, a component handler, an autocomplete handler and an http
    *  handler, whose dispose() stays pending until `finish()` -- and records every call it receives. */
   const disposing = () => {
