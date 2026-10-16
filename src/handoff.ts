@@ -113,33 +113,53 @@ export type HandoffOutcome =
  * The marker is read before the container state on purpose: a replacement that has signalled
  * `ready` is already retiring us, so it may well be stopping — and a container seen mid-stop
  * would otherwise be misread as one that died. What it *said* outranks how it currently looks.
+ *
+ * A failed inspect (`inspectFailed`) is not a verdict either: the replacement's state is UNKNOWN
+ * for that poll, which is not the same as gone (#433). The marker, above, still decides;
+ * otherwise the poll keeps waiting and the deadline bounds how long that can go on.
  */
 export function decideHandoffOutcome(o: {
   marker?: HandoffMarker;
   replacement?: ReplacementState;
+  /** This poll's inspect of the replacement failed (a 5xx, a timeout): its state is UNKNOWN, which is not
+   *  "gone" (#433). The marker still decides; otherwise keep waiting, and let the deadline bound it. */
+  inspectFailed?: boolean;
   elapsedMs: number;
   deadlineMs?: number;
 }): HandoffOutcome {
   if (o.marker?.status === "ready") return "ready";
   if (o.marker?.status === "failed") return "failed";
-  // Gone entirely, or stopped without ever signalling: it isn't coming back to signal now.
-  if (!o.replacement) return "failed";
-  if (!o.replacement.running && o.replacement.status !== "created") return "failed";
+  if (!o.inspectFailed) {
+    // Gone entirely, or stopped without ever signalling: it isn't coming back to signal now.
+    if (!o.replacement) return "failed";
+    if (!o.replacement.running && o.replacement.status !== "created") return "failed";
+  }
   if (o.elapsedMs >= (o.deadlineMs ?? HANDOFF_DEADLINE_MS)) return "timeout";
   return "waiting";
 }
+
+/** What became of the `<name>-next` container after a failed swap, for the requester (#451): there was
+ *  nothing to clean up (never created, or already gone), it was removed, it restarted after the verdict
+ *  and was left alone (the generation guard in `redeploy()`), or the removal failed. */
+export type ReplacementDisposition = "none" | "removed" | "left" | "remove-failed";
 
 /** What the requester is told when the swap didn't happen. The original is still running, which
  *  is the part that matters — this is a report, not an apology for being down. */
 export function handoffFailureMessage(outcome: "failed" | "timeout" | "stalled", o: {
   targetSha: string;
   error?: string;
+  replacement?: ReplacementDisposition;
+  replacementError?: string;
 }): string {
   const short = shortSha(o.targetSha);
+  const tail = replacementTail(o);
   if (outcome === "timeout") {
+    // `o.error` here is the last poll's daemon error, when the last poll failed (a failed inspect is not
+    // a verdict, #433): a deadline spent on a daemon that would not answer is worth naming.
     return (
       `⚠️ The replacement for \`${short}\` never reported in within ` +
-      `${Math.round(HANDOFF_DEADLINE_MS / 1000)}s — I removed it and stayed on the current build.`
+      `${Math.round(HANDOFF_DEADLINE_MS / 1000)}s` +
+      `${o.error ? ` (last daemon error: ${o.error})` : ""} — ${tail}`
     );
   }
   if (outcome === "stalled") {
@@ -149,16 +169,36 @@ export function handoffFailureMessage(outcome: "failed" | "timeout" | "stalled",
     // is (a slow-but-eventual failure the redeploy loop still caught), it's worth showing.
     return (
       `⚠️ The replacement for \`${short}\` verified but never retired me within ` +
-      `${Math.round(RETIREMENT_DEADLINE_MS / 60_000)}m — I removed it and stayed on the ` +
-      `current build. Check the daemon socket.${o.error ? ` (${o.error})` : ""}`
+      `${Math.round(RETIREMENT_DEADLINE_MS / 60_000)}m — ${tail} ` +
+      `Check the daemon socket.${o.error ? ` (${o.error})` : ""}`
     );
   }
   // Outcome-neutral on purpose: this bucket covers everything from "never started" to "started,
   // then exited without signalling" to "we lost track of it mid-poll" — `${o.error}` carries the
   // specific reason, so the headline must not claim a stage (e.g. "failed to start") the
   // replacement may already be past.
-  return (
-    `⚠️ The replacement for \`${short}\` did not complete the handoff` +
-    `${o.error ? `: ${o.error}` : ""}. I removed it and stayed on the current build.`
-  );
+  return `⚠️ The replacement for \`${short}\` did not complete the handoff${o.error ? `: ${o.error}` : ""} — ${tail}`;
+}
+
+/** One clause per disposition (#451), lowercase so it follows a dash; every one ends on "the current
+ *  build", which is the headline. An absent disposition makes no claim about the container. */
+function replacementTail(o: { replacement?: ReplacementDisposition; replacementError?: string }): string {
+  switch (o.replacement) {
+    case "none":
+      return "nothing was left to clean up, and I stayed on the current build.";
+    case "removed":
+      return "I removed it and stayed on the current build.";
+    case "left":
+      return (
+        "it restarted after I had decided, so I left it alone (check `docker ps` for the `-next` " +
+        "container) and stayed on the current build."
+      );
+    case "remove-failed":
+      return (
+        `I could not remove it${o.replacementError ? ` (${o.replacementError})` : ""}: remove the ` +
+        "`-next` container by hand. I stayed on the current build."
+      );
+    default:
+      return "I stayed on the current build.";
+  }
 }

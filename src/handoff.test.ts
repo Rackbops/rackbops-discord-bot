@@ -93,6 +93,20 @@ describe("decideHandoffOutcome", () => {
       }),
     ).toBe("ready");
   });
+
+  // #433: a failed inspect (a 5xx, a timeout) says nothing about the replacement. It is not "gone" and
+  // not "exited": the poll waits, and only the deadline can end it without the replacement's own word.
+  test("a failed inspect is not a verdict: waiting before the deadline, timeout at it", () => {
+    expect(decideHandoffOutcome({ inspectFailed: true, elapsedMs: 0 })).toBe("waiting");
+    // The replacement is undefined on a failed inspect; that must not read as "vanished" (-> failed).
+    expect(decideHandoffOutcome({ inspectFailed: true, replacement: undefined, elapsedMs: 0 })).toBe("waiting");
+    expect(decideHandoffOutcome({ inspectFailed: true, elapsedMs: HANDOFF_DEADLINE_MS })).toBe("timeout");
+  });
+
+  test("the marker still decides when the inspect failed", () => {
+    expect(decideHandoffOutcome({ marker: marker("ready"), inspectFailed: true, elapsedMs: 0 })).toBe("ready");
+    expect(decideHandoffOutcome({ marker: marker("failed"), inspectFailed: true, elapsedMs: 0 })).toBe("failed");
+  });
 });
 
 describe("handoffFailureMessage", () => {
@@ -138,6 +152,48 @@ describe("handoffFailureMessage", () => {
   test("every failure says the current build is still running", () => {
     for (const outcome of ["failed", "timeout", "stalled"] as const) {
       expect(handoffFailureMessage(outcome, { targetSha: sha })).toContain("current build");
+      for (const replacement of ["none", "removed", "left", "remove-failed"] as const) {
+        expect(handoffFailureMessage(outcome, { targetSha: sha, replacement })).toContain("current build");
+      }
     }
+  });
+
+  // #451: "I removed it" is only said when it was removed. Every other disposition says what is true.
+  test("says what became of the replacement, per disposition, for every outcome", () => {
+    for (const outcome of ["failed", "timeout", "stalled"] as const) {
+      const none = handoffFailureMessage(outcome, { targetSha: sha, replacement: "none" });
+      expect(none).toContain("nothing was left to clean up");
+      expect(none).not.toContain("removed it");
+
+      expect(handoffFailureMessage(outcome, { targetSha: sha, replacement: "removed" })).toContain("removed it");
+
+      const left = handoffFailureMessage(outcome, { targetSha: sha, replacement: "left" });
+      expect(left).toContain("left it alone");
+      expect(left).toContain("-next");
+      expect(left).not.toContain("removed it");
+
+      const failed = handoffFailureMessage(outcome, {
+        targetSha: sha,
+        replacement: "remove-failed",
+        replacementError: "409 Conflict",
+      });
+      expect(failed).toContain("could not remove it");
+      expect(failed).toContain("409 Conflict");
+      expect(failed).toContain("by hand");
+      expect(failed).not.toContain("removed it");
+
+      // Absent: no claim about the container at all.
+      const unknown = handoffFailureMessage(outcome, { targetSha: sha });
+      for (const claim of ["removed it", "left it alone", "could not remove", "nothing was left"]) {
+        expect(unknown).not.toContain(claim);
+      }
+    }
+  });
+
+  // #433: a deadline spent on a daemon that would not answer is worth naming to the requester.
+  test("a timeout names the last daemon error when there was one", () => {
+    const withError = handoffFailureMessage("timeout", { targetSha: sha, error: "docker inspect c failed: 500" });
+    expect(withError).toContain("last daemon error: docker inspect c failed: 500");
+    expect(handoffFailureMessage("timeout", { targetSha: sha })).not.toContain("last daemon error");
   });
 });

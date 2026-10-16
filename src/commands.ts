@@ -398,7 +398,12 @@ export function updateReply(
           o.redeploy.outcome === "timeout" || o.redeploy.outcome === "stalled"
             ? o.redeploy.outcome
             : "failed";
-        return handoffFailureMessage(kind, { targetSha: latestSha, error: o.redeploy.error });
+        return handoffFailureMessage(kind, {
+          targetSha: latestSha,
+          error: o.redeploy.error,
+          replacement: o.redeploy.replacement,
+          replacementError: o.redeploy.replacementError,
+        });
       }
       // No "if I come back on the same build…" caveat: the bot answers that itself now,
       // with a follow-up naming the build it actually landed on (see updateReport.ts).

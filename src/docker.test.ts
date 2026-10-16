@@ -375,6 +375,17 @@ describe("daemon calls", () => {
     await removeContainer("abc");
   });
 
+  // #451: a caller reporting what it cleaned up has to tell "the daemon removed it" from "the daemon had
+  // nothing by that id or name" -- both are success, only one of them is a removal.
+  test("removeContainer says whether the daemon had the container", async () => {
+    stub(() => new Response("", { status: 204 }));
+    expect(await removeContainer("abc")).toBe(true);
+    stub(() => new Response("", { status: 404 }));
+    expect(await removeContainer("abc")).toBe(false);
+    stub(() => new Response("boom", { status: 500 }));
+    await expect(removeContainer("abc")).rejects.toThrow("docker rm abc failed: 500");
+  });
+
   test("a real stop failure still throws", async () => {
     stub(() => new Response("boom", { status: 500 }));
     await expect(stopContainer("abc")).rejects.toThrow("docker stop abc failed: 500");

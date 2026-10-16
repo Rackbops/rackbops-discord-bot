@@ -29,12 +29,14 @@ import {
   bootMode,
   clearMarker,
   decideHandoffOutcome,
+  HANDOFF_DEADLINE_MS,
   HANDOFF_FROM_ENV,
   HANDOFF_RESTART_POLICY_ENV,
   readMarker,
   RETIREMENT_DEADLINE_MS,
   writeMarker,
   type HandoffOutcome,
+  type ReplacementDisposition,
 } from "./handoff";
 import { beginHandoff, endHandoff } from "./restart";
 import { SHORT_SHA_LEN, shortSha } from "./storage";
@@ -195,6 +197,26 @@ export function buildCreateSpec(
 export interface RedeployResult {
   outcome?: HandoffOutcome;
   error?: string;
+  /** What became of the `<name>-next` container (#451): never created, removed, left alone because it
+   *  restarted after the verdict (the generation guard), or still there after a failed removal. */
+  replacement?: ReplacementDisposition;
+  /** Set with `remove-failed`: the daemon's answer. */
+  replacementError?: string;
+}
+
+/** Test seams; real callers take every default. */
+export interface RedeployOptions {
+  /** `RETIREMENT_DEADLINE_MS`: the post-`ready` retirement wait. */
+  deadlineMs?: number;
+  /** `POLL_MS`: the interval of both the handoff poll and the retirement wait. */
+  pollMs?: number;
+  /** `HANDOFF_DEADLINE_MS`: how long the original waits for a verdict. */
+  handoffDeadlineMs?: number;
+  /** The clock the verdict times and the generation guard use. Not the retirement wait's, which keeps
+   *  `Date.now()`: with a fixed clock the retirement wait would never end. */
+  now?: () => number;
+  /** The marker reads in the handoff poll and in `redeploy()`; not the retirement wait's. */
+  readMarker?: typeof readMarker;
 }
 
 /**
@@ -205,19 +227,18 @@ export interface RedeployResult {
  * therefore not a return: it starts the retirement wait, and outliving that wait is itself a
  * failure (`stalled`), because the one thing `ready` promised was a stop that never came.
  */
-export async function redeploy(
-  latestSha: string,
-  // Test seam: real callers always take the defaults. Overridable so a test can exercise the
-  // retirement wait (item 3) without actually waiting out the real 3-minute deadline.
-  retirementOpts: { deadlineMs?: number; pollMs?: number } = {},
-): Promise<RedeployResult> {
+export async function redeploy(latestSha: string, opts: RedeployOptions = {}): Promise<RedeployResult> {
+  const now = opts.now ?? Date.now;
+  const read = opts.readMarker ?? readMarker;
+  const pollMs = opts.pollMs ?? POLL_MS;
   await clearMarker();
 
   let self: ContainerInspect;
   try {
     self = await inspectSelf();
   } catch (err) {
-    return { error: `could not inspect own container: ${(err as Error).message}` };
+    // Nothing was created yet, so there is nothing of ours to remove (#451).
+    return { error: `could not inspect own container: ${(err as Error).message}`, replacement: "none" };
   }
 
   const tag = shaTag(self.Config.Image, latestSha);
@@ -235,7 +256,7 @@ export async function redeploy(
     // A failed build is inert: nothing has been created, so there is nothing to unwind — and the
     // scheduler was never quiesced (beginHandoff runs only just before the create below), so a
     // failed or wedged build leaves nothing to resume.
-    return { error: `build failed: ${built.error ?? "unknown error"}` };
+    return { error: `build failed: ${built.error ?? "unknown error"}`, replacement: "none" };
   }
   await pruneOldImages(self.Config.Image);
 
@@ -283,23 +304,58 @@ export async function redeploy(
     // reads as "a swap is still in progress" until some LATER redeploy's leftover sweep above runs
     // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the
     // same handle that sweep uses, so removing by it is already proven to work.
-    await removeContainer(replacementId ?? name, true).catch((cleanupErr) => {
-      console.error(`[redeploy] could not clean up the failed replacement: ${(cleanupErr as Error).message}`);
-    });
+    let replacement: ReplacementDisposition = "none";
+    let replacementError: string | undefined;
+    try {
+      // The daemon may have nothing by that name (a create it rejected outright, e.g. a 400 on a bad
+      // bind): then nothing was started and the requester must not hear "removed" (#451).
+      replacement = (await removeContainer(replacementId ?? name, true)) ? "removed" : "none";
+    } catch (cleanupErr) {
+      replacement = "remove-failed";
+      replacementError = (cleanupErr as Error).message;
+      console.error(`[redeploy] could not clean up the failed replacement: ${replacementError}`);
+    }
     endHandoff();
-    return { error: `could not start the replacement: ${(err as Error).message}` };
+    return {
+      error: `could not start the replacement: ${(err as Error).message}`,
+      replacement,
+      ...(replacementError !== undefined ? { replacementError } : {}),
+    };
   }
   console.log(`[redeploy] replacement ${name} started — waiting for it to verify`);
 
   let outcome: HandoffOutcome;
-  // Sampled by awaitHandoff right before the observation that decided the outcome; 0 (epoch) on
-  // the catch-below path, where nothing was ever decided by an observation at all — see the
-  // removal guard below for why that default is safe (a genuinely running replacement with any
-  // real StartedAt is always > 0, so the guard only ever SKIPS a removal on real, later evidence).
-  let observedAt = 0;
+  // #431: the verdict's own time, the baseline the generation guard below compares the replacement's
+  // later StartedAt against. Sampled before the poll, replaced by the poll's own observation, re-sampled
+  // after the retirement wait and in the backstop catch — never left at epoch 0, which made the guard
+  // read EVERY running replacement as a later life and skip the removal.
+  let observedAt = now();
   let pollError: string | undefined;
   try {
-    ({ outcome, observedAt } = await awaitHandoff(replacementId));
+    const decided = await awaitHandoff(replacementId, {
+      deadlineMs: opts.handoffDeadlineMs ?? HANDOFF_DEADLINE_MS,
+      pollMs,
+      now,
+      readMarker: read,
+    });
+    outcome = decided.outcome;
+    observedAt = decided.observedAt;
+    // Set only when the LAST poll's inspect failed: a deadline spent on a daemon that would not answer
+    // is named to the requester; an error the daemon recovered from is not blamed for a silent replacement.
+    if (outcome === "timeout") pollError = decided.lastPollError;
+    if (outcome !== "ready") {
+      // Row 15 of the handoff state table: a `ready` written after that poll's marker read and before its
+      // verdict would otherwise lose to `timeout` or `failed`. What the replacement SAID outranks what the
+      // poll saw, so read once more before acting on anything else. A `ready` that lands after THIS read
+      // (before the removal below) is the residual window: the generation guard's inspect plus the removal
+      // call — milliseconds against a healthy daemon, up to one 60 s call bound against a hanging one.
+      const late = await read();
+      if (late?.status === "ready") {
+        console.warn(`[redeploy] the replacement signalled ready as the poll decided ${outcome} — honouring it`);
+        outcome = "ready";
+        pollError = undefined;
+      }
+    }
     if (outcome === "ready") {
       // It has verified and is retiring us; this process is about to be stopped mid-sentence.
       // Almost. `ready` is a promise of a stop, not the stop itself — if `retireOriginal` dies
@@ -313,7 +369,7 @@ export async function redeploy(
       // writes `failed` (with a reason) the moment its own retire attempt throws, and a blind
       // sleep would sit on that answer for up to `RETIREMENT_DEADLINE_MS` before ever reading it.
       console.log("[redeploy] replacement verified — handing over");
-      if (await awaitRetirementFailure(retirementOpts.deadlineMs, retirementOpts.pollMs)) {
+      if (await awaitRetirementFailure(opts.deadlineMs, pollMs)) {
         console.error("[redeploy] replacement signalled failed after verifying — reclaiming");
         outcome = "failed";
       } else {
@@ -328,20 +384,25 @@ export async function redeploy(
       // StartedAt must be judged against when THIS decision was actually made, not against the stale
       // moment "ready" first arrived — an unrefreshed baseline biases the guard toward wrongly
       // skipping a removal it should make.
-      observedAt = Date.now();
+      observedAt = now();
     }
   } catch (err) {
-    // A daemon blip anywhere in this stretch (a dropped socket, one 500 from the poll, or —
-    // pathologically — the retirement wait above) must not escape uncaught: left unguarded,
-    // this rejection propagated straight through `applyUpdate` -> `checkForUpdate` and skipped
-    // everything below, including `endHandoff()` — quiescing the bot forever (#37). Both the
-    // poll and the wait land here so neither can reopen that gap on its own.
+    // The #37 safety net. A failed inspect no longer reaches here (awaitHandoff catches it per poll,
+    // and `readMarker` never throws), so this is for something new: a throw from the retirement wait or
+    // the clock. It must not escape uncaught — left unguarded, the rejection propagated straight through
+    // `applyUpdate` -> `checkForUpdate` and skipped everything below, including `endHandoff()`,
+    // quiescing the bot forever. It still un-quiesces on every exit, and it judges the replacement
+    // against the moment it fired (#431): a throw late in a long wait must not leave the guard comparing
+    // against the pre-poll time.
     pollError = (err as Error).message;
     console.error(`[redeploy] handoff decision failed: ${pollError} — reclaiming`);
     outcome = "failed";
+    observedAt = now();
   }
 
-  const marker = await readMarker();
+  const marker = await read();
+  let replacement: ReplacementDisposition = "removed";
+  let replacementError: string | undefined;
   try {
     // #160 change 5, defence in depth: change 2 (the standby's RestartPolicy:"no") already stops
     // Docker itself from producing this, so this guard is for what's left — a manual `docker
@@ -369,14 +430,21 @@ export async function redeploy(
       );
     }
     if (restartedSinceDecision) {
+      replacement = "left";
       console.warn(`[redeploy] replacement restarted after we decided ${outcome} — leaving it alone`);
     } else {
-      await removeContainer(replacementId, true);
+      // The window left open: a `ready` written after the marker read above and before this call — the
+      // guard's inspect plus this removal, milliseconds against a healthy daemon, up to one 60 s call
+      // bound against a hanging one — removes a replacement mid-retire. `none` when the daemon already
+      // had nothing by that id (#451): the requester must not hear "removed" for what was never there.
+      replacement = (await removeContainer(replacementId, true)) ? "removed" : "none";
     }
   } catch (err) {
     // Cleanup, not the verdict — a stuck removal (e.g. a 409 mid-teardown) must not skip the
     // `endHandoff()` below either, for the same reason a poll failure above must not.
-    console.error(`[redeploy] could not remove the replacement: ${(err as Error).message}`);
+    replacement = "remove-failed";
+    replacementError = (err as Error).message;
+    console.error(`[redeploy] could not remove the replacement: ${replacementError}`);
   } finally {
     // endHandoff FIRST, and synchronously. Everything this block exists to guarantee is that the
     // bot un-quiesces on every exit (#37); an await ahead of it puts a rejection between the
@@ -386,23 +454,46 @@ export async function redeploy(
     endHandoff();
     await clearMarker();
   }
-  console.warn(`[redeploy] handoff ${outcome} — staying on the current build`);
-  return { outcome, error: pollError ?? marker?.error };
+  console.warn(`[redeploy] handoff ${outcome} — staying on the current build (replacement: ${replacement})`);
+  return {
+    outcome,
+    error: pollError ?? marker?.error,
+    replacement,
+    ...(replacementError !== undefined ? { replacementError } : {}),
+  };
 }
 
 /** Poll the marker and the replacement's own state until one of them decides it. `observedAt` is
  *  sampled right before the observation that produced the terminal outcome (#160, change 5) — the
  *  baseline `redeploy()`'s pre-removal generation check compares the replacement's later
  *  `State.StartedAt` against, so a replacement that restarted after this observation isn't
- *  force-removed as if it were still the one this outcome was decided about. */
-async function awaitHandoff(replacementId: string): Promise<{ outcome: HandoffOutcome; observedAt: number }> {
-  const startedAt = Date.now();
+ *  force-removed as if it were still the one this outcome was decided about. A failed inspect (#433)
+ *  is not a verdict: the marker, read first, still decides; otherwise the replacement's state is
+ *  unknown for that poll and the deadline bounds how long that can go on. `lastPollError` is the LAST
+ *  poll's inspect error, or undefined when the last poll's inspect worked. */
+async function awaitHandoff(
+  replacementId: string,
+  o: { deadlineMs: number; pollMs: number; now: () => number; readMarker: typeof readMarker },
+): Promise<{ outcome: HandoffOutcome; observedAt: number; lastPollError?: string }> {
+  const startedAt = o.now();
+  let lastPollError: string | undefined;
   for (;;) {
-    const observedAt = Date.now();
-    const [marker, container] = await Promise.all([
-      readMarker(),
-      tryInspectContainer(replacementId),
-    ]);
+    const observedAt = o.now();
+    const marker = await o.readMarker();
+    let container: ContainerInspect | undefined;
+    let inspectFailed = false;
+    try {
+      container = await tryInspectContainer(replacementId);
+      if (lastPollError !== undefined) console.log("[redeploy] the replacement's state is readable again");
+      lastPollError = undefined;
+    } catch (err) {
+      inspectFailed = true;
+      const message = (err as Error).message;
+      if (lastPollError === undefined) {
+        console.warn(`[redeploy] could not inspect the replacement (${message}); still waiting on the marker`);
+      }
+      lastPollError = message;
+    }
     const outcome = decideHandoffOutcome({
       marker,
       replacement: container && {
@@ -410,10 +501,12 @@ async function awaitHandoff(replacementId: string): Promise<{ outcome: HandoffOu
         status: container.State.Status,
         exitCode: container.State.ExitCode,
       },
-      elapsedMs: Date.now() - startedAt,
+      inspectFailed,
+      elapsedMs: o.now() - startedAt,
+      deadlineMs: o.deadlineMs,
     });
-    if (outcome !== "waiting") return { outcome, observedAt };
-    await Bun.sleep(POLL_MS);
+    if (outcome !== "waiting") return { outcome, observedAt, lastPollError };
+    await Bun.sleep(o.pollMs);
   }
 }
 
