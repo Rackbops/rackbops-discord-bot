@@ -1112,6 +1112,10 @@ describe("completeTakeOver — real daemon calls", () => {
     Name: "/warbandeer-discord",
     State: { Running: false, Status: "exited", ExitCode: 0 },
   };
+  // This container as a post-#39 replacement really is: running a SHA tag, never `:latest` itself (the shared
+  // SELF fixture says `:latest`, which would let a no-op retag of the image onto itself pass).
+  const SELF_SHA_IMAGE = "warbandeer-discord-debug-bot:abc1234";
+  const selfOnShaTag: ContainerInspect = { ...SELF, Config: { ...SELF.Config, Image: SELF_SHA_IMAGE } };
   const real = { warn: console.warn, error: console.error, log: console.log };
   let warns: string[] = [];
 
@@ -1136,7 +1140,7 @@ describe("completeTakeOver — real daemon calls", () => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
       calls.push({ path: pathname, method, url: String(url) });
-      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname === `/containers/${HOSTNAME}/json`) return new Response(JSON.stringify(selfOnShaTag), { status: 200 });
       if (pathname === `/containers/${ORIGINAL_ID}/json`) return (o.original ?? (() => new Response(JSON.stringify(stopped), { status: 200 })))();
       if (pathname === `/containers/${ORIGINAL_ID}` && method === "DELETE") return (o.remove ?? (() => new Response("", { status: 204 })))();
       if (pathname === `/containers/${SELF_ID}/stop`) return new Response("", { status: 204 });
@@ -1164,8 +1168,12 @@ describe("completeTakeOver — real daemon calls", () => {
     expect(new URL(calls[del]!.url).searchParams.get("force")).toBeNull();
     expect(calls[ren]!.path).toBe(`/containers/${SELF_ID}/rename`); // this container takes the name
     expect(new URL(calls[ren]!.url).searchParams.get("name")).toBe("warbandeer-discord");
-    // The tag moves :latest onto this build's own image.
-    expect(new URL(calls[tag]!.url).searchParams.get("tag")).toBe("latest");
+    // The tag moves :latest onto this build's own image: the SOURCE is this container's sha tag (the path) and
+    // the target is `<repo>:latest` (the query). Mutation: tagging the image onto itself leaves :latest behind.
+    expect(calls[tag]!.path).toBe(`/images/${encodeURIComponent(SELF_SHA_IMAGE)}/tag`);
+    const tagged = new URL(calls[tag]!.url);
+    expect(tagged.searchParams.get("repo")).toBe("warbandeer-discord-debug-bot");
+    expect(tagged.searchParams.get("tag")).toBe("latest");
   });
 
   test("a DELETE 500 on the stopped original still renames, and only warns", async () => {
