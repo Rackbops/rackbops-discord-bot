@@ -1209,6 +1209,9 @@ describe("redeploy — cleanup always runs", () => {
       readMarker: async () => {
         reads++;
         if (reads === 3) throw new Error("marker read blew up");
+        // The final read finds a failed marker with a reason of its own: the backstop's own reason still
+        // leads the result (`pollError ?? marker?.error`).
+        if (reads === 4) return { status: "failed", error: "the replacement's own reason", at: Date.now() };
         return undefined;
       },
     });
