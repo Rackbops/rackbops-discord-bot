@@ -802,8 +802,10 @@ describe("resolveUpdateAttempt (#450)", () => {
     for (const owed of [{ ...armed, toSha: "c".repeat(40) }, { ...armed, fromSha: "c".repeat(40) }, {}, undefined]) {
       await seed(recorded());
       state.pendingUpdateReport = owed as never;
+      const before = structuredClone(owed); // the verdict is set in place, so compare with a copy taken first
       expect(await resolveUpdateAttempt({ probe: probing(absent).probe, log: quiet().log })).toBe("interrupted");
-      expect(state.pendingUpdateReport).toEqual(owed as never); // not marked, not created, not thrown over
+      expect(state.pendingUpdateReport).toEqual(before as never); // not marked, not created, not thrown over
+      expect((state.pendingUpdateReport as { interrupted?: true } | undefined)?.interrupted).toBeUndefined();
       expect(state.attemptedUpdateToSha).toBeUndefined();
       expect(state.swapInFlight).toBeUndefined();
     }
