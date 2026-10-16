@@ -87,8 +87,18 @@ export function configLeaks(s: { changedKeys: string[] }): string[] {
 }
 
 /** Against what `resetUpdateForTest()` leaves. */
-export function updateLeaks(s: { checkInFlight: boolean }): string[] {
-  return s.checkInFlight ? ["an update check still in flight — the next checkForUpdate answers busy"] : [];
+export function updateLeaks(s: {
+  checkInFlight: boolean;
+  suppressedWarnedFor?: string;
+  lastFailure?: { sha: string; reason: string };
+}): string[] {
+  const leaks: string[] = [];
+  if (s.checkInFlight) leaks.push("an update check still in flight — the next checkForUpdate answers busy");
+  if (s.suppressedWarnedFor !== undefined) {
+    leaks.push(`the suppressed warning already logged for ${s.suppressedWarnedFor} — a later check would not log it`);
+  }
+  if (s.lastFailure !== undefined) leaks.push("a failed swap remembered — a later suppressed warning would name it");
+  return leaks;
 }
 
 /** Against what `resetPluginDisposingForTest()` leaves, and with no plugin state.json write pending. */

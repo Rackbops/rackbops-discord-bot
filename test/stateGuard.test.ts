@@ -220,6 +220,15 @@ describe("updateLeaks", () => {
   test("names a check in flight", () => {
     expect(updateLeaks({ checkInFlight: true })).toEqual([expect.stringContaining("an update check still in flight")]);
   });
+  test("names a suppressed warning that already fired, and a failed swap still remembered (#506 item 13)", () => {
+    expect(updateLeaks({ checkInFlight: false, suppressedWarnedFor: "abc" })).toEqual([
+      expect.stringContaining("the suppressed warning already logged for abc"),
+    ]);
+    expect(updateLeaks({ checkInFlight: false, lastFailure: { sha: "abc", reason: "boom" } })).toEqual([
+      expect.stringContaining("a failed swap remembered"),
+    ]);
+    expect(updateLeaks({ checkInFlight: false, suppressedWarnedFor: undefined, lastFailure: undefined })).toEqual([]);
+  });
 });
 
 describe("pluginHostLeaks", () => {
