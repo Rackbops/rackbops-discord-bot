@@ -143,6 +143,36 @@ describe("loadPluginIndex", () => {
       }
     });
 
+    // #440: a release element is read for its `version` (compareSemver splits it) and `publishedAt` (renderNotes slices
+    // it), `url` and `notes` are only printed. One that cannot be read threw a TypeError inside the whole notice pass,
+    // every poll; it is refused here instead, and the entry is named.
+    describe("a release that cannot be read is refused here, not thrown on in the notice pass (#440)", () => {
+      const good = { version: "1.1.0", publishedAt: "2026-09-04T00:00:00.000Z", url: "https://example/r/1.1.0", notes: "what changed" };
+      const reason = 'plugins[0] ("warbandeer"): releases is not a list of releases with a string version and publishedAt';
+      const cases: [string, unknown][] = [
+        ["a null element", null],
+        ["a numeric version", { ...good, version: 110 }],
+        ["a publishedAt that is not a string", { ...good, publishedAt: 20260904 }],
+        ["a url that is not a string", { ...good, url: 5 }],
+        ["notes that are null", { ...good, notes: null }],
+      ];
+      for (const [name, release] of cases) {
+        test(`${name}`, async () => {
+          const { source, warns } = await warnsFor({ ...VALID_INDEX, plugins: [entryWith({ releases: [good, release] })] });
+          expect(source).toBe("cache");
+          expect(warns[0]).toContain(reason);
+        });
+      }
+
+      test("a full release, and one with no url or notes, are accepted", async () => {
+        for (const releases of [[good], [{ version: "1.1.0", publishedAt: "2026-09-04T00:00:00.000Z" }]]) {
+          const { source, warns } = await warnsFor({ ...VALID_INDEX, plugins: [entryWith({ releases })] });
+          expect(source).toBe("fresh");
+          expect(warns).toEqual([]);
+        }
+      });
+    });
+
     test("a duplicate name, and an entry that is not an object", async () => {
       expect((await warnsFor({ ...VALID_INDEX, plugins: [VALID_INDEX.plugins[0], VALID_INDEX.plugins[0]] })).warns[0]).toContain(
         'plugins[1] ("warbandeer"): duplicate name',
