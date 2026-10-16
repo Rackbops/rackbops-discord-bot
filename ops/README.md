@@ -153,7 +153,9 @@ third argument only if you need to force-install that branch's `bot-ops.sh` into
 `bin/` despite it differing from `main`'s (see "Keeping `bot-ops.sh` and `docker-compose.yml`
 current" above, issue #230). `bin` is always refused. A name that is `next` or ends in `-next` is refused for a
 new instance (#567: `-next` is the suffix a self-update gives its replacement container); a re-run on an existing
-instance of that shape only warns, as does any run for an instance whose `-next` sibling already exists.
+instance of that shape only warns (an instance counts as existing when its config dir or its stack dir is
+there), as does any run for an instance whose `-next` sibling already exists, which also says that the
+instance's self-update removes that sibling's container while it is stopped.
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
 a re-run — fill in secrets there by hand). It refreshes three things that are deployment

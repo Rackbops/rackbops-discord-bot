@@ -115,7 +115,7 @@ check_instance_name() {
       ;;
     *)
       if [ -d "${CONFIG_DIR}-next" ] || [ -d "${STACK_DIR}-next" ]; then
-        echo "install: WARNING: an instance '${INSTANCE}-next' already exists on this host; its container is the name the self-update of '$PROJECT' gives its replacement, so the two cannot share a daemon until one is renamed (#567)" >&2
+        echo "install: WARNING: an instance '${INSTANCE}-next' already exists on this host; its container is the name the self-update of '$PROJECT' gives its replacement, so the two cannot share a daemon until one is renamed, and a self-update of '$PROJECT' removes '${PROJECT}-next' if that container is stopped (#567)" >&2
       fi
       ;;
   esac

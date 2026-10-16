@@ -1126,6 +1126,7 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
       expect(r.stdout.trim()).toBe("");
       expect(r.stderr).toContain("would be 'rackbops-discord-bot-prod-next', which ends in -next");
       expect(r.stderr).toContain("the suffix the self-update reserves for its replacement (<container>-next)"); // the issue's acceptance: say WHY
+      expect(r.stderr).toContain("pick another name");
       expect(r.stderr).toContain("(#567)");
     });
   });
@@ -1139,6 +1140,7 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
       expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
       // Quoted, so the unstripped name ('...-prod-next') cannot satisfy it: this is the container it collides WITH.
       expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+      expect(r.stderr).toContain("(#567)");
     });
   });
 
@@ -1150,6 +1152,7 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
       expect(r.stdout.trim()).toBe("ok prod-next");
       expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
       expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+      expect(r.stderr).toContain("(#567)");
     });
   });
 
@@ -1166,8 +1169,9 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
     });
   });
 
-  test("only the suffix counts: prod, nextgen, prodnext and next-prod install silently", async () => {
-    for (const name of ["prod", "nextgen", "prodnext", "next-prod"]) {
+  // `prodnext` tells `*-next` from `*next`; `prod-nextgen` and `my-next-app` tell it from `*-next*` (the suffix, only).
+  test("only the suffix counts: prod, nextgen, prodnext, next-prod, prod-nextgen and my-next-app install silently", async () => {
+    for (const name of ["prod", "nextgen", "prodnext", "next-prod", "prod-nextgen", "my-next-app"]) {
       await withInstanceDirs(name, async (dirs) => {
         const r = await runName(name, dirs);
         expect(r.exitCode, name).toBe(0);
@@ -1188,10 +1192,59 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
           expect(r.exitCode, label).toBe(0);
           expect(r.stdout.trim(), label).toBe("ok prod");
           expect(r.stderr, label).toContain("WARNING: an instance 'prod-next' already exists");
+          // What the collision costs: a stopped X-next is what X's self-update sweeps (src/redeploy.ts, the leftover sweep).
+          expect(r.stderr, label).toContain("removes 'rackbops-discord-bot-prod-next' if that container is stopped");
           expect(r.stderr, label).toContain("(#567)");
         });
       }
     }
+  });
+});
+
+// The CONSUMER boundary: main()'s own slice (the same BRANCH_GUARD_TO_FETCH the branch-gate tests run) with the REAL
+// check_instance_name, every write stubbed to a recording line. A new `probe-next` must exit 1 before any WRITE, and a
+// plain `probe` must reach the end with its writes (so the stubs prove the slice does get that far). The CONFIG_DIR the
+// slice derives is the real /opt path, which no test machine has, so the instance is "new".
+async function runNameGate(instance: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const script = [
+    "set -euo pipefail",
+    'die() { echo "install: $*" >&2; exit 1; }',
+    "need() { :; }",
+    "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
+    CHECK_INSTANCE_NAME,
+    'bootstrap_dir() { echo "WRITE:bootstrap_dir $1"; }',
+    'mkdir() { echo "WRITE:mkdir $*"; }',
+    'chown() { echo "WRITE:chown $*"; }',
+    'sed() { echo "WRITE:sed"; }',
+    "random_token() { echo faketoken; }",
+    'fetch() { echo "WRITE:fetch $1"; }',
+    'install_shared_bin() { echo "WRITE:install_shared_bin"; }',
+    BRANCH_GUARD_TO_FETCH,
+    'echo "REACHED_END"',
+  ].join("\n");
+  const proc = Bun.spawn([BASH!, "-c", script, "_", instance], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+describe.skipIf(!runnable)("install.sh's main() stops a new next/*-next instance before it writes anything (#567)", () => {
+  test("control: a plain new instance reaches the end of the slice with its writes", async () => {
+    const r = await runNameGate("probe");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("WRITE:bootstrap_dir /opt/rackbops-discord-bot/probe");
+    expect(r.stdout).toContain("REACHED_END");
+  });
+
+  test("a new probe-next dies in the slice with no write at all", async () => {
+    const r = await runNameGate("probe-next");
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("would be 'rackbops-discord-bot-probe-next'");
+    expect(r.stdout).not.toContain("WRITE:");
+    expect(r.stdout).not.toContain("REACHED_END");
   });
 });
 
