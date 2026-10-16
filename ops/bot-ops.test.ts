@@ -1256,6 +1256,22 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(dockerCalls(fx).some((c) => c.includes("compose") && c.includes("restart"))).toBe(true);
   });
 
+  test("beside a stopped canonical, the finishing message names the alive match, not the whole list", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "exited\nrunning", originalState: "stopped" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("is running and 'probe-container' is not running");
+  });
+
+  // Only the exact words are leftovers: a state that merely CONTAINS one of them is not (no Docker state does;
+  // this pins that the match is whole-line, not a substring).
+  test("only the exact words exited and dead are leftovers", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "undead", originalState: "running" });
+    const run = await botOps(fx, ["restart"]);
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("a self-update is in progress");
+  });
+
   test("two exited matches are two leftovers, not a swap", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { nextState: "exited\ndead", originalState: "running" });
     const run = await botOps(fx, ["restart"]);
