@@ -149,7 +149,7 @@ function renderNotes(releases: PluginRelease[], maxLen = MESSAGE_LIMIT): string 
   const body = releases.map((r) => `**${r.version}** (${r.publishedAt.slice(0, 10)})\n${r.notes ?? ""}`).join("\n\n");
   if (body.length <= maxLen) return body;
   const tail = `\n… full notes: ${releases[0]?.url ?? ""}`;
-  return body.slice(0, Math.max(0, maxLen - tail.length)) + tail;
+  return sliceUtf16(body, Math.max(0, maxLen - tail.length)) + tail;
 }
 
 /** The `(from, to]` release notes for a plugin, rendered + clamped. Exported for `/plugins list`. */
@@ -172,10 +172,28 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
   // silently losing the notice after retries. Same whole-message budgeting as report.ts.
   const notes = renderNotes(u.releases, MESSAGE_LIMIT - head.length - last.length - 1);
   const msg = `${head}${notes}\n${last}`;
-  // Belt-and-suspenders (mirrors renderPluginsList): the budget keeps this within the cap for any
-  // realistic input; a pathologically long plugin name (head + footer alone > cap) could still
-  // overflow, so hard-cap rather than let Discord reject the send.
-  return msg.length <= MESSAGE_LIMIT ? msg : msg.slice(0, MESSAGE_LIMIT);
+  // Belt-and-suspenders: the budget keeps this within the cap for any realistic input; a pathologically long
+  // plugin name (head + footer alone > cap) could still overflow, so hard-cap rather than let Discord reject the
+  // send, and never inside a surrogate pair (the cut can land in a version or release url, which the index only
+  // checks are strings).
+  return msg.length <= MESSAGE_LIMIT ? msg : sliceUtf16(msg, MESSAGE_LIMIT);
+}
+
+/** `s` cut to at most `n` UTF-16 units, never inside a surrogate pair: when the last kept unit would be a high
+ *  surrogate the cut backs off one unit (#563). No ellipsis -- see `cutUtf16` for the one that marks the cut.
+ *  (`github.ts` keeps its own `sliceUtf16` for its reply clamps: that module imports `config`, and this one stays
+ *  free of it.) */
+export function sliceUtf16(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const last = s.charCodeAt(n - 1);
+  return s.slice(0, n > 0 && last >= 0xd800 && last <= 0xdbff ? n - 1 : n);
+}
+
+/** `s` cut to `max` units with an ellipsis when anything was cut, surrogate-safe (`sliceUtf16`): the `shortError`
+ *  guard (#544), shared with the list's clamp (#563). Byte-identical to the old guard for every `max` >= 1. */
+export function cutUtf16(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${sliceUtf16(s, Math.max(0, max - 1))}…`;
 }
 
 /** #544: an entry's `error`, fit for one reply line: whitespace collapsed, cut to `max` characters with an
@@ -185,61 +203,92 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
 function shortError(error: unknown, max = 120): string | undefined {
   if (typeof error !== "string") return undefined;
   const oneLine = error.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= max) return oneLine;
-  const cutAt = max - 1;
-  const code = oneLine.charCodeAt(cutAt - 1);
-  const end = code >= 0xd800 && code <= 0xdbff ? cutAt - 1 : cutAt; // do not split a surrogate pair
-  return `${oneLine.slice(0, end)}…`;
+  return cutUtf16(oneLine, max);
 }
 
-/** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
- *  note, skip/snooze markers and, for a plugin that is not running this boot, that it is down with the
- *  first error recorded for it (#544). Uses the (freshly-fetched) index for "available" + notes. Pure. */
-export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date): string {
+/** #418: who asked for a pending scheduled update, fit for the list: a Discord snowflake as a mention, a panel
+ *  identity (`email:<addr>` / `token`) as text, collapsed to one line and cut to 80 units; `?` for a blank, so a
+ *  hand-edited state.json cannot break the list. An `update-now`'s requester is not shown (only the transient
+ *  pending report holds it). */
+function requesterText(by: unknown): string {
+  if (typeof by === "string" && isDiscordUserId(by)) return `<@${by}>`;
+  const text = String(by ?? "").replace(/\s+/g, " ").trim();
+  return text === "" ? "?" : cutUtf16(text, 80);
+}
+
+/** The schedule line of a pending scheduled update (#104), with its requester (#418). */
+function scheduleLine(scheduled: NonNullable<PluginStateEntry["scheduled"]>): string {
+  return `\n  ⏳ update to ${scheduled.version} scheduled ${discordTs(Date.parse(scheduled.at), "R")} (requested by ${requesterText(scheduled.requestedBy)})`;
+}
+
+/** The `/plugins list` body: per installed plugin, its version, any newer version (with "(needs a newer bot)" when
+ *  the index entry needs another host API than `hostApiVersion`, #502 item 13) + first-release note, skip/snooze
+ *  markers and, for a plugin that is not running this boot, that it is down with the first error recorded for it
+ *  (#544), and a pending schedule with its requester (#418). Uses the (freshly-fetched) index for "available" +
+ *  notes. Pure.
+ *
+ *  When the whole list exceeds Discord's cap (#563) it is clamped in three tiers. Every plugin's FIRST line (its
+ *  down marker and schedule line included) has priority over any release note: the notes are added back in list
+ *  order while they fit (one that does not fit is skipped, a later smaller one can still go in), and a tail says
+ *  the list was truncated. If the first lines alone exceed 2000 units, whole LINES from the top are kept, then the
+ *  tail (a schedule line is a line of its own, so the cut can fall between a plugin's first line and its schedule
+ *  line, and a plugin after the cut is dropped with its schedule line); and when the first lines fit in 2000 units
+ *  but not with the tail they go out bare, with no tail. No cut lands inside a surrogate pair. */
+export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date, hostApiVersion: number): string {
   if (state.plugins.length === 0) return "No plugins installed.";
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
-  const out = state.plugins
-    .map((p) => {
-      // #225: an off entry shows only that it's off and its pin — no "available", no notes, since
-      // nothing about it will change until it's turned back on. A pending schedule still shows (it's
-      // paused, not cancelled) so /plugins cancel has something visible to act on.
-      if (!p.enabled) {
-        let offLine = `• **${p.name}** — off (installed ${p.installedVersion ?? "(not installed)"})`;
-        if (p.scheduled) {
-          offLine += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
-        }
-        return offLine;
-      }
-      let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
-      let notes = "";
-      const entry = entryByName.get(p.name);
-      if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
-        line += ` → ${entry.version} available`;
-        if (p.skippedVersion === entry.version) line += " (skipped)";
-        else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
-        const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
-        if (firstBlock) notes = `\n${firstBlock.slice(0, 300)}`;
-      }
-      // #544: a plugin that failed to install, load or activate this boot says so on its first line, not
-      // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
-      if (!p.active) {
-        const why = shortError(p.error);
-        line += ` — not running${why ? ` (first error: ${why})` : ""}`;
-      }
-      line += notes;
-      // A pending scheduled update (#104) — shown regardless of whether the index still lists that
-      // version as current, so `/plugins cancel` has something visible to act on.
-      if (p.scheduled) {
-        line += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
-      }
-      return line;
-    })
-    .join("\n");
-  // Clamp the whole reply — many plugins each with a note can exceed Discord's cap and editReply
-  // would reject it, leaving the deferred reply hanging.
-  if (out.length <= MESSAGE_LIMIT) return out;
+  const rows = state.plugins.map((p): { line: string; note: string; tail: string } => {
+    // A pending scheduled update (#104) — shown regardless of whether the index still lists that
+    // version as current, so `/plugins cancel` has something visible to act on. It FOLLOWS the note.
+    const tail = p.scheduled ? scheduleLine(p.scheduled) : "";
+    // #225: an off entry shows only that it's off and its pin — no "available", no notes, since
+    // nothing about it will change until it's turned back on. A pending schedule still shows (it's
+    // paused, not cancelled) so /plugins cancel has something visible to act on.
+    if (!p.enabled) {
+      return { line: `• **${p.name}** — off (installed ${p.installedVersion ?? "(not installed)"})`, note: "", tail };
+    }
+    let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
+    let note = "";
+    const entry = entryByName.get(p.name);
+    if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
+      line += ` → ${entry.version} available${entry.hostApiVersion !== hostApiVersion ? " (needs a newer bot)" : ""}`;
+      if (p.skippedVersion === entry.version) line += " (skipped)";
+      else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
+      const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
+      if (firstBlock) note = `\n${sliceUtf16(firstBlock, 300)}`;
+    }
+    // #544: a plugin that failed to install, load or activate this boot says so on its first line, not
+    // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
+    if (!p.active) {
+      const why = shortError(p.error);
+      line += ` — not running${why ? ` (first error: ${why})` : ""}`;
+    }
+    return { line, note, tail };
+  });
+  // #563: Discord's cap, in three tiers. Everything fits: as is. Else every plugin's first line (its down marker and
+  // schedule line included) has priority over any release note: the notes are added back in list order while they
+  // still fit, and the tail says some were dropped. If the first lines alone exceed 2000 units, whole lines from the
+  // top (at the last line break that fits, which can be the one before a plugin's own schedule line); if they fit in
+  // 2000 but not with the tail, they go out bare (every plugin named beats the tail); a single first line over
+  // the cap (a hostile name) is cut surrogate-safe. Without a clamp editReply would reject the reply and leave the
+  // deferred reply hanging.
   const trunc = "\n… (list truncated)";
-  return out.slice(0, Math.max(0, MESSAGE_LIMIT - trunc.length)) + trunc;
+  const full = rows.map((r) => r.line + r.note + r.tail).join("\n");
+  if (full.length <= MESSAGE_LIMIT) return full;
+  const headsOnly = rows.map((r) => r.line + r.tail).join("\n");
+  const cap = MESSAGE_LIMIT - trunc.length;
+  if (headsOnly.length > cap) {
+    if (headsOnly.length <= MESSAGE_LIMIT) return headsOnly; // every plugin named, no room for the tail
+    const lastBreak = headsOnly.lastIndexOf("\n", cap);
+    return (lastBreak > 0 ? headsOnly.slice(0, lastBreak) : cutUtf16(headsOnly, cap)) + trunc;
+  }
+  let room = cap - headsOnly.length;
+  const shown = rows.map((r) => {
+    if (r.note === "" || r.note.length > room) return r.line + r.tail;
+    room -= r.note.length;
+    return r.line + r.note + r.tail;
+  });
+  return shown.join("\n") + trunc;
 }
 
 // ---- #104: acting on an update (/plugins update|remind|skip|cancel) ------------------------------
@@ -822,13 +871,17 @@ export interface PluginReportDeps {
  * #104: the boot after an update, tell the requester what actually came up. Runs after
  * `writePluginState` (so the state entry reflects this boot's install/activate) and is fire-and-forget
  * from `index.ts`. Clears `pendingReport` — through the shared mutator, and BEFORE delivering — so a
- * failed send can't re-fire the report every boot (the `reportUpdateOutcome` rule). DM → channel.
+ * failed send can't re-fire the report every boot (the `reportUpdateOutcome` rule), but only the report it READ
+ * (#501 item 11): one written since is someone else's and survives to be delivered. DM → channel.
  */
 export async function reportPluginUpdateOutcome(deps: PluginReportDeps): Promise<void> {
   const state = await deps.readState();
   const report = state.pendingReport;
   if (!report) return;
   await deps.mutateState((s) => {
+    // #501 item 11: only the report read above. One written since -- by the 5 s request drain (a panel update-now),
+    // the 60 s tick (a due schedule) or a /plugins update -- is someone else's and must survive to be delivered.
+    if (s.pendingReport?.plugin !== report.plugin || s.pendingReport.requestedAt !== report.requestedAt) return s;
     const next = { ...s };
     delete next.pendingReport;
     return next;

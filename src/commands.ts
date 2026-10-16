@@ -212,7 +212,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
               "plugins",
             ),
           ]);
-          await interaction.editReply(renderPluginsList(state, index, new Date()));
+          await interaction.editReply(renderPluginsList(state, index, new Date(), HOST_API_VERSION));
         } catch (err) {
           // Match the /update deferred convention: a failure edits the deferred reply with an
           // error rather than leaving the admin's "thinking…" hanging. Logged first (#503 item 11).
