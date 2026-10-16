@@ -5,15 +5,18 @@ import type { HandoffMarker } from "./handoff";
 // redeploy.ts pulls in the `config` singleton (env resolved at import time) -- the required vars
 // are primed once by test/setup.ts's bunfig preload (#136).
 const {
+  awaitRetirementFailure,
   baseName,
   buildCreateSpec,
   buildRemote,
   canonicalName,
+  CARRIED_HOST_CONFIG_KEYS,
   completeTakeOver,
   detectRollback,
   finishProbation,
   FIRST_TICK_CAP_MS,
   healOwnName,
+  imageRepo,
   latestTag,
   ownName,
   redeploy,
@@ -26,9 +29,9 @@ const {
   STEP_ASIDE_GRACE_MS,
   takeOver,
 } = await import("./redeploy");
-const { clearMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV, HANDOFF_RESTART_RETRIES_ENV } =
+const { clearMarker, readMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV, HANDOFF_RESTART_RETRIES_ENV } =
   await import("./handoff");
-const { beginShutdown, handoffActive, restartPending, resetForTest } = await import("./restart");
+const { beginShutdown, handoffActive, onBeforeExit, restartPending, resetForTest } = await import("./restart");
 const { SHORT_SHA_LEN } = await import("./storage");
 
 const SELF_ID = "a".repeat(64);
@@ -123,6 +126,36 @@ describe("buildRemote", () => {
 
   test("carries a branch with slashes through intact", () => {
     expect(buildRemote("Rackbops/rackbops-discord-bot", "feat/x")).toContain("#feat/x");
+  });
+});
+
+// #491 item 12: the repo of an image reference. A registry's port colon and a digest used to be cut at the first colon
+// (`registry:5000/bot:tag` -> `registry`).
+describe("imageRepo", () => {
+  test("a registry port, a digest, a tag, and a bare name", () => {
+    expect(imageRepo("registry:5000/bot:tag")).toBe("registry:5000/bot");
+    expect(imageRepo("ghcr.io/x/bot@sha256:abc")).toBe("ghcr.io/x/bot");
+    expect(imageRepo("localhost:5000/bot")).toBe("localhost:5000/bot");
+    expect(imageRepo("bot:latest")).toBe("bot");
+    expect(imageRepo("bot")).toBe("bot");
+    expect(imageRepo("registry:5000/ns/bot:1.2@sha256:abc")).toBe("registry:5000/ns/bot");
+  });
+
+  test("shaTag, latestTag and selectImagesToPrune use it: a registry-qualified image keeps its registry", () => {
+    const current = "registry:5000/warbandeer-discord-debug-bot:latest";
+    expect(shaTag(current, "abcdef1234")).toBe("registry:5000/warbandeer-discord-debug-bot:abcdef1");
+    expect(latestTag(current)).toBe("registry:5000/warbandeer-discord-debug-bot:latest");
+    const image = (tag: string, created: number): ImageSummary => ({ Id: tag, RepoTags: [tag], Created: created });
+    const pruned = selectImagesToPrune(
+      [
+        image("registry:5000/warbandeer-discord-debug-bot:1111111", 1),
+        image("registry:5000/warbandeer-discord-debug-bot:2222222", 2),
+        image("registry:1111111", 3), // what the first-colon parse would have called this image's repo
+      ],
+      current,
+      0,
+    );
+    expect(pruned).toEqual(["registry:5000/warbandeer-discord-debug-bot:2222222", "registry:5000/warbandeer-discord-debug-bot:1111111"]);
   });
 });
 
@@ -393,7 +426,9 @@ describe("buildCreateSpec", () => {
 
   // #51 item 6: without this the replacement resolves by container name only, so
   // `http://bot:<port>` (README's documented tunnel mapping) stops resolving after the first
-  // self-update — inert today (no HTTP server yet), latent for the desktop-app API work.
+  // self-update. #491 item 11: the alias is attached at create, so for the seconds before the standby's HTTP router
+  // is up (started inside `activate()`, after its login) Docker DNS may hand `bot` to a container that refuses the
+  // connection; attaching it at the takeover would need a disconnect/connect of the live standby's network — declined.
   test("carries the network's deliberately-configured service alias over", () => {
     expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toContain("bot");
   });
@@ -428,6 +463,148 @@ describe("buildCreateSpec", () => {
   test("no NetworkingConfig when the original has no network mode at all", () => {
     const bare = buildCreateSpec({ ...SELF, HostConfig: {} }, { image: "i", handoffFrom: "x", oldImageEnv: [] });
     expect(bare.NetworkingConfig).toBeUndefined();
+  });
+
+  // #491 item 10: what compose sets per service survives the first swap, a tmpfs mount no longer makes every
+  // create a 400, and what is not carried is said so. Unverified here: a real daemon accepting these (the fields are
+  // copied from Docker's own inspect of a compose-made container, which is the shape the create API documents).
+  describe("what the replacement inherits (#491 item 10)", () => {
+    const input = { image: "i", handoffFrom: "x", oldImageEnv: [] as string[] };
+    const withHostConfig = (extra: Record<string, unknown>): ContainerInspect =>
+      ({ ...SELF, HostConfig: { ...SELF.HostConfig, ...extra } }) as ContainerInspect;
+    const quiet = () => {
+      const warns: string[] = [];
+      return { warns, log: { warn: (m: string) => void warns.push(m) } };
+    };
+
+    test("a tmpfs mount is carried as the daemon reported it, never as a bind (the source-less `:/path:rw` it used to become)", () => {
+      const { warns, log } = quiet();
+      const long = { Type: "tmpfs", Target: "/run/x", TmpfsOptions: { SizeBytes: 1024 } };
+      const self = {
+        ...withHostConfig({ Tmpfs: { "/tmp": "size=64m" }, Mounts: [long, { Type: "bind", Target: "/etc/y", Source: "/etc/y" }] }),
+        Mounts: [...SELF.Mounts, { Type: "tmpfs", Source: "", Destination: "/run/x", RW: true }],
+      } as ContainerInspect;
+      const spec = buildCreateSpec(self, input, log);
+      expect(spec.HostConfig.Binds.some((b) => b.includes("/run/x"))).toBe(false);
+      expect(spec.HostConfig.Binds).toEqual(buildCreateSpec(SELF, input).HostConfig.Binds); // volume and bind exactly as before
+      expect(spec.HostConfig.Tmpfs).toEqual({ "/tmp": "size=64m" });
+      expect(spec.HostConfig.Mounts).toEqual([long]); // the long form's tmpfs entry only; the bind entry is not copied
+      expect(warns).toEqual([]);
+      // Plain SELF has neither.
+      const plain = buildCreateSpec(SELF, input);
+      expect(plain.HostConfig.Tmpfs).toBeUndefined();
+      expect(plain.HostConfig.Mounts).toBeUndefined();
+    });
+
+    test("an empty Tmpfs map is not emitted", () => {
+      expect(buildCreateSpec(withHostConfig({ Tmpfs: {} }), input).HostConfig.Tmpfs).toBeUndefined();
+    });
+
+    test("every listed HostConfig key is carried verbatim; a plain original carries none; null is not carried", () => {
+      for (const key of CARRIED_HOST_CONFIG_KEYS) {
+        const sentinel = { sentinel: key };
+        const spec = buildCreateSpec(withHostConfig({ [key]: sentinel }), input);
+        expect(spec.HostConfig[key], key).toEqual(sentinel);
+      }
+      const plain = buildCreateSpec(SELF, input);
+      for (const key of CARRIED_HOST_CONFIG_KEYS) expect(key in plain.HostConfig, key).toBe(false);
+      const nulls = buildCreateSpec(withHostConfig({ CapAdd: null, OomKillDisable: null }), input);
+      expect("CapAdd" in nulls.HostConfig).toBe(false);
+      expect("OomKillDisable" in nulls.HostConfig).toBe(false);
+    });
+
+    // The pin that makes removing a name red: the loop above runs over the constant itself and cannot see a removal.
+    test("the carried list is exactly these 22 names", () => {
+      expect([...CARRIED_HOST_CONFIG_KEYS]).toEqual([
+        "LogConfig", "CapAdd", "CapDrop", "ExtraHosts", "Dns", "DnsSearch", "DnsOptions", "SecurityOpt", "Ulimits",
+        "ReadonlyRootfs", "Memory", "MemorySwap", "MemoryReservation", "NanoCpus", "CpuShares", "PidsLimit", "ShmSize",
+        "Sysctls", "Devices", "GroupAdd", "OomKillDisable", "Privileged",
+      ]);
+    });
+
+    // StopTimeout is container-only; the five image-merged Config keys would pin the OLD image's values (the reason
+    // GIT_SHA is dropped), so the new image's must win.
+    test("StopTimeout is carried; WorkingDir, Healthcheck, StopSignal, Entrypoint and Cmd are not", () => {
+      const self = {
+        ...SELF,
+        Config: {
+          ...SELF.Config,
+          StopTimeout: 25,
+          WorkingDir: "/old",
+          Healthcheck: { Test: ["CMD", "true"] },
+          StopSignal: "SIGINT",
+          Entrypoint: ["/entry"],
+          Cmd: ["old.js"],
+        },
+      } as ContainerInspect;
+      const spec = buildCreateSpec(self, input) as unknown as Record<string, unknown>;
+      expect(spec.StopTimeout).toBe(25);
+      for (const key of ["WorkingDir", "Healthcheck", "StopSignal", "Entrypoint", "Cmd"]) expect(key in spec, key).toBe(false);
+      expect("StopTimeout" in buildCreateSpec(SELF, input)).toBe(false);
+      // 0 is a value to carry, not an absent one.
+      expect((buildCreateSpec({ ...self, Config: { ...self.Config, StopTimeout: 0 } }, input) as unknown as Record<string, unknown>).StopTimeout).toBe(0);
+    });
+
+    test("a mount of a type nothing here carries is named in the log and dropped", () => {
+      const { warns, log } = quiet();
+      const self = { ...SELF, Mounts: [...SELF.Mounts, { Type: "npipe", Source: "", Destination: "//./pipe/x", RW: true }] };
+      const spec = buildCreateSpec(self, input, log);
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain("npipe");
+      expect(warns[0]).toContain("//./pipe/x");
+      expect(spec.HostConfig.Binds.some((b) => b.includes("pipe"))).toBe(false);
+    });
+
+    test("a second network is named in the log; the one network and its alias are carried as before", () => {
+      const { warns, log } = quiet();
+      const self = {
+        ...SELF,
+        NetworkSettings: { Networks: { ...SELF.NetworkSettings.Networks, tunnel_net: { Aliases: null } } },
+      };
+      const spec = buildCreateSpec(self, input, log);
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain("tunnel_net");
+      expect(spec.HostConfig.NetworkMode).toBe("wbd_default");
+      expect(spec.NetworkingConfig?.EndpointsConfig["wbd_default"]?.Aliases).toContain("bot");
+    });
+
+    test("the default bridge under the default network mode is not a second network", () => {
+      const { warns, log } = quiet();
+      buildCreateSpec(
+        { ...SELF, HostConfig: { ...SELF.HostConfig, NetworkMode: "default" }, NetworkSettings: { Networks: { bridge: {} } } },
+        input,
+        log,
+      );
+      expect(warns).toEqual([]);
+      // The same with no NetworkMode reported at all, and with the mode spelt `bridge`.
+      buildCreateSpec(
+        { ...SELF, HostConfig: { ...SELF.HostConfig, NetworkMode: undefined }, NetworkSettings: { Networks: { bridge: {} } } },
+        input,
+        log,
+      );
+      buildCreateSpec(
+        { ...SELF, HostConfig: { ...SELF.HostConfig, NetworkMode: "bridge" }, NetworkSettings: { Networks: { bridge: {} } } },
+        input,
+        log,
+      );
+      expect(warns).toEqual([]);
+    });
+
+    test("published ports are named in the log and not carried", () => {
+      const { warns, log } = quiet();
+      const spec = buildCreateSpec(withHostConfig({ PortBindings: { "8080/tcp": [{ HostPort: "8080" }] } }), input, log);
+      expect(warns).toHaveLength(1);
+      expect(warns[0]).toContain("8080/tcp");
+      expect("PortBindings" in spec.HostConfig).toBe(false);
+    });
+
+    test("an original that needs no warning gets none", () => {
+      const { warns, log } = quiet();
+      buildCreateSpec(SELF, input, log);
+      // An empty map (what an inspect of a container with no published port carries, as far as is known) is no port.
+      buildCreateSpec(withHostConfig({ PortBindings: {} }), input, log);
+      expect(warns).toEqual([]);
+    });
   });
 });
 
@@ -1336,6 +1513,29 @@ describe("finishProbation", () => {
     expect(said.some((l) => l.includes("first tick capped"))).toBe(true);
   });
 
+  // #525 S4b note 2: finishProbation only ENDS probation, the swap itself is completeTakeOver's. The old line said
+  // "completing the swap" even where the default completion declines to (a SIGTERM drain). Mutation: put the suffix back.
+  test("the probation line says probation is over and does not announce the swap", async () => {
+    const completed: string[] = [];
+    await finishProbation("orig", Promise.resolve(), { sleep: () => new Promise<void>(() => {}), complete: async (id) => void completed.push(id) });
+    expect(said).toContain("[handoff] probation over (first tick settled)");
+    expect(said.some((l) => l.includes("completing the swap"))).toBe(false);
+    expect(completed).toEqual(["orig"]);
+  });
+
+  test("the same line, and still one completion, while this process is shutting down", async () => {
+    const completed: string[] = [];
+    beginShutdown("test"); // logs "[restart] shutdown in progress: test" into `said` too, so assert on the specific line
+    try {
+      await finishProbation("orig", Promise.resolve(), { sleep: () => new Promise<void>(() => {}), complete: async (id) => void completed.push(id) });
+    } finally {
+      resetForTest();
+    }
+    expect(said).toContain("[handoff] probation over (first tick settled)");
+    expect(said.some((l) => l.includes("completing the swap"))).toBe(false);
+    expect(completed).toEqual(["orig"]);
+  });
+
   test("a first tick that rejects still ends probation (it ran), and finishProbation does not throw", async () => {
     const completed: string[] = [];
     await finishProbation("orig", Promise.reject(new Error("tick blew up")), { capMs: 60_000, sleep: () => new Promise<void>(() => {}), complete: async (id) => void completed.push(id) });
@@ -1509,6 +1709,39 @@ describe("stepAside", () => {
     expect(slept).toBe(false);
     expect(errors).toHaveLength(2); // the "stepping aside" line, then why it exits instead
   });
+
+  // #525 S4b note 1: both exit(1) paths run the #446 exit hooks first (an interaction line in flight is written
+  // before the process ends), as the daemon's SIGTERM path does. Mutation: delete either runExitHooks() call.
+  test("a stop that fails runs the exit hooks before it exits 1", async () => {
+    const order: string[] = [];
+    onBeforeExit(() => void order.push("hook"));
+    try {
+      void stepAside({
+        inspectSelf: async () => SELF,
+        stop: async () => {
+          throw new Error("daemon down");
+        },
+        exit: (c) => void order.push(`exit ${c}`),
+        sleep: async () => {},
+      });
+      await until(() => order.includes("exit 1"));
+    } finally {
+      resetForTest();
+    }
+    expect(order).toEqual(["hook", "exit 1"]);
+  });
+
+  test("the grace running out with no signal runs the exit hooks before it exits 1", async () => {
+    const order: string[] = [];
+    onBeforeExit(() => void order.push("hook"));
+    try {
+      void stepAside({ inspectSelf: async () => SELF, stop: async () => {}, exit: (c) => void order.push(`exit ${c}`), sleep: async () => {} });
+      await until(() => order.includes("exit 1"));
+    } finally {
+      resetForTest();
+    }
+    expect(order).toEqual(["hook", "exit 1"]);
+  });
 });
 
 // #37: a daemon error anywhere from "replacement started" onward must still reach `endHandoff()`
@@ -1586,9 +1819,11 @@ describe("redeploy — cleanup always runs", () => {
     /** What `redeploy()` is running as (default `SELF`): a bot named `<name>-next` is refused (#547). */
     self?: ContainerInspect;
     /** The answer to the post-build inspect of the replacement's name (#492): default a 404, nothing holds it. */
-    leftover?: () => Response;
+    leftover?: () => Response | Promise<Response>;
+    /** Runs (awaited) when `POST /containers/create` arrives, before it answers. */
+    onCreate?: () => Promise<void>;
     /** The answer to the un-forced removal of that leftover by id (default 204). */
-    leftoverDelete?: () => Response;
+    leftoverDelete?: () => Response | Promise<Response>;
     /** The answer to a removal of the replacement's name BY NAME (default: the catch-all 404). */
     nameDelete?: () => Response;
   }) {
@@ -1611,14 +1846,14 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === `/containers/${replName}/json`) {
         pendingAt.leftover = restartPending();
-        return o.leftover ? o.leftover() : new Response("", { status: 404 });
+        return o.leftover ? await o.leftover() : new Response("", { status: 404 });
       }
       if (o.nameDelete && method === "DELETE" && pathname === `/containers/${replName}`) {
         return o.nameDelete();
       }
       if (pathname === `/containers/${LEFTOVER_ID}` && method === "DELETE") {
         pendingAt.sweep = restartPending();
-        return o.leftoverDelete ? o.leftoverDelete() : new Response("", { status: 204 });
+        return o.leftoverDelete ? await o.leftoverDelete() : new Response("", { status: 204 });
       }
       if (pathname === "/build") {
         pendingAt.build = restartPending();
@@ -1634,6 +1869,7 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === "/containers/create") {
         pendingAt.create = restartPending();
+        await o.onCreate?.();
         // The daemon created it but never answered in time — the abort surfaces as a rejection
         // with no id, exactly as docker.ts's `bounded` produces it.
         if (o.createTimesOut) throw new Error("docker create warbandeer-discord-next timed out after 60000ms");
@@ -2056,13 +2292,258 @@ describe("redeploy — cleanup always runs", () => {
       removeReplacement: () => new Response("", { status: 204 }),
       afterStart: () => writeMarker({ status: "ready", sha: "3333333", at: Date.now() }),
     });
-    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 200, deadlineMs: 60, pollMs: 15 });
+    // deadlineMs: 0 — the retirement wait makes no inspect of its own (#491 item 13 inspects the replacement each
+    // poll), so the two inspects counted below are still exactly the deciding poll and the pre-removal one.
+    const result = await redeploy("a".repeat(40), { handoffDeadlineMs: 200, deadlineMs: 0, pollMs: 15 });
     expect(result.outcome).toBe("stalled"); // ready honoured, then the retirement wait elapsed — not "failed"
     expect(result.error).toBeUndefined(); // the poll's 500 belongs to no verdict: it is only named on a timeout
     const inspects = calls.filter((c) => c.method === "GET" && c.path === `/containers/${REPLACEMENT_ID}/json`);
     expect(inspects.length).toBe(2); // the one deciding poll, then the pre-removal inspect
     expect(wasRemovalAttempted()).toBe(true);
     expect(handoffActive()).toBe(false);
+  });
+
+  // #491 item 13: a replacement that writes `ready` and then dies hard before it has stopped the original (an OOM
+  // kill, a crash) leaves the marker at `ready`; the retirement wait inspects it each poll, so the original is
+  // freed within a poll instead of sitting quiesced for the whole RETIREMENT_DEADLINE_MS (3 minutes).
+  const runningAt = (since: () => number, ms: number) => () =>
+    jsonRes(
+      Date.now() - since() < ms
+        ? { ...SELF, State: { Running: true, Status: "running", ExitCode: 0 } }
+        : { ...SELF, State: { Running: false, Status: "exited", ExitCode: 137 } },
+    );
+
+  test("a replacement that dies after signalling ready is failed within a poll, with its exit code", async () => {
+    let t0 = 0;
+    stubDaemon({
+      afterStart: async () => {
+        t0 = Date.now();
+        await writeMarker({ status: "ready", sha: "4444444", at: Date.now() });
+      },
+      pollReplacement: runningAt(() => t0, 60),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const startedAt = Date.now();
+    try {
+      const result = await redeploy("4".repeat(40), { deadlineMs: 2000, pollMs: 20 });
+      expect(Date.now() - startedAt).toBeLessThan(1000); // not the deadline
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("the replacement died after signalling ready (status exited, exit 137)");
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(handoffActive()).toBe(false);
+    expect(wasRemovalAttempted()).toBe(true);
+  });
+
+  // An inspect that throws is not a verdict (as in awaitHandoff): the marker is still `ready`, the deadline decides.
+  test("an inspect that fails during the retirement wait is not a verdict: stalled at the deadline, not failed", async () => {
+    stubDaemon({
+      afterStart: () => writeMarker({ status: "ready", sha: "4545454", at: Date.now() }),
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await redeploy("4".repeat(40), { deadlineMs: 120, pollMs: 15 });
+      expect(result.outcome).toBe("stalled");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // The marker is read AFTER the inspect, in the same poll: a `failed` the replacement wrote as it died still wins,
+  // so the requester reads ITS reason, not the generic one. The marker is written inside the poll, between that
+  // poll's inspect and its marker read: a reversed order cannot see it.
+  test("a failed marker written as the replacement dies still wins, with its own reason", async () => {
+    let t0 = 0;
+    stubDaemon({
+      afterStart: async () => {
+        t0 = Date.now();
+        await writeMarker({ status: "ready", sha: "4646464", at: Date.now() });
+      },
+      pollReplacement: async () => {
+        if (Date.now() - t0 >= 60) {
+          await writeMarker({ status: "failed", sha: "4646464", error: "takeover failed: boom", at: Date.now() });
+          return jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } });
+        }
+        return jsonRes({ ...SELF, State: { Running: true, Status: "running", ExitCode: 0 } });
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await redeploy("4".repeat(40), { deadlineMs: 2000, pollMs: 20 });
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("takeover failed: boom");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a replacement that is merely `created` after ready is not died: stalled at the deadline", async () => {
+    stubDaemon({
+      afterStart: () => writeMarker({ status: "ready", sha: "4747474", at: Date.now() }),
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "created", ExitCode: 0 } }),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await redeploy("4".repeat(40), { deadlineMs: 120, pollMs: 15 });
+      expect(result.outcome).toBe("stalled");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // Each retirement inspect is bounded by the time left: a hung daemon cannot hold the wait for docker.ts's flat minute.
+  test("a hung inspect during the retirement wait is bounded by the time left", async () => {
+    stubDaemon({
+      afterStart: () => writeMarker({ status: "ready", sha: "4848484", at: Date.now() }),
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: true, Status: "running", ExitCode: 0 } }),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const inner = globalThis.fetch;
+    let gets = 0;
+    globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
+      if (new URL(String(url)).pathname === `/containers/${REPLACEMENT_ID}/json`) {
+        gets += 1;
+        // GET 1 is the deciding handoff poll; GET 2 is the retirement wait's first inspect: it never answers.
+        if (gets === 2) {
+          const signal = init?.signal;
+          return await new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason)));
+        }
+      }
+      return inner(url as never, init as never);
+    }) as unknown as typeof fetch;
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const startedAt = Date.now();
+    try {
+      const result = await redeploy("6".repeat(40), { deadlineMs: 60, pollMs: 15 });
+      expect(result.outcome).toBe("stalled");
+      expect(Date.now() - startedAt).toBeLessThan(3000); // a flat 60 s bound would hold it for a minute
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // A `failed` written during a daemon outage is still seen: the marker is read even when the inspect throws.
+  test("a failed marker is seen through a daemon outage during the retirement wait", async () => {
+    stubDaemon({
+      afterStart: async () => {
+        await writeMarker({ status: "ready", sha: "4949494", at: Date.now() });
+        setTimeout(() => void writeMarker({ status: "failed", sha: "4949494", error: "retire boom", at: Date.now() }), 60);
+      },
+      pollReplacement: () => new Response("boom", { status: 500 }),
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await redeploy("4".repeat(40), { deadlineMs: 300, pollMs: 20 });
+      expect(result.outcome).toBe("failed");
+      expect(result.error).toBe("retire boom");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  // #491 item 14: the marker is cleared right before the create, not at the top: a surviving earlier standby that
+  // writes during the build (up to 15 minutes) must not be read as this attempt's replacement.
+  test("the marker is cleared after the leftover sweep and before the create, not at the top", async () => {
+    await writeMarker({ status: "ready", sha: "stale00", at: 0 });
+    let markerAtInspect: HandoffMarker | undefined;
+    let markerAtRemoval: HandoffMarker | undefined;
+    let markerAtCreate: HandoffMarker | undefined | "unread" = "unread";
+    stubDaemon({
+      leftover: async () => {
+        markerAtInspect = await readMarker();
+        return jsonRes({ ...SELF, Id: LEFTOVER_ID, Name: "/warbandeer-discord-next", State: { Running: false, Status: "exited", ExitCode: 1 } });
+      },
+      leftoverDelete: async () => {
+        markerAtRemoval = await readMarker();
+        return new Response("", { status: 204 });
+      },
+      onCreate: async () => {
+        markerAtCreate = await readMarker();
+      },
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("7".repeat(40));
+    expect(markerAtInspect?.sha).toBe("stale00"); // still there while the build and the leftover inspect run
+    expect(markerAtRemoval?.sha).toBe("stale00"); // and while the leftover is removed
+    expect(markerAtCreate).toBeUndefined(); // gone by the create
+  });
+
+  // #491 item 10, end to end: what buildCreateSpec derives is what reaches the daemon's create call.
+  test("the create body carries the original's LogConfig and tmpfs, and no bind for the tmpfs", async () => {
+    const logConfig = { Type: "json-file", Config: { "max-size": "10m" } };
+    stubDaemon({
+      self: {
+        ...SELF,
+        HostConfig: { ...SELF.HostConfig, LogConfig: logConfig, Tmpfs: { "/tmp": "" } },
+        Mounts: [...SELF.Mounts, { Type: "tmpfs", Source: "", Destination: "/tmp", RW: true }],
+      } as ContainerInspect,
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("8".repeat(40));
+    const create = calls.find((c) => c.method === "POST" && c.path === "/containers/create");
+    expect(create?.body).toBeDefined();
+    const sent = JSON.parse(create!.body!) as { HostConfig: { LogConfig?: unknown; Tmpfs?: unknown; Binds: string[] } };
+    expect(sent.HostConfig.LogConfig).toEqual(logConfig);
+    expect(sent.HostConfig.Tmpfs).toEqual({ "/tmp": "" });
+    expect(sent.HostConfig.Binds.length).toBeGreaterThan(0); // the volume and the socket bind are still there
+    expect(sent.HostConfig.Binds.some((b) => b.includes("/tmp"))).toBe(false);
+  });
+
+  // A replacement the daemon no longer knows, or one that is `removing`, is not the "died after ready" verdict: only
+  // `exited`/`dead` is (the handoff poll reads these two differently; see awaitRetirementFailure's docstring).
+  test("an absent or removing replacement after ready is not died: stalled at the deadline", async () => {
+    for (const answer of [() => new Response("", { status: 404 }), () => jsonRes({ ...SELF, State: { Running: false, Status: "removing", ExitCode: 0 } })]) {
+      stubDaemon({
+        afterStart: () => writeMarker({ status: "ready", sha: "4747474", at: Date.now() }),
+        pollReplacement: answer,
+        removeReplacement: () => new Response("", { status: 204 }),
+      });
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const result = await redeploy("4".repeat(40), { deadlineMs: 120, pollMs: 15 });
+        expect(result.outcome).toBe("stalled");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
+  });
+
+  // The inspect's timeout argument, through the seam awaitRetirementFailure takes: the time left, capped at docker.ts's
+  // minute and never below one poll.
+  test("each retirement inspect is bounded by the time left, capped at a minute, and never below one poll", async () => {
+    const asked: number[] = [];
+    const record = async (_id: string, timeoutMs?: number) => {
+      asked.push(timeoutMs ?? -1);
+      return undefined;
+    };
+    await awaitRetirementFailure(REPLACEMENT_ID, 40, 50, record); // the time left after the first poll's sleep is already negative
+    expect(asked).toEqual([50]);
+    asked.length = 0;
+    const wait = awaitRetirementFailure(REPLACEMENT_ID, 3_600_000, 5, async (id, ms) => {
+      asked.push(ms ?? -1);
+      return { ...SELF, Id: id, State: { Running: false, Status: "exited", ExitCode: 9 } };
+    });
+    expect(await wait).toEqual({ kind: "died", status: "exited", exitCode: 9 });
+    expect(asked).toEqual([60_000]); // an hour left is still one minute
+  });
+
+  // `dead` is as gone as `exited`.
+  test("a dead replacement after ready is died, with its status and exit code", async () => {
+    const result = await awaitRetirementFailure(REPLACEMENT_ID, 2_000, 5, async (id) => ({
+      ...SELF,
+      Id: id,
+      State: { Running: false, Status: "dead", ExitCode: 137 },
+    }));
+    expect(result).toEqual({ kind: "died", status: "dead", exitCode: 137 });
   });
 
   // The replacement's own reason outranks the poll's last daemon error: a `failed` marker decided this poll

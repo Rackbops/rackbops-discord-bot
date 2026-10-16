@@ -22,6 +22,7 @@ import {
   tagImage,
   tryInspectContainer,
   updateContainer,
+  type CarriedHostConfig,
   type ContainerInspect,
   type CreateContainerSpec,
   type ImageSummary,
@@ -40,13 +41,23 @@ import {
   type HandoffOutcome,
   type ReplacementDisposition,
 } from "./handoff";
-import { beginHandoff, endHandoff, isShuttingDown } from "./restart";
+import { beginHandoff, endHandoff, isShuttingDown, runExitHooks } from "./restart";
 import { SHORT_SHA_LEN, shortSha } from "./storage";
 
 const POLL_MS = 2_000;
 /** Per-sha image tags kept around. More than one is what makes rolling back to a *previous*
  *  build possible at all; a small number is what stops that filling the box's disk. */
 const KEEP_SHA_TAGS = 3;
+
+/** `HostConfig` keys the replacement inherits verbatim from the original (#491 item 10): what compose sets per
+ *  service and the create API accepts unchanged. Anything else in the inspect's HostConfig is NOT carried, and
+ *  `buildCreateSpec` says so when it would have mattered (a mount of another type, a second network, a port binding).
+ *  Checked against `CarriedHostConfig` (src/docker.ts) at compile time, so a name here without a field there fails `tsc`. */
+export const CARRIED_HOST_CONFIG_KEYS = [
+  "LogConfig", "CapAdd", "CapDrop", "ExtraHosts", "Dns", "DnsSearch", "DnsOptions", "SecurityOpt", "Ulimits",
+  "ReadonlyRootfs", "Memory", "MemorySwap", "MemoryReservation", "NanoCpus", "CpuShares", "PidsLimit", "ShmSize",
+  "Sysctls", "Devices", "GroupAdd", "OomKillDisable", "Privileged",
+] as const satisfies readonly (keyof CarriedHostConfig)[];
 
 /** Docker reports names with a leading slash. */
 export function canonicalName(inspectedName: string): string {
@@ -109,13 +120,25 @@ export function buildRemote(repo: string, ref: string): string {
 }
 
 /**
+ * The repository part of an image reference (#491 item 12): `registry:5000/bot:tag` -> `registry:5000/bot`,
+ * `ghcr.io/x/bot@sha256:…` -> `ghcr.io/x/bot`, `bot:latest` -> `bot`, `bot` -> `bot`. A tag is only ever after the
+ * last `/`, so a registry port's colon is left alone; a digest is cut at its `@`.
+ */
+export function imageRepo(ref: string): string {
+  const noDigest = ref.split("@")[0] ?? ref;
+  const slash = noDigest.lastIndexOf("/");
+  const colon = noDigest.indexOf(":", slash + 1);
+  return colon === -1 ? noDigest : noDigest.slice(0, colon);
+}
+
+/**
  * The only tag a fresh build gets. Never `:latest` — see `latestTag` and `completeTakeOver`'s
  * `tagLatest`. Before issue #39's fix this was one of two tags applied at build time (the other
  * being `:latest` itself), and the *build* result's tag array happening to put `:latest` first is
  * exactly what let a not-yet-verified image get used both to build and to create the replacement.
  */
 export function shaTag(currentImage: string, sha: string): string {
-  const repo = currentImage.split(":")[0] ?? currentImage;
+  const repo = imageRepo(currentImage);
   return `${repo}:${shortSha(sha)}`;
 }
 
@@ -128,7 +151,7 @@ export function shaTag(currentImage: string, sha: string): string {
  * compiled but crashed at boot, or crashed before its start-up and first tick were through.
  */
 export function latestTag(currentImage: string): string {
-  const repo = currentImage.split(":")[0] ?? currentImage;
+  const repo = imageRepo(currentImage);
   return `${repo}:latest`;
 }
 
@@ -142,7 +165,7 @@ export function selectImagesToPrune(
   currentImage: string,
   keep = KEEP_SHA_TAGS,
 ): string[] {
-  const repo = currentImage.split(":")[0] ?? currentImage;
+  const repo = imageRepo(currentImage);
   // String ops, not a RegExp built from `repo` — a registry-qualified name's dots would match
   // loosely and could sweep in another repo's sha tags. The WIDTH regex, on the other hand, is
   // rebuilt from SHORT_SHA_LEN (not hand-written) so it can never silently drift from what
@@ -159,9 +182,16 @@ export function selectImagesToPrune(
 }
 
 /**
- * The replacement's container spec, derived entirely from the original's own inspect — which
- * is what keeps this zero-config: the compose project, volumes, network and restart policy are
- * discovered, never configured.
+ * The replacement's container spec, derived from the original's own inspect — a deliberate subset, which is
+ * what keeps this zero-config: what compose sets per service and the create API takes unchanged
+ * (`CARRIED_HOST_CONFIG_KEYS`; the mounts by type, tmpfs as the daemon reported it; `StopTimeout`; the labels,
+ * the user, the one network and its alias) is discovered, never configured. NOT carried: `WorkingDir`,
+ * `Healthcheck`, `StopSignal`, `Entrypoint` and `Cmd` (the inspect merges the image's values with the
+ * container's, the same reason `GIT_SHA` is dropped below, so the new image's must win; a compose override of
+ * those is lost across a swap, as it always was); published ports, extra networks and the other `HostConfig`
+ * keys (`IpcMode`, `PidMode`, `Runtime`, `CpuPeriod`/`CpuQuota`, `CpusetCpus`, `MemorySwappiness`,
+ * `OomScoreAdj`, `CgroupParent`, `StorageOpt`). Of what is dropped, only another mount type, an extra network and a
+ * published port are named in the log (#491 item 10); the rest is dropped silently.
  *
  * `GIT_SHA` is dropped from the copied env on purpose. `Config.Env` merges the image's baked-in
  * ENV with the container's own, so copying it verbatim would pin the *old* build's sha onto the
@@ -194,6 +224,7 @@ export function selectImagesToPrune(
 export function buildCreateSpec(
   self: ContainerInspect,
   o: { image: string; handoffFrom: string; oldImageEnv: string[] },
+  log: Pick<Console, "warn"> = console,
 ): CreateContainerSpec {
   const oldImageEnvSet = new Set(o.oldImageEnv);
   const originalPolicyName = self.HostConfig.RestartPolicy?.Name || "unless-stopped";
@@ -216,6 +247,35 @@ export function buildCreateSpec(
   const aliases = netMode
     ? self.NetworkSettings.Networks[netMode]?.Aliases?.filter((a) => a !== selfShortId)
     : undefined;
+  // #491 item 10: mounts by type. `volume`/`bind` are Binds (derived from Mounts rather than HostConfig.Binds:
+  // compose may express a named volume as either, and Mounts is always populated); tmpfs comes two ways and both are
+  // carried as the daemon reported them -- the short form (`tmpfs:` / --tmpfs) as HostConfig.Tmpfs, the long form
+  // (`type: tmpfs` / --mount) as HostConfig.Mounts entries with their TmpfsOptions -- never as a Bind, which is the
+  // source-less `:/path:rw` the old code produced for it (#491 item 10); any other Mounts type is named in the log
+  // and dropped.
+  const binds: string[] = [];
+  for (const m of self.Mounts) {
+    if (m.Type === "bind" || m.Type === "volume") binds.push(`${m.Name ?? m.Source}:${m.Destination}:${m.RW ? "rw" : "ro"}`);
+    else if (m.Type !== "tmpfs") {
+      log.warn(`[redeploy] not carrying the ${m.Type} mount at ${m.Destination} onto the replacement — only bind, volume and tmpfs mounts are`);
+    }
+  }
+  const tmpfs = self.HostConfig.Tmpfs ?? undefined;
+  const tmpfsMounts = (self.HostConfig.Mounts ?? []).filter((m) => m.Type === "tmpfs");
+  const carried: CarriedHostConfig = {};
+  for (const key of CARRIED_HOST_CONFIG_KEYS) {
+    const value = self.HostConfig[key];
+    if (value !== undefined && value !== null) carried[key] = value;
+  }
+  const otherNetworks = Object.keys(self.NetworkSettings.Networks).filter(
+    (n) => n !== netMode && !((netMode === undefined || netMode === "default" || netMode === "bridge") && n === "bridge"),
+  );
+  if (otherNetworks.length > 0) {
+    log.warn(`[redeploy] the replacement joins ${netMode ?? "the default network"} only — not ${otherNetworks.join(", ")} (a self-update carries one network)`);
+  }
+  if (self.HostConfig.PortBindings && Object.keys(self.HostConfig.PortBindings).length > 0) {
+    log.warn(`[redeploy] the original's published ports (${Object.keys(self.HostConfig.PortBindings).join(", ")}) are not carried onto the replacement: it would collide with the original while both exist`);
+  }
   return {
     Image: o.image,
     Env: env,
@@ -225,12 +285,13 @@ export function buildCreateSpec(
     // then has no root to drop from — so it could never join the socket's group, and would
     // come up unable to retire anyone.
     User: self.Config.User,
+    // Container-only (a compose `stop_grace_period`), so unlike the image-merged keys it is safe to carry.
+    ...(self.Config.StopTimeout !== undefined ? { StopTimeout: self.Config.StopTimeout } : {}),
     HostConfig: {
-      // Derived from Mounts rather than HostConfig.Binds: compose may express a named volume
-      // as either, and Mounts is the one that is always populated.
-      Binds: self.Mounts.map(
-        (m) => `${m.Name ?? m.Source}:${m.Destination}:${m.RW ? "rw" : "ro"}`,
-      ),
+      // Derived from Mounts rather than HostConfig.Binds (see the mount loop above).
+      Binds: binds,
+      ...(tmpfs && Object.keys(tmpfs).length > 0 ? { Tmpfs: tmpfs } : {}),
+      ...(tmpfsMounts.length > 0 ? { Mounts: tmpfsMounts } : {}),
       // #160: never the original's policy — see this function's own docstring. Never
       // {Name:"on-failure", MaximumRetryCount:0} either; Docker reads 0 as unlimited, not zero.
       RestartPolicy: { Name: "no" },
@@ -238,6 +299,7 @@ export function buildCreateSpec(
       // Compose's `init: true` lives on the container, not the image — without carrying it
       // over, the replacement runs its process as PID 1 instead of under docker-init.
       Init: self.HostConfig.Init ?? undefined,
+      ...carried,
     },
     ...(netMode && aliases?.length ? { NetworkingConfig: { EndpointsConfig: { [netMode]: { Aliases: aliases } } } } : {}),
   };
@@ -290,7 +352,6 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   const now = opts.now ?? Date.now;
   const read = opts.readMarker ?? readMarker;
   const pollMs = opts.pollMs ?? POLL_MS;
-  await clearMarker();
 
   let self: ContainerInspect;
   try {
@@ -375,6 +436,10 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // started since the inspect above is a 409 here, which the catch below reports as a failure instead of
     // killing a live bot. Only when one was seen: no leftover, no call.
     if (leftover) await removeContainer(leftover.Id);
+    // #491 item 14: cleared HERE, after the sweep and right before the create, not at the top of this function:
+    // a surviving earlier standby that writes during the build (up to 15 minutes) must not be read as this
+    // attempt's replacement by the first poll. Nothing reads the marker outside a redeploy.
+    await clearMarker();
     replacementId = await createContainer(
       name,
       buildCreateSpec(self, { image: tag, handoffFrom: self.Id, oldImageEnv }),
@@ -489,8 +554,15 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // writes `failed` (with a reason) the moment its own retire attempt throws, and a blind
       // sleep would sit on that answer for up to `RETIREMENT_DEADLINE_MS` before ever reading it.
       console.log("[redeploy] replacement verified — handing over");
-      if (await awaitRetirementFailure(opts.deadlineMs, pollMs)) {
+      const retirement = await awaitRetirementFailure(replacementId, opts.deadlineMs, pollMs);
+      if (retirement.kind === "failed") {
         console.error("[redeploy] replacement signalled failed after verifying — reclaiming");
+        outcome = "failed";
+      } else if (retirement.kind === "died") {
+        // #491 item 13: it wrote `ready` and then died before it had stopped us (an OOM kill, a crash) — the marker
+        // never flips, so without this the original would sit quiesced for the whole deadline.
+        pollError = `the replacement died after signalling ready (status ${retirement.status}, exit ${retirement.exitCode})`;
+        console.error(`[redeploy] ${pollError} — reclaiming`);
         outcome = "failed";
       } else {
         console.error("[redeploy] verified replacement never retired us — reclaiming");
@@ -630,23 +702,46 @@ async function awaitHandoff(
   }
 }
 
+export type RetirementWait = { kind: "failed" } | { kind: "died"; status: string; exitCode: number } | { kind: "stalled" };
+
 /**
- * Poll the marker during the post-`ready` retirement wait, so a `failed` written after the
- * replacement already signalled `ready` is caught within one `pollMs`, not left sitting until
- * `deadlineMs` (`RETIREMENT_DEADLINE_MS`, 3 minutes) elapses blind. Returns `true` the moment the
- * marker flips to `failed`; `false` once the whole deadline passes while it's still `ready`
- * (a genuine stall — the daemon socket itself is presumed stuck, per `handoffFailureMessage`).
+ * Poll the replacement AND the marker during the post-`ready` retirement wait: a replacement that died after
+ * writing `ready` (#491 item 13: `exited` or `dead`) and a `failed` written after `ready` are each caught within one
+ * `pollMs`, not left until `deadlineMs` (`RETIREMENT_DEADLINE_MS`, 3 minutes) elapses blind. The inspect comes
+ * FIRST and the marker second, so a `failed` the replacement wrote as it died still wins and its own reason is
+ * reported. `created`/`restarting`/`removing`/`running`, an absent container and an inspect that throws are not a
+ * verdict here; the deadline bounds them (a genuine stall — the daemon socket itself is presumed stuck, per
+ * `handoffFailureMessage`). The handoff poll (`decideHandoffOutcome`) differs for an absent container and for
+ * `removing`: it reads both as `failed` (any stopped state but `created`), while here only `exited`/`dead` is a
+ * verdict. Once `takeOver` has restored the original's restart policy the daemon may restart a replacement that
+ * crashed, which reads as `restarting`/`running` rather than `exited`, so the verdict catches one that stays down.
+ * Each inspect is bounded by the time left, but never by less than one poll, so the wait never outlives the
+ * deadline by more than a poll plus one bounded inspect.
  */
-async function awaitRetirementFailure(
+export async function awaitRetirementFailure(
+  replacementId: string,
   deadlineMs = RETIREMENT_DEADLINE_MS,
   pollMs = POLL_MS,
-): Promise<boolean> {
+  inspect: (id: string, timeoutMs?: number) => Promise<ContainerInspect | undefined> = tryInspectContainer,
+): Promise<RetirementWait> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < deadlineMs) {
     await Bun.sleep(pollMs);
-    if ((await readMarker())?.status === "failed") return true;
+    const remainingMs = deadlineMs - (Date.now() - startedAt);
+    let current: ContainerInspect | undefined;
+    try {
+      // Bounded by the time left (a poll at least, docker.ts's default at most), so a hung daemon cannot hold this
+      // wait past the deadline by more than one bounded call.
+      current = await inspect(replacementId, Math.max(pollMs, Math.min(60_000, remainingMs)));
+    } catch {
+      // not a verdict: the marker below still decides this poll
+    }
+    if ((await readMarker())?.status === "failed") return { kind: "failed" };
+    if (current && (current.State.Status === "exited" || current.State.Status === "dead")) {
+      return { kind: "died", status: current.State.Status, exitCode: current.State.ExitCode };
+    }
   }
-  return false;
+  return { kind: "stalled" };
 }
 
 async function pruneOldImages(currentImage: string): Promise<void> {
@@ -1031,7 +1126,7 @@ export async function finishProbation(originalId: string, firstTick: Promise<voi
   const sleep = o.sleep ?? Bun.sleep;
   const settled = () => "settled" as const;
   const how = await Promise.race([firstTick.then(settled, settled), sleep(capMs).then(() => "capped" as const)]);
-  console.log(`[handoff] probation over (first tick ${how}) — completing the swap`);
+  console.log(`[handoff] probation over (first tick ${how})`);
   await (o.complete ?? completeTakeOver)(originalId);
 }
 
@@ -1253,7 +1348,8 @@ export const STEP_ASIDE_GRACE_MS = 30_000;
  * Stop THIS container through the daemon (an explicit stop is exempt from `unless-stopped`, so it stays
  * down as an exited `<name>-next`), and let the SIGTERM reach `index.ts`'s shutdown handler. If the stop
  * call fails, or no signal arrives within {@link STEP_ASIDE_GRACE_MS}, exit 1 (Docker's backoff bounds
- * the loop; the log says why). Never returns.
+ * the loop; the log says why). Never returns. Either exit runs the #446 exit hooks first, as the daemon's SIGTERM
+ * path does through the shutdown handler.
  */
 export async function stepAside(deps: RollbackDeps = {}): Promise<never> {
   const exit = deps.exit ?? ((code: number) => process.exit(code));
@@ -1264,11 +1360,13 @@ export async function stepAside(deps: RollbackDeps = {}): Promise<never> {
     await (deps.stop ?? stopContainer)(self.Id);
   } catch (err) {
     console.error(`[handoff] could not stop this container through the daemon — exiting instead: ${(err as Error).message}`);
+    runExitHooks(); // #446: an interaction line in flight is written before this process ends
     exit(1);
     return new Promise<never>(() => {});
   }
   await sleep(STEP_ASIDE_GRACE_MS);
   console.error("[handoff] no stop signal arrived — exiting");
+  runExitHooks(); // #446: as above
   exit(1);
   return new Promise<never>(() => {});
 }
