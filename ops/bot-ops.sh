@@ -314,6 +314,7 @@ declare -A RESERVED_KEYS=(
   [HANDOFF_FROM]=1             # src/handoff.ts: the raw standby instruction, set by the redeploy machinery (#46 checks the named container)
   [HANDOFF_RESTART_POLICY]=1   # src/redeploy.ts: the original's restart policy, carried to the replacement
   [HOSTNAME]=1                 # src/docker.ts: the bot's own container id, set by docker
+  [BOT_DOCKER_SOCKET]=1        # src/docker.ts: the daemon socket path, a test seam (#459) -- set by nothing in a deployment, and no plugin may claim it
   [SHARDS]=1                   # discord.js Client (src/client.ts builds it with no shard options): the shards it serves
   [SHARD_COUNT]=1              # discord.js Client: the shard count
   [SHARDING_MANAGER]=1         # discord.js Client: makes client.shard a ShardClientUtil

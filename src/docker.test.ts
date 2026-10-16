@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { parseBuildOutput, parseContainerId, STOP_TIMEOUT_SEC } from "./docker";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { parseBuildOutput, parseContainerId, resolveDockerSocket, STOP_TIMEOUT_SEC } from "./docker";
 import { settleWithin } from "../test/settleWithin";
+import { TEST_DATA_PREFIX } from "../test/sweep";
 
 // The socket-facing calls are exercised through a stubbed `globalThis.fetch`, in the style of
 // update.test.ts — the parsing they depend on is pure and tested directly.
@@ -49,6 +53,20 @@ describe("parseContainerId", () => {
   });
 });
 
+// #459: the socket path is a test seam read once at import, so the in-process suite can only pin its default
+// (the `unix` assertions below). The choice itself is this pure function. An EMPTY value is unset: the whole
+// operator `.env` reaches the process, and Bun treats an empty `unix` as absent and dials TCP `http://docker`,
+// which fails by a DNS error or hangs until the bound -- the very failure the transport pin exists to catch.
+describe("resolveDockerSocket (#459)", () => {
+  test("defaults to /var/run/docker.sock when the variable is unset or empty, and otherwise takes it as given", () => {
+    expect(resolveDockerSocket({})).toBe("/var/run/docker.sock");
+    expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "" })).toBe("/var/run/docker.sock");
+    expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "/srv/d.sock" })).toBe("/srv/d.sock");
+    // The generic name (a line copied from another stack's .env) must not redirect anything: why the key is BOT_-prefixed.
+    expect(resolveDockerSocket({ DOCKER_SOCKET: "/other/d.sock" })).toBe("/var/run/docker.sock");
+  });
+});
+
 describe("parseBuildOutput", () => {
   test("a clean build is ok", () => {
     expect(
@@ -79,11 +97,21 @@ describe("parseBuildOutput", () => {
   test("empty output is ok — nothing reported a problem", () => {
     expect(parseBuildOutput("")).toEqual({ ok: true });
   });
+
+  // #513: valid JSON that is not an object is noise too. `null` is the one that matters: a property
+  // read on it throws a TypeError out of buildImage; a number or a string just reads as undefined.
+  test("a line that parses to null, a number or a string is noise, and an error after it is still reported", () => {
+    expect(parseBuildOutput('null\n42\n"x"\n{"stream":"ok"}')).toEqual({ ok: true });
+    expect(parseBuildOutput('null\n{"error":"boom","errorDetail":{"message":"boom"}}')).toEqual({
+      ok: false,
+      error: "boom",
+    });
+  });
 });
 
 describe("daemon calls", () => {
   const realFetch = globalThis.fetch;
-  let calls: { url: string; method: string; signal?: AbortSignal; body?: string }[] = [];
+  let calls: { url: string; method: string; signal?: AbortSignal; body?: string; unix?: string }[] = [];
 
   const stub = (impl: (url: string, init?: RequestInit) => Response) => {
     calls = [];
@@ -93,6 +121,7 @@ describe("daemon calls", () => {
         method: init?.method ?? "GET",
         signal: init?.signal ?? undefined,
         body: init?.body ? String(init.body) : undefined,
+        unix: init?.unix,
       });
       return Promise.resolve(impl(String(url), init));
     }) as unknown as typeof fetch;
@@ -112,6 +141,7 @@ describe("daemon calls", () => {
     stub(() => new Response("OK", { status: 200 }));
     expect(await daemonReachable()).toBe(true);
     expect(calls[0]?.url).toContain("/_ping");
+    expect(calls[0]?.unix).toBe("/var/run/docker.sock"); // #459: the transport, which every stub used to ignore
   });
 
   test("a build passes the remote context, both tags and the sha build-arg", async () => {
@@ -152,7 +182,7 @@ describe("daemon calls", () => {
   // Goes through `settleWithin` like every other bound assertion. An explicit per-test timeout is
   // NOT enough on its own: bun's timeout is itself unref'd, so when a regressed bound leaves
   // nothing ref'd it cannot interrupt either, and the run wedges with no output. This test used to
-  // rely on that timeout alone — mutating buildImage's bound was the one call site of fourteen
+  // rely on that timeout alone — mutating buildImage's bound was the one call site in the table below
   // that survived, reaching a reviewer as a hung CI job rather than a red test. Worse, it runs
   // before the two body-read tests, so it suppressed those too.
   test(
@@ -221,7 +251,9 @@ describe("daemon calls", () => {
   // handed, so a new call — or an edit handing one a signal that never fires — reopens #130's
   // defect with a fully green suite. Driven both ways: a request that never answers, and a
   // request that answers then wedges mid-body. `daemonReachable` swallows its own errors by
-  // design, so it is asserted to RESOLVE false rather than reject; everything else must reject.
+  // design, so it is asserted to RESOLVE false rather than reject; everything else must reject. The
+  // "bound table names every exported daemon call" test below keeps this table complete against the
+  // module's exports.
   const everyDaemonCall: [string, (timeoutMs: number) => Promise<unknown>][] = [
     ["daemonReachable", (t) => daemonReachable(t)],
     ["inspectSelf", (t) => inspectSelf(t)],
@@ -279,10 +311,27 @@ describe("daemon calls", () => {
         // A call that reads no body settles on headers alone; one that does must abort. Either
         // way it must SETTLE within its bound rather than hang.
         await settleWithin(call(20), name);
+        // #459: and every one of them went out over the daemon socket (the stub records each call's `unix`).
+        expect(calls.length).toBeGreaterThan(0);
+        for (const c of calls) expect(c.unix).toBe("/var/run/docker.sock");
       }),
       1000,
     );
   }
+
+  // The table above is only as good as its rows: a new exported daemon call without one would be
+  // unbounded-by-convention with a green suite (#130's defect). So the table is compared with the
+  // module's exported async functions, and the next daemon call either gets a row or turns this red.
+  // A daemon call written as a plain function that returns `bounded(...)` would not be counted here;
+  // the module has none, and one would have to be added to the table by hand.
+  test("the bound table names every exported daemon call", async () => {
+    const mod = await import("./docker");
+    const asyncExports = Object.entries(mod)
+      .filter(([, v]) => typeof v === "function" && (v as Function).constructor.name === "AsyncFunction")
+      .map(([k]) => k)
+      .sort();
+    expect(asyncExports).toEqual(everyDaemonCall.map(([n]) => n).sort());
+  });
 
   // Every test above passes an explicit tiny `timeoutMs`; no production caller passes one at all
   // (`src/redeploy.ts` never does), so without this both defaults could be raised to infinity —
@@ -430,4 +479,76 @@ describe("daemon calls", () => {
       expect((err as Error).message).toContain("failed: 500");
     }
   });
+});
+
+// #459: every test above stubs `fetch`, so none of them can see the one statement that makes this module
+// talk to a daemon at all (`fetch(url, { unix })`), nor Bun's real abort on a real socket. This one runs
+// the REAL fetch from src/docker.ts in a child process (test/dockerSocketChild.ts) against a
+// `Bun.serve({ unix })` the child starts itself: the ping must answer through the socket, and a call to a
+// handler that never answers and one to a handler that sends one body byte and wedges must both be cut by
+// the bound, in well under a second. A child because src/docker.ts reads BOT_DOCKER_SOCKET once at import and
+// this process has one module registry (the preload clears the variable here, so nothing real is reachable).
+// Runs on Windows and Linux; CI's Linux run is the one that counts for the production kernel.
+describe("the real transport (#459)", () => {
+  const FIXTURE = join(import.meta.dir, "..", "test", "dockerSocketChild.ts");
+  const DEFAULT_FIXTURE = join(import.meta.dir, "..", "test", "dockerSocketDefaultChild.ts");
+  const CHILD_TIMEOUT_MS = 20_000;
+
+  interface Bounded {
+    ok: boolean;
+    message?: string;
+    elapsedMs: number;
+  }
+
+  /** Runs a fixture in a child process with `BOT_DOCKER_SOCKET` as given and returns the last stdout line, parsed. */
+  function runFixture<T>(fixture: string, socket: string): T {
+    const child = Bun.spawnSync([process.execPath, fixture], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, BOT_DOCKER_SOCKET: socket },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: CHILD_TIMEOUT_MS,
+    });
+    if (child.exitCode !== 0) {
+      const why = child.exitedDueToTimeout
+        ? `was killed after ${CHILD_TIMEOUT_MS}ms`
+        : `exited ${child.exitCode} (signal ${child.signalCode ?? "none"})`;
+      throw new Error(`fixture ${why}:\n${child.stderr.toString()}\n${child.stdout.toString()}`);
+    }
+    return JSON.parse(child.stdout.toString().trim().split("\n").at(-1) ?? "") as T;
+  }
+
+  // An empty BOT_DOCKER_SOCKET is unset (the `.env` of a deployment can carry a blank line). The pure function is
+  // pinned above; this shows the module-level constant goes through it, which only a fresh import can.
+  test("a blank BOT_DOCKER_SOCKET in the environment leaves daemon calls on /var/run/docker.sock", () => {
+    const run = runFixture<{ reachable: boolean; unix: (string | undefined)[] }>(DEFAULT_FIXTURE, "");
+    expect(run.reachable).toBe(true);
+    expect(run.unix).toEqual(["/var/run/docker.sock"]);
+  });
+
+  test(
+    "the real fetch reaches a unix socket at BOT_DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound",
+    () => {
+      // Named like the suite's own data dirs (pid included) so test/setup.ts sweeps it if a crash skips the
+      // `finally`; the socket sits directly inside, short because Linux caps a socket path near 108 bytes.
+      const dir = mkdtempSync(join(tmpdir(), `${TEST_DATA_PREFIX}${process.pid}-`));
+      try {
+        const run = runFixture<{ ping: boolean; hang: Bounded; wedge: Bounded; wedgeStatus: number }>(
+          FIXTURE,
+          join(dir, "d.sock"),
+        );
+        expect(run.ping).toBe(true);
+        expect(run.wedgeStatus).toBe(200); // the wedge handler's headers really arrived before it stalled
+        for (const [shape, r] of [["hang", run.hang], ["wedge", run.wedge]] as const) {
+          expect(r.ok, shape).toBe(false);
+          expect(r.message, shape).toMatch(/timed out after 100ms/);
+          expect(r.elapsedMs, shape).toBeLessThan(1_000);
+        }
+      } finally {
+        // A child the timeout killed leaves its `.sock` file behind, so the directory goes either way.
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    CHILD_TIMEOUT_MS + 10_000,
+  );
 });
