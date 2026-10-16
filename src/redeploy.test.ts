@@ -38,7 +38,7 @@ const { clearMarker, readMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_
 const { beginShutdown, handoffActive, onBeforeExit, restartPending, resetForTest } = await import("./restart");
 const { SHORT_SHA_LEN, DATA_DIR } = await import("./storage");
 const { config } = await import("./config");
-const { resetBotStateForTest, state: botState } = await import("./state");
+const { resetBotStateForTest, saveState, state: botState } = await import("./state");
 
 const SELF_ID = "a".repeat(64);
 const SELF_SHORT_ID = SELF_ID.slice(0, 12);
@@ -892,6 +892,28 @@ describe("takeOver — the default state re-read and retirement record (#507, #5
     const disk = JSON.parse(readFileSync(FILE, "utf8"));
     expect(disk.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
     expect(disk.seenReleaseIds["a/b"]).toEqual([1, 2, 3]);
+  });
+
+  // Mutation (M9c): completeTakeOver's default `clearRetirement` replaced by a no-op -- every R4 test injects its own.
+  test("R4: completeTakeOver's DEFAULT clear removes the record from memory and from disk", async () => {
+    const ORIGINAL = "f".repeat(64);
+    botState.retiredBy = { sha: NEW, originalSha: OLD, at: 1 };
+    await saveState();
+    expect(JSON.parse(readFileSync(FILE, "utf8")).retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 1 });
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await completeTakeOver(ORIGINAL, {
+        inspect: async () => ({ ...SELF, Id: ORIGINAL, Name: "/warbandeer-discord", State: { Running: false, Status: "exited", ExitCode: 0 } }),
+        tagLatest: async () => {},
+        remove: async () => {},
+        rename: async () => {},
+        stepAside: async () => Promise.reject(new Error("must not step aside")),
+      });
+    } finally {
+      log.mockRestore();
+    }
+    expect(botState.retiredBy).toBeUndefined();
+    expect("retiredBy" in JSON.parse(readFileSync(FILE, "utf8"))).toBe(false);
   });
 });
 

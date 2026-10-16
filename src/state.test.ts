@@ -382,6 +382,14 @@ describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => 
     expect(q.warns).toEqual([]);
   });
 
+  // Mutation: dropping `normalizeSeenReleaseIds` from the reload -- a file an older single-repo bot last wrote would
+  // put a bare array where the per-repo map belongs, and the next release poll would throw on it.
+  test("S1b: a legacy single-repo id list in the file is filed under the configured repo, as at load", async () => {
+    writeFileSync(FILE, JSON.stringify({ seenReleaseIds: [4, 5, 6] }));
+    expect(await reloadState(quiet().log)).toBe("reloaded");
+    expect(state.seenReleaseIds).toEqual({ [config.githubRepo]: [4, 5, 6] });
+  });
+
   // Mutation: replacing memory with an empty state when there is no file (or an unreadable one).
   test("S2: no file keeps what is in memory and says so", async () => {
     state.seenReleaseIds["a/b"] = [1, 2];
@@ -478,8 +486,11 @@ describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => 
     expect(q.warns[0]).toContain("no GIT_SHA");
   });
 
+  // Mutation: clearRetirement not saving -- the record had to be on disk first for the check to mean anything.
   test("S5: clearRetirement clears and saves the record; with none set it writes nothing", async () => {
     state.retiredBy = { sha: NEW, originalSha: OLD, at: 5 };
+    await saveState();
+    expect(onDisk().retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
     await clearRetirement();
     expect(state.retiredBy).toBeUndefined();
     expect("retiredBy" in onDisk()).toBe(false);
