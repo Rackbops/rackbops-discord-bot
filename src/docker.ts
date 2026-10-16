@@ -323,13 +323,17 @@ export async function stopContainer(id: string, timeoutSec = STOP_TIMEOUT_SEC, t
   });
 }
 
-export async function removeContainer(id: string, force = false, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> {
+/** `true` when the daemon removed it, `false` when it had nothing by that id or name (404) -- a removal
+ *  that already happened is not an error, but a caller reporting what it cleaned up needs to know (#451). */
+export async function removeContainer(id: string, force = false, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<boolean> {
   const params = new URLSearchParams(force ? { force: "1" } : {});
-  await bounded(timeoutMs, `rm ${id}`, async (s) => {
+  return bounded(timeoutMs, `rm ${id}`, async (s) => {
     const res = await api(`/containers/${encodeURIComponent(id)}?${params}`, s, { method: "DELETE" });
-    if (!res.ok && res.status !== 404) {
+    if (res.status === 404) return false;
+    if (!res.ok) {
       throw new Error(`docker rm ${id} failed: ${res.status} ${clampUpstreamBody(await res.text())}`);
     }
+    return true;
   });
 }
 

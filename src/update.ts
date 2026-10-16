@@ -347,6 +347,8 @@ async function applyUpdate(
   // instead of rebuilding it every 15 minutes; an admin's /update (force: true) still bypasses it.
   state.pendingUpdateReport = undefined;
   await saveState();
-  console.warn(`[update] redeploy to ${shortNew} failed: ${result.error ?? result.outcome}`);
+  console.warn(
+    `[update] redeploy to ${shortNew} failed: ${result.error ?? result.outcome} (replacement: ${result.replacement ?? "unknown"})`,
+  );
   return result;
 }

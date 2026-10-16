@@ -216,6 +216,26 @@ describe("updateReply", () => {
   test("a stalled swap gets the stall wording, not the generic failure", () => {
     expect(updateReply("restart", SHA, { redeploy: { outcome: "stalled" } })).toContain("verified");
   });
+
+  // #451: the reply says what became of the `-next` container, and a timeout names the daemon's last error.
+  test("the /update failure reply says what became of the replacement", () => {
+    expect(updateReply("restart", SHA, { redeploy: { outcome: "failed", replacement: "left" } })).toContain(
+      "left it alone",
+    );
+    const timeout = updateReply("restart", SHA, {
+      redeploy: { outcome: "timeout", replacement: "removed", error: "docker inspect x failed: 500" },
+    });
+    expect(timeout).toContain("removed it");
+    expect(timeout).toContain("last daemon error: docker inspect x failed: 500");
+    expect(updateReply("restart", SHA, { redeploy: { outcome: "failed", replacement: "none" } })).not.toContain(
+      "removed it",
+    );
+    const refused = updateReply("restart", SHA, {
+      redeploy: { outcome: "failed", replacement: "remove-failed", replacementError: "409" },
+    });
+    expect(refused).toContain("could not remove it");
+    expect(refused).toContain("409");
+  });
 });
 
 describe("commandData", () => {
