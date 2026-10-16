@@ -539,6 +539,18 @@ describe("index.ts wiring", () => {
       // The timer's beats (and the tick's) are gated on this flag, so they cannot run before initRouting.
       expect(bootDrain).toBeLessThan(ready);
     });
+
+    // #419: the boot drain's update-now may leave a restart deferred by the first tick's critical section; the
+    // report-back then belongs to the next boot, and must not run (it would say "still on the old version").
+    test("the boot report-back is skipped while a restart exit is requested", () => {
+      const bootDrain = source.indexOf("await consumePluginRequests(livePluginRequestDeps())", activateFn);
+      const report = source.indexOf("reportPluginUpdateOutcome({", activateFn);
+      const guard = source.indexOf("if (restartRequested()) {", bootDrain);
+      expect(guard).toBeGreaterThan(bootDrain);
+      expect(guard).toBeLessThan(report);
+      expect(source.slice(guard, report)).toContain("} else {");
+      expect(source).toMatch(/import \{[^}]*\brestartRequested\b[^}]*\} from "\.\/restart";/);
+    });
   });
 
   // #259: joining and leaving a server. index.ts can't run under test, so the wiring is pinned in the source.

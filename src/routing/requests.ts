@@ -58,7 +58,7 @@ export type RoutingRequest =
 
 export type ParsedRoutingRequest = { ok: true; request: RoutingRequest } | { ok: false; reason: string };
 
-const MAX_REQUESTED_BY = 200;
+export const MAX_REQUESTED_BY = 200;
 // How much of `requestedBy` is looked at for a url before it is clipped to `MAX_REQUESTED_BY`. Redaction
 // is linear but not free (about a second per megabyte of hostile text), so a value is cut to this first;
 // a url cut short by it is still redacted, because the pattern matches from `webhooks/` on.

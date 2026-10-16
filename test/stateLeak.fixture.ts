@@ -49,6 +49,7 @@ test("leaks a request drain still running", () => {
     mutateState: none,
     requestRestart: () => {},
     hostApiVersion: 1,
+    adminUserIds: [],
     now: () => new Date("2026-09-05T12:00:00.000Z"),
     log: { info() {}, warn() {}, error() {} },
   };
