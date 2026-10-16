@@ -279,7 +279,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     return {
       error:
         process.env[HANDOFF_FROM_ENV] && !namedAfterItsProject(self)
-          ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a minute; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
+          ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
           : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name (for an install.sh instance, another instance name) and recreate it",
       replacement: "none",
     };
@@ -374,7 +374,8 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // name is someone else's (it took the name during the build, so the create failed on a 409, or the sweep
     // above did, and no create was attempted) and the 409 here is reported instead of killing it: in the error
     // text, with the disposition `none` (nothing of OURS is left), not `remove-failed`, whose requester message
-    // says "remove the -next container by hand", which is the wrong advice for a live bot.
+    // says "remove the -next container by hand", which is the wrong advice for a live bot. Only a 409 means
+    // that: any other failure leaves our own `created` orphan, and stays `remove-failed`.
     let replacement: ReplacementDisposition = "none";
     let replacementError: string | undefined;
     let foreignHolder: string | undefined;
@@ -383,7 +384,9 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // bind): then nothing was started and the requester must not hear "removed" (#451).
       replacement = (await (replacementId ? removeContainer(replacementId, true) : removeContainer(name))) ? "removed" : "none";
     } catch (cleanupErr) {
-      if (replacementId === undefined) {
+      // A 409 is Docker refusing to remove a RUNNING container: someone else's. Any other failure (a wedged
+      // daemon's 500, a timeout) leaves OUR created orphan in place, which `remove-failed` tells the requester.
+      if (replacementId === undefined && /failed: 409\b/.test((cleanupErr as Error).message)) {
         foreignHolder = (cleanupErr as Error).message;
         console.error(`[redeploy] ${name} is held by a container that could not be removed — leaving it alone: ${foreignHolder}`);
       } else {
@@ -1118,8 +1121,12 @@ export interface HealDeps {
  * Bounded and best-effort: the boot continues on every outcome. A container named after its own compose
  * project (`namedAfterItsProject`: how `ops/install.sh` names an instance, `-next` included) is never renamed.
  * The limit: that exemption, and the `HANDOFF_FROM` gate, are all that tell a deployment's own `*-next` name
- * from a swap's replacement; a container created by `compose` alone with a `container_name` ending in
- * `-next` that has also self-updated before #547 is indistinguishable and would be renamed.
+ * from a swap's replacement, so three narrow cases go the wrong way, none reachable through install.sh: a
+ * container created by `compose` alone with a `container_name` ending in `-next` that has also self-updated
+ * before #547 is indistinguishable and would be renamed; a swap's replacement whose name equals its project
+ * label (a hand-written compose with project `foo-next` and `container_name: foo`) is exempt and not healed;
+ * and a replacement stuck unrenamed from before #547 for an instance named `P-next` is `P-next-next`, which is
+ * healed to `P`, not `P-next`.
  */
 export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
   const log = deps.log ?? console;

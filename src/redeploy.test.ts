@@ -1851,6 +1851,44 @@ describe("redeploy — cleanup always runs", () => {
     expect(restartPending()).toBe(false);
   });
 
+  // A cleanup that fails for any OTHER reason than Docker's 409 leaves our own `created` orphan behind (the #130
+  // case: a create that timed out, then a daemon too wedged to answer the removal), and the requester is told so.
+  test("a create that times out followed by a failing by-name cleanup is remove-failed, not a foreign holder", async () => {
+    stubDaemon({
+      createTimesOut: true,
+      nameDelete: () => new Response("boom", { status: 500 }),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("9".repeat(40));
+    expect(result.replacement).toBe("remove-failed");
+    expect(result.replacementError).toContain("500");
+    expect(result.error).not.toContain("held by a container that could not be removed");
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The project-named exemption reads the bot's own labels: a container the daemon reports with none (null) is not
+  // named after a project, and `redeploy()` must refuse it like any other -next bot instead of throwing.
+  test("a bot named -next whose labels are null is refused, not crashed", async () => {
+    stubDaemon({
+      self: { ...SELF, Name: "/warbandeer-discord-next", Config: { ...SELF.Config, Labels: null as unknown as Record<string, string> } },
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID;
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.replacement).toBe("none");
+      expect(result.error).toContain("docker restart warbandeer-discord-next");
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+  });
+
   // The window between the inspect and the sweep: a stopped leftover that someone starts in it is a 409 on the
   // un-forced removal, reported as a failure to start, and never force-removed, by id or by name.
   test("a leftover started between the inspect and the sweep is a reported failure, not a kill", async () => {
