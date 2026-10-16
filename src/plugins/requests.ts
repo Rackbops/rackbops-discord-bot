@@ -1,7 +1,7 @@
 // The plugin request MAILBOX (#105, extended by #241). The admin panel can't write the bot's data (the
 // bot is the sole writer), so each panel action becomes a request file in data/plugins/requests/
 // (written for the update actions by `ops/bot-ops.sh plugin-request` via `docker exec -u bun`; the
-// routing actions get the same treatment in #240). The bot drains them --
+// routing actions get the same treatment, #240). The bot drains them --
 // validating each, applying the surviving ones, then deleting the file (a malformed/invalid one is moved
 // aside to requests/rejected/). Two families share the directory:
 //
@@ -26,6 +26,7 @@ import {
   parseRoutingRequest,
   redactWebhookUrls,
   requestIdOf,
+  MAX_REQUESTED_BY,
   ROUTING_ACTIONS,
   RoutingRefusal,
   type RoutingRequestDeps,
@@ -34,6 +35,7 @@ import { shown } from "../routing/resolve";
 import type { PluginIndex, PluginIndexEntry, PluginRequest, PluginStateEntry, PluginStateFile } from "./contract";
 import {
   cancelPending,
+  isDiscordUserId,
   pinUpdateNow,
   remindLater,
   scheduleUpdate,
@@ -42,6 +44,8 @@ import {
 } from "./updates";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+// U+FFFD, built from its code point (a typed escape is normalised to the glyph by the Edit tool).
+const REPLACEMENT = String.fromCharCode(0xfffd);
 const PLUGIN_NAME_RE = /^[a-z][a-z0-9-]*$/;
 // Anchored semver, no slashes/dots-only — this is the AUTHORITATIVE path-traversal gate, since a
 // version flows into a filesystem join and an npm URL segment in install.ts.
@@ -65,6 +69,8 @@ export interface PluginRequestDeps {
   mutateState: (mutate: (s: PluginStateFile) => PluginStateFile) => Promise<void>;
   requestRestart: (reason: string) => void;
   hostApiVersion: number;
+  /** #480 item 4: the Discord ids a snowflake `requestedBy` may be (ADMIN_USER_IDS); a panel identity is any other non-empty string. */
+  adminUserIds: string[];
   now: () => Date;
   log: PluginUpdateLog;
   /** What the four routing actions run against (#241). Absent: a routing action is rejected. */
@@ -87,6 +93,8 @@ export interface PluginRequestDeps {
 }
 
 const TORN_READ_RETRY_MS = 250;
+// A request file is a few hundred characters (a webhook-add) at most; anything past this is never a real request.
+const MAX_REQUEST_CHARS = 64 * 1024;
 
 // Single-flight: the boot drain and a tick drain (both call consumePluginRequests) must not overlap —
 // two readdir passes could each see, apply, and unlink the same file. A module-level promise chain
@@ -125,10 +133,15 @@ let draining: Promise<void> = Promise.resolve();
 const UNREAD: unique symbol = Symbol("unread");
 const undeletable = new Map<string, string | typeof UNREAD>();
 
+// #480 item 8: the error code of the last non-ENOENT readDir failure that was logged, so an unreadable mailbox is
+// logged once per code rather than every beat. Cleared by a readDir that succeeds.
+let lastReaddirFailure: string | undefined;
+
 /** Forgets every file remembered as undeletable, as a restart does. Leaves the drain queue alone
  *  (that is `resetPluginRequestDrainForTest`), so a drain a test leaked still reaches the guard. */
 export function resetPluginRequestsForTest(): void {
   undeletable.clear();
+  lastReaddirFailure = undefined;
 }
 
 /** The test-state guard's own (test/stateGuard.ts): starts a fresh drain queue. The guard runs this
@@ -139,14 +152,15 @@ export function resetPluginRequestDrainForTest(): void {
   draining = Promise.resolve();
 }
 
-/** What the test-state guard (test/stateGuard.ts) reads here: `undeletable`, which
+/** What the test-state guard (test/stateGuard.ts) reads here: `undeletable` and `readdirFailure`, which
  *  `resetPluginRequestsForTest` resets, and `draining`, handed over as is — the guard asks whether
  *  it is still pending (which `resetPluginRequestDrainForTest` drops). */
-export function pluginRequestsStateForTest(): { undeletable: number; draining: Promise<void> } {
-  return { undeletable: undeletable.size, draining };
+export function pluginRequestsStateForTest(): { undeletable: number; draining: Promise<void>; readdirFailure: boolean } {
+  return { undeletable: undeletable.size, draining, readdirFailure: lastReaddirFailure !== undefined };
 }
 
-/** Drain the request mailbox once, serialized against any concurrent drain. Never throws. */
+/** Drain the request mailbox once, serialized against any concurrent drain. Rejects only when the Plugin Index load
+ *  threw (the update files stay queued; the routing requests before and after them were handled), never for a file. */
 export function consumePluginRequests(deps: PluginRequestDeps): Promise<void> {
   const run = draining.then(
     () => drainOnce(deps),
@@ -206,9 +220,20 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   let files: string[];
   try {
     files = (await deps.readDir(deps.requestsDir)).filter((f) => f.endsWith(".json")).sort();
-  } catch {
-    return; // no requests dir yet (or unreadable) — nothing to drain
+  } catch (err) {
+    // #480 item 8: "no requests dir yet" is ENOENT; anything else (EACCES on a root-owned dir, EMFILE) is a mailbox
+    // nobody is reading, logged once per error code rather than every beat.
+    if (!isNotFound(err)) {
+      const code = (err as { code?: unknown }).code;
+      const key = typeof code === "string" ? code : errorText(err);
+      if (lastReaddirFailure !== key) {
+        lastReaddirFailure = key;
+        deps.log.warn(`[plugins] cannot list the request mailbox ${deps.requestsDir}: ${key} — panel requests are not being applied`);
+      }
+    }
+    return;
   }
+  lastReaddirFailure = undefined;
   // Forget a stuck file once it is gone, so a request that arrives later under the same name is handled.
   for (const name of [...undeletable.keys()]) if (!files.includes(name)) undeletable.delete(name);
   if (files.length === 0) return;
@@ -260,6 +285,12 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     const refuse = async (reason: string, secret = false): Promise<void> => {
       if (!(await reject(deps, path, file, reason, secret))) undeletable.set(file, text);
     };
+    // #480 item 5: nothing has looked inside the text yet. A blob this size is never a real request; it is deleted
+    // (secret = true), not quarantined, and reject logs the one line.
+    if (text.length > MAX_REQUEST_CHARS) {
+      await refuse(`request file too large (${text.length} characters)`, true);
+      continue;
+    }
     let parsed = tryParse(text);
     if (!parsed.ok) {
       // A writer older than #240 is not atomic, so this may be a request still being written: look once more before
@@ -317,7 +348,7 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
     // this file still queued, so every later drain threw on it again.
     let v: Valid;
     try {
-      v = validate(raw, installed, entryByName, deps.hostApiVersion);
+      v = validate(raw, installed, entryByName, deps.hostApiVersion, deps.adminUserIds);
     } catch (err) {
       v = { ok: false, reason: `validation threw — ${errorText(err)}` };
     }
@@ -345,9 +376,23 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
   // requests that did not need it have been dealt with.
   if (loadFailure !== undefined) throw loadFailure;
 
-  // ONE restart after the full drain, so an update-now doesn't strand later co-dropped files (two
-  // update-nows share it — buildPluginStateFile consumes each targetVersion independently).
-  if (restartReason !== undefined) deps.requestRestart(restartReason);
+  // ONE restart after the full drain, so an update-now doesn't strand later co-dropped files -- and only if a
+  // targetVersion is still set once every file has been applied (#480 item 6): a cancel in the same drain for the
+  // plugin an update-now pinned leaves nothing to install. buildPluginStateFile consumes each targetVersion
+  // independently; `pendingReport` is ONE slot (contract.ts), so two update-nows in one drain keep both targets and
+  // the LAST report-back only -- the replaced one is named in the log (#480 item 7).
+  if (restartReason !== undefined) {
+    let pinned = true;
+    try {
+      pinned = (await deps.readState()).plugins.some((p) => p.targetVersion !== undefined);
+    } catch (err) {
+      // The files are applied and gone; a lost restart would strand their pins. Restart as before. (One argument:
+      // `PluginUpdateLog.warn` takes the message only; the cause goes in the text.)
+      deps.log.warn(`[plugins] could not re-read the plugin state after the drain (${redactWebhookUrls(errorText(err))}); restarting as requested`);
+    }
+    if (pinned) deps.requestRestart(restartReason);
+    else deps.log.warn("[plugins] the update-now in this drain was cancelled before the restart; nothing to install");
+  }
 }
 
 type Outcome = { ok: true; channelId?: string } | { ok: false; reason: string };
@@ -430,13 +475,22 @@ export function validate(
   installed: Map<string, PluginStateEntry>,
   entryByName: Map<string, PluginIndexEntry>,
   hostApiVersion: number,
+  adminUserIds: string[],
 ): Valid {
   if (typeof raw !== "object" || raw === null) return { ok: false, reason: "not an object" };
   const r = raw as Record<string, unknown>;
   const action = r.action;
   if (typeof action !== "string" || !ACTIONS.has(action)) return { ok: false, reason: `unknown action ${shown(action)}` };
   if (typeof r.plugin !== "string" || !PLUGIN_NAME_RE.test(r.plugin)) return { ok: false, reason: `bad plugin name ${shown(r.plugin)}` };
-  if (typeof r.requestedBy !== "string" || r.requestedBy.length === 0) return { ok: false, reason: "missing requestedBy" };
+  if (typeof r.requestedBy !== "string") return { ok: false, reason: "missing requestedBy" };
+  // #480 items 4 and 5: a Discord id is DMed (the heads-up, the report-back), so it must be an admin's; anything
+  // else is a panel identity (email:<addr>, token). Stored and logged as given, so it is bounded and stripped of
+  // control characters first (MAX_REQUESTED_BY is the routing path's bound; isDiscordUserId is the DM sites' test).
+  const requestedBy = r.requestedBy.replace(/[\x00-\x1f\x7f]/g, "").slice(0, MAX_REQUESTED_BY);
+  if (requestedBy.length === 0) return { ok: false, reason: "missing requestedBy" };
+  if (isDiscordUserId(requestedBy) && !adminUserIds.includes(requestedBy)) {
+    return { ok: false, reason: `requestedBy ${requestedBy} is not an admin` };
+  }
   const plugin = r.plugin;
 
   // Pre-flight: the plugin must be installed (updateEntry silently no-ops on an unknown name, so a
@@ -463,8 +517,9 @@ export function validate(
   // An update to the version that is ALREADY installed is a no-op, so it is refused (#263) rather than
   // pinned and restarted for. That ends the restart loop of an applied update-now whose file cannot be
   // deleted, once the install has landed (the file is seen again after the restart it caused, and by then it
-  // names the installed version; see the residual beside `undeletable`), and it is a better answer to a
-  // double-click in the panel too. Only these two actions: skip, remind and cancel for the installed version
+  // names the installed version; see the residual beside `undeletable`). The panel does not see this refusal: it
+  // is a log line and a file in `rejected/` (an update request carries no id to record a result under, unlike a
+  // routing request). Only these two actions: skip, remind and cancel for the installed version
   // are harmless and still apply. Placed after the shape checks above (version, schedule time, days), so a
   // malformed version is still "bad version" and a bad schedule time is still that, and before the host-API
   // check (the one corner where the reason changes for a request that was refused before: the index's
@@ -486,8 +541,10 @@ export function validate(
     if (entry && r.version === entry.version && entry.hostApiVersion !== hostApiVersion) {
       return { ok: false, reason: `${plugin} ${r.version} needs host API v${entry.hostApiVersion} (bot is v${hostApiVersion})` };
     }
+    // With an empty or uncached index `entryByName` is empty and this check cannot run: a pin to an incompatible
+    // current version is then caught by the install (it fails and reverts, #104).
   }
-  return { ok: true, request: raw as PluginRequest };
+  return { ok: true, request: { ...(raw as PluginRequest), requestedBy } };
 }
 
 /** Apply one validated request through the shared #104 builders. Returns the target version if this
@@ -502,7 +559,12 @@ async function apply(r: PluginRequest, deps: PluginRequestDeps): Promise<string 
         channelId: undefined,
         requestedAt: deps.now().getTime(),
       };
-      await deps.mutateState(pinUpdateNow(r.plugin, r.version, report));
+      await deps.mutateState((s) => {
+        if (s.pendingReport !== undefined && s.pendingReport.plugin !== r.plugin) {
+          deps.log.warn(`[plugins] the report-back for ${s.pendingReport.plugin} ${s.pendingReport.toVersion} is replaced by ${r.plugin} ${r.version}'s (one report slot)`);
+        }
+        return pinUpdateNow(r.plugin, r.version, report)(s);
+      });
       return r.version;
     }
     case "schedule":
@@ -538,7 +600,8 @@ async function removeFile(deps: PluginRequestDeps, path: string): Promise<boolea
  * the file and nothing else. Resolves true when the file is gone (moved or deleted), false when it is not.
  */
 async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string, secretBearing = false): Promise<boolean> {
-  deps.log.warn(`[plugins] rejecting request ${file}: ${redactWebhookUrls(reason)}`);
+  // #480 item 5: a reason may carry untrusted text (an action, a thrown message); no control character reaches the log.
+  deps.log.warn(`[plugins] rejecting request ${file}: ${redactWebhookUrls(reason).replace(/[\x00-\x1f\x7f]/g, REPLACEMENT)}`);
   if (secretBearing) {
     try {
       await deps.unlink(path);

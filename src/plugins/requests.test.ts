@@ -17,6 +17,8 @@ import {
 } from "./requests";
 
 const REQ_DIR = "/data/plugins/requests";
+// An admin's Discord id (a snowflake `requestedBy` must be one of the deps' adminUserIds, #480 item 4).
+const ADMIN = "200863115821318144";
 
 function entry(name: string, version: string, hostApiVersion = 1): PluginIndexEntry {
   return { name, package: `@rackbops/plugin-${name}`, version, description: name, hostApiVersion, commands: [], env: [], releases: [] };
@@ -24,12 +26,22 @@ function entry(name: string, version: string, hostApiVersion = 1): PluginIndexEn
 function installedMap(...names: [string, string | undefined][]): Map<string, PluginStateEntry> {
   return new Map(names.map(([name, v]) => [name, { name, enabled: true, configured: true, missingEnv: [], active: true, ...(v ? { installedVersion: v } : {}) }]));
 }
+const plug = (name: string, over: Partial<PluginStateEntry> = {}): PluginStateEntry => ({
+  name,
+  enabled: true,
+  configured: true,
+  missingEnv: [],
+  active: true,
+  installedVersion: "1.0.0",
+  ...over,
+});
+const twoPlugins = (): PluginStateFile => ({ hostApiVersion: 1, writtenAt: "", plugins: [plug("warbandeer"), plug("other")] });
 const entryMap = (...es: PluginIndexEntry[]) => new Map(es.map((e) => [e.name, e]));
 
 describe("validate (#105 trust boundary)", () => {
   const installed = installedMap(["warbandeer", "1.0.0"]);
   const entries = entryMap(entry("warbandeer", "1.1.0"));
-  const ok = (raw: unknown) => validate(raw, installed, entries, 1);
+  const ok = (raw: unknown) => validate(raw, installed, entries, 1, []);
 
   test("accepts each well-formed action", () => {
     expect(ok({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "email:x" }).ok).toBe(true);
@@ -81,7 +93,7 @@ describe("validate (#105 trust boundary)", () => {
 
   test("the comparison is exact: a prerelease and its release are different versions (#263)", () => {
     const rc = installedMap(["warbandeer", "1.0.0-rc.1"]);
-    const check = (version: string) => validate({ action: "update-now", plugin: "warbandeer", version, requestedBy: "t" }, rc, entries, 1);
+    const check = (version: string) => validate({ action: "update-now", plugin: "warbandeer", version, requestedBy: "t" }, rc, entries, 1, []);
     expect(check("1.0.0-rc.1")).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0-rc.1" });
     expect(check("1.0.0").ok).toBe(true); // the release of the installed prerelease is a real update
     expect(check("1.0.0-rc.2").ok).toBe(true);
@@ -98,7 +110,7 @@ describe("validate (#105 trust boundary)", () => {
     // An installed version that is not itself well-formed makes the order of the two checks observable: a
     // request naming exactly that text must be refused as malformed, not as "already on".
     const odd = installedMap(["warbandeer", "1.0"]);
-    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0", requestedBy: "t" }, odd, entries, 1);
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0", requestedBy: "t" }, odd, entries, 1, []);
     expect(refused.ok).toBe(false);
     expect(refused.ok === false && refused.reason).toContain("bad version");
     // and the refusals that come before it in `validate` keep their own reasons
@@ -111,15 +123,15 @@ describe("validate (#105 trust boundary)", () => {
     // The index's current is 1.0.0, needs host API v2 (the bot is v1), and 1.0.0 is what is installed: it is
     // already installed, so that is the answer, not "needs host API".
     const incompat = entryMap(entry("warbandeer", "1.0.0", 2));
-    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0.0", requestedBy: "t" }, installed, incompat, 1);
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "1.0.0", requestedBy: "t" }, installed, incompat, 1, []);
     expect(refused).toEqual({ ok: false, reason: "warbandeer is already on 1.0.0" });
   });
 
   test("rejects an update to the index's CURRENT version when it's host-API-incompatible", () => {
     const incompatEntries = entryMap(entry("warbandeer", "1.1.0", 2)); // needs host API v2
-    expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, installed, incompatEntries, 1).ok).toBe(false);
+    expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" }, installed, incompatEntries, 1, []).ok).toBe(false);
     // …but an explicit pin to a DIFFERENT (older) version is honored (compat unknowable per-release).
-    expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.0.5", requestedBy: "t" }, installed, incompatEntries, 1).ok).toBe(true);
+    expect(validate({ action: "update-now", plugin: "warbandeer", version: "1.0.5", requestedBy: "t" }, installed, incompatEntries, 1, []).ok).toBe(true);
   });
 
   // #225: a carried-forward off (enabled: false) plugin.
@@ -128,7 +140,7 @@ describe("validate (#105 trust boundary)", () => {
   ]);
 
   test("update-now and schedule are refused for an off plugin; remind, skip and cancel still apply", () => {
-    const offOk = (raw: unknown) => validate(raw, offInstalled, entries, 1);
+    const offOk = (raw: unknown) => validate(raw, offInstalled, entries, 1, []);
     expect(offOk({ action: "update-now", plugin: "warbandeer", version: "1.1.0", requestedBy: "t" })).toEqual({
       ok: false,
       reason: "warbandeer is off — turn it on first",
@@ -145,7 +157,7 @@ describe("validate (#105 trust boundary)", () => {
   test("an off plugin's bad version is still \"bad version\"", () => {
     // The off check sits AFTER the shape checks (version/at/days), so a malformed version keeps its
     // own reason even for a plugin that's off.
-    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "not-a-version", requestedBy: "t" }, offInstalled, entries, 1);
+    const refused = validate({ action: "update-now", plugin: "warbandeer", version: "not-a-version", requestedBy: "t" }, offInstalled, entries, 1, []);
     expect(refused.ok).toBe(false);
     expect(refused.ok === false && refused.reason).toContain("bad version");
   });
@@ -158,7 +170,10 @@ describe("consumePluginRequests drain", () => {
   // a test awaits its drains, and the guard fails one that leaves a drain running.
   afterEach(resetPluginRequestsForTest);
 
-  function harness(files: Record<string, unknown>, opts: { routing?: RoutingRequestDeps; state?: PluginStateFile } = {}) {
+  function harness(
+    files: Record<string, unknown>,
+    opts: { routing?: RoutingRequestDeps; state?: PluginStateFile; readDirError?: Error; readStateThrowsAfter?: number } = {},
+  ) {
     const fs = new Map<string, string>(Object.entries(files).map(([k, v]) => [k, JSON.stringify(v)]));
     const rejected: string[] = [];
     const restarts: string[] = [];
@@ -170,7 +185,10 @@ describe("consumePluginRequests drain", () => {
     let state: PluginStateFile = opts.state ?? { hostApiVersion: 1, writtenAt: "", plugins: [{ name: "warbandeer", enabled: true, configured: true, missingEnv: [], active: true, installedVersion: "1.0.0" }] };
     const deps: PluginRequestDeps = {
       requestsDir: REQ_DIR,
-      readDir: async (dir) => (dir === REQ_DIR ? [...fs.keys()] : Promise.reject(new Error("ENOENT"))),
+      readDir: async (dir) => {
+        if (opts.readDirError !== undefined) throw opts.readDirError;
+        return dir === REQ_DIR ? [...fs.keys()] : Promise.reject(new Error("ENOENT"));
+      },
       readFile: async (path) => {
         const name = path.slice(REQ_DIR.length + 1);
         const v = fs.get(name);
@@ -193,11 +211,13 @@ describe("consumePluginRequests drain", () => {
       },
       readState: async () => {
         stateReads += 1;
+        if (opts.readStateThrowsAfter !== undefined && stateReads >= opts.readStateThrowsAfter) throw new Error("state unreadable");
         return state;
       },
       mutateState: async (mutate) => { state = mutate(state); mutations.push(1); },
       requestRestart: (reason) => restarts.push(reason),
       hostApiVersion: 1,
+      adminUserIds: [ADMIN],
       now: () => new Date("2026-09-05T12:00:00.000Z"),
       log: {
         info() {},
@@ -321,14 +341,197 @@ describe("consumePluginRequests drain", () => {
   test("multiple update-now files share ONE restart across the drain (later files not stranded)", async () => {
     // Two update-now files + a cancel: the restart is requested ONCE, after the whole drain — a
     // restart-per-file would fire twice and (in production) strand the files dropped after the first.
-    const h = harness({
-      "100-update-now-1.json": wb({ action: "update-now", version: "1.0.5" }),
-      "200-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }),
-      "300-cancel-1.json": wb({ action: "cancel" }),
-    });
+    // The cancel names a second installed plugin, so warbandeer's target remains (#480 item 6: a cancel for the
+    // pinned plugin itself would cancel the restart, Q4).
+    const h = harness(
+      {
+        "100-update-now-1.json": wb({ action: "update-now", version: "1.0.5" }),
+        "200-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }),
+        "300-cancel-1.json": wb({ action: "cancel", plugin: "other" }),
+      },
+      { state: twoPlugins() },
+    );
     await consumePluginRequests(h.deps);
     expect(h.fs.size).toBe(0); // all three drained despite the two update-nows
     expect(h.restarts).toHaveLength(1); // exactly one restart, AFTER the full drain
+    // a second click on the same plugin is silent: no "one report slot" warn
+    expect(h.warns.filter((w) => w.includes("one report slot"))).toEqual([]);
+  });
+
+  test("Q1 (#417): a schedule file stores version, time and requester", async () => {
+    const h = harness({ "100-schedule-1.json": wb({ action: "schedule", version: "1.1.0", at: "2026-09-06T12:00:00.000Z" }) });
+    await consumePluginRequests(h.deps);
+    expect(h.state.plugins[0]?.scheduled).toEqual({ version: "1.1.0", at: "2026-09-06T12:00:00.000Z", requestedBy: "email:me@x.com" });
+    expect(h.restarts).toEqual([]);
+  });
+
+  test("Q1 (#417): a remind file sets remindAt to now + 7 days by default, now + days when given", async () => {
+    const dflt = harness({ "100-remind-1.json": wb({ action: "remind", version: "1.1.0" }) });
+    await consumePluginRequests(dflt.deps);
+    expect(dflt.state.plugins[0]?.remindAt).toBe("2026-09-12T12:00:00.000Z");
+    expect(dflt.restarts).toEqual([]);
+    const three = harness({ "100-remind-1.json": wb({ action: "remind", version: "1.1.0", days: 3 }) });
+    await consumePluginRequests(three.deps);
+    expect(three.state.plugins[0]?.remindAt).toBe("2026-09-08T12:00:00.000Z");
+    expect(three.restarts).toEqual([]);
+  });
+
+  test("Q1 (#417): a cancel file clears scheduled, targetVersion and this plugin's pendingReport", async () => {
+    const state: PluginStateFile = {
+      hostApiVersion: 1,
+      writtenAt: "",
+      plugins: [plug("warbandeer", { scheduled: { version: "1.1.0", at: "2026-09-06T12:00:00.000Z", requestedBy: "token" }, targetVersion: "1.1.0" })],
+      pendingReport: { plugin: "warbandeer", toVersion: "1.1.0", userId: "token", channelId: undefined, requestedAt: 1 },
+    };
+    const h = harness({ "100-cancel-1.json": wb({ action: "cancel" }) }, { state });
+    await consumePluginRequests(h.deps);
+    expect(h.state.plugins[0]?.scheduled).toBeUndefined();
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(h.state.pendingReport).toBeUndefined();
+    expect(h.restarts).toEqual([]);
+  });
+
+  test("Q1 (#417): a non-string requestedBy is refused as missing", async () => {
+    const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy: 5 }) });
+    await consumePluginRequests(h.deps);
+    expect(h.warns.join("\n")).toContain("missing requestedBy");
+    expect(h.rejected).toEqual(["100-skip-1.json"]);
+    expect(h.mutations).toEqual([]);
+  });
+
+  test("Q2 (#480 item 4): a snowflake requestedBy must be an admin; panel identities and non-snowflakes pass", async () => {
+    const applied = async (requestedBy: string): Promise<boolean> => {
+      const h = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy }) });
+      await consumePluginRequests(h.deps);
+      if (h.rejected.length > 0) expect(h.warns.join("\n")).toContain("is not an admin");
+      return h.rejected.length === 0 && h.state.plugins[0]?.skippedVersion === "1.1.0";
+    };
+    expect(await applied(ADMIN)).toBe(true);
+    expect(await applied("300000000000000000")).toBe(false);
+    expect(await applied("1".repeat(17))).toBe(false);
+    expect(await applied("1".repeat(20))).toBe(false);
+    expect(await applied("email:me@x.com")).toBe(true);
+    expect(await applied("token")).toBe(true);
+    expect(await applied("1".repeat(16))).toBe(true);
+    expect(await applied("1".repeat(21))).toBe(true);
+    const direct = validate(
+      { action: "skip", plugin: "warbandeer", version: "1.1.0", requestedBy: ADMIN },
+      installedMap(["warbandeer", "1.0.0"]),
+      entryMap(entry("warbandeer", "1.1.0")),
+      1,
+      [],
+    );
+    expect(direct).toEqual({ ok: false, reason: `requestedBy ${ADMIN} is not an admin` });
+  });
+
+  test("Q3 (#480 item 5): requestedBy is stripped of control characters and clipped; an empty strip is missing", async () => {
+    const dirty = "me\n\t\r\x00\x7f\x1b[31mevil" + "x".repeat(300);
+    const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0", requestedBy: dirty }) });
+    await consumePluginRequests(h.deps);
+    const by = h.state.pendingReport?.userId ?? "";
+    expect(by).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(by.length).toBe(200);
+    const empty = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy: "\n\t" }) });
+    await consumePluginRequests(empty.deps);
+    expect(empty.warns.join("\n")).toContain("missing requestedBy");
+    expect(empty.rejected).toEqual(["100-skip-1.json"]);
+  });
+
+  test("Q3 (#480 item 5): a request file over 64 Ki characters is deleted unparsed, with one log line", async () => {
+    const huge = harness({ "100-skip-1.json": wb({ action: "skip", version: "1.1.0", requestedBy: "x".repeat(70_000) }) });
+    await consumePluginRequests(huge.deps);
+    expect(huge.fs.size).toBe(0);
+    expect(huge.rejected).toEqual([]);
+    expect(huge.warns).toHaveLength(1);
+    expect(huge.warns[0]).toMatch(/rejecting request .* too large \(70074 characters\)/);
+    expect(huge.mutations).toEqual([]);
+    expect(huge.indexLoads).toBe(0);
+    const junk = harness({});
+    junk.fs.set("100-x.json", "{ not json" + "x".repeat(70_000));
+    await consumePluginRequests(junk.deps);
+    expect(junk.fs.size).toBe(0);
+    expect(junk.warns).toHaveLength(1);
+    expect(junk.warns[0]).toContain("too large");
+    expect(junk.warns[0]).not.toContain("unreadable JSON");
+  });
+
+  test("Q3 (#480 item 5): a reason cannot forge a log line", async () => {
+    const h = harness({ "100-x.json": wb({ action: "nope\n\r\x1b\x7fforged", version: "1.1.0" }) });
+    await consumePluginRequests(h.deps);
+    expect(h.warns).toHaveLength(1);
+    expect(h.warns[0]).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(h.warns[0]!.split(String.fromCharCode(0xfffd)).length - 1).toBe(4);
+    expect(h.errors).toEqual([]);
+  });
+
+  test("Q4 (#480 item 6): a cancel in the same drain cancels the restart; a failed re-read restarts as before", async () => {
+    const h = harness({
+      "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }),
+      "200-cancel-1.json": wb({ action: "cancel" }),
+    });
+    await consumePluginRequests(h.deps);
+    expect(h.restarts).toEqual([]);
+    expect(h.state.plugins[0]?.targetVersion).toBeUndefined();
+    expect(h.state.pendingReport).toBeUndefined();
+    expect(h.fs.size).toBe(0);
+    expect(h.warns.filter((w) => w.includes("cancelled before the restart"))).toHaveLength(1);
+
+    // call 1 is the context load, call 2 the post-drain re-read
+    const broken = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) }, { readStateThrowsAfter: 2 });
+    await consumePluginRequests(broken.deps);
+    expect(broken.restarts).toHaveLength(1);
+    expect(broken.warns.filter((w) => w.includes("could not re-read"))).toHaveLength(1);
+  });
+
+  test("Q5 (#480 item 7): a replaced report-back is named in the log", async () => {
+    const h = harness(
+      {
+        "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }),
+        "200-update-now-1.json": wb({ action: "update-now", plugin: "other", version: "1.1.0" }),
+      },
+      { state: twoPlugins() },
+    );
+    await consumePluginRequests(h.deps);
+    expect(h.state.plugins.map((p) => p.targetVersion)).toEqual(["1.1.0", "1.1.0"]);
+    expect(h.state.pendingReport?.plugin).toBe("other");
+    const slot = h.warns.filter((w) => w.includes("one report slot"));
+    expect(slot).toHaveLength(1);
+    expect(slot[0]).toContain("warbandeer");
+    expect(slot[0]).toContain("other");
+    expect(h.restarts).toHaveLength(1);
+  });
+
+  test("Q6 (#480 item 8): an unreadable mailbox is logged once per error code, again after a recovery", async () => {
+    const eacces = Object.assign(new Error("EACCES"), { code: "EACCES" });
+    const h = harness({}, { readDirError: eacces });
+    await consumePluginRequests(h.deps);
+    expect(h.warns).toHaveLength(1);
+    expect(h.warns[0]).toContain("EACCES");
+    expect(h.warns[0]).toContain(REQ_DIR);
+    expect(pluginRequestsStateForTest().readdirFailure).toBe(true);
+    await consumePluginRequests(h.deps);
+    expect(h.warns).toHaveLength(1);
+    resetPluginRequestsForTest();
+    expect(pluginRequestsStateForTest().readdirFailure).toBe(false);
+
+    const missing = harness({}, { readDirError: Object.assign(new Error("ENOENT"), { code: "ENOENT" }) });
+    await consumePluginRequests(missing.deps);
+    expect(missing.warns).toEqual([]);
+
+    // a readDir that succeeds re-arms the warning
+    let failing = true;
+    const flaky = harness({});
+    const readDir = flaky.deps.readDir;
+    flaky.deps.readDir = async (dir) => {
+      if (failing) throw eacces;
+      return readDir(dir);
+    };
+    await consumePluginRequests(flaky.deps);
+    failing = false;
+    await consumePluginRequests(flaky.deps);
+    failing = true;
+    await consumePluginRequests(flaky.deps);
+    expect(flaky.warns).toHaveLength(2);
   });
 
   test("a malformed / invalid file is quarantined to rejected/, never thrown, others still apply", async () => {
@@ -800,7 +1003,7 @@ describe("consumePluginRequests drain", () => {
         };
         for (const [field, raw] of Object.entries(cases)) {
           let result: ReturnType<typeof validate> | undefined;
-          expect(() => (result = validate(raw, installed, entries, 1)), `${kind} ${field}`).not.toThrow();
+          expect(() => (result = validate(raw, installed, entries, 1, [])), `${kind} ${field}`).not.toThrow();
           expect(result?.ok, `${kind} ${field}`).toBe(false);
           // Named, not printed: the reason stays short however deep the value was.
           expect(result && !result.ok && result.reason.length, `${kind} ${field}`).toBeLessThan(80);
@@ -812,7 +1015,7 @@ describe("consumePluginRequests drain", () => {
       const installed = installedMap(["warbandeer", "1.0.0"]);
       const entries = entryMap(entry("warbandeer", "1.1.0"));
       const why = (raw: object) => {
-        const v = validate(raw, installed, entries, 1);
+        const v = validate(raw, installed, entries, 1, []);
         return v.ok ? undefined : v.reason;
       };
       expect(why({ action: "nope", plugin: "warbandeer", requestedBy: "t" })).toContain("unknown action");
@@ -1724,6 +1927,14 @@ describe("consumePluginRequests drain", () => {
       await consumePluginRequests(h.deps);
       expect(r.routing.results).toEqual([]);
       expect(r.calls).toEqual([]);
+    });
+
+    test("Q7 (#481 item 9): an update-now carrying an id still records no result", async () => {
+      const r = routingFake();
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0", id: ID }) }, { routing: r.deps });
+      await consumePluginRequests(h.deps);
+      expect(r.routing.results).toEqual([]);
+      expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
     });
 
     test("two routing requests arriving together are applied one after the other, never interleaved", async () => {

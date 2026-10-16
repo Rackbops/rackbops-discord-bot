@@ -115,9 +115,10 @@ export async function pluginHostLeaks(s: {
 }
 
 /** Against what `resetPluginRequestsForTest()` and `resetPluginRequestDrainForTest()` leave. */
-export async function pluginRequestLeaks(s: { undeletable: number; draining: Promise<void> }): Promise<string[]> {
+export async function pluginRequestLeaks(s: { undeletable: number; draining: Promise<void>; readdirFailure: boolean }): Promise<string[]> {
   const leaks: string[] = [];
   if (s.undeletable !== 0) leaks.push(`${s.undeletable} request file(s) remembered as undeletable — a later drain skips them`);
+  if (s.readdirFailure) leaks.push("a request-mailbox readdir failure remembered — the next one is not logged");
   if (!(await settled(s.draining))) leaks.push("a request drain still running — the next drain queues behind it");
   return leaks;
 }

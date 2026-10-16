@@ -253,9 +253,12 @@ describe("pluginHostLeaks", () => {
 });
 
 describe("pluginRequestLeaks", () => {
-  const CLEAN = { undeletable: 0, draining: DONE };
+  const CLEAN = { undeletable: 0, draining: DONE, readdirFailure: false };
   test("a clean state has no leaks", async () => {
     expect(await pluginRequestLeaks(CLEAN)).toEqual([]);
+  });
+  test("names a remembered readdir failure", async () => {
+    expect(await pluginRequestLeaks({ ...CLEAN, readdirFailure: true })).toEqual([expect.stringContaining("readdir failure remembered")]);
   });
   test("names remembered undeletable files", async () => {
     expect(await pluginRequestLeaks({ ...CLEAN, undeletable: 2 })).toEqual([expect.stringContaining("2 request file(s)")]);
@@ -264,7 +267,7 @@ describe("pluginRequestLeaks", () => {
     expect(await pluginRequestLeaks({ ...CLEAN, draining: NEVER })).toEqual([expect.stringContaining("a request drain still running")]);
   });
   test("names every dirty field", async () => {
-    expect(await pluginRequestLeaks({ undeletable: 1, draining: NEVER })).toHaveLength(2);
+    expect(await pluginRequestLeaks({ undeletable: 1, draining: NEVER, readdirFailure: true })).toHaveLength(3);
   });
 });
 

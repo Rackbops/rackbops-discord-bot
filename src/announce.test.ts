@@ -54,6 +54,9 @@ describe("livePluginRequestDeps (#241)", () => {
       const deps = livePluginRequestDeps();
       // The mailbox is where it always was.
       expect(deps.requestsDir).toBe(join(DATA_DIR, "plugins", "requests"));
+      // #480 item 4: the admin gate reads the bot's own ADMIN_USER_IDS. Identity, not equality: the preload sets
+      // none, so `config.adminUserIds` is [] under test and `toEqual([])` would pass for a hard-coded [].
+      expect(deps.adminUserIds).toBe(config.adminUserIds);
       const routing = deps.routing;
       expect(routing).toBeDefined();
       // The two that are the live routing functions themselves...

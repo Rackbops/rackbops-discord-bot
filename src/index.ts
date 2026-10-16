@@ -26,6 +26,7 @@ import {
   onBeforeExit,
   onStopRequested,
   restartPending,
+  restartRequested,
   runExitHooks,
   withCritical,
 } from "./restart";
@@ -534,9 +535,10 @@ async function activate(c: Client<true>): Promise<void> {
   // while the bot was down is honoured before the pluginRequests/pluginUpdates ticks or a /plugins
   // command can interleave (those two ticks wait on the state-ready flag; the others, plugin ticks
   // included, already run from startScheduler), and the single-flight consumer never overlaps the
-  // first tick's drain. An update-now request restarts here
-  // (exit deferred by nothing at boot → immediate), applying on the next boot; anything queued after
-  // is drained by the pluginRequests tick. Swallows its own failures (never blocks startup).
+  // first tick's drain. An update-now request restarts here: at once when nothing is in flight, else
+  // deferred by the first tick's critical section (startScheduler fired the first tick synchronously
+  // above), applying on the next boot; anything queued after is drained by the pluginRequests tick.
+  // Swallows its own failures (never blocks startup).
   try {
     await consumePluginRequests(livePluginRequestDeps());
   } catch (err) {
@@ -554,18 +556,26 @@ async function activate(c: Client<true>): Promise<void> {
 
   // #104: and the owed /plugins-update follow-up. Not awaited for the same reason; clears its marker
   // through the shared mutator (the pluginUpdates tick is live now that markPluginStateReady fired).
-  reportPluginUpdateOutcome({
-    readState: () => readPluginState(DATA_DIR, storage),
-    mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
-    dmUser: async (userId, content) => {
-      const user = await client.users.fetch(userId);
-      await user.send(content);
-    },
-    postChannel: async (channelId, userId, content) => {
-      await sendToChannel(client, channelId, `<@${userId}> ${content}`, { allowedMentions: { users: [userId] } });
-    },
-    log: console,
-  }).catch((err) => console.error("[plugins] report-back", err));
+  // #419: the boot drain's update-now may have requested a restart that the first tick is still deferring. The
+  // report it wrote belongs to the boot AFTER that restart (the target is not installed yet); reporting it now would
+  // say "still on the old version" and consume it. The exit re-runs this whole boot. restartRequested, not
+  // restartPending: a handoff alone (the first tick's AUTO_UPDATE) can fail and leave this process owing the report.
+  if (restartRequested()) {
+    console.log("[plugins] a restart is pending — the plugin update report-back waits for the next boot");
+  } else {
+    reportPluginUpdateOutcome({
+      readState: () => readPluginState(DATA_DIR, storage),
+      mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
+      dmUser: async (userId, content) => {
+        const user = await client.users.fetch(userId);
+        await user.send(content);
+      },
+      postChannel: async (channelId, userId, content) => {
+        await sendToChannel(client, channelId, `<@${userId}> ${content}`, { allowedMentions: { users: [userId] } });
+      },
+      log: console,
+    }).catch((err) => console.error("[plugins] report-back", err));
+  }
 }
 
 await client.login(config.discordToken);
