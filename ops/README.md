@@ -414,7 +414,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   original's name once its own start-up and first tick are through (#548), so `BOT_OPS_CONTAINER` still
   resolves and needs no change — for those seconds `status` and `logs` show the stopped original under the
   canonical name and the live bot is `<name>-next`; a build that crashes in that window is rolled back with
-  `docker start <name>`, which makes the new container step aside.
+  `docker stop <name>-next` and then `docker start <name>` (README.md, "The original is stopped at the
+  handoff but kept…", has the caveats; a `recreate` or `env-set` landing in that window is not a rollback).
 
 ## Enabling a panel + choosing a bot (debug/prod)
 

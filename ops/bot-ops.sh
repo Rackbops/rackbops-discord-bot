@@ -371,12 +371,13 @@ declare -A RESERVED_KEYS=(
 # refuse only while "-next" exists AND the canonical name still resolves to a RUNNING container. A
 # gap remains between that stop and the end of that probation (seconds to a minute, no longer
 # milliseconds) where this allows through, because the canonical name is the stopped original then;
-# the guard's LOGIC is untouched here (S3b-1 makes it refuse while a RUNNING "-next" exists). In that
-# gap :latest still names the OLD image (tagLatest now runs AFTER the stop, in completeTakeOver), so a
-# recreate landing there starts the old build beside the live replacement; the replacement finds the
-# original running when probation ends (completeTakeOver, or its next boot's detectRollback) and
-# steps aside, so the overlap is bounded by the probation instead of persisting as a split-brain —
-# the same class of accepted residual risk as issue #51's own item 1.
+# the guard's LOGIC is untouched here (#490 item 2 makes it refuse while a RUNNING "-next" exists). In
+# that gap :latest still names the OLD image (tagLatest now runs AFTER the stop, in completeTakeOver),
+# so a `recreate`/`env-set` landing there starts a NEW container (a new id, which the replacement's
+# HANDOFF_FROM no longer names) on the old build beside the live replacement: two live bots, and
+# nothing steps aside — the same outcome as the window above, now seconds to a minute wide until that
+# follow-up lands. Only the operator's `docker start <name>` (the same container id) is a case the
+# replacement notices and steps aside for.
 #
 # Formerly a known, DECLINED residual risk (tracked on #85, now HANDLED by #160, not by this
 # guard): retireOriginal's own stopContainer call on a genuine first attempt used to be unguarded
