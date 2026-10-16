@@ -26,6 +26,7 @@ const {
   livePluginRequestDeps,
   livePluginUpdateDeps,
   PLUGIN_REQUESTS_TICK_WAIT_MS,
+  RELEASE_NAME_MAX,
   startScheduler,
   TICK_MS,
   TICK_WATCHDOG_MS,
@@ -35,7 +36,7 @@ const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routin
 const { DATA_DIR } = await import("./storage");
 const { writeDiscovery } = await import("./routing/discovery");
 const { rmSync: removePath } = await import("node:fs");
-const { state } = await import("./state");
+const { state, saveState } = await import("./state");
 const { requestRestart, setExitFn, resetForTest: resetRestartForTest, RESTART_EXIT_CODE } = await import("./restart");
 
 describe("livePluginRequestDeps (#241)", () => {
@@ -502,18 +503,40 @@ describe("checkReleases (#342)", () => {
     }
   });
 
-  // #437: the unreachable path leaves the repo's seen-id list as it was, so when the repo answers again the
-  // releases it published meanwhile ARE announced (oldest first) -- only a repo with no list seeds silently.
-  test("a repo that was unreachable announces what was published meanwhile once it answers again (#437)", async () => {
-    const repo = "rackbops/came-back-probe";
+  // #437, #499: a fake Client whose channel records what is posted, and the shape GitHub's releases API answers.
+  const gh = (id: number, over: Record<string, unknown> = {}) => ({
+    id,
+    name: `v${id}`,
+    tag_name: `v${id}`,
+    html_url: `https://example.test/r/${id}`,
+    draft: false,
+    prerelease: false,
+    ...over,
+  });
+  const recordingClient = () => {
     const sent: string[] = [];
     const fakeClient = {
       channels: { fetch: async () => ({ isSendable: () => true, send: async (m: string) => void sent.push(m) }) },
     } as unknown as Client;
-    const gh = (id: number) => ({ id, name: `v${id}`, tag_name: `v${id}`, html_url: `https://example.test/r/${id}`, draft: false, prerelease: false });
+    return { fakeClient, sent };
+  };
+
+  // #437: the unreachable path leaves the repo's seen-id list as it was, so when the repo answers again the
+  // releases it published meanwhile ARE announced (oldest first) -- only a repo with no list seeds silently.
+  // #499 item 4: and the per-repo request carries the bot's GitHub headers, and "lost"/"recovered" are logged once each.
+  test("a repo that was unreachable announces what was published meanwhile once it answers again (#437, #499)", async () => {
+    const repo = "rackbops/came-back-probe";
+    const { fakeClient, sent } = recordingClient();
     let answer = () => new Response("not found", { status: 404 });
-    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => answer()) as unknown as typeof fetch);
-    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    const inits: (RequestInit | undefined)[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async (_url: unknown, init?: RequestInit) => {
+      inits.push(init);
+      return answer();
+    }) as unknown as typeof fetch);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const realToken = config.githubToken;
+    config.githubToken = "t-l2-probe";
     state.seenReleaseIds[repo] = [1, 2];
     try {
       await checkReleases(fakeClient, [repo]); // unreachable: skipped, list untouched, nothing posted
@@ -524,15 +547,226 @@ describe("checkReleases (#342)", () => {
       await checkReleases(fakeClient, [repo]); // back: 3 and 4 were published meanwhile -> announced, oldest first
       expect(sent).toEqual(["📦 New release: **v3**\nhttps://example.test/r/3", "📦 New release: **v4**\nhttps://example.test/r/4"]);
       expect(state.seenReleaseIds[repo]).toEqual([1, 2, 3, 4]); // recorded id by id through the real persist callback
+      // ...and saved: the docs rest on "each id is persisted right after its post", so read the file back.
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "state.json"), "utf8")).seenReleaseIds[repo]).toEqual([1, 2, 3, 4]);
       // The "at most the newest 15" in the comment and CONTEXT.md is this request's page size, so pin it.
       const urls = fetchSpy.mock.calls.map(([url]) => String(url));
       expect(urls).toHaveLength(2);
       for (const url of urls) expect(url).toBe(`https://api.github.com/repos/${repo}/releases?per_page=15`);
+      // #499 item 4: the request carries the bot's GitHub headers (a private repo 404s without the token, quietly).
+      expect(inits).toHaveLength(2);
+      for (const init of inits) {
+        expect(init?.headers).toEqual({
+          Accept: "application/vnd.github+json",
+          "User-Agent": "rackbops-discord-bot",
+          Authorization: "Bearer t-l2-probe",
+        });
+      }
+      // And the two edges are logged once each: `announceTo` also logs `[announce]` lines through the same spy.
+      expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith("[release]"))).toEqual([
+        `[release] ${repo} is unreachable (missing, or GITHUB_TOKEN cannot see it) — skipping it quietly until it answers again`,
+      ]);
+      expect(logSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith("[release]"))).toEqual([
+        `[release] ${repo} is reachable again`,
+      ]);
     } finally {
+      config.githubToken = realToken;
       delete state.seenReleaseIds[repo]; // `state` is the shared singleton (dataIsolation.test.ts does the same)
+      await saveState(); // and the file, which the test above wrote this repo into
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  // #499 item 5: one page per poll. A whole page of releases that are all new, on a repo we have polled before, means
+  // older ones may exist that were never fetched; the poll says so. Four things pinned here: it warns at a full page,
+  // not at 14; not on a first poll (the seed); not when any release on the page is already seen.
+  test("a whole page of new releases on a repo polled before warns that older ones may not have been fetched (#499)", async () => {
+    const repo = "rackbops/page-probe";
+    const { fakeClient, sent } = recordingClient();
+    let answer: unknown[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify(answer), { status: 200 })) as unknown as typeof fetch);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const pageWarnings = () =>
+      warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith(`[release] ${repo}: every one of the`));
+    const page = (from: number, count: number) => Array.from({ length: count }, (_, i) => gh(from - i));
+    try {
+      // 15 releases (ids 17..3), none seen: one warning, and all 15 are still announced.
+      state.seenReleaseIds[repo] = [1];
+      answer = page(17, 15);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toEqual([
+        `[release] ${repo}: every one of the 15 releases on the page is new — anything older may not have been fetched and will not be announced`,
+      ]);
+      expect(sent).toHaveLength(15);
+
+      // A repo seeded with zero releases keeps a DEFINED empty list (decideReleaseAnnouncements): a full page of new
+      // releases on it warns like any other. (A `seen.length > 0` guard would have exempted it.)
+      warnSpy.mockClear();
+      sent.length = 0;
+      state.seenReleaseIds[repo] = [];
+      answer = page(300, 15);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toHaveLength(1);
+
+      // A fresh case, not a continuation: 14 new releases with ids not used above, against a re-seeded list. A page one
+      // short of full is not a full page (reusing ids 17..4 against the list the case above left would pass with the
+      // `>= RELEASES_PER_PAGE - 1` mutant alive).
+      warnSpy.mockClear();
+      sent.length = 0;
+      state.seenReleaseIds[repo] = [1];
+      answer = page(100, 14);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toEqual([]);
+      expect(sent).toHaveLength(14);
+
+      // A first poll (no list yet) of a full page seeds silently: no warning, nothing announced, the 15 ids recorded.
+      // `console.error` must stay silent: without the `seen !== undefined` guard the `seen.includes` below throws a
+      // TypeError, which checkReleases' per-repo catch swallows -- "no warning" alone would pass that.
+      warnSpy.mockClear();
+      errorSpy.mockClear();
+      sent.length = 0;
+      delete state.seenReleaseIds[repo];
+      answer = page(50, 15);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toEqual([]);
+      expect(sent).toEqual([]);
+      expect(errorSpy).not.toHaveBeenCalled();
+      expect(state.seenReleaseIds[repo]).toEqual(page(50, 15).map((r) => r.id));
+
+      // A full page that is not all new: every id seen, or just one of them. Without the `every(...)` guard a healthy
+      // repo with 15 releases would warn on every poll.
+      warnSpy.mockClear();
+      state.seenReleaseIds[repo] = page(50, 15).map((r) => r.id);
+      answer = page(50, 15);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toEqual([]);
+      state.seenReleaseIds[repo] = [36];
+      answer = page(50, 15); // ids 50..36: id 36 is seen, the other 14 are new
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toEqual([]);
+      expect(fetchSpy).toHaveBeenCalled();
+    } finally {
+      delete state.seenReleaseIds[repo];
+      await saveState();
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  // The warning is logged before the posts, so a post that throws cannot lose it: moving it after
+  // commitReleaseAnnouncements would make a failing OLDEST post (the one that blocks the repo) suppress it for good.
+  test("the page warning is logged even when the first post fails (#499)", async () => {
+    const repo = "rackbops/page-fail-probe";
+    const failing = {
+      channels: { fetch: async () => ({ isSendable: () => true, send: async () => Promise.reject(new Error("Discord said no")) }) },
+    } as unknown as Client;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify(Array.from({ length: 15 }, (_, i) => gh(40 - i))), { status: 200 })) as unknown as typeof fetch);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    state.seenReleaseIds[repo] = [1];
+    try {
+      await checkReleases(failing, [repo]); // the per-repo catch absorbs the failed post
+      expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith(`[release] ${repo}: every one of the 15`))).toHaveLength(1);
+      expect(errorSpy).toHaveBeenCalled(); // the failed post was logged, not swallowed silently
+      expect(state.seenReleaseIds[repo]).toEqual([1]); // nothing was posted, so the list did not advance
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      delete state.seenReleaseIds[repo];
+      await saveState();
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  // The docs say a save that fails does not make the SAME process post a release twice: persist records the id in
+  // memory before saveState runs. Only a restart before a later save succeeds re-posts it. Swapping those two lines
+  // (save first, record after) would re-post the release on every poll while saves keep failing.
+  test("a save that fails does not make the same process re-post the release on the next poll (#499)", async () => {
+    const repo = "rackbops/save-fail-probe";
+    const { fakeClient, sent } = recordingClient();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify([gh(3), gh(2), gh(1)]), { status: 200 })) as unknown as typeof fetch);
+    const writeSpy = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    state.seenReleaseIds[repo] = [1];
+    try {
+      await checkReleases(fakeClient, [repo]); // posts v2; its save fails, which stops this poll and is logged
+      expect(sent).toEqual(["📦 New release: **v2**\nhttps://example.test/r/2"]);
+      expect(errorSpy).toHaveBeenCalled();
+      expect(state.seenReleaseIds[repo]).toEqual([1, 2]); // recorded in memory although the save failed
+      await checkReleases(fakeClient, [repo]); // the next poll posts v3 and NOT v2 again
+      expect(sent).toEqual(["📦 New release: **v2**\nhttps://example.test/r/2", "📦 New release: **v3**\nhttps://example.test/r/3"]);
+    } finally {
+      writeSpy.mockRestore();
+      delete state.seenReleaseIds[repo];
+      await saveState();
+      fetchSpy.mockRestore();
+      errorSpy.mockRestore();
+      for (const spy of quiet) spy.mockRestore();
+    }
+  });
+
+  // #499 item 6: a restart or shutdown pending mid-walk ends the walk between repos instead of racing the drain's grace
+  // through the ones left (the next walk -- the next boot's startup catch-up -- polls them). The complement, with no
+  // restart pending, is "calls checkRepo once per repo" above.
+  test("a restart pending mid-walk stops the walk between repos (#499)", async () => {
+    const exits: number[] = [];
+    const restoreExit = setExitFn((code) => void exits.push(code));
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    const calls: string[] = [];
+    try {
+      await checkReleases(client, ["a/b", "c/d", "e/f"], async (repo) => {
+        calls.push(repo);
+        if (repo === "a/b") requestRestart("mid-walk"); // critical depth 0: exits into the stub at once, stays pending
+      });
+      expect(calls).toEqual(["a/b"]);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+      expect(logSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith("[release]"))).toEqual([
+        "[release] a restart or shutdown is pending — stopping the walk before c/d",
+      ]);
+    } finally {
+      restoreExit();
+      logSpy.mockRestore();
+      resetRestartForTest();
+    }
+  });
+
+  // #499 items 7 and 8: a pre-release is announced as one (a separate final release posts again, as itself; one promoted in place keeps its id and does not), and the
+  // name is bounded, so one huge name cannot make every post for the repo fail and block the newer releases.
+  test("a pre-release is announced as one, and a long name is clamped (#499)", async () => {
+    const repo = "rackbops/pre-probe";
+    const { fakeClient, sent } = recordingClient();
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify([gh(2, { prerelease: true }), gh(1, { name: "x".repeat(600) })]), { status: 200 })) as unknown as typeof fetch);
+    const quiet = [spyOn(console, "warn").mockImplementation(() => {}), spyOn(console, "log").mockImplementation(() => {})];
+    state.seenReleaseIds[repo] = [];
+    try {
+      await checkReleases(fakeClient, [repo]);
+      expect(sent).toEqual([
+        `📦 New release: **${"x".repeat(RELEASE_NAME_MAX)}…**\nhttps://example.test/r/1`, // oldest first; 200 units and clampReply's suffix
+        "📦 New pre-release: **v2**\nhttps://example.test/r/2",
+      ]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      delete state.seenReleaseIds[repo];
+      await saveState();
       fetchSpy.mockRestore();
       for (const spy of quiet) spy.mockRestore();
     }
+  });
+
+  test("RELEASE_NAME_MAX is 200 units", () => {
+    expect(RELEASE_NAME_MAX).toBe(200);
   });
 });
 
@@ -1053,6 +1287,7 @@ describe("commitReleaseAnnouncements", () => {
     name: `v${id}`,
     tag: `v${id}`,
     url: `https://example.com/${id}`,
+    prerelease: false,
   });
 
   // The issue's literal acceptance bullet. `releases` is passed newest-first (GitHub's own API

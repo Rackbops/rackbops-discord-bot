@@ -17,7 +17,7 @@ export interface PendingUpdateReport {
   requestedAt: number; // ms epoch, so boot can tell a fresh restart from a week-old one
 }
 
-// Persisted so restarts never re-announce something already posted.
+// Persisted so a restart does not re-announce a release whose save landed (CONTEXT.md's Behavior section lists what can still repeat one).
 export interface BotState {
   // Seen release ids keyed by `owner/repo`, so watched repos never collide and each seeds
   // its "first poll is silent" backlog independently.
