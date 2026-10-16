@@ -273,6 +273,50 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
   });
 
+  // The other half of #509 item 3: a Bun.write that fails AFTER creating its temp file (a full disk
+  // leaves the partial file behind), which the rename-only case above never reaches.
+  test("a Bun.write that fails after creating its temp file leaves nothing behind", async () => {
+    const file = join(dir, "x.json");
+    const spy = spyOn(Bun, "write").mockImplementation((async (path: unknown) => {
+      writeFileSync(String(path), '{"half');
+      throw new Error("ENOSPC: no space left on device");
+    }) as never);
+    try {
+      await expect(writeJsonAtomic(file, { n: 1 })).rejects.toThrow(/ENOSPC/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  // The cleanup is best-effort: when it fails too (EBUSY/EPERM on Windows), the error worth throwing is
+  // the write's. A directory sits where the next write's temp file goes: Bun.write fails EISDIR and the
+  // cleanup's rmSync fails as well (ERR_FS_EISDIR -- removing a directory needs `recursive`). The next
+  // temp name is read off a stalled write first, since the counter is private to the module.
+  test("the cleanup's own failure does not mask the error that caused it", async () => {
+    const file = join(dir, "x.json");
+    const stall = stallBunWrite();
+    let next: number;
+    try {
+      void writeJsonAtomic(file, { n: 0 }).catch(() => {});
+      await stall.reached;
+      next = Number(String(stall.calls[0]![0]).match(/\.(\d+)\.tmp$/)![1]) + 1;
+    } finally {
+      stall.restore();
+    }
+    mkdirSync(`${file}.${process.pid}.${TMP_TOKEN}.${next}.tmp`);
+    await expect(writeJsonAtomic(file, { n: 1 })).rejects.toMatchObject({ code: "EISDIR" });
+  });
+
+  // classifyReadError calls a read that fails with EISDIR an error, which is only unreachable because
+  // Bun's exists() is false for a directory (probed on Windows); this keeps a Bun or platform that
+  // answers differently from turning a directory at the path into a boot-time crash loop unseen.
+  test("a directory where the file should be reads as absent", async () => {
+    const file = join(dir, "x.json");
+    mkdirSync(file);
+    expect(await readJsonOrFresh(file, () => ({ n: 0 }), "test")).toEqual({ n: 0 });
+  });
+
   test("100 concurrent saves through one writer leave a parseable, uncorrupted file", async () => {
     const file = join(dir, "x.json");
     const writer = createJsonWriter<{ n: number }>(file);

@@ -132,8 +132,12 @@ describe("isRawBotState (#509)", () => {
     ["a map of number lists", { seenReleaseIds: { "a/b": [1] } }, true],
     ["a key the core no longer defines", { attemptedUpdateToSha: "x" }, true],
     ["a map value of null", { seenReleaseIds: { "a/b": null } }, false],
+    ["a null seenReleaseIds (read as absent, as it always was)", { seenReleaseIds: null }, true],
     ["a string seenReleaseIds", { seenReleaseIds: "abc" }, false],
+    ["a number seenReleaseIds", { seenReleaseIds: 42 }, false],
+    ["a boolean seenReleaseIds", { seenReleaseIds: true }, false],
     ["a list of strings", { seenReleaseIds: ["1"] }, false],
+    ["a list of lists", { seenReleaseIds: [[1, 2]] }, false],
     ["null", null, false],
     ["a number", 42, false],
     ["a list", [], false],
@@ -187,6 +191,15 @@ describe("loadStateFrom / saveStateTo / createStateWriter", () => {
     } finally {
       errorSpy.mockRestore();
     }
+  });
+
+  // `null` loaded as an empty map before the shape check (the normalizer's `??`), and still does: the
+  // other keys, `attemptedUpdateToSha` among them, must not be moved aside with the file.
+  test("a null seenReleaseIds loads as an empty map and keeps the file's other keys", async () => {
+    const file = join(dir, "state.json");
+    writeFileSync(file, '{"seenReleaseIds":null,"attemptedUpdateToSha":"abc"}');
+    expect(await loadStateFrom(file)).toEqual({ seenReleaseIds: {}, attemptedUpdateToSha: "abc" });
+    expect(existsSync(file)).toBe(true);
   });
 
   // #457: only the pure normalizer was tested, so a wrong repo at the call site stayed green.

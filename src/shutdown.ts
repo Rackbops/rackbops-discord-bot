@@ -120,16 +120,16 @@ export function createShutdownHandler(deps: ShutdownDeps): (signal: string) => P
     }
     deps.log.log(`[shutdown] ${signal} received — draining in-flight work (up to ${deps.graceMs}ms)`);
     const startedAt = Date.now();
-    let drained = false;
+    let drained: boolean | undefined; // undefined: awaitIdle threw, and the line below has said so
     try {
       drained = await deps.awaitIdle(deps.graceMs);
     } catch (err) {
       deps.log.error("[shutdown] the drain failed (continuing to dispose and exit)", err);
     }
     const elapsedMs = Date.now() - startedAt;
-    if (drained) {
+    if (drained === true) {
       deps.log.log(`[shutdown] drained in ${elapsedMs}ms — exiting`);
-    } else {
+    } else if (drained === false) {
       deps.log.error(`[shutdown] grace elapsed after ${elapsedMs}ms — exiting with work still in flight`);
     }
     // #184: bound disposePlugins to whatever's left of graceMs after the drain, same nesting rule

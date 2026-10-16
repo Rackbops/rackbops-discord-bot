@@ -35,16 +35,19 @@ export interface BotState {
 
 const RELEASE_ID_CAP = 100;
 
-/** The raw shape `loadStateFrom` accepts: an object whose `seenReleaseIds`, when present, is a number list
- *  (the legacy single-repo form) or a map of number lists. Anything else — `null`, a number, a list, a
- *  map with a `null` or string value — would parse but break every later `saveState` (#509), so it is
- *  treated as corrupt. Other keys are not checked: they round-trip untouched. */
-export type RawBotState = Omit<BotState, "seenReleaseIds"> & { seenReleaseIds?: number[] | Record<string, number[]> };
+/** The raw shape `loadStateFrom` accepts: an object whose `seenReleaseIds` is absent (or `null`, which
+ *  `normalizeSeenReleaseIds`'s `??` has always read as absent), a number list (the legacy single-repo
+ *  form) or a map of number lists. Anything else — a root that is not an object, a number, a string, a
+ *  list of lists, a map with a `null` or string value — would parse but break every later `saveState`
+ *  (#509), so it is treated as corrupt. Other keys are not checked: they round-trip untouched. */
+export type RawBotState = Omit<BotState, "seenReleaseIds"> & {
+  seenReleaseIds?: number[] | Record<string, number[]> | null;
+};
 
 export function isRawBotState(raw: unknown): raw is RawBotState {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
   const ids = (raw as { seenReleaseIds?: unknown }).seenReleaseIds;
-  if (ids === undefined) return true;
+  if (ids === undefined || ids === null) return true; // absent; `null` is what `normalizeSeenReleaseIds`'s `??` has always read as absent
   if (isNumberList(ids)) return true;
   return typeof ids === "object" && ids !== null && !Array.isArray(ids) && Object.values(ids).every(isNumberList);
 }
@@ -81,7 +84,7 @@ export async function loadStateFrom(path: string): Promise<BotState> {
     moveCorruptAside(path, "state", "not a state object (seenReleaseIds must be a number list or a map of number lists)");
     return { seenReleaseIds: {} };
   }
-  return { ...raw, seenReleaseIds: normalizeSeenReleaseIds(raw.seenReleaseIds, config.githubRepo) };
+  return { ...raw, seenReleaseIds: normalizeSeenReleaseIds(raw.seenReleaseIds ?? undefined, config.githubRepo) };
 }
 
 /**

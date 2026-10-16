@@ -171,14 +171,14 @@ export function classifyReadError(err: unknown): "corrupt" | "absent" | "error" 
 /**
  * Reads and parses JSON at `path`, falling back to `fresh()` for an absent file (the common
  * fresh-install case). A file that **parsed badly** (empty, truncated, not JSON — a process killed
- * mid-write before #154's temp+rename, or a hand edit; temp+rename covers an OOM-kill, a SIGKILL or a
+ * mid-write before temp+rename (#68), or a hand edit; temp+rename covers an OOM-kill, a SIGKILL or a
  * crash, but there is no `fsync`, so a host power loss is outside it, #510) is logged and moved aside
  * to `<path>.corrupt-<timestamp>` rather than thrown, so a bad file degrades to "this one file's
- * history lost once" instead of crashing whatever awaited it at import. A read that fails for any other
- * reason (EACCES, EIO, ...) is logged and **rethrown**: returning fresh would let the next write
- * overwrite a file that may be intact, and moving it aside would hide an environment fault (#509). That
- * reaches every caller, the installed plugins' `HostStorage.readJsonOrFresh` included. `label` names
- * which file this is, in the log line.
+ * history lost once" instead of crashing whatever awaited it at import. Once the file is known to
+ * exist, a read that fails for any other reason (EACCES, EIO, ...) is logged and **rethrown**:
+ * returning fresh would let the next write overwrite a file that may be intact, and moving it aside
+ * would hide an environment fault (#509). That reaches every caller, the installed plugins'
+ * `HostStorage.readJsonOrFresh` included. `label` names which file this is, in the log line.
  */
 export async function readJsonOrFresh<T>(path: string, fresh: () => T, label: string): Promise<T> {
   const file = Bun.file(path);
@@ -230,9 +230,9 @@ export function createJsonWriter<T>(path: string): { save: (data: T) => Promise<
  * its own queue (a `Map`, populated lazily and emptied as queues settle, #511), so unrelated
  * files' updates never wait on each other; two updates to the SAME path are fully ordered, so the
  * second's `mutate` always sees the first's result, never a stale read. This is what
- * `characters.ts` needs and `createJsonWriter`
- * alone doesn't provide: one Discord User's file can receive two pushes (two different Account
- * Labels, or a retry) close enough together that a naive read-then-write loses one of them.
+ * `characters.ts` needs and `createJsonWriter` alone doesn't provide: one Discord User's file can
+ * receive two pushes (two different Account Labels, or a retry) close enough together that a naive
+ * read-then-write loses one of them.
  */
 export function createKeyedJsonMutator<T>(): {
   update: (path: string, fresh: () => T, mutate: (current: T) => T, label: string) => Promise<void>;

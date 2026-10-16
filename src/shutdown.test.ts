@@ -158,7 +158,9 @@ describe("createShutdownHandler (#154)", () => {
     expect(h.order).toEqual(["disposePlugins", "destroyClient", "exit"]);
     expect(h.exits).toEqual([0]);
     expect(h.errors.some((e) => typeof e === "string" && e.includes("the drain failed"))).toBe(true);
-    expect(h.logs.some((l) => l.includes("drained in"))).toBe(false); // a drain that threw did not succeed
+    // A drain that threw neither drained nor ran out of grace: neither of those two lines may be said.
+    expect(h.logs.some((l) => l.includes("drained in"))).toBe(false);
+    expect(h.errors.some((e) => typeof e === "string" && e.includes("grace elapsed"))).toBe(false);
   });
 
   test("a throwing beginShutdown is logged, and the drain still runs before exit", async () => {
