@@ -37,6 +37,7 @@ export function restartStateLeaks(s: RestartStateForTest): string[] {
   if (s.idleWaiters !== 0) leaks.push(`${s.idleWaiters} awaitCriticalIdle waiter(s) never resolved`);
   if (s.stopListeners !== 0) leaks.push(`${s.stopListeners} onStopRequested listener(s) still registered`);
   if (s.stopNotified) leaks.push("stop already notified — a later onStopRequested listener would never run");
+  if (s.deferralArmed) leaks.push("a restart deferral deadline still armed — it would exit the process when it fires");
   return leaks;
 }
 

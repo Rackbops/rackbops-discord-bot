@@ -491,7 +491,7 @@ describe("takeOver", () => {
 // describe below.
 describe("takeOver — real daemon calls (the ordering guard for the whole hazard, #160)", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const ORIGINAL_ID = "e".repeat(64);
   let calls: { path: string; method: string; body?: string }[] = [];
 
@@ -606,7 +606,7 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
 // sole live bot).
 describe("retireOriginal", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const ORIGINAL_ID = "d".repeat(64);
   let calls: { path: string; method: string }[] = [];
 
@@ -751,7 +751,7 @@ describe("retireOriginal", () => {
 // docker.test.ts/update.test.ts, rather than mocking the docker/handoff modules directly.
 describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const REPLACEMENT_ID = "c".repeat(64);
   let calls: { path: string; method: string; url: string; body?: string }[] = [];
   // `restartPending()` sampled at the moment of each daemon call the fix's timing hinges on.

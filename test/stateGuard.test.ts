@@ -56,6 +56,7 @@ const CLEAN_RESTART: RestartStateForTest = {
   idleWaiters: 0,
   stopListeners: 0,
   stopNotified: false,
+  deferralArmed: false,
 };
 
 describe("restartStateLeaks", () => {
@@ -72,6 +73,7 @@ describe("restartStateLeaks", () => {
     ["idleWaiters", { idleWaiters: 1 }, "1 awaitCriticalIdle waiter(s)"],
     ["stopListeners", { stopListeners: 3 }, "3 onStopRequested listener(s)"],
     ["stopNotified", { stopNotified: true }, "stop already notified"],
+    ["deferralArmed", { deferralArmed: true }, "restart deferral deadline still armed"],
   ];
   for (const [field, dirty, expected] of rows) {
     test(`names ${field} when only it is dirty`, () => {
@@ -96,8 +98,9 @@ describe("restartStateLeaks", () => {
       idleWaiters: 1,
       stopListeners: 1,
       stopNotified: true,
+      deferralArmed: true,
     };
-    expect(restartStateLeaks(allDirty)).toHaveLength(7);
+    expect(restartStateLeaks(allDirty)).toHaveLength(8);
   });
 });
 
