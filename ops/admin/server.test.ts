@@ -7323,7 +7323,7 @@ describe("planApply with secrets (#244)", () => {
 
 describe("validateSecretChanges (#244)", () => {
   const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
-  const labelOf = (key: string) => "Spotify client secret";
+  const labelOf = (_key: string) => "Spotify client secret";
 
   test("a secret that fails its format is reported by label, and the message does not contain the value", () => {
     const bad = validateSecretChanges(schema, [{ key: "SPOTIFY_CLIENT_SECRET", before: "", now: "short!!", secret: true }], labelOf);
@@ -11085,7 +11085,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   test("a change made while a request is in flight is held and sent once when the result lands", async () => {
     let live = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
     let n = 0;
-    const apiImpl = async (path: string, init?: { method?: string }) => {
+    const apiImpl = async (_path: string, init?: { method?: string }) => {
       if (init && init.method === "POST") {
         n++;
         const id = "req" + n;

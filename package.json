@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "packageManager": "bun@1.4.2",
-  "description": "Discord bot: DMF/reset timers, server-up announcements, addon release notifications",
+  "description": "Discord bot: a plugin host with GitHub release announcements and in-place self-update",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
