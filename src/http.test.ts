@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { connect } from "node:net";
 import { startHostHttp } from "./http";
 import { createTrustedProxy, type TrustedProxy } from "./net/clientIp";
 
@@ -178,19 +179,71 @@ describe("startHostHttp (#220)", () => {
     }
   });
 
-  test("after stop(), a request on an already-open (kept-alive) connection gets a 503, not the handler", async () => {
+  // #494 item 12: over ONE raw keep-alive socket (node:net), so the second request provably rides the same
+  // connection -- `fetch` may open a fresh one, and then the old test passed without ever reaching the 503.
+  // What Bun does with an idle kept-alive socket on `server.stop()` is platform-dependent: on Windows (Bun
+  // 1.4.2) it closes the socket itself, so the `closing` branch in http.ts is not reached through a
+  // kept-alive connection there; the outcome on Linux is whatever the CI log line below says. On every
+  // platform the guarantee that matters holds and is asserted: the handler never runs again, and the
+  // connection ends in exactly one of two ways -- a 503 with `Connection: close`, or closed with no bytes --
+  // never hung (what cloudflared would see) and never served.
+  test("after stop(), a request on the SAME kept-alive connection is answered 503 + Connection: close or the socket is closed -- never served, never hung", async () => {
     let called = 0;
     const http = startHostHttp({
       port: 0, maxBodyBytes: 1024, handle: async () => { called += 1; return new Response("ok"); }, log: quiet,
       proxy: untrusted(),
     });
-    const first = await fetch(`http://127.0.0.1:${http.port}/x`); // opens a keep-alive connection
-    await first.text();
-    http.stop();
-    const second = await fetch(`http://127.0.0.1:${http.port}/x`).catch(() => undefined);
-    // Either the reused connection is answered 503, or the socket is already gone; the handler never runs again.
-    if (second !== undefined) expect(second.status).toBe(503);
-    expect(called).toBe(1);
+    const socket = connect({ host: "127.0.0.1", port: http.port });
+    let received = "";
+    let ended = false;
+    const watchers = new Set<() => void>();
+    const poke = () => { for (const w of [...watchers]) w(); };
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk: string) => { received += chunk; poke(); });
+    for (const event of ["close", "end", "error"]) socket.on(event, () => { ended = true; poke(); });
+    const request = (path: string) =>
+      `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n`;
+    // Headers and the whole `Content-Length` body have arrived.
+    const complete = (): boolean => {
+      const end = received.indexOf("\r\n\r\n");
+      if (end === -1) return false;
+      const length = Number(/content-length:\s*(\d+)/i.exec(received.slice(0, end))?.[1] ?? "0");
+      return received.length >= end + 4 + length;
+    };
+    const waitFor = (ready: () => boolean, ms: number): Promise<"ready" | "ended" | "timeout"> =>
+      new Promise((resolve) => {
+        const finish = (outcome: "ready" | "ended" | "timeout") => { clearTimeout(timer); watchers.delete(check); resolve(outcome); };
+        const check = () => { if (ready()) finish("ready"); else if (ended) finish("ended"); };
+        const timer = setTimeout(() => finish("timeout"), ms);
+        watchers.add(check);
+        check();
+      });
+    try {
+      await new Promise<void>((resolve, reject) => { socket.once("connect", () => resolve()); socket.once("error", reject); });
+      socket.write(request("/x"));
+      expect(await waitFor(complete, 2000)).toBe("ready");
+      expect(received.startsWith("HTTP/1.1 200")).toBe(true);
+      expect(called).toBe(1);
+
+      http.stop();
+      received = "";
+      socket.write(request("/y")); // the same socket, after stop()
+      const outcome = await waitFor(complete, 2000);
+      console.log(`[http.test] after stop() on a kept-alive socket (${process.platform}): ${outcome === "ready" ? `answered ${received.split("\r\n")[0]}` : outcome === "ended" ? `socket closed, ${received.length} bytes` : "NO ANSWER"}`);
+      // Mutation: a stop() that leaves the handler live makes `called` 2 here; deleting `if (closing)` in
+      // http.ts is invisible on a platform that closes the socket itself (see above) and red on one that does not.
+      expect(outcome).not.toBe("timeout");
+      expect(called).toBe(1);
+      if (outcome === "ready") {
+        expect(received.startsWith("HTTP/1.1 503")).toBe(true);
+        expect(received.toLowerCase()).toContain("connection: close");
+      } else {
+        expect(received).toBe("");
+      }
+    } finally {
+      socket.destroy();
+      http.stop();
+    }
   });
 
   test("stop() closes the listener", async () => {

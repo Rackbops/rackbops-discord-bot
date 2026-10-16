@@ -3,7 +3,7 @@
 // Bun.serve wiring end to end; these pin the pure decision logic itself, one case at a time, with a
 // fake DNS lookup and a fake clock so nothing here touches a real resolver or a real timer.
 import { describe, expect, test } from "bun:test";
-import { clientIpFrom, createTrustedProxy } from "./clientIp";
+import { canonicalAddress, clientIpFrom, createTrustedProxy, PROXY_BOOT_REFRESH_TIMEOUT_MS } from "./clientIp";
 
 function fakeRequest(headers: Record<string, string> = {}): Request {
   return new Request("http://test.invalid/", { headers });
@@ -107,6 +107,164 @@ describe("createTrustedProxy / isTrusted", () => {
     now = 60_000;
     await proxy.refresh(); // an explicit refresh call still surfaces no throw
     expect(proxy.isTrusted("10.0.0.5")).toBe(true); // old set kept, not cleared
+  });
+});
+
+// #494 item 9: one spelling per IPv6 literal, so an operator's `FD00::1` or `fd00:0:0:0:0:0:0:1` equals the
+// compressed lowercase form Bun's `srv.requestIP` reports.
+describe("canonicalAddress", () => {
+  test("maps every spelling of an address to one form", () => {
+    const table: Array<[string, string]> = [
+      ["::ffff:10.0.0.5", "10.0.0.5"], // Bun's dual-stack notation for an IPv4 peer
+      ["::ffff:a00:5", "10.0.0.5"], // the same address typed in hex
+      ["0:0:0:0:0:ffff:10.0.0.5", "10.0.0.5"], // ... or in long form with a dotted tail
+      ["FD00:0:0:0:0:0:0:1", "fd00::1"],
+      ["2001:DB8::0001", "2001:db8::1"],
+      ["64:ff9b::1.2.3.4", "64:ff9b::102:304"], // an embedded IPv4 tail comes out in hex
+      ["FE80::1%ETH0", "fe80::1%eth0"], // a zone id the URL parser refuses: left as typed, lowercased
+      ["10.0.0.5", "10.0.0.5"],
+      ["cloudflared", "cloudflared"],
+    ];
+    for (const [input, expected] of table) expect(canonicalAddress(input)).toBe(expected);
+  });
+});
+
+describe("createTrustedProxy -- IPv6 spellings (#494)", () => {
+  test("an IPv6 literal matches whatever spelling either side uses", async () => {
+    const longForm = createTrustedProxy({ host: "cloudflared", lookup: async () => ["FD00:0:0:0:0:0:0:1"] });
+    await longForm.refresh();
+    expect(longForm.isTrusted("fd00::1")).toBe(true);
+    expect(longForm.isTrusted("fd00::2")).toBe(false);
+
+    const compressed = createTrustedProxy({ host: "cloudflared", lookup: async () => ["fd00::1"] });
+    await compressed.refresh();
+    expect(compressed.isTrusted("FD00:0:0:0:0:0:0:1")).toBe(true);
+
+    const mappedHex = createTrustedProxy({ host: "cloudflared", lookup: async () => ["::ffff:a00:5"] });
+    await mappedHex.refresh();
+    expect(mappedHex.isTrusted("::ffff:10.0.0.5")).toBe(true);
+    expect(mappedHex.isTrusted("10.0.0.5")).toBe(true);
+  });
+});
+
+// #493 items 4 and 5: a failed lookup is retried soon, logged once per streak, and the boot wait is bounded.
+describe("createTrustedProxy -- failures, logging and the boot bound (#493)", () => {
+  const settle = () => Bun.sleep(0);
+
+  test("a failed lookup is retried after the retry window on the next miss, and a success re-arms the full throttle", async () => {
+    let calls = 0;
+    let now = 0;
+    let fail = true;
+    const proxy = createTrustedProxy({
+      host: "cloudflared",
+      lookup: async () => {
+        calls += 1;
+        if (fail) throw new Error("ENOTFOUND");
+        return ["10.0.0.5"];
+      },
+      now: () => now,
+    });
+    await proxy.refresh(); // t=0: fails
+    expect(calls).toBe(1);
+
+    now = 4_999;
+    proxy.isTrusted("10.0.0.99");
+    await settle();
+    expect(calls).toBe(1); // still inside the retry window
+
+    fail = false;
+    now = 5_000;
+    proxy.isTrusted("10.0.0.99"); // Mutation: the retry window equal to the 60 s throttle leaves this at 1.
+    await settle();
+    expect(calls).toBe(2);
+    expect(proxy.isTrusted("10.0.0.5")).toBe(true);
+
+    for (const t of [5_001, 64_999]) {
+      now = t;
+      proxy.isTrusted("10.0.0.99");
+      await settle();
+      expect(calls).toBe(2); // the success re-armed the full 60 s window (from t=5000)
+    }
+    now = 65_000;
+    proxy.isTrusted("10.0.0.99");
+    await settle();
+    expect(calls).toBe(3);
+  });
+
+  test("a failure is warned once per streak, and the recovery logged once", async () => {
+    const outcomes = ["ok", "fail", "fail", "ok", "ok"];
+    const logs: string[] = [];
+    const warns: string[] = [];
+    const proxy = createTrustedProxy({
+      host: "cloudflared",
+      lookup: async () => {
+        if (outcomes.shift() === "fail") throw new Error("ENOTFOUND");
+        return ["10.0.0.5"];
+      },
+      log: { log: (m: string) => logs.push(m), warn: (m: string) => warns.push(m) },
+    });
+    await proxy.refresh();
+    expect([logs.length, warns.length]).toEqual([1, 0]);
+    expect(logs[0]).toContain('TRUSTED_PROXY_HOST "cloudflared" resolved to 1 address(es)');
+    await proxy.refresh();
+    await proxy.refresh();
+    expect([logs.length, warns.length]).toEqual([1, 1]); // Mutation: no `failing` flag warns on the second failure too.
+    expect(warns[0]).toContain("did not resolve");
+    expect(warns[0]).toContain("ENOTFOUND");
+    await proxy.refresh();
+    expect([logs.length, warns.length]).toEqual([2, 1]); // the recovery is said once
+    expect(logs[1]).toContain("resolved to 1 address(es)");
+    await proxy.refresh();
+    expect([logs.length, warns.length]).toEqual([2, 1]); // a steady success is silent
+  });
+
+  test("the first successful resolve is logged", async () => {
+    const logs: string[] = [];
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5", "10.0.0.6"], log: { log: (m: string) => logs.push(m), warn: () => {} } });
+    await proxy.refresh();
+    expect(logs).toEqual(['[http] TRUSTED_PROXY_HOST "cloudflared" resolved to 2 address(es)']);
+  });
+
+  const slowLookup = (ms: number, calls: { n: number }) => () => {
+    calls.n += 1;
+    return new Promise<string[]>((resolve) => setTimeout(() => resolve(["10.0.0.5"]), ms));
+  };
+
+  test("refresh(timeoutMs) resolves at the bound when the lookup is slow, warns, and the lookup still lands", async () => {
+    const warns: string[] = [];
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: slowLookup(500, { n: 0 }), log: { log: () => {}, warn: (m: string) => warns.push(m) } });
+    const started = performance.now();
+    await proxy.refresh(50);
+    // Mutation: a refresh that ignores its bound waits the full 500 ms.
+    expect(performance.now() - started).toBeLessThan(400);
+    expect(proxy.isTrusted("10.0.0.5")).toBe(false); // fail closed until the lookup lands
+    expect(warns.some((w) => w.includes("has not resolved after 50ms"))).toBe(true);
+    await Bun.sleep(700);
+    expect(proxy.isTrusted("10.0.0.5")).toBe(true); // the late lookup replaced the set
+  });
+
+  test("a miss while a timed-out boot lookup is still running does not start a second lookup", async () => {
+    const calls = { n: 0 };
+    let now = 0;
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: slowLookup(300, calls), now: () => now, log: { log: () => {}, warn: () => {} } });
+    await proxy.refresh(20);
+    expect(calls.n).toBe(1);
+    now = 61_000; // past the throttle, so a miss WOULD refresh -- but one lookup is already in flight
+    proxy.isTrusted("10.0.0.99");
+    await Bun.sleep(0);
+    expect(calls.n).toBe(1);
+    await Bun.sleep(400);
+    expect(proxy.isTrusted("10.0.0.5")).toBe(true);
+  });
+
+  test("refresh() with no bound waits for the lookup", async () => {
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: slowLookup(100, { n: 0 }) });
+    await proxy.refresh();
+    expect(proxy.isTrusted("10.0.0.5")).toBe(true);
+  });
+
+  test("the boot bound is 2 seconds", () => {
+    expect(PROXY_BOOT_REFRESH_TIMEOUT_MS).toBe(2000);
   });
 });
 
