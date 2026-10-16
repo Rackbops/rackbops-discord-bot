@@ -7,8 +7,8 @@
 // The signal is a marker file in the shared `state:/app/data` volume both containers already
 // mount. Deliberately its own file, never `state.json`: the replacement writes it, from two sites
 // (the verify timer gives up; `takeOver` signals `ready`, or `failed` from its catch), and each
-// marker names the container that wrote it; the original reads it and ignores one another
-// container wrote (#506); it is cleared by the original before it creates the replacement and
+// marker names the container that wrote it (by its 12-hex short id, when it has one); the original
+// reads it and ignores one another container wrote (#506); it is cleared by the original before it creates the replacement and
 // after a failed attempt, and by the replacement in `takeOver`. One writer in the normal case; a
 // surviving earlier replacement's writes are ignored, not prevented.
 

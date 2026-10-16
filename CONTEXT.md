@@ -803,7 +803,7 @@ _Avoid_: server list, guild cache
   `readMarker`'s tolerant parse, so it needs no temp+rename) and clears it once it has taken over
   (`takeOver`, once the original is stopped — the marker's job ends there, not at the end of
   probation); the original reads it, and clears it right before it creates the replacement and after a failed
-  one (`redeploy.ts`). One writer in the normal case (from two sites), two clearers, and a survivor's writes ignored, not prevented (each marker names the container that wrote it, #506). `decideHandoffOutcome` reads it *before* the container state because a
+  one (`redeploy.ts`). One writer in the normal case (from two sites), two clearers, and a survivor's writes ignored, not prevented (each marker names the container that wrote it by its short id, when it has one, #506). `decideHandoffOutcome` reads it *before* the container state because a
   replacement that signalled `ready` is already stopping the original, so it can be caught mid-stop
   and would otherwise be misread as one that died.
 - **`bot-ops.sh env-set` must never gain `--build`.** It recreates without building so it reuses
