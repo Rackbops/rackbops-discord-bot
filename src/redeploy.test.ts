@@ -1502,7 +1502,8 @@ describe("redeploy — cleanup always runs", () => {
   let calls: { path: string; method: string; url: string; body?: string }[] = [];
   // `restartPending()` sampled at the moment of each daemon call the fix's timing hinges on.
   let pendingAt: Record<string, boolean> = {};
-  // #492 item 15: set by any stop or removal of THIS container's own id. `redeploy()` never does either; the
+  // #492 item 15: set by any stop or removal of THIS container by its id, its short id or its NAME (the name is
+  // the hazard of #492 item 16). `redeploy()` never does either; the
   // `afterEach` below asserts it for every test here, so a self-removal the stub's `DELETE` catch-all would
   // absorb (or a self-stop only the "unstubbed" throw would catch) fails the test that made it.
   let touchedSelf = false;
@@ -1567,15 +1568,18 @@ describe("redeploy — cleanup always runs", () => {
     leftover?: () => Response;
     /** The answer to the un-forced removal of that leftover by id (default 204). */
     leftoverDelete?: () => Response;
+    /** The answer to a removal of the replacement's name BY NAME (default: the catch-all 404). */
+    nameDelete?: () => Response;
   }) {
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
       calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
+      const selfRefs = [SELF_ID, HOSTNAME, canonicalName((o.self ?? SELF).Name)];
       if (
-        (method === "POST" && (pathname === `/containers/${SELF_ID}/stop` || pathname === `/containers/${HOSTNAME}/stop`)) ||
-        (method === "DELETE" && (pathname === `/containers/${SELF_ID}` || pathname === `/containers/${HOSTNAME}`))
+        (method === "POST" && selfRefs.some((ref) => pathname === `/containers/${ref}/stop`)) ||
+        (method === "DELETE" && selfRefs.some((ref) => pathname === `/containers/${ref}`))
       ) {
         touchedSelf = true;
       }
@@ -1583,7 +1587,11 @@ describe("redeploy — cleanup always runs", () => {
         return o.selfInspectFails ? new Response("boom", { status: 500 }) : jsonRes(o.self ?? SELF);
       }
       if (pathname === `/containers/${replacementName(SELF.Name)}/json`) {
+        pendingAt.leftover = restartPending();
         return o.leftover ? o.leftover() : new Response("", { status: 404 });
+      }
+      if (o.nameDelete && method === "DELETE" && pathname === `/containers/${replacementName(SELF.Name)}`) {
+        return o.nameDelete();
       }
       if (pathname === `/containers/${LEFTOVER_ID}` && method === "DELETE") {
         pendingAt.sweep = restartPending();
@@ -1615,7 +1623,7 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
       if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
-      if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
+      if (method === "DELETE") return new Response("", { status: 404 }); // the by-name cleanup of a create that timed out
       throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
     }) as unknown as typeof fetch;
   }
@@ -1720,7 +1728,8 @@ describe("redeploy — cleanup always runs", () => {
       expect(result.outcome).toBeUndefined();
       expect(result.error).toContain("docker restart warbandeer-discord-next");
       expect(result.error).toContain("run /update again");
-      expect(result.error).toContain("still named warbandeer-discord-next");
+      expect(result.error).toContain("is named warbandeer-discord-next");
+      expect(result.error).toContain("still finishing"); // during S3a's probation the name is legitimately -next
     } finally {
       delete process.env[HANDOFF_FROM_ENV];
     }
@@ -1744,6 +1753,31 @@ describe("redeploy — cleanup always runs", () => {
     expect(result.error).toContain("container_name");
     expect(result.error).not.toContain("docker restart");
     expect(calls.some((c) => c.path === "/build")).toBe(false);
+  });
+
+  // An install.sh instance is named after its compose project, and that name is the deployment's own: a restart
+  // would not heal it (the heal leaves it alone), so the advice is the one that can be followed.
+  test("a bot named -next after its compose project is told to pick another name, never to restart", async () => {
+    stubDaemon({
+      self: {
+        ...SELF,
+        Name: "/rackbops-discord-bot-next",
+        Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
+      },
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID;
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.error).toContain("container_name");
+      expect(result.error).toContain("another instance name");
+      expect(result.error).not.toContain("docker restart");
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
   });
 
   // #492: whatever holds the replacement's name is inspected after the build, outside the quiesce.
@@ -1785,7 +1819,8 @@ describe("redeploy — cleanup always runs", () => {
     expect(sweep).toBeGreaterThan(inspect);
     expect(create).toBeGreaterThan(sweep);
     expect(new URL(calls[sweep]!.url).searchParams.get("force")).toBeNull();
-    expect(pendingAt.sweep).toBe(true); // inside the quiesce, like the create
+    expect(pendingAt.leftover).toBe(false); // the inspect sits OUTSIDE the quiesce (the README's arithmetic needs it)
+    expect(pendingAt.sweep).toBe(true); // the removal inside it, like the create
     // never by name
     expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`)).toBe(false);
   });
@@ -1823,6 +1858,7 @@ describe("redeploy — cleanup always runs", () => {
       leftover: () =>
         jsonRes({ ...SELF, Id: LEFTOVER_ID, Name: "/warbandeer-discord-next", State: { Running: false, Status: "exited", ExitCode: 1 } }),
       leftoverDelete: () => new Response("conflict: cannot remove a running container", { status: 409 }),
+      nameDelete: () => new Response("conflict: cannot remove a running container", { status: 409 }),
       pollReplacement: () => {
         throw new Error("must not poll");
       },
@@ -1831,6 +1867,10 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("6".repeat(40));
     expect(result.error).toContain("could not start the replacement");
     expect(result.error).toContain("409");
+    // The holder is someone else's live bot: told so, and NOT as a replacement to "remove by hand".
+    expect(result.error).toContain("held by a container that could not be removed (it may be running; check docker ps)");
+    expect(result.replacement).toBe("none");
+    expect(result.replacementError).toBeUndefined();
     expect(calls.some((c) => c.path === "/containers/create")).toBe(false);
     for (const c of calls.filter((c) => c.method === "DELETE")) expect(new URL(c.url).searchParams.get("force")).toBeNull();
     expect(handoffActive()).toBe(false);
@@ -2798,6 +2838,45 @@ describe("healOwnName", () => {
       expect(await healOwnName(h.deps), JSON.stringify(labels)).toBe("occupied");
       expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
     }
+  });
+
+  // install.sh names an instance's container after its compose project: an instance called `next` or
+  // `canary-next` has a -next name of its own, which a boot that has HANDOFF_FROM must not rename away.
+  test("a container named after its own compose project is never renamed, whatever it ends in", async () => {
+    const own = {
+      ...SELF,
+      Name: "/rackbops-discord-bot-next",
+      Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
+    };
+    const h = harness({ self: own });
+    expect(await healOwnName(h.deps)).toBe("canonical");
+    expect(h.events).toEqual(["inspectSelf"]); // no inspect of the base, no removal, no rename
+    expect(h.logs.filter((l) => l.level === "log")).toHaveLength(1);
+    // The same name WITHOUT the project label is a swap's replacement and is healed.
+    const swapped = harness({ self: { ...own, Config: { ...own.Config, Labels: { ...SELF.Config.Labels } } } });
+    expect(await healOwnName(swapped.deps)).toBe("renamed");
+  });
+
+  test("a holder whose labels are null is another service, not a crash", async () => {
+    const h = harness({ holder: holder({ Config: { ...SELF.Config, Labels: null as unknown as Record<string, string> } }) });
+    expect(await healOwnName(h.deps)).toBe("occupied");
+    expect(h.logs.filter((l) => l.level === "warn")[0]!.text).toContain("another service");
+  });
+
+  // The default bound is the one resolveBootMode shares: 10 s, "at most" in index.ts's comment and CONTEXT.md.
+  test("the default bound is ten seconds", async () => {
+    const delays: unknown[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      delays.push(ms);
+      return realSetTimeout(fn, ms, ...rest);
+    }) as unknown as typeof setTimeout;
+    try {
+      await healOwnName(harness({ self: SELF }).deps);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    expect(delays).toContain(10_000);
   });
 
   test("a drifted -next-next name folds back to the base in one hop", async () => {

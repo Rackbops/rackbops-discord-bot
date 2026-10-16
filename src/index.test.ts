@@ -166,6 +166,11 @@ describe("index.ts wiring", () => {
       expect(code.join("\n")).not.toContain("await ");
       expect(source).toMatch(/const verifyTimer =\s*\n\s*bootMode\(process\.env\) === "standby"/);
       expect((source.match(/const verifyTimer =/g) ?? []).length).toBe(1);
+      // What the timer does when it fires, and when: the 90 s budget, a `failed` marker for the original, exit 1.
+      const timerBlock = source.slice(timer, source.indexOf("    : undefined;", timer));
+      expect(timerBlock).toContain("}, VERIFY_DEADLINE_MS)");
+      expect(timerBlock).toContain('status: "failed"');
+      expect(timerBlock).toContain("process.exit(1);");
       expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);
     });
 
@@ -183,6 +188,9 @@ describe("index.ts wiring", () => {
       expect(clear).toBeGreaterThan(rollback);
       expect(heal).toBeGreaterThan(clear); // the timer is cleared before the heal's own wait begins
       expect((source.match(/healOwnName\(/g) ?? []).length).toBe(1);
+      // The timer is cleared in exactly two places: the ready handler (the login landed) and the downgrade above.
+      // A third, unconditional one would silently disable standby verification.
+      expect((source.match(/clearTimeout\(verifyTimer\)/g) ?? []).length).toBe(2);
       expect(source).toMatch(/import \{[^}]*\bhealOwnName\b[^}]*\} from "\.\/redeploy";/);
     });
   });

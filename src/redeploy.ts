@@ -272,12 +272,15 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   }
   if (canonicalName(self.Name) !== baseName(self.Name)) {
     // #547/#492: a bot that is itself `<name>-next` must not sweep or create under that name. Refused here,
-    // before anything is built, on the name alone: no daemon call, and nothing to unwind.
+    // before anything is built, on the name alone: no daemon call beyond the self-inspect above, and nothing to
+    // unwind. `docker restart` is only advised where `healOwnName` would act: a swap's replacement (HANDOFF_FROM
+    // set), not one that is named after its compose project, which is the deployment's own name (install.sh).
     const current = canonicalName(self.Name);
     return {
-      error: process.env[HANDOFF_FROM_ENV]
-        ? `this bot is still named ${current} (the previous swap's rename never landed): docker restart ${current} heals the name at boot (#547); the automatic check will not retry this sha, so run /update again afterwards`
-        : "this container's name ends in -next, which the self-update reserves for its replacement: give it another container_name and recreate it",
+      error:
+        process.env[HANDOFF_FROM_ENV] && !namedAfterItsProject(self)
+          ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a minute; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
+          : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name (for an install.sh instance, another instance name) and recreate it",
       replacement: "none",
     };
   }
@@ -367,23 +370,31 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     //
     // Forced only WITH an id (#492): the start may have taken effect, and a plain DELETE of a running
     // container is a 409 that would leave a second live bot. By name, un-forced: with no id the container was
-    // never started by us, so the orphan is `created` and a plain DELETE removes it; a RUNNING holder of the
-    // name is someone else's (it took the name during the build, which is also why the create failed) and the
-    // 409 is reported below instead of killing it.
+    // never started by us, so the orphan is `created` and a plain DELETE removes it. A RUNNING holder of the
+    // name is someone else's (it took the name during the build, so the create failed on a 409, or the sweep
+    // above did, and no create was attempted) and the 409 here is reported instead of killing it: in the error
+    // text, with the disposition `none` (nothing of OURS is left), not `remove-failed`, whose requester message
+    // says "remove the -next container by hand", which is the wrong advice for a live bot.
     let replacement: ReplacementDisposition = "none";
     let replacementError: string | undefined;
+    let foreignHolder: string | undefined;
     try {
       // The daemon may have nothing by that name (a create it rejected outright, e.g. a 400 on a bad
       // bind): then nothing was started and the requester must not hear "removed" (#451).
       replacement = (await (replacementId ? removeContainer(replacementId, true) : removeContainer(name))) ? "removed" : "none";
     } catch (cleanupErr) {
-      replacement = "remove-failed";
-      replacementError = (cleanupErr as Error).message;
-      console.error(`[redeploy] could not clean up the failed replacement: ${replacementError}`);
+      if (replacementId === undefined) {
+        foreignHolder = (cleanupErr as Error).message;
+        console.error(`[redeploy] ${name} is held by a container that could not be removed — leaving it alone: ${foreignHolder}`);
+      } else {
+        replacement = "remove-failed";
+        replacementError = (cleanupErr as Error).message;
+        console.error(`[redeploy] could not clean up the failed replacement: ${replacementError}`);
+      }
     }
     endHandoff();
     return {
-      error: `could not start the replacement: ${(err as Error).message}`,
+      error: `could not start the replacement: ${(err as Error).message}${foreignHolder !== undefined ? ` — and ${name} is held by a container that could not be removed (it may be running; check docker ps)` : ""}`,
       replacement,
       ...(replacementError !== undefined ? { replacementError } : {}),
     };
@@ -1070,6 +1081,19 @@ export async function resolveBootMode(
   }
 }
 
+const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
+const COMPOSE_SERVICE_LABEL = "com.docker.compose.service";
+
+/**
+ * Named after its own compose project: `ops/install.sh` names a deployed instance's container after its project
+ * (`BOT_OPS_CONTAINER=$PROJECT`), so such a name is the deployment's own, whatever it ends in — `-next` included
+ * (instance `next`, `canary-next`). The reserved suffix does not apply to it: `healOwnName` leaves it alone and
+ * `redeploy()` does not advise a restart for it. Labels are read null-safely: a container with none has no project.
+ */
+function namedAfterItsProject(c: ContainerInspect): boolean {
+  return canonicalName(c.Name) === c.Config.Labels?.[COMPOSE_PROJECT_LABEL];
+}
+
 export type HealOutcome = "canonical" | "renamed" | "occupied" | "unknown";
 
 /** Test seams for {@link healOwnName}; each defaults to the real daemon call. */
@@ -1091,7 +1115,11 @@ export interface HealDeps {
  * RUNNING holder alone and says so. The swap's own stopped original is never that holder: it is
  * `HANDOFF_FROM` itself, and while it exists the boot is `standby` and `completeTakeOver` converges it
  * (remove, rename), so the corpse a failed removal leaves is the standby path's, never this one's.
- * Bounded and best-effort: the boot continues on every outcome.
+ * Bounded and best-effort: the boot continues on every outcome. A container named after its own compose
+ * project (`namedAfterItsProject`: how `ops/install.sh` names an instance, `-next` included) is never renamed.
+ * The limit: that exemption, and the `HANDOFF_FROM` gate, are all that tell a deployment's own `*-next` name
+ * from a swap's replacement; a container created by `compose` alone with a `container_name` ending in
+ * `-next` that has also self-updated before #547 is indistinguishable and would be renamed.
  */
 export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
   const log = deps.log ?? console;
@@ -1100,6 +1128,11 @@ export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_
     const current = canonicalName(self.Name);
     const base = baseName(self.Name);
     if (current === base) return "canonical";
+    if (namedAfterItsProject(self)) {
+      // An install.sh instance named `next` or `canary-next`: the name is the deployment's own, not a swap's.
+      log.log(`[handoff] this bot is named ${current}, like its compose project — that is its own name, leaving it`);
+      return "canonical";
+    }
     const holder = await (deps.inspect ?? tryInspectContainer)(base);
     if (holder) {
       if (holder.State.Running) {
@@ -1130,14 +1163,10 @@ export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_
 
 /** Both on the same compose project AND service (labels present on both): the holder is this bot's own kind. */
 function sameComposeService(a: ContainerInspect, b: ContainerInspect): boolean {
-  const project = "com.docker.compose.project";
-  const service = "com.docker.compose.service";
-  return (
-    Boolean(a.Config.Labels[project]) &&
-    a.Config.Labels[project] === b.Config.Labels[project] &&
-    Boolean(a.Config.Labels[service]) &&
-    a.Config.Labels[service] === b.Config.Labels[service]
-  );
+  // Null-safe: Docker can report a container with no labels as `null`, which is "not the same service", not a throw.
+  const project = (c: ContainerInspect) => c.Config.Labels?.[COMPOSE_PROJECT_LABEL];
+  const service = (c: ContainerInspect) => c.Config.Labels?.[COMPOSE_SERVICE_LABEL];
+  return Boolean(project(a)) && project(a) === project(b) && Boolean(service(a)) && service(a) === service(b);
 }
 
 /** Test seams for {@link detectRollback} and {@link stepAside}. */

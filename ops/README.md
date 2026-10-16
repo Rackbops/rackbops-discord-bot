@@ -449,8 +449,11 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   that. Then `docker rename <name>-next <name>`. Since #547 `docker restart <name>-next` does the same at boot
   for a container a self-update created: it takes `<name>` when that is free, or held by a STOPPED container of the
   same compose project and service (which it removes first); with `<name>` RUNNING it leaves both alone and logs
-  `two bots on one token` (stop one by hand). A compose-created container renamed to `*-next` by hand is not healed,
-  and while a bot is still named `<name>-next` its `/update` is refused with that restart as the advice. (c) Neither yet: wait. An **exited** `<name>-next` blocks
+  `two bots on one token` (stop one by hand). A compose-created container renamed to `*-next` by hand is not healed
+  (its `/update` is refused with the `container_name` advice instead); a swapped-in container still named
+  `<name>-next` has its `/update` refused with that restart as the advice. An instance whose container is
+  named `-next` after its own compose project (`install.sh next`, `canary-next`) is never renamed and cannot
+  self-update: pick another instance name. (c) Neither yet: wait. An **exited** `<name>-next` blocks
   nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
   (`docker rm <name>-next` clears it sooner).
 
