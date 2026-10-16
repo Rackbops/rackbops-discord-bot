@@ -2,7 +2,7 @@
 record and the report that follows it -- #450 (the whole issue), #449's guard half, #452 (the tests), #411 and #429 (the
 docs that follow the code), and #506 items 12 and 13. Written by the orchestrating session on 2026-10-16 against main
 `1a4567d` (PR #576 merged); every `file:line` below was read at that sha. Audited read-only before it was committed
-(round 1, Sonnet, 14 min, 92 tool uses, the snippets type-checked against a replica with the repo's flags): five
+(round 1, Sonnet, the snippets type-checked against a replica with the repo's flags): five
 blockers applied -- the in-flight log line read `.status` off a union member that has none; the existing `afterEach`
 blocks in `update.test.ts` never call `resetUpdateForTest()`, so the new module values would have tripped the
 test-state guard on four existing tests; `probeReplacement` had no test seam (it now takes `deps` like `healOwnName`);
@@ -14,8 +14,11 @@ boot) instead of consuming the report with a claim that may be false. Also appli
 (a hand-edited one is `stale`, never a throw before the scheduler starts), the `interrupted` text no longer asserts
 what cannot be proved after a rollback, the "re-fire" wording says "at most one repeat", the busy doc comment, the
 index.ts/updateReport.ts/two-flags-gotcha rows are in the docs step, `suppressedWarnedFor` is reset when a new failure
-is recorded, the `exitFn` restore, the placement anchors, and D1b's merge order. The implementer re-reads each anchor
-on the tree it works from. D1b (`526-D1b-update-reply.md`, the `/update` reply path in `commands.ts`) runs in parallel
+is recorded, the `exitFn` restore, the placement anchors, and D1b's merge order. Round 2 (same auditor, the rewritten
+snippets type-checked again): no blocker; one gap applied -- a report left behind a probe that stays `unknown` never
+aged out, because the `in-flight` return came before the age check; now `reportUpdateOutcome` drops a report older
+than 24 h first, and an `unknown` probe on a record older than 24 h resolves as `interrupted`. The implementer
+re-reads each anchor on the tree it works from. D1b (`526-D1b-update-reply.md`, the `/update` reply path in `commands.ts`) runs in parallel
 on another sub: it edits `commands.ts`, `commands.test.ts`, `README.md:62` and `:103` and the `commands.ts`/
 `commands.test.ts` rows of `CONTEXT.md`; this bundle edits none of those. S4b (#525, PR #577) edits `redeploy.ts` in
 `buildCreateSpec`, `awaitRetirementFailure`, `stepAside` and `finishProbation`; this bundle adds one exported function
@@ -106,9 +109,13 @@ the interval between the two merges, which is already false today for the AUTO c
    `<name>-next` through the daemon (bounded by `RESOLVE_BOOT_MODE_TIMEOUT_MS`, as `resolveBootMode` and
    `healOwnName` are). A running or restarting `-next` is a swap IN FLIGHT (row 10): touch nothing, log, and leave the
    report to the new build. A probe that cannot tell (no daemon, a timeout, a failed inspect) is treated the same way:
-   the record, A and P stay for the next boot to resolve (P ages out at 24 h, `reportTooOld`), because clearing A on a
-   guess could start a build beside a standby that is about to retire this process, and telling the requester "nothing
-   changed" while that standby may be about to say "updated" would be two contradictory messages. Anything else --
+   the record, A and P stay for the next boot to resolve, because clearing A on a guess could start a build beside a
+   standby that is about to retire this process, and telling the requester "nothing changed" while that standby may
+   be about to say "updated" would be two contradictory messages. Two bounds keep that from lasting forever:
+   `reportUpdateOutcome` drops a report older than 24 h (`reportTooOld`) BEFORE it honours `in-flight`, and a probe
+   that is still `unknown` on a record older than 24 h (`startedAt`, `SWAP_RECORD_MAX_AGE_MS`) resolves as
+   `interrupted` -- nothing can still be in flight a day later, and a running holder of the replacement's name would
+   stop the next redeploy before anything was quiesced anyway (S3b-2). Anything else --
    stopped, never started (`created`), gone -- is INTERRUPTED: clear the record and A (the automatic check retries),
    keep P so the requester is told. Neither sha matching (a third build, or no `GIT_SHA`) is STALE: clear the record,
    leave A and P to the existing paths. An ordinary boot (no record) still never touches the socket. Known limit,
@@ -299,17 +306,26 @@ export type AttemptResolution =
    *  the markers are left to the existing paths. */
   | "stale";
 
-/** Pure: the verdict from the record, this build's sha and (when it matters) the probe of `<name>-next`. */
+/** A record a probe could not resolve for this long is not a swap in flight any more (#450): the standby's own budget
+ *  is minutes, and a running holder of its name would stop the next redeploy before anything was quiesced. */
+export const SWAP_RECORD_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** Pure: the verdict from the record, this build's sha, (when it matters) the probe of `<name>-next`, and the clock. */
 export function decideAttemptResolution(o: {
   swap?: SwapInFlight;
   runningSha?: string;
   probe?: ReplacementProbe;
+  now?: number;
 }): AttemptResolution {
   if (!o.swap) return "none";
   if (!o.runningSha) return "stale";
   if (sameSha(o.swap.toSha, o.runningSha)) return "landed";
   if (!sameSha(o.swap.fromSha, o.runningSha)) return "stale";
-  if (o.probe?.kind === "alive" || o.probe?.kind === "unknown") return "in-flight";
+  if (o.probe?.kind === "alive") return "in-flight";
+  if (o.probe?.kind === "unknown") {
+    // Leave it for the next boot — unless the record is a day old, when nothing can still be in flight.
+    return o.now !== undefined && o.now - o.swap.startedAt > SWAP_RECORD_MAX_AGE_MS ? "interrupted" : "in-flight";
+  }
   return "interrupted";
 }
 
@@ -342,7 +358,7 @@ export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promi
   const swap = isSwapInFlight(raw) ? raw : undefined;
   const needsProbe = !!swap && !!config.gitSha && !sameSha(swap.toSha, config.gitSha) && sameSha(swap.fromSha, config.gitSha);
   const probe = needsProbe ? await (deps.probe ?? probeReplacement)() : undefined;
-  const resolution = swap ? decideAttemptResolution({ swap, runningSha: config.gitSha, probe }) : "stale";
+  const resolution = swap ? decideAttemptResolution({ swap, runningSha: config.gitSha, probe, now: Date.now() }) : "stale";
   const target = swap ? shortSha(swap.toSha) : "an unknown build";
   if (resolution === "in-flight") {
     const seen = probe?.kind === "alive" ? `${probe.name} is ${probe.status}` : `whether ${probe?.name ?? "the replacement"} is alive could not be told: ${probe?.kind === "unknown" ? probe.error : "no probe"}`;
@@ -460,7 +476,11 @@ export async function reportUpdateOutcome(
 ): Promise<void> {
   const report = state.pendingUpdateReport;
   if (!report) return;
-  if (resolution === "in-flight") {
+  const now = Date.now();
+  // Age first, then the in-flight hold: a report a boot keeps leaving for "the new build or the next boot" (a probe
+  // that stays unknown) must still die at 24 h, or it would survive every boot for good.
+  const tooOld = reportTooOld(report, now);
+  if (resolution === "in-flight" && !tooOld) {
     console.log(`[updateReport] a swap to ${short(report.toSha)} may be in flight — leaving its report to the new build or the next boot`);
     return;
   }
@@ -472,8 +492,7 @@ export async function reportUpdateOutcome(
     console.warn("[updateReport] could not clear the pending report before delivering it (it may repeat once at the next boot)", err);
   }
 
-  const now = Date.now();
-  if (reportTooOld(report, now)) {
+  if (tooOld) {
     console.log(
       `[updateReport] dropping a stale report for ${short(report.toSha)} ` +
         `(requested ${Math.round((now - report.requestedAt) / 3_600_000)}h ago)`,
@@ -525,8 +544,7 @@ anchor on one line at a time and reflow the bullet by hand.
   pin). `CONTEXT.md`'s `updateReport.test.ts`, `redeploy.test.ts` (`:193`), `index.test.ts` and `stateGuard.test.ts`
   rows (Grep each ``| `src/<file>` |`` / ``| `test/<file>` |``): likewise for R1-R4, the probe tests, the order pin and
   the two leak cases.
-- `CONTEXT.md:156` (the `index.ts` row, which narrates `activate()`'s order): after the clause about returning when
-  `isShuttingDown()` and before "then the scheduler" (Grep ``returns right after it when `isShuttingDown()``), insert
+- `CONTEXT.md:156` (the `index.ts` row, which narrates `activate()`'s order): Grep ``returns right after it when `isShuttingDown()`` (one hit) to FIND the clause, then insert AFTER that clause's closing parenthetical (it ends "...must then have booted)"), before "then the scheduler" -- never on the anchor itself, which is the clause's start:
   ``, then resolves the swap record (`resolveUpdateAttempt`, #450: one bounded daemon call only when a record exists)``.
 - `CONTEXT.md:182` (the `updateReport.ts` row): old ``reportUpdateOutcome(client)`` -> new
   ``reportUpdateOutcome(client, resolution?, deliverers?)`` and append `` ; `interrupted` is the fifth outcome (#450); a failing clear-save is logged, not thrown, and delivery goes ahead (at most one repeat at the next boot, #506); `in-flight` leaves the report in place; the deliverers are injectable``.
@@ -538,10 +556,12 @@ anchor on one line at a time and reflow the bullet by hand.
 - `CONTEXT.md:1095` (the busy gotcha's last line, ``  `pendingUpdateReport` and then force-remove its replacement.``): append `` Since #449 the guard is `restartPending() || checkInFlight`: a pending exit-75 restart (the no-socket path, deferred behind the command's own critical section) refuses a second `/update` too, which used to overwrite the first requester's `pendingUpdateReport`.`` And the next bullet (`:1096-...`, "**The guard is two flags, not one (#51 item 4).** `handoffActive()` alone doesn't read true until ..."): old ``**The guard is two flags, not one (#51 item 4).** `handoffActive()` alone`` -> new ``**The guard is two flags, not one (#51 item 4; the first is `restartPending()` since #449).** `handoffActive()` alone`` (read the bullet and keep it true: `checkInFlight` still covers the stretch before a handoff begins).
 - `CONTEXT.md:1190` (``  bot has exited for a sha and come back unchanged, it warns instead of exiting again.``): old ``it warns instead of exiting again.`` -> new ``it warns once per pending sha per process — naming the failed swap when there was one (#506 item 13) — instead of exiting again.``
 - `CONTEXT.md:1204` (``  own `ShaRelation` (`unpublished`) and resolves to `disabled` naming the sha — so such a deploy``): after ``(`unpublished`)`` insert `` — a 404 whose body says "no common ancestor" is `diverged` instead, a rewritten branch, which restarts (#411) —``.
-- `CONTEXT.md:1212` (``  `startScheduler` and doesn't await it: an owed follow-up must never delay or crash startup.``): append `` A save that fails there is logged and the report is delivered anyway (#506 item 12: "nothing here throws" was false; the cost is at most one repeat at the next boot, since the disk then still holds the report). `resolveUpdateAttempt()` runs before `startScheduler` (#450), so an interrupted attempt's marker is cleared before the first tick can read it and its verdict reaches `reportUpdateOutcome`; a swap still in flight — or one whose `-next` the daemon could not be asked about — leaves the report in place for the new build or the next boot (the record then stays until that boot; `/update` does not read it).``
+- `CONTEXT.md:1212` (``  `startScheduler` and doesn't await it: an owed follow-up must never delay or crash startup.``): append `` A save that fails there is logged and the report is delivered anyway (#506 item 12: "nothing here throws" was false; the cost is at most one repeat at the next boot, since the disk then still holds the report). `resolveUpdateAttempt()` runs before `startScheduler` (#450), so an interrupted attempt's marker is cleared before the first tick can read it and its verdict reaches `reportUpdateOutcome`; a swap still in flight — or one whose `-next` the daemon could not be asked about — leaves the report in place for the new build or the next boot (the record then stays until that boot; `/update` does not read it), bounded two ways: the 24 h age drop runs before the in-flight hold, and a record a day old that the daemon still cannot be asked about resolves as `interrupted`.``
 - `README.md:106`: old ``which of three things happened:`` -> new ``which of five things happened:``; after line 109 (the `❓ **unexpected**` bullet) insert
   ``  - ⚠️ **interrupted** — came back on the same build because the process restarted before the new build had taken over (a reboot, an OOM kill, a `bot-ops.sh restart` or the panel's Restart during the build), or because the swap was rolled back; nothing changed, and the next `/update` or automatic check tries again. If a stopped `<name>-next` was left behind, the next update removes it. (If the bot cannot ask the daemon whether a `<name>-next` is still alive, it keeps the report for its next start instead of guessing.)``
   and ``  - ❓ **unknown** — came back with no `GIT_SHA` baked in, so it cannot tell.``
+  (The "keeps the report for its next start instead of guessing" clause holds for a day: an older report is dropped
+  as stale, and the record itself is resolved after a day even when the daemon still cannot be asked.)
 - `README.md:112`: old ``it says so once in the log and **stops trying**`` -> new ``it says so once per pending build in the log (per process: a restart says it again once; naming the failed swap when there was one) and **stops trying**``.
 - `docs/plans/epics/E516/525-handoff-state-table.md`: one `**D1a:**` note at the end of the "Recovered by" cell of
   rows 5, 8, 10, 11, 28 and 30 (anchor each on the cell's last words; the rows are single lines): row 5 "the busy
@@ -571,9 +591,11 @@ the test-state guard fails the one that does not. The requester fixture:
 - **U1 (`decideAttemptResolution`, pure):** a `describe("decideAttemptResolution (#450)")` with one `test` per row:
   no swap -> `none`; no running sha -> `stale`; `toSha` running -> `landed` (also with a short running sha);
   `fromSha` running + probe `alive` (`status: "running"` and `"restarting"`) -> `in-flight`; `fromSha` running + probe
-  `unknown` -> `in-flight`; `fromSha` running + probe `stopped` (`"exited"`, `"created"`, `"dead"`), `absent`, and no
-  probe at all -> `interrupted`; neither sha -> `stale`; `toSha` running with a probe `alive` -> `landed` (the sha
-  check wins before the probe is read).
+  `unknown` with `now` within 24 h of `startedAt` (and with no `now` at all) -> `in-flight`; the same `unknown` with
+  `now` = `startedAt + SWAP_RECORD_MAX_AGE_MS + 1` -> `interrupted` (and exactly `+ SWAP_RECORD_MAX_AGE_MS` is still
+  `in-flight`: the bound is strict); `fromSha` running + probe `stopped` (`"exited"`, `"created"`, `"dead"`), `absent`,
+  and no probe at all -> `interrupted`; neither sha -> `stale`; `toSha` running with a probe `alive` -> `landed` (the
+  sha check wins before the probe is read); `expect(SWAP_RECORD_MAX_AGE_MS).toBe(86_400_000)`.
 - **U2 (#452, #450: on disk before `redeploy`, cleared after):** `config.gitSha = OLD`, `stubGitHub()`, a requester;
   `deps.redeployAvailable: async () => true`; `deps.redeploy: async () => { seenOnDisk = onDisk(); return { outcome: "failed", error: "boom" }; }`.
   Assert `seenOnDisk.attemptedUpdateToSha === NEW`, `seenOnDisk.pendingUpdateReport` equals the requester plus
@@ -614,8 +636,10 @@ the test-state guard fails the one that does not. The requester fixture:
     absent on disk, A and P untouched.
   - `config.gitSha = OLD`, probe `{ kind: "alive", name: "bot-next", status: "running" }`: `in-flight`, nothing
     changed in memory or on disk (compare `onDisk()` before and after), the log line names `bot-next`.
-  - probe `{ kind: "unknown", name: "bot-next", error: "timed out after 10000ms" }`: `in-flight` too, nothing changed
-    in memory or on disk, the log line contains `could not be told` and the error.
+  - probe `{ kind: "unknown", name: "bot-next", error: "timed out after 10000ms" }` on a record whose `startedAt` is
+    `Date.now() - 60_000`: `in-flight` too, nothing changed in memory or on disk, the log line contains
+    `could not be told` and the error. The same probe on a record whose `startedAt` is
+    `Date.now() - SWAP_RECORD_MAX_AGE_MS - 60_000`: `interrupted`, record and A cleared, P kept.
   - probe `stopped` (`"exited"`), then separately `absent`: `interrupted`, `swapInFlight` and A cleared in memory and on
     disk, P still there (memory and disk), the warn line says `cleared the attempt marker`.
   - `config.gitSha = "d".repeat(40)` (a third build): `stale`, probe not called, `swapInFlight` cleared, A and P untouched.
@@ -634,16 +658,21 @@ the test-state guard fails the one that does not. The requester fixture:
   `fromSha` leg); with `"none"`/`"landed"`/`"stale"` and running `FROM` -> `noop` (unchanged). `updateOutcomeMessage`:
   the distinct-text test's set size becomes 5; a new test pins that `interrupted` names `TO` and `now`, contains
   `did not take` and `/update`, and does NOT contain `wasn't rebuilt`; `unexpected` contains `automatic update`.
-- **R2 (`reportUpdateOutcome`, in-flight):** `state.pendingUpdateReport = report()`, a `console.log` spy, deliverers
-  whose every route throws if called: `await reportUpdateOutcome({} as Client, "in-flight", deliverers)` ->
-  `state.pendingUpdateReport` still the report, no deliverer called, the log line contains `in flight`.
+- **R2 (`reportUpdateOutcome`, in-flight):** `state.pendingUpdateReport = report({ requestedAt: Date.now() })`, a
+  `console.log` spy, deliverers whose every route throws if called: `await reportUpdateOutcome({} as Client, "in-flight", deliverers)` ->
+  `state.pendingUpdateReport` still the report, no deliverer called, the log line contains `in flight`. **R2b:** the
+  same with `requestedAt: Date.now() - 25 * 3_600_000` (older than 24 h): P is cleared (memory and disk: seed it with
+  `await saveState()` first), no deliverer called, the log line says `dropping a stale report` (the age check comes
+  before the in-flight hold).
 - **R3 (`reportUpdateOutcome`, clear-before-deliver and the failing save):** `config.gitSha = TO`,
   `state.pendingUpdateReport = report({ requestedAt: Date.now() }); await saveState()` (ON DISK, or the
   clear-before-deliver mutant survives), deliverers whose `viaToken` records `onDisk().pendingUpdateReport` AND
   `state.pendingUpdateReport` at the moment it is called and resolves: after the call both recorded values are
   `undefined` (cleared in memory and on disk BEFORE delivery) and the log line says `updated (delivered via token)`.
-  Then the same with `spyOn(Bun, "write")` rejecting (`disk full`): the call resolves (does not throw), `viaToken` was
-  still called once, and a `console.warn` spy saw `could not clear the pending report before delivering it`. And with
+  Then a second phase: re-seed P in memory and on disk (`await saveState()`) and ONLY THEN install the
+  `spyOn(Bun, "write")` that rejects (`disk full`; installing it before the seed would reject the seed itself): the
+  call resolves (does not throw), `viaToken` was still called once, and a `console.warn` spy saw
+  `could not clear the pending report before delivering it`; `mockRestore` in `finally`. And with
   `resolution: "interrupted"` and `config.gitSha = FROM`: the delivered `content` starts `⚠️ Back up on` and contains
   `did not take`.
 - **R4 (#452: `viaToken` and `viaDm`):** `viaDm`: a fake client `{ users: { fetch: async (id) => ({ send: async (c) => sends.push([id, c]) }) } }`
@@ -684,6 +713,7 @@ the end.
 |---|---|---|
 | M1 | 2f: `state.swapInFlight = viaSocket ? {...} : undefined` -> `= undefined` | U2 (not on disk before `redeploy`) |
 | M2 | 2g: delete `state.swapInFlight = undefined;` | U2 (still on disk after the failed redeploy) |
+| M2b | 2g: delete the conditional `state.pendingUpdateReport = undefined;` | U2 (the `/update` call's report still on disk after its failure) |
 | M3 | 2g: add `state.attemptedUpdateToSha = undefined;` | the existing #50 test (`update.test.ts:273-295`) and U2 |
 | M4 | 2d: `restartPending() \|\| checkInFlight` -> `handoffActive() \|\| checkInFlight` (re-import it) | U6 (the second call decides `restart` and overwrites P) |
 | M5 | 2f: `if (report) state.pendingUpdateReport = report;` -> `state.pendingUpdateReport = report;` | U7 (P is `undefined` on disk during `redeploy`) |
@@ -711,13 +741,17 @@ the end.
 | M22 | 2c/`updateLeaks`: the `suppressedWarnedFor` line deleted | test/stateGuard.test.ts's new case |
 | M23 | `:287-291`: delete the `current` clear of A (and, separately, only its `saveState`) | U4 (memory; then disk) |
 | M24 | `:315-317`: `finally { checkInFlight = false }` -> release only on the normal return | U5 (the second call answers `busy`) |
+| M25 | 2h: the `unknown` branch ignores the age (always `in-flight`) | U1's `+ SWAP_RECORD_MAX_AGE_MS + 1` case; U9's old-record case |
+| M25b | 2h: `>` -> `>=` on the age bound | U1's exact-bound case |
+| M26 | 4d: the in-flight return no longer consults `tooOld` | R2b (P kept, no drop line) |
+| M27 | step 3: `found.State.Running \|\|` dropped | redeploy.test.ts's running case (`alive` expected) |
 
 ### Coverage table
 
 | Bullet (the issue's observable outcome) | Step(s) | Test | Mutation that fails it |
 |---|---|---|---|
-| #450: a boot after a death mid-swap reports `interrupted`, not `noop`, and the automatic check retries | 1, 2f-2h, 3, 4, 5 | U1, U2, U9, R1, R3, index pin, redeploy probe tests | M1, M2, M8-M11, M14, M16, M18, M20, M21 |
-| #450: a boot beside a live `-next`, or one that cannot ask, touches nothing and leaves the report | 2h, 4d | U9's alive and unknown cases, R2 | M9, M9b, M15 |
+| #450: a boot after a death mid-swap reports `interrupted`, not `noop`, and the automatic check retries | 1, 2f-2h, 3, 4, 5 | U1, U2, U9, R1, R3, index pin, redeploy probe tests | M1, M2, M2b, M8-M11, M14, M14b, M16, M18, M20, M21, M27 |
+| #450: a boot beside a live `-next`, or one that cannot ask, touches nothing and leaves the report -- for at most a day | 2h, 4d | U9's alive, unknown and old-record cases, R2, R2b | M9, M9b, M15, M25, M25b, M26 |
 | #449 (guard): a second `/update` during a deferred exit-75 restart is refused and the first report survives | 2d | U6 | M4 |
 | #452: P and A are on disk before `redeploy`; P cleared after a failure; A cleared on `current`; the no-socket branch; a thrown fetch releases the latch; `reportUpdateOutcome` clears before delivering; `viaToken`/`viaDm` | 2f, 2g, 4d | U2, U3, U4, U5, R3, R4 | M1-M3, M12, M13, M19a, M19b, M20, M23, M24 |
 | #506-12: a rejecting save does not stop delivery; an AUTO attempt neither overwrites nor wipes an owed report | 2f, 2g, 4d | R3, U7 | M5, M5b, M13 |
