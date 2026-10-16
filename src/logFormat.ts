@@ -5,8 +5,11 @@
 // Done by swapping the console methods once, from src/bootLog.ts (the first import), rather than by
 // touching the call sites: every host line and every plugin line goes through `console` (a plugin's
 // `host.log` is `createHostApi`'s wrapper over it, src/plugins/host.ts), so one swap covers them all,
-// the boot lines included. A multi-line message (an error's stack) stays one record, because JSON
-// escapes the newlines.
+// the boot lines included. Covered: the five methods below (`log`, `info`, `debug`, `warn`, `error`).
+// Not covered, and left plain on purpose: `console.trace/dir/table/assert/group`, `process.emitWarning`,
+// and anything written straight to `process.stdout`/`stderr` -- a line-oriented consumer tolerates a
+// non-JSON line, as it already must for Bun's own crash output (#495). A multi-line message (an error's
+// stack) stays one record, because JSON escapes the newlines.
 
 import { format } from "node:util";
 
