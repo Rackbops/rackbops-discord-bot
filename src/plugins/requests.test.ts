@@ -502,9 +502,43 @@ describe("consumePluginRequests drain", () => {
       expect(h.warns).toEqual([]);
       expect(h.rejected).toEqual([]);
       expect(h.mutations).toHaveLength(3);
-      expect(h.state.plugins[0]?.skippedVersion).toBe("1.0.0");
+      // a remind after a skip is a change of mind (#501 item 4): it lifts the skip it follows
+      expect(h.state.plugins[0]?.skippedVersion).toBeUndefined();
       expect(h.restarts).toHaveLength(0);
       expect(h.fs.size).toBe(0);
+    });
+
+    // #441, the mailbox path: an update-now request supersedes a schedule pending for the same version.
+    test("an update-now request drops a pending schedule for that version", async () => {
+      const state: PluginStateFile = {
+        hostApiVersion: 1,
+        writtenAt: "",
+        plugins: [
+          {
+            name: "warbandeer",
+            enabled: true,
+            configured: true,
+            missingEnv: [],
+            active: true,
+            installedVersion: "1.0.0",
+            scheduled: { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "email:me@x.com" },
+          },
+        ],
+      };
+      const h = harness({ "100-update-now-1.json": wb({ action: "update-now", version: "1.1.0" }) }, { state });
+      await consumePluginRequests(h.deps);
+      expect(h.state.plugins[0]?.targetVersion).toBe("1.1.0");
+      expect(h.state.plugins[0]?.scheduled).toBeUndefined();
+    });
+
+    // #501 item 4, the mailbox path: the request's own version is what the snooze acknowledges (a drain that dropped it
+    // would leave the next tick to notify the version and wipe the snooze).
+    test("a remind request acknowledges the version it names", async () => {
+      const h = harness({ "100-remind-1.json": wb({ action: "remind", version: "1.1.0", days: 3 }) });
+      await consumePluginRequests(h.deps);
+      expect(h.warns).toEqual([]);
+      expect(h.state.plugins[0]?.notifiedVersion).toBe("1.1.0");
+      expect(h.state.plugins[0]?.remindAt).toBeDefined();
     });
 
     test("an update-now for any other version than the installed one is applied as before", async () => {

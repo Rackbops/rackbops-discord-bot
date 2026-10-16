@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelType, type Client } from "discord.js";
@@ -828,6 +828,91 @@ describe("announceStateForTest's poll state", () => {
     } finally {
       fetchSpy.mockRestore();
     }
+  });
+
+  // #442: a schedule fires within a minute of its time. The 15-minute gap gates the INDEX poll (the notices); between
+  // polls the check still looks at the due schedules, so one that falls due after a poll does not wait for the next.
+  // The state file is the real one (data/plugins/state.json under the test DATA_DIR): the check reads and writes it
+  // through the live deps, and the scheduled update's restart goes into the setExitFn stub.
+  describe("the pluginUpdates check runs due schedules between index polls (#442)", () => {
+    const stateFile = join(DATA_DIR, "plugins", "state.json");
+    const writePluginStateFile = (scheduledAt?: string) => {
+      mkdirSync(join(DATA_DIR, "plugins"), { recursive: true });
+      writeFileSync(
+        stateFile,
+        JSON.stringify({
+          hostApiVersion: 1,
+          writtenAt: "",
+          plugins: [
+            {
+              name: "a",
+              enabled: true,
+              configured: true,
+              missingEnv: [],
+              active: true,
+              installedVersion: "1.0.0",
+              // a panel identity: the heads-up DM is skipped, so no Discord client is needed
+              ...(scheduledAt ? { scheduled: { version: "1.1.0", at: scheduledAt, requestedBy: "email:me@x.com" } } : {}),
+            },
+          ],
+        }),
+      );
+    };
+    const readEntry = () => JSON.parse(readFileSync(stateFile, "utf8")).plugins[0] as { targetVersion?: string; scheduled?: unknown };
+    const PAST = "2020-01-01T00:00:00.000Z";
+
+    // Offline fetch (loadPluginIndex falls back to an empty index and warns), quiet logs, an exit stub; all restored.
+    async function withProbe(body: (probe: { exits: number[]; fetchSpy: ReturnType<typeof spyOn> }) => Promise<void>): Promise<void> {
+      const exits: number[] = [];
+      const restoreExit = setExitFn((code) => void exits.push(code));
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+        throw new Error("offline");
+      }) as unknown as typeof fetch);
+      const quiet = [
+        spyOn(console, "warn").mockImplementation(() => {}),
+        spyOn(console, "error").mockImplementation(() => {}),
+        spyOn(console, "log").mockImplementation(() => {}),
+      ];
+      try {
+        await body({ exits, fetchSpy });
+      } finally {
+        restoreExit();
+        resetRestartForTest();
+        fetchSpy.mockRestore();
+        for (const spy of quiet) spy.mockRestore();
+        rmSync(stateFile, { force: true });
+      }
+    }
+
+    test("a schedule that falls due between two index polls fires on the next tick, not the next poll", async () => {
+      await withProbe(async ({ exits }) => {
+        markPluginStateReady();
+        const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "pluginUpdates")!;
+        writePluginStateFile(); // nothing scheduled: the first run is the poll (it stamps lastPluginPollAt)
+        await check.run();
+        expect(announceStateForTest().lastPluginPollAt).toBeGreaterThan(0);
+        expect(exits).toEqual([]);
+        writePluginStateFile(PAST); // now a schedule is due, and the poll gap has not elapsed
+        await check.run();
+        expect(exits).toEqual([RESTART_EXIT_CODE]); // fired between polls
+        expect(readEntry().targetVersion).toBe("1.1.0");
+        expect(readEntry().scheduled).toBeUndefined();
+      });
+    });
+
+    test("nothing runs before markPluginStateReady: a due schedule on file is neither fired nor dropped (the boot write comes first)", async () => {
+      await withProbe(async ({ exits, fetchSpy }) => {
+        expect(announceStateForTest().pluginStateReady).toBe(false);
+        const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "pluginUpdates")!;
+        writePluginStateFile(PAST);
+        await check.run(); // would be the poll tick
+        await check.run(); // would be a between-polls tick
+        expect(exits).toEqual([]);
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(readEntry().scheduled).toBeDefined();
+        expect(readEntry().targetVersion).toBeUndefined();
+      });
+    });
   });
 
   // #460: the autoUpdate check is gated on AUTO_UPDATE and on its own 15-minute gap (no startup special case:

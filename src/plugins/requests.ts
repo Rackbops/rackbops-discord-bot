@@ -509,7 +509,7 @@ async function apply(r: PluginRequest, deps: PluginRequestDeps): Promise<string 
       await deps.mutateState(scheduleUpdate(r.plugin, r.version, r.at, r.requestedBy));
       return undefined;
     case "remind":
-      await deps.mutateState(remindLater(r.plugin, new Date(deps.now().getTime() + (r.days ?? 7) * DAY_MS).toISOString()));
+      await deps.mutateState(remindLater(r.plugin, new Date(deps.now().getTime() + (r.days ?? 7) * DAY_MS).toISOString(), r.version));
       return undefined;
     case "skip":
       await deps.mutateState(skipVersion(r.plugin, r.version));

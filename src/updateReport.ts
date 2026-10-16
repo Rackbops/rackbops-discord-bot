@@ -1,7 +1,8 @@
 import { REST, Routes, type Client } from "discord.js";
 import { config } from "./config";
 import { state, saveState, type PendingUpdateReport } from "./state";
-import { sameSha } from "./update";
+import { sameSha, type AttemptResolution } from "./update";
+import { prefixedName } from "./commandNaming";
 import { sendToChannel } from "./announce";
 import { shortSha as short } from "./storage";
 import { withoutRequest } from "./plugins/delivery";
@@ -25,18 +26,18 @@ export type UpdateOutcome =
   | "updated"
   /** Came back on the sha we left on — the image was never rebuilt. */
   | "noop"
-  /** Came back on some third sha — someone else deployed in between. */
+  /** Came back on the sha we left on because the process restarted before the new build took over, or the swap was rolled back (#450). */
+  | "interrupted"
+  /** Came back on some third sha — neither the build we left nor the one we were picking up (someone deployed in between, or an automatic update landed). */
   | "unexpected"
   /** Came back without a GIT_SHA baked in — nothing to compare. */
   | "unknown";
 
-export function decideUpdateOutcome(o: {
-  report: PendingUpdateReport;
-  runningSha?: string;
-}): UpdateOutcome {
+/** `report.interrupted` is the boot's verdict on the swap record (`resolveUpdateAttempt`, #450), saved with the report. */
+export function decideUpdateOutcome(o: { report: PendingUpdateReport; runningSha?: string }): UpdateOutcome {
   if (!o.runningSha) return "unknown";
   if (sameSha(o.runningSha, o.report.toSha)) return "updated";
-  if (sameSha(o.runningSha, o.report.fromSha)) return "noop";
+  if (sameSha(o.runningSha, o.report.fromSha)) return o.report.interrupted ? "interrupted" : "noop";
   return "unexpected";
 }
 
@@ -56,11 +57,17 @@ export function updateOutcomeMessage(
         `\`${short(report.toSha)}\` was not picked up: the image wasn't rebuilt. ` +
         "Redeploy with `--build` (see the README)."
       );
+    case "interrupted":
+      return (
+        `⚠️ Back up on \`${now}\` — the update to \`${short(report.toSha)}\` did not take: this process is back on ` +
+        "the build it left on (it restarted before the new build had taken over, or the swap was rolled back). " +
+        `Run /${prefixedName(config.commandPrefix, "update")} again.`
+      );
     case "unexpected":
       return (
         `❓ Back up on \`${now}\`, which is neither the build I left on ` +
         `(\`${short(report.fromSha)}\`) nor the one I was picking up ` +
-        `(\`${short(report.toSha)}\`) — something else deployed in between.`
+        `(\`${short(report.toSha)}\`) — something else deployed in between (an automatic update, or a redeploy by hand).`
       );
     case "unknown":
       return (
@@ -149,22 +156,58 @@ export function liveDeliverers(client: Client): Deliverers {
   };
 }
 
+/** The report owed right now, or `null`: what `index.ts` remembers when it resolves the swap record at boot. */
+export function owedReportNow(): PendingUpdateReport | null {
+  return state.pendingUpdateReport ?? null;
+}
+
 /**
- * Deliver the follow-up owed from a `/update`-initiated restart, if any.
+ * Deliver the follow-up owed from a `/update`-initiated restart, if any. `resolution` is what this boot made of the
+ * swap record (`resolveUpdateAttempt`, #450): `in-flight` leaves the report in place for the new build, which is
+ * about to retire this process and has the same report in its own snapshot (or for this container's next boot, when
+ * the probe could not tell). An `interrupted` swap needs nothing passed here: that boot marked the report itself
+ * (`report.interrupted`), which `decideUpdateOutcome` reads, so the truthful outcome also survives a boot that died
+ * between resolving and delivering. `owed` is the report the boot saw when it resolved the record (`index.ts` takes it
+ * there, before the interaction handler attaches); a different one is a `/update` this process took since, and is left
+ * for its own restart. The default, the report owed at call time, is for a caller that has no such moment.
  *
- * The marker is cleared and persisted *before* delivery is attempted: a delivery that fails
- * must not leave a report that re-fires on every subsequent boot. Nothing here throws — a
- * follow-up is never worth wedging startup over.
+ * The marker is cleared and persisted *before* delivery is attempted: a delivery that fails must not leave a report
+ * that re-fires on every subsequent boot. A save that fails is logged and delivery goes ahead anyway (#506 item 12:
+ * one report beats none, at the cost of at most one repeat at the next boot). Nothing here throws.
  */
-export async function reportUpdateOutcome(client: Client): Promise<void> {
+export async function reportUpdateOutcome(
+  client: Client,
+  resolution: AttemptResolution = "none",
+  deliverers: Deliverers = liveDeliverers(client),
+  owed: PendingUpdateReport | null = owedReportNow(),
+): Promise<void> {
   const report = state.pendingUpdateReport;
   if (!report) return;
+  // Only the report the boot saw (`owed`, taken where the swap record was resolved) is owed to anyone yet. One armed
+  // since — by a `/update` this process took while it finished starting — describes a restart still in progress: sending
+  // it now would say "the image wasn't rebuilt" to a requester whose build is running, and clear the report the
+  // replacement is about to deliver as "updated".
+  if (report !== owed) {
+    console.log(`[updateReport] a report for ${short(report.toSha)} was armed since this boot began — its restart reports it`);
+    return;
+  }
+  const now = Date.now();
+  // Age first, then the in-flight hold: a report a boot keeps leaving for "the new build or the next boot" (a probe
+  // that stays unknown) must still die at 24 h, or it would survive every boot for good.
+  const tooOld = reportTooOld(report, now);
+  if (resolution === "in-flight" && !tooOld) {
+    console.log(`[updateReport] a swap to ${short(report.toSha)} may be in flight — leaving its report to the new build or the next boot`);
+    return;
+  }
 
   state.pendingUpdateReport = undefined;
-  await saveState();
+  try {
+    await saveState();
+  } catch (err) {
+    console.warn("[updateReport] could not clear the pending report before delivering it (it may repeat once at the next boot)", err);
+  }
 
-  const now = Date.now();
-  if (reportTooOld(report, now)) {
+  if (tooOld) {
     console.log(
       `[updateReport] dropping a stale report for ${short(report.toSha)} ` +
         `(requested ${Math.round((now - report.requestedAt) / 3_600_000)}h ago)`,
@@ -174,6 +217,6 @@ export async function reportUpdateOutcome(client: Client): Promise<void> {
 
   const outcome = decideUpdateOutcome({ report, runningSha: config.gitSha });
   const content = updateOutcomeMessage(outcome, report, config.gitSha);
-  const route = await deliverUpdateReport(report, content, liveDeliverers(client), now);
+  const route = await deliverUpdateReport(report, content, deliverers, now);
   console.log(`[updateReport] ${outcome} (delivered via ${route}): ${content}`);
 }
