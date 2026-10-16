@@ -9,6 +9,7 @@ import {
   endCritical,
   endHandoff,
   handoffActive,
+  isShuttingDown,
   onStopRequested,
   requestRestart,
   resetForTest,
@@ -409,6 +410,32 @@ describe("beginShutdown (#154)", () => {
     expect(restartPending()).toBe(false);
     beginShutdown("SIGTERM");
     expect(restartPending()).toBe(true);
+  });
+});
+
+// #541: index.ts's activate() stops after plugin activation only when the process is leaving for good.
+// restartPending() is also true for a handoff, and a handoff that fails ends (endHandoff) with the process
+// still running, so acting on it would leave the bot half-booted for good.
+describe("isShuttingDown (#541)", () => {
+  test("is true after beginShutdown and only then", () => {
+    expect(isShuttingDown()).toBe(false);
+    beginShutdown("SIGTERM");
+    expect(isShuttingDown()).toBe(true);
+    resetForTest();
+    expect(isShuttingDown()).toBe(false);
+  });
+
+  test("is not true for a handoff, ended or not, nor for a pending restart", () => {
+    beginHandoff("redeploy -> abc1234");
+    expect(restartPending()).toBe(true);
+    expect(isShuttingDown()).toBe(false);
+    endHandoff();
+    expect(isShuttingDown()).toBe(false);
+    beginCritical(); // so the restart below is deferred, not an immediate exit
+    requestRestart("test");
+    expect(restartPending()).toBe(true);
+    expect(isShuttingDown()).toBe(false);
+    endCritical();
   });
 });
 

@@ -260,6 +260,13 @@ export function restartPending(): boolean {
   return pending !== undefined || handoff !== undefined || shuttingDown;
 }
 
+/** True once `beginShutdown` has run — and only then. Unlike `restartPending()` it is not true for a handoff
+ *  (which can end and leave the process running, `endHandoff`) or a pending restart (which exits by itself),
+ *  so it is the one to ask when the question is "is this process leaving for good?" (#541). */
+export function isShuttingDown(): boolean {
+  return shuttingDown;
+}
+
 /**
  * #154: marks the process as shutting down — folded into `restartPending()` so `onTick`'s own
  * `if (restartPending()) return` guard (`announce.ts`) starts no new tick once a signal has

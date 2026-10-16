@@ -682,20 +682,22 @@ export const PLUGIN_ACTIVATE_TIMEOUT_MS = 30_000;
  * #541: a shutdown (`disposePlugins` has begun) is checked twice per plugin. Before its `activate()` is
  * called: the plugin is not activated at all (`error` says so). After it settled inside the bound: it came
  * up while the process was already leaving, so what it set up is released now — its `dispose()`, awaited and
- * bounded by PLUGIN_DISPOSE_TIMEOUT_MS, isolated like every other plugin call — and the plugin is left off.
- * The run is published (`activation`) so `disposePlugins` can wait, bounded, for the plugin in flight; every
- * later plugin is still visited, so each carries its own `error` for the log. */
+ * bounded by `disposeTimeoutMs` (the test seam for PLUGIN_DISPOSE_TIMEOUT_MS), isolated like every other
+ * plugin call — and the plugin is left off. The run is published (`activation`) so `disposePlugins` can
+ * wait, bounded, for the plugin in flight; every later plugin is still visited, so each carries its own
+ * `error` for the log. */
 export async function activatePlugins(
   loaded: readonly LoadedPlugin[],
   log: BaseLog,
   timeoutMs = PLUGIN_ACTIVATE_TIMEOUT_MS,
+  disposeTimeoutMs = PLUGIN_DISPOSE_TIMEOUT_MS,
 ): Promise<void> {
-  const run = activateEach(loaded, log, timeoutMs);
+  const run = activateEach(loaded, log, timeoutMs, disposeTimeoutMs);
   activation = run.catch(() => {}); // the loop isolates every plugin's throw; this only guards the publication
   return run;
 }
 
-async function activateEach(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number): Promise<void> {
+async function activateEach(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number, disposeTimeoutMs: number): Promise<void> {
   for (const lp of loaded) {
     if (disposing) {
       lp.error = "shutdown began before activate() ran";
@@ -714,7 +716,7 @@ async function activateEach(loaded: readonly LoadedPlugin[], log: BaseLog, timeo
         // and bounded, so the shutdown that is waiting on this run (disposePlugins) sees it done.
         lp.error = "shutdown began during activate()";
         log.warn(`[plugins] ${lp.entry.name} finished activating after a shutdown began — disposing what it set up`);
-        await disposeOne(lp, log, PLUGIN_DISPOSE_TIMEOUT_MS);
+        await disposeOne(lp, log, disposeTimeoutMs);
         continue;
       }
       lp.running = true;
@@ -770,8 +772,9 @@ export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
 /**
  * `activatePlugins`'s counterpart (#184), called once on the way out (`shutdown.ts`'s drain, after
  * in-flight critical sections have settled and before the gateway connection closes). Only plugins
- * that are actually `running` are disposed — one that never activated, or whose `activate()` threw,
- * has nothing `dispose()` could safely release. Unlike `activatePlugins` (deliberately sequential,
+ * that are actually `running` are disposed HERE — one that never activated, or whose `activate()` threw,
+ * has nothing `dispose()` could safely release (a plugin whose `activate()` settles during the shutdown is
+ * disposed by the activation loop instead, #541, below). Unlike `activatePlugins` (deliberately sequential,
  * "in order"), every running plugin's `dispose?.()` starts at once and each is bounded
  * independently by the SAME `timeoutMs` (see that constant's own comment for why concurrent, not
  * sequential, is what actually keeps one wedged plugin from delaying another's chance to even
@@ -789,8 +792,10 @@ export const PLUGIN_DISPOSE_TIMEOUT_MS = 2_000;
  * after each await: a plugin whose `activate()` is still pending is disposed by that loop once it settles
  * (and left off), and none after it is activated. So the shutdown also waits for the activation in flight,
  * concurrently with the disposals above and bounded by the same `timeoutMs` (a wedged `activate()` is given
- * up on, like a wedged `dispose()`; the late dispose shares that one bound). Nothing is waited for once boot
- * has finished: `activation` is then long settled.
+ * up on, like a wedged `dispose()`). The loop's own late dispose is bounded separately, by
+ * PLUGIN_DISPOSE_TIMEOUT_MS: production passes that same constant here, so in production the activate()
+ * that settles late in the wait and then disposes slowly gets only what is left of one bound. Nothing is
+ * waited for once boot has finished: `activation` is then long settled.
  */
 export async function disposePlugins(loaded: readonly LoadedPlugin[], log: BaseLog, timeoutMs: number): Promise<void> {
   disposing = true;
@@ -1299,7 +1304,8 @@ let activation: Promise<void> = Promise.resolve();
 /** What the test-state guard (test/stateGuard.ts) reads here: `writes` settles once every
  *  state.json update queued through `mutatePluginState` has (which `resetPluginHostForTest` drops);
  *  `disposing` is whether `disposePlugins` ran (activatePlugins now refuses every plugin until
- *  `resetPluginDisposingForTest()`); `activation` settles once the activation run in flight has (#541). */
+ *  `resetPluginDisposingForTest()`); `activation` settles once the activation run in flight has (#541;
+ *  only `resetPluginHostForTest` forgets a run, so a test that leaves one running is still seen). */
 export function pluginHostStateForTest(): { writes: Promise<void>; disposing: boolean; activation: Promise<void> } {
   return { writes: stateMutator.idle(), disposing, activation };
 }
@@ -1311,16 +1317,17 @@ export function pluginHostStateForTest(): { writes: Promise<void>; disposing: bo
  *  disposing flag and forgets the activation run (see `resetPluginDisposingForTest`). */
 export function resetPluginHostForTest(): void {
   stateMutator = createKeyedJsonMutator<PluginStateFile>();
+  activation = Promise.resolve();
   resetPluginDisposingForTest();
 }
 
-/** #541: puts the disposing flag back to false and forgets the activation run — and nothing else. The
- *  flag-only half of `resetPluginHostForTest`, for a test's own cleanup after it called `disposePlugins`
- *  (an `afterEach`): it leaves the state.json write queue alone, so a write the test leaked is still
- *  seen by the guard (the CONTEXT.md convention that `resetPluginHostForTest` is not for cleanup). */
+/** #541: puts the disposing flag back to false — and nothing else. The flag-only half of
+ *  `resetPluginHostForTest`, for a test's own cleanup after it called `disposePlugins` (an `afterEach`):
+ *  it leaves the state.json write queue AND the activation run alone, so a write or an activation the test
+ *  leaked is still seen by the guard (the CONTEXT.md convention that `resetPluginHostForTest` is not for
+ *  cleanup). */
 export function resetPluginDisposingForTest(): void {
   disposing = false;
-  activation = Promise.resolve();
 }
 
 /** Race-safe read-modify-write of data/plugins/state.json (see stateMutator). */

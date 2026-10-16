@@ -111,21 +111,25 @@ describe("pluginHostStateForTest", () => {
       expect(pluginHostStateForTest().disposing).toBe(true); // never cleared by production code
     });
 
-    test("resetPluginDisposingForTest clears the flag and forgets an activation run; resetPluginHostForTest does too", async () => {
+    // The flag-only reset is a test's own cleanup, so it must leave an activation the test leaked visible to the
+    // guard; only the guard's own reset (resetPluginHostForTest) forgets a run.
+    test("resetPluginDisposingForTest clears only the flag; resetPluginHostForTest also forgets an activation run", async () => {
       const held = heldActivate();
       const run = activatePlugins([loaded(entry({ name: "held" }), { activate: held.activate })], makeLog().log, 5_000);
       await held.started;
       expect(await settled(pluginHostStateForTest().activation)).toBe(false); // the run in flight
       await disposePlugins([], makeLog().log, 10); // gives up on it after 10 ms
       expect(pluginHostStateForTest().disposing).toBe(true);
+
       resetPluginDisposingForTest();
       expect(pluginHostStateForTest().disposing).toBe(false);
-      expect(await settled(pluginHostStateForTest().activation)).toBe(true); // forgotten, though the run itself is still going
+      expect(await settled(pluginHostStateForTest().activation)).toBe(false); // still the run in flight: the guard would see it
 
       await disposePlugins([], makeLog().log, 10);
       expect(pluginHostStateForTest().disposing).toBe(true);
       resetPluginHostForTest();
       expect(pluginHostStateForTest().disposing).toBe(false);
+      expect(await settled(pluginHostStateForTest().activation)).toBe(true); // forgotten, though the run itself is still going
 
       held.resolve(); // let the run finish (the flag is down again, so the plugin simply comes up)
       await run;
@@ -2369,12 +2373,37 @@ describe("a shutdown during plugin activation (#541)", () => {
     const run = activatePlugins([lp], log, 10_000);
     await held.started;
     const t0 = performance.now();
-    await disposePlugins([wedgedDispose, lp], log, 300); // the dispose gives up at 300 ms, the activation wait too
+    await disposePlugins([wedgedDispose, lp], log, 400); // the dispose gives up at 400 ms, the activation wait too
     const took = performance.now() - t0;
-    expect(took).toBeGreaterThanOrEqual(270);
-    expect(took).toBeLessThan(550); // one after the other it would be ~600
+    expect(took).toBeGreaterThanOrEqual(370);
+    expect(took).toBeLessThan(650); // one after the other it would be ~800
     held.resolve();
     await run;
+  });
+
+  // The late dispose runs inside the loop, so if it never settled the run would never end and no later plugin
+  // would be visited. The bound is a parameter (like the activate bound) so this does not take 2 s.
+  test("a late dispose() that never settles is given up on after its own bound, so the run still ends", async () => {
+    const { log } = makeLog();
+    const held = heldActivate();
+    const lp = loaded(entry({ name: "two" }), { activate: held.activate, dispose: () => new Promise<void>(() => {}) });
+    const run = activatePlugins([lp], log, 10_000, 50); // the late dispose gets 50 ms
+    await held.started;
+    await disposePlugins([], log, 10); // the shutdown gives up on the wait; the loop carries on without it
+    held.resolve();
+    expect(await orHung(run)).not.toBe("hung");
+    expect([lp.running, lp.error]).toEqual([false, "shutdown began during activate()"]);
+  });
+
+  // `activation` is what disposePlugins waits on, "settled, never rejecting". A throwing logger makes the run
+  // itself reject (the pre-start warn is outside the loop's try), which must not reach the shutdown's wait.
+  test("a run that rejects is published as settled, so the shutdown's wait still resolves", async () => {
+    const throwingWarn = { info: () => {}, warn: () => { throw new Error("log boom"); }, error: () => {} };
+    await disposePlugins([], makeLog().log, 10); // a shutdown already began, so the first plugin's warn fires
+    const lp = loaded(entry({ name: "one" }), { activate: async () => {} });
+    await expect(activatePlugins([lp], throwingWarn, 20)).rejects.toThrow("log boom");
+    expect(await settled(pluginHostStateForTest().activation)).toBe(true);
+    await expect(disposePlugins([], makeLog().log, 50)).resolves.toBeUndefined();
   });
 
   test("nothing is waited for once boot has finished", async () => {
