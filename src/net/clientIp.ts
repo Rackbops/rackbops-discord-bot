@@ -59,6 +59,8 @@ async function defaultLookup(host: string): Promise<string[]> {
  * plain IPv4 address, a hostname) passes through unchanged.
  */
 export function canonicalAddress(address: string): string {
+  // First, and on its own: the dotted mapped form is what Bun reports for every IPv4 peer, so the common
+  // request skips the URL parse below (which would reach the same answer through the hex fold).
   const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(address);
   if (mapped) return mapped[1]!;
   if (isIP(address) !== 6) return address;
@@ -110,7 +112,7 @@ export function createTrustedProxy(opts: {
     const run = (async () => {
       try {
         addresses = new Set((await lookup(host)).map(canonicalAddress));
-        nextRefreshAt = now() + REFRESH_THROTTLE_MS;
+        // A success keeps the full-window stamp set above; only a failure shortens it (below).
         if (!everResolved || failing) log?.log(`[http] TRUSTED_PROXY_HOST "${host}" resolved to ${addresses.size} address(es)`);
         everResolved = true;
         failing = false;
