@@ -345,7 +345,7 @@ export async function handleCommand(
     await target.command.handle(interaction);
     return "answered";
   } catch (err) {
-    // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+    // #545: a failed reply (a REST error, or a network failure whose `path` is the URL) carries the interaction token in `url` and the reply in
     // `requestBody`; withoutRequest keeps code/status/method.
     console.error(`[plugins] ${target.plugin} command /${interaction.commandName} failed`, withoutRequest(err));
     if (!interaction.replied && !interaction.deferred) {

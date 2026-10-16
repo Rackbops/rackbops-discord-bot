@@ -188,6 +188,13 @@ describe("withoutRequest (#508)", () => {
     const token = `token-${crypto.randomUUID()}`;
     const url = `http://127.0.0.1:9/v10/interactions/5/${token}/callback`;
     const networkError = () => Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused", path: url, errno: 0 });
+    /** Whether `value`, or anything under its `cause` / `errors`, still has a `requestBody` (looked at directly, however deep). */
+    const carriesAnywhere = (value: unknown): boolean => {
+      if (!(value instanceof Error)) return false;
+      if ("requestBody" in value) return true;
+      const members = value instanceof AggregateError ? value.errors : [];
+      return [value.cause, ...members].some(carriesAnywhere);
+    };
     const printedAll = (value: unknown) => [format("x", value), Bun.inspect(value), JSON.stringify(value)].join("\n");
 
     test("a bare network error whose path is the request URL is cleaned: name, message and code kept, path dropped", () => {
@@ -280,28 +287,109 @@ describe("withoutRequest (#508)", () => {
       expect(printedAll(clean)).not.toContain(token);
     });
 
-    test("an error with no request-carrying cause comes back as it is, and a cause cycle ends", () => {
+    test("an error with no request-carrying cause comes back as it is", () => {
       const plain = new Error("x", { cause: new Error("y") });
       expect(withoutRequest(plain)).toBe(plain);
-      const loop = new Error("loop");
-      loop.cause = loop;
-      expect(withoutRequest(loop)).toBe(loop);
-      const aggregateLoop = new AggregateError([], "agg");
-      (aggregateLoop.errors as unknown[]).push(aggregateLoop);
-      expect(withoutRequest(aggregateLoop)).toBe(aggregateLoop);
+      const notAnError = new Error("x", { cause: "just text" });
+      expect(withoutRequest(notAnError)).toBe(notAnError);
     });
 
-    test("a request-carrying error is found up to five levels down, and a chain longer than that is left alone", () => {
+    test("a cause cycle ends at the bound, cut off, and does not hang", () => {
+      const loop = new Error("loop");
+      loop.cause = loop;
+      const clean = withoutRequest(loop) as Error;
+      expect(clean.message).toBe("loop");
+      const aggregateLoop = new AggregateError([], "agg");
+      (aggregateLoop.errors as unknown[]).push(aggregateLoop);
+      const cleanAggregate = withoutRequest(aggregateLoop) as AggregateError;
+      expect(cleanAggregate).toBeInstanceOf(AggregateError);
+      expect(cleanAggregate.message).toBe("agg");
+    });
+
+    // It runs inside catch blocks: a throw out of it would cost the user's reply and hide the real error.
+    test("an error it cannot read is replaced by a placeholder, never thrown out of it", () => {
+      const withGetter = (key: string) => {
+        const err = new Error("x");
+        Object.defineProperty(err, key, { get: () => { throw new Error(`getter ${key}`); } });
+        return err;
+      };
+      // Read on every error: replaced. `code` and `status` are read only when a copy is made, which a throwing
+      // `cause` or `path` has already ended; on an error that is no copy candidate they are never touched.
+      for (const key of ["cause", "path", "url"]) {
+        const replaced = withoutRequest(withGetter(key)) as Error;
+        expect(replaced, key).toBeInstanceOf(Error);
+        expect(replaced.message, key).toContain("could not be inspected safely");
+      }
+      for (const key of ["code", "status"]) {
+        const untouched = withGetter(key);
+        expect(withoutRequest(untouched), key).toBe(untouched);
+      }
+      const requestWithBadCode = Object.assign(withGetter("code"), { requestBody: { content: marker } });
+      expect((withoutRequest(requestWithBadCode) as Error).message).toContain("could not be inspected safely");
+      const aggregate = new AggregateError([], "agg");
+      Object.defineProperty(aggregate, "errors", { get: () => { throw new Error("getter errors"); } });
+      expect((withoutRequest(aggregate) as Error).message).toContain("could not be inspected safely");
+      const hostile = new Proxy(new Error("proxy"), { has: () => { throw new Error("has trap"); } });
+      expect((withoutRequest(hostile) as Error).message).toContain("could not be inspected safely");
+    });
+
+    test("a wide, self-referencing AggregateError is bounded: it is replaced, in milliseconds", () => {
+      const wide = new AggregateError([], "wide");
+      for (let i = 0; i < 30; i += 1) (wide.errors as unknown[]).push(wide);
+      const started = Date.now();
+      const replaced = withoutRequest(wide) as Error;
+      expect(Date.now() - started).toBeLessThan(500);
+      expect(replaced.message).toContain("could not be inspected safely");
+    });
+
+    test("an AggregateError past the last level followed is cut off too", () => {
+      let deep: unknown = new AggregateError([discordError()], "deep aggregate");
+      for (let i = 0; i < 5; i += 1) deep = new Error(`level ${i}`, { cause: deep });
+      expect(carriesAnywhere(deep)).toBe(true);
+      const clean = withoutRequest(deep);
+      expect(carriesAnywhere(clean)).toBe(false);
+      let last: unknown = clean;
+      while (last instanceof Error && last.cause !== undefined) last = last.cause;
+      expect(last).toBeInstanceOf(AggregateError);
+      expect((last as AggregateError).errors).toEqual([]);
+    });
+
+    test("a mix of a shallow and a too-deep request-carrying error is cleaned in both", () => {
+      let deep: unknown = discordError();
+      for (let i = 0; i < 6; i += 1) deep = new Error(`deep ${i}`, { cause: deep });
+      let near: unknown = new AggregateError([discordError(), deep], "mixed");
+      for (let i = 0; i < 3; i += 1) near = new Error(`near ${i}`, { cause: near });
+      expect(carriesAnywhere(near)).toBe(true); // the control
+      expect(carriesAnywhere(withoutRequest(near))).toBe(false);
+    });
+
+    test("a copy keeps only the properties it has: a network error gains no status or method", () => {
+      const clean = withoutRequest(networkError()) as Error & Record<string, unknown>;
+      expect("status" in clean).toBe(false);
+      expect("method" in clean).toBe(false);
+    });
+
+    test("a request-carrying error is found up to five levels down, and what hangs below that is cut off", () => {
       const wrapped = (levels: number) => {
         let deep: unknown = discordError();
         for (let i = 0; i < levels; i += 1) deep = new Error(`level ${i}`, { cause: deep });
-        return deep;
+        return deep as Error;
       };
       const five = wrapped(5);
       expect(printedAll(five)).toContain("requestBody:");
       expect(printedAll(withoutRequest(five))).not.toContain("requestBody:");
+      // Six wrappers put the request-carrying error past the last level followed: the wrapper there is copied
+      // with its cause cut off, never left raw (the chain's top is a copy too, since something below it changed).
       const six = wrapped(6);
-      expect(withoutRequest(six)).toBe(six); // past the bound: returned unchanged, not half-cleaned
+      expect(printedAll(six)).toContain("requestBody:");
+      const clean = withoutRequest(six) as Error;
+      expect(clean).not.toBe(six);
+      expect(printedAll(clean)).not.toContain("requestBody:");
+      // The six wrappers stay, named; the request-carrying error under the last one is gone, not half-cleaned.
+      const chain: Error[] = [];
+      for (let e: unknown = clean; e instanceof Error; e = e.cause) chain.push(e);
+      expect(chain.map((e) => e.message)).toEqual(["level 5", "level 4", "level 3", "level 2", "level 1", "level 0"]);
+      expect(carriesAnywhere(clean)).toBe(false);
     });
   });
 

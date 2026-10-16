@@ -836,7 +836,7 @@ export async function dispatchPluginInteractionOutcome(
     await handler.call(lp.plugin, interaction);
     return "answered";
   } catch (err) {
-    // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+    // #545: a failed reply (a REST error, or a network failure whose `path` is the URL) carries the interaction token in `url` and the reply in
     // `requestBody`; withoutRequest keeps code/status/method.
     log.error(`[plugins] ${lp.entry.name} interaction failed`, withoutRequest(err));
     if (!interaction.replied && !interaction.deferred) {
@@ -939,7 +939,7 @@ export async function dispatchPluginAutocomplete(opts: {
       }
     }
   } catch (err) {
-    // #545: as the interaction handler above -- a REST error's `url` and `requestBody` are not logged.
+    // #545: as the interaction handler above -- a failed call's `url`, `path` and `requestBody` are not logged.
     log.error(`[plugins] ${target?.entry.name} autocomplete for "${bare}" failed`, withoutRequest(err));
   }
   if (!respondCalled && !interaction.responded) await interaction.respond([]);

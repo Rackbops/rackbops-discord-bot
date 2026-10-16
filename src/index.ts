@@ -300,7 +300,7 @@ async function activate(c: Client<true>): Promise<void> {
           log: console,
         });
       }
-      // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+      // #545: a failed reply (a REST error, or a network failure whose `path` is the URL) carries the interaction token in `url` and the reply in
       // `requestBody`; withoutRequest keeps what an operator needs (code, status, method).
     } catch (err) {
       outcome = "error";

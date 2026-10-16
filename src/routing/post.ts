@@ -55,8 +55,8 @@ function usableWebhook(routing: RoutingFile, channelId: string): WebhookMeta | u
  * exactly once.
  *
  * It rejects only when EVERY target failed, with the first error (the others are logged) -- both through
- * `withoutRequest`, so a discord.js REST error carries no `requestBody` (#508); any other error is
- * unchanged. A plugin that sees a rejection typically posts again on its next tick, and that would post
+ * `withoutRequest`, so a discord.js REST error carries no `requestBody` (#508); an error that carries
+ * no request is unchanged. A plugin that sees a rejection typically posts again on its next tick, and that would post
  * again to the channels that DID get the message -- every minute, for as long as one channel stays
  * unreachable. With one target (the case with no routing) this is exactly today's behaviour: the failure
  * propagates.
