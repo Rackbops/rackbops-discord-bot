@@ -195,7 +195,7 @@ export async function tryInspectContainer(
  *
  * Success is the absence of an error line, nothing more: a stream that was cleanly truncated reads
  * as `ok`. Requiring a success marker was considered and declined; such a build surfaces later, not
- * here — `redeploy()` goes on to prune images, inspect itself, quiesce the scheduler and clear any
+ * here — `redeploy()` goes on to prune images, inspect its own image, quiesce the scheduler and clear any
  * leftover replacement, and then `createContainer` 404s on the tag that was never made, reported as `could not
  * start the replacement: …` (after which `endHandoff()` resumes the scheduler), not as `build failed:`.
  */

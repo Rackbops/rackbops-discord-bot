@@ -43,8 +43,9 @@ const hang = await bounded("hang");
 const wedge = await bounded("wedge");
 // Without this the wedge case could silently become a second copy of the hang case (a renamed path in the
 // handler above would send nothing at all): prove the wedge handler really sends its headers, which is the
-// part that distinguishes it. A handler that sent none would leave this fetch waiting, and the parent's
-// spawn timeout kills the child -- red, not green.
+// part that distinguishes it. A handler that sent none would leave this fetch waiting until the server's own
+// request timeout (about 10 s) drops the connection and the child exits 1, or the parent's spawn timeout
+// kills it -- red, not green.
 const probe = new AbortController();
 const wedgeResponse = await fetch("http://docker/containers/wedge/json", { unix: socket, signal: probe.signal });
 const wedgeStatus = wedgeResponse.status;

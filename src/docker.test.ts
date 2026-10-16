@@ -55,9 +55,8 @@ describe("parseContainerId", () => {
 
 // #459: the socket path is a test seam read once at import, so the in-process suite can only pin its default
 // (the `unix` assertions below). The choice itself is this pure function. An EMPTY value is unset: the whole
-// operator `.env` reaches the process, and `unix: ""` would send every call somewhere other than the daemon
-// (both reviewers' probes of Bun 1.4.2 saw it fail, one as a hang until the bound), the very failure the
-// transport pin exists to catch.
+// operator `.env` reaches the process, and Bun treats an empty `unix` as absent and dials TCP `http://docker`,
+// which fails by a DNS error or hangs until the bound -- the very failure the transport pin exists to catch.
 describe("resolveDockerSocket (#459)", () => {
   test("defaults to /var/run/docker.sock when the variable is unset or empty, and otherwise takes it as given", () => {
     expect(resolveDockerSocket({})).toBe("/var/run/docker.sock");
@@ -490,6 +489,7 @@ describe("daemon calls", () => {
 // Runs on Windows and Linux; CI's Linux run is the one that counts for the production kernel.
 describe("the real transport (#459)", () => {
   const FIXTURE = join(import.meta.dir, "..", "test", "dockerSocketChild.ts");
+  const DEFAULT_FIXTURE = join(import.meta.dir, "..", "test", "dockerSocketDefaultChild.ts");
   const CHILD_TIMEOUT_MS = 20_000;
 
   interface Bounded {
@@ -498,6 +498,32 @@ describe("the real transport (#459)", () => {
     elapsedMs: number;
   }
 
+  /** Runs a fixture in a child process with `DOCKER_SOCKET` as given and returns the last stdout line, parsed. */
+  function runFixture<T>(fixture: string, socket: string): T {
+    const child = Bun.spawnSync([process.execPath, fixture], {
+      cwd: join(import.meta.dir, ".."),
+      env: { ...process.env, DOCKER_SOCKET: socket },
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: CHILD_TIMEOUT_MS,
+    });
+    if (child.exitCode !== 0) {
+      const why = child.exitedDueToTimeout
+        ? `was killed after ${CHILD_TIMEOUT_MS}ms`
+        : `exited ${child.exitCode} (signal ${child.signalCode ?? "none"})`;
+      throw new Error(`fixture ${why}:\n${child.stderr.toString()}\n${child.stdout.toString()}`);
+    }
+    return JSON.parse(child.stdout.toString().trim().split("\n").at(-1) ?? "") as T;
+  }
+
+  // An empty DOCKER_SOCKET is unset (the `.env` of a deployment can carry a blank line). The pure function is
+  // pinned above; this shows the module-level constant goes through it, which only a fresh import can.
+  test("a blank DOCKER_SOCKET in the environment leaves daemon calls on /var/run/docker.sock", () => {
+    const run = runFixture<{ reachable: boolean; unix: (string | undefined)[] }>(DEFAULT_FIXTURE, "");
+    expect(run.reachable).toBe(true);
+    expect(run.unix).toEqual(["/var/run/docker.sock"]);
+  });
+
   test(
     "the real fetch reaches a unix socket at DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound",
     () => {
@@ -505,21 +531,10 @@ describe("the real transport (#459)", () => {
       // `finally`; the socket sits directly inside, short because Linux caps a socket path near 108 bytes.
       const dir = mkdtempSync(join(tmpdir(), `${TEST_DATA_PREFIX}${process.pid}-`));
       try {
-        const child = Bun.spawnSync([process.execPath, FIXTURE], {
-          cwd: join(import.meta.dir, ".."),
-          env: { ...process.env, DOCKER_SOCKET: join(dir, "d.sock") },
-          stdout: "pipe",
-          stderr: "pipe",
-          timeout: CHILD_TIMEOUT_MS,
-        });
-        if (child.exitCode !== 0) {
-          const why = child.exitedDueToTimeout
-            ? `was killed after ${CHILD_TIMEOUT_MS}ms`
-            : `exited ${child.exitCode} (signal ${child.signalCode ?? "none"})`;
-          throw new Error(`fixture ${why}:\n${child.stderr.toString()}\n${child.stdout.toString()}`);
-        }
-        const last = child.stdout.toString().trim().split("\n").at(-1) ?? "";
-        const run = JSON.parse(last) as { ping: boolean; hang: Bounded; wedge: Bounded; wedgeStatus: number };
+        const run = runFixture<{ ping: boolean; hang: Bounded; wedge: Bounded; wedgeStatus: number }>(
+          FIXTURE,
+          join(dir, "d.sock"),
+        );
         expect(run.ping).toBe(true);
         expect(run.wedgeStatus).toBe(200); // the wedge handler's headers really arrived before it stalled
         for (const [shape, r] of [["hang", run.hang], ["wedge", run.wedge]] as const) {
