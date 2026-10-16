@@ -389,7 +389,10 @@ describe("selectPlugins -- privileged gateway intents (#493)", () => {
       expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped, intents.join(",")).toMatch(/privileged gateway intent/);
     }
     const idx = index([entry({ name: "p", intents: [GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] })]);
-    expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toContain("MessageContent");
+    // The declared list is quoted in full and comma-space separated (the panel and state.json show this line).
+    expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBe(
+      "declares the privileged gateway intent MessageContent (in [512, 32768]), which the host never requests",
+    );
   });
 
   test("the privileged bits are discord.js's", () => {

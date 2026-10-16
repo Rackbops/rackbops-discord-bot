@@ -160,9 +160,8 @@ export function resolveConfig(env: Env): Config {
   // -- fail closed, the same rule #220's own HTTP_PORT above uses. A hostname (letters, digits, `.`, `_`,
   // `-` -- a compose service name may carry an underscore) or an IP literal as `node:net`'s `isIP` reads
   // it: IPv6 in any spelling (a zone id is accepted and ignored), **without** brackets, which `dns.lookup`
-  // cannot resolve (a tunnel running
-  // on the host reaches the container via the bridge gateway's address rather than a compose service
-  // name). `clientIp.ts` canonicalizes both sides of the comparison (#494).
+  // cannot resolve (a tunnel running on the host reaches the container via the bridge gateway's address
+  // rather than a compose service name). `clientIp.ts` canonicalizes both sides of the comparison (#494).
   const trustedProxyHost = optional("TRUSTED_PROXY_HOST");
   if (trustedProxyHost !== undefined && isIP(trustedProxyHost) === 0 && !/^[A-Za-z0-9_.-]+$/.test(trustedProxyHost)) {
     throw new Error(`TRUSTED_PROXY_HOST must be a hostname or IP address, got "${trustedProxyHost}"`);

@@ -403,7 +403,7 @@ describe("resolveConfig -- TRUSTED_PROXY_HOST (#319)", () => {
   // #494 item 9: an underscore is legal in a compose service name; an IPv6 literal is accepted in any spelling
   // (clientIp.ts canonicalizes both sides of the comparison), but never in brackets, which `dns.lookup` cannot resolve.
   test("a compose hostname or an IP literal (v4 or v6, any spelling) is accepted verbatim", () => {
-    for (const value of ["cloudflared", "cloud_flared", "172.18.0.1", "fd00::1", "FD00::1", "fd00:0:0:0:0:0:0:1", "::ffff:10.0.0.5"]) {
+    for (const value of ["cloudflared", "cloud_flared", "172.18.0.1", "fd00::1", "FD00::1", "fd00:0:0:0:0:0:0:1", "::ffff:10.0.0.5", "fe80::1%8", "fe80::b1c9:ea7d:c0c5:bd23%Ethernet"]) {
       expect(resolveConfig({ ...base, TRUSTED_PROXY_HOST: value }).trustedProxyHost).toBe(value);
     }
   });

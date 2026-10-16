@@ -55,8 +55,9 @@ async function defaultLookup(host: string): Promise<string[]> {
  * Any other IPv6 literal is canonicalized through the URL parser (#494): lowercase, zeros compressed, an
  * embedded IPv4 tail in hex, so an operator's `FD00::1` or `fd00:0:0:0:0:0:0:1` equals the compressed form
  * `srv.requestIP` reports. The WHATWG host parser is the one IPv6 normalizer the runtime ships; it refuses
- * a zone id, so that is dropped first (a link-local peer is reported without one, so a zone could never
- * match). Applied on BOTH sides of the comparison. Anything else (a plain IPv4 address, a hostname) passes
+ * a zone id, so that is dropped first (Bun 1.4.2 on Windows reports a link-local peer without one, so a zone
+ * could never match; dropping it on both sides makes the comparison hold whichever way a platform reports
+ * it). Applied on BOTH sides of the comparison. Anything else (a plain IPv4 address, a hostname) passes
  * through unchanged.
  */
 export function canonicalAddress(address: string): string {
@@ -66,7 +67,8 @@ export function canonicalAddress(address: string): string {
   if (mapped) return mapped[1]!;
   if (isIP(address) !== 6) return address;
   // A zone id (`fe80::1%eth0`, `fe80::1%8`) is dropped: `isIP` accepts it and `dns.lookup` returns it, but Bun
-  // reports a link-local peer WITHOUT one (probed on Bun 1.4.2), so a zone could never match the peer.
+  // reports a link-local peer WITHOUT one (probed on Bun 1.4.2, Windows), so a zone could never match the peer.
+  // Dropped on both sides, the comparison holds whichever way a platform reports it.
   const zoneAt = address.indexOf("%");
   const bare = zoneAt === -1 ? address : address.slice(0, zoneAt);
   let canonical: string;

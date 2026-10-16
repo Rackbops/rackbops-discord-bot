@@ -849,7 +849,7 @@ DISCORD_TOKEN=<Pip's bot token>
 ANNOUNCE_CHANNEL_ID=<channel id>
 RELEASE_ANNOUNCE_CHANNEL_ID=
 # The one approved server: registration is one guild-scoped PUT there and nowhere else
-# (src/routing/register.ts:56-59, :128-131, reached from src/index.ts:378-393). Set it before the
+# (src/routing/register.ts:56-59, :128-131, reached from src/index.ts:382-397). Set it before the
 # first up (see above): single-server mode never clears a global list an earlier boot left behind.
 DISCORD_SERVER_ID=<server id>
 # Every command is prefixed, core ones included (src/commandNaming.ts:15-16, used at :22-23;
@@ -932,7 +932,7 @@ the host's other interaction replies, which go only to the person who interacted
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:224-228` |
 | `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from members without Discord's Administrator permission (`src/commands.ts:106-107` and `:138`); the handler then refuses anyone not in `ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included. | `src/commands.ts:107` and `:138`; the refusal `:50-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:15-16` |
 | `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts:66-72` |
-| `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:220`; `src/index.ts:378-393` |
+| `/pipagent` | The plugin's `agent` command, prefixed by `buildCommandBody`; registered with the core commands in one guild-scoped PUT to `DISCORD_SERVER_ID`. | Single mode (no `routing.json`) with a home guild: `src/routing/register.ts:56-59`, executed at `:128-131`. Not a direct REST call in `index.ts`: `initRouting` and `applyRouting` do it. Its replies are to whoever typed it. | `src/plugins/host.ts:293-332`, called at `src/index.ts:220`; `src/index.ts:382-397` |
 | Report-backs after an update | Nowhere under this `.env` unless a mailbox request moved the plugin (see why). In general: an ephemeral follow-up where the command was typed, within 15 minutes of it, else a DM, else a channel post (`src/updateReport.ts:101-104`, the window `:13-14`; the follow-up is a raw REST webhook POST, `:128-133`, the one send path outside the Client, `src/client.ts:6-7`). | Delivered only when an owed marker exists: `state.pendingUpdateReport`, set only with a `requester` (the guard `src/update.ts:103-111`, applied at `:303-308`; the one call site constructing a requester is `src/commands.ts:117`), or `state.pendingReport`, set by `/plugins update`, `runDueSchedules` and a mailbox `update-now` (`src/plugins/requests.ts:497-507`). `/pipupdate` and `/pipplugins` refuse here, so the mailbox, which writes only `state.pendingReport` (`src/plugins/requests.ts:498-505`), is the only writer left and `state.pendingUpdateReport` has none; a snowflake `requestedBy` is DMed and any other value is logged (`src/plugins/updates.ts:697-702`: the log at `:697-698`, the DM at `:702`). | `src/index.ts:457` (`reportUpdateOutcome`, `src/updateReport.ts:156-176`) and `:461-472` (`reportPluginUpdateOutcome`, `src/plugins/updates.ts:684-714`) |
 | Plugin `post` / `dm` / `edit` / `announce` (the host API) | A DM or an edit, **sent by core code on the plugin's request**: this is the path owner result DMs take. A channel delivery is refused here: `host.post` is wired (`src/index.ts:199-208`), every channel delivery takes that branch (`plugins/mcp/src/drain.ts:177-190`), and with no `routing.json` it throws "destination is not mapped in that server" before any Discord call (`src/plugins/host.ts:148-150`, `src/routing/resolve.ts:95-99`), recorded `failed` / `UPSTREAM_UNAVAILABLE`. Pip runs no panel, and the bot's own paths map a destination only through a `routing-set` request written to the host mailbox (`ops/bot-ops.sh:1279-1303`, applied at `src/plugins/requests.ts:381`), the same host-side write the scheduled-update row describes; this runbook writes none. The `announce` fallback to `ANNOUNCE_CHANNEL_ID` (`plugins/mcp/src/drain.ts:196-202`) runs only when `host.post` is not a function, so never here. | Only the `mcp` plugin calls it here, and only when the bridge's service sends a delivery (or the plugin's own tick re-drives one a restart left `unknown`, `plugins/mcp/src/index.ts:65-80`; the `edit` call `plugins/mcp/src/drain.ts:105`, the DM call `:133`, the channel branch `:177-190`); the service's grants for the principal bound what it may ask for (section 4). | `src/index.ts:179-208` (the host wiring); `src/plugins/delivery.ts:16-46` (`sendPayloadToChannel`, `sendPayloadDm`), `:56-62` (`editOwnMessage`); `src/routing/post.ts:60` (`postForPlugin`, the `announce` path) |
 | Guild events | Nothing sent. | `GuildCreate`/`GuildDelete` re-register commands or rewrite discovery. | `src/index.ts:303-304`, `src/routing/live.ts:272-293` |
@@ -1044,7 +1044,7 @@ env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints i
 `{"dm":true,...}` says the listener is up, the token the plugin loaded is the one the container was created
 with (a file edited since then needs a recreate), and DMs are enabled
 (`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
-the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:175-184`),
+the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:182-191`),
 so it may run in a loop. The failing answers below do count toward that lockout (a bad bearer records a
 failure, `auth.ts:66-67`; more than ten in a minute answers `429`, `auth.ts:8-12`), so read them by hand
 rather than looping. Any other answer:
@@ -1069,7 +1069,7 @@ rather than looping. Any other answer:
   (`host.ts:850`; `mcp` 0.3.1 has one). An unexpected failure of the whole plugin setup instead logs a line
   beginning `[plugins] plugin setup failed` and the bot starts core-only (`src/index.ts:222-224`).
 - No answer: the listener binds after login, plugin install and activation (`src/index.ts:330-357`,
-  `startHostHttp` at `:346`) and before command registration (`:378-393`), so a boot that has not reached
+  `startHostHttp` at `:346`) and before command registration (`:382-397`), so a boot that has not reached
   that point answers nothing yet; a bind failure logs a line beginning `[http] could not listen on :8794`
   (`:355`); with `HTTP_PORT` unset there is no listener at all (`:330`); otherwise the port in the probe is
   not `HTTP_PORT`.

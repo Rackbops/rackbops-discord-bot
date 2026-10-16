@@ -444,6 +444,7 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
 // narrowing the bot's class in either part refuses something env-set accepted.
 const WATCHED_REPOS_CORPUS = [
   "none", "None", "NONE", "nonE", "foo", "foo/", "/foo", "a/b/c", "a//b", "a b/c", "a/b c", "a/b@1", "a/b#c", "ünï/cøde",
+  "a@b/c", "a#b/c", "a:b/c", "a+b/c", "a~b/c", "a\\b/c", "a/b:c", "a/b+c", "a/b~c",
   "a/b", "A/B", "0/9", "a.b/c", "a/b.c", "a_b/c", "a/b_c", "a-b/c", "a/b-c", "0a/c", "a/b0", "Acme.js/thing_2-x", "a.b.c/d.e.f",
   "a/b,c/d", "a/b,c/d,e/f", "a/b,None", "None,a/b", "none,a/b", "a/b,none", "a/b,foo", "a/b,,c/d", "a/b,", ",a/b", "a/b, c/d",
   "",

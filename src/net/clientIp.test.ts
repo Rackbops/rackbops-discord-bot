@@ -131,6 +131,14 @@ describe("canonicalAddress", () => {
       ["10.0.0.5", "10.0.0.5"],
       ["cloudflared", "cloudflared"],
       ["Not-An-Address", "Not-An-Address"], // anything that is not an IPv6 literal passes through untouched
+      // The mapped folds are anchored: only a WHOLE `::ffff:<ipv4>` address is an IPv4 peer. An unanchored
+      // regex would fold each of these into 10.0.0.5, and a foreign IPv6 peer would be trusted as the sidecar.
+      ["2001:db8::ffff:a00:5", "2001:db8::ffff:a00:5"],
+      ["::ffff:a00:5:1", "::ffff:a00:5:1"],
+      ["::ffff:1:2:3", "::ffff:1:2:3"],
+      ["2001:db8::ffff:10.0.0.5", "2001:db8::ffff:a00:5"], // a dotted tail on a NON-mapped address is only hexed
+      ["2001::ffff:10.0.0.5", "2001::ffff:a00:5"],
+      ["::ffff:10.0.0.5%8", "10.0.0.5"], // zone dropped first, then the same mapped address
     ];
     for (const [input, expected] of table) expect(canonicalAddress(input)).toBe(expected);
   });
