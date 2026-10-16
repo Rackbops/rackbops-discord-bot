@@ -139,6 +139,8 @@ describe("canonicalAddress", () => {
       ["2001:db8::ffff:10.0.0.5", "2001:db8::ffff:a00:5"], // a dotted tail on a NON-mapped address is only hexed
       ["2001::ffff:10.0.0.5", "2001::ffff:a00:5"],
       ["::ffff:10.0.0.5%8", "10.0.0.5"], // zone dropped first, then the same mapped address
+      ["::ffff:10.0.0.5.9", "::ffff:10.0.0.5.9"], // not an address at all: a prefix match must not fold it
+      ["::ffff:10.0.0.5:1", "::ffff:10.0.0.5:1"],
     ];
     for (const [input, expected] of table) expect(canonicalAddress(input)).toBe(expected);
   });
