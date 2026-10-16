@@ -467,7 +467,9 @@ describe("reportUpdateOutcome", () => {
       await reportUpdateOutcome(client, "none", forbidden, null); // the boot saw none at all
       expect(state.pendingUpdateReport).toBe(armedLater);
       expect(onDisk().pendingUpdateReport.userId).toBe("43");
-      expect(log.mock.calls.filter((c) => String(c[0]).includes("armed since this boot began"))).toHaveLength(2);
+      const held = log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("armed since this boot began"));
+      expect(held).toHaveLength(2);
+      expect(held.every((m) => m.includes(shortSha(TO)) && !m.includes(shortSha(FROM)))).toBe(true); // names where it was going
 
       // The report the boot did see is delivered, and cleared.
       const contents: string[] = [];

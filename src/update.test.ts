@@ -882,6 +882,7 @@ describe("resolveUpdateAttempt (#450)", () => {
       expect(state.swapInFlight).toBeUndefined();
       expect(state.attemptedUpdateToSha).toBe(NEW);
       expect(state.pendingUpdateReport).toBeDefined();
+      expect(state.pendingUpdateReport?.interrupted).toBeUndefined(); // stale is not a failed swap: nothing is marked
     }
   });
 
