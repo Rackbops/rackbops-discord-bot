@@ -311,7 +311,7 @@ export interface PluginActionResult {
   reply: string;
   /** The state mutation to apply, or absent for a refusal / no-op (nothing is written then). */
   mutate?: (s: PluginStateFile) => PluginStateFile;
-  /** Set only for `update` NOW — the handler restarts (inside withCritical) after the reply lands. */
+  /** Set only for `update` NOW — the handler requests the restart (inside withCritical) right after the pin write, then replies (#503 item 10). */
   restart?: { from: string; to: string };
 }
 
