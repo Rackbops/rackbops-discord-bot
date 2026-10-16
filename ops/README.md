@@ -1341,10 +1341,12 @@ was rehearsed on this deployment (section 9); the `unregister`, the stop and the
 ## Admin panel
 
 A small per-instance web panel (`ops/admin/`) — an authenticated wrapper around this
-script's own operations, plus a few read-only / self-contained server-native routes (see "What it
+script's own operations, plus a few server-native routes of its own, some of which write (see "What it
 exposes" below). Built primarily to sidestep the `ops.json` gap
 above rather than fix it: reachable from anywhere, not just wherever the desktop app is
-installed, and structurally incapable of touching an instance other than its own (it only ever
+installed, and scoped to its own instance by the four `BOT_OPS_*` values its container is started with
+(not structurally: the container mounts the Docker socket and the host-shared `bin/`, so it is those
+values and `bot-ops.sh`'s checks of them that keep it to one instance; it only ever
 knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance).
 
 **Two doors gate it**, the same pattern already proven for Dockge on nucbox
@@ -1386,9 +1388,10 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    Access vars above — it isn't picked up live. If `admins.json` exists
    but can't be read or parsed (a hand-edit typo, a bad mount), the panel fails **closed**, not
    open: narrowing stays in effect (no JWT authorizes unless a bootstrap email matches) rather
-   than silently reopening to everyone — the `ADMIN_TOKEN` bearer token remains available to fix
-   the file. You can't lock everyone out: bootstrap admins can't be removed from the panel, you
-   can't remove yourself, and — when there's no bootstrap floor at all — the panel refuses to
+   than silently reopening to everyone — a broken `admins.json` is repaired from the host
+   (`/api/admins` reads the file first on GET, POST and DELETE, so it answers 502 until it is),
+   while the `ADMIN_TOKEN` bearer token still reaches every other route. You can't lock everyone
+   out: bootstrap admins can't be removed from the panel, you can't remove yourself, and — when there's no bootstrap floor at all — the panel refuses to
    remove the last remaining admin
    (which would silently reopen it to everyone). Never applied to the bearer-token fallback, which
    stays identity-blind by design.

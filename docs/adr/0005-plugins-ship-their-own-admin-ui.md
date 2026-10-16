@@ -92,7 +92,8 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    panel-level, root-equivalent access, and the Plugin Index is the trust boundary.** A mounted bundle
    is not sandboxed. The panel `import()`s it into its own document (`ops/admin/public/index.html`,
    `mountAdmin(root, makeAdminApi(plugin))`): no iframe, no worker, and no Content-Security-Policy
-   (`handleRequest` sets only `Content-Type` on the page, and the page carries no `http-equiv` policy).
+   (`handleRequest` sets `Content-Type` on the page and `serve` adds `X-Frame-Options` and `X-Content-Type-Options`
+   to every response, #466 — neither is a CSP — and the page carries no `http-equiv` policy).
    Its requests are indistinguishable from the operator's own: a same-origin `fetch` carries the
    Cloudflare Access session and passes the cross-site-write gate, which refuses only a mismatched
    `Origin` (`isCrossSiteWrite`). So a bundle can, for example, `POST /api/admins` to add an admin who
@@ -153,7 +154,7 @@ operator who installs a plugin is trusting its admin code the way they already t
 The `AdminApi` scoping keeps an honest bundle to its own keys, and the server-side `env-set` gate
 refuses core secrets; neither bounds a hostile bundle, and neither is a sandbox. Delivery adds
 exactly two new panel routes (`GET /plugin-admin/<name>.js`, `GET /api/plugin-proxy/<name>`), both
-allowlisted to `ADMIN_ASSET_HOST` and size-capped, so a bundle can never make the panel reach an
+allowlisted to `ADMIN_ASSET_HOST`, size-capped, and never followed through a redirect (#465), so a bundle can never make the panel reach an
 arbitrary origin. #165's installed-version pinning means a tab can legitimately show a
 no-settings-tab-at-this-version note — an expected state (a plugin pinned below its first
 admin-bundle release), not a regression. No change to `src/plugins/contract.ts` or `HOST_API_VERSION` — this ADR's
