@@ -69,7 +69,7 @@ services:
 
   # Opt-in, deploy-only (needs BOT_OPS_CONFIG_DIR/BOT_OPS_COMPOSE_FILE pointed at real /opt/...
   # paths — see ops/install.sh, which generates them; not meant for local dev). A small
-  # per-instance admin web panel, a thin wrapper around ops/bot-ops.sh's five operations. Runs
+  # per-instance admin web panel, a thin wrapper around ops/bot-ops.sh's operations. Runs
   # as its own sidecar (independent of the bot process's lifecycle) with no published host
   # port — reached over the network via nucbox's own pre-existing, host-level Cloudflare tunnel
   # (an ingress rule pointed at this service, external to this compose file), gated by Cloudflare
