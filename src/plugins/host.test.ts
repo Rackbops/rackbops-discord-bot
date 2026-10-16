@@ -2267,7 +2267,11 @@ describe("a shutdown during plugin activation (#541)", () => {
     const held = heldActivate();
     let thirdActivated = false;
     const lp1 = loaded(entry({ name: "one" }), { activate: async () => {}, dispose: async () => { events.push("one disposed"); } });
-    const lp2 = loaded(entry({ name: "two" }), { activate: held.activate, dispose: async () => { events.push("two disposed"); } });
+    // Takes a moment (a server close, a flush): the shutdown must wait for it, not just for it to be started.
+    const lp2 = loaded(entry({ name: "two" }), {
+      activate: held.activate,
+      dispose: async () => { await Bun.sleep(20); events.push("two disposed"); },
+    });
     const lp3 = loaded(entry({ name: "three" }), {
       activate: async () => { thirdActivated = true; },
       dispose: async () => { events.push("three disposed"); },
