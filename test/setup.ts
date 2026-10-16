@@ -74,6 +74,11 @@ process.env.ANNOUNCE_CHANNEL_ID ??= "100";
 // among them), and an ambient COMMAND_PREFIX (a shell's, or Bun's .env autoload) used to fail those tests
 // pointing at the fixture. A test that needs a prefix sets one in a child process (commandPrefix.test.ts).
 process.env.COMMAND_PREFIX = "";
+// #459: the daemon socket path is a test seam (src/docker.ts). Cleared, not defaulted: an ambient value
+// (a shell's, or Bun's .env autoload) would change the path src/docker.ts reads at import, so every
+// stubbed-fetch assertion on the `unix` option would fail. (The real transport test hands its child an
+// explicit BOT_DOCKER_SOCKET, which overrides this either way.)
+delete process.env.BOT_DOCKER_SOCKET;
 
 // The test-state guard is the NEXT preload (test/stateGuardHook.ts), not this one: it loads modules
 // that read the environment set above when they are first imported, and a static import here would
