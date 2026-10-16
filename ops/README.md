@@ -259,7 +259,7 @@ like any other key, but `env-get` never lists one and `env-schema` reports it as
 are write-only" under the safety notes. A key the deployment
 itself owns (a core credential, or a variable `docker-compose.yml` interpolates) or the bot core reads
 without the panel editing it (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`,
-`HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and the four shard variables the discord.js
+`HANDOFF_FROM`, `HANDOFF_RESTART_POLICY`, `HANDOFF_RESTART_RETRIES`, `HOSTNAME`, and the four shard variables the discord.js
 `Client` reads, `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`, `SHARDING_MANAGER_MODE`, and the HTTP
 router's `HTTP_PORT` (#220) and `TRUSTED_PROXY_HOST` (#319), and `LOG_FORMAT` (#324), and `BOT_DOCKER_SOCKET` (#459, the daemon socket path: a test seam that nothing in a deployment sets) — all `RESERVED_KEYS`, #278), or that act on the core's own outbound calls or on a tool it spawns — both
 spellings of each proxy variable, since Bun's `fetch` honours upper- and lower-case alike
@@ -332,7 +332,7 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   deployment or the bot core owns — the core credentials, the access and admin settings, every variable
   `docker-compose.yml` interpolates, the settings the core reads that the panel does not edit
   (`GITHUB_REPO`, `PLUGIN_REGISTRY_URL`, `BOT_DATA_DIR`, `NODE_ENV`, `HANDOFF_FROM`,
-  `HANDOFF_RESTART_POLICY`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
+  `HANDOFF_RESTART_POLICY`, `HANDOFF_RESTART_RETRIES`, `HOSTNAME`, and discord.js's `SHARDS`, `SHARD_COUNT`, `SHARDING_MANAGER`,
   `SHARDING_MANAGER_MODE`, #278; the HTTP router's `HTTP_PORT`, #220, and `TRUSTED_PROXY_HOST`, #319; `LOG_FORMAT`, #324; `BOT_DOCKER_SOCKET`, #459, a test seam that nothing in a deployment sets), and the variables that act on the core's own outbound calls or on a
   tool it spawns — both spellings of each proxy variable (`HTTP_PROXY`/`http_proxy`,
   `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`) and `TAR_OPTIONS` (#280) — is
@@ -411,24 +411,39 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   tagged — including one a `/update` self-deploy (nazumods/wow#879) just built. Adding `--build` would rebuild
   from the box's checkout and roll the bot back on every settings edit.
 - These subcommands keep working across a self-update: the replacement container takes the
-  original's name as it retires it, so `BOT_OPS_CONTAINER` still resolves and needs no change.
+  original's name once its own start-up and first tick are through (#548), so `BOT_OPS_CONTAINER` still
+  resolves and needs no change — for those seconds `status` and `logs` show the stopped original under the
+  canonical name and the live bot is `<name>-next`; a build that crashes in that window is rolled back with
+  `docker stop <name>-next` and then `docker start <name>` (README.md, "The original is stopped at the
+  handoff but kept…", has the caveats). `restart`, `env-set` and `recreate` are refused for those seconds
+  (the next bullet).
 - **A refused `restart`, `env-set` or `recreate`** (#490). All three refuse while a `<name>-next` container
   is **alive** (running, restarting, paused, removing or created), because a recreate then may start a second
   bot on the one Discord token (not verified without a daemon). If `<name>` itself is running the message says
-  *in progress*: a swap is under way, so retry in a minute. If it persists and the `-next` container is
+  *in progress*: a swap is under way, so retry once it completes. If it persists and the `-next` container is
   *created*, a process died between its create and its start (or the start failed and so did the cleanup):
   `docker rm <name>-next` clears it. If `<name>`
   is **not** running the message says *finishing*: the swap is between stopping the original and taking its
-  name, or it finished without taking it (the new bot stays named `<name>-next` beside the stopped original).
+  name (since #548 that is the whole probation: the rest of the new build's start-up plus up to 60 s for its
+  first tick), or it finished without taking it (the new bot stays named `<name>-next` beside the stopped
+  original).
   Tell the cases apart by the state and by the replacement's log, not by a clock:
   `docker ps -a --filter name='^/<name>' --format '{{.Names}} {{.State}}'` and
   `docker logs <name>-next 2>&1 | grep '\[handoff\]'`. (a) The new build keeps crashing (repeated
   `Logged in as …` boots in the log, or the state flipping through `restarting`) and the old container is still
-  there (`docker ps -a` lists `<name>`): roll back with `docker rm -f <name>-next`, then `docker start <name>`.
-  That brings the old build back, but `:latest` already names the new one (the replacement tagged it when it
-  verified itself), and a recreate reuses whatever is tagged, so before any recreate (`recreate`, `env-set`,
-  the panel's Restart) re-point it: `docker tag <repo>:<oldsha> <repo>:latest` (`docker images <repo>` lists
-  the sha tags). (b) The bot is up and the log has `[handoff] could not take the name` or `could not remove
+  there, stopped (`docker ps -a` lists `<name>`): roll back with `docker stop <name>-next`, then
+  `docker start <name>` (a new build that hangs rather than crashes never looks at all, so the stop comes
+  first; `docker rm -f <name>-next` ends it at once). That brings the old build back. While the log has no
+  `[handoff] probation over` line `:latest` still names it: the new build tags `:latest` only when its
+  probation is over (#548), so no re-tag is needed before a later recreate (`recreate`, `env-set`, the
+  panel's Restart). Once that line is there the tag may already have moved, whether or not `<name>` is
+  still listed (a removal that failed after the tag leaves it listed): check where `:latest` points
+  (`docker image inspect <repo>:latest --format '{{.Id}}'`, against the same for `<repo>:<oldsha>`;
+  `docker images <repo>` lists the sha tags) and, if it names the new build, re-point it with
+  `docker tag <repo>:<oldsha> <repo>:latest` before any recreate. The stopped `<name>-next` that is left
+  blocks nothing (see the exited case below). If `docker ps -a` no longer lists `<name>`, the original is
+  gone and there is nothing to start: stop `<name>-next` if it is alive (a `recreate` is refused while it
+  is), re-point `:latest` the same way, and `recreate`. (b) The bot is up and the log has `[handoff] could not take the name` or `could not remove
   the stopped original`: the swap finished but the rename did not. If `docker ps -a` still lists `<name>` (the
   stopped original), `docker rm <name>` (a plain `rm` refuses a running container); if it is already gone, skip
   that. Then `docker rename <name>-next <name>`. (c) Neither yet: wait. An **exited** `<name>-next` blocks
@@ -569,7 +584,9 @@ In the Cloudflare Zero Trust dashboard, create a tunnel for this instance (Netwo
 create -> Docker connector) and copy its token: it goes into `.env` in the next step. Give it one
 public hostname, `clerk.<domain>`, with the service `http://rackbops-discord-bot-clerk:8080` --
 the container **name**, not the `bot` alias a self-update's replacement also carries (see
-`HTTP_PORT` in `.env.example`). Put a Cloudflare Access application in front of the hostname
+`HTTP_PORT` in `.env.example`). A self-update's replacement takes that name when its probation ends
+(its start-up and first tick are through, #548), so through the tunnel the router is reachable again
+from then on. Put a Cloudflare Access application in front of the hostname
 (Access -> Applications -> self-hosted, `clerk.<domain>`): Google sign-in with an allow policy
 listing the people who may use the web area, plus a service token and a Service Auth policy for
 the uptime monitor, which checks `/tracker/healthz` through the gate. Each friend is added to the
