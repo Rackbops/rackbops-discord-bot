@@ -357,7 +357,7 @@ _Avoid_: server list, guild cache
   tick is gated (`markPluginStateReady`) until the boot `state.json` write lands, so its keyed-mutator
   persist can't race that one-time whole-file write. `/plugins list` (admin-only, ephemeral) shows
   installed vs available + the first release note per plugin (and a pending schedule, if any), and marks
-  an enabled plugin that is not running this boot (`active: false`) with `— not running (<its error>)`
+  an enabled plugin that is not running this boot (`active: false`) with `— not running (first error: <its error>)`
   on its first line, the error collapsed to one line and cut to 120 characters (#544). That `error` is
   the first failure recorded this boot, so on a reverted update it can be the target's install failure
   rather than why the previous version is down. The list shows whatever `state.json` holds when the

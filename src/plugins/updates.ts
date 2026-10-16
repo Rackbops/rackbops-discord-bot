@@ -214,7 +214,7 @@ export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _n
       // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
       if (!p.active) {
         const why = shortError(p.error);
-        line += ` — not running${why ? ` (${why})` : ""}`;
+        line += ` — not running${why ? ` (first error: ${why})` : ""}`;
       }
       line += notes;
       // A pending scheduled update (#104) — shown regardless of whether the index still lists that

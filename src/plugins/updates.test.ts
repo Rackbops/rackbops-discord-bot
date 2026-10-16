@@ -254,7 +254,7 @@ describe("renderPluginsList", () => {
   describe("a plugin that is not running (#544)", () => {
     const firstLine = (s: PluginStateEntry, idx: PluginIndex = index([])) => renderPluginsList(state([s]), idx, NOW).split("\n")[0];
     // The text inside the marker's parentheses.
-    const parenthesised = (line: string | undefined) => /^• \*\*a\*\* — installed 1\.0\.0 — not running \((.*)\)$/.exec(line ?? "")?.[1];
+    const parenthesised = (line: string | undefined) => /^• \*\*a\*\* — installed 1\.0\.0 — not running \(first error: (.*)\)$/.exec(line ?? "")?.[1];
 
     test("says so, with its error collapsed to one line and cut to 120 characters", () => {
       const line = firstLine(stateEntry("a", "1.0.0", { active: false, error: `activate threw\n  at x.js:1\n${"y".repeat(300)}` }));
@@ -295,14 +295,14 @@ describe("renderPluginsList", () => {
       const idx = index([entry("a", "1.1.0", { releases: [rel("1.1.0", { notes: "shiny" })] })]);
       const out = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e" })]), idx, NOW);
       const lines = out.split("\n");
-      expect(lines[0]).toBe("• **a** — installed 1.0.0 → 1.1.0 available — not running (e)");
+      expect(lines[0]).toBe("• **a** — installed 1.0.0 → 1.1.0 available — not running (first error: e)");
       expect(lines.slice(1).join("\n")).toContain("shiny");
       expect(lines[0]).not.toContain("shiny");
     });
     test("a pending schedule still follows on its own line", () => {
       const scheduled = { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" };
       const lines = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e", scheduled })]), index([]), NOW).split("\n");
-      expect(lines[0]).toBe("• **a** — installed 1.0.0 — not running (e)");
+      expect(lines[0]).toBe("• **a** — installed 1.0.0 — not running (first error: e)");
       expect(lines[1]).toContain("⏳ update to 1.1.0 scheduled");
     });
     test("an off plugin that is not running still reads only off", () => {
