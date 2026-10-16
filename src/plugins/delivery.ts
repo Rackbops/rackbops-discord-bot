@@ -14,7 +14,7 @@ const CANNOT_MESSAGE_USER = 50007;
  * a DM's text, a card -- nor `rawError` or `url`, so a plugin that logs the rejection whole
  * (`host.log.error("dm failed", err)`, which under LOG_FORMAT=json is `util.format`ted in full) logs
  * none of it. `code` is kept as is, since a plugin tells
- * Discord's answers apart by it (10013 "Unknown User"). An error that carries no request (see below) is returned as it is.
+ * Discord's answers apart by it (10013 "Unknown User"). An error that carries no request (see below) is returned as it is, bar a cause chain nested past the last level followed.
  *
  * The host's own log sites use it too (#545): a failed reply to an interaction carries the interaction
  * token in `url` and the reply in `requestBody`, so index.ts's handler, the plugin command, interaction and
@@ -32,12 +32,14 @@ const CANNOT_MESSAGE_USER = 50007;
  * The error is also followed through `cause` and an `AggregateError`'s `errors`, `MAX_CAUSE_DEPTH` levels
  * down: a wrapper that holds a request-carrying error comes back as a plain copy of itself (message, name,
  * stack, `code`; its other properties are not kept) with the cleaned error in its place, and what hangs
- * below the last level followed is cut off, not left unexamined. Any other error comes back as it is. Not
- * followed: any other property that might hold an error.
+ * below the last level followed is cut off, not left unexamined (also from an error that carries no request:
+ * a plain cause chain longer than that comes back as a truncated copy). Any other error comes back as it is.
+ * Not followed: any other property that might hold an error.
  *
  * It fails closed and never throws -- it runs inside `catch` blocks, where a throw would cost the user's
  * "Something went wrong." reply and hide the real error. An error it cannot read (a throwing accessor, a
- * Proxy that throws) or that nests more than `MAX_NODES` errors is replaced by a fixed placeholder.
+ * Proxy that throws) or that takes more than `MAX_NODES` visits to walk (the error itself counts, and one reached twice
+ * counts twice) is replaced by a fixed placeholder.
  */
 export function withoutRequest(err: unknown): unknown {
   try {
@@ -50,8 +52,8 @@ export function withoutRequest(err: unknown): unknown {
 /** How many `cause`/`errors` levels `withoutRequest` follows. A cycle in them ends here. */
 const MAX_CAUSE_DEPTH = 5;
 
-/** The most errors one `withoutRequest` call looks at, so a wide, self-referencing AggregateError cannot make it
- *  do work that grows with the width to the power of the depth. */
+/** The most visits one `withoutRequest` call makes (the error itself counts, and one reached twice counts twice), so
+ *  a wide, self-referencing AggregateError cannot make it do work that grows with the width to the power of the depth. */
 const MAX_NODES = 1000;
 
 const UNCLEANABLE = "an error that could not be inspected safely was replaced (its request may have been in it)";
@@ -92,6 +94,8 @@ function clean(err: unknown, depth: number, budget: { left: number }): unknown {
   if (carriesRequest(err)) return requestCopy(err);
   const { cause } = err as Error & { cause?: unknown };
   const members = err instanceof AggregateError && Array.isArray(err.errors) ? (err.errors as unknown[]) : undefined;
+  // Before any walk of it: a sparse array of a billion holes spends no budget as it is mapped.
+  if (members !== undefined && members.length > budget.left) throw new Error("too many nested errors");
   if (depth >= MAX_CAUSE_DEPTH) {
     // Past the last level followed: cut what hangs below rather than leave it unexamined.
     if (cause === undefined && (members === undefined || members.length === 0)) return err;

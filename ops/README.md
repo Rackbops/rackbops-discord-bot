@@ -675,7 +675,7 @@ how long it took. Since #545 an error's own line keeps the error's name, message
 method but leaves out the request: the URL (it holds the interaction token), the request body (the reply)
 and Discord's raw answer. That holds for a Discord REST error, for a network failure that never reached
 Discord, and for either as the `cause` (or a member of the `errors`) of another error, up to five levels
-deep (anything below that is cut off); an error that cannot be inspected safely is replaced by a one-line placeholder, and an error a plugin wraps any other way is logged as the plugin hands it over. The interaction line
+deep (anything below that is cut off); an error that cannot be inspected safely is replaced by a fixed placeholder error, and an error a plugin wraps any other way is logged as the plugin hands it over. The interaction line
 itself never carries an option value, a
 modal field or what the bot answered, so a `/web` sign-in link or a reminder's text never reaches
 the log. `docker logs rackbops-discord-bot-clerk 2>&1 | jq -rR 'fromjson? | .msg | select(test("^\\[interaction\\] (command|component|modal) "))'`

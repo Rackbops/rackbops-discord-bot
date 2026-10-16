@@ -98,8 +98,8 @@ export function createHostApi(opts: {
   const log: PluginLog = {
     info: (m) => opts.baseLog.info(`[${name}] ${m}`),
     warn: (m) => opts.baseLog.warn(`[${name}] ${m}`),
-    // #545: the logged copy of a discord.js REST error loses `url` (it carries an interaction token when the
-    // plugin was replying) and `requestBody` (the reply); the plugin's own error object is untouched.
+    // #545: the logged copy of a failed call's error loses `url` and `path` (they carry an interaction token when
+    // the plugin was replying) and `requestBody` (the reply); the plugin's own error object is untouched.
     error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, withoutRequest(e)),
   };
   // #219: only a destination the manifest declares, with a valid name, is passed on; any other is said
@@ -836,8 +836,8 @@ export async function dispatchPluginInteractionOutcome(
     await handler.call(lp.plugin, interaction);
     return "answered";
   } catch (err) {
-    // #545: a failed reply (a REST error, or a network failure whose `path` is the URL) carries the interaction token in `url` and the reply in
-    // `requestBody`; withoutRequest keeps code/status/method.
+    // #545: a failed reply carries the interaction token (a REST error in `url`, a network failure in `path`) and
+    // the reply in `requestBody`; withoutRequest keeps code/status/method.
     log.error(`[plugins] ${lp.entry.name} interaction failed`, withoutRequest(err));
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});

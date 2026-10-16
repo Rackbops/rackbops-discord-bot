@@ -287,6 +287,33 @@ describe("withoutRequest (#508)", () => {
       expect(printedAll(clean)).not.toContain(token);
     });
 
+    test("a request-free cause chain of six errors keeps its identity, and of seven is cut at the sixth", () => {
+      const chain = (length: number) => {
+        let deep = new Error("leaf");
+        for (let i = 1; i < length; i += 1) deep = new Error(`level ${i}`, { cause: deep });
+        return deep;
+      };
+      const six = chain(6);
+      expect(withoutRequest(six)).toBe(six); // the sixth error is at the bound and has nothing below it
+      const seven = chain(7);
+      const clean = withoutRequest(seven) as Error;
+      expect(clean).not.toBe(seven);
+      let last: Error = clean;
+      let levels = 1;
+      while (last.cause instanceof Error) {
+        last = last.cause;
+        levels += 1;
+      }
+      expect(levels).toBe(6);
+    });
+
+    test("the URL scheme is matched without regard to case", () => {
+      const upper = Object.assign(new TypeError("Unable to connect"), { code: "ConnectionRefused", path: url.replace("http://", "HTTP://") });
+      const clean = withoutRequest(upper) as Error & Record<string, unknown>;
+      expect(clean).not.toBe(upper);
+      expect("path" in clean).toBe(false);
+    });
+
     test("an error with no request-carrying cause comes back as it is", () => {
       const plain = new Error("x", { cause: new Error("y") });
       expect(withoutRequest(plain)).toBe(plain);
@@ -307,7 +334,7 @@ describe("withoutRequest (#508)", () => {
     });
 
     // It runs inside catch blocks: a throw out of it would cost the user's reply and hide the real error.
-    test("an error it cannot read is replaced by a placeholder, never thrown out of it", () => {
+    test("an error whose properties it must read and cannot is replaced by a placeholder, never thrown out of it; one it need not read is left alone", () => {
       const withGetter = (key: string) => {
         const err = new Error("x");
         Object.defineProperty(err, key, { get: () => { throw new Error(`getter ${key}`); } });
@@ -331,6 +358,27 @@ describe("withoutRequest (#508)", () => {
       expect((withoutRequest(aggregate) as Error).message).toContain("could not be inspected safely");
       const hostile = new Proxy(new Error("proxy"), { has: () => { throw new Error("has trap"); } });
       expect((withoutRequest(hostile) as Error).message).toContain("could not be inspected safely");
+    });
+
+    test("an AggregateError with a huge sparse errors array is replaced at once, not walked", () => {
+      const sparse = new AggregateError([], "sparse");
+      Object.defineProperty(sparse, "errors", { value: new Array(2 ** 32 - 1) });
+      const started = Date.now();
+      const replaced = withoutRequest(sparse) as Error;
+      expect(Date.now() - started).toBeLessThan(500);
+      expect(replaced.message).toContain("could not be inspected safely");
+    });
+
+    // The budget is exactly 1000 visits: the error itself, and each error reached counts once per visit.
+    test("the walk budget is exactly 1000 visits: 1000 in all is walked, 1001 is replaced", () => {
+      const plain = () => new Error("plain");
+      const flat = (members: number) => new AggregateError(Array.from({ length: members }, plain), "flat");
+      const exactly = flat(999); // 1 + 999 = 1000 visits
+      expect(withoutRequest(exactly)).toBe(exactly);
+      expect((withoutRequest(flat(1000)) as Error).message).toContain("could not be inspected safely"); // 1001
+      // The last visit is the one that spends the last unit: a tree of exactly 1000 visits, found by walking, not by the width guard.
+      const tree = new AggregateError(Array.from({ length: 9 }, () => new AggregateError(Array.from({ length: 110 }, plain), "inner")), "outer");
+      expect(withoutRequest(tree)).toBe(tree); // 1 + 9 + 9 * 110 = 1000
     });
 
     test("a wide, self-referencing AggregateError is bounded: it is replaced, in milliseconds", () => {
