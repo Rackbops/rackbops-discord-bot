@@ -228,6 +228,14 @@ describe("withoutRequest (#508)", () => {
       expect(printedAll(clean)).not.toContain(token);
     });
 
+    test("an error that carries a requestBody and no URL at all is cleaned too", () => {
+      const bare = Object.assign(new Error("odd"), { requestBody: { content: marker }, code: 7 });
+      const clean = withoutRequest(bare) as Error & Record<string, unknown>;
+      expect(clean).not.toBe(bare);
+      expect([clean.message, clean.code, "requestBody" in clean]).toEqual(["odd", 7, false]);
+      expect(printedAll(clean)).not.toContain(marker);
+    });
+
     test("an error whose path or url is not an http(s) URL (an fs error's path) is returned as is", () => {
       const fsError = Object.assign(new Error("ENOENT: no such file or directory, open '/data/x.json'"), { code: "ENOENT", path: "/data/x.json", syscall: "open", errno: -2 });
       expect(withoutRequest(fsError)).toBe(fsError);
@@ -239,6 +247,7 @@ describe("withoutRequest (#508)", () => {
       const inner = discordError();
       const wrapper = new Error("reply failed", { cause: inner });
       Object.assign(wrapper, { code: "E_WRAPPED" });
+      wrapper.name = "ReplyFailed";
       const clean = withoutRequest(wrapper) as Error & Record<string, unknown>;
       expect(clean).not.toBe(wrapper);
       expect([clean.name, clean.message, clean.code, clean.stack]).toEqual([wrapper.name, "reply failed", "E_WRAPPED", wrapper.stack]);
