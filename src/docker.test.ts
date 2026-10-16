@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -352,27 +352,148 @@ describe("daemon calls", () => {
   test(
     "inspectSelf's mountinfo fallback is bounded too, not just the hostname leg",
     async () => {
-      const realFile = Bun.file;
       const realHost = process.env.HOSTNAME;
       delete process.env.HOSTNAME;
-      // The id has to be 64 hex for parseContainerId to accept it (a short id is rejected).
-      (Bun as { file: unknown }).file = () => ({
-        text: async () => `1 1 0:1 /containers/${"f".repeat(64)}/hostname /etc/hostname rw`,
-      });
       try {
         stub((_url, init) => wedgedBody(init?.signal));
-        const r = await settleWithin(inspectSelf(20), "inspectSelf fallback");
+        // The id has to be 64 hex for parseContainerId to accept it (a short id is rejected). The mountinfo
+        // reader is injected (#512), so no `Bun.file` swap is needed.
+        const r = await settleWithin(
+          inspectSelf(20, async () => `1 1 0:1 /containers/${"f".repeat(64)}/hostname /etc/hostname rw`),
+          "inspectSelf fallback",
+        );
         expect(r.ok).toBe(false);
         expect((r as { e: Error }).e.message).toMatch(/timed out after 20ms/);
         // Proves the fallback leg actually ran, rather than the hostname leg being hit by accident.
         expect(calls[0]!.url).toContain("f".repeat(64));
       } finally {
-        (Bun as { file: unknown }).file = realFile;
         if (realHost !== undefined) process.env.HOSTNAME = realHost;
       }
     },
     1000,
   );
+
+  // #512: a 200 from the hostname lookup is not proof it is this container. Docker's own short-id hostname
+  // proves itself (the answer's id starts with it); a hostname pinned in compose is compared with the id in
+  // this process's own mountinfo; a mismatch falls through to the mountinfo leg like a non-ok answer does.
+  describe("inspectSelf checks it is looking at itself (#512)", () => {
+    const ID_A = "a".repeat(64);
+    const ID_F = "f".repeat(64);
+    const SHORT = "abcdef012345";
+    const mountinfoFor = (id: string) => `1 1 0:1 /containers/${id}/hostname /etc/hostname rw`;
+    const realHost = process.env.HOSTNAME;
+    afterEach(() => {
+      if (realHost === undefined) delete process.env.HOSTNAME;
+      else process.env.HOSTNAME = realHost;
+    });
+
+    /** A mountinfo reader that counts its calls and returns (or throws) what it is given. */
+    function reader(result: string | Error) {
+      const r = {
+        calls: 0,
+        read: async (): Promise<string> => {
+          r.calls++;
+          if (result instanceof Error) throw result;
+          return result;
+        },
+      };
+      return r;
+    }
+
+    /** Answers `GET /containers/<x>/json` with `{ Id }` for each path given, and 404 for any other. */
+    function answering(ids: Record<string, string>) {
+      stub((url) => {
+        const id = ids[new URL(url).pathname];
+        return id === undefined ? new Response("", { status: 404 }) : new Response(JSON.stringify({ Id: id }), { status: 200 });
+      });
+    }
+    const paths = () => calls.map((c) => new URL(c.url).pathname);
+
+    test("a short-id hostname whose answer carries another id falls back to mountinfo", async () => {
+      process.env.HOSTNAME = SHORT;
+      answering({ [`/containers/${SHORT}/json`]: ID_F, [`/containers/${ID_A}/json`]: ID_A });
+      const mountinfo = reader(mountinfoFor(ID_A));
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000, mountinfo.read);
+        expect(self.Id).toBe(ID_A);
+        expect(paths()).toEqual([`/containers/${SHORT}/json`, `/containers/${ID_A}/json`]);
+        expect(mountinfo.calls).toBe(1);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a short-id hostname whose answer matches is accepted without reading mountinfo", async () => {
+      process.env.HOSTNAME = SHORT;
+      const id = SHORT + "0".repeat(52);
+      answering({ [`/containers/${SHORT}/json`]: id });
+      const mountinfo = reader(new Error("mountinfo must not be read"));
+      const self = await inspectSelf(1000, mountinfo.read);
+      expect(self.Id).toBe(id);
+      expect(paths()).toEqual([`/containers/${SHORT}/json`]);
+      expect(mountinfo.calls).toBe(0);
+    });
+
+    test("a pinned hostname that resolves to a sibling is rejected when mountinfo names another id", async () => {
+      process.env.HOSTNAME = "bot";
+      answering({ "/containers/bot/json": ID_F, [`/containers/${ID_A}/json`]: ID_A });
+      const mountinfo = reader(mountinfoFor(ID_A));
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const self = await inspectSelf(1000, mountinfo.read);
+        expect(self.Id).toBe(ID_A);
+        expect(paths()).toEqual(["/containers/bot/json", `/containers/${ID_A}/json`]);
+        expect(mountinfo.calls).toBe(1); // read once for the comparison, not again for the fallback
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("a pinned hostname whose answer is this very container is accepted", async () => {
+      process.env.HOSTNAME = "bot";
+      answering({ "/containers/bot/json": ID_A });
+      const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
+      expect(self.Id).toBe(ID_A);
+      expect(paths()).toEqual(["/containers/bot/json"]);
+    });
+
+    test("no readable mountinfo accepts a pinned hostname's answer, as before", async () => {
+      process.env.HOSTNAME = "bot";
+      answering({ "/containers/bot/json": ID_F });
+      const self = await inspectSelf(1000, reader(new Error("ENOENT: no such file")).read);
+      expect(self.Id).toBe(ID_F);
+      expect(paths()).toEqual(["/containers/bot/json"]);
+    });
+
+    test("a mountinfo with no container line accepts it too", async () => {
+      process.env.HOSTNAME = "bot";
+      answering({ "/containers/bot/json": ID_F });
+      const self = await inspectSelf(1000, reader("1 1 0:1 / / rw").read);
+      expect(self.Id).toBe(ID_F);
+      expect(paths()).toEqual(["/containers/bot/json"]);
+    });
+
+    test("a rejected hostname answer and no mountinfo id is the existing error", async () => {
+      process.env.HOSTNAME = SHORT;
+      answering({ [`/containers/${SHORT}/json`]: ID_F });
+      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await expect(inspectSelf(1000, reader("1 1 0:1 / / rw").read)).rejects.toThrow(/cannot determine own container id/);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    test("no hostname and an unreadable mountinfo is that same error, not a raw ENOENT", async () => {
+      delete process.env.HOSTNAME;
+      answering({});
+      await expect(inspectSelf(1000, reader(new Error("ENOENT: no such file")).read)).rejects.toThrow(
+        /cannot determine own container id/,
+      );
+    });
+  });
 
   // The other half of the bound: a call that finishes well inside its budget must RETIRE its
   // timer, or every completed call leaves a live abort armed against a signal nobody is watching

@@ -147,22 +147,51 @@ export function parseContainerId(mountinfo: string): string | undefined {
  * Inspect the container this process is running in.
  *
  * Hostname first: Docker sets it to the short container id, and the daemon resolves a short id
- * fine — one request, no parsing. Mountinfo is the fallback for the case that breaks it, a
- * `hostname:` pinned in the compose file, where the name would resolve to nothing (or worse,
- * to some other container that happens to be called that).
+ * fine — one request, no parsing. But a 200 is not proof (#512): a `hostname:` pinned in the compose
+ * file may resolve to nothing, or to some other container that happens to be called that. So the answer
+ * is checked: a short-id hostname must be a prefix of the returned id; any other hostname is compared
+ * with the id in this process's own mountinfo when that can be read and parsed (Docker bind-mounts
+ * `/etc/hostname` from `…/containers/<id>/…`, so the id is spelled out there even under cgroup v2).
+ * A mismatch, like a non-ok answer, falls through to the mountinfo leg. Where mountinfo cannot be read
+ * (not Docker) or names no container (a plain host), a pinned hostname's answer stands, as before.
+ *
+ * `readMountinfo` is injectable so a test needs no `Bun.file` swap; it is read at most once per call.
  */
-export async function inspectSelf(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<ContainerInspect> {
+export async function inspectSelf(
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  readMountinfo: () => Promise<string> = () => Bun.file("/proc/self/mountinfo").text(),
+): Promise<ContainerInspect> {
   // ONE bound across both attempts, not one each. Two nested bounds would make the worst case
   // 2 x timeoutMs (a fast non-ok hostname inspect, then a wedge on the fallback) — undocumented,
   // and 120s on the default. It also gave the fallback its own bound that only a Linux-only test
   // could reach, so it could be widened without any test noticing.
   return bounded(timeoutMs, "inspect self", async (s) => {
     const host = process.env.HOSTNAME;
+    let mountinfoRead = false;
+    let mountinfoId: string | undefined;
+    const ownId = async (): Promise<string | undefined> => {
+      if (!mountinfoRead) {
+        mountinfoRead = true;
+        try {
+          mountinfoId = parseContainerId(await readMountinfo());
+        } catch {
+          mountinfoId = undefined; // not Docker, or no /proc: nothing to compare with
+        }
+      }
+      return mountinfoId;
+    };
     if (host) {
       const res = await api(`/containers/${encodeURIComponent(host)}/json`, s);
-      if (res.ok) return (await res.json()) as ContainerInspect;
+      if (res.ok) {
+        const answer = (await res.json()) as ContainerInspect;
+        const isSelf = /^[0-9a-f]{12}$/.test(host)
+          ? answer.Id.startsWith(host)
+          : ((await ownId()) ?? answer.Id) === answer.Id;
+        if (isSelf) return answer;
+        console.warn(`[docker] HOSTNAME ${host} resolved to another container (${answer.Id.slice(0, 12)}); using mountinfo`);
+      }
     }
-    const id = parseContainerId(await Bun.file("/proc/self/mountinfo").text());
+    const id = await ownId();
     if (!id) throw new Error("cannot determine own container id (not running under Docker?)");
     return (await (await ok(`/containers/${encodeURIComponent(id)}/json`, s)).json()) as ContainerInspect;
   });

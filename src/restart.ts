@@ -13,6 +13,13 @@
 // `docker stop`'s own SIGKILL timeout) before letting the process exit — see `awaitCriticalIdle`
 // and `handoffExemption` below for how a handoff's own holder avoids waiting on itself.
 //
+// A requested restart's wait is bounded too (#512): after `RESTART_DEFERRAL_MAX_MS` it exits anyway, with
+// the stuck depth in the log, unless a handoff is active (the original must stay alive through a swap),
+// when it waits another round. And a shutdown owns the exit: once one is in progress, a pending restart's
+// section closing releases the shutdown's drain instead of exiting 75 ahead of `disposePlugins` and
+// `destroyClient`. A requested restart does not itself run the plugins' `dispose()`: `contract.ts` promises
+// it for a `docker stop`, a self-update's retire and SIGINT, not for this path (#512 item 4, declined).
+//
 // A plugin tick holds its own unit of the critical section for as long as its call is pending, even
 // past PLUGIN_TICK_TIMEOUT_MS (plugins/host.ts, #248). A restart request or a shutdown notifies the
 // `onStopRequested` listeners below; the plugin host's listener aborts every pending tick's
@@ -21,13 +28,24 @@
 // stop at a point of its choosing within the grace, and one that ignores its signal delays a restart
 // by that grace at most, never forever (the #217 trade-off this replaces).
 
-/** Distinct from a crash, so a supervisor can tell an update apart from a failure. */
+/** Distinct from a crash, so a supervisor can tell an update apart from a failure. Published as 75 by
+ *  README.md and .env.example, so `restart.test.ts` pins the value itself, not this constant. */
 export const RESTART_EXIT_CODE = 75;
+
+/** The longest a requested restart waits for in-flight work before exiting anyway (#512): a deferred
+ *  restart stops every new tick and mailbox drain (`restartPending`), so a critical section that never
+ *  closes would leave the bot serving interactions with all scheduled work silently stopped. Thirty
+ *  minutes sits above the longest legitimate section — a tick running a self-update's 15-minute build —
+ *  and an active handoff is exempt outright (the original must stay alive through it); so only a stuck
+ *  section ever sees this fire, and the log names its depth. Ref'd, like `awaitCriticalIdle`'s timer. */
+export const RESTART_DEFERRAL_MAX_MS = 30 * 60_000;
 
 type ExitFn = (code: number) => void;
 
 let critical = 0;
 let pending: string | undefined;
+// #512: armed while a requested restart is deferred behind an open critical section (see requestRestart).
+let deferralTimer: ReturnType<typeof setTimeout> | undefined;
 let handoff: string | undefined;
 let exitFn: ExitFn = (code) => process.exit(code);
 
@@ -100,8 +118,14 @@ export function setExitFn(fn: ExitFn): () => void {
   };
 }
 
+function clearDeferral(): void {
+  if (deferralTimer !== undefined) clearTimeout(deferralTimer);
+  deferralTimer = undefined;
+}
+
 /** Reset module state between tests. */
 export function resetForTest(): void {
+  clearDeferral();
   critical = 0;
   pending = undefined;
   handoff = undefined;
@@ -120,6 +144,7 @@ export interface RestartStateForTest {
   idleWaiters: number;
   stopListeners: number;
   stopNotified: boolean;
+  deferralArmed: boolean;
 }
 
 /** A read-only snapshot of the state `resetForTest` resets, for the test-state guard. */
@@ -132,6 +157,7 @@ export function stateForTest(): RestartStateForTest {
     idleWaiters: idleResolvers.length,
     stopListeners: stopListeners.length,
     stopNotified,
+    deferralArmed: deferralTimer !== undefined,
   };
 }
 
@@ -167,7 +193,10 @@ export function beginCritical(): void {
 
 export function endCritical(): void {
   critical = Math.max(0, critical - 1);
-  if (critical === 0 && pending !== undefined) doExit(pending);
+  // A shutdown already draining owns the exit (#512): the handler goes on to dispose the plugins, close the
+  // gateway and exit 0 once `maybeResolveIdle()` below releases its drain, so a pending restart exiting 75
+  // here would cut all of that off.
+  if (critical === 0 && pending !== undefined && !shuttingDown) doExit(pending);
   // #154: release everyone waiting on awaitCriticalIdle once we're back at (or below) the live
   // exemption — not just at 0, so a handoff's own holder never blocks itself (see
   // handoffExemption above).
@@ -235,10 +264,12 @@ export function restartPending(): boolean {
  * `if (restartPending()) return` guard (`announce.ts`) starts no new tick once a signal has
  * arrived, the same way it already refuses one during a handoff or a pending restart. Called once,
  * by the shutdown handler (`shutdown.ts`), before it awaits the drain — never cleared, since a
- * process that has started shutting down never un-shuts-down.
+ * process that has started shutting down never un-shuts-down. A deferred restart's deadline is
+ * disarmed here: the shutdown owns the exit from now on (#512), and the handler's own grace bounds it.
  */
 export function beginShutdown(reason: string): void {
   shuttingDown = true;
+  clearDeferral();
   console.log(`[restart] shutdown in progress: ${reason}`);
   notifyStop(reason);
 }
@@ -270,19 +301,44 @@ export function awaitCriticalIdle(timeoutMs: number): Promise<boolean> {
 
 /**
  * Ask the process to exit so the orchestrator respawns it. Exits immediately when
- * idle, otherwise as soon as the in-flight critical section finishes. Repeat calls
- * while one is already pending are no-ops — the first reason wins.
+ * idle, otherwise as soon as the in-flight critical section finishes, or after
+ * `deferralMaxMs` (`RESTART_DEFERRAL_MAX_MS`) if one never does — except while a handoff is active, when
+ * the original must stay alive and the wait is simply renewed (#512). Repeat calls while one is already
+ * pending are no-ops — the first reason wins. A shutdown already in progress owns the exit instead: the
+ * restart records itself as pending but neither exits nor arms the deadline.
  */
-export function requestRestart(reason: string): void {
+export function requestRestart(reason: string, deferralMaxMs = RESTART_DEFERRAL_MAX_MS): void {
   if (pending !== undefined) return;
   pending = reason;
   // #248: first, so a plugin tick holding the critical section is told to bail before we wait on it.
   notifyStop(reason);
-  if (critical === 0) doExit(reason);
-  else console.log(`[restart] deferred until in-flight work finishes: ${reason}`);
+  if (shuttingDown) return; // the shutdown handler owns the exit (#512)
+  if (critical === 0) {
+    doExit(reason);
+    return;
+  }
+  console.log(`[restart] deferred until in-flight work finishes: ${reason}`);
+  armDeferral(reason, deferralMaxMs);
+}
+
+function armDeferral(reason: string, deferralMaxMs: number): void {
+  deferralTimer = setTimeout(() => {
+    deferralTimer = undefined;
+    if (shuttingDown) return;
+    if (handoffActive()) {
+      // Never exit the original mid-swap (see beginHandoff): wait another round; the handoff's own end
+      // closes the section, or ends this process.
+      console.warn(`[restart] in-flight work has not finished after ${deferralMaxMs}ms, but a handoff is active — waiting on it`);
+      armDeferral(reason, deferralMaxMs);
+      return;
+    }
+    console.error(`[restart] in-flight work did not finish within ${deferralMaxMs}ms (critical depth ${critical}); exiting anyway`);
+    doExit(reason);
+  }, deferralMaxMs);
 }
 
 function doExit(reason: string): void {
+  clearDeferral();
   console.log(`[restart] exiting (${RESTART_EXIT_CODE}): ${reason}`);
   exitFn(RESTART_EXIT_CODE);
 }

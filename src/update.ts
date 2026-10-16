@@ -242,7 +242,8 @@ export function resetUpdateForTest(): void {
  *
  * The restart is only *requested*. On the exit-75 fallback path (`requestRestart`) that request
  * is held until any in-flight announcement and state write finish (a plugin tick is aborted and waited
- * on for PLUGIN_TICK_ABORT_GRACE_MS at most, #248 — see `restart.ts`'s header); the socket-mounted redeploy path
+ * on for PLUGIN_TICK_ABORT_GRACE_MS at most, #248 — see `restart.ts`'s header; the whole wait is bounded by
+ * `RESTART_DEFERRAL_MAX_MS`, a handoff exempt, #512); the socket-mounted redeploy path
  * instead quiesces via `beginHandoff` — now only for the create→verify window, after the build (#130) —
  * which stops new ticks but does not await a tick already running.
  */
