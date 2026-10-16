@@ -9,6 +9,7 @@ import {
   endCritical,
   endHandoff,
   handoffActive,
+  isShuttingDown,
   onStopRequested,
   requestRestart,
   resetForTest,
@@ -409,6 +410,21 @@ describe("beginShutdown (#154)", () => {
     expect(restartPending()).toBe(false);
     beginShutdown("SIGTERM");
     expect(restartPending()).toBe(true);
+  });
+
+  // #548: a replacement's probation stops completing when IT is being stopped, but keeps completing while a
+  // pending restart or a handoff of its own is in flight, so isShuttingDown is narrower than restartPending.
+  test("isShuttingDown is true after beginShutdown only: not for a pending restart or an in-flight handoff", () => {
+    expect(isShuttingDown()).toBe(false);
+    beginHandoff("redeploy");
+    expect(restartPending()).toBe(true);
+    expect(isShuttingDown()).toBe(false);
+    endHandoff();
+    beginCritical();
+    requestRestart("update");
+    expect(isShuttingDown()).toBe(false);
+    beginShutdown("SIGTERM");
+    expect(isShuttingDown()).toBe(true);
   });
 });
 
