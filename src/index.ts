@@ -21,6 +21,7 @@ import {
   beginCritical,
   beginShutdown,
   endCritical,
+  isShuttingDown,
   onBeforeExit,
   onStopRequested,
   restartPending,
@@ -97,8 +98,9 @@ const client = createClient(collectIntents(CORE_INTENTS, selectedPlugins));
 
 // #184: the plugins actually loaded this boot, kept in module scope (not activate()-local, unlike
 // loadResult below) so the shutdown handler — wired here, before activate() has ever run — can
-// dispose them by the time a signal actually arrives. Empty until activate() assigns it, which
-// correctly makes disposePlugins a no-op for a signal that arrives before any plugin has loaded.
+// dispose them by the time a signal actually arrives. Empty until activate() assigns it, so for a signal
+// that arrives before any plugin has loaded disposePlugins has nothing to dispose (it still sets the
+// host's `disposing` flag, #541, so a boot that reaches activatePlugins afterwards activates none).
 let currentLoadedPlugins: readonly LoadedPlugin[] = [];
 // #220: stops the host's HTTP listener, once activate() has started one (HTTP_PORT set). A no-op until
 // then, so a signal before activate() has nothing to stop.
@@ -340,6 +342,18 @@ async function activate(c: Client<true>): Promise<void> {
   // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
   // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
+  // #541: a shutdown began during activation. disposePlugins has run, or runs as soon as the drain ends,
+  // and the loop refuses every plugin it had not started by then (one already running is disposed). Writing
+  // state.json, draining the mailbox, binding HTTP and sending the update report-back now would record and
+  // announce a boot that never happened (the report would say "failed to start" for a plugin the shutdown
+  // refused). Stop here; the pending report survives to the next boot.
+  // Shutdown only (not restartPending, which is also true for a handoff): a handoff that began meanwhile
+  // can still fail and leave this process running, and it must then have booted; a pending restart exits
+  // by itself.
+  if (isShuttingDown()) {
+    console.warn("[plugins] shutdown in progress — the rest of activation is skipped");
+    return;
+  }
 
   // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
   // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores

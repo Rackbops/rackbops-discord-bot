@@ -83,6 +83,38 @@ describe("index.ts wiring", () => {
     expect(source.slice(guard, write)).toMatch(/\} else \{\s*$/); // the write is the guard's else
   });
 
+  // #541: a shutdown that began during plugin activation has already disposed what was running, and the loop
+  // refused the rest. If activate() then carried on it would write state.json, bind HTTP and send the update
+  // report-back for a boot that never happened ("failed to start" for a plugin the shutdown refused, consuming
+  // the pending report). index.ts can't run under test, so the early return is pinned: right after
+  // activatePlugins, before the scheduler, the state write, the ready flag and the report-back.
+  test("activate() returns right after activatePlugins when a shutdown is in progress, before anything is started, written or reported (#541)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const activated = source.indexOf("await activatePlugins(loadResult.loaded, console);", activateFn);
+    const guard = source.indexOf("if (isShuttingDown()) {", activated);
+    const scheduler = source.indexOf("startScheduler(", activated);
+    const write = source.indexOf("await writePluginState({", activated);
+    const ready = source.indexOf("markPluginStateReady();", activated);
+    const report = source.indexOf("reportPluginUpdateOutcome({", activated);
+    for (const pos of [activated, guard, scheduler, write, ready, report]) expect(pos).toBeGreaterThan(activateFn);
+    expect(guard).toBeGreaterThan(activated);
+    for (const later of [scheduler, write, ready, report]) expect(guard).toBeLessThan(later);
+    // Nothing between the two lines (the guard follows the await directly), and the block is a bare return.
+    expect(source.slice(activated + "await activatePlugins(loadResult.loaded, console);".length, guard)).toMatch(/^\s*(\/\/[^\n]*\n\s*)*$/);
+    const block = source.slice(guard, source.indexOf("\n  }\n", guard));
+    expect(block).toMatch(/console\.warn\("\[plugins\] shutdown in progress — the rest of activation is skipped"\);\s*return;$/);
+    // Shutdown only: restartPending() is also true for a handoff, which can fail and leave this process running
+    // (half-booted, if the boot had been skipped), and for a pending restart, which exits by itself. Checked on the
+    // CODE of the guard's own stretch (comment lines dropped), so a comment that names either cannot fail it.
+    const code = source
+      .slice(activated, guard + block.length)
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    expect((code.match(/\bisShuttingDown\(\)/g) ?? []).length).toBe(1);
+    expect(/\brestartPending\(\)/.test(code)).toBe(false);
+  });
+
   // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads
   // at module-eval, which nothing but the source can show.
   test("no plugin code loads at module-eval — the bundle import() is inside activate()", () => {
