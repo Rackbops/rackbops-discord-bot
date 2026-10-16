@@ -6,8 +6,9 @@
 //
 // The signal is a marker file in the shared `state:/app/data` volume both containers already
 // mount. Deliberately its own file, never `state.json`: exactly one process writes it (the
-// replacement) and exactly one reads it (the original), so the file that actually matters is
-// never touched by two writers at once.
+// replacement, which also clears it in `takeOver`); the original reads it and clears it
+// (`redeploy.ts`), never writes it — so the file that actually matters is never touched by two
+// writers at once.
 
 import { join } from "node:path";
 import { DATA_DIR, shortSha } from "./storage";

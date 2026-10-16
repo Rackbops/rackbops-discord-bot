@@ -245,7 +245,11 @@ export async function startContainer(id: string, timeoutMs = DEFAULT_TIMEOUT_MS)
   );
 }
 
-export async function stopContainer(id: string, timeoutSec = 10, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> {
+/** `docker stop`'s grace before SIGKILL, in seconds, for every stop this bot issues; `shutdown.ts`'s
+ *  `SHUTDOWN_GRACE_MS` is measured against it (its test imports this). */
+export const STOP_TIMEOUT_SEC = 10;
+
+export async function stopContainer(id: string, timeoutSec = STOP_TIMEOUT_SEC, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<void> {
   const params = new URLSearchParams({ t: String(timeoutSec) });
   await bounded(timeoutMs, `stop ${id}`, async (s) => {
     const res = await api(`/containers/${encodeURIComponent(id)}/stop?${params}`, s, { method: "POST" });

@@ -256,7 +256,7 @@ settings in the dashboard.
 | `src/docker.ts` | Docker Engine API client over the daemon socket |
 | `src/updateReport.ts` | The follow-up after a `/update` restart: which build it came back on |
 | `src/restart.ts` | Graceful restart, deferred past in-flight announcements (a plugin tick is aborted and waited on for 5 s at most, #248) |
-| `src/state.ts` | Release-announcement dedup state (`data/state.json`) |
+| `src/state.ts` | `data/state.json`: release-announcement dedup state, plus the self-update guard (`attemptedUpdateToSha`) and the owed `/update` follow-up (`pendingUpdateReport`) |
 | `src/github.ts` | GitHub API: releases + `/report` issue creation |
 | `src/storage.ts` | Shared atomic JSON read/write (+ `DATA_DIR`), handed to plugins as `HostApi.storage`/`dataDir` |
 | `src/plugins/contract.ts` | The host<->plugin contract — types and `HOST_API_VERSION` only (`docs/adr/0004`) |

@@ -7,7 +7,11 @@ const { writeMarker, clearMarker, MARKER_FILE } = await import("./handoff");
 const { DATA_DIR } = await import("./storage");
 
 /**
- * The regression guard for #139: the suite must never read or write the checkout's own `data/`.
+ * The regression guard for #139, as far as a test can be one: it drives the two real writers
+ * (`saveState()`, `writeMarker()`) and proves each landed under `BOT_DATA_DIR` while the checkout's
+ * `data/` stayed byte-identical to the preload's snapshot. It does not see reads, a file that sorts
+ * after this one, or a write-then-delete before it ran; the containment itself is the preload
+ * (`test/setup.ts`) plus `resolveDataDir`'s refusal to use the checkout under `bun test`.
  *
  * These assert against the REAL write path — `saveState()` and `writeMarker()` on the real
  * singletons — deliberately. The obvious version of this test (asserting on `resolveDataDir()` or

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { STOP_TIMEOUT_SEC } from "./docker";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS, type ShutdownDeps } from "./shutdown";
 
 interface Harness {
@@ -137,9 +138,39 @@ describe("createShutdownHandler (#154)", () => {
     expect(h.exits).toEqual([0]);
   });
 
-  test("SHUTDOWN_GRACE_MS leaves real margin under docker stop's 10s SIGKILL bound", () => {
+  // The bound is docker.ts's own stop timeout (what every stop this bot issues sends as `t=`, pinned in
+  // docker.test.ts), not a literal restated here.
+  test("SHUTDOWN_GRACE_MS leaves real margin under docker stop's SIGKILL bound, as docker.ts sets it", () => {
     expect(SHUTDOWN_GRACE_MS).toBe(8_000);
-    expect(SHUTDOWN_GRACE_MS).toBeLessThan(10_000);
+    expect(SHUTDOWN_GRACE_MS).toBeLessThan(STOP_TIMEOUT_SEC * 1000);
+    expect(STOP_TIMEOUT_SEC).toBe(10);
+  });
+
+  // #510 item 12a: neither phase throws today, but the exit must be reached whatever they do —
+  // otherwise `draining` stays true and the process sits until the daemon's SIGKILL.
+  test("a rejecting awaitIdle still disposes, destroys and exits 0, logging the failure", async () => {
+    const h = makeHarness({
+      awaitIdle: async () => {
+        throw new Error("drain blew up");
+      },
+    });
+    await h.handler("SIGTERM");
+    expect(h.order).toEqual(["disposePlugins", "destroyClient", "exit"]);
+    expect(h.exits).toEqual([0]);
+    expect(h.errors.some((e) => typeof e === "string" && e.includes("the drain failed"))).toBe(true);
+    expect(h.logs.some((l) => l.includes("drained in"))).toBe(false); // a drain that threw did not succeed
+  });
+
+  test("a throwing beginShutdown is logged, and the drain still runs before exit", async () => {
+    const h = makeHarness({
+      beginShutdown: () => {
+        throw new Error("beginShutdown blew up");
+      },
+    });
+    await h.handler("SIGTERM");
+    expect(h.order).toEqual(["awaitIdle", "disposePlugins", "destroyClient", "exit"]);
+    expect(h.exits).toEqual([0]);
+    expect(h.errors.some((e) => typeof e === "string" && e.includes("beginShutdown failed"))).toBe(true);
   });
 
   // #154 review finding: an earlier version gave destroyClient a FRESH DESTROY_CLIENT_TIMEOUT_MS

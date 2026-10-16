@@ -1,7 +1,6 @@
-import { mkdirSync, renameSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { config } from "./config";
-import { DATA_DIR } from "./storage";
+import { DATA_DIR, moveCorruptAside, readJsonOrFresh, writeJsonAtomic } from "./storage";
 
 /**
  * A `/update`-initiated restart, recorded so the bot can tell the requester what build it
@@ -27,12 +26,32 @@ export interface BotState {
   // weeklyAnnouncedFor, realmStatus), removed here in #107 now that the wow plugin owns them in its own
   // data/wow.json — are deliberately NOT re-added above, yet are PRESERVED on disk untouched: loadStateFrom
   // spreads the raw JSON (`{ ...raw }`) and saveStateTo re-serialises the whole object, so unknown keys
-  // round-trip. A rollback that reintroduces the old core code finds its dedup history intact.
+  // round-trip. A rollback that reintroduces the old core code finds those keys as they were when the
+  // core last wrote them — preserved, not advanced: since #107 the wow plugin keeps its own copy in
+  // `data/wow.json`, so the frozen values can be older than the plugin's.
   attemptedUpdateToSha?: string; // sha we last exited to update to; guards against an exit loop
   pendingUpdateReport?: PendingUpdateReport; // /update follow-up owed on next boot; consumed once
 }
 
 const RELEASE_ID_CAP = 100;
+
+/** The raw shape `loadStateFrom` accepts: an object whose `seenReleaseIds`, when present, is a number list
+ *  (the legacy single-repo form) or a map of number lists. Anything else — `null`, a number, a list, a
+ *  map with a `null` or string value — would parse but break every later `saveState` (#509), so it is
+ *  treated as corrupt. Other keys are not checked: they round-trip untouched. */
+export type RawBotState = Omit<BotState, "seenReleaseIds"> & { seenReleaseIds?: number[] | Record<string, number[]> };
+
+export function isRawBotState(raw: unknown): raw is RawBotState {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
+  const ids = (raw as { seenReleaseIds?: unknown }).seenReleaseIds;
+  if (ids === undefined) return true;
+  if (isNumberList(ids)) return true;
+  return typeof ids === "object" && ids !== null && !Array.isArray(ids) && Object.values(ids).every(isNumberList);
+}
+
+function isNumberList(v: unknown): v is number[] {
+  return Array.isArray(v) && v.every((n) => typeof n === "number");
+}
 
 // Imported, never recomputed (#139): the shared resolver is what an override relocates, and a
 // second local copy of this expression is how the suite ended up writing the real checkout.
@@ -41,35 +60,28 @@ const STATE_FILE = join(DATA_DIR, "state.json");
 export const state: BotState = await loadStateFrom(STATE_FILE);
 
 /**
- * Reads and parses a state file at `path`. Distinguishes "absent" (a fresh install — the common
- * case) from "present but broken" (empty, truncated, or otherwise unparseable — a power loss or
- * OOM-kill mid-write, or two overlapping writers racing before `createStateWriter` existed): the
- * latter is logged loudly and moved aside to `<path>.corrupt-<timestamp>` for inspection rather
- * than thrown, so a bad file degrades to "dedup history lost once" instead of the top-level
- * `await` above throwing before `index.ts` even runs — which `restart: unless-stopped` would then
- * relaunch into forever. Mirrors `handoff.ts`'s `readMarker`, which treats its own sibling file
- * the same way. The move-aside is itself best-effort: a failed rename is logged, not thrown —
- * losing the forensic copy is still better than a crash loop.
+ * Reads and parses a state file at `path` through `readJsonOrFresh` (one implementation of the
+ * catch), then checks the shape. Distinguishes "absent" (a fresh install — the common case) from
+ * "present but broken": a file that parsed badly (empty, truncated, not JSON — a process killed
+ * mid-write, which temp+rename now rules out for this bot's own writes, or a hand edit) or parsed
+ * into the wrong shape (`isRawBotState`) is logged loudly and moved aside to
+ * `<path>.corrupt-<timestamp>` for inspection rather than thrown, so a bad file degrades to "dedup
+ * history lost once" instead of the top-level `await` above throwing before `index.ts` even runs.
+ * **A read that failed for another reason (EACCES, EIO, ...) is rethrown by `readJsonOrFresh`**, so
+ * that top-level `await` fails the boot with the real error and `restart: unless-stopped` relaunches
+ * into it until the volume is fixed (#509): the alternative, a silent fresh state, would re-announce
+ * every release and then overwrite a file that may be intact. The move-aside is itself best-effort:
+ * a failed rename is logged, not thrown — losing the forensic copy is still better than a crash loop.
+ * There is no `fsync` (#510), so a host power loss is outside what the temp+rename write covers.
  */
 export async function loadStateFrom(path: string): Promise<BotState> {
-  const file = Bun.file(path);
-  if (!(await file.exists())) return { seenReleaseIds: {} };
-  try {
-    const raw = (await file.json()) as Omit<BotState, "seenReleaseIds"> & {
-      seenReleaseIds?: number[] | Record<string, number[]>;
-    };
-    return { ...raw, seenReleaseIds: normalizeSeenReleaseIds(raw.seenReleaseIds, config.githubRepo) };
-  } catch (err) {
-    console.error(`[state] ${path} is unreadable or corrupt — starting fresh (dedup history lost once): ${err}`);
-    const corrupt = `${path}.corrupt-${Date.now()}`;
-    try {
-      renameSync(path, corrupt);
-      console.error(`[state] moved the corrupt file aside to ${corrupt} for inspection`);
-    } catch (renameErr) {
-      console.error(`[state] couldn't move the corrupt file aside: ${renameErr}`);
-    }
+  const raw = await readJsonOrFresh<unknown>(path, () => undefined, "state");
+  if (raw === undefined) return { seenReleaseIds: {} };
+  if (!isRawBotState(raw)) {
+    moveCorruptAside(path, "state", "not a state object (seenReleaseIds must be a number list or a map of number lists)");
     return { seenReleaseIds: {} };
   }
+  return { ...raw, seenReleaseIds: normalizeSeenReleaseIds(raw.seenReleaseIds, config.githubRepo) };
 }
 
 /**
@@ -85,16 +97,10 @@ export function normalizeSeenReleaseIds(
   return raw ?? {};
 }
 
-/**
- * Atomically writes `data` to `path`: a temp file in the same directory, then an atomic rename —
- * never a bare truncate-in-place, which a crash mid-write (or, absent `createStateWriter`'s
- * queue, an overlapping second writer) can catch and leave unparseable for the next `loadStateFrom`.
- */
-export async function saveStateTo(path: string, data: BotState): Promise<void> {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
-  await Bun.write(tmp, JSON.stringify(data, null, 2));
-  renameSync(tmp, path);
+/** `writeJsonAtomic` for the state file — the same temp name (pid, `TMP_TOKEN`, counter) and rename as
+ *  every other JSON file this bot writes (#510; it used to keep a `${path}.tmp` copy of the pattern). */
+export function saveStateTo(path: string, data: BotState): Promise<void> {
+  return writeJsonAtomic(path, data);
 }
 
 /**
@@ -157,10 +163,14 @@ export function resetStateWriterForTest(): void {
   stateWriter = createStateWriter(STATE_FILE);
 }
 
+/** Keeps the newest `cap` ids per repo, in place (every importer holds `state`), and returns the map. */
+export function capSeenReleaseIds(ids: Record<string, number[]>, cap = RELEASE_ID_CAP): Record<string, number[]> {
+  for (const [repo, list] of Object.entries(ids)) ids[repo] = list.slice(-cap);
+  return ids;
+}
+
 export function saveState(): Promise<void> {
   // Cap each repo's release-id history so the file never grows unbounded.
-  for (const [repo, ids] of Object.entries(state.seenReleaseIds)) {
-    state.seenReleaseIds[repo] = ids.slice(-RELEASE_ID_CAP);
-  }
+  capSeenReleaseIds(state.seenReleaseIds);
   return stateWriter.save(state);
 }
