@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { GatewayIntentBits } from "discord.js";
 import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./registry";
 import type { PluginIndex, PluginIndexEntry } from "./contract";
 
@@ -344,5 +345,72 @@ describe("collectIntents", () => {
   test("a skipped plugin with no entry at all is handled without throwing", () => {
     const selected = [{ name: "a", skipped: "not in the plugin index" }];
     expect(collectIntents(core, selected)).toEqual([1]);
+  });
+});
+
+// #493 item 6: the host never requests a privileged gateway intent. One the operator has not enabled in the
+// developer portal is refused at login, the process exits, and `restart: unless-stopped` loops -- for every
+// instance running that plugin. So the entry is skipped, by name, like any other entry the host cannot run.
+describe("selectPlugins -- privileged gateway intents (#493)", () => {
+  const PRIVILEGED = [
+    ["GuildMembers", GatewayIntentBits.GuildMembers],
+    ["GuildPresences", GatewayIntentBits.GuildPresences],
+    ["MessageContent", GatewayIntentBits.MessageContent],
+  ] as const;
+
+  test("an entry that declares a privileged intent is skipped, naming it, and a combined bitmask does not slip past", () => {
+    for (const [name, bit] of PRIVILEGED) {
+      const idx = index([entry({ name: "p", intents: [bit] })]);
+      const result = selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS);
+      expect(result[0]!.skipped).toMatch(new RegExp(`privileged gateway intent ${name} \\(in \\[${bit}\\]\\)`));
+      expect(result[0]!.entry).toBe(idx.plugins[0]);
+    }
+    // 32770 = MessageContent | GuildMembers: discord.js ORs the numbers, so a lookup of exact values would miss it.
+    const combined = index([entry({ name: "p", intents: [GatewayIntentBits.MessageContent | GatewayIntentBits.GuildMembers] })]);
+    const skipped = selectPlugins(combined, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped!;
+    expect(skipped).toContain("GuildMembers");
+    expect(skipped).toContain("MessageContent");
+    expect(skipped).toContain("privileged gateway intents ");
+    // The whole reason, as the panel and state.json show it.
+    expect(skipped).toBe("declares the privileged gateway intents GuildMembers, MessageContent (in [32770]), which the host never requests");
+    const single = index([entry({ name: "p", intents: [GatewayIntentBits.MessageContent] })]);
+    expect(selectPlugins(single, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBe(
+      "declares the privileged gateway intent MessageContent (in [32768]), which the host never requests",
+    );
+    // A non-privileged intent (GuildMessages) is selected as before.
+    const plain = index([entry({ name: "p", intents: [GatewayIntentBits.GuildMessages] })]);
+    expect(selectPlugins(plain, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBeUndefined();
+  });
+
+  test("a privileged intent is found wherever it sits among the declared intents", () => {
+    // Mutation: reading only the first declared intent leaves a realistic entry like this one selected.
+    for (const intents of [[GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent], [GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMessages], [1, 512, 4096, GatewayIntentBits.GuildPresences]]) {
+      const idx = index([entry({ name: "p", intents })]);
+      expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped, intents.join(",")).toMatch(/privileged gateway intent/);
+    }
+    const idx = index([entry({ name: "p", intents: [GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] })]);
+    // The declared list is quoted in full and comma-space separated (the panel and state.json show this line).
+    expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBe(
+      "declares the privileged gateway intent MessageContent (in [512, 32768]), which the host never requests",
+    );
+  });
+
+  test("the privileged bits are discord.js's", () => {
+    // registry.ts spells the bits out (it imports nothing but the contract's types); this reads them off the library.
+    expect(GatewayIntentBits.GuildMembers).toBe(2);
+    expect(GatewayIntentBits.GuildPresences).toBe(256);
+    expect(GatewayIntentBits.MessageContent).toBe(32768);
+  });
+
+  test("an entry skipped for its host API keeps that reason, privileged intent or not", () => {
+    const idx = index([entry({ name: "p", hostApiVersion: 2, intents: [GatewayIntentBits.MessageContent] })]);
+    expect(selectPlugins(idx, [{ name: "p" }], 1, CORE_COMMANDS)[0]!.skipped).toBe("needs host API v2, this bot is v1");
+  });
+
+  test("collectIntents never carries a privileged bit", () => {
+    for (const intents of [[32768], [32770]]) {
+      const idx = index([entry({ name: "p", intents })]);
+      expect(collectIntents([1], selectPlugins(idx, [{ name: "p" }], 1, []))).toEqual([1]);
+    }
   });
 });
