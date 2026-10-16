@@ -770,7 +770,8 @@ describe("handleCommand — /update", () => {
 
   /**
    * Admin `999`'s `/update` interaction, recording every edit and DM that LANDS and counting every attempt. The first
-   * `editFails` edits reject with `failure.error` (a reply Discord refuses); the DM rejects with it when `dmFails`.
+   * `editFails` edits reject with `failure.error` (a reply Discord refuses); the DM rejects with `dmError` (else the
+   * same error) when `dmFails`.
    */
   function adminUpdate(
     o: {
@@ -778,6 +779,7 @@ describe("handleCommand — /update", () => {
       failure?: { error: unknown };
       editFails?: number;
       dmFails?: boolean;
+      dmError?: unknown;
       /** Make the DM take this long, and record the order of the refused edit and the DM into `events`. */
       sendDelayMs?: number;
       events?: string[];
@@ -794,7 +796,7 @@ describe("handleCommand — /update", () => {
           calls.dm += 1;
           o.events?.push("dm-start");
           if (o.sendDelayMs) await Bun.sleep(o.sendDelayMs);
-          if (o.dmFails) throw o.failure!.error;
+          if (o.dmFails) throw o.dmError ?? o.failure!.error;
           dms.push(content);
           o.events?.push("dm-done");
         },
@@ -911,17 +913,20 @@ describe("handleCommand — /update", () => {
   // command for 15, so the reply to a long failed swap can arrive after the token died. The reply is sent to the
   // requester by DM instead (the check did NOT fail, so `[update] /update failed` is not logged); a DM that fails too
   // rejects out, as the double failure always did, so index.ts's catch logs it. The log carries neither the token nor
-  // the reply (#545). Mutations: no fallback (the handler rejects instead of answering, nothing is sent); a second
-  // `editReply` instead of the DM; a swallowed DM failure (resolves instead of rejecting); the raw error in the warn.
+  // the reply (#545). The DM's failure is a different error from the edit's, so which one rejects out is pinned too.
+  // Mutations: no fallback (the handler rejects instead of answering, nothing is sent); a second `editReply` instead of
+  // the DM; a swallowed DM failure (resolves instead of rejecting); the edit's error rethrown in place of the DM's; the
+  // raw error in the warn.
   test("a /update whose reply Discord rejects is sent by DM, logged without the token; a DM that fails too rejects out (#503 item 2)", async () => {
     for (const dmFails of [false, true]) {
       const failure = replyFailure("webhook");
-      const { interaction, edits, dms, calls } = adminUpdate({ failure, editFails: 1, dmFails });
+      const dmError = new Error("Cannot send messages to this user");
+      const { interaction, edits, dms, calls } = adminUpdate({ failure, editFails: 1, dmFails, dmError });
       const warn = spyOn(console, "warn").mockImplementation(() => {});
       try {
         await asAdmin("", async () => {
           // config.gitSha = "": `disabled`, so no fetch and a reply to send.
-          if (dmFails) await expect(handleCommand(interaction)).rejects.toBe(failure.error);
+          if (dmFails) await expect(handleCommand(interaction)).rejects.toBe(dmError);
           else expect(await handleCommand(interaction)).toBe("answered");
         });
         expect(edits).toEqual([]);
@@ -1419,8 +1424,21 @@ describe("commands.ts — clampReply guards every editReply (#55, #186, #503)", 
     expect(block.split("await interaction.editReply(content)")).toHaveLength(2);
     expect(block.split("editReply(")).toHaveLength(2);
     // Both clamps keep the default max (1900, under Discord's 2000): a tighter one would cut a real 1000-1400 unit
-    // failed-swap reply, a looser one is no clamp.
-    expect(block).not.toMatch(/clampReply\([^;]*,\s*\d[\d_.e]*\s*\)/);
+    // failed-swap reply, a looser one is no clamp. Each call has ONE argument -- counted at the call's own nesting
+    // depth, so `Number(1000)` or a named constant cannot slip past a pattern for numeric literals.
+    const args = [...block.matchAll(/clampReply\(/g)].map((m) => {
+      const segments = [""];
+      let depth = 1;
+      for (let i = m.index! + "clampReply(".length; i < block.length; i++) {
+        const c = block[i]!;
+        if ("([{".includes(c)) depth++;
+        else if (")]}".includes(c) && --depth === 0) break;
+        if (c === "," && depth === 1) segments.push("");
+        else segments[segments.length - 1] += c;
+      }
+      return segments.filter((s) => s.trim() !== "").length;
+    });
+    expect(args).toEqual([1, 1]);
   });
 
   test("/plugins list's failure edit is wrapped in clampReply", async () => {

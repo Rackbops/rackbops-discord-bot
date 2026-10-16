@@ -146,9 +146,9 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
           // (docker.ts's BUILD_TIMEOUT_MS), so the reply to a long failed swap can arrive after the token died. The
           // requester is known: tell them by DM, whatever made the edit fail. A DM that fails too rejects out of here,
           // as the double failure did before: on the swap path index.ts logs it and the interaction line says `error`;
-          // on the exit-75 path the restart's exit fires as this section closes, ahead of that catch, so nothing logs
-          // the DM's own failure there (the warn below records the refused edit) and the post-boot report is what
-          // reaches the requester.
+          // on the exit-75 path, when this is the last open critical section, the restart's exit fires as it closes,
+          // ahead of that catch, so nothing logs the DM's own failure there (the warn below records the refused edit)
+          // and the post-boot report is what reaches the requester.
           console.warn(
             `[update] /${interaction.commandName}: the reply was refused — sending it by DM`,
             withoutRequest(err),
