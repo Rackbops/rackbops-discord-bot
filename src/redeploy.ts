@@ -304,15 +304,17 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // exists but never started, and the ONLY other cleanup site is this same function's own
     // leftover-removal above, which doesn't run again until the next redeploy attempt. Since
     // #51 item 5, that lingering container also reads as "a swap is still in progress" to
-    // bot-ops.sh's guard, refusing restart/env-set for however long until that next attempt —
+    // bot-ops.sh's guard (a `created` one does, on purpose; an exited leftover no longer blocks it
+    // since #490), refusing restart/env-set for however long until that next attempt —
     // which the update scheduler's own anti-loop suppression can push out indefinitely for the
     // same sha. Best-effort: a cleanup failure here must not shadow the real error being reported.
     //
     // Cleans up by NAME when there is no id (#130). `createContainer` is now timeout-bounded, so it
     // can abort while the daemon goes on to create the container anyway — a slow-then-recovering
     // daemon is exactly the case that bound exists for. `replacementId` is then never assigned, and
-    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` that bot-ops.sh
-    // reads as "a swap is still in progress" until some LATER redeploy's leftover sweep above runs
+    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` (`created`,
+    // so not an exited leftover) that bot-ops.sh reads as "a swap is still in progress" until some
+    // LATER redeploy's leftover sweep above runs
     // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the
     // same handle that sweep uses, so removing by it is already proven to work.
     let replacement: ReplacementDisposition = "none";
@@ -689,7 +691,8 @@ async function restoreOriginalRestartPolicy(): Promise<void> {
  * until then; stopping the replacement FIRST (`docker stop <name>-next`, which also ends a crash loop)
  * and then `docker start <name>` has no overlap. A replacement that HANGS in `activate()` never
  * reaches any check (#408): `docker rm -f <name>-next` first, then `docker start <name>`. A `recreate`
- * or `env-set` is no rollback: it gives the original a NEW id, which none of these checks follow.
+ * or `env-set` is no rollback: it gives the original a NEW id, which none of these checks follow
+ * (`bot-ops.sh` refuses both while `<name>-next` is alive, #490; a plain `compose up -d` does not).
  *
  * The guard is for the unhappy path. Almost every throw site inside is at or before the original
  * is stopped: `write`, `restorePolicy`, and the pre-stop inspect all precede it, and
@@ -805,7 +808,8 @@ export interface CompleteTakeOverEffects {
  * one looks again: an original started during the tag call is left alone (Docker's 409) and steps this
  * build aside too — the one gap left is that tag call itself, in which case `:latest` names the build
  * rolled back from until the next update retags it. What this cannot see is a `recreate`/`env-set`,
- * which gives the original a new id (see {@link takeOver}).
+ * which gives the original a new id (see {@link takeOver}; `bot-ops.sh` refuses those while
+ * `<name>-next` is alive).
  *
  * A process that is already shutting down at either check (before the tag, before the removal) does none
  * of the rest: a SIGTERM starts the shutdown drain, which lets the first tick finish (plugin ticks are told
