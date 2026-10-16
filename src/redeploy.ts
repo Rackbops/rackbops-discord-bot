@@ -54,8 +54,9 @@ export function canonicalName(inspectedName: string): string {
 
 /**
  * `canonicalName` without any trailing `-next`: the name the compose file's `container_name` pins (#547). The
- * suffix is reserved for the replacement (`replacementName`), so a name that ends in it is a replacement
- * that has not taken the canonical name, and a drifted `<name>-next-next` folds back to `<name>`.
+ * suffix is reserved for the replacement (`replacementName`), so a name that ends in it is taken to be a
+ * replacement that has not taken the canonical name (`namedAfterItsProject` is the exception: a deployment
+ * called `...-next`), and a drifted `<name>-next-next` folds back to `<name>`.
  */
 export function baseName(inspectedName: string): string {
   return canonicalName(inspectedName).replace(/(?:-next)+$/, "");
@@ -397,7 +398,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     }
     endHandoff();
     return {
-      error: `could not start the replacement: ${(err as Error).message}${foreignHolder !== undefined ? ` — and ${name} is held by a container that could not be removed (it may be running; check docker ps)` : ""}`,
+      error: `could not start the replacement: ${(err as Error).message}${foreignHolder !== undefined ? ` — and ${name} is held by a container I did not start and could not remove (it may be running; check docker ps)` : ""}`,
       replacement,
       ...(replacementError !== undefined ? { replacementError } : {}),
     };

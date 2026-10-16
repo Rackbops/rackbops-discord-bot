@@ -90,7 +90,7 @@ armed at `index.ts:467`); O waits 180 s after `ready` (`handoff.ts:43`); O's SIG
    (`:184`, `:264-267`), start (`:268`).
 6. **Wait.** O polls the marker and R's container state every 2 s (`awaitHandoff`, `:398-418`).
 7. **R boots.** Loads `state.json` at import (`state.ts:41`), plugin index, `resolveBootMode`, logs in; the 90 s
-   verify timer is armed before all of it, at `index.ts`'s module top (**S3b-2**, #492: it used to be armed after the plugin index and `resolveBootMode`) (`index.ts:69-128`, `:467-481`).
+   verify timer is armed at `index.ts`'s module top, before the plugin index and `resolveBootMode` (**S3b-2**, #492: it used to be armed after them; `state.ts`'s import-time load still runs first) (`index.ts:69-128`, `:467-481`).
 8. **R verifies and takes over.** `ClientReady` clears the timer and runs `takeOver` (`index.ts:130-138`):
    write `ready` (`redeploy.ts:621`), tag `:latest` (`:628`), restore the original restart policy (`:639`),
    `retireOriginal(O)` (`:640`: inspect, stop, remove, rename), clear the marker (`:641`). **S3a:** `takeOver` no

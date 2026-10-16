@@ -1865,7 +1865,7 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("9".repeat(40));
     expect(result.replacement).toBe("remove-failed");
     expect(result.replacementError).toContain("500");
-    expect(result.error).not.toContain("held by a container that could not be removed");
+    expect(result.error).not.toContain("held by a container I did not start");
     expect(handoffActive()).toBe(false);
   });
 
@@ -1906,7 +1906,7 @@ describe("redeploy — cleanup always runs", () => {
     expect(result.error).toContain("could not start the replacement");
     expect(result.error).toContain("409");
     // The holder is someone else's live bot: told so, and NOT as a replacement to "remove by hand".
-    expect(result.error).toContain("held by a container that could not be removed (it may be running; check docker ps)");
+    expect(result.error).toContain("held by a container I did not start and could not remove (it may be running; check docker ps)");
     expect(result.replacement).toBe("none");
     expect(result.replacementError).toBeUndefined();
     expect(calls.some((c) => c.path === "/containers/create")).toBe(false);

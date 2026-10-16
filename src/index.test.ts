@@ -169,6 +169,7 @@ describe("index.ts wiring", () => {
       // What the timer does when it fires, and when: the 90 s budget, a `failed` marker for the original, exit 1.
       const timerBlock = source.slice(timer, source.indexOf("    : undefined;", timer));
       expect(timerBlock).toContain("}, VERIFY_DEADLINE_MS)");
+      expect(timerBlock).toContain("await writeMarker({"); // awaited: the exit must not race the marker write
       expect(timerBlock).toContain('status: "failed"');
       expect(timerBlock).toContain("process.exit(1);");
       expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);

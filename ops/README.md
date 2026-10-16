@@ -453,7 +453,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   (its `/update` is refused with the `container_name` advice instead); a swapped-in container still named
   `<name>-next` has its `/update` refused with that restart as the advice. An instance whose container is
   named `-next` after its own compose project (`install.sh next`, `canary-next`) is never renamed and cannot
-  self-update: pick another instance name. (c) Neither yet: wait. An **exited** `<name>-next` blocks
+  self-update: pick another instance name. A compose-only deployment whose `container_name` ends in `-next` and
+  that had already self-updated before #547 would be renamed at its next boot. (c) Neither yet: wait. An **exited** `<name>-next` blocks
   nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
   (`docker rm <name>-next` clears it sooner).
 
