@@ -881,7 +881,8 @@ describe("redeploy — cleanup always runs", () => {
 
   // #130: createContainer is timeout-bounded now, so it can abort while the daemon goes on to
   // create the container anyway. redeploy() never learns the id, so an id-only cleanup would skip
-  // the orphan — and a lingering `<name>-next` reads to bot-ops.sh as "a swap is still in
+  // the orphan — and a lingering `<name>-next` (created or running; an exited one no longer blocks
+  // the guard since #490) reads to bot-ops.sh as "a swap is still in
   // progress", refusing restart/env-set until some later redeploy's leftover sweep runs, which the
   // anti-loop suppression can defer indefinitely for the same sha. Cleanup must fall back to the
   // NAME. Before the fix this test saw only the pre-create sweep, never a cleanup removal.
@@ -969,7 +970,7 @@ describe("redeploy — cleanup always runs", () => {
   // createContainer can succeed and startContainer still fail (a bind-mount error, a network
   // alias conflict, a daemon hiccup) — without cleanup here the created-but-never-started
   // container leaks until the NEXT redeploy attempt's own leftover-removal line. Found during
-  // review of #51 item 5: bot-ops.sh's new guard reads that lingering container as "a swap is
+  // review of #51 item 5: bot-ops.sh's new guard reads that lingering (`created`) container as "a swap is
   // still in progress" and refuses restart/env-set for however long until that next attempt,
   // which the update scheduler's anti-loop suppression can push out indefinitely for the same sha.
   test("a startContainer failure cleans up the just-created replacement instead of leaking it", async () => {

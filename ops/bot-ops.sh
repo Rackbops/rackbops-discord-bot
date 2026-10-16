@@ -338,59 +338,51 @@ declare -A RESERVED_KEYS=(
 )
 
 # A self-update (nazumods/wow#879) briefly runs the replacement alongside the original under
-# "<container>-next" before it takes the canonical name over. Recreating or restarting the
-# ORIGINAL while that container exists races retireOriginal's own stop/remove/rename and can leave
-# two bots alive on the shared token (issue #51 item 5) — refuse outright rather than risk it; the
-# operator can just retry once the swap finishes (usually well under a minute).
+# "<container>-next" before it takes the canonical name over. Recreating or restarting the original
+# while that replacement is ALIVE races its stop/remove/rename and can leave two bots on the shared
+# token (issue #51 item 5): refuse outright, and the operator can retry once the swap finishes.
 #
-# The "-next" container's mere EXISTENCE is not enough on its own to decide THAT, in either
-# direction:
-#   - Too EARLY a signal misses the pre-verification window (up to VERIFY_DEADLINE_MS, ~90s) where
-#     "-next" already exists but hasn't written anything yet — an env-set force-recreate landing
-#     there would recreate the untouched original under a brand-new container id, orphaning the
-#     replacement's own HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats
-#     it as "already gone" (its documented tolerant path), and skips the rename WITHOUT throwing —
-#     so the replacement still goes live. Two live bots, and the recreated one is still on the OLD
-#     image (:latest isn't retagged until takeOver verifies).
-#   - Too LATE a signal (checked only via a marker file, tried and reverted once already) means the
-#     container's existence outlives the marker: retireOriginal tolerates its own post-stop
-#     remove/rename failing (a stopped original corpse still holding the canonical name, or the
-#     resulting name conflict) and never retries — "cosmetic," per its own comment, since the bot
-#     is up and serving either way. Guarding on a marker that's already been cleared by then would
-#     wrongly allow past that safe point, but guarding on one that hasn't been WRITTEN yet wrongly
-#     refuses nothing during the dangerous window above — no single read of that file can tell the
-#     two apart, since both look identical (absent) from outside.
-#
-# What actually distinguishes "still unresolved" from "resolved, rename just didn't stick" is
-# whether the ORIGINAL itself is still running. It stays running for the entire pre-verification
-# wait and the entire verified-but-not-yet-retired wait (nothing has touched it yet in either), and
-# retireOriginal's own comment calls its stop "the point of no return" — every step after that
-# (remove, rename) is best-effort and non-fatal on failure. So: refuse only while "-next" exists
-# AND the canonical name still resolves to a RUNNING container. A narrow gap remains between that
-# stop and the remainder of the cleanup finishing (typically milliseconds — two more daemon calls)
-# where this allows through; unlike the window above, both containers agree on the SAME already-
-# verified image there (tagLatest runs before the stop), so the worst case is a brief, self-
-# resolving overlap rather than a stale-code split-brain — the same class of accepted residual risk
-# as issue #51's own item 1.
-#
-# Formerly a known, DECLINED residual risk (tracked on #85, now HANDLED by #160, not by this
-# guard): retireOriginal's own stopContainer call on a genuine first attempt used to be unguarded
-# — if the daemon actually stopped the original but the HTTP response was lost in transit (the
-# exact scenario takeOver's own comment names), that throw crashed the REPLACEMENT process rather
-# than completing the swap, which could leave the crashed replacement mid-reboot (a real Bun
-# process + gateway reconnect, low seconds) while `docker ps` already read the original as safely
-# gone — a window where an env-set landing here could still produce a genuine two-live-bots
-# outcome. #160 closed it at the source: retireOriginal now re-inspects the original on any stop
-# throw and proceeds (rather than crashing) once it's confirmed down, so a lost-in-transit response
-# no longer crashes the replacement at all — see CONTEXT.md's matching gotcha. #160 also stops
-# Docker's OWN restart policy from resurrecting an unverified standby (the other half of #85), so
-# this guard's own signal (`-next` exists + the canonical name still running) is no longer racing
-# either failure mode it used to.
+# The signal is the "-next" container's STATE, read once; whether the canonical name is running only
+# chooses the message (#490, #548):
+#   - exited / dead: a LEFTOVER, so the guard passes. A host reboot or daemon restart inside the swap
+#     window leaves the standby exited for good (its restart policy is "no" since #160) while the
+#     original comes back under its own policy and runs; nothing is coming to retire anyone, and the
+#     next self-update sweeps the name. Refusing would lock the operator out of restart, env-set and
+#     recreate behind a "try again once it completes" that never becomes true (#490 item 2).
+#   - created: refuses ON PURPOSE. Every swap sits there for the length of its start call (create and
+#     start run back to back), and that early window is the one this guard was written for: an
+#     env-set force-recreate landing while "-next" exists but has written nothing yet would recreate
+#     the untouched original under a brand-new container id, orphaning the replacement's own
+#     HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats it as "already gone"
+#     and skips the rename WITHOUT throwing, so the replacement still goes live: two live bots, and
+#     the recreated one is still on the OLD image. Treating "created" as a leftover would reopen that
+#     race on every swap to spare a lockout that needs a process death inside the same gap; that one
+#     is cleared with `docker rm <container>-next` (ops/README.md).
+#   - running, restarting, paused, removing: ALIVE. With the canonical name running this is a swap in
+#     flight (the pre-verification wait and the verified-but-not-yet-retired wait: nothing has
+#     touched the original yet). With the canonical name NOT running it is the seconds after the
+#     replacement's login while the new build proves itself (#548), a new build crash-looping in that
+#     probation, or a swap whose rename never landed (#547): a recreate would start a second bot
+#     beside the live one, which the old signal ("-next" exists AND the canonical name runs) let
+#     through. It is refused with a pointer to the runbook in ops/README.md, which tells the three
+#     apart by the replacement's log.
+# The name filter is a regex, so more than one line is possible; one alive line is enough to refuse
+# (fail closed). A `docker ps` that errors reads as "no -next" and the guard passes, as it always did.
+# History: #51 item 5 added the guard; #160 closed the lost-stop-response window (retireOriginal
+# re-inspects the original) and stopped Docker's own restart policy from resurrecting an unverified
+# standby, so refusing while the replacement is alive is no longer racing those failure modes.
 guard_no_handoff_in_progress() {
-  docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.Names}}' 2>/dev/null | grep -q . || return 0
+  local states alive
+  # One `ps -a` with `{{.State}}` (not `{{.Names}}`): the question is whether the replacement is ALIVE,
+  # not whether it exists. Anything but exited or dead means a swap is in flight or just finished.
+  states="$(docker ps -a --filter "name=^/${CONTAINER}-next$" --format '{{.State}}' 2>/dev/null || true)"
+  # No -next container at all leaves $states empty, and so $alive empty: the next line returns.
+  alive="$(grep -vxE 'exited|dead' <<<"$states" | head -n1 || true)"
+  [ -n "$alive" ] || return 0
   if docker ps --filter "name=^/${CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
-    die "a self-update is in progress (container '${CONTAINER}-next' exists and '${CONTAINER}' is still running) — try again once it completes"
+    die "a self-update is in progress (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is still running) — try again once it completes"
   fi
+  die "a self-update is finishing (container '${CONTAINER}-next' is ${alive} and '${CONTAINER}' is not running) — try again in a minute; if it persists, read 'docker logs ${CONTAINER}-next' and see ops/README.md (a new build that keeps crashing: 'docker start ${CONTAINER}' rolls back; one that is up but never took the name: rename it)"
 }
 
 # #227: one exclusive lock per config dir around every mutation of it (env-set's read-modify-write

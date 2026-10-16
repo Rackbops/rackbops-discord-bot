@@ -272,15 +272,17 @@ export async function redeploy(
     // exists but never started, and the ONLY other cleanup site is this same function's own
     // leftover-removal above, which doesn't run again until the next redeploy attempt. Since
     // #51 item 5, that lingering container also reads as "a swap is still in progress" to
-    // bot-ops.sh's guard, refusing restart/env-set for however long until that next attempt —
+    // bot-ops.sh's guard (a `created` one does, on purpose; an exited leftover no longer blocks it
+    // since #490), refusing restart/env-set for however long until that next attempt —
     // which the update scheduler's own anti-loop suppression can push out indefinitely for the
     // same sha. Best-effort: a cleanup failure here must not shadow the real error being reported.
     //
     // Cleans up by NAME when there is no id (#130). `createContainer` is now timeout-bounded, so it
     // can abort while the daemon goes on to create the container anyway — a slow-then-recovering
     // daemon is exactly the case that bound exists for. `replacementId` is then never assigned, and
-    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` that bot-ops.sh
-    // reads as "a swap is still in progress" until some LATER redeploy's leftover sweep above runs
+    // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` (created or running,
+    // so not an exited leftover) that bot-ops.sh reads as "a swap is still in progress" until some
+    // LATER redeploy's leftover sweep above runs
     // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the
     // same handle that sweep uses, so removing by it is already proven to work.
     await removeContainer(replacementId ?? name, true).catch((cleanupErr) => {
