@@ -131,4 +131,4 @@ route.
   `activate()` has returned and the first scheduler tick has settled (60 s cap). Its listener binds
   earlier, inside `activate()`, but is reachable through the tunnel by name only from the rename on:
   for the tail of `activate()` plus the first tick the route points at the stopped original. That is
-  the cost of keeping the original as a one-command rollback.
+  the cost of keeping the original as a rollback target.

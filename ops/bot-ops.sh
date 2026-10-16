@@ -357,7 +357,7 @@ declare -A RESERVED_KEYS=(
 #   - Too LATE a signal (checked only via a marker file, tried and reverted once already) means the
 #     container's existence outlives the marker: completeTakeOver tolerates its own remove/rename
 #     failing (a stopped original corpse still holding the canonical name, or the resulting name
-#     conflict) and never retries until a later standby boot — "cosmetic," per its own comment,
+#     conflict) and never retries until a later standby boot — treated as cosmetic (non-fatal),
 #     since the bot is up and serving either way. Guarding on a marker that's already been cleared by then would
 #     wrongly allow past that safe point, but guarding on one that hasn't been WRITTEN yet wrongly
 #     refuses nothing during the dangerous window above — no single read of that file can tell the

@@ -37,7 +37,7 @@ import {
   writeMarker,
   type HandoffOutcome,
 } from "./handoff";
-import { beginHandoff, endHandoff } from "./restart";
+import { beginHandoff, endHandoff, isShuttingDown } from "./restart";
 import { SHORT_SHA_LEN, shortSha } from "./storage";
 
 const POLL_MS = 2_000;
@@ -83,7 +83,7 @@ export function shaTag(currentImage: string, sha: string): string {
  * -d`). Applied only once `completeTakeOver` runs for the replacement under it: it has logged in,
  * finished `activate()` and gone through its first tick (settled, or 60 s passed; #548) — never at
  * build time (issue #39), so none of those paths can ever recreate the bot on a build that merely
- * compiled but crashed at boot, or crashed within that first minute after it logged in.
+ * compiled but crashed at boot, or crashed before its start-up and first tick were through.
  */
 export function latestTag(currentImage: string): string {
   const repo = currentImage.split(":")[0] ?? currentImage;
@@ -533,6 +533,9 @@ export interface TakeOverEffects {
   rolledBack?: () => Promise<boolean>;
   /** Stops this container instead of the original ({@link stepAside}); only reached when `rolledBack` says so. */
   stepAside?: () => Promise<never>;
+  /** Seams for the DEFAULT `stepAside` (its `exit`, `sleep`, `stop`), so the real wiring of the rollback branch
+   *  can be exercised without ending the test process. Ignored when `stepAside` is given. */
+  stepAsideDeps?: RollbackDeps;
   exit?: (code: number) => void;
 }
 
@@ -631,7 +634,7 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
   const clear = effects.clear ?? clearMarker;
   const restorePolicy = effects.restorePolicy ?? restoreOriginalRestartPolicy;
   const rolledBack = effects.rolledBack ?? (() => detectRollback({ ...process.env, [HANDOFF_FROM_ENV]: originalId }));
-  const aside = effects.stepAside ?? (() => stepAside());
+  const aside = effects.stepAside ?? (() => stepAside(effects.stepAsideDeps));
   const exit = effects.exit ?? ((code: number) => process.exit(code));
   // #548: look again before touching anything. An operator's `docker start <name>` that landed after the
   // boot-time check is a rollback; `ready` and the stop would undo it. Outside the try: this never throws,
@@ -682,6 +685,8 @@ export interface CompleteTakeOverEffects {
   /** Seams for the DEFAULT `stepAside` (its `exit` and `sleep`, or a stub `stop`), so the real wiring of the
    *  rollback branch can be exercised without ending the test process. Ignored when `stepAside` is given. */
   stepAsideDeps?: RollbackDeps;
+  /** Whether this process is shutting down (`restart.ts`'s `isShuttingDown`, the default). */
+  shuttingDown?: () => boolean;
 }
 
 /**
@@ -693,10 +698,19 @@ export interface CompleteTakeOverEffects {
  * this runs, `docker start <name>` on the stopped original is the rollback — and if that has happened,
  * the original is RUNNING when this looks at it, which means the operator chose it: this container
  * steps aside (stops itself) rather than kill it, and does so BEFORE tagging, so a build the operator
- * just rolled back from never becomes `:latest`. The removal is NOT forced, and a refused one looks
- * again: an original started during the tag call is left alone (Docker's 409) and steps this build
- * aside too. What this cannot see is a `recreate`/`env-set`, which gives the original a new id (see
- * {@link takeOver}).
+ * rolled back from before this looked never becomes `:latest`. The removal is NOT forced, and a refused
+ * one looks again: an original started during the tag call is left alone (Docker's 409) and steps this
+ * build aside too — the one gap left is that tag call itself, in which case `:latest` names the build
+ * rolled back from until the next update retags it. What this cannot see is a `recreate`/`env-set`,
+ * which gives the original a new id (see {@link takeOver}).
+ *
+ * A process that is shutting down does none of this (checked before the tag and before the removal): a
+ * SIGTERM aborts the first tick, so probation looks over, and completing then would remove the original
+ * while the operator is stopping this container to roll back (`docker stop <name>-next`, then
+ * `docker start <name>`). A stopped replacement that is later restarted boots as a standby beside the
+ * kept original and completes the swap itself. (A shutdown only — not a pending restart or a handoff of
+ * this process's own: those leave the swap to complete, and the next boot or the next replacement
+ * converges the names.)
  *
  * Every other step is best-effort and logged; none throws, because the bot is up and serving and a
  * cleanup failure must not take it down (a rejecting `ClientReady` handler ends the process). An
@@ -713,6 +727,9 @@ export async function completeTakeOver(originalId: string, effects: CompleteTake
   const remove = effects.remove ?? removeContainer;
   const rename = effects.rename ?? takeName;
   const aside = effects.stepAside ?? (() => stepAside(effects.stepAsideDeps));
+  const shuttingDown = effects.shuttingDown ?? isShuttingDown;
+  const leaveForALaterBoot = () =>
+    console.log("[handoff] this process is shutting down — leaving the stopped original for a later boot to remove");
   // Read first: whether the operator rolled back, and the original's name — which cannot be read once the
   // corpse is gone.
   let original: ContainerInspect | undefined;
@@ -730,6 +747,7 @@ export async function completeTakeOver(originalId: string, effects: CompleteTake
     );
     await aside();
   }
+  if (shuttingDown()) return leaveForALaterBoot();
   // Best-effort, same "never fail a good deploy over housekeeping" rule as pruneOldImages: applied only
   // now, post-verification — never at build time — which is issue #39's fix: a build that merely
   // *compiled* but crashed at boot used to leave `:latest` arming every later recreate (env-set, a
@@ -741,6 +759,7 @@ export async function completeTakeOver(originalId: string, effects: CompleteTake
         `the previous one, until the next successful update retags it): ${(err as Error).message}`,
     );
   });
+  if (shuttingDown()) return leaveForALaterBoot();
   try {
     // NOT forced: the original was read as stopped above, and the tag call since may have taken a while. A
     // forced removal would kill and delete an original the operator started in that gap; Docker refuses
