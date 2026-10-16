@@ -11,7 +11,7 @@ import { restartPending, requestRestart, withCritical } from "./restart";
 import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator } from "./storage";
 import { loadPluginIndex } from "./plugins";
 import { readPluginState, mutatePluginState } from "./plugins/host";
-import { checkPluginUpdates, type PluginUpdateDeps } from "./plugins/updates";
+import { checkPluginUpdates, runDuePluginSchedules, type PluginUpdateDeps } from "./plugins/updates";
 import { consumePluginRequests, type PluginRequestDeps } from "./plugins/requests";
 import { settledWithin } from "./plugins/drain";
 import { HOST_API_VERSION, type HostStorage } from "./plugins/contract";
@@ -261,11 +261,17 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
       // update, which moves the pin and restarts the bot (#104), the one place this tick acts on an
       // update, and only because an admin scheduled it.
       // Gated on pluginStateReady so it can't race the boot state.json write (see the flag above).
+      // The index poll (the notices, then due schedules) runs on the 15-minute gap; on every other tick
+      // only the due schedules are looked at (#442), so a schedule fires within a minute of its time.
       name: "pluginUpdates",
       run: async () => {
-        if (pluginStateReady && shouldPollPluginUpdates()) {
+        if (!pluginStateReady) return;
+        if (shouldPollPluginUpdates()) {
           lastPluginPollAt = Date.now(); // stamp at poll start, like checkReleases/checkAutoUpdate
-          await checkPluginUpdates(livePluginUpdateDeps(client));
+          await checkPluginUpdates(livePluginUpdateDeps(client)); // the notice pass, then due schedules
+        } else {
+          // #442: a schedule fires within a minute of its time, not on the next 15-minute index poll.
+          await runDuePluginSchedules(livePluginUpdateDeps(client));
         }
       },
     },

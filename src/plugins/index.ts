@@ -81,7 +81,25 @@ function entryProblem(p: unknown): string | undefined {
   if (!Array.isArray(e.env) || !e.env.every((k) => typeof k === "object" && k !== null && typeof (k as { key?: unknown }).key === "string")) {
     return "env is not a list of { key } entries";
   }
-  if (!Array.isArray(e.releases)) return "releases is not a list";
+  // #440: a release element's `version` is split by compareSemver and its `publishedAt` sliced by renderNotes; one that
+  // is not an object with both as strings threw a TypeError inside the whole notice pass, every poll. `url` and
+  // `notes` are only printed: strings when present, tolerated when absent (an absent `notes` prints nothing in the
+  // notice, `renderNotes` in updates.ts; the live index carries both).
+  if (
+    !Array.isArray(e.releases) ||
+    !e.releases.every((r) => {
+      if (typeof r !== "object" || r === null) return false;
+      const x = r as { version?: unknown; publishedAt?: unknown; url?: unknown; notes?: unknown };
+      return (
+        typeof x.version === "string" &&
+        typeof x.publishedAt === "string" &&
+        (x.url === undefined || typeof x.url === "string") &&
+        (x.notes === undefined || typeof x.notes === "string")
+      );
+    })
+  ) {
+    return "releases is not a list of releases with a string version and publishedAt";
+  }
   // discord.js's IntentsBitField throws on a non-number flag (BitFieldInvalid) — validated here so
   // a malformed entry never reaches createClient() uncaught. A bad entry that slipped past this would
   // also get cached, crash-looping every restart until the cache is cleared.

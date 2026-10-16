@@ -12,7 +12,8 @@ import { isReportModal, handleReportModal } from "./report";
 import { startScheduler, describeReleaseWatch, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
-import { reportUpdateOutcome } from "./updateReport";
+import { owedReportNow, reportUpdateOutcome } from "./updateReport";
+import { resolveUpdateAttempt } from "./update";
 import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { detectRollback, finishProbation, healOwnName, resolveBootMode, stepAside, takeOver } from "./redeploy";
 import { createReadyHandler } from "./ready";
@@ -278,6 +279,18 @@ async function activate(c: Client<true>): Promise<void> {
     console.error("[plugins] plugin setup failed — the bot starts core-only", err);
   }
 
+  // #450: what the previous life of this container left behind — a socket-path swap it started and never finished —
+  // is resolved BEFORE the interaction handler attaches: a `/update` that arrived first would arm a fresh record
+  // that this would take for the dead life's and clear while its build runs. The verdict is saved on the owed
+  // report, which is delivered at the end of this function (`reportUpdateOutcome`). One bounded daemon call, and
+  // only when such a record exists; an ordinary boot still never touches the socket. In standby this runs after
+  // takeOver, like every other state write of the replacement's. Not during a shutdown (the #541 guard below is the
+  // same rule for the rest of activation): the record stays for the next boot, which resolves it the same way.
+  const attempt = isShuttingDown() ? "none" : await resolveUpdateAttempt();
+  // The report the boot owes, as of this moment: a `/update` taken after the handler attaches arms a newer one that
+  // belongs to its own restart, and the report-back at the end of this function must not deliver or clear that one.
+  const owedAtBoot = owedReportNow();
+
   // Attach the interaction handler and bring plugins/the scheduler live BEFORE registering slash
   // commands with Discord: neither depends on that REST round-trip (commandMap/loadResult are
   // already populated above), so doing it first used to leave the bot with no interaction handler
@@ -534,8 +547,9 @@ async function activate(c: Client<true>): Promise<void> {
   markPluginStateReady();
 
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
-  // and reportUpdateOutcome already swallows every delivery failure of its own.
-  reportUpdateOutcome(client).catch((err) => console.error("[updateReport]", err));
+  // and reportUpdateOutcome already swallows every delivery failure of its own; `attempt` is what this boot made of
+  // the swap record (#450).
+  reportUpdateOutcome(client, attempt, undefined, owedAtBoot).catch((err) => console.error("[updateReport]", err));
 
   // #104: and the owed /plugins-update follow-up. Not awaited for the same reason; clears its marker
   // through the shared mutator (the pluginUpdates tick is live now that markPluginStateReady fired).
