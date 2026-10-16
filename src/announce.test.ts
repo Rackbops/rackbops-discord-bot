@@ -522,8 +522,12 @@ describe("checkReleases (#342)", () => {
 
       answer = () => new Response(JSON.stringify([gh(4), gh(3), gh(2), gh(1)]), { status: 200 });
       await checkReleases(fakeClient, [repo]); // back: 3 and 4 were published meanwhile -> announced, oldest first
-      expect(sent.map((m) => m.split("\n")[0])).toEqual(["📦 New release: **v3**", "📦 New release: **v4**"]);
-      expect(state.seenReleaseIds[repo]).toEqual([1, 2, 3, 4]); // persisted through the real saveState (awaited by checkReleases)
+      expect(sent).toEqual(["📦 New release: **v3**\nhttps://example.test/r/3", "📦 New release: **v4**\nhttps://example.test/r/4"]);
+      expect(state.seenReleaseIds[repo]).toEqual([1, 2, 3, 4]); // recorded id by id through the real persist callback
+      // The "at most the newest 15" in the comment and CONTEXT.md is this request's page size, so pin it.
+      const urls = fetchSpy.mock.calls.map(([url]) => String(url));
+      expect(urls).toHaveLength(2);
+      for (const url of urls) expect(url).toBe(`https://api.github.com/repos/${repo}/releases?per_page=15`);
     } finally {
       delete state.seenReleaseIds[repo]; // `state` is the shared singleton (dataIsolation.test.ts does the same)
       fetchSpy.mockRestore();
@@ -660,8 +664,8 @@ describe("describeReleaseWatch (#342)", () => {
 // Scoped to runTick's isolation guarantee (issue #43). checkReleases is exported with injectable deps
 // (#342) and tested above; the remaining core checks call real discord.js / GitHub APIs and their gates
 // are driven through tickChecks and startScheduler (#439, #460: the cadence tests above, the restart-safety
-// describe below), so this exercises the actual extracted isolation mechanism onTick delegates to, rather
-// than mocking discord.js's Client end-to-end.
+// describe below; the pluginRequests gate stays a source pin, above), so this exercises the actual extracted
+// isolation mechanism onTick delegates to, rather than mocking discord.js's Client end-to-end.
 describe("runTick", () => {
   test("a throwing check doesn't stop the rest from running", async () => {
     const ran: string[] = [];
@@ -832,6 +836,7 @@ describe("onTick's restart safety (#460)", () => {
     const exits: number[] = [];
     const restoreExit = setExitFn((code) => void exits.push(code));
     let exitedBeforeCheckEnded: boolean | undefined;
+    let exitedBeforeLaterCheck: boolean | undefined;
     try {
       await tickWith([
         {
@@ -842,11 +847,15 @@ describe("onTick's restart safety (#460)", () => {
             exitedBeforeCheckEnded = exits.length > 0;
           },
         },
+        // Runs after the restarter has returned. With ONE section around the whole tick the exit is still deferred
+        // here; a section per check would have closed (and exited) when the restarter ended.
+        { name: "later", run: async () => void (exitedBeforeLaterCheck = exits.length > 0) },
       ]);
     } finally {
       restoreExit();
     }
     expect(exitedBeforeCheckEnded).toBe(false); // deferred: the tick holds the critical section
+    expect(exitedBeforeLaterCheck).toBe(false); // and still deferred after that check ended: one section for the whole tick
     expect(exits).toEqual([RESTART_EXIT_CODE]); // and landed when the tick's section closed (endCritical -> doExit)
   });
 });
