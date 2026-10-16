@@ -14,7 +14,7 @@ import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
 import { writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
-import { resolveBootMode, takeOver } from "./redeploy";
+import { detectRollback, finishProbation, resolveBootMode, stepAside, takeOver } from "./redeploy";
 import { createReadyHandler } from "./ready";
 import {
   awaitCriticalIdle,
@@ -103,6 +103,10 @@ let currentLoadedPlugins: readonly LoadedPlugin[] = [];
 // #220: stops the host's HTTP listener, once activate() has started one (HTTP_PORT set). A no-op until
 // then, so a signal before activate() has nothing to stop.
 let stopHttp: () => void = () => {};
+// #548: the scheduler's FIRST tick, assigned by activate() when it starts the scheduler. A standby's
+// probation waits on it (redeploy.ts's finishProbation) before the stopped original is removed. Already
+// settled until then, and in a normal boot nothing reads it.
+let firstTick: Promise<void> = Promise.resolve();
 
 // #154: the first (and only) signal handler in this codebase, registered before resolveBootMode's
 // own daemon call below so even a standby stopped mid-verify drains cleanly (trivially idle —
@@ -130,18 +134,24 @@ process.on("SIGINT", shutdownHandler);
 // A daemon call only happens here when the env actually says standby (#46) — an ordinary boot
 // resolves this without ever touching the docker socket, same as before.
 const mode = await resolveBootMode(process.env);
+// #548: a standby whose original is RUNNING although this container has taken over before was rolled
+// back by the operator (`docker start <name>`); it steps aside instead of stopping the original again.
+if (mode === "standby" && (await detectRollback(process.env))) await stepAside();
 
-// A completed gateway login is the verification bar: process-alive proves nothing, and this
-// is the first moment the new build has demonstrated it can actually do its job. `takeOver` is
-// crash-proof — a retire failure exits this process rather than falling through to `activate`,
-// so a doomed handoff can never leave two live bots on the shared token. The order (clear the verify
-// timer, takeOver only in standby, then activate) lives in `src/ready.ts`, where `ready.test.ts` drives
-// it (#435); index.test.ts pins that this call is the only thing attached to ClientReady.
+// A completed gateway login is the verification bar for STOPPING the original: process-alive proves
+// nothing, and this is the first moment the new build has demonstrated it can actually do its job.
+// `takeOver` is crash-proof — a retire failure exits this process rather than falling through to
+// `activate`, so a doomed handoff can never leave two live bots on the shared token. The removal, the
+// canonical name and `:latest` wait for `activate()` and the first tick (#548, `finishProbation`): until
+// then the stopped original is the way back. The order (clear the verify timer, takeOver only in
+// standby, then activate, then afterActivate in standby) lives in `src/ready.ts`, where `ready.test.ts`
+// drives it (#435); index.test.ts pins that this call is the only thing attached to ClientReady.
 client.once(
   Events.ClientReady,
   createReadyHandler({
     mode,
     takeOver: () => takeOver(process.env[HANDOFF_FROM_ENV]!),
+    afterActivate: () => finishProbation(process.env[HANDOFF_FROM_ENV]!, firstTick),
     activate,
     clearVerifyTimer: () => clearTimeout(verifyTimer),
     log: console,
@@ -340,7 +350,7 @@ async function activate(c: Client<true>): Promise<void> {
   });
   onStopRequested((reason) => tickControl.stop(reason));
   console.log(describeReleaseWatch(config.watchedRepos));
-  startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
+  firstTick = startScheduler(client, pluginTicks(loadResult.loaded, console, PLUGIN_TICK_TIMEOUT_MS, tickControl));
 
   // #220 (ADR-0007): the host's HTTP router, only when HTTP_PORT is set. After activatePlugins, so a
   // plugin's `running` gate is already true; routeHttpRequest answers 503 for one that is not. A bind

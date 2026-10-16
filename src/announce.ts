@@ -60,10 +60,13 @@ export function isPluginStateReady(): boolean {
 
 const pluginStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 
-export function startScheduler(client: Client, extraChecks: TickCheck[] = []): void {
+/** Returns the FIRST tick's promise (settled, never rejecting) so the standby's probation can wait for
+ *  one tick to have run (#548). Callers that do not care ignore it. */
+export function startScheduler(client: Client, extraChecks: TickCheck[] = []): Promise<void> {
   const tick = () => onTick(client, extraChecks).catch((err) => console.error("[tick]", err));
-  tick();
+  const first = tick();
   setInterval(tick, TICK_MS);
+  return first;
 }
 
 type AnnounceKind = "release";

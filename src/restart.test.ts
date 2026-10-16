@@ -411,31 +411,20 @@ describe("beginShutdown (#154)", () => {
     beginShutdown("SIGTERM");
     expect(restartPending()).toBe(true);
   });
-});
 
-// #541: index.ts's activate() stops after plugin activation only when the process is leaving for good.
-// restartPending() is also true for a handoff, and a handoff that fails ends (endHandoff) with the process
-// still running, so acting on it would leave the bot half-booted for good.
-describe("isShuttingDown (#541)", () => {
-  test("is true after beginShutdown and only then", () => {
+  // #548: a replacement's probation stops completing when IT is being stopped, but keeps completing while a
+  // pending restart or a handoff of its own is in flight, so isShuttingDown is narrower than restartPending.
+  test("isShuttingDown is true after beginShutdown only: not for a pending restart or an in-flight handoff", () => {
     expect(isShuttingDown()).toBe(false);
-    beginShutdown("SIGTERM");
-    expect(isShuttingDown()).toBe(true);
-    resetForTest();
-    expect(isShuttingDown()).toBe(false);
-  });
-
-  test("is not true for a handoff, ended or not, nor for a pending restart", () => {
-    beginHandoff("redeploy -> abc1234");
+    beginHandoff("redeploy");
     expect(restartPending()).toBe(true);
     expect(isShuttingDown()).toBe(false);
     endHandoff();
+    beginCritical();
+    requestRestart("update");
     expect(isShuttingDown()).toBe(false);
-    beginCritical(); // so the restart below is deferred, not an immediate exit
-    requestRestart("test");
-    expect(restartPending()).toBe(true);
-    expect(isShuttingDown()).toBe(false);
-    endCritical();
+    beginShutdown("SIGTERM");
+    expect(isShuttingDown()).toBe(true);
   });
 });
 

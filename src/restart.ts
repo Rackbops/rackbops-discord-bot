@@ -260,9 +260,10 @@ export function restartPending(): boolean {
   return pending !== undefined || handoff !== undefined || shuttingDown;
 }
 
-/** True once `beginShutdown` has run — and only then. Unlike `restartPending()` it is not true for a handoff
- *  (which can end and leave the process running, `endHandoff`) or a pending restart (which exits by itself),
- *  so it is the one to ask when the question is "is this process leaving for good?" (#541). */
+/** True once `beginShutdown` has run, i.e. a SIGTERM/SIGINT arrived and the process is draining. Unlike
+ *  `restartPending`, neither a pending restart nor an in-flight handoff of THIS process sets it (#548:
+ *  the replacement's probation must keep completing while its own first tick starts a redeploy, and must
+ *  stop completing when it is being stopped). */
 export function isShuttingDown(): boolean {
   return shuttingDown;
 }

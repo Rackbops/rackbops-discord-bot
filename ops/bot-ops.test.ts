@@ -1098,7 +1098,8 @@ describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on
 
 // Issue #51 item 5: a self-update briefly runs the replacement alongside the original under
 // "<container>-next" before it takes the canonical name over. restart/env-set recreating or
-// restarting the ORIGINAL in that window races retireOriginal's own stop/remove/rename and can
+// restarting the ORIGINAL in that window races the replacement's own stop (retireOriginal) and its later
+// remove/rename (completeTakeOver, after probation, #548) and can
 // leave two bots on the shared token — both commands must refuse outright rather than risk it.
 // The signal is the "-next" container's STATE since #490 (the next two describes): an ALIVE one
 // refuses, and whether the canonical name is still running only chooses the message; an exited
@@ -1137,10 +1138,11 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
 });
 
 // #490 reversed what this describe pinned under #51. Then, a running "<container>-next" beside a stopped or
-// absent canonical was taken for a cosmetic rename failure (retireOriginal tolerates a failed remove/rename;
-// only a later boot of the replacement retries it), so the guard let restart/env-set through rather than lock
-// the operator out forever. That state is the live bot sitting beside the stopped original: the instant between
-// retireOriginal's stop and its rename, and a swap whose remove or rename failed (#547, the live bot stays
+// absent canonical was taken for a cosmetic rename failure (the replacement tolerates a failed remove/rename;
+// only a later boot of it retries them), so the guard let restart/env-set through rather than lock
+// the operator out forever. That state is the live bot sitting beside the stopped original: the window between
+// retireOriginal's stop and completeTakeOver's rename (the whole probation, #548: the rest of start-up plus up
+// to 60 s for the first tick), and a swap whose remove or rename failed (#547, the live bot stays
 // "-next"). A recreate there may start a second bot beside the live one (not verified without a daemon), which
 // is the race the guard exists to stop, so that state now REFUSES, with a message that points at the runbook.
 // What does not refuse any more is an EXITED (or dead) "-next": a leftover of a swap that was interrupted or
@@ -1185,12 +1187,12 @@ describe.skipIf(!runnable)("bot-ops.sh refuses a mutation beside a live -next, a
     expect(run.stderr).toContain("a self-update is finishing");
     expect(run.stderr).toContain("docker logs probe-container-next");
     expect(run.stderr).toContain("see ops/README.md");
-    // The rollback is the two-command form: remove the new build's container, then start the old one.
-    expect(run.stderr).toContain("'docker rm -f probe-container-next' then 'docker start probe-container'");
-    expect(run.stderr).toContain("with the old container still there");
-    // The rollback restarts the OLD build, but :latest already names the new one (takeOver tagged it), and a
-    // recreate reuses whatever is tagged: the message has to say so.
-    expect(run.stderr).toContain("':latest' must be re-pointed at it before any recreate");
+    // The runbook owns the rollback (ops/README.md): the message points at it, and does not repeat a recipe that
+    // goes stale. Since #548 the new build tags :latest only after its probation, so a rollback of a build that
+    // is still in it needs no re-point; the old message said otherwise.
+    expect(run.stderr).toContain("rolling back a new build that keeps crashing, or one that is up but never took the name");
+    expect(run.stderr).not.toContain("re-pointed");
+    expect(run.stderr).not.toContain("docker rm -f");
   });
 
   // An exited -next is a leftover, not a swap in flight.
@@ -3876,7 +3878,7 @@ describe("RESERVED_KEYS covers the deployment's own keys (#240)", () => {
     expect(files.length).toBeGreaterThan(20);
     expect(read.size).toBeGreaterThanOrEqual(15); // can't pass vacuously
     // the reads the scan must see, or its regexes have rotted
-    for (const key of ["DISCORD_TOKEN", "GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HOSTNAME", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY"]) {
+    for (const key of ["DISCORD_TOKEN", "GITHUB_REPO", "PLUGIN_REGISTRY_URL", "BOT_DATA_DIR", "NODE_ENV", "HOSTNAME", "HANDOFF_FROM", "HANDOFF_RESTART_POLICY", "HANDOFF_RESTART_RETRIES"]) {
       expect(read.has(key), `the scan should see ${key}`).toBe(true);
     }
     expect([...read].filter(([k]) => !allowedKeys.has(k) && !reserved.has(k)).map(([k, f]) => `${k} (${f})`)).toEqual([]);
@@ -3913,6 +3915,7 @@ describe.skipIf(!runnable)("a manifest cannot claim a core setting the panel doe
     "NODE_ENV",
     "HANDOFF_FROM",
     "HANDOFF_RESTART_POLICY",
+    "HANDOFF_RESTART_RETRIES",
     "HOSTNAME",
     "SHARDS",
     "SHARD_COUNT",

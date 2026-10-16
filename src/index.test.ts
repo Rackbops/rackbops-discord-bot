@@ -147,6 +147,32 @@ describe("index.ts wiring", () => {
       // takeOver is called from exactly one place, and never un-gated by an inline `await takeOver(`.
       expect((source.match(/takeOver\(process\.env\[HANDOFF_FROM_ENV\]!\)/g) ?? []).length).toBe(1);
       expect(source).not.toMatch(/await takeOver\(/);
+      // #548: probation's end is the ready handler's `afterActivate` (standby only, after activate), fed
+      // the scheduler's first tick; it is called from exactly one place and never un-gated by an inline await.
+      expect(call).toContain("afterActivate: () => finishProbation(process.env[HANDOFF_FROM_ENV]!, firstTick),");
+      expect((source.match(/finishProbation\(process\.env\[HANDOFF_FROM_ENV\]!, firstTick\)/g) ?? []).length).toBe(1);
+      expect(source).not.toMatch(/await finishProbation\(/);
+    });
+
+    // #548: the first tick is what probation waits on; assigned where activate() starts the scheduler.
+    test("activate() hands the scheduler's first tick to firstTick, which probation waits on", () => {
+      expect((source.match(/firstTick = startScheduler\(client, /g) ?? []).length).toBe(1);
+      expect(source.indexOf("firstTick = startScheduler(")).toBeGreaterThan(source.indexOf("async function activate("));
+      expect((source.match(/let firstTick: Promise<void> = Promise\.resolve\(\);/g) ?? []).length).toBe(1);
+    });
+
+    // #548: a standby whose original is RUNNING after this container took over before was rolled back by the
+    // operator (`docker start <name>`); it steps aside right after resolveBootMode, before the Client logs in
+    // or anything is attached, instead of stopping the original again.
+    test("a standby checks for a rollback right after resolveBootMode and before the ClientReady handler is attached", () => {
+      const resolved = source.indexOf("await resolveBootMode(process.env);");
+      const attach = source.indexOf("client.once(");
+      expect(resolved).toBeGreaterThan(-1);
+      const between = source.slice(resolved, attach);
+      expect(between).toContain('if (mode === "standby" && (await detectRollback(process.env))) await stepAside();');
+      expect((source.match(/detectRollback\(/g) ?? []).length).toBe(1);
+      expect((source.match(/stepAside\(/g) ?? []).length).toBe(1);
+      expect(source).toMatch(/import \{[^}]*\bdetectRollback\b[^}]*\bfinishProbation\b[^}]*\bstepAside\b[^}]*\} from "\.\/redeploy";/);
     });
   });
 
