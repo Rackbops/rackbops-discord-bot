@@ -355,8 +355,9 @@ declare -A RESERVED_KEYS=(
 #     start run back to back), which is the first instant of the early window this guard was written
 #     for: an env-set force-recreate landing while "-next" exists but has written nothing yet would
 #     recreate the untouched original under a brand-new container id, orphaning the replacement's own
-#     HANDOFF_FROM reference; retireOriginal then 404s on that stale id, treats it as "already gone"
-#     and skips the rename WITHOUT throwing, so the replacement still goes live: two live bots, and
+#     HANDOFF_FROM reference; retireOriginal then 404s on that stale id and treats it as "already
+#     gone", and completeTakeOver later finds no original to take the name from and skips the rename
+#     WITHOUT throwing, so the replacement still goes live: two live bots, and
 #     the recreated one is still on the OLD image. Treating "created" as a leftover would reopen that
 #     race on every swap to spare a lockout that needs a process death inside the same gap; that one
 #     is cleared with `docker rm <container>-next` (ops/README.md).

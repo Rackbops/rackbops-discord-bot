@@ -753,11 +753,12 @@ _Avoid_: server list, guild cache
   which the first tick can settle, which is why `completeTakeOver` returns early under `isShuttingDown()` instead of
   completing the swap while it drains. What the looks cannot see: a `recreate`/`env-set` during
   probation gives the original a NEW container id that none of them follow — `bot-ops.sh` now
-  refuses both (and `restart`) while `<name>-next` is alive, #490, but a plain `compose up -d`
-  has no guard and could leave two bots (whether compose also recreates `<name>-next` is
-  unverified); a
-  replacement hung in `activate()` (#408) never gets as far as the end-of-probation look, so a
-  rollback of it starts with `docker rm -f <name>-next`; with `AUTO_UPDATE=true` a revived
+  refuses both (and `restart`) while `<name>-next` is alive, #490; a plain `compose up -d` has no
+  guard, and while it most likely just starts the stopped original (a rollback the replacement
+  steps aside for), a forced recreate it triggered could leave two bots (unverified without a
+  daemon, as is whether compose also recreates `<name>-next`); a replacement that hangs rather
+  than crashes never gets as far as a look, so stop it first (`docker stop <name>-next`, or
+  `docker rm -f <name>-next` to end it at once) and only then `docker start <name>`; with `AUTO_UPDATE=true` a revived
   original can update itself to the bad build again; and a redeploy started inside the
   replacement's first tick may not converge (#547).
 - **`GIT_SHA` is stripped from the replacement's copied env** (`buildCreateSpec`). Docker's

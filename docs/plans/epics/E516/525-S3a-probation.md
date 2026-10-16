@@ -11,7 +11,7 @@ tree; the implementer re-reads each one on the tree it works from and corrects a
 > wins.** (1) The removal in `completeTakeOver` is NOT forced (a forced one would kill and delete an original the
 > operator started during the tag call); a refused removal looks again and steps aside. (2) Decision 4 ("a
 > recreate during probation makes the replacement step aside") is false: a `recreate`/`env-set` creates a new
-> container id that nothing follows, so two bots can run until #490 item 2's guard lands (S3b-1). (3) The
+> container id that nothing follows, so two bots could run; S3b-1 (#490 item 2's guard, since landed) refuses `bot-ops.sh` `recreate`, `env-set` and `restart` while `-next` is alive, a plain `compose up -d` is unguarded. (3) The
 > rollback to recommend is `docker stop <name>-next`, then `docker start <name>`; a bare `docker start` overlaps
 > until the replacement looks. (4) `detectRollback` ignores a standby with no `HANDOFF_RESTART_POLICY` in its env
 > (a pre-#160 standby). (5) `completeTakeOver` steps aside before it tags (a rolled-back-from build must not

@@ -1098,7 +1098,8 @@ describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on
 
 // Issue #51 item 5: a self-update briefly runs the replacement alongside the original under
 // "<container>-next" before it takes the canonical name over. restart/env-set recreating or
-// restarting the ORIGINAL in that window races retireOriginal's own stop/remove/rename and can
+// restarting the ORIGINAL in that window races the replacement's own stop (retireOriginal) and its later
+// remove/rename (completeTakeOver, after probation, #548) and can
 // leave two bots on the shared token — both commands must refuse outright rather than risk it.
 // The signal is the "-next" container's STATE since #490 (the next two describes): an ALIVE one
 // refuses, and whether the canonical name is still running only chooses the message; an exited
@@ -1137,10 +1138,11 @@ describe.skipIf(!runnable)("bot-ops.sh refuses restart/env-set while a swap is m
 });
 
 // #490 reversed what this describe pinned under #51. Then, a running "<container>-next" beside a stopped or
-// absent canonical was taken for a cosmetic rename failure (retireOriginal tolerates a failed remove/rename;
-// only a later boot of the replacement retries it), so the guard let restart/env-set through rather than lock
-// the operator out forever. That state is the live bot sitting beside the stopped original: the instant between
-// retireOriginal's stop and its rename, and a swap whose remove or rename failed (#547, the live bot stays
+// absent canonical was taken for a cosmetic rename failure (the replacement tolerates a failed remove/rename;
+// only a later boot of it retries them), so the guard let restart/env-set through rather than lock
+// the operator out forever. That state is the live bot sitting beside the stopped original: the window between
+// retireOriginal's stop and completeTakeOver's rename (the whole probation, #548: the rest of start-up plus up
+// to 60 s for the first tick), and a swap whose remove or rename failed (#547, the live bot stays
 // "-next"). A recreate there may start a second bot beside the live one (not verified without a daemon), which
 // is the race the guard exists to stop, so that state now REFUSES, with a message that points at the runbook.
 // What does not refuse any more is an EXITED (or dead) "-next": a leftover of a swap that was interrupted or

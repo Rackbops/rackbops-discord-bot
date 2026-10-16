@@ -689,10 +689,11 @@ async function restoreOriginalRestartPolicy(): Promise<void> {
  * ({@link stepAside}). That is not instant: a replacement that is alive and in probation only looks at
  * the end of it (the rest of `activate()` plus up to 60 s), and both bots answer on the shared token
  * until then; stopping the replacement FIRST (`docker stop <name>-next`, which also ends a crash loop)
- * and then `docker start <name>` has no overlap. A replacement that HANGS in `activate()` never
- * reaches any check (#408): `docker rm -f <name>-next` first, then `docker start <name>`. A `recreate`
- * or `env-set` is no rollback: it gives the original a NEW id, which none of these checks follow
- * (`bot-ops.sh` refuses both while `<name>-next` is alive, #490; a plain `compose up -d` does not).
+ * and then `docker start <name>` has no overlap, and also covers a replacement that hangs rather than
+ * crashes (it never reaches any check): stop it first, `docker rm -f <name>-next` ends it at once. A
+ * `recreate` or `env-set` is no rollback: it gives the original a NEW id, which none of these checks
+ * follow (`bot-ops.sh` refuses both while `<name>-next` is alive, #490; a plain `compose up -d` does
+ * not, and most likely just starts the stopped original, which is a rollback).
  *
  * The guard is for the unhappy path. Almost every throw site inside is at or before the original
  * is stopped: `write`, `restorePolicy`, and the pre-stop inspect all precede it, and

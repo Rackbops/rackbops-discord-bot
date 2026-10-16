@@ -415,11 +415,12 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   resolves and needs no change — for those seconds `status` and `logs` show the stopped original under the
   canonical name and the live bot is `<name>-next`; a build that crashes in that window is rolled back with
   `docker stop <name>-next` and then `docker start <name>` (README.md, "The original is stopped at the
-  handoff but kept…", has the caveats).
+  handoff but kept…", has the caveats). `restart`, `env-set` and `recreate` are refused for those seconds
+  (the next bullet).
 - **A refused `restart`, `env-set` or `recreate`** (#490). All three refuse while a `<name>-next` container
   is **alive** (running, restarting, paused, removing or created), because a recreate then may start a second
   bot on the one Discord token (not verified without a daemon). If `<name>` itself is running the message says
-  *in progress*: a swap is under way, so retry in a minute. If it persists and the `-next` container is
+  *in progress*: a swap is under way, so retry once it completes. If it persists and the `-next` container is
   *created*, a process died between its create and its start (or the start failed and so did the cleanup):
   `docker rm <name>-next` clears it. If `<name>`
   is **not** running the message says *finishing*: the swap is between stopping the original and taking its
@@ -431,13 +432,18 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   `docker logs <name>-next 2>&1 | grep '\[handoff\]'`. (a) The new build keeps crashing (repeated
   `Logged in as …` boots in the log, or the state flipping through `restarting`) and the old container is still
   there, stopped (`docker ps -a` lists `<name>`): roll back with `docker stop <name>-next`, then
-  `docker start <name>` (a new build that hangs rather than crashes needs `docker rm -f <name>-next` first).
-  That brings the old build back, and `:latest` still names it: the new build tags `:latest` only when its
+  `docker start <name>` (a new build that hangs rather than crashes never looks at all, so the stop comes
+  first; `docker rm -f <name>-next` ends it at once). That brings the old build back. While the log has no
+  `[handoff] probation over` line `:latest` still names it: the new build tags `:latest` only when its
   probation is over (#548), so no re-tag is needed before a later recreate (`recreate`, `env-set`, the
-  panel's Restart). The stopped `<name>-next` that is left blocks nothing (see the exited case below).
-  (If `docker ps -a` no longer lists `<name>`, the swap got past its probation and the original is gone:
-  there is nothing to start; re-point `:latest` at the previous sha tag with `docker tag <repo>:<oldsha>
-  <repo>:latest` (`docker images <repo>` lists the sha tags) and `recreate`.) (b) The bot is up and the log has `[handoff] could not take the name` or `could not remove
+  panel's Restart). Once that line is there the tag may already have moved, whether or not `<name>` is
+  still listed (a removal that failed after the tag leaves it listed): check where `:latest` points
+  (`docker image inspect <repo>:latest --format '{{.Id}}'`, against the same for `<repo>:<oldsha>`;
+  `docker images <repo>` lists the sha tags) and, if it names the new build, re-point it with
+  `docker tag <repo>:<oldsha> <repo>:latest` before any recreate. The stopped `<name>-next` that is left
+  blocks nothing (see the exited case below). If `docker ps -a` no longer lists `<name>`, the original is
+  gone and there is nothing to start: stop `<name>-next` if it is alive (a `recreate` is refused while it
+  is), re-point `:latest` the same way, and `recreate`. (b) The bot is up and the log has `[handoff] could not take the name` or `could not remove
   the stopped original`: the swap finished but the rename did not. If `docker ps -a` still lists `<name>` (the
   stopped original), `docker rm <name>` (a plain `rm` refuses a running container); if it is already gone, skip
   that. Then `docker rename <name>-next <name>`. (c) Neither yet: wait. An **exited** `<name>-next` blocks
