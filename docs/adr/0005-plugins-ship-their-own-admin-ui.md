@@ -93,7 +93,7 @@ panel's own guarded save path — the plugin owns presentation, the panel keeps 
    is not sandboxed. The panel `import()`s it into its own document (`ops/admin/public/index.html`,
    `mountAdmin(root, makeAdminApi(plugin))`): no iframe, no worker, and no Content-Security-Policy
    (`handleRequest` sets `Content-Type` on the page and `serve` adds `X-Frame-Options` and `X-Content-Type-Options`
-   to every response, #466 — neither is a CSP — and the page carries no `http-equiv` policy).
+   to every response the app produces, #466 — neither is a CSP — and the page carries no `http-equiv` policy).
    Its requests are indistinguishable from the operator's own: a same-origin `fetch` carries the
    Cloudflare Access session and passes the cross-site-write gate, which refuses only a mismatched
    `Origin` (`isCrossSiteWrite`). So a bundle can, for example, `POST /api/admins` to add an admin who

@@ -3,8 +3,8 @@
 // `version` once at startup) plus server-native routes of its own (/api/whoami, /api/branches,
 // /api/plugins, /api/plugins/request, /api/admins, the routing writes /api/routing, /api/webhooks and
 // /api/discovery/refresh, the admin-bundle and data-asset delivery, and the static assets). Runs as
-// its own sidecar service (the profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
-// the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
+// its own sidecar service (the profile-gated `admin` service in docker-compose.yml) so it stays
+// reachable independently of the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
 // token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
@@ -1896,8 +1896,8 @@ type RoutingRequestBody =
  * Anything bot-ops.sh wrote (its stderr in a failure, its `queued` in a success) passes through
  * `redactWebhookUrls` before it is logged or answered: a `die "... '$url'"` in the script would otherwise
  * carry the secret straight back to the page and into `docker logs`. So does the message of an error
- * `runBotOps` itself throws (it is caught here: an unhandled rejection would reach Bun's own error output,
- * which is outside this file's control and could carry the payload).
+ * `runBotOps` itself throws (it is caught here: an unhandled rejection would reach `serve()`'s net, which
+ * logs the error object as it is, unredacted, and could carry the payload).
  */
 async function queueRoutingRequest(
   config: HandlerConfig,
@@ -2220,9 +2220,10 @@ export async function serve(req: Request, config: HandlerConfig): Promise<Respon
 }
 
 /** `Bun.serve`'s last resort (#465 item 9), behind `serve`'s own net: what Bun calls when the fetch handler itself
- *  throws or rejects. Without an `error` handler Bun answers its development error page (the message, local paths,
- *  source lines) — and `serve` cannot reject through any request this suite can build, so this is exported to be called
- *  directly. */
+ *  throws or rejects. Without an `error` handler Bun answers its own page — with `development` on (its default when
+ *  NODE_ENV is unset) the ~50 KB development error page (the message, local paths, source lines), with it off a bare
+ *  "Something went wrong!" — and neither carries the security headers. `serve` cannot reject through any request this
+ *  suite can build, so this is exported to be called directly. */
 export function lastResortResponse(err: unknown): Response {
   console.error("[admin] unhandled", err);
   return new Response("internal error", { status: 500, headers: SECURITY_HEADERS });

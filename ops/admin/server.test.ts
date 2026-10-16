@@ -1915,8 +1915,11 @@ describe("handleRequest", () => {
       expect(view.plugins[0]).toMatchObject({ enabled: true, installedVersion: "1.0.0" });
       expect(err).toHaveBeenCalledTimes(1);
       expect(String(err.mock.calls[0]![0])).toContain("couldn't merge the Plugin Index");
-      // ... with the CAUSE (mutation: `, err` dropped from the log call): the TypeError `releasesNewerThan` threw.
-      expect(err.mock.calls[0]![1]).toBeInstanceOf(TypeError);
+      // ... with the CAUSE (mutations: `, err` dropped from the log call; another error logged in its place): the
+      // TypeError `releasesNewerThan` threw reading `.version` of a null release.
+      const cause = err.mock.calls[0]![1] as Error;
+      expect(cause).toBeInstanceOf(TypeError);
+      expect(cause.message).toContain("version");
     } finally {
       err.mockRestore();
     }
@@ -3873,8 +3876,9 @@ describe("serve (#465 item 9, #466 item 14)", () => {
     }
   });
 
-  // ... and for real: a Bun.serve given these options but a fetch that THROWS reaches the last resort, not Bun's
-  // development page. Mutation: `development: false` or the error handler dropped (a ~50 KB html page, no headers).
+  // ... and for real: a Bun.serve given these options but a fetch that THROWS reaches the last resort. Mutation: the
+  // error handler dropped (Bun answers its own page or "Something went wrong!", with no headers). `development: false`
+  // is guarded by the by-value test above, not by this one (with a handler present, development on still answers this).
   test("a real Bun.serve with serveOptions answers a throwing fetch with the plain 500, not Bun's development page", async () => {
     const err = spyOn(console, "error").mockImplementation(() => {});
     const srv = Bun.serve({
@@ -3896,7 +3900,8 @@ describe("serve (#465 item 9, #466 item 14)", () => {
   });
 
   // The one line the suite cannot run: the entry point hands Bun.serve `serveOptions(config, PORT)`. Read from the
-  // transpiled source, so a comment cannot satisfy it. Mutation: a hand-written literal back in its place.
+  // transpiled source, so a comment cannot satisfy it (a deliberate alias or string literal could: this catches a
+  // regression, not an evasion). Mutation: a hand-written literal, or a changed argument, back in its place.
   test("the entry point calls Bun.serve once, with serveOptions(config, PORT)", () => {
     const js = new Bun.Transpiler({ loader: "ts" }).transformSync(readFileSync(new URL("./server.ts", import.meta.url), "utf8"));
     expect(js.split("Bun.serve(").length - 1).toBe(1);
