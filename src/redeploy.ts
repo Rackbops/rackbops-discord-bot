@@ -5,6 +5,7 @@
 // itself (marker, deadlines, outcome decision) is in `handoff.ts`, kept free of I/O so it
 // can be tested as pure logic.
 
+import { prefixedName } from "./commandNaming";
 import { config } from "./config";
 import {
   buildImage,
@@ -53,13 +54,52 @@ export function canonicalName(inspectedName: string): string {
 }
 
 /**
+ * `canonicalName` without any trailing `-next`: the name the compose file's `container_name` pins (#547). The
+ * suffix is reserved for the replacement (`replacementName`), so a name that ends in it is taken to be a
+ * replacement that has not taken the canonical name, and a drifted `<name>-next-next` folds back to `<name>`.
+ * `ownName` is what the code asks, because it knows the one deployment that legitimately ends in `-next`.
+ */
+export function baseName(inspectedName: string): string {
+  return canonicalName(inspectedName).replace(/(?:-next)+$/, "");
+}
+
+const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
+const COMPOSE_SERVICE_LABEL = "com.docker.compose.service";
+
+/** The compose project a container belongs to, from its label (null-safe: Docker can report no labels as `null`). */
+function projectOf(c: ContainerInspect): string | undefined {
+  return c.Config.Labels?.[COMPOSE_PROJECT_LABEL] || undefined;
+}
+
+/**
+ * The name a container is MEANT to carry, which is what a swap's replacement must end up with. `ops/install.sh`
+ * names a deployed instance's container after its compose project (`BOT_OPS_CONTAINER=$PROJECT`) and the
+ * replacement copies the original's labels, so with the project known: the project itself, and `<project>-next`
+ * is its replacement still waiting for the name. That keeps an instance called `next` or `canary-next`
+ * working: `rackbops-discord-bot-next` is its own name (it self-updates, and its replacement is
+ * `rackbops-discord-bot-next-next`), and `baseName` would have taken it for an un-renamed replacement. Anything
+ * else falls back to `baseName`, the reserved-suffix rule: a name that ends in `-next` is a replacement.
+ */
+export function ownName(inspectedName: string, project?: string): string {
+  const current = canonicalName(inspectedName);
+  if (project && (current === project || current === `${project}-next`)) return project;
+  return baseName(inspectedName);
+}
+
+/**
  * The replacement can't be created under the canonical name — `container_name` in the compose
  * file pins it and the original still holds it — so it comes up beside it and takes the name
  * once it has run (`completeTakeOver`, #548). Keeping the canonical name is what lets `bot-ops.sh` and the
  * desktop Ops panels, which filter on it, keep working across a swap with no change.
+ *
+ * Derived from the bot's OWN name (#492, `ownName`): `-next` is a reserved suffix, so a bot that is still named
+ * `<name>-next` is never asked for `<name>-next-next`, and `redeploy()` REFUSES to run from one rather than
+ * target its own name — see its docstring. A drifted `<name>-next-next` folds back to `<name>-next`. The one
+ * exception is a deployment whose own name ends in `-next` (known from its compose project): its replacement
+ * is `<name>-next`, e.g. `prod-next-next`.
  */
-export function replacementName(inspectedName: string): string {
-  return `${canonicalName(inspectedName)}-next`;
+export function replacementName(inspectedName: string, project?: string): string {
+  return `${ownName(inspectedName, project)}-next`;
 }
 
 /** A git URL the daemon can fetch a build context from: the whole repo at the target ref
@@ -237,6 +277,14 @@ export interface RedeployOptions {
  * partway through the wait, so the successful path never returns at all. Observing `ready` is
  * therefore not a return: it starts the retirement wait, and outliving that wait is itself a
  * failure (`stalled`), because the one thing `ready` promised was a stop that never came.
+ *
+ * Two refusals, both before anything is quiesced or created (#492, #547): a bot that is itself named
+ * `<name>-next` (the suffix is reserved for the replacement; the message says what to do, and `healOwnName`
+ * is what takes the canonical name back at boot), checked on the name and labels alone before the build —
+ * a deployment whose OWN name ends in `-next`, known from its compose project (`ownName`), is not refused
+ * and self-updates into `<name>-next`; and a
+ * RUNNING container already holding the replacement's name, checked after the build so one that appeared
+ * during it is seen. Nothing is ever force-removed by name.
  */
 export async function redeploy(latestSha: string, opts: RedeployOptions = {}): Promise<RedeployResult> {
   const now = opts.now ?? Date.now;
@@ -250,6 +298,22 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   } catch (err) {
     // Nothing was created yet, so there is nothing of ours to remove (#451).
     return { error: `could not inspect own container: ${(err as Error).message}`, replacement: "none" };
+  }
+  const current = canonicalName(self.Name);
+  if (current !== ownName(self.Name, projectOf(self))) {
+    // The command as this instance registered it (COMMAND_PREFIX), never the bare name.
+    const updateCommand = `/${prefixedName(config.commandPrefix, "update")}`;
+    // #547/#492: a bot that is itself `<name>-next` (a replacement that has not taken its name, or a container
+    // that merely ends in the reserved suffix) must not sweep or create under that name. Refused here, before
+    // anything is built, on the name and labels alone: no daemon call beyond the self-inspect above, and nothing
+    // to unwind. A deployment whose OWN name ends in `-next` (its compose project's, as install.sh names it) is
+    // not refused: `ownName` knows it, and its replacement is `<name>-next`.
+    return {
+      error: process.env[HANDOFF_FROM_ENV]
+        ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run ${updateCommand} again afterwards`
+        : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name and recreate it",
+      replacement: "none",
+    };
   }
 
   const tag = shaTag(self.Config.Image, latestSha);
@@ -278,7 +342,22 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     .then((img) => img.Config.Env)
     .catch(() => []);
 
-  const name = replacementName(self.Name);
+  const name = replacementName(self.Name, projectOf(self));
+  // #492: whatever holds the replacement's name is inspected here, after the build (so a holder that appeared
+  // during it is seen) and before the quiesce. A RUNNING holder is never swept; a stopped one is removed by id
+  // below, un-forced, so one that starts in between is a 409 and a reported failure, not a kill.
+  let leftover: ContainerInspect | undefined;
+  try {
+    leftover = await tryInspectContainer(name);
+  } catch (err) {
+    return { error: `could not check for a leftover ${name}: ${(err as Error).message}`, replacement: "none" };
+  }
+  if (leftover?.State.Running) {
+    return {
+      error: `a running container already holds ${name} — not sweeping a live container; check docker ps`,
+      replacement: "none",
+    };
+  }
   // Quiesce the scheduler now, not before the build: only the create→verify window needs the
   // scheduler quiet (the replacement shares the state volume once it exists), and the build writes
   // no state at all. Quiescing through it therefore bought nothing but risk — an unbounded pause on
@@ -292,7 +371,10 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   beginHandoff(`redeploy -> ${shortSha(latestSha)}`);
   let replacementId: string | undefined;
   try {
-    await removeContainer(name, true); // a leftover from an earlier failed attempt
+    // A stopped leftover from an earlier failed attempt, removed by id and NOT forced (#492): one that was
+    // started since the inspect above is a 409 here, which the catch below reports as a failure instead of
+    // killing a live bot. Only when one was seen: no leftover, no call.
+    if (leftover) await removeContainer(leftover.Id);
     replacementId = await createContainer(
       name,
       buildCreateSpec(self, { image: tag, handoffFrom: self.Id, oldImageEnv }),
@@ -315,22 +397,38 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // an id-only cleanup would skip the orphan entirely, leaving a `<name>-next` (`created`,
     // so not an exited leftover) that bot-ops.sh reads as "a swap is still in progress" until some
     // LATER redeploy's leftover sweep above runs
-    // — which the anti-loop suppression can defer indefinitely for the same sha. The name is the
-    // same handle that sweep uses, so removing by it is already proven to work.
+    // — which the anti-loop suppression can defer indefinitely for the same sha.
+    //
+    // Forced only WITH an id (#492): the start may have taken effect, and a plain DELETE of a running
+    // container is a 409 that would leave a second live bot. By name, un-forced: with no id the container was
+    // never started by us, so the orphan is `created` and a plain DELETE removes it. A RUNNING holder of the
+    // name is someone else's (it took the name during the build, so the create failed on a 409, or the sweep
+    // above did, and no create was attempted) and the 409 here is reported instead of killing it: in the error
+    // text, with the disposition `none` (nothing of OURS is left), not `remove-failed`, whose requester message
+    // says "remove the -next container by hand", which is the wrong advice for a live bot. Only a 409 means
+    // that: any other failure leaves our own `created` orphan, and stays `remove-failed`.
     let replacement: ReplacementDisposition = "none";
     let replacementError: string | undefined;
+    let foreignHolder: string | undefined;
     try {
       // The daemon may have nothing by that name (a create it rejected outright, e.g. a 400 on a bad
       // bind): then nothing was started and the requester must not hear "removed" (#451).
-      replacement = (await removeContainer(replacementId ?? name, true)) ? "removed" : "none";
+      replacement = (await (replacementId ? removeContainer(replacementId, true) : removeContainer(name))) ? "removed" : "none";
     } catch (cleanupErr) {
-      replacement = "remove-failed";
-      replacementError = (cleanupErr as Error).message;
-      console.error(`[redeploy] could not clean up the failed replacement: ${replacementError}`);
+      // A 409 is Docker refusing to remove a RUNNING container: someone else's. Any other failure (a wedged
+      // daemon's 500, a timeout) leaves OUR created orphan in place, which `remove-failed` tells the requester.
+      if (replacementId === undefined && /failed: 409\b/.test((cleanupErr as Error).message)) {
+        foreignHolder = (cleanupErr as Error).message;
+        console.error(`[redeploy] ${name} is held by a container that could not be removed — leaving it alone: ${foreignHolder}`);
+      } else {
+        replacement = "remove-failed";
+        replacementError = (cleanupErr as Error).message;
+        console.error(`[redeploy] could not clean up the failed replacement: ${replacementError}`);
+      }
     }
     endHandoff();
     return {
-      error: `could not start the replacement: ${(err as Error).message}`,
+      error: `could not start the replacement: ${(err as Error).message}${foreignHolder !== undefined ? ` — and ${name} is held by a container I did not start and could not remove (it may be running; check docker ps)` : ""}`,
       replacement,
       ...(replacementError !== undefined ? { replacementError } : {}),
     };
@@ -946,8 +1044,9 @@ export async function redeployAvailable(): Promise<boolean> {
  *  even attempted. `docker.ts` now bounds every call (`DEFAULT_TIMEOUT_MS`, 60s); this keeps a
  *  tighter bound on the first daemon dependency on the path *before* a gateway login, so a hung
  *  (not merely erroring) socket falls through to the same "can't confirm" handling as any other
- *  inspect failure without eating 60s of boot. Comfortably under `VERIFY_DEADLINE_MS` (90s), so it
- *  can't meaningfully eat into that budget on a boot that turns out to be a genuine handoff. */
+ *  inspect failure without eating 60s of boot. Since #492 the standby's 90 s verify timer is armed at
+ *  `index.ts`'s module top, so this bound (like `loadPluginIndex`'s 5 s) runs INSIDE that budget, not before
+ *  it; `healOwnName` shares it. */
 const RESOLVE_BOOT_MODE_TIMEOUT_MS = 10_000;
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -996,6 +1095,10 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * answering the same token concurrently, which is strictly worse than leaning on the existing
  * crash-proof paths (`verifyTimer`, `RETIREMENT_DEADLINE_MS`) to resolve it. Only a confirmed-gone
  * original ever downgrades to `normal`.
+ *
+ * A `normal` boot of a container that was CREATED as a standby (`HANDOFF_FROM` still in its env) is a
+ * swapped-in container whose original is gone; `index.ts` follows it with `healOwnName` (#547), because
+ * nothing else renames it if the swap's own rename never landed.
  */
 export async function resolveBootMode(
   env: Record<string, string | undefined>,
@@ -1010,6 +1113,82 @@ export async function resolveBootMode(
   } catch {
     return "standby";
   }
+}
+
+export type HealOutcome = "canonical" | "renamed" | "occupied" | "unknown";
+
+/** Test seams for {@link healOwnName}; each defaults to the real daemon call. */
+export interface HealDeps {
+  inspectSelf?: typeof inspectSelf;
+  inspect?: typeof tryInspectContainer;
+  remove?: (id: string) => Promise<unknown>;
+  rename?: typeof renameContainer;
+  log?: Pick<Console, "log" | "warn" | "error">;
+}
+
+/**
+ * #547: a swapped-in container whose own rename never landed boots `normal` once its original is gone
+ * (`resolveBootMode`), and nothing on that path renames it, so it would run as `<name>-next` for good:
+ * `bot-ops.sh` looks it up by the canonical name, the swap guard refuses every mutation, and `redeploy()`
+ * refuses the next swap. Called by `index.ts` only when the env says standby (`HANDOFF_FROM` set) and the
+ * daemon said normal; an ordinary boot still never touches the socket. Takes the canonical name when it
+ * is free, or held by a stopped container of this compose service (removed first, un-forced); leaves a
+ * RUNNING holder alone and says so. The swap's own stopped original is never that holder: it is
+ * `HANDOFF_FROM` itself, and while it exists the boot is `standby` and `completeTakeOver` converges it
+ * (remove, rename), so the corpse a failed removal leaves is the standby path's, never this one's.
+ * Bounded and best-effort: the boot continues on every outcome. The name it takes is `ownName`'s: the compose
+ * project's when the container is that or `<project>-next` (how `ops/install.sh` names an instance, a `-next`
+ * one included), otherwise the name without its `-next` suffixes.
+ * The limits: that rule and the `HANDOFF_FROM` gate are all that tell a deployment's own `*-next` name from a
+ * swap's replacement, so three narrow cases go the wrong way, none reachable through a new install.sh
+ * instance: a container created by `compose` alone with a `container_name` ending in `-next` that is not its
+ * project's, and had already self-updated before #547, is indistinguishable from a replacement and would be
+ * renamed; a replacement whose name equals its project label (a hand-written compose with project `foo-next`
+ * and `container_name: foo`, so the replacement `foo-next`) is taken for its own name and not healed; and
+ * instances `X` and `X-next` on one daemon are not told apart by the sweep or by `bot-ops.sh`'s guard
+ * (#567 refuses to install the second).
+ */
+export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
+  const log = deps.log ?? console;
+  const run = async (): Promise<HealOutcome> => {
+    const self = await (deps.inspectSelf ?? inspectSelf)();
+    const current = canonicalName(self.Name);
+    const base = ownName(self.Name, projectOf(self));
+    if (current === base) return "canonical";
+    const holder = await (deps.inspect ?? tryInspectContainer)(base);
+    if (holder) {
+      if (holder.State.Running) {
+        log.error(
+          `[handoff] this bot is ${current} but ${base} is running (${holder.Id.slice(0, 12)}) — two bots on one token; leaving both alone, see ops/README.md`,
+        );
+        return "occupied";
+      }
+      if (!sameComposeService(self, holder)) {
+        log.warn(
+          `[handoff] this bot is ${current}; ${base} is held by a stopped container of another service (${holder.Id.slice(0, 12)}) — not touching it`,
+        );
+        return "occupied";
+      }
+      await (deps.remove ?? ((id: string) => removeContainer(id)))(holder.Id);
+    }
+    await (deps.rename ?? renameContainer)(self.Id, base);
+    log.log(`[handoff] took the name ${base} (this container booted as ${current}, #547)`);
+    return "renamed";
+  };
+  try {
+    return await withTimeout(run(), timeoutMs);
+  } catch (err) {
+    log.warn(`[handoff] could not heal this container's name: ${(err as Error).message}`);
+    return "unknown";
+  }
+}
+
+/** Both on the same compose project AND service (labels present on both): the holder is this bot's own kind. */
+function sameComposeService(a: ContainerInspect, b: ContainerInspect): boolean {
+  // Null-safe: Docker can report a container with no labels as `null`, which is "not the same service", not a throw.
+  const project = (c: ContainerInspect) => c.Config.Labels?.[COMPOSE_PROJECT_LABEL];
+  const service = (c: ContainerInspect) => c.Config.Labels?.[COMPOSE_SERVICE_LABEL];
+  return Boolean(project(a)) && project(a) === project(b) && Boolean(service(a)) && service(a) === service(b);
 }
 
 /** Test seams for {@link detectRollback} and {@link stepAside}. */

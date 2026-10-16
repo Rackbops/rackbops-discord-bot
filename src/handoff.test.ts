@@ -5,6 +5,8 @@ import {
   handoffFailureMessage,
   HANDOFF_DEADLINE_MS,
   HANDOFF_FROM_ENV,
+  RETIREMENT_DEADLINE_MS,
+  VERIFY_DEADLINE_MS,
   type HandoffMarker,
   type ReplacementState,
 } from "./handoff";
@@ -214,5 +216,21 @@ describe("handoffFailureMessage", () => {
     const withError = handoffFailureMessage("timeout", { targetSha: sha, error: "docker inspect c failed: 500" });
     expect(withError).toContain("(last daemon error: docker inspect c failed: 500)");
     expect(handoffFailureMessage("timeout", { targetSha: sha })).not.toContain("last daemon error");
+  });
+});
+
+// #492 (redeploy-15): the deadlines are what README.md's "about 11 minutes" and the state table sum, and the
+// relations between them are what the protocol relies on; none was pinned by a test.
+describe("the deadlines (#492)", () => {
+  test("the replacement's verify budget sits inside the original's handoff deadline, with margin", () => {
+    expect(VERIFY_DEADLINE_MS).toBe(90_000);
+    expect(HANDOFF_DEADLINE_MS).toBe(120_000);
+    // The original's clock starts at startContainer, the replacement's at its module top: the margin is what is
+    // left for the container's own start and import time before the replacement's `failed` marker can be read.
+    expect(HANDOFF_DEADLINE_MS - VERIFY_DEADLINE_MS).toBeGreaterThanOrEqual(20_000);
+  });
+
+  test("the retirement wait is the documented three minutes", () => {
+    expect(RETIREMENT_DEADLINE_MS).toBe(180_000);
   });
 });

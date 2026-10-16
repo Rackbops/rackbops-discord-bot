@@ -5,6 +5,7 @@ import type { HandoffMarker } from "./handoff";
 // redeploy.ts pulls in the `config` singleton (env resolved at import time) -- the required vars
 // are primed once by test/setup.ts's bunfig preload (#136).
 const {
+  baseName,
   buildCreateSpec,
   buildRemote,
   canonicalName,
@@ -12,7 +13,9 @@ const {
   detectRollback,
   finishProbation,
   FIRST_TICK_CAP_MS,
+  healOwnName,
   latestTag,
+  ownName,
   redeploy,
   replacementName,
   resolveBootMode,
@@ -74,6 +77,40 @@ describe("naming", () => {
   test("the replacement gets a name that can't collide with the original", () => {
     expect(replacementName("/warbandeer-discord")).toBe("warbandeer-discord-next");
     expect(replacementName("/warbandeer-discord")).not.toBe(canonicalName("/warbandeer-discord"));
+  });
+
+  // #492/#547: `-next` is a reserved suffix. The base name is what the compose file pins.
+  test("baseName strips the slash and any trailing -next suffixes, and only a suffix", () => {
+    expect(baseName("/warbandeer-discord-next")).toBe("warbandeer-discord");
+    expect(baseName("/warbandeer-discord-next-next")).toBe("warbandeer-discord");
+    expect(baseName("/warbandeer-discord")).toBe("warbandeer-discord");
+    expect(baseName("/nextgen-bot")).toBe("nextgen-bot");
+    expect(baseName("/bot-next-gen")).toBe("bot-next-gen");
+  });
+
+  test("the replacement's name is derived from the base, so a drifted name folds back to <name>-next", () => {
+    expect(replacementName("/warbandeer-discord-next")).toBe("warbandeer-discord-next");
+    expect(replacementName("/warbandeer-discord-next-next")).toBe("warbandeer-discord-next");
+  });
+
+  // ops/install.sh names a deployed instance's container after its compose project, and the replacement copies
+  // the original's labels: with the project known, an instance whose OWN name ends in -next (`next`,
+  // `canary-next`) is told apart from a replacement that has not taken its name.
+  test("ownName and replacementName know a deployment whose own name ends in -next, from its compose project", () => {
+    const P = "rackbops-discord-bot-next";
+    expect(ownName(`/${P}`, P)).toBe(P); // its own name
+    expect(replacementName(`/${P}`, P)).toBe(`${P}-next`); // so it self-updates, into <name>-next
+    expect(ownName(`/${P}-next`, P)).toBe(P); // its replacement, waiting for the name
+    expect(ownName("/rackbops-discord-bot-prod-next", "rackbops-discord-bot-prod")).toBe("rackbops-discord-bot-prod");
+    expect(ownName("/rackbops-discord-bot-prod", "rackbops-discord-bot-prod")).toBe("rackbops-discord-bot-prod");
+  });
+
+  test("without a matching project the reserved-suffix rule applies: a name ending in -next is a replacement", () => {
+    expect(ownName("/x-next", "unrelated")).toBe("x");
+    expect(ownName("/x-next")).toBe("x");
+    expect(ownName("/x-next", undefined)).toBe("x");
+    expect(ownName("/warbandeer-discord", "warbandeer-discord-debug")).toBe("warbandeer-discord");
+    expect(replacementName("/x", "")).toBe("x-next"); // an empty label is no project
   });
 });
 
@@ -1482,14 +1519,21 @@ describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
   const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const REPLACEMENT_ID = "c".repeat(64);
+  const LEFTOVER_ID = "d".repeat(64);
   let calls: { path: string; method: string; url: string; body?: string }[] = [];
   // `restartPending()` sampled at the moment of each daemon call the fix's timing hinges on.
   let pendingAt: Record<string, boolean> = {};
+  // #492 item 15: set by any stop or removal of THIS container by its id, its short id or its NAME (the name is
+  // the hazard of #492 item 16). `redeploy()` never does either; the
+  // `afterEach` below asserts it for every test here, so a self-removal the stub's `DELETE` catch-all would
+  // absorb (or a self-stop only the "unstubbed" throw would catch) fails the test that made it.
+  let touchedSelf = false;
 
   beforeEach(async () => {
     process.env.HOSTNAME = HOSTNAME;
     calls = [];
     pendingAt = {};
+    touchedSelf = false;
     resetForTest();
     await clearMarker();
   });
@@ -1499,6 +1543,8 @@ describe("redeploy — cleanup always runs", () => {
     delete process.env.HOSTNAME;
     resetForTest();
     await clearMarker();
+    // LAST on purpose: a failing assertion placed first would skip the restores above and leak into the next test.
+    expect(touchedSelf).toBe(false);
   });
 
   const jsonRes = (body: unknown, status = 200) =>
@@ -1537,14 +1583,42 @@ describe("redeploy — cleanup always runs", () => {
     /** Makes the hostname lookup `inspectSelf()` tries first answer 500, so `redeploy()` fails at its very
      *  first daemon call (the mountinfo fallback then fails too: absent off Linux, no container id on it). */
     selfInspectFails?: boolean;
+    /** What `redeploy()` is running as (default `SELF`): a bot named `<name>-next` is refused (#547). */
+    self?: ContainerInspect;
+    /** The answer to the post-build inspect of the replacement's name (#492): default a 404, nothing holds it. */
+    leftover?: () => Response;
+    /** The answer to the un-forced removal of that leftover by id (default 204). */
+    leftoverDelete?: () => Response;
+    /** The answer to a removal of the replacement's name BY NAME (default: the catch-all 404). */
+    nameDelete?: () => Response;
   }) {
+    // The name `redeploy()` will derive for its replacement from the self-inspect this stub answers with.
+    const replName = replacementName((o.self ?? SELF).Name, (o.self ?? SELF).Config.Labels?.["com.docker.compose.project"]);
     globalThis.fetch = (async (url: string, init?: RequestInit & { unix?: string }) => {
       const method = init?.method ?? "GET";
       const { pathname } = new URL(String(url));
       calls.push({ path: pathname, method, url: String(url), body: init?.body ? String(init.body) : undefined });
 
+      const selfRefs = [SELF_ID, HOSTNAME, canonicalName((o.self ?? SELF).Name)];
+      if (
+        (method === "POST" && selfRefs.some((ref) => pathname === `/containers/${ref}/stop`)) ||
+        (method === "DELETE" && selfRefs.some((ref) => pathname === `/containers/${ref}`))
+      ) {
+        touchedSelf = true;
+      }
       if (pathname === `/containers/${HOSTNAME}/json`) {
-        return o.selfInspectFails ? new Response("boom", { status: 500 }) : jsonRes(SELF);
+        return o.selfInspectFails ? new Response("boom", { status: 500 }) : jsonRes(o.self ?? SELF);
+      }
+      if (pathname === `/containers/${replName}/json`) {
+        pendingAt.leftover = restartPending();
+        return o.leftover ? o.leftover() : new Response("", { status: 404 });
+      }
+      if (o.nameDelete && method === "DELETE" && pathname === `/containers/${replName}`) {
+        return o.nameDelete();
+      }
+      if (pathname === `/containers/${LEFTOVER_ID}` && method === "DELETE") {
+        pendingAt.sweep = restartPending();
+        return o.leftoverDelete ? o.leftoverDelete() : new Response("", { status: 204 });
       }
       if (pathname === "/build") {
         pendingAt.build = restartPending();
@@ -1572,7 +1646,7 @@ describe("redeploy — cleanup always runs", () => {
       }
       if (pathname === `/containers/${REPLACEMENT_ID}/json`) return o.pollReplacement();
       if (pathname === `/containers/${REPLACEMENT_ID}` && method === "DELETE") return o.removeReplacement();
-      if (method === "DELETE") return new Response("", { status: 404 }); // the leftover-name cleanup
+      if (method === "DELETE") return new Response("", { status: 404 }); // the by-name cleanup of a create that timed out
       throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
     }) as unknown as typeof fetch;
   }
@@ -1620,7 +1694,7 @@ describe("redeploy — cleanup always runs", () => {
   // progress", refusing restart/env-set until some later redeploy's leftover sweep runs, which the
   // anti-loop suppression can defer indefinitely for the same sha. Cleanup must fall back to the
   // NAME. Before the fix this test saw only the pre-create sweep, never a cleanup removal.
-  test("a create that times out sweeps the name it may have orphaned, forcibly", async () => {
+  test("a create that times out removes the name it may have orphaned, by name and NOT forced", async () => {
     stubDaemon({
       pollReplacement: () => {
         throw new Error("must not poll — redeploy() returns on the failed create");
@@ -1631,17 +1705,274 @@ describe("redeploy — cleanup always runs", () => {
     const result = await redeploy("8".repeat(40));
     expect(result.error).toContain("could not start the replacement");
     expect(result.error).toContain("timed out");
-    // Two DELETEs against the NAME: the pre-create leftover sweep, then the post-failure cleanup.
+    // ONE DELETE against the NAME, the post-failure cleanup: with no leftover seen there is no pre-create sweep.
     const byName = calls.filter(
       (c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`,
     );
-    expect(byName.length).toBe(2);
-    // force=1 is load-bearing, not incidental. The abort case this exists for is a daemon that
-    // already CREATED — and, on the startContainer leg, already STARTED — the container before
-    // failing to answer. A plain DELETE on a running container is a 409, which removeContainer
-    // throws on, and the orphan left behind would be a *running* second bot rather than a stopped
-    // one: strictly worse than the state this cleanup is here to remove.
-    for (const c of byName) expect(new URL(c.url).searchParams.get("force")).toBe("1");
+    expect(byName.length).toBe(1);
+    // NOT forced (#492): with no id the container was never started by us (createContainer is the call that
+    // timed out), so the orphan is `created` and a plain DELETE removes it. A RUNNING container that holds
+    // the name is someone else's, started during the build, and Docker's 409 refuses to remove it.
+    for (const c of byName) expect(new URL(c.url).searchParams.get("force")).toBeNull();
+    expect(handoffActive()).toBe(false);
+  });
+
+  // The other half of that rule, #130's: WITH an id the start may have taken effect, and a plain DELETE of a
+  // running container is a 409 that would leave a second live bot, so the by-id cleanup is forced.
+  test("a start that fails removes the created replacement by id, forcibly", async () => {
+    stubDaemon({
+      pollReplacement: () => {
+        throw new Error("must not poll — redeploy() returns on the failed start");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+      startFails: true,
+    });
+    await redeploy("7".repeat(40));
+    const cleanup = calls.filter((c) => c.method === "DELETE" && c.path === `/containers/${REPLACEMENT_ID}`);
+    expect(cleanup).toHaveLength(1);
+    expect(new URL(cleanup[0]!.url).searchParams.get("force")).toBe("1");
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`)).toBe(false);
+  });
+
+  // #547/#492: `-next` is reserved for the replacement. A bot that is itself `<name>-next` is refused on its
+  // name alone, before anything is built, so it can never sweep or create under its own name.
+  test("a bot named -next refuses before the build, on its name alone, and says docker restart heals it", async () => {
+    stubDaemon({
+      self: { ...SELF, Name: "/warbandeer-discord-next" },
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID;
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.replacement).toBe("none");
+      expect(result.outcome).toBeUndefined();
+      expect(result.error).toContain("docker restart warbandeer-discord-next");
+      expect(result.error).toContain("run /update again");
+      expect(result.error).toContain("is named warbandeer-discord-next");
+      expect(result.error).toContain("still finishing"); // during S3a's probation the name is legitimately -next
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+    // The self-inspect and nothing else: no build, no inspect of any name, no removal.
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([`GET /containers/${HOSTNAME}/json`]);
+    expect(restartPending()).toBe(false);
+    expect(handoffActive()).toBe(false);
+  });
+
+  test("a compose-created bot named -next is told to rename it, not to restart", async () => {
+    stubDaemon({
+      self: { ...SELF, Name: "/warbandeer-discord-next" },
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    delete process.env[HANDOFF_FROM_ENV];
+    const result = await redeploy("1".repeat(40));
+    expect(result.replacement).toBe("none");
+    expect(result.error).toContain("container_name");
+    expect(result.error).not.toContain("docker restart");
+    expect(calls.some((c) => c.path === "/build")).toBe(false);
+  });
+
+  // The pin for an install.sh instance whose own name ends in -next (instance `next`, `canary-next`): its container
+  // is named after its compose project, so it is NOT a replacement waiting for a name. It self-updates, and its
+  // standby is <name>-next (here rackbops-discord-bot-next-next); nothing refuses it and nothing renames it.
+  const projectNamed = (name: string): ContainerInspect => ({
+    ...SELF,
+    Name: `/${name}`,
+    Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "rackbops-discord-bot-next" } },
+  });
+
+  test("a bot whose own -next name is its compose project's still self-updates, into <name>-next", async () => {
+    stubDaemon({
+      self: projectNamed("rackbops-discord-bot-next"),
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID; // a swapped-in container that has taken its name: the worst case for a name-only rule
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.outcome).toBe("failed"); // it got as far as the verdict: nothing refused it
+      expect(result.error).toBeUndefined();
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+    const create = calls.find((c) => c.path === "/containers/create");
+    expect(new URL(create!.url).searchParams.get("name")).toBe("rackbops-discord-bot-next-next");
+    expect(calls.some((c) => c.path === "/build")).toBe(true);
+  });
+
+  test("the un-renamed replacement of such an instance is refused with the restart advice (its heal takes the project's name)", async () => {
+    stubDaemon({
+      self: projectNamed("rackbops-discord-bot-next-next"),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID;
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.replacement).toBe("none");
+      expect(result.error).toContain("docker restart rackbops-discord-bot-next-next");
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+    expect(calls.some((c) => c.path === "/build")).toBe(false);
+  });
+
+  // #492: whatever holds the replacement's name is inspected after the build, outside the quiesce.
+  test("a running holder of <name>-next after the build is refused before anything is quiesced or created", async () => {
+    stubDaemon({
+      leftover: () =>
+        jsonRes({ ...SELF, Id: "f".repeat(64), Name: "/warbandeer-discord-next", State: { Running: true, Status: "running", ExitCode: 0 } }),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("2".repeat(40));
+    expect(result.replacement).toBe("none");
+    expect(result.error).toContain("a running container already holds warbandeer-discord-next");
+    expect(calls.some((c) => c.path === "/build")).toBe(true); // after the build: a holder that appeared in it is seen
+    expect(calls.some((c) => c.path === "/containers/create")).toBe(false);
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+    expect(pendingAt.create).toBeUndefined();
+    expect(restartPending()).toBe(false);
+    expect(handoffActive()).toBe(false);
+  });
+
+  test("a stopped leftover is removed by id, un-forced, after the quiesce begins and before the create", async () => {
+    stubDaemon({
+      leftover: () =>
+        jsonRes({ ...SELF, Id: LEFTOVER_ID, Name: "/warbandeer-discord-next", State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("3".repeat(40));
+    const at = (pred: (c: (typeof calls)[number]) => boolean) => calls.findIndex(pred);
+    const build = at((c) => c.path === "/build");
+    const inspect = at((c) => c.method === "GET" && c.path === "/containers/warbandeer-discord-next/json");
+    const sweep = at((c) => c.method === "DELETE" && c.path === `/containers/${LEFTOVER_ID}`);
+    const create = at((c) => c.path === "/containers/create");
+    expect(build).toBeGreaterThan(-1);
+    expect(inspect).toBeGreaterThan(build);
+    expect(sweep).toBeGreaterThan(inspect);
+    expect(create).toBeGreaterThan(sweep);
+    expect(new URL(calls[sweep]!.url).searchParams.get("force")).toBeNull();
+    expect(pendingAt.leftover).toBe(false); // the inspect sits OUTSIDE the quiesce (the README's arithmetic needs it)
+    expect(pendingAt.sweep).toBe(true); // the removal inside it, like the create
+    // never by name
+    expect(calls.some((c) => c.method === "DELETE" && c.path === `/containers/${replacementName(SELF.Name)}`)).toBe(false);
+  });
+
+  test("no leftover means no removal before the create", async () => {
+    stubDaemon({
+      pollReplacement: () => jsonRes({ ...SELF, State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      removeReplacement: () => new Response("", { status: 404 }),
+    });
+    await redeploy("4".repeat(40));
+    const create = calls.findIndex((c) => c.path === "/containers/create");
+    expect(create).toBeGreaterThan(-1);
+    expect(calls.slice(0, create).some((c) => c.method === "DELETE")).toBe(false);
+  });
+
+  test("a leftover inspect that errors ends the redeploy before the quiesce, with the reason", async () => {
+    stubDaemon({
+      leftover: () => new Response("boom", { status: 500 }),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("5".repeat(40));
+    expect(result.error).toContain("could not check for a leftover warbandeer-discord-next");
+    expect(result.replacement).toBe("none");
+    expect(calls.some((c) => c.path === "/containers/create")).toBe(false);
+    expect(restartPending()).toBe(false);
+  });
+
+  // A cleanup that fails for any OTHER reason than Docker's 409 leaves our own `created` orphan behind (the #130
+  // case: a create that timed out, then a daemon too wedged to answer the removal), and the requester is told so.
+  test("a create that times out followed by a failing by-name cleanup is remove-failed, not a foreign holder", async () => {
+    stubDaemon({
+      createTimesOut: true,
+      nameDelete: () => new Response("boom", { status: 500 }),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("9".repeat(40));
+    expect(result.replacement).toBe("remove-failed");
+    expect(result.replacementError).toContain("500");
+    expect(result.error).not.toContain("held by a container I did not start");
+    expect(handoffActive()).toBe(false);
+  });
+
+  // `projectOf` reads the bot's own labels null-safely: a container the daemon reports with none (null) has no
+  // project, so `ownName` falls back to the reserved-suffix rule and `redeploy()` refuses it like any other -next
+  // bot instead of throwing.
+  test("a bot named -next whose labels are null is refused, not crashed", async () => {
+    stubDaemon({
+      self: { ...SELF, Name: "/warbandeer-discord-next", Config: { ...SELF.Config, Labels: null as unknown as Record<string, string> } },
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    process.env[HANDOFF_FROM_ENV] = SELF_ID;
+    try {
+      const result = await redeploy("1".repeat(40));
+      expect(result.replacement).toBe("none");
+      expect(result.error).toContain("docker restart warbandeer-discord-next");
+    } finally {
+      delete process.env[HANDOFF_FROM_ENV];
+    }
+  });
+
+  // The "no id" half of the foreign-holder rule: with an id the removal is forced and a 409 is OUR replacement
+  // (it started, then something held it), reported as remove-failed, never as someone else's container.
+  test("a 409 on the forced cleanup by id is remove-failed, not a foreign holder", async () => {
+    stubDaemon({
+      startFails: true,
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("conflict", { status: 409 }),
+    });
+    const result = await redeploy("9".repeat(40));
+    expect(result.replacement).toBe("remove-failed");
+    expect(result.replacementError).toContain("409");
+    expect(result.error).not.toContain("held by a container I did not start");
+  });
+
+  // The window between the inspect and the sweep: a stopped leftover that someone starts in it is a 409 on the
+  // un-forced removal, reported as a failure to start, and never force-removed, by id or by name.
+  test("a leftover started between the inspect and the sweep is a reported failure, not a kill", async () => {
+    stubDaemon({
+      leftover: () =>
+        jsonRes({ ...SELF, Id: LEFTOVER_ID, Name: "/warbandeer-discord-next", State: { Running: false, Status: "exited", ExitCode: 1 } }),
+      leftoverDelete: () => new Response("conflict: cannot remove a running container", { status: 409 }),
+      nameDelete: () => new Response("conflict: cannot remove a running container", { status: 409 }),
+      pollReplacement: () => {
+        throw new Error("must not poll");
+      },
+      removeReplacement: () => new Response("", { status: 204 }),
+    });
+    const result = await redeploy("6".repeat(40));
+    expect(result.error).toContain("could not start the replacement");
+    expect(result.error).toContain("409");
+    // The holder is someone else's live bot: told so, and NOT as a replacement to "remove by hand".
+    expect(result.error).toContain("held by a container I did not start and could not remove (it may be running; check docker ps)");
+    expect(result.replacement).toBe("none");
+    expect(result.replacementError).toBeUndefined();
+    expect(calls.some((c) => c.path === "/containers/create")).toBe(false);
+    for (const c of calls.filter((c) => c.method === "DELETE")) expect(new URL(c.url).searchParams.get("force")).toBeNull();
     expect(handoffActive()).toBe(false);
   });
 
@@ -2484,5 +2815,283 @@ describe("resolveBootMode", () => {
   test("a daemon call that never resolves times out and stays standby, not hung forever", async () => {
     const inspect = () => new Promise<ContainerInspect | undefined>(() => {}); // never settles
     expect(await resolveBootMode({ [HANDOFF_FROM_ENV]: SELF.Id }, inspect, 20)).toBe("standby");
+  });
+});
+
+// #547: a swapped-in container whose rename never landed boots `normal` (its original is gone), and nothing on
+// that path renames it. `index.ts` calls `healOwnName` right after `resolveBootMode` when the env says standby
+// and the daemon said normal; every daemon call here is an injected seam.
+describe("healOwnName", () => {
+  const NEXT: ContainerInspect = { ...SELF, Name: "/warbandeer-discord-next" };
+  const HOLDER_ID = "e".repeat(64);
+  const holder = (over: Partial<ContainerInspect> = {}): ContainerInspect => ({
+    ...SELF,
+    Id: HOLDER_ID,
+    Name: "/warbandeer-discord",
+    State: { Running: false, Status: "exited", ExitCode: 0 },
+    ...over,
+  });
+
+  /** Records every seam call, in order, and what was logged. */
+  function harness(o: { self?: ContainerInspect; holder?: ContainerInspect | undefined; failAt?: "inspectSelf" | "inspect" | "remove" | "rename" } = {}) {
+    const events: string[] = [];
+    const logs: { level: "log" | "warn" | "error"; text: string }[] = [];
+    const fail = (at: string) => {
+      if (o.failAt === at) throw new Error(`${at} failed`);
+    };
+    const deps = {
+      inspectSelf: async () => {
+        events.push("inspectSelf");
+        fail("inspectSelf");
+        return o.self ?? NEXT;
+      },
+      inspect: async (name: string) => {
+        events.push(`inspect:${name}`);
+        fail("inspect");
+        return "holder" in o ? o.holder : undefined;
+      },
+      remove: async (id: string) => {
+        events.push(`remove:${id}`);
+        fail("remove");
+      },
+      rename: async (id: string, name: string) => {
+        events.push(`rename:${id}:${name}`);
+        fail("rename");
+      },
+      log: {
+        log: (text: string) => void logs.push({ level: "log", text }),
+        warn: (text: string) => void logs.push({ level: "warn", text }),
+        error: (text: string) => void logs.push({ level: "error", text }),
+      },
+    };
+    return { deps, events, logs };
+  }
+
+  test("a canonical name is left alone, with one inspect and no rename", async () => {
+    const h = harness({ self: SELF });
+    expect(await healOwnName(h.deps)).toBe("canonical");
+    expect(h.events).toEqual(["inspectSelf"]);
+  });
+
+  test("a free base name is taken", async () => {
+    const h = harness();
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord", `rename:${SELF_ID}:warbandeer-discord`]);
+    expect(h.logs).toEqual([{ level: "log", text: expect.stringContaining("took the name warbandeer-discord") }]);
+  });
+
+  test("a stopped holder of the same compose service is removed, then the name is taken", async () => {
+    const h = harness({ holder: holder() });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual([
+      "inspectSelf",
+      "inspect:warbandeer-discord",
+      `remove:${HOLDER_ID}`,
+      `rename:${SELF_ID}:warbandeer-discord`,
+    ]);
+  });
+
+  test("a RUNNING holder is left alone and logged as two bots on one token", async () => {
+    const h = harness({ holder: holder({ State: { Running: true, Status: "running", ExitCode: 0 } }) });
+    expect(await healOwnName(h.deps)).toBe("occupied");
+    expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
+    const errors = h.logs.filter((l) => l.level === "error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.text).toContain("two bots");
+    expect(errors[0]!.text).toContain("warbandeer-discord-next");
+  });
+
+  test("a stopped holder of another service, or with no compose labels, is left alone", async () => {
+    const otherService = holder({
+      Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.service": "admin" } },
+    });
+    const otherProject = holder({
+      Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "elsewhere" } },
+    });
+    const unlabelled = holder({ Config: { ...SELF.Config, Labels: {} } });
+    for (const other of [otherService, otherProject, unlabelled]) {
+      const h = harness({ holder: other });
+      expect(await healOwnName(h.deps)).toBe("occupied");
+      expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]); // no remove, no rename
+      expect(h.logs.filter((l) => l.level === "warn")).toHaveLength(1);
+    }
+  });
+
+  test("this bot without compose labels never matches a holder (no service to be the same as)", async () => {
+    const h = harness({ self: { ...NEXT, Config: { ...SELF.Config, Labels: {} } }, holder: holder({ Config: { ...SELF.Config, Labels: {} } }) });
+    expect(await healOwnName(h.deps)).toBe("occupied");
+    expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
+  });
+
+  // A label missing on BOTH sides is not "the same": undefined === undefined must not make two unrelated
+  // containers one service. Each of the two labels is needed on this bot's side, separately.
+  test("a compose label missing on both sides never matches, whichever of the two it is", async () => {
+    const project = "com.docker.compose.project";
+    const service = "com.docker.compose.service";
+    const onlyService = { [service]: "bot" };
+    const onlyProject = { [project]: "warbandeer-discord-debug" };
+    for (const labels of [onlyService, onlyProject]) {
+      const h = harness({
+        self: { ...NEXT, Config: { ...SELF.Config, Labels: labels } },
+        holder: holder({ Config: { ...SELF.Config, Labels: labels } }),
+      });
+      expect(await healOwnName(h.deps), JSON.stringify(labels)).toBe("occupied");
+      expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord"]);
+    }
+  });
+
+  // install.sh names an instance's container after its compose project: an instance called `next` or
+  // `canary-next` has a -next name of its own, which a boot that has HANDOFF_FROM must not rename away.
+  const projectLabeled = (name: string, project: string): ContainerInspect => ({
+    ...SELF,
+    Name: `/${name}`,
+    Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": project } },
+  });
+
+  test("a container named after its own compose project is its own name, whatever it ends in", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-next", "rackbops-discord-bot-next") });
+    expect(await healOwnName(h.deps)).toBe("canonical");
+    expect(h.events).toEqual(["inspectSelf"]); // no inspect of the base, no removal, no rename
+    // The same name WITHOUT that project label is a swap's replacement of a compose-only deployment: healed.
+    const swapped = harness({ self: projectLabeled("rackbops-discord-bot-next", "something-else") });
+    expect(await healOwnName(swapped.deps)).toBe("renamed");
+    expect(swapped.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot", `rename:${SELF_ID}:rackbops-discord-bot`]);
+  });
+
+  // The pin (b): the real standby case, an install.sh instance's replacement, named <project>-next with the
+  // original's labels (the project is the base name): healed to the project's name.
+  test("a -next container whose compose project is the base name is a replacement and is healed", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-prod-next", "rackbops-discord-bot-prod") });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot-prod", `rename:${SELF_ID}:rackbops-discord-bot-prod`]);
+  });
+
+  // And the replacement of the -next instance itself: <project>-next carries the project <project>, so its heal takes
+  // <project> (the instance's own name), not the base name without its -next.
+  test("the replacement of an instance whose own name ends in -next is healed to that name, not to the base", async () => {
+    const h = harness({ self: projectLabeled("rackbops-discord-bot-next-next", "rackbops-discord-bot-next") });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:rackbops-discord-bot-next", `rename:${SELF_ID}:rackbops-discord-bot-next`]);
+  });
+
+  test("a holder whose labels are null is another service, not a crash", async () => {
+    const h = harness({ holder: holder({ Config: { ...SELF.Config, Labels: null as unknown as Record<string, string> } }) });
+    expect(await healOwnName(h.deps)).toBe("occupied");
+    expect(h.logs.filter((l) => l.level === "warn")[0]!.text).toContain("another service");
+  });
+
+  // The default bound is the one resolveBootMode shares: 10 s, "at most" in index.ts's comment and CONTEXT.md.
+  test("the default bound is ten seconds", async () => {
+    const delays: unknown[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      delays.push(ms);
+      return realSetTimeout(fn, ms, ...rest);
+    }) as unknown as typeof setTimeout;
+    try {
+      await healOwnName(harness({ self: SELF }).deps);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    expect(delays).toContain(10_000);
+  });
+
+  test("a drifted -next-next name folds back to the base in one hop", async () => {
+    const h = harness({ self: { ...SELF, Name: "/warbandeer-discord-next-next" } });
+    expect(await healOwnName(h.deps)).toBe("renamed");
+    expect(h.events).toEqual(["inspectSelf", "inspect:warbandeer-discord", `rename:${SELF_ID}:warbandeer-discord`]);
+  });
+
+  test("a daemon error at any step is logged and the boot continues: unknown", async () => {
+    for (const failAt of ["inspectSelf", "inspect", "remove", "rename"] as const) {
+      const h = harness({ holder: holder(), failAt });
+      expect(await healOwnName(h.deps), failAt).toBe("unknown");
+      const warns = h.logs.filter((l) => l.level === "warn");
+      expect(warns, failAt).toHaveLength(1);
+      expect(warns[0]!.text).toContain(`${failAt} failed`);
+    }
+  });
+
+  test("a hung daemon is bounded: unknown, in well under the daemon's own 60 s", async () => {
+    const h = harness();
+    const started = Date.now();
+    const outcome = await healOwnName({ ...h.deps, inspect: () => new Promise(() => {}) }, 20);
+    expect(outcome).toBe("unknown");
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(h.logs.filter((l) => l.level === "warn")[0]!.text).toContain("timed out");
+  });
+
+  test("a canonical name takes no inspect of the base even when the holder seam would answer", async () => {
+    const h = harness({ self: SELF, holder: holder() });
+    await healOwnName(h.deps);
+    expect(h.events.filter((e) => e.startsWith("inspect:"))).toEqual([]);
+  });
+});
+
+// The same heal through the REAL docker.ts calls, against a recording `fetch`: the default seams (the un-forced
+// removal, the rename's query, the inspect by NAME) are the ones the injected-seam tests above do not exercise.
+describe("healOwnName — real daemon calls (#547)", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = SELF_SHORT_ID;
+  const HOLDER_ID = "e".repeat(64);
+  let calls: { method: string; path: string; url: string }[] = [];
+  let logSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    calls = [];
+    logSpy = spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+    logSpy.mockRestore();
+  });
+
+  const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+
+  function stubDaemon(holder?: ContainerInspect) {
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(String(url));
+      calls.push({ method, path: pathname, url: String(url) });
+      if (pathname === `/containers/${HOSTNAME}/json`) return json({ ...SELF, Name: "/warbandeer-discord-next" });
+      if (pathname === "/containers/warbandeer-discord/json") return holder ? json(holder) : new Response("", { status: 404 });
+      if (method === "DELETE" && pathname === `/containers/${HOLDER_ID}`) return new Response("", { status: 204 });
+      if (method === "POST" && pathname === `/containers/${SELF_ID}/rename`) return new Response("", { status: 204 });
+      throw new Error(`unstubbed daemon call: ${method} ${pathname}`);
+    }) as unknown as typeof fetch;
+  }
+
+  test("a free base name: one inspect of itself, one of the name, then the rename, and no removal", async () => {
+    stubDaemon();
+    expect(await healOwnName()).toBe("renamed");
+    expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      `GET /containers/${HOSTNAME}/json`,
+      "GET /containers/warbandeer-discord/json",
+      `POST /containers/${SELF_ID}/rename`,
+    ]);
+    expect(new URL(calls[2]!.url).searchParams.get("name")).toBe("warbandeer-discord");
+  });
+
+  test("a stopped holder of the same compose service is removed by id, un-forced, before the rename", async () => {
+    stubDaemon({ ...SELF, Id: HOLDER_ID, Name: "/warbandeer-discord", State: { Running: false, Status: "exited", ExitCode: 0 } });
+    expect(await healOwnName()).toBe("renamed");
+    const del = calls.findIndex((c) => c.method === "DELETE");
+    const ren = calls.findIndex((c) => c.path.endsWith("/rename"));
+    expect(calls[del]!.path).toBe(`/containers/${HOLDER_ID}`);
+    expect(new URL(calls[del]!.url).searchParams.get("force")).toBeNull(); // a holder started since the inspect is a 409, not a kill
+    expect(ren).toBeGreaterThan(del);
+  });
+
+  test("a running holder: no removal and no rename reach the daemon", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      stubDaemon({ ...SELF, Id: HOLDER_ID, Name: "/warbandeer-discord", State: { Running: true, Status: "running", ExitCode: 0 } });
+      expect(await healOwnName()).toBe("occupied");
+      expect(calls.some((c) => c.method === "DELETE" || c.path.endsWith("/rename"))).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
