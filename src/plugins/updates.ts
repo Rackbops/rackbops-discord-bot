@@ -168,8 +168,23 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
   return msg.length <= MESSAGE_LIMIT ? msg : msg.slice(0, MESSAGE_LIMIT);
 }
 
+/** #544: an entry's `error`, fit for one reply line: whitespace collapsed, cut to `max` characters with an
+ *  ellipsis (never inside a surrogate pair). `undefined` for anything that is not a non-blank string, so a
+ *  hand-edited state.json cannot break the list. */
+function shortError(error: unknown, max = 120): string | undefined {
+  if (typeof error !== "string") return undefined;
+  const oneLine = error.replace(/\s+/g, " ").trim();
+  if (oneLine === "") return undefined;
+  if (oneLine.length <= max) return oneLine;
+  const cutAt = max - 1;
+  const code = oneLine.charCodeAt(cutAt - 1);
+  const end = code >= 0xd800 && code <= 0xdbff ? cutAt - 1 : cutAt; // do not split a surrogate pair
+  return `${oneLine.slice(0, end)}…`;
+}
+
 /** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
- *  note, and skip/snooze markers. Uses the (freshly-fetched) index for "available" + notes. Pure. */
+ *  note, skip/snooze markers and, for a plugin that is not running this boot, that it is down with its
+ *  error (#544). Uses the (freshly-fetched) index for "available" + notes. Pure. */
 export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date): string {
   if (state.plugins.length === 0) return "No plugins installed.";
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
@@ -186,14 +201,22 @@ export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _n
         return offLine;
       }
       let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
+      let notes = "";
       const entry = entryByName.get(p.name);
       if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
         line += ` → ${entry.version} available`;
         if (p.skippedVersion === entry.version) line += " (skipped)";
         else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
         const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
-        if (firstBlock) line += `\n${firstBlock.slice(0, 300)}`;
+        if (firstBlock) notes = `\n${firstBlock.slice(0, 300)}`;
       }
+      // #544: a plugin that failed to install, load or activate this boot says so on its first line, not
+      // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
+      if (!p.active) {
+        const why = shortError(p.error);
+        line += ` — not running${why ? ` (${why})` : ""}`;
+      }
+      line += notes;
       // A pending scheduled update (#104) — shown regardless of whether the index still lists that
       // version as current, so `/plugins cancel` has something visible to act on.
       if (p.scheduled) {
@@ -443,7 +466,9 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
 // ---- #104: report-back on the boot after an update ----------------------------------------------
 
 /** Decide the boot report-back message for a completed (or failed) update, from the freshly-written
- *  state entry. Success when the plugin actually came up on the target; else one of two failures. */
+ *  state entry. Success when the plugin actually came up on the target; else off, or one of three failures:
+ *  reverted to a previous version that runs, reverted to one that is not running either (#543), or
+ *  installed on the target but failed to start. */
 export function decidePluginReportOutcome(
   report: NonNullable<PluginStateFile["pendingReport"]>,
   entry: PluginStateEntry | undefined,
@@ -459,10 +484,16 @@ export function decidePluginReportOutcome(
   if (entry && installed === to && entry.active) {
     return { ok: true, message: `✅ **${name}** is now ${to}.` };
   }
-  const why = entry?.error ? ` (${entry.error})` : "";
-  if (installed !== undefined && installed !== to) {
-    // Reverted: the target failed to install, so the previous version was reused (from cache).
-    return { ok: false, message: `⚠️ **${name}** could not be updated to ${to}${why} — still on ${installed}.` };
+  const short = shortError(entry?.error);
+  const why = short ? ` (${short})` : "";
+  if (entry && installed !== undefined && installed !== to) {
+    // Reverted: the target failed to install, so the previous version was reused (from cache) — or, on
+    // install.ts's last-good-failed path, nothing was. `error` names the TARGET's failure (host.ts builds it
+    // first-failure-wins), so the tail only says whether the previous version runs (#543): "still on" implies
+    // it does.
+    return entry.active
+      ? { ok: false, message: `⚠️ **${name}** could not be updated to ${to}${why} — still on ${installed}.` }
+      : { ok: false, message: `⚠️ **${name}** could not be updated to ${to}${why} — and ${installed} is not running either.` };
   }
   // Installed the target but activate() threw (or no installed version at all).
   return { ok: false, message: `⚠️ **${name}** updated to ${to} but failed to start${why}.` };
