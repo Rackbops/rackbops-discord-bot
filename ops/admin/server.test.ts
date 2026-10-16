@@ -43,6 +43,8 @@ import {
   resolveAdminBundleUrl,
   resolvePluginProxyUrl,
   serve,
+  serveOptions,
+  lastResortResponse,
   SECURITY_HEADERS,
   serveAdminBundle,
   servePluginProxy,
@@ -1913,6 +1915,8 @@ describe("handleRequest", () => {
       expect(view.plugins[0]).toMatchObject({ enabled: true, installedVersion: "1.0.0" });
       expect(err).toHaveBeenCalledTimes(1);
       expect(String(err.mock.calls[0]![0])).toContain("couldn't merge the Plugin Index");
+      // ... with the CAUSE (mutation: `, err` dropped from the log call): the TypeError `releasesNewerThan` threw.
+      expect(err.mock.calls[0]![1]).toBeInstanceOf(TypeError);
     } finally {
       err.mockRestore();
     }
@@ -2630,8 +2634,9 @@ describe("parsePluginIndex (#102)", () => {
   test("null when an entry is missing name or version", () => {
     expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a" }] }))).toBeNull();
   });
-  // #404: the three containers the merge iterates. A non-array one — `null` included — used to pass the parse and
-  // throw inside mergePluginsView, answering 500 for the cache's lifetime. Mutation: dropping the checks.
+  // #404: the three containers the merge iterates. A non-array one used to pass the parse and throw inside
+  // mergePluginsView, answering 500 for the cache's lifetime; `null` merged fine before (`?? []`) and is refused now too,
+  // as the bot refuses it. Mutations: dropping a check; `!= null` for `!== undefined` (null passes) on any of the three.
   test.each([
     ["env as an object", { env: {} }],
     ["env as null", { env: null }],
@@ -2639,8 +2644,17 @@ describe("parsePluginIndex (#102)", () => {
     ["commands as null", { commands: null }],
     ["releases as a string", { releases: "x" }],
     ["releases as an object", { releases: {} }],
+    ["releases as null", { releases: null }],
   ])("null when an entry's %s (#404)", (_label, bad) => {
     expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0", ...bad }] }))).toBeNull();
+  });
+  // Each container ALONE, valid: a check wired to the wrong field (commands tested against env, say) refuses these.
+  test.each([
+    ["env", { env: [{ key: "A_B" }] }],
+    ["commands", { commands: ["x"] }],
+    ["releases", { releases: [] }],
+  ])("an entry with only a valid %s still parses (#404)", (_label, ok) => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0", ...ok }] }))).not.toBeNull();
   });
   test("an entry with none of the three containers, or with all three as arrays, still parses", () => {
     expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0" }] }))).not.toBeNull();
@@ -3249,6 +3263,12 @@ describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => 
     ).toBeNull();
     const own = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
     expect(resolveAdminBundleUrl(withAdmin(own), "warbandeer")).toBe(own);
+    // The production path: the page always sends ?v=<installedVersion>, so for an up-to-date plugin the pin EQUALS
+    // entry.version (this helper's "1.0.0") and the request lands on this branch WITH a defined installedVersion.
+    // Mutation: the prefix check applied only when installedVersion is undefined.
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/gh/x/y@main/a.js"), "warbandeer", "1.0.0")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-other@1.0.0/dist/admin.js"), "warbandeer", "1.0.0")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin(own), "warbandeer", "1.0.0")).toBe(own);
   });
   // An empty `package` would make the prefix `/npm/@`, which every scoped URL matches; an absent one `/npm/undefined@`.
   // Mutation: the typeof/empty guard dropped.
@@ -3489,6 +3509,29 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
     expect(res.headers.get("Content-Type")).toContain("text/javascript");
     expect(await res.text()).toContain("mountAdmin");
   });
+  // #465 item 8 through the route, on the path the page really takes (`?v=<entry.version>`): a /gh/ adminUrl is a 404
+  // and nothing is fetched. Mutation: the prefix check applied only without a pin.
+  test("a /gh/ adminUrl is a 404 even when the page pins the CURRENT version, and nothing is fetched (#465 item 8)", async () => {
+    let fetched = 0;
+    const gh: PluginIndex = {
+      schemaVersion: 1,
+      plugins: [
+        {
+          name: "warbandeer",
+          version: "1.1.0",
+          package: "@rackbops/plugin-warbandeer",
+          adminUrl: "https://cdn.jsdelivr.net/gh/x/y@main/a.js",
+          adminApiVersion: ADMIN_API_VERSION,
+        },
+      ],
+    };
+    const res = await serveAdminBundle(
+      bundleReq("/plugin-admin/warbandeer.js?v=1.1.0"),
+      cfg({ listPluginIndex: async () => gh, fetchAdminAsset: async () => (fetched++, okAsset("x")) }),
+    );
+    expect(res.status).toBe(404);
+    expect(fetched).toBe(0);
+  });
   test("404 when the plugin ships no admin bundle", async () => {
     expect((await serveAdminBundle(bundleReq("/plugin-admin/ghost.js"), cfg())).status).toBe(404);
   });
@@ -3662,8 +3705,8 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
     expect(seen?.redirect).toBe("error");
   });
 
-  // ... and for real: a local server answering 302. A followed redirect would request /ok (served 200, or a 404 from a
-  // closed port that the catch would also turn into a 502) — so the assertion is on what the server was ASKED.
+  // ... and for real: a local server answering 302. A followed redirect would request /ok (served 200). A weaker test
+  // that redirected to a closed port would also end in a 502 (the catch), so the assertion is on what the server was ASKED.
   // Mutation: `redirect: "error"` dropped (the target is requested and the asset served).
   test("a real 302 is a 502 and its target is never requested (#465 item 7)", async () => {
     const hits: string[] = [];
@@ -3764,10 +3807,11 @@ describe("serve (#465 item 9, #466 item 14)", () => {
   // Mutation: the catch rethrows (the request rejects), or the 500 carries the error's text.
   test("a route that rejects answers a plain 500: logged, no stack or message in the body, both headers", async () => {
     const err = spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("spawn bash ENOENT /opt/secret/path");
     try {
       const res = await serve(
         authed("/api/plugins"),
-        cfg({ runBotOps: async () => { throw new Error("spawn bash ENOENT /opt/secret/path"); } }),
+        cfg({ runBotOps: async () => { throw boom; } }),
       );
       expect(res.status).toBe(500);
       expect(await res.text()).toBe("internal error");
@@ -3775,6 +3819,7 @@ describe("serve (#465 item 9, #466 item 14)", () => {
       expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
       expect(err).toHaveBeenCalledTimes(1);
       expect(String(err.mock.calls[0]![0])).toBe("[admin] GET /api/plugins failed");
+      expect(err.mock.calls[0]![1]).toBe(boom); // the cause is logged (mutation: `, err` dropped)
     } finally {
       err.mockRestore();
     }
@@ -3794,18 +3839,68 @@ describe("serve (#465 item 9, #466 item 14)", () => {
     }
   });
 
-  // The entry point does not run under test (import.meta.main), so the Bun.serve literal is pinned from the source:
-  // `serve` as the fetch, development off (Bun's development error page is ~50 KB of message, paths and source lines),
-  // and a last-resort error handler whose response carries the headers too.
-  // Mutations: any of the four fragments dropped.
-  test("Bun.serve runs serve(), with development off and a last-resort error handler that carries the headers", () => {
-    const src = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
-    expect(src.split("Bun.serve({").length - 1).toBe(1);
-    const start = src.indexOf("Bun.serve({");
-    const block = src.slice(start, src.indexOf("\n  });", start));
-    for (const fragment of ["fetch: (req) => serve(req, config)", "development: false", "error(err)", "headers: SECURITY_HEADERS"]) {
-      expect({ fragment, found: block.includes(fragment) }).toEqual({ fragment, found: true });
+  // The entry point does not run under test (import.meta.main), so what it hands Bun.serve is `serveOptions`, pinned BY
+  // VALUE: the port, development off (Bun's development error page is ~50 KB of message, paths and source lines), the
+  // idle timeout, `serve` as the fetch (handleRequest alone sets no headers), and a last-resort error handler.
+  // Mutations: development true or dropped; the idle timeout dropped; fetch not `serve`; the error handler dropped.
+  test("serveOptions: development off, the idle timeout, serve as the fetch, a last-resort error handler", async () => {
+    const opts = serveOptions(cfg(), 18999);
+    expect(opts.port).toBe(18999);
+    expect(opts.development).toBe(false);
+    expect(opts.idleTimeout).toBe(IDLE_TIMEOUT_SECONDS);
+    expect(opts.error).toBe(lastResortResponse);
+    const res = await opts.fetch(new Request("http://x/nope"));
+    expect(res.status).toBe(404);
+    expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN"); // it IS serve()
+  });
+
+  // `serve` cannot reject through any request this suite can build, so the last resort is called directly. Mutations: the
+  // status, the body (the error's text), the headers, or the log (the cause) changed.
+  test("lastResortResponse: a plain 500 with both headers; the cause is logged, never answered", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("boom /opt/secret/path");
+    try {
+      const res = lastResortResponse(boom);
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("internal error");
+      expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0]![0])).toBe("[admin] unhandled");
+      expect(err.mock.calls[0]![1]).toBe(boom);
+    } finally {
+      err.mockRestore();
     }
+  });
+
+  // ... and for real: a Bun.serve given these options but a fetch that THROWS reaches the last resort, not Bun's
+  // development page. Mutation: `development: false` or the error handler dropped (a ~50 KB html page, no headers).
+  test("a real Bun.serve with serveOptions answers a throwing fetch with the plain 500, not Bun's development page", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    const srv = Bun.serve({
+      ...serveOptions(cfg(), 0),
+      fetch() {
+        throw new Error("boom /opt/secret/path");
+      },
+    });
+    try {
+      const r = await fetch(`http://127.0.0.1:${srv.port}/`);
+      expect(r.status).toBe(500);
+      expect(await r.text()).toBe("internal error");
+      expect(r.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+      expect(r.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    } finally {
+      srv.stop(true);
+      err.mockRestore();
+    }
+  });
+
+  // The one line the suite cannot run: the entry point hands Bun.serve `serveOptions(config, PORT)`. Read from the
+  // transpiled source, so a comment cannot satisfy it. Mutation: a hand-written literal back in its place.
+  test("the entry point calls Bun.serve once, with serveOptions(config, PORT)", () => {
+    const js = new Bun.Transpiler({ loader: "ts" }).transformSync(readFileSync(new URL("./server.ts", import.meta.url), "utf8"));
+    expect(js.split("Bun.serve(").length - 1).toBe(1);
+    expect(js).toContain("Bun.serve(serveOptions(config, PORT))");
   });
 });
 

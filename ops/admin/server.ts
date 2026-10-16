@@ -2,9 +2,8 @@
 // logs, restart, recreate, env-get, env-set, env-schema, routing-get and the plugin request mailbox;
 // `version` once at startup) plus server-native routes of its own (/api/whoami, /api/branches,
 // /api/plugins, /api/plugins/request, /api/admins, the routing writes /api/routing, /api/webhooks and
-// /api/discovery/refresh, the admin-bundle and data-asset delivery, and the static assets). Runs as its
-// own sidecar service (the
-// profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
+// /api/discovery/refresh, the admin-bundle and data-asset delivery, and the static assets). Runs as
+// its own sidecar service (the profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
 // the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
 // token as the fallback (OR, not AND — see authorizeRequest).
@@ -910,8 +909,9 @@ export function parsePluginIndex(text: string): PluginIndex | null {
     if (p === null || typeof p !== "object") return false;
     const e = p as { name?: unknown; version?: unknown; env?: unknown; commands?: unknown; releases?: unknown };
     if (typeof e.name !== "string" || typeof e.version !== "string") return false;
-    // #404: the three containers the merge iterates. A non-array one (`null` included) used to throw inside
-    // `mergePluginsView` and 500 the Plugins tab for the cache's lifetime.
+    // #404: the three containers the merge iterates. A non-array one used to throw inside `mergePluginsView` and
+    // 500 the Plugins tab for the cache's lifetime. `null` merged fine before (`?? []`) and is refused now too, as the
+    // bot refuses it.
     if (e.env !== undefined && !Array.isArray(e.env)) return false;
     if (e.commands !== undefined && !Array.isArray(e.commands)) return false;
     if (e.releases !== undefined && !Array.isArray(e.releases)) return false;
@@ -2025,10 +2025,11 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
 
   // The Modify Plugins view: the Plugin Index (what's available) merged with the bot's installed
   // state (status.plugins) and the current PLUGINS selection (env-get). Server-native, authenticated
-  // like every /api/* route; a GET, so isCrossSiteWrite never applies. 200 whatever the index or the
-  // status looks like — an unreachable or unmergeable index (#404) degrades to an indexError plus the
-  // installed plugins, so the panel still renders what's installed (a `runBotOps` that rejects is
-  // serve()'s plain 500). (Saving happens through the existing POST /api/env, not here.)
+  // like every /api/* route; a GET, so isCrossSiteWrite never applies. 200 for any index or status SHAPE the
+  // merge can trip on — an unreachable or unmergeable index (#404) degrades to an indexError plus the
+  // installed plugins, so the panel still renders what's installed (what no merge can fix — a `runBotOps`
+  // that rejects, a view too deeply nested to serialise — is serve()'s plain 500). (Saving happens
+  // through the existing POST /api/env, not here.)
   if (req.method === "GET" && url.pathname === "/api/plugins") {
     const [statusRes, envRes] = await Promise.all([
       config.runBotOps({ args: ["status"], contentType: "application/json" }),
@@ -2185,9 +2186,10 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   return new Response(stdout, { headers: { "Content-Type": invocation.contentType } });
 }
 
-/** The two response headers every answer carries (#466 item 14): the panel is framed only by its own origin (nothing
- *  does today; ADR-0005 keeps a same-origin iframe open for plugin UIs), and nothing it serves — the page, the assets,
- *  a proxied data asset with its upstream Content-Type — is sniffed into another type. */
+/** The two response headers every response the app produces carries (#466 item 14): the panel is framed only by its
+ *  own origin (nothing does today; ADR-0005 keeps a same-origin iframe open for plugin UIs), and nothing it serves —
+ *  the page, the assets, a proxied data asset with its upstream Content-Type — is sniffed into another type. (Bun's own
+ *  protocol-level replies, an `OPTIONS *` or an over-long header block, never reach `serve`.) */
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "X-Frame-Options": "SAMEORIGIN",
   "X-Content-Type-Options": "nosniff",
@@ -2215,6 +2217,31 @@ export async function serve(req: Request, config: HandlerConfig): Promise<Respon
   }
   for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
   return res;
+}
+
+/** `Bun.serve`'s last resort (#465 item 9), behind `serve`'s own net: what Bun calls when the fetch handler itself
+ *  throws or rejects. Without an `error` handler Bun answers its development error page (the message, local paths,
+ *  source lines) — and `serve` cannot reject through any request this suite can build, so this is exported to be called
+ *  directly. */
+export function lastResortResponse(err: unknown): Response {
+  console.error("[admin] unhandled", err);
+  return new Response("internal error", { status: 500, headers: SECURITY_HEADERS });
+}
+
+/** Everything `Bun.serve` is given (#465 item 9), as a function of the handler config and the port so the values are
+ *  pinned by tests (the entry point does not run under test): `serve` as the fetch, `development: false` (Bun's
+ *  development error page is ~50 KB of message, paths and source lines), `lastResortResponse` as the error handler.
+ *  idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long restart/env-set request out
+ *  from under the client while bot-ops.sh is still legitimately running (issue #53 item 1). See
+ *  SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin. */
+export function serveOptions(config: HandlerConfig, port: number) {
+  return {
+    port,
+    fetch: (req: Request) => serve(req, config),
+    idleTimeout: IDLE_TIMEOUT_SECONDS,
+    development: false,
+    error: lastResortResponse,
+  };
 }
 
 // Everything below only runs when this file is the actual entry point (`bun run server.ts`),
@@ -2378,20 +2405,8 @@ if (import.meta.main) {
     adminToken, indexHtml, assets, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt,
     adminStore, outdatedFiles,
   };
-  // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
-  // restart/env-set request out from under the client while bot-ops.sh is still legitimately
-  // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.
-  // #465 item 9: `serve` is the request net; `development: false` and `error` are the last resort behind it (without
-  // them a throw that escapes answers Bun's development error page — the message, local paths, source lines).
-  Bun.serve({
-    port: PORT,
-    fetch: (req) => serve(req, config),
-    idleTimeout: IDLE_TIMEOUT_SECONDS,
-    development: false,
-    error(err) {
-      console.error("[admin] unhandled", err);
-      return new Response("internal error", { status: 500, headers: SECURITY_HEADERS });
-    },
-  });
+  // The options (serve as the fetch, idleTimeout, development off, the last-resort error handler) are `serveOptions`'s,
+  // so their values are tested; only this call is not.
+  Bun.serve(serveOptions(config, PORT));
   console.log(`[admin] listening on :${PORT}`);
 }

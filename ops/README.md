@@ -1410,8 +1410,8 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    `ADMIN_TOKEN` exported). If this token has leaked, editing `.env` alone is not enough: the
    leaked token keeps working until that recreate happens.
 
-**What it exposes — `bot-ops.sh`'s operations plus a few read-only or self-contained,
-server-native routes:** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart` (routed but unused
+**What it exposes — `bot-ops.sh`'s operations plus a few server-native routes of its own
+(some of which write):** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart` (routed but unused
 by the page since #277 — see below), `POST /api/recreate` (**#277**: what the Overview's Restart
 button actually calls), `GET /api/env`,
 `POST /api/env`, `GET /api/whoami` (reflects the requester's own verified Access identity — who
