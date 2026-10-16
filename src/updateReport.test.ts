@@ -84,14 +84,28 @@ describe("decideUpdateOutcome", () => {
   test("an unmarked report back on the source build stays a noop", () => {
     expect(decideUpdateOutcome({ report: report(), runningSha: FROM })).toBe("noop");
   });
+
+  // #558: a rolled-back swap did land first, so the rollback outranks the interrupted mark when both are on a report.
+  // Mutation M19b: checking `interrupted` first.
+  test("rolled-back when the boot found itself rolled back: the report carries the verdict, and it outranks interrupted", () => {
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true }), runningSha: FROM })).toBe("rolled-back");
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true }), runningSha: shortSha(FROM) })).toBe("rolled-back");
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true, interrupted: true }), runningSha: FROM })).toBe("rolled-back");
+  });
+
+  test("a rolled-back mark does not hide an update that landed, a third build, or a missing GIT_SHA", () => {
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true }), runningSha: TO })).toBe("updated");
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true }), runningSha: THIRD })).toBe("unexpected");
+    expect(decideUpdateOutcome({ report: report({ rolledBack: true }) })).toBe("unknown");
+  });
 });
 
 describe("updateOutcomeMessage", () => {
   test("each outcome produces distinct text", () => {
-    const msgs = (["updated", "noop", "interrupted", "unexpected", "unknown"] as const).map((o) =>
+    const msgs = (["updated", "noop", "interrupted", "rolled-back", "unexpected", "unknown"] as const).map((o) =>
       updateOutcomeMessage(o, report(), TO),
     );
-    expect(new Set(msgs).size).toBe(5);
+    expect(new Set(msgs).size).toBe(6);
   });
 
   test("interrupted names the target and the build, says the update did not take, and names the command to run again (#450)", () => {
@@ -101,6 +115,20 @@ describe("updateOutcomeMessage", () => {
     expect(msg).toContain("did not take");
     expect(msg).toContain("/update"); // config.commandPrefix is empty in this process
     expect(msg).not.toContain("wasn't rebuilt"); // the wrong cause the noop text names
+    // A rollback of a recorded swap is `rolled-back` now; the text no longer claims it (#558).
+    expect(msg).not.toContain("rolled back");
+  });
+
+  // Mutation M19: the rolled-back outcome returning the interrupted text.
+  test("rolled-back names the target, says it landed and was rolled back, that automatic updates skip it, and the command to apply it (#558)", () => {
+    const msg = updateOutcomeMessage("rolled-back", report(), FROM);
+    expect(msg).toContain(shortSha(TO));
+    expect(msg).toContain(shortSha(FROM));
+    expect(msg).toContain("landed and was then rolled back");
+    expect(msg).toContain("Automatic updates skip");
+    expect(msg).toContain("/update"); // config.commandPrefix is empty in this process
+    expect(msg).not.toContain("did not take");
+    expect(msg).not.toContain("wasn't rebuilt");
   });
 
   test("unexpected admits an automatic update or a redeploy by hand may be the cause", () => {
@@ -415,6 +443,27 @@ describe("reportUpdateOutcome", () => {
     expect(contents[0]!.startsWith("⚠️ Back up on")).toBe(true);
     expect(contents[0]).toContain("did not take");
     expect(contents[0]).not.toContain("wasn't rebuilt");
+  });
+
+  // #558: a rolled-back original's boot marks the report in place and passes "rolled-back": it is neither held nor
+  // re-decided, and the outcome comes from the mark.
+  test("a report the boot marked rolled-back is cleared and delivered as rolled-back", async () => {
+    config.gitSha = FROM;
+    const owed = report({ requestedAt: Date.now(), rolledBack: true });
+    state.pendingUpdateReport = owed;
+    await saveState();
+    const contents: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "rolled-back", { ...forbidden, viaToken: async (_r, content) => void contents.push(content) }, owed);
+    } finally {
+      log.mockRestore();
+    }
+    expect(contents).toHaveLength(1);
+    expect(contents[0]!.startsWith("⚠️ Back up on")).toBe(true);
+    expect(contents[0]).toContain("landed and was then rolled back");
+    expect(state.pendingUpdateReport).toBeUndefined();
+    expect(onDisk().pendingUpdateReport).toBeUndefined();
   });
 
   // Mutation: the `resolution = "none"` default becoming "in-flight" -- every report called without one would be held.

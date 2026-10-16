@@ -14,7 +14,7 @@ import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { owedReportNow, reportUpdateOutcome } from "./updateReport";
 import { resolveUpdateAttempt } from "./update";
-import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
+import { bootMode, ownContainerShortId, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { detectRollback, finishProbation, healOwnName, resolveBootMode, stepAside, takeOver } from "./redeploy";
 import { createReadyHandler } from "./ready";
 import {
@@ -86,6 +86,7 @@ const verifyTimer =
           status: "failed",
           sha: config.gitSha,
           error: "the replacement never completed a gateway login",
+          replacementId: ownContainerShortId(),
           at: Date.now(),
         });
         process.exit(1);

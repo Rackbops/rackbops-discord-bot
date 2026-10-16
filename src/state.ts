@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { config } from "./config";
-import { DATA_DIR, moveCorruptAside, readJsonOrFresh, writeJsonAtomic } from "./storage";
+import { DATA_DIR, moveCorruptAside, readJsonOrFresh, shortSha, writeJsonAtomic } from "./storage";
 
 /**
  * A `/update`-initiated restart, recorded so the bot can tell the requester what build it
@@ -19,6 +19,10 @@ export interface PendingUpdateReport {
   // same save that clears the swap record -- so the verdict is on disk with the report it describes, and a boot that dies
   // before delivering it still reports `interrupted`, not the "image wasn't rebuilt" a bare `noop` would say.
   interrupted?: true;
+  // #558: set by the boot that found itself rolled back (`retiredBy` naming it as the original, `resolveUpdateAttempt`)
+  // when this report is the one that swap armed, in the same save that arms the attempt marker -- so the verdict is on
+  // disk with the report, and a boot that dies before delivering it still reports `rolled-back`. Wins over `interrupted`.
+  rolledBack?: true;
 }
 
 /**
@@ -33,6 +37,12 @@ export interface SwapInFlight {
   fromSha: string; // the build that started the swap
   toSha: string; // the build it was swapping to
   startedAt: number; // ms epoch, for the log
+}
+
+export interface RetiredBy {
+  sha: string; // the replacement's build
+  originalSha: string; // the build it retired (the swap record's fromSha)
+  at: number; // ms epoch, for the log
 }
 
 // Persisted so a restart does not re-announce a release whose save landed (CONTEXT.md's Behavior section lists what can still repeat one).
@@ -50,6 +60,11 @@ export interface BotState {
   attemptedUpdateToSha?: string; // sha we last exited to update to; guards against an exit loop
   pendingUpdateReport?: PendingUpdateReport; // /update follow-up owed on next boot; consumed once
   swapInFlight?: SwapInFlight; // #450: a socket-path swap from before its build until redeploy() returns or the next boot resolves it
+  /** #558: written by the replacement in `takeOver`, after it has stopped the original and adopted the file: which
+   *  build retired which. A later boot of the ORIGINAL (the operator's `docker start <name>`, a rollback) reads it and
+   *  arms `attemptedUpdateToSha` with `sha`, so the automatic check skips the build it was rolled back from; cleared by
+   *  `completeTakeOver` once the original is gone, by the rolled-back boot itself, and by a boot it names neither way. */
+  retiredBy?: RetiredBy;
 }
 
 const RELEASE_ID_CAP = 100;
@@ -195,4 +210,63 @@ export function saveState(): Promise<void> {
   // Cap each repo's release-id history so the file never grows unbounded.
   capSeenReleaseIds(state.seenReleaseIds);
   return stateWriter.save(state);
+}
+
+/**
+ * #507: re-read `state.json` into the shared object, in place (every importer holds this one object). For the
+ * replacement, right after it has stopped the original: its own copy was loaded at import, and the original may have
+ * persisted a release id (or anything else) since, which the replacement's first save would otherwise drop. An absent
+ * file keeps what is in memory; a file that will not parse is moved aside by `readJsonOrFresh` (as at load, so the
+ * evidence outlives the next save) and what is in memory is kept; a file that parses but is not a state object is kept
+ * on disk and ignored. A reload never turns a good snapshot into an empty one.
+ */
+export async function reloadState(log: Pick<Console, "warn"> = console): Promise<"reloaded" | "kept"> {
+  let raw: unknown;
+  try {
+    raw = await readJsonOrFresh<unknown>(STATE_FILE, () => undefined, "state");
+  } catch (err) {
+    log.warn("[state] could not re-read state.json; keeping the copy loaded at start", err);
+    return "kept";
+  }
+  if (raw === undefined) {
+    log.warn("[state] state.json is absent or was moved aside as unreadable; keeping the copy loaded at start");
+    return "kept";
+  }
+  if (!isRawBotState(raw)) {
+    log.warn("[state] state.json is not a state object; keeping the copy loaded at start");
+    return "kept";
+  }
+  const fresh: BotState = { ...raw, seenReleaseIds: normalizeSeenReleaseIds(raw.seenReleaseIds ?? undefined, config.githubRepo) };
+  const current = state as unknown as Record<string, unknown>;
+  for (const k of Object.keys(current)) delete current[k];
+  Object.assign(current, fresh);
+  return "reloaded";
+}
+
+/** #558: the replacement's record of the swap it just completed, from the swap record the original armed (D1a). */
+export async function recordRetirement(replacementSha: string | undefined, log: Pick<Console, "log" | "warn"> = console): Promise<void> {
+  if (!replacementSha) {
+    log.warn("[state] not recording the retirement: this build has no GIT_SHA");
+    return;
+  }
+  // A restart of this replacement during its probation: its first life recorded this already (and then resolved the
+  // swap record as landed, so there is nothing to read now). Nothing to do, nothing to say.
+  if (state.retiredBy?.sha === replacementSha) return;
+  const originalSha = state.swapInFlight?.fromSha;
+  if (!originalSha) {
+    log.warn(
+      "[state] not recording the retirement: no swap record from the original to read (it ran a build before #450, or it had already resolved the record) — if this swap is rolled back, set AUTO_UPDATE=false on the original until a newer commit lands",
+    );
+    return;
+  }
+  state.retiredBy = { sha: replacementSha, originalSha, at: Date.now() };
+  await saveState();
+  log.log(`[state] recorded that ${shortSha(replacementSha)} retired ${shortSha(originalSha)}`);
+}
+
+/** #558: the original is gone, so no rollback can bring it back; the record is cleared. No-op when none is set. */
+export async function clearRetirement(): Promise<void> {
+  if (state.retiredBy === undefined) return;
+  state.retiredBy = undefined;
+  await saveState();
 }

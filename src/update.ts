@@ -1,5 +1,5 @@
 import { config } from "./config";
-import { state, saveState, type PendingUpdateReport, type SwapInFlight } from "./state";
+import { state, saveState, type PendingUpdateReport, type RetiredBy, type SwapInFlight } from "./state";
 import { restartPending, requestRestart } from "./restart";
 import { prefixedName } from "./commandNaming";
 import { probeReplacement, redeploy, redeployAvailable, type RedeployResult, type ReplacementProbe } from "./redeploy";
@@ -391,6 +391,9 @@ async function applyUpdate(
 
 /** What a boot makes of the swap record its previous life left (#450). */
 export type AttemptResolution =
+  /** `retiredBy` names this build as the ORIGINAL: the operator started it again after a swap that landed (a rollback,
+   *  #558). The build it was retired by is armed as attempted; the record and any swap record are cleared. */
+  | "rolled-back"
   /** No record: the two markers say the whole story (an exit-75 respawn, or nothing pending). */
   | "none"
   /** `toSha` is this build: the swap landed and this is the replacement. The record is cleared. */
@@ -442,6 +445,29 @@ function isSwapInFlight(v: unknown): v is SwapInFlight {
   );
 }
 
+/** A `retiredBy` as written by `recordRetirement`; a hand-edited one must not throw at boot. */
+export function isRetiredBy(v: unknown): v is RetiredBy {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as RetiredBy).sha === "string" &&
+    typeof (v as RetiredBy).originalSha === "string" &&
+    typeof (v as RetiredBy).at === "number"
+  );
+}
+
+/** What `retiredBy` says about this boot (#558). `replacement` is checked first: the record's two shas can only be
+ *  equal through a hand edit (`decideUpdate` answers `current` for the running sha before `force` is read, so no swap to
+ *  the same commit exists), and that build is then treated as the replacement, which keeps the record. */
+export type RetirementVerdict = "none" | "rolled-back" | "replacement" | "stale";
+export function decideRetirement(o: { retiredBy?: RetiredBy; runningSha?: string }): RetirementVerdict {
+  if (!o.retiredBy) return "none";
+  if (!o.runningSha) return "stale";
+  if (sameSha(o.retiredBy.sha, o.runningSha)) return "replacement";
+  if (sameSha(o.retiredBy.originalSha, o.runningSha)) return "rolled-back";
+  return "stale";
+}
+
 /** Test seams for {@link resolveUpdateAttempt}. */
 export interface ResolveAttemptDeps {
   probe?: () => Promise<ReplacementProbe>;
@@ -468,11 +494,59 @@ function describeProbe(p: ReplacementProbe): string {
  * (`interrupted`), which is how it reaches `reportUpdateOutcome` -- and survives a boot that dies before delivering it.
  * The daemon is asked only in the ambiguous case (back on `fromSha`), bounded like `resolveBootMode`; an ordinary boot,
  * and the replacement's own boot, make no daemon call here. Never throws.
+ *
+ * The replacement's `retiredBy` record (#558) is read first: a build it names as the ORIGINAL has been started again
+ * after a swap that landed (a rollback), and resolves `rolled-back` without a probe, arming the attempt marker with the
+ * build it was rolled back from. That needs both builds to carry the record's writer and reader, and the swap record
+ * the writer reads from; the first swap into that change is unprotected.
  */
 export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promise<AttemptResolution> {
   const log = deps.log ?? console;
+  // #558: the retirement record first. A rollback resolves here and never probes; a stale or malformed record is
+  // cleared and saved with whatever follows (or on its own when no swap record follows).
+  const retiredRaw: unknown = state.retiredBy;
+  const retired = isRetiredBy(retiredRaw) ? retiredRaw : undefined;
+  const verdict = decideRetirement({ retiredBy: retired, runningSha: config.gitSha });
+  let retirementCleared = false;
+  if (verdict === "rolled-back") {
+    // This container was retired by `sha` and is running again — the operator rolled back. The swap landed, so any
+    // swap record is moot (no probe); the build we were rolled back from is armed as attempted, so the automatic
+    // check skips it until a newer commit lands, and /update (force) still applies it. The owed report, if it is the
+    // one that swap armed (same shas, equality as in the `interrupted` branch), carries the verdict.
+    state.attemptedUpdateToSha = retired!.sha;
+    state.retiredBy = undefined;
+    state.swapInFlight = undefined;
+    const owed = state.pendingUpdateReport;
+    // In place, as the `interrupted` mark is: `reportUpdateOutcome` delivers only the report object it was handed
+    // (`report === owed`, identity), so a copy must not replace it.
+    if (owed?.fromSha === retired!.originalSha && owed.toSha === retired!.sha) owed.rolledBack = true;
+    log.warn(
+      `[update] this container was retired by ${shortSha(retired!.sha)} and is running again — rolled back by the operator; the automatic check skips ${shortSha(retired!.sha)} until a newer commit lands, and /${prefixedName(config.commandPrefix, "update")} applies it anyway`,
+    );
+    try {
+      await saveState();
+    } catch (err) {
+      log.warn("[update] could not save the rollback marker (armed in memory; the next boot re-arms it)", err);
+    }
+    return "rolled-back";
+  }
+  if (verdict === "stale" || (retiredRaw !== undefined && retired === undefined)) {
+    state.retiredBy = undefined;
+    retirementCleared = true;
+    log.log("[update] a retirement record belongs to another build or is malformed — cleared it");
+  }
+  // `replacement`: this is the new build during or after its probation; the record stays for the original to find.
   const raw: unknown = state.swapInFlight;
-  if (raw === undefined) return "none";
+  if (raw === undefined) {
+    if (retirementCleared) {
+      try {
+        await saveState();
+      } catch (err) {
+        log.warn("[update] could not save the cleared retirement record (it is cleared in memory; the next boot clears it again)", err);
+      }
+    }
+    return "none";
+  }
   const swap = isSwapInFlight(raw) ? raw : undefined;
   // Only the build the swap left asks the daemon: a record this bot writes has `fromSha` != `toSha`, so the build it
   // landed on (the replacement's own boot) never matches `fromSha` and makes no call.

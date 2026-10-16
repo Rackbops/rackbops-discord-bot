@@ -35,13 +35,16 @@ import {
   HANDOFF_FROM_ENV,
   HANDOFF_RESTART_POLICY_ENV,
   HANDOFF_RESTART_RETRIES_ENV,
+  ownContainerShortId,
   readMarker,
   RETIREMENT_DEADLINE_MS,
   writeMarker,
+  type HandoffMarker,
   type HandoffOutcome,
   type ReplacementDisposition,
 } from "./handoff";
 import { beginHandoff, endHandoff, isShuttingDown, runExitHooks } from "./restart";
+import { clearRetirement, recordRetirement, reloadState } from "./state";
 import { SHORT_SHA_LEN, shortSha } from "./storage";
 
 const POLL_MS = 2_000;
@@ -500,7 +503,12 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   }
   console.log(`[redeploy] replacement ${name} started — waiting for it to verify`);
 
+  // #506: the marker is bound to the container that wrote it. The foreign ids already warned about, shared by the four
+  // reads below (the poll, the late re-read, the final read, the retirement wait) so a poll does not repeat the line.
+  const foreign = new Set<string>();
   let outcome: HandoffOutcome;
+  // The `ready` marker that decided the outcome (the poll's, or the late re-read's), for the line that names its sha.
+  let readyMarker: HandoffMarker | undefined;
   // #431: the verdict's own time, the baseline the generation guard below compares the replacement's
   // later StartedAt against. Replaced by the poll's own observation, re-sampled after the retirement wait
   // and in the backstop catch — never left at epoch 0, which made the guard read EVERY running replacement
@@ -515,9 +523,11 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       pollMs,
       now,
       readMarker: read,
+      foreign,
     });
     outcome = decided.outcome;
     observedAt = decided.observedAt;
+    readyMarker = decided.marker;
     // Set only when the LAST poll's inspect failed: a deadline spent on a daemon that would not answer
     // is named to the requester; an error the daemon recovered from is not blamed for a silent replacement.
     if (outcome === "timeout") pollError = decided.lastPollError;
@@ -527,10 +537,11 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // poll saw, so read once more before acting on anything else. A `ready` that lands after THIS re-read
       // (before the removal below) is the residual window: the generation guard's inspect plus the removal
       // call — milliseconds against a healthy daemon, up to two sequential 60 s call bounds against a hanging one.
-      const late = await read();
+      const late = markerFor(await read(), replacementId, foreign);
       if (late?.status === "ready") {
         console.warn(`[redeploy] the replacement signalled ready as the poll decided ${outcome} — honouring it`);
         outcome = "ready";
+        readyMarker = late;
         pollError = undefined;
       } else if (late?.status === "failed" && outcome !== "failed") {
         // The poll said `timeout` but the replacement gave up in that window: its own word beats "never
@@ -553,8 +564,8 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // The wait polls the marker rather than sleeping blind for the whole deadline: `takeOver`
       // writes `failed` (with a reason) the moment its own retire attempt throws, and a blind
       // sleep would sit on that answer for up to `RETIREMENT_DEADLINE_MS` before ever reading it.
-      console.log("[redeploy] replacement verified — handing over");
-      const retirement = await awaitRetirementFailure(replacementId, opts.deadlineMs, pollMs);
+      console.log(`[redeploy] replacement verified${readyMarker?.sha ? ` (${shortSha(readyMarker.sha)})` : ""} — handing over`);
+      const retirement = await awaitRetirementFailure(replacementId, opts.deadlineMs, pollMs, undefined, foreign);
       if (retirement.kind === "failed") {
         console.error("[redeploy] replacement signalled failed after verifying — reclaiming");
         outcome = "failed";
@@ -592,7 +603,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     observedAt = now();
   }
 
-  const marker = await read();
+  const marker = markerFor(await read(), replacementId, foreign);
   let replacement: ReplacementDisposition = "removed";
   let replacementError: string | undefined;
   try {
@@ -665,13 +676,14 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
  *  poll's inspect error, or undefined when the last poll's inspect worked. */
 async function awaitHandoff(
   replacementId: string,
-  o: { deadlineMs: number; pollMs: number; now: () => number; readMarker: typeof readMarker },
-): Promise<{ outcome: HandoffOutcome; observedAt: number; lastPollError?: string }> {
+  o: { deadlineMs: number; pollMs: number; now: () => number; readMarker: typeof readMarker; foreign: Set<string> },
+): Promise<{ outcome: HandoffOutcome; observedAt: number; lastPollError?: string; marker?: HandoffMarker }> {
   const startedAt = o.now();
   let lastPollError: string | undefined;
   for (;;) {
     const observedAt = o.now();
-    const marker = await o.readMarker();
+    // #506: a marker another container wrote (a surviving earlier replacement) is not this attempt's verdict.
+    const marker = markerFor(await o.readMarker(), replacementId, o.foreign);
     let container: ContainerInspect | undefined;
     let inspectFailed = false;
     try {
@@ -697,9 +709,31 @@ async function awaitHandoff(
       elapsedMs: o.now() - startedAt,
       deadlineMs: o.deadlineMs,
     });
-    if (outcome !== "waiting") return { outcome, observedAt, lastPollError };
+    if (outcome !== "waiting") return { outcome, observedAt, lastPollError, marker };
     await Bun.sleep(o.pollMs);
   }
+}
+
+const CONTAINER_SHORT_ID_RE = /^[0-9a-f]{12}$/;
+
+/** #506: a marker names the container that wrote it; one from another container (an earlier replacement that is still
+ *  alive, or an attempt the daemon lost) is not this attempt's verdict. A marker with no id, or with one that is not a
+ *  12-hex short id (an older standby; a pinned hostname), is taken as-is. `warned` is this attempt's set of foreign
+ *  ids already reported, so a 2 s poll does not repeat the line. */
+export function markerFor(
+  marker: HandoffMarker | undefined,
+  replacementId: string,
+  warned: Set<string>,
+  log: Pick<Console, "warn"> = console,
+): HandoffMarker | undefined {
+  const id = marker?.replacementId;
+  if (!marker || !id || !CONTAINER_SHORT_ID_RE.test(id)) return marker;
+  if (replacementId.startsWith(id)) return marker;
+  if (!warned.has(id)) {
+    warned.add(id);
+    log.warn(`[redeploy] ignoring a ${marker.status} marker written by ${id}, not by this attempt's replacement ${replacementId.slice(0, 12)}`);
+  }
+  return undefined;
 }
 
 export type RetirementWait = { kind: "failed" } | { kind: "died"; status: string; exitCode: number } | { kind: "stalled" };
@@ -723,6 +757,7 @@ export async function awaitRetirementFailure(
   deadlineMs = RETIREMENT_DEADLINE_MS,
   pollMs = POLL_MS,
   inspect: (id: string, timeoutMs?: number) => Promise<ContainerInspect | undefined> = tryInspectContainer,
+  foreign: Set<string> = new Set(),
 ): Promise<RetirementWait> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < deadlineMs) {
@@ -736,7 +771,7 @@ export async function awaitRetirementFailure(
     } catch {
       // not a verdict: the marker below still decides this poll
     }
-    if ((await readMarker())?.status === "failed") return { kind: "failed" };
+    if (markerFor(await readMarker(), replacementId, foreign)?.status === "failed") return { kind: "failed" };
     if (current && (current.State.Status === "exited" || current.State.Status === "dead")) {
       return { kind: "died", status: current.State.Status, exitCode: current.State.ExitCode };
     }
@@ -835,6 +870,10 @@ export interface TakeOverEffects {
    *  can be exercised without ending the test process. Ignored when `stepAside` is given. */
   stepAsideDeps?: RollbackDeps;
   exit?: (code: number) => void;
+  /** #507: re-read `state.json` once the original is stopped (`reloadState`); best-effort. */
+  reload?: () => Promise<unknown>;
+  /** #558: record which build retired which (`recordRetirement`); best-effort. */
+  recordRetirement?: () => Promise<void>;
 }
 
 /** The real `tagLatest` effect (run from {@link completeTakeOver}): reads this container's own image
@@ -919,6 +958,15 @@ async function restoreOriginalRestartPolicy(): Promise<void> {
  * the *original* actually decides `stalled`/`failed` — see its own comment) still keeps the original
  * from force-removing a replacement that is mid-flight.
  *
+ * Two steps follow the stop, each best-effort (a `.catch` that logs): they sit outside what the catch below can
+ * mean, since it writes `failed` on the premise that the original was never stopped, which is false by then. `reload`
+ * (#507): this process loaded `state.json` at import and has written nothing since, while the original may have
+ * persisted a release id (or cleared the owed report) after that, so once the original is down — its shutdown drain
+ * awaited the write it had in flight — the file is re-read in place, before this process's first save would drop
+ * those. `recordRetirement` (#558): the swap record the original armed says which build this one retired; written
+ * to the shared file so a later boot of the ORIGINAL (the operator's `docker start <name>`, a rollback) knows it was
+ * rolled back and does not auto-update to this build again. `completeTakeOver` clears it once the original is gone.
+ *
  * On failure, then, we do the one safe thing: write a `failed` marker — which lets an original
  * still polling reclaim at once instead of waiting its deadline out — and exit. We must not fall
  * through to `activate()`: two live bots on the one shared token would double every reply for the
@@ -936,12 +984,14 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
   const rolledBack = effects.rolledBack ?? (() => detectRollback({ ...process.env, [HANDOFF_FROM_ENV]: originalId }));
   const aside = effects.stepAside ?? (() => stepAside(effects.stepAsideDeps));
   const exit = effects.exit ?? ((code: number) => process.exit(code));
+  const reload = effects.reload ?? reloadState;
+  const record = effects.recordRetirement ?? (() => recordRetirement(config.gitSha));
   // #548: look again before touching anything. An operator's `docker start <name>` that landed after the
   // boot-time check is a rollback; `ready` and the stop would undo it. Outside the try: this never throws,
   // and stepping aside is not a failed handoff (no `failed` marker, no exit(1) from the catch below).
   if (await rolledBack()) await aside();
   try {
-    await write({ status: "ready", sha: config.gitSha, at: Date.now() });
+    await write({ status: "ready", sha: config.gitSha, replacementId: ownContainerShortId(), at: Date.now() });
     // #160: restore the ORIGINAL's restart policy onto THIS container — BEFORE retire(originalId).
     // The standby was created with RestartPolicy:"no" precisely so Docker can never resurrect it
     // half-verified; that protection only stays safe if a policy-restored, genuinely-live bot
@@ -950,6 +1000,14 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
     // here: it follows probation, in completeTakeOver — #548, #490.)
     await restorePolicy();
     await retire(originalId);
+    // #507: the original is stopped and its drain awaited its last completed state write; this process's copy predates
+    // it. Adopt the file before the first write of this process's own (the clear below writes the marker, not the
+    // state, but activate()'s first save is minutes away at most). Best-effort: a failed reload keeps the snapshot.
+    await reload().catch((err) => console.warn("[handoff] state re-read failed; keeping the snapshot", err));
+    // #558: so a `docker start <name>` of the stopped original knows it was rolled back. Best-effort for the same reason.
+    await record().catch((err) =>
+      console.warn("[handoff] could not record the retirement; a rolled-back original will auto-update to this build again", err),
+    );
     await clear();
   } catch (err) {
     console.error(
@@ -968,6 +1026,7 @@ export async function takeOver(originalId: string, effects: TakeOverEffects = {}
       // promise this guard exists to keep from rejecting. No production site throws a non-Error,
       // but "crash-proof" has to hold unconditionally.
       error: `takeover failed: ${err instanceof Error ? err.message : String(err)}`,
+      replacementId: ownContainerShortId(),
       at: Date.now(),
     }).catch(() => {});
     exit(1);
@@ -987,6 +1046,8 @@ export interface CompleteTakeOverEffects {
   stepAsideDeps?: RollbackDeps;
   /** Whether this process is shutting down (`restart.ts`'s `isShuttingDown`, the default). */
   shuttingDown?: () => boolean;
+  /** #558: clears the `retiredBy` record once the original is gone (`clearRetirement`, the default). */
+  clearRetirement?: () => Promise<void>;
 }
 
 /**
@@ -1025,6 +1086,10 @@ export interface CompleteTakeOverEffects {
  * corpse holding the canonical name, so the rename fails too and this bot stays `<name>-next` until a
  * later boot retries — #547 adds the normal-boot heal. An original that is already gone (404)
  * is the healthy case of a swap whose removal already happened: tag, nothing to remove or rename.
+ *
+ * The `retiredBy` record `takeOver` wrote (#558) is cleared once the removal returns (a removed original, or one
+ * already gone): from then on no rollback to it is possible. It is kept while the corpse stays (a failed removal)
+ * and on the step-aside paths, since `docker start <name>` is still possible there.
  */
 export async function completeTakeOver(originalId: string, effects: CompleteTakeOverEffects = {}): Promise<void> {
   const inspect = effects.inspect ?? tryInspectContainer;
@@ -1033,6 +1098,7 @@ export async function completeTakeOver(originalId: string, effects: CompleteTake
   const rename = effects.rename ?? takeName;
   const aside = effects.stepAside ?? (() => stepAside(effects.stepAsideDeps));
   const shuttingDown = effects.shuttingDown ?? isShuttingDown;
+  const clearRetired = effects.clearRetirement ?? clearRetirement;
   const leaveForALaterBoot = () =>
     console.log("[handoff] this process is shutting down — leaving the stopped original for a later boot to remove");
   // Read first: whether the operator rolled back, and the original's name — which cannot be read once the
@@ -1070,6 +1136,11 @@ export async function completeTakeOver(originalId: string, effects: CompleteTake
     // forced removal would kill and delete an original the operator started in that gap; Docker refuses
     // (409) to remove a running container without force, which lands in the warning below instead.
     await remove(originalId);
+    // #558: the original is gone, so no `docker start <name>` can bring it back and the record has nothing left to
+    // protect. One clear, on the one path a successful removal and an already-gone original (`remove` of an absent
+    // id resolves) both take; not in the catch below (the corpse stays, a rollback is still possible), not on the
+    // step-aside paths.
+    await clearRetired().catch((err) => console.warn("[handoff] could not clear the retirement record", err));
   } catch (err) {
     // An explicit stop is exempt from `unless-stopped`, so the corpse stays down; it merely still holds
     // the canonical name, which the rename below treats as non-fatal.

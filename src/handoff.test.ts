@@ -5,6 +5,7 @@ import {
   handoffFailureMessage,
   HANDOFF_DEADLINE_MS,
   HANDOFF_FROM_ENV,
+  ownContainerShortId,
   RETIREMENT_DEADLINE_MS,
   VERIFY_DEADLINE_MS,
   type HandoffMarker,
@@ -20,8 +21,35 @@ const running: ReplacementState = { running: true, status: "running", exitCode: 
 const exited: ReplacementState = { running: false, status: "exited", exitCode: 1 };
 const created: ReplacementState = { running: false, status: "created", exitCode: 0 };
 
+describe("ownContainerShortId (#506 item 10)", () => {
+  test("Docker's 12-hex short id, as the hostname, is the container's id", () => {
+    expect(ownContainerShortId({ HOSTNAME: "0123456789ab" })).toBe("0123456789ab");
+  });
+
+  // Mutation: returning env.HOSTNAME unconditionally would stamp a pinned name on every marker, and the original
+  // would then take every marker the replacement writes for a stranger's.
+  test("a hostname pinned in compose, an uppercase or too-long id, an empty one, or none at all is not an id", () => {
+    expect(ownContainerShortId({ HOSTNAME: "my-pinned-host" })).toBeUndefined();
+    expect(ownContainerShortId({ HOSTNAME: "0123456789AB" })).toBeUndefined();
+    expect(ownContainerShortId({ HOSTNAME: "0123456789abc" })).toBeUndefined();
+    expect(ownContainerShortId({ HOSTNAME: "" })).toBeUndefined();
+    expect(ownContainerShortId({})).toBeUndefined();
+  });
+
+  test("reads process.env by default", () => {
+    const before = process.env.HOSTNAME;
+    process.env.HOSTNAME = "fedcba987654";
+    try {
+      expect(ownContainerShortId()).toBe("fedcba987654");
+    } finally {
+      if (before === undefined) delete process.env.HOSTNAME;
+      else process.env.HOSTNAME = before;
+    }
+  });
+});
+
 describe("bootMode", () => {
-  test("HANDOFF_FROM is the whole instruction to boot in standby", () => {
+  test("HANDOFF_FROM is the raw standby instruction (resolveBootMode confirms it against the daemon, #46)", () => {
     expect(bootMode({ [HANDOFF_FROM_ENV]: "abc123" })).toBe("standby");
   });
 
