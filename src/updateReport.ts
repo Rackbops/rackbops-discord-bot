@@ -26,18 +26,21 @@ export type UpdateOutcome =
   | "updated"
   /** Came back on the sha we left on — the image was never rebuilt. */
   | "noop"
-  /** Came back on the sha we left on because the process restarted before the new build took over, or the swap was rolled back (#450). */
+  /** Came back on the sha we left on because the process restarted before the new build took over (#450). */
   | "interrupted"
+  /** Came back on the sha we left on because the update landed and the operator rolled it back (#558). */
+  | "rolled-back"
   /** Came back on some third sha — neither the build we left nor the one we were picking up (someone deployed in between, or an automatic update landed). */
   | "unexpected"
   /** Came back without a GIT_SHA baked in — nothing to compare. */
   | "unknown";
 
-/** `report.interrupted` is the boot's verdict on the swap record (`resolveUpdateAttempt`, #450), saved with the report. */
+/** `report.rolledBack` and `report.interrupted` are boots' verdicts (`resolveUpdateAttempt`, #558 and #450), saved with
+ *  the report; a rollback wins, since a rolled-back swap did land first. */
 export function decideUpdateOutcome(o: { report: PendingUpdateReport; runningSha?: string }): UpdateOutcome {
   if (!o.runningSha) return "unknown";
   if (sameSha(o.runningSha, o.report.toSha)) return "updated";
-  if (sameSha(o.runningSha, o.report.fromSha)) return o.report.interrupted ? "interrupted" : "noop";
+  if (sameSha(o.runningSha, o.report.fromSha)) return o.report.rolledBack ? "rolled-back" : o.report.interrupted ? "interrupted" : "noop";
   return "unexpected";
 }
 
@@ -60,8 +63,13 @@ export function updateOutcomeMessage(
     case "interrupted":
       return (
         `⚠️ Back up on \`${now}\` — the update to \`${short(report.toSha)}\` did not take: this process is back on ` +
-        "the build it left on (it restarted before the new build had taken over, or the swap was rolled back). " +
+        "the build it left on (it restarted before the new build had taken over). " +
         `Run /${prefixedName(config.commandPrefix, "update")} again.`
+      );
+    case "rolled-back":
+      return (
+        `⚠️ Back up on \`${now}\` — the update to \`${short(report.toSha)}\` landed and was then rolled back (the new build was stopped and this one started again). ` +
+        `Automatic updates skip \`${short(report.toSha)}\` until a newer commit lands; run /${prefixedName(config.commandPrefix, "update")} to apply it anyway.`
       );
     case "unexpected":
       return (

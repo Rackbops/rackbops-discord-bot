@@ -229,6 +229,9 @@ describe("index.ts wiring", () => {
       expect(timerBlock).toContain("}, VERIFY_DEADLINE_MS)");
       expect(timerBlock).toContain("await writeMarker({"); // awaited: the exit must not race the marker write
       expect(timerBlock).toContain('status: "failed"');
+      // #506 item 10: the marker names the container that wrote it, so the original can tell this attempt's
+      // replacement from a survivor of an earlier one (index.ts does not run under test; the write is pinned here).
+      expect(timerBlock).toContain("replacementId: ownContainerShortId(),");
       expect(timerBlock).toContain("process.exit(1);");
       expect(source).toMatch(/import \{[^}]*\bbootMode\b[^}]*\} from "\.\/handoff";/);
     });

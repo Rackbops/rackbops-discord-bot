@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ContainerInspect, ImageSummary } from "./docker";
 import type { HandoffMarker } from "./handoff";
 
@@ -18,6 +20,7 @@ const {
   healOwnName,
   imageRepo,
   latestTag,
+  markerFor,
   ownName,
   probeReplacement,
   redeploy,
@@ -28,12 +31,14 @@ const {
   shaTag,
   stepAside,
   STEP_ASIDE_GRACE_MS,
-  takeOver,
+  takeOver: realTakeOver,
 } = await import("./redeploy");
 const { clearMarker, readMarker, writeMarker, HANDOFF_FROM_ENV, HANDOFF_RESTART_POLICY_ENV, HANDOFF_RESTART_RETRIES_ENV } =
   await import("./handoff");
 const { beginShutdown, handoffActive, onBeforeExit, restartPending, resetForTest } = await import("./restart");
-const { SHORT_SHA_LEN } = await import("./storage");
+const { SHORT_SHA_LEN, DATA_DIR } = await import("./storage");
+const { config } = await import("./config");
+const { resetBotStateForTest, saveState, state: botState } = await import("./state");
 
 const SELF_ID = "a".repeat(64);
 const SELF_SHORT_ID = SELF_ID.slice(0, 12);
@@ -62,6 +67,13 @@ const SELF: ContainerInspect = {
   // is this SPECIFIC container's own identity and must not be carried onto a different one.
   NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", SELF_SHORT_ID] } } },
 };
+
+/** #507/#558: `takeOver`'s default `reload` and `recordRetirement` read and write the test dir's real `state.json`, which
+ *  src/dataIsolation.test.ts leaves a probe id in, and fail the test-state guard in eight of the existing tests. Every
+ *  `takeOver` call in this file stubs both as no-ops unless the test passes its own; the one test that wants the real
+ *  ones calls `realTakeOver`. */
+const NO_STATE = { reload: async () => {}, recordRetirement: async () => {} };
+const takeOver: typeof realTakeOver = (originalId, effects = {}) => realTakeOver(originalId, { ...NO_STATE, ...effects });
 
 /** Polls `done` until it holds (at most `ms`), so a slow runner delays a test that waits on an un-awaited call
  *  instead of failing it. */
@@ -753,6 +765,212 @@ describe("takeOver", () => {
     });
     expect(exits).toEqual([1]);
   });
+
+  // R1 (#507, #558): the state re-read and the retirement record come AFTER the stop (the original's last write is in
+  // the file only once it is down) and BEFORE the marker is cleared; the record is written from the reloaded file.
+  test("R1: ready, restore, retire, then the state re-read, then the retirement record, then the marker clear", async () => {
+    const calls: string[] = [];
+    await takeOver(ID, {
+      write: async (m) => void calls.push(`write:${m.status}`),
+      restorePolicy: async () => void calls.push("restore"),
+      retire: async () => void calls.push("retire"),
+      reload: async () => void calls.push("reload"),
+      recordRetirement: async () => void calls.push("recordRetirement"),
+      clear: async () => void calls.push("clear"),
+      exit: () => void calls.push("exit"),
+    });
+    expect(calls).toEqual(["write:ready", "restore", "retire", "reload", "recordRetirement", "clear"]);
+  });
+
+  // R2: the original IS stopped by then, and the catch below says it was not, so neither step may reach it.
+  test("R2: a rejecting state re-read or retirement record is logged and the takeover still completes: no failed marker, no exit", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const failing of ["reload", "recordRetirement"] as const) {
+        const calls: string[] = [];
+        const writes: string[] = [];
+        const exits: number[] = [];
+        await takeOver(ID, {
+          write: async (m) => void writes.push(m.status),
+          restorePolicy: async () => {},
+          retire: async () => void calls.push("retire"),
+          reload: async () => {
+            calls.push("reload");
+            if (failing === "reload") throw new Error("disk gone");
+          },
+          recordRetirement: async () => {
+            calls.push("recordRetirement");
+            if (failing === "recordRetirement") throw new Error("disk full");
+          },
+          clear: async () => void calls.push("clear"),
+          exit: (code) => void exits.push(code),
+        });
+        expect({ failing, calls }).toEqual({ failing, calls: ["retire", "reload", "recordRetirement", "clear"] });
+        expect(writes).toEqual(["ready"]);
+        expect(exits).toEqual([]);
+      }
+      const said = warn.mock.calls.map((c) => String(c[0]));
+      expect(said.some((m) => m.includes("state re-read failed"))).toBe(true);
+      expect(said.some((m) => m.includes("could not record the retirement"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  // R6 (#506 item 10): the markers this process writes name the container that wrote them -- but only when HOSTNAME
+  // is Docker's 12-hex short id; a pinned name is not an id, so the marker then carries none (and is accepted as an
+  // older standby's is).
+  test("R6: the ready write and the catch's failed write carry the container's short id, and carry none for a pinned hostname", async () => {
+    const before = process.env.HOSTNAME;
+    try {
+      for (const [host, expected] of [
+        ["0123456789ab", "0123456789ab"],
+        ["my-pinned-host", undefined],
+      ] as const) {
+        process.env.HOSTNAME = host;
+        const writes: HandoffMarker[] = [];
+        await takeOver(ID, {
+          write: async (m) => void writes.push(m),
+          restorePolicy: async () => {
+            throw new Error("daemon: update rejected");
+          },
+          retire: async () => {},
+          exit: () => {},
+        });
+        expect(writes.map((m) => [m.status, m.replacementId])).toEqual([
+          ["ready", expected],
+          ["failed", expected],
+        ]);
+      }
+    } finally {
+      if (before === undefined) delete process.env.HOSTNAME;
+      else process.env.HOSTNAME = before;
+    }
+  });
+});
+
+// R3 (#507, #558): the two new effects through their DEFAULTS, against the test dir's real state.json, which is seeded on
+// DISK so that the re-read is what brings the original's swap record into memory. Restores the file, `state` and
+// `config.gitSha`: a polluted file would fail the next test's reload (src/dataIsolation.test.ts leaves a probe id in it).
+describe("takeOver — the default state re-read and retirement record (#507, #558)", () => {
+  const FILE = join(DATA_DIR, "state.json");
+  const OLD = "a".repeat(40);
+  const NEW = "b".repeat(40);
+  let prior: string | undefined;
+  const realGitSha = config.gitSha;
+
+  beforeEach(() => {
+    prior = existsSync(FILE) ? readFileSync(FILE, "utf8") : undefined;
+  });
+  afterEach(() => {
+    config.gitSha = realGitSha;
+    resetBotStateForTest();
+    if (prior === undefined) rmSync(FILE, { force: true });
+    else writeFileSync(FILE, prior);
+  });
+
+  test("R3: the reload brings the original's swap record in from disk and the record is written, in memory and on disk", async () => {
+    writeFileSync(FILE, JSON.stringify({ seenReleaseIds: { "a/b": [1, 2, 3] }, swapInFlight: { fromSha: OLD, toSha: NEW, startedAt: 1 } }));
+    expect(botState.swapInFlight).toBeUndefined(); // the snapshot this process loaded at start does not have it
+    config.gitSha = NEW;
+    const order: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await realTakeOver("b".repeat(64), {
+        write: async () => void order.push("write"),
+        restorePolicy: async () => void order.push("restore"),
+        retire: async () => void order.push("retire"),
+        clear: async () => void order.push("clear"),
+        rolledBack: async () => false,
+        exit: () => {},
+      });
+    } finally {
+      log.mockRestore();
+    }
+    expect(order).toEqual(["write", "restore", "retire", "clear"]);
+    expect(botState.seenReleaseIds["a/b"]).toEqual([1, 2, 3]);
+    expect(botState.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    const disk = JSON.parse(readFileSync(FILE, "utf8"));
+    expect(disk.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    expect(disk.seenReleaseIds["a/b"]).toEqual([1, 2, 3]);
+  });
+
+  // Mutation (M9c): completeTakeOver's default `clearRetirement` replaced by a no-op -- every R4 test injects its own.
+  test("R4: completeTakeOver's DEFAULT clear removes the record from memory and from disk", async () => {
+    const ORIGINAL = "f".repeat(64);
+    botState.retiredBy = { sha: NEW, originalSha: OLD, at: 1 };
+    await saveState();
+    expect(JSON.parse(readFileSync(FILE, "utf8")).retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 1 });
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await completeTakeOver(ORIGINAL, {
+        inspect: async () => ({ ...SELF, Id: ORIGINAL, Name: "/warbandeer-discord", State: { Running: false, Status: "exited", ExitCode: 0 } }),
+        tagLatest: async () => {},
+        remove: async () => {},
+        rename: async () => {},
+        stepAside: async () => Promise.reject(new Error("must not step aside")),
+      });
+    } finally {
+      log.mockRestore();
+    }
+    expect(botState.retiredBy).toBeUndefined();
+    expect("retiredBy" in JSON.parse(readFileSync(FILE, "utf8"))).toBe(false);
+  });
+});
+
+// R5 (#506 item 10): the original ignores a marker another container wrote. `markerFor` is the filter; the four reads of
+// `redeploy()` go through it (tested in "redeploy — cleanup always runs" below).
+describe("markerFor (#506 item 10)", () => {
+  const ID = "c".repeat(64);
+  const OWN = ID.slice(0, 12);
+  const FOREIGN = "d".repeat(12);
+  const marker = (replacementId?: string): HandoffMarker => ({ status: "ready", sha: "abcdef1", replacementId, at: 0 });
+  const quiet = () => {
+    const warns: string[] = [];
+    return { warns, log: { warn: (...a: unknown[]) => void warns.push(a.map(String).join(" ")) } };
+  };
+
+  test("no marker is no marker", () => {
+    expect(markerFor(undefined, ID, new Set(), quiet().log)).toBeUndefined();
+  });
+
+  // Mutation: ignoring a marker with no id would drop an older standby's every marker.
+  test("a marker with no id is accepted as before: an older standby wrote it", () => {
+    const m = marker(undefined);
+    const q = quiet();
+    expect(markerFor(m, ID, new Set(), q.log)).toBe(m);
+    expect(q.warns).toEqual([]);
+  });
+
+  // Mutation: dropping the 12-hex test would treat a pinned name as another container and ignore every marker.
+  test("an id that is not a 12-hex short id (a pinned hostname) is accepted", () => {
+    for (const id of ["my-pinned-host", "0123456789AB", "0123456789abc", "0123456789a"]) {
+      const m = marker(id);
+      expect({ id, kept: markerFor(m, ID, new Set(), quiet().log) === m }).toEqual({ id, kept: true });
+    }
+  });
+
+  test("this attempt's own short id (a prefix of the id the create returned) is accepted", () => {
+    const m = marker(OWN);
+    const q = quiet();
+    expect(markerFor(m, ID, new Set(), q.log)).toBe(m);
+    expect(q.warns).toEqual([]);
+  });
+
+  // Mutation: dropping the prefix check honours every marker (a survivor's ready is taken for this attempt's).
+  test("another container's 12-hex id is ignored, with one warn naming both, however often it is read", () => {
+    const q = quiet();
+    const warned = new Set<string>();
+    expect(markerFor(marker(FOREIGN), ID, warned, q.log)).toBeUndefined();
+    expect(markerFor(marker(FOREIGN), ID, warned, q.log)).toBeUndefined();
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain(FOREIGN);
+    expect(q.warns[0]).toContain(OWN);
+    expect(q.warns[0]).toContain("ready");
+    // a second foreign id is a second line
+    expect(markerFor(marker("e".repeat(12)), ID, warned, q.log)).toBeUndefined();
+    expect(q.warns).toHaveLength(2);
+  });
 });
 
 // #160's actual guard against the permanent-outage hazard: the effects-injection tests above only
@@ -1320,6 +1538,78 @@ describe("completeTakeOver", () => {
     await completeTakeOver(ORIGINAL, effects(order, { inspect: async () => (order.push("inspect"), undefined) }));
     expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:plain`]);
     expect(logged.warn).toEqual([]);
+  });
+
+  // R4 (#558): the retirement record is cleared ONCE, when the original is gone for good -- after the removal returns,
+  // on the one path a removed original and an already-gone one both take -- and kept while a rollback is possible.
+  describe("the retirement record (#558)", () => {
+    const withClear = (order: string[], o: Record<string, unknown> = {}) =>
+      effects(order, { clearRetirement: async () => void order.push("clearRetirement"), ...o });
+
+    test("R4: cleared once, right after a successful removal and before the rename", async () => {
+      const order: string[] = [];
+      await completeTakeOver(ORIGINAL, withClear(order));
+      expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:plain`, "clearRetirement", "rename:warbandeer-discord"]);
+    });
+
+    test("R4: an original that is already gone clears it exactly once", async () => {
+      const order: string[] = [];
+      await completeTakeOver(ORIGINAL, withClear(order, { inspect: async () => (order.push("inspect"), undefined) }));
+      expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:plain`, "clearRetirement"]);
+    });
+
+    test("R4: a removal that fails keeps it (the corpse stays, a rollback is still possible)", async () => {
+      const order: string[] = [];
+      await completeTakeOver(
+        ORIGINAL,
+        withClear(order, {
+          remove: async () => {
+            order.push("remove");
+            throw new Error("rm refused");
+          },
+        }),
+      );
+      expect(order).toEqual(["inspect", "tag", "remove", "inspect", "rename:warbandeer-discord"]);
+    });
+
+    test("R4: the step-aside paths keep it", async () => {
+      const running = { ...corpse, State: { Running: true, Status: "running", ExitCode: 0 } };
+      const first: string[] = [];
+      await expect(completeTakeOver(ORIGINAL, withClear(first, { inspect: async () => (first.push("inspect"), running) }))).rejects.toBe(asideSentinel);
+      expect(first).toEqual(["inspect", "aside"]);
+
+      // ...and a removal refused because the operator started the original in the meantime.
+      const second: string[] = [];
+      let inspects = 0;
+      await expect(
+        completeTakeOver(
+          ORIGINAL,
+          withClear(second, {
+            inspect: async () => (second.push("inspect"), ++inspects === 1 ? corpse : running),
+            remove: async () => {
+              second.push("remove");
+              throw new Error("409 conflict");
+            },
+          }),
+        ),
+      ).rejects.toBe(asideSentinel);
+      expect(second).toEqual(["inspect", "tag", "remove", "inspect", "aside"]);
+    });
+
+    test("R4: a record that cannot be cleared is only logged: the rename still happens", async () => {
+      const order: string[] = [];
+      await completeTakeOver(
+        ORIGINAL,
+        withClear(order, {
+          clearRetirement: async () => {
+            order.push("clearRetirement");
+            throw new Error("disk full");
+          },
+        }),
+      );
+      expect(order).toEqual(["inspect", "tag", `remove:${ORIGINAL}:plain`, "clearRetirement", "rename:warbandeer-discord"]);
+      expect(logged.warn.some((m) => m.includes("could not clear the retirement record") && m.includes("disk full"))).toBe(true);
+    });
   });
 });
 
@@ -3223,6 +3513,183 @@ describe("redeploy — cleanup always runs", () => {
       expect((await redeploy("1".repeat(40))).replacement).toBe("removed");
       stubDaemon({ pollReplacement: exited, removeReplacement: () => new Response("", { status: 404 }) });
       expect((await redeploy("2".repeat(40))).replacement).toBe("none");
+    });
+  });
+
+  // R5 (#506 item 10): the four places `redeploy()` reads the marker -- the poll, the late re-read, the final read and the
+  // retirement wait -- take a marker another container wrote (a surviving earlier replacement) for nobody's verdict.
+  describe("a marker another container wrote is not this attempt's verdict (#506 item 10)", () => {
+    const OWN = REPLACEMENT_ID.slice(0, 12);
+    const FOREIGN = "d".repeat(12);
+    const SHA = "abcdef1234567890";
+    const marker = (status: HandoffMarker["status"], replacementId?: string, extra: Partial<HandoffMarker> = {}): HandoffMarker => ({
+      status,
+      sha: SHA,
+      replacementId,
+      at: Date.now(),
+      ...extra,
+    });
+    const quietDaemon = (extra: Partial<Parameters<typeof stubDaemon>[0]> = {}) =>
+      stubDaemon({ pollReplacement: () => jsonRes(SELF), removeReplacement: () => new Response("", { status: 204 }), ...extra });
+    let warn: ReturnType<typeof spyOn>;
+    let log: ReturnType<typeof spyOn>;
+    beforeEach(() => {
+      warn = spyOn(console, "warn").mockImplementation(() => {});
+      log = spyOn(console, "log").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      warn.mockRestore();
+      log.mockRestore();
+    });
+    const ignored = () => warn.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("ignoring a "));
+    const logged = (): string[] => log.mock.calls.map((c: unknown[]) => String(c[0]));
+
+    // Mutation: the poll's read unfiltered honours the foreign ready (outcome `stalled`); the warn latch not consulted
+    // says the line on every poll.
+    test("the poll keeps waiting past a foreign ready to its deadline, and says so once across every read", async () => {
+      quietDaemon();
+      const result = await redeploy("a".repeat(40), {
+        handoffDeadlineMs: 60,
+        pollMs: 15,
+        readMarker: async () => marker("ready", FOREIGN),
+      });
+      expect(result.outcome).toBe("timeout");
+      expect(result.error).toBeUndefined();
+      expect(ignored()).toHaveLength(1);
+      expect(ignored()[0]).toContain(FOREIGN);
+      expect(ignored()[0]).toContain(OWN);
+    });
+
+    // Mutation: the late re-read unfiltered turns the timeout into `ready` and a retirement wait.
+    test("the late re-read ignores a foreign ready", async () => {
+      quietDaemon();
+      let reads = 0;
+      const result = await redeploy("a".repeat(40), {
+        handoffDeadlineMs: 0,
+        deadlineMs: 60,
+        pollMs: 15,
+        readMarker: async () => (++reads === 2 ? marker("ready", FOREIGN) : undefined),
+      });
+      expect(result.outcome).toBe("timeout");
+      expect(ignored()).toHaveLength(1);
+    });
+
+    // Mutation: the final read unfiltered carries a foreign failed's text into the result (`pollError ?? marker?.error`).
+    test("the final read ignores a foreign failed: its text is not carried into the result", async () => {
+      quietDaemon();
+      let reads = 0;
+      const result = await redeploy("a".repeat(40), {
+        handoffDeadlineMs: 0,
+        pollMs: 15,
+        readMarker: async () => (++reads === 3 ? marker("failed", FOREIGN, { error: "foreign boom" }) : undefined),
+      });
+      expect(result.outcome).toBe("timeout");
+      expect(result.error).toBeUndefined();
+      expect(ignored()).toHaveLength(1);
+    });
+
+    // Mutation: the retirement wait reading the file marker unfiltered ends in `failed`.
+    test("the retirement wait ignores a foreign failed and stalls at its deadline", async () => {
+      quietDaemon({ afterStart: () => writeMarker(marker("failed", FOREIGN, { error: "foreign boom" })) });
+      const result = await redeploy("a".repeat(40), {
+        deadlineMs: 60,
+        pollMs: 15,
+        readMarker: async () => marker("ready", OWN),
+      });
+      expect(result.outcome).toBe("stalled");
+      expect(ignored()).toHaveLength(1);
+    });
+
+    // The same four reads with this attempt's own id, no id, and a pinned hostname behave as they did before.
+    test("a marker with this attempt's own id, with no id, or with a pinned hostname is honoured at all four reads", async () => {
+      for (const id of [OWN, undefined, "my-pinned-host"]) {
+        // the poll's read: ready -> the retirement wait, which stalls on a quiet file
+        quietDaemon();
+        const poll = await redeploy("a".repeat(40), { deadlineMs: 40, pollMs: 15, readMarker: async () => marker("ready", id) });
+        expect({ id, where: "poll", outcome: poll.outcome }).toEqual({ id, where: "poll", outcome: "stalled" });
+
+        // the late re-read: the poll decided timeout, the replacement had said ready meanwhile
+        quietDaemon();
+        let lateReads = 0;
+        const late = await redeploy("a".repeat(40), {
+          handoffDeadlineMs: 0,
+          deadlineMs: 40,
+          pollMs: 15,
+          readMarker: async () => (++lateReads === 2 ? marker("ready", id) : undefined),
+        });
+        expect({ id, where: "late", outcome: late.outcome }).toEqual({ id, where: "late", outcome: "stalled" });
+
+        // the final read: its own reason surfaces
+        quietDaemon();
+        let finalReads = 0;
+        const final = await redeploy("a".repeat(40), {
+          handoffDeadlineMs: 0,
+          pollMs: 15,
+          readMarker: async () => (++finalReads === 3 ? marker("failed", id, { error: "own boom" }) : undefined),
+        });
+        expect({ id, where: "final", error: final.error }).toEqual({ id, where: "final", error: "own boom" });
+
+        // the retirement wait: its failed ends it at once
+        quietDaemon({ afterStart: () => writeMarker(marker("failed", id, { error: "own boom" })) });
+        const wait = await redeploy("a".repeat(40), { deadlineMs: 400, pollMs: 15, readMarker: async () => marker("ready", id) });
+        expect({ id, where: "wait", outcome: wait.outcome }).toEqual({ id, where: "wait", outcome: "failed" });
+      }
+      expect(ignored()).toEqual([]);
+    });
+
+    // Mutation: `retirement wait` not given the shared set -- the same foreign id seen in the poll and again in the wait
+    // would be said twice in one attempt.
+    test("one foreign id is said once across the poll and the retirement wait", async () => {
+      quietDaemon({ afterStart: () => writeMarker(marker("failed", FOREIGN, { error: "foreign boom" })) });
+      let reads = 0;
+      const result = await redeploy("a".repeat(40), {
+        deadlineMs: 60,
+        pollMs: 15,
+        readMarker: async () => (++reads === 1 ? marker("ready", FOREIGN) : marker("ready", OWN)),
+      });
+      expect(result.outcome).toBe("stalled"); // the foreign ready was ignored once, the own ready decided, the foreign failed was ignored
+      expect(ignored()).toHaveLength(1);
+    });
+
+    // A marker is JSON on a shared volume: a `ready` whose sha is not a string must not turn a verified handoff into a
+    // failure (the log line asked for the sha's first characters).
+    test("a ready marker whose sha is not a string is still the verdict", async () => {
+      quietDaemon();
+      const result = await redeploy("a".repeat(40), {
+        deadlineMs: 20,
+        pollMs: 15,
+        readMarker: async () => marker("ready", OWN, { sha: 12345 as unknown as string }),
+      });
+      expect(result.outcome).toBe("stalled");
+      expect(logged().filter((m) => m.startsWith("[redeploy] replacement verified"))).toEqual(["[redeploy] replacement verified — handing over"]);
+    });
+
+    // Mutation: dropping the sha from the line; reading it from the wrong marker (the poll's, never the late re-read's).
+    test("the verified line names the sha of the ready marker that decided it, whichever read saw it", async () => {
+      const verified = () => logged().filter((m) => m.startsWith("[redeploy] replacement verified"));
+      quietDaemon();
+      await redeploy("a".repeat(40), { deadlineMs: 20, pollMs: 15, readMarker: async () => marker("ready", OWN) });
+      expect(verified()).toEqual([`[redeploy] replacement verified (${SHA.slice(0, SHORT_SHA_LEN)}) — handing over`]);
+
+      log.mockClear();
+      quietDaemon();
+      let reads = 0;
+      await redeploy("a".repeat(40), {
+        handoffDeadlineMs: 0,
+        deadlineMs: 20,
+        pollMs: 15,
+        readMarker: async () => (++reads === 2 ? marker("ready", OWN) : undefined),
+      });
+      expect(verified()).toEqual([`[redeploy] replacement verified (${SHA.slice(0, SHORT_SHA_LEN)}) — handing over`]);
+
+      log.mockClear();
+      quietDaemon();
+      await redeploy("a".repeat(40), {
+        deadlineMs: 20,
+        pollMs: 15,
+        readMarker: async () => marker("ready", OWN, { sha: undefined }),
+      });
+      expect(verified()).toEqual(["[redeploy] replacement verified — handing over"]);
     });
   });
 });

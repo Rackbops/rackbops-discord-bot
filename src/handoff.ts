@@ -5,15 +5,17 @@
 // one — once it has proved itself — does all the retiring.
 //
 // The signal is a marker file in the shared `state:/app/data` volume both containers already
-// mount. Deliberately its own file, never `state.json`: exactly one process writes it (the
-// replacement, which also clears it in `takeOver`); the original reads it and clears it
-// (`redeploy.ts`), never writes it — so the file that actually matters is never touched by two
-// writers at once.
+// mount. Deliberately its own file, never `state.json`: the replacement writes it, from two sites
+// (the verify timer gives up; `takeOver` signals `ready`, or `failed` from its catch), and each
+// marker names the container that wrote it (by its 12-hex short id, when it has one); the original
+// reads it and ignores one another container wrote (#506); it is cleared by the original before it creates the replacement and
+// after a failed attempt, and by the replacement in `takeOver`. One writer in the normal case; a
+// surviving earlier replacement's writes are ignored, not prevented.
 
 import { join } from "node:path";
 import { DATA_DIR, shortSha } from "./storage";
 
-/** Set on the replacement only. Its presence *is* the instruction to boot in standby. */
+/** Set on the replacement only, and never cleared from its env. Its presence is the RAW standby instruction: necessary, not sufficient — `resolveBootMode` (redeploy.ts) confirms it against the daemon, since a swapped-in container restarts with it set forever (#46). */
 export const HANDOFF_FROM_ENV = "HANDOFF_FROM";
 
 /** Set on the replacement only, alongside {@link HANDOFF_FROM_ENV}: the ORIGINAL's restart-policy
@@ -64,7 +66,16 @@ export interface HandoffMarker {
   sha?: string;
   /** Why it gave up, when `failed`. */
   error?: string;
-  at: number;
+  /** The writer's own container id (its hostname, the 12-hex form), so the original can tell this attempt's replacement from a survivor of an earlier one (#506). Absent from a marker an older standby wrote, and from one written where HOSTNAME is not Docker's short id. */
+  replacementId?: string;
+  at: number; // when it was written; informational
+}
+
+/** This container's 12-hex short id when Docker set it as the hostname, else undefined (a `hostname:` pinned in compose,
+ *  an env-level HOSTNAME=, or no container at all) -- the same test `docker.ts`'s self-inspect applies. */
+export function ownContainerShortId(env: Record<string, string | undefined> = process.env): string | undefined {
+  const host = env.HOSTNAME;
+  return host !== undefined && /^[0-9a-f]{12}$/.test(host) ? host : undefined;
 }
 
 /**
@@ -72,6 +83,9 @@ export interface HandoffMarker {
  * standby — connected enough to verify itself, not yet answering — because both instances
  * hold the same `DISCORD_TOKEN`, and Discord delivers every event to both sessions. A
  * standby that registered handlers would double every command reply for the overlap.
+ *
+ * This is the RAW check, on the env alone: necessary, not sufficient — `resolveBootMode` (redeploy.ts) confirms it
+ * against the daemon, since a swapped-in container restarts with `HANDOFF_FROM` set forever (#46).
  */
 export function bootMode(env: Record<string, string | undefined>): "standby" | "normal" {
   return env[HANDOFF_FROM_ENV] ? "standby" : "normal";

@@ -14,10 +14,13 @@ import { DATA_DIR } from "./storage";
 const {
   botStateForTest,
   capSeenReleaseIds,
+  clearRetirement,
   createStateWriter,
   isRawBotState,
   loadStateFrom,
   normalizeSeenReleaseIds,
+  recordRetirement,
+  reloadState,
   resetBotStateForTest,
   resetStateWriterForTest,
   saveState,
@@ -325,5 +328,223 @@ describe("loadStateFrom / saveStateTo / createStateWriter", () => {
     const parsed = JSON.parse(readFileSync(file, "utf8"));
     expect(parsed.seenReleaseIds["nazumods/wow"]).toBeArray();
     expect(parsed.seenReleaseIds["nazumods/wow"].length).toBe(1);
+  });
+});
+
+// #507, #558: the replacement's re-read of the shared file and the record of who retired whom. These touch the real
+// test-dir state.json (the file `reloadState` reads), so each test restores its prior bytes -- or absence -- and the
+// shared `state` keys: restoring only the keys would leave a polluted file for the next reload.
+describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => {
+  const FILE = join(DATA_DIR, "state.json");
+  const OLD = "a".repeat(40);
+  const NEW = "b".repeat(40);
+  let prior: string | undefined;
+  const quiet = () => {
+    const warns: string[] = [];
+    const logs: string[] = [];
+    return {
+      warns,
+      logs,
+      log: {
+        warn: (...a: unknown[]) => void warns.push(a.map(String).join(" ")),
+        log: (...a: unknown[]) => void logs.push(a.map(String).join(" ")),
+      },
+    };
+  };
+  const onDisk = () => JSON.parse(readFileSync(FILE, "utf8")) as Record<string, any>;
+  const corruptSiblings = () => readdirSync(DATA_DIR).filter((f) => f.startsWith("state.json.corrupt-"));
+
+  beforeEach(() => {
+    prior = existsSync(FILE) ? readFileSync(FILE, "utf8") : undefined;
+  });
+  afterEach(async () => {
+    await settled(botStateForTest().writes);
+    resetBotStateForTest();
+    for (const f of corruptSiblings()) rmSync(join(DATA_DIR, f), { force: true });
+    if (prior === undefined) rmSync(FILE, { force: true });
+    else writeFileSync(FILE, prior);
+  });
+
+  // Mutations: keeping memory when the file parses (never replacing it); leaving a key the file lacks behind. (The
+  // shared object keeps its identity because `state` is a const and the reload assigns into it.)
+  test("S1: re-reads the file into the shared object, in place: the longer id list, the new key, and a key the file lacks is gone", async () => {
+    state.seenReleaseIds["a/b"] = [1];
+    state.attemptedUpdateToSha = "z".repeat(40); // in memory only
+    writeFileSync(FILE, JSON.stringify({ seenReleaseIds: { "a/b": [1, 2, 3] }, retiredBy: { sha: NEW, originalSha: OLD, at: 5 } }));
+    const q = quiet();
+
+    expect(await reloadState(q.log)).toBe("reloaded");
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2, 3]);
+    expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
+    expect("attemptedUpdateToSha" in state).toBe(false);
+    expect(q.warns).toEqual([]);
+  });
+
+  // Mutation: dropping `normalizeSeenReleaseIds` from the reload -- a file an older single-repo bot last wrote would
+  // put a bare array where the per-repo map belongs, and the next release poll would throw on it.
+  test("S1b: a legacy single-repo id list in the file is filed under the configured repo, as at load", async () => {
+    writeFileSync(FILE, JSON.stringify({ seenReleaseIds: [4, 5, 6] }));
+    expect(await reloadState(quiet().log)).toBe("reloaded");
+    expect(state.seenReleaseIds).toEqual({ [config.githubRepo]: [4, 5, 6] });
+  });
+
+  // Mutation: replacing memory with an empty state when there is no file (or an unreadable one).
+  test("S2: no file keeps what is in memory and says so", async () => {
+    state.seenReleaseIds["a/b"] = [1, 2];
+    rmSync(FILE, { force: true });
+    const q = quiet();
+
+    expect(await reloadState(q.log)).toBe("kept");
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("absent");
+  });
+
+  // Mutation: letting a read error that is not corruption (EACCES, EIO) escape -- `reloadState` never throws, so a
+  // caller needs no catch of its own to keep the snapshot.
+  test("S2b: a read that fails (not corruption) keeps the snapshot and says so, and never throws", async () => {
+    state.seenReleaseIds["a/b"] = [1, 2];
+    writeFileSync(FILE, "{}");
+    const q = quiet();
+    const fail = failJsonRead(new Error("EIO: i/o error"));
+    try {
+      expect(await reloadState(q.log)).toBe("kept");
+    } finally {
+      fail.restore();
+    }
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("could not re-read");
+    expect(q.warns[0]).toContain("EIO");
+  });
+
+  test("S3: a file that will not parse is moved aside by readJsonOrFresh and the snapshot is kept", async () => {
+    state.seenReleaseIds["a/b"] = [1, 2];
+    writeFileSync(FILE, "{ not json");
+    const q = quiet();
+
+    expect(await reloadState(q.log)).toBe("kept");
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
+    expect(q.warns).toHaveLength(1);
+    expect(corruptSiblings()).toHaveLength(1); // the evidence outlives the replacement's next save
+    expect(existsSync(FILE)).toBe(false);
+  });
+
+  // Mutation: dropping the `isRawBotState` check assigns whatever parsed (here a number where the map belongs).
+  test("S3b: a file that parses but is not a state object is ignored and left on disk", async () => {
+    state.seenReleaseIds["a/b"] = [1, 2];
+    writeFileSync(FILE, '{"seenReleaseIds": 5}');
+    const q = quiet();
+
+    expect(await reloadState(q.log)).toBe("kept");
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("not a state object");
+    expect(readFileSync(FILE, "utf8")).toBe('{"seenReleaseIds": 5}');
+    expect(corruptSiblings()).toEqual([]);
+  });
+
+  // Mutations: reading `toSha` instead of `fromSha`; dropping the early return for a build already recorded (a write
+  // and a warn where there should be neither).
+  test("S4: recordRetirement writes who retired whom from the swap record, in memory and on disk", async () => {
+    state.swapInFlight = { fromSha: OLD, toSha: NEW, startedAt: 1 };
+    const q = quiet();
+
+    await recordRetirement(NEW, q.log);
+    expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    expect(onDisk().retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    expect(q.warns).toEqual([]);
+    expect(q.logs).toHaveLength(1);
+  });
+
+  test("S4: no swap record to read writes nothing and warns once, naming the AUTO_UPDATE advice", async () => {
+    const write = spyOn(Bun, "write");
+    const q = quiet();
+    try {
+      await recordRetirement(NEW, q.log);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.retiredBy).toBeUndefined();
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("no swap record");
+    expect(q.warns[0]).toContain("AUTO_UPDATE=false");
+  });
+
+  test("S4: a restart of the replacement that already recorded itself writes nothing and says nothing", async () => {
+    state.retiredBy = { sha: NEW, originalSha: OLD, at: 5 }; // no swap record: its first life resolved it as landed
+    const write = spyOn(Bun, "write");
+    const q = quiet();
+    try {
+      await recordRetirement(NEW, q.log);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
+    expect(q.warns).toEqual([]);
+    expect(q.logs).toEqual([]);
+  });
+
+  // Mutation: comparing only the build (the second conjunct dropped) keeps a leftover record that names an earlier
+  // original, and the rollback of THIS swap would then be read as stale and re-update.
+  test("S4: a leftover record for the same build but another original is rewritten from the swap record; the same original is not", async () => {
+    const OLDER = "c".repeat(40);
+    state.retiredBy = { sha: NEW, originalSha: OLDER, at: 5 };
+    state.swapInFlight = { fromSha: OLD, toSha: NEW, startedAt: 1 };
+    const q = quiet();
+    await recordRetirement(NEW, q.log);
+    expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    expect(state.retiredBy!.at).not.toBe(5);
+    expect(onDisk().retiredBy.originalSha).toBe(OLD);
+
+    // the same original (this replacement died in probation before it resolved the record): nothing to do
+    const mine = { sha: NEW, originalSha: OLD, at: 7 };
+    state.retiredBy = mine;
+    const write = spyOn(Bun, "write");
+    const again = quiet();
+    try {
+      await recordRetirement(NEW, again.log);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.retiredBy).toBe(mine);
+    expect(again.warns).toEqual([]);
+    expect(again.logs).toEqual([]);
+  });
+
+  test("S4: a build with no GIT_SHA records nothing and says why", async () => {
+    state.swapInFlight = { fromSha: OLD, toSha: NEW, startedAt: 1 };
+    const write = spyOn(Bun, "write");
+    const q = quiet();
+    try {
+      await recordRetirement(undefined, q.log);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.retiredBy).toBeUndefined();
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("no GIT_SHA");
+  });
+
+  // Mutation: clearRetirement not saving -- the record had to be on disk first for the check to mean anything.
+  test("S5: clearRetirement clears and saves the record; with none set it writes nothing", async () => {
+    state.retiredBy = { sha: NEW, originalSha: OLD, at: 5 };
+    await saveState();
+    expect(onDisk().retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
+    await clearRetirement();
+    expect(state.retiredBy).toBeUndefined();
+    expect("retiredBy" in onDisk()).toBe(false);
+
+    const write = spyOn(Bun, "write");
+    try {
+      await clearRetirement();
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
   });
 });

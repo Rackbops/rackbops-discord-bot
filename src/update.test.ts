@@ -2,14 +2,16 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ReplacementProbe } from "./redeploy";
-import type { SwapInFlight } from "./state";
+import type { PendingUpdateReport, RetiredBy, SwapInFlight } from "./state";
 
 // `update.ts` pulls in the `config` singleton, which resolves process.env at import time -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
   checkForUpdate,
   decideAttemptResolution,
+  decideRetirement,
   decideUpdate,
+  isRetiredBy,
   sameSha,
   buildUpdateReport,
   fetchShaRelation,
@@ -969,6 +971,233 @@ describe("resolveUpdateAttempt (#450)", () => {
     }
     expect(q.lines.some((l) => l.level === "warn" && l.text.includes("could not save the resolved swap record"))).toBe(true);
     expect(state.swapInFlight).toBeUndefined(); // resolved in memory
+  });
+});
+
+// #558: the replacement's `retiredBy` record, as the ORIGINAL meets it when the operator starts it again. Pure verdicts
+// first, then the boot (seeded on disk, a probe that must not be asked), then what the next checks do.
+describe("decideRetirement / isRetiredBy (#558)", () => {
+  const rb = (over: Partial<RetiredBy> = {}): RetiredBy => ({ sha: NEW, originalSha: OLD, at: 5, ...over });
+
+  // Mutation M14: checking the original before the replacement turns "both equal" into a rollback.
+  test("U1: none, stale without a sha, replacement, rolled-back, stale; the replacement is checked first", () => {
+    expect(decideRetirement({ runningSha: OLD })).toBe("none");
+    expect(decideRetirement({ retiredBy: rb() })).toBe("stale");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: "" })).toBe("stale");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: NEW })).toBe("replacement");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: NEW.slice(0, 7) })).toBe("replacement");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: OLD })).toBe("rolled-back");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: OLD.slice(0, 7) })).toBe("rolled-back");
+    expect(decideRetirement({ retiredBy: rb(), runningSha: "c".repeat(40) })).toBe("stale");
+    // a hand-edited record whose two shas are equal: the running build is taken for the replacement, which keeps it
+    expect(decideRetirement({ retiredBy: rb({ originalSha: NEW }), runningSha: NEW })).toBe("replacement");
+  });
+
+  test("U1: isRetiredBy accepts the written shape and rejects a hand-edited or truncated one", () => {
+    expect(isRetiredBy(rb())).toBe(true);
+    expect(isRetiredBy({ sha: 5 })).toBe(false);
+    expect(isRetiredBy({ sha: NEW, originalSha: OLD })).toBe(false);
+    expect(isRetiredBy({ sha: NEW, originalSha: 7, at: 5 })).toBe(false);
+    expect(isRetiredBy({ sha: 5, originalSha: OLD, at: 5 })).toBe(false);
+    expect(isRetiredBy({ sha: NEW, originalSha: OLD, at: "now" })).toBe(false);
+    expect(isRetiredBy("junk")).toBe(false);
+    expect(isRetiredBy(null)).toBe(false);
+    expect(isRetiredBy(undefined)).toBe(false);
+  });
+});
+
+describe("resolveUpdateAttempt — a rolled-back original (#558)", () => {
+  const realFetch = globalThis.fetch;
+  const realGitSha = config.gitSha;
+  const THIRD = "c".repeat(40);
+  const retired = (over: Partial<RetiredBy> = {}): RetiredBy => ({ sha: NEW, originalSha: OLD, at: 5, ...over });
+  const swap = (): SwapInFlight => ({ fromSha: OLD, toSha: NEW, startedAt: Date.now() - 1000 });
+  const armed = (): PendingUpdateReport => buildUpdateReport({ runningSha: OLD, latestSha: NEW, requester: REQUESTER, now: Date.now() })!;
+  const quiet = () => {
+    const lines: { level: "log" | "warn"; text: string }[] = [];
+    return {
+      lines,
+      log: {
+        log: (...a: unknown[]) => void lines.push({ level: "log", text: a.map(String).join(" ") }),
+        warn: (...a: unknown[]) => void lines.push({ level: "warn", text: a.map(String).join(" ") }),
+      } as Pick<Console, "log" | "warn">,
+    };
+  };
+  /** What the shared file holds when the operator starts the original again: the replacement's record, and whatever the
+   *  replacement's own boot left of the swap record and the owed report. */
+  const seed = async (o: { retired?: unknown; swap?: unknown; report?: PendingUpdateReport }) => {
+    state.retiredBy = o.retired as never;
+    state.swapInFlight = o.swap as never;
+    state.pendingUpdateReport = o.report;
+    state.attemptedUpdateToSha = undefined;
+    await saveState();
+  };
+  /** A probe that fails the test when it is asked. */
+  const mustNotProbe = () => {
+    throw new Error("a rollback must not probe the daemon");
+  };
+
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    config.gitSha = realGitSha;
+    state.retiredBy = undefined;
+    state.swapInFlight = undefined;
+    state.pendingUpdateReport = undefined;
+    state.attemptedUpdateToSha = undefined;
+    await saveState();
+    resetUpdateForTest();
+    resetRestartForTest();
+  });
+
+  // Mutations: M15 (the attempt marker not armed), M16 (the record not cleared), M16b (the report not marked),
+  // M17 (the swap record resolved first, with a probe), a copy of the report instead of the mark in place.
+  test("U2: retiredBy naming this build as the original: rolled-back, no probe, the sha armed, the record and the swap record cleared, the report marked", async () => {
+    config.gitSha = OLD;
+    const owed = armed();
+    await seed({ retired: retired(), swap: swap(), report: owed });
+    const q = quiet();
+
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: q.log })).toBe("rolled-back");
+    expect(state.attemptedUpdateToSha).toBe(NEW);
+    expect(state.retiredBy).toBeUndefined();
+    expect(state.swapInFlight).toBeUndefined();
+    expect(state.pendingUpdateReport).toBe(owed); // marked in place: reportUpdateOutcome delivers the object it was handed
+    expect(owed.rolledBack).toBe(true);
+    const disk = onDisk();
+    expect(disk.attemptedUpdateToSha).toBe(NEW);
+    expect("retiredBy" in disk).toBe(false);
+    expect("swapInFlight" in disk).toBe(false);
+    expect(disk.pendingUpdateReport.rolledBack).toBe(true);
+    const warned = q.lines.filter((l) => l.level === "warn");
+    expect(warned).toHaveLength(1);
+    expect(warned[0]!.text).toContain(shortSha(NEW));
+    expect(warned[0]!.text.split(shortSha(NEW)).length - 1).toBe(2); // "retired by X" and "skips X"
+    expect(warned[0]!.text).toContain("rolled back by the operator");
+    expect(warned[0]!.text).toContain("/update"); // config.commandPrefix is empty in this process
+  });
+
+  // Mutations: marking whatever report is owed (a rollback of one swap must not mark another's report).
+  test("U2: a report armed by another swap is not marked; with none owed nothing is created", async () => {
+    config.gitSha = OLD;
+    const other = { ...armed(), toSha: THIRD };
+    await seed({ retired: retired(), report: other });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("rolled-back");
+    expect(other.rolledBack).toBeUndefined();
+    expect(onDisk().pendingUpdateReport.rolledBack).toBeUndefined();
+
+    const otherFrom = { ...armed(), fromSha: THIRD };
+    await seed({ retired: retired(), report: otherFrom });
+    await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log });
+    expect(otherFrom.rolledBack).toBeUndefined();
+
+    await seed({ retired: retired() });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("rolled-back");
+    expect(state.pendingUpdateReport).toBeUndefined();
+    expect(state.attemptedUpdateToSha).toBe(NEW);
+  });
+
+  // Mutations M18 (the replacement verdict clears the record too): the replacement's own boot, or its restart in
+  // probation, must leave the record for the original to find.
+  test("U2: this build is the replacement: the record is untouched, and the swap record resolves as it does without one", async () => {
+    config.gitSha = NEW;
+    await seed({ retired: retired() });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("none");
+    expect(state.retiredBy).toEqual(retired());
+    expect(onDisk().retiredBy).toEqual(retired());
+
+    await seed({ retired: retired(), swap: swap() });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("landed");
+    expect(onDisk().retiredBy).toEqual(retired());
+    expect("swapInFlight" in onDisk()).toBe(false);
+  });
+
+  // Mutation M16c: the stale clear not saved when no swap record follows.
+  test("U2: a record naming neither build is stale: cleared, on disk too, even with no swap record to save it", async () => {
+    config.gitSha = THIRD;
+    await seed({ retired: retired() });
+    const q = quiet();
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: q.log })).toBe("none");
+    expect(state.retiredBy).toBeUndefined();
+    expect("retiredBy" in onDisk()).toBe(false);
+    expect(state.attemptedUpdateToSha).toBeUndefined(); // a stale record arms nothing
+    expect(q.lines.some((l) => l.text.includes("belongs to another build or is malformed"))).toBe(true);
+
+    // and with a swap record that follows (also stale for this build): one resolution, both cleared
+    await seed({ retired: retired(), swap: swap() });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("stale");
+    expect("retiredBy" in onDisk()).toBe(false);
+    expect("swapInFlight" in onDisk()).toBe(false);
+  });
+
+  // Mutation: the stale-clear save as a bare `await saveState()` -- the "never throws" contract on this path.
+  test("U2: a stale record whose clearing cannot be saved is logged, still resolves none, and never throws", async () => {
+    config.gitSha = THIRD;
+    await seed({ retired: retired() });
+    const q = quiet();
+    const write = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+    try {
+      expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: q.log })).toBe("none");
+    } finally {
+      write.mockRestore();
+    }
+    expect(q.lines.some((l) => l.level === "warn" && l.text.includes("could not save the cleared retirement record"))).toBe(true);
+    expect(state.retiredBy).toBeUndefined(); // cleared in memory
+  });
+
+  test("U2: a build with no sha cannot tell: the record is cleared, not acted on", async () => {
+    config.gitSha = undefined;
+    await seed({ retired: retired() });
+    expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("none");
+    expect(state.retiredBy).toBeUndefined();
+    expect(state.attemptedUpdateToSha).toBeUndefined();
+  });
+
+  test("U2: a malformed record is cleared and never throws", async () => {
+    config.gitSha = OLD;
+    for (const bad of [{ sha: 5 }, "junk", null, 42, {}]) {
+      await seed({ retired: bad });
+      expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: quiet().log })).toBe("none");
+      expect(state.retiredBy).toBeUndefined();
+      expect("retiredBy" in onDisk()).toBe(false);
+      expect(state.attemptedUpdateToSha).toBeUndefined();
+    }
+  });
+
+  test("U2: a save that fails is logged and the rollback still stands in memory", async () => {
+    config.gitSha = OLD;
+    await seed({ retired: retired(), report: armed() });
+    const q = quiet();
+    const write = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+    try {
+      expect(await resolveUpdateAttempt({ log: q.log })).toBe("rolled-back");
+    } finally {
+      write.mockRestore();
+    }
+    expect(q.lines.some((l) => l.level === "warn" && l.text.includes("could not save the rollback marker"))).toBe(true);
+    expect(state.attemptedUpdateToSha).toBe(NEW);
+    expect(state.retiredBy).toBeUndefined();
+  });
+
+  // #558's second acceptance bullet: after the rollback boot, the automatic check leaves the build alone and an
+  // explicit /update still applies it. The stub deps keep a forced check from reaching the daemon.
+  test("U3: the automatic check is suppressed for the build rolled back from; /update (force) still restarts", async () => {
+    config.gitSha = OLD;
+    await seed({ retired: retired(), swap: swap() });
+    await resolveUpdateAttempt({ log: quiet().log });
+    stubGitHub(NEW);
+    const deps = { redeployAvailable: async () => true, redeploy: async () => ({ outcome: "failed" as const, error: "stubbed" }) };
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect((await checkForUpdate({}, deps)).decision).toBe("suppressed");
+      // The suppressed warning says why: a rollback, not "came back on the build it exited from ... rebuild the image".
+      const pending = warn.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("still pending"));
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toContain("the last attempt failed: it landed and was rolled back by the operator");
+      expect(pending[0]).not.toContain("rebuild the image");
+      expect((await checkForUpdate({ force: true }, deps)).decision).toBe("restart");
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
