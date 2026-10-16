@@ -127,6 +127,29 @@ describe("canonicalAddress", () => {
     ];
     for (const [input, expected] of table) expect(canonicalAddress(input)).toBe(expected);
   });
+
+  // The dotted form is what Bun reports for EVERY IPv4 peer (dual-stack listener), so the per-request hot
+  // path must not pay for the URL parser; the hex fold would reach the same answer, only slower, which is
+  // why nothing but a count of `new URL` calls can see the fast path.
+  test("the dotted IPv4-mapped form never reaches the URL parser", () => {
+    const RealURL = globalThis.URL;
+    let parsed = 0;
+    class CountingURL extends RealURL {
+      constructor(...args: ConstructorParameters<typeof URL>) {
+        parsed += 1;
+        super(...args);
+      }
+    }
+    globalThis.URL = CountingURL as typeof URL;
+    try {
+      expect(canonicalAddress("::ffff:10.0.0.5")).toBe("10.0.0.5");
+      expect(parsed).toBe(0);
+      expect(canonicalAddress("fd00::1")).toBe("fd00::1");
+      expect(parsed).toBe(1); // the counter works: any other IPv6 literal does take the parser
+    } finally {
+      globalThis.URL = RealURL;
+    }
+  });
 });
 
 describe("createTrustedProxy -- IPv6 spellings (#494)", () => {
