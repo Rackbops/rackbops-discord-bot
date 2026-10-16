@@ -14,6 +14,7 @@ import { DATA_DIR, readJsonOrFresh, shortSha } from "./storage";
 import { commandNamer } from "./commandNaming";
 import { isPluginStateReady } from "./announce";
 import { loadPluginIndex } from "./plugins";
+import { withoutRequest } from "./plugins/delivery";
 import { mutatePluginState, type PluginCommandTarget } from "./plugins/host";
 import {
   renderPluginsList,
@@ -344,7 +345,9 @@ export async function handleCommand(
     await target.command.handle(interaction);
     return "answered";
   } catch (err) {
-    console.error(`[plugins] ${target.plugin} command /${interaction.commandName} failed`, err);
+    // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+    // `requestBody`; withoutRequest keeps code/status/method.
+    console.error(`[plugins] ${target.plugin} command /${interaction.commandName} failed`, withoutRequest(err));
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});
     }

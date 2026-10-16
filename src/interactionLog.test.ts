@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
-import { customIdPrefix, describeInteraction, interactionLogLine, type InteractionLike } from "./interactionLog";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { createInteractionLine, customIdPrefix, describeInteraction, interactionLogLine, type InteractionLike } from "./interactionLog";
 import { jsonLogLine } from "./logFormat";
+import { beginShutdown, onBeforeExit, requestRestart, resetForTest, runExitHooks, setExitFn, stateForTest, withCritical } from "./restart";
 
 // #328: the one line per interaction. index.ts can't run under test, so its wiring is pinned in
 // index.test.ts; what is tested here is what a line may and may not carry.
@@ -90,5 +91,138 @@ describe("describeInteraction + interactionLogLine", () => {
     const line = interactionLogLine(describeInteraction(fake("command", { commandName: "web" }))!, "answered", 7);
     const parsed = JSON.parse(jsonLogLine("info", [line], new Date("2026-09-30T00:00:00Z")));
     expect(parsed).toEqual({ time: "2026-09-30T00:00:00.000Z", level: "info", msg: line });
+  });
+
+  test("the exiting outcome renders like the others (#446)", () => {
+    const facts = describeInteraction(fake("command", { commandName: "update" }))!;
+    expect(interactionLogLine(facts, "exiting", 1234)).toBe(`[interaction] command /update user=${USER} where=dm outcome=exiting 1234ms`);
+  });
+});
+
+// #446: index.ts registers an exit hook that writes the line with `exiting` and the handler's `finally` writes
+// it with the real outcome; this is what makes exactly one of the two land. index.ts can't run under test, so
+// the rule lives here, and index.test.ts pins that the handler goes through it.
+describe("createInteractionLine (#446)", () => {
+  const facts = describeInteraction(fake("command", { commandName: "update" }))!;
+  /** A clock that answers each call from `times`, then the last one again. */
+  const clock = (...times: number[]) => {
+    let i = 0;
+    return () => times[Math.min(i++, times.length - 1)]!;
+  };
+
+  test("writes once, whichever caller is first: the exit hook before the handler returns", () => {
+    const written: string[] = [];
+    const line = createInteractionLine(facts, (l) => written.push(l), clock(1000, 1250));
+    line("exiting");
+    line("answered");
+    expect(written).toEqual([`[interaction] command /update user=${USER} where=dm outcome=exiting 250ms`]);
+  });
+
+  test("writes once, whichever caller is first: the handler returning before any exit", () => {
+    const written: string[] = [];
+    const line = createInteractionLine(facts, (l) => written.push(l), clock(1000, 1007));
+    line("answered");
+    line("exiting");
+    line("error");
+    expect(written).toEqual([`[interaction] command /update user=${USER} where=dm outcome=answered 7ms`]);
+  });
+
+  test("writes nothing without facts (autocomplete)", () => {
+    const written: string[] = [];
+    const line = createInteractionLine(null, (l) => written.push(l));
+    line("answered");
+    line("exiting");
+    expect(written).toEqual([]);
+  });
+
+  test("the duration runs from when the writer was made, not from when it is called", () => {
+    const written: string[] = [];
+    const line = createInteractionLine(facts, (l) => written.push(l), clock(5, 50_005));
+    line("gated");
+    expect(written[0]).toEndWith("outcome=gated 50000ms");
+  });
+
+  // The handler's pattern (index.ts), driven through the real restart machinery: the writer, the exit hook
+  // registered before the work, and the hook removed with the real outcome written in a `finally`.
+  describe("as index.ts's handler uses it, through restart.ts", () => {
+    beforeEach(() => resetForTest());
+    afterEach(() => resetForTest());
+
+    /** What the handler does around `work`; `exits` records the exit function's calls, after the hooks. */
+    const handle = async (written: string[], work: () => Promise<void>, exits: string[] = []) => {
+      const restore = setExitFn((code) => exits.push(`exit ${code}`));
+      const line = createInteractionLine(facts, (l) => written.push(l.replace(/ \d+ms$/, "")));
+      const offExit = onBeforeExit(() => line("exiting"));
+      try {
+        await work();
+      } finally {
+        offExit();
+        line("answered");
+        restore();
+      }
+    };
+    const exitingLine = `[interaction] command /update user=${USER} where=dm outcome=exiting`;
+    const answeredLine = `[interaction] command /update user=${USER} where=dm outcome=answered`;
+
+    test("a command that requests a restart inside its critical section leaves one exiting line, before the exit", async () => {
+      const written: string[] = [];
+      const exits: string[] = [];
+      const logSpy = spyOn(console, "log").mockImplementation(() => {});
+      try {
+        await handle(written, () => withCritical(async () => requestRestart("update")), exits);
+      } finally {
+        logSpy.mockRestore();
+      }
+      expect(written).toEqual([exitingLine]);
+      expect(exits).toEqual(["exit 75"]);
+    });
+
+    test("a command that returns normally leaves one answered line, and its hook is gone", async () => {
+      const written: string[] = [];
+      await handle(written, async () => {});
+      expect(written).toEqual([answeredLine]);
+      expect(stateForTest().exitHooks).toBe(0);
+    });
+
+    test("an interaction that finishes during a shutdown's drain writes its own outcome, not exiting", async () => {
+      const written: string[] = [];
+      const logSpy = spyOn(console, "log").mockImplementation(() => {});
+      try {
+        beginShutdown("SIGTERM");
+        await handle(written, async () => {});
+        runExitHooks(); // the shutdown handler's exit, after the drain
+      } finally {
+        logSpy.mockRestore();
+      }
+      expect(written).toEqual([answeredLine]);
+    });
+
+    test("an interaction still in flight at the shutdown's exit writes exiting once, and not again when it returns", async () => {
+      const written: string[] = [];
+      let finish: () => void = () => {};
+      const logSpy = spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const running = handle(written, () => new Promise<void>((resolve) => (finish = resolve)));
+        beginShutdown("SIGTERM");
+        runExitHooks();
+        expect(written).toEqual([exitingLine]);
+        finish();
+        await running;
+      } finally {
+        logSpy.mockRestore();
+      }
+      expect(written).toEqual([exitingLine]);
+    });
+  });
+
+  test("a write that throws is its first and only attempt: the second caller does not write again", () => {
+    let attempts = 0;
+    const line = createInteractionLine(facts, () => {
+      attempts += 1;
+      throw new Error("stdout closed");
+    });
+    expect(() => line("exiting")).toThrow("stdout closed");
+    line("answered");
+    expect(attempts).toBe(1);
   });
 });

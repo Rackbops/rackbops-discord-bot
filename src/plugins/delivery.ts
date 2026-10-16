@@ -15,6 +15,13 @@ const CANNOT_MESSAGE_USER = 50007;
  * (`host.log.error("dm failed", err)`, which under LOG_FORMAT=json is `util.format`ted in full) logs
  * none of it. `code` is kept as is, since a plugin tells
  * Discord's answers apart by it (10013 "Unknown User"). Anything else is returned unchanged.
+ *
+ * The host's own log sites use it too (#545): a failed reply to an interaction carries the interaction
+ * token in `url` and the reply in `requestBody`, so index.ts's handler, the plugin command, interaction and
+ * autocomplete dispatchers, the `/update` report's delivery and `host.log.error` all log this view. The
+ * `host.log.error` wrapper cleans only the LOGGED copy; the plugin's own error object is untouched. A
+ * `RateLimitError` (`url`, no `requestBody`) passes the gate below unchanged and is unreachable at those
+ * sites, since `rejectOnRateLimit` is unset.
  */
 export function withoutRequest(err: unknown): unknown {
   if (!(err instanceof Error) || !("requestBody" in err)) return err;

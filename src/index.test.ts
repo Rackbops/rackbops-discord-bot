@@ -468,8 +468,10 @@ describe("index.ts wiring", () => {
     expect(dispatchBranch).toBeLessThan(dispatchCall);
   });
 
-  // #328: one log line per interaction, written after it is handled, from the one handler.
-  test("the InteractionCreate handler logs one interaction line in a finally, with each branch's outcome", () => {
+  // #328/#446: one log line per interaction, from the one handler -- written by a once-only writer
+  // (createInteractionLine, tested in interactionLog.test.ts) that the handler's `finally` calls with the
+  // outcome and that an exit hook calls with `exiting` when the handler's command ends the process first.
+  test("the InteractionCreate handler logs one interaction line through the once-only writer, from an exit hook or its finally", () => {
     const start = source.indexOf("client.on(Events.InteractionCreate");
     const end = source.indexOf("client.on(Events.GuildCreate", start);
     const handler = source.slice(start, end);
@@ -477,11 +479,33 @@ describe("index.ts wiring", () => {
     expect(handler).toContain("const facts = describeInteraction(interaction);");
     expect(handler).toMatch(/outcome = await handleCommand\(/);
     expect(handler).toMatch(/outcome = await dispatchPluginInteractionOutcome\(/);
-    expect(handler).toMatch(/catch \(err\) \{\s*outcome = "error";\s*console\.error\("\[interaction\]", err\);/);
-    expect(handler).toMatch(/finally \{\s*if \(facts\) console\.info\(interactionLogLine\(facts, outcome, Date\.now\(\) - started\)\);\s*\}/);
-    // Only one line per interaction: the log call appears once.
-    expect(handler.match(/interactionLogLine\(/g)?.length).toBe(1);
+    // The writer is made once, and is the only thing that formats a line (the handler no longer calls interactionLogLine).
+    expect(handler.match(/createInteractionLine\(facts, \(l\) => console\.info\(l\)\);/g)?.length).toBe(1);
+    expect(handler).not.toContain("interactionLogLine(");
+    expect(handler).not.toContain("started");
+    // The exit hook is registered only for an interaction with a line, before the `try` its command runs in
+    // (a command that ends the process leaves the `try` by exit, not by return), and is removed in the finally.
+    const hook = 'const offExit = facts ? onBeforeExit(() => line("exiting")) : () => {};';
+    expect(handler.split(hook)).toHaveLength(2);
+    expect(handler.indexOf("const facts = describeInteraction(interaction);")).toBeLessThan(handler.indexOf(hook));
+    expect(handler.indexOf("const line = createInteractionLine(")).toBeLessThan(handler.indexOf(hook));
+    expect(handler.indexOf(hook)).toBeLessThan(handler.indexOf("try {"));
+    expect(handler.match(/onBeforeExit\(/g)?.length).toBe(1);
+    // #545: the error is logged without its request.
+    expect(handler).toMatch(/catch \(err\) \{\s*outcome = "error";\s*console\.error\("\[interaction\]", withoutRequest\(err\)\);/);
+    expect(handler).toMatch(/finally \{\s*offExit\(\);\s*line\(outcome\);\s*\}/);
     expect(handler).toContain('if (outcome === "unclaimed" && interaction.isMessageComponent()) await answerUnclaimedPress(');
+  });
+
+  // #446: the hooks run at the shutdown's exit -- after the drain, so an interaction that finished in it wrote its
+  // own outcome -- through the one `exit` the handler calls for its normal, timed-out and second-signal exits alike.
+  test("the shutdown handler's exit runs the exit hooks and then exits (#446)", () => {
+    const start = source.indexOf("createShutdownHandler(");
+    const call = source.slice(start, source.indexOf("});", start));
+    expect(start).toBeGreaterThan(-1);
+    expect(call).toMatch(/exit: \(code\) => \{\s*runExitHooks\(\);\s*process\.exit\(code\);\s*\},/);
+    // Nowhere else: not at the signal (that would discard the hooks a drain-time interaction registers).
+    expect(source.match(/runExitHooks\(/g)?.length).toBe(1);
   });
 
   // #154: the first (and only) signal handler in this codebase. Registered before resolveBootMode

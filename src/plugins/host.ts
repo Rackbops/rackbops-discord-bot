@@ -13,6 +13,7 @@ import { commandNamer, prefixedName } from "../commandNaming";
 import { DESTINATION_NAME_RE, SNOWFLAKE_RE, type DiscoveryFile, type RoutingFile } from "../routing/model";
 import { destinationChannel, mappedDestinations, shown } from "../routing/resolve";
 import { createKeyedJsonMutator } from "../storage";
+import { withoutRequest } from "./delivery";
 import { validateHostMessage, type BuiltPayload } from "./hostMessage";
 import type {
   HostApi,
@@ -97,7 +98,9 @@ export function createHostApi(opts: {
   const log: PluginLog = {
     info: (m) => opts.baseLog.info(`[${name}] ${m}`),
     warn: (m) => opts.baseLog.warn(`[${name}] ${m}`),
-    error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, e),
+    // #545: the logged copy of a discord.js REST error loses `url` (it carries an interaction token when the
+    // plugin was replying) and `requestBody` (the reply); the plugin's own error object is untouched.
+    error: (m, e) => opts.baseLog.error(`[${name}] ${m}`, withoutRequest(e)),
   };
   // #219: only a destination the manifest declares, with a valid name, is passed on; any other is said
   // once per name (at most MAX_DESTINATION_WARNINGS of them, so a plugin forwarding user input cannot
@@ -833,7 +836,9 @@ export async function dispatchPluginInteractionOutcome(
     await handler.call(lp.plugin, interaction);
     return "answered";
   } catch (err) {
-    log.error(`[plugins] ${lp.entry.name} interaction failed`, err);
+    // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+    // `requestBody`; withoutRequest keeps code/status/method.
+    log.error(`[plugins] ${lp.entry.name} interaction failed`, withoutRequest(err));
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({ content: "Something went wrong.", flags: MessageFlags.Ephemeral }).catch(() => {});
     }
@@ -934,7 +939,8 @@ export async function dispatchPluginAutocomplete(opts: {
       }
     }
   } catch (err) {
-    log.error(`[plugins] ${target?.entry.name} autocomplete for "${bare}" failed`, err);
+    // #545: as the interaction handler above -- a REST error's `url` and `requestBody` are not logged.
+    log.error(`[plugins] ${target?.entry.name} autocomplete for "${bare}" failed`, withoutRequest(err));
   }
   if (!respondCalled && !interaction.responded) await interaction.respond([]);
 }

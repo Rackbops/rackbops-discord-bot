@@ -9,6 +9,7 @@ import type { HostDeliveryDeps, LoadedPlugin } from "./host";
 import { pinsFromState, selectPlugins } from "./registry";
 import { createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "../storage";
 import { freshRouting, type DiscoveryFile, type RoutingFile } from "../routing/model";
+import { expectCleanedLog, replyFailure } from "../../test/restError";
 import { stallBunWrite } from "../../test/stallBunWrite";
 import { settled } from "../../test/stateLeaks";
 // DISCORD_TOKEN/ANNOUNCE_CHANNEL_ID (some transitive imports read them at load time) are primed
@@ -110,6 +111,19 @@ function makeLog() {
   };
 }
 
+/** Like `makeLog`, but keeps the error call's second argument -- the logged error itself (#545). */
+function makeErrorLog() {
+  const errors: unknown[][] = [];
+  return {
+    log: {
+      info: () => {},
+      warn: () => {},
+      error: (...args: unknown[]) => void errors.push(args),
+    },
+    errors,
+  };
+}
+
 function entry(over: Partial<PluginIndexEntry> = {}): PluginIndexEntry {
   return {
     name: "demo",
@@ -175,6 +189,35 @@ describe("createHostApi", () => {
     expect(host.dataDir).toBe("/data");
     host.log.info("hello");
     expect(calls).toEqual([{ level: "info", message: "[p] hello" }]);
+  });
+
+  // #545: a plugin that replies to an interaction itself and logs the rejection (`host.log.error("reply failed", err)`)
+  // would otherwise log the interaction token (`url`) and the reply (`requestBody`).
+  test("host.log.error logs a REST error without its request, and a plain error as it is (#545)", () => {
+    const { log, errors } = makeErrorLog();
+    const host = createHostApi({
+      entry: entry({ name: "p" }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async () => {},
+    });
+    const failure = replyFailure();
+    const plain = new Error("boom");
+    host.log.error("reply failed", failure.error);
+    host.log.error("plain", plain);
+    host.log.error("no error at all");
+    host.log.error("not an error", "just text");
+    expect(errors).toHaveLength(4);
+    expect(errors[0]![0]).toBe("[p] reply failed");
+    expectCleanedLog(errors[0]!, failure);
+    expect(errors[1]).toEqual(["[p] plain", plain]);
+    expect(errors[1]![1]).toBe(plain); // by identity: only a REST error is rewritten
+    expect(errors[2]).toEqual(["[p] no error at all", undefined]);
+    expect(errors[3]).toEqual(["[p] not an error", "just text"]);
+    expect(failure.error.requestBody).toBeDefined(); // the plugin's own error object is untouched
+    expect(failure.error.url).toContain(failure.token);
   });
 });
 
@@ -1688,6 +1731,21 @@ describe("dispatchPluginAutocomplete (#287)", () => {
     expect(s.calls.some((l) => l.level === "error" && l.message.includes("finder autocomplete"))).toBe(true);
   });
 
+  // #545: the picker's reply is the interaction callback too, so a rejected `respond` carries the token in `url`.
+  test("a REST error from a plugin's autocomplete is logged without the interaction token (#545)", async () => {
+    const failure = replyFailure();
+    const command: PluginCommand = { ...cmd("search"), autocomplete: async () => { throw failure.error; } };
+    const lp = loaded(entry({ name: "finder" }), { commands: [command] }, true);
+    const { log, errors } = makeErrorLog();
+    const map = pluginCommandMap([lp], [], makeLog().log);
+    const { interaction, responses } = fakeAutocomplete();
+    await dispatchPluginAutocomplete({ interaction: interaction as never, bare: "search", map, loaded: [lp], gate: async () => undefined, log });
+    expect(responses).toEqual([[]]); // the picker still gets its empty list
+    expect(errors).toHaveLength(1);
+    expect(errors[0]![0]).toBe('[plugins] finder autocomplete for "search" failed');
+    expectCleanedLog(errors[0]!, failure);
+  });
+
   test("an autocomplete() that returns without responding gets the empty-list fallback", async () => {
     const s = setup({ autocomplete: async () => {} });
     const { interaction, responses } = fakeAutocomplete();
@@ -2364,6 +2422,16 @@ describe("dispatchPluginInteraction", () => {
     expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("other:x"), log)).toBe("unclaimed");
     const stopped = loaded(entry({ name: "wow" }), { interactions: async () => {} }, false);
     expect(await dispatchPluginInteractionOutcome([stopped], fakeInteraction("wow:ok"), log)).toBe("unclaimed");
+  });
+
+  test("a REST error from a plugin's own reply is logged without the interaction token or the reply (#545)", async () => {
+    const failure = replyFailure();
+    const { log, errors } = makeErrorLog();
+    const lp = loaded(entry({ name: "wow" }), { interactions: async () => { throw failure.error; } }, true);
+    expect(await dispatchPluginInteractionOutcome([lp], fakeInteraction("wow:x"), log)).toBe("error");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]![0]).toBe("[plugins] wow interaction failed");
+    expectCleanedLog(errors[0]!, failure);
   });
 
   test("a throwing handler gets a best-effort ephemeral reply IF it hadn't already replied/deferred", async () => {

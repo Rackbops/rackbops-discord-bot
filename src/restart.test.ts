@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import {
   RESTART_DEFERRAL_MAX_MS,
   RESTART_EXIT_CODE,
@@ -9,10 +9,12 @@ import {
   endCritical,
   endHandoff,
   handoffActive,
+  onBeforeExit,
   onStopRequested,
   requestRestart,
   resetForTest,
   restartPending,
+  runExitHooks,
   setExitFn,
   stateForTest,
   withCritical,
@@ -426,6 +428,7 @@ describe("stateForTest (what the test-state guard reads)", () => {
       stopListeners: 0,
       stopNotified: false,
       deferralArmed: false,
+      exitHooks: 0,
     });
   });
 
@@ -466,6 +469,133 @@ describe("stateForTest (what the test-state guard reads)", () => {
     expect(stateForTest().stopListeners).toBe(1);
     off();
     expect(stateForTest().stopListeners).toBe(0);
+  });
+});
+
+// #446: a log line that the exit would otherwise lose (the interaction line of the command that asked for
+// it) is written by a hook that runs right before the process exits -- `doExit` for a requested restart,
+// `runExitHooks` for the shutdown handler's exit (index.ts wires it in).
+describe("onBeforeExit (#446)", () => {
+  test("a requested restart runs the hooks, in registration order, before the exit function", () => {
+    const order: string[] = [];
+    restore();
+    restore = setExitFn((code) => {
+      order.push("exit");
+      exits.push(code);
+    });
+    onBeforeExit(() => order.push("a"));
+    onBeforeExit(() => order.push("b"));
+    requestRestart("t");
+    expect(order).toEqual(["a", "b", "exit"]);
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+  });
+
+  test("a deferred restart runs the hooks when the section closes, once", () => {
+    const hook = mock(() => {});
+    beginCritical();
+    onBeforeExit(hook);
+    requestRestart("t");
+    expect(hook).not.toHaveBeenCalled();
+    endCritical();
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+    expect(stateForTest().exitHooks).toBe(0);
+  });
+
+  test("runExitHooks runs and empties the list; beginShutdown does not run them", () => {
+    const hook = mock(() => {});
+    onBeforeExit(hook);
+    beginShutdown("SIGTERM");
+    expect(hook).not.toHaveBeenCalled();
+    expect(stateForTest().exitHooks).toBe(1);
+    runExitHooks();
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(stateForTest().exitHooks).toBe(0);
+    runExitHooks();
+    expect(hook).toHaveBeenCalledTimes(1);
+  });
+
+  test("a throwing hook is isolated: the others run and the exit still happens", () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const seen: string[] = [];
+      onBeforeExit(() => {
+        throw new Error("boom");
+      });
+      onBeforeExit(() => seen.push("second"));
+      requestRestart("t");
+      expect(seen).toEqual(["second"]);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain("an exit hook threw");
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("an unsubscribed hook is not run", () => {
+    const hook = mock(() => {});
+    const off = onBeforeExit(hook);
+    off();
+    expect(stateForTest().exitHooks).toBe(0);
+    requestRestart("t");
+    expect(hook).not.toHaveBeenCalled();
+  });
+
+  test("unsubscribing one hook leaves the others registered", () => {
+    const a = mock(() => {});
+    const b = mock(() => {});
+    const offA = onBeforeExit(a);
+    onBeforeExit(b);
+    offA();
+    expect(stateForTest().exitHooks).toBe(1);
+    runExitHooks();
+    expect(a).not.toHaveBeenCalled();
+    expect(b).toHaveBeenCalledTimes(1);
+  });
+
+  test("resetForTest clears the hooks, and stateForTest counts them", () => {
+    onBeforeExit(() => {});
+    onBeforeExit(() => {});
+    expect(stateForTest().exitHooks).toBe(2);
+    resetForTest();
+    expect(stateForTest().exitHooks).toBe(0);
+  });
+
+  test("a hook registered after beginShutdown still runs at the exit (an interaction that arrives in the drain)", () => {
+    const hook = mock(() => {});
+    beginShutdown("SIGTERM");
+    onBeforeExit(hook);
+    runExitHooks();
+    expect(hook).toHaveBeenCalledTimes(1);
+  });
+
+  test("a hook that unsubscribes itself, or a later one, while the hooks run does not change who runs", () => {
+    const seen: string[] = [];
+    let offB: () => void = () => {};
+    onBeforeExit(() => {
+      seen.push("a");
+      offB();
+    });
+    offB = onBeforeExit(() => seen.push("b"));
+    runExitHooks();
+    expect(seen).toEqual(["a", "b"]);
+  });
+
+  test("the deadline exit of a stuck section runs the hooks too (#512)", async () => {
+    const hook = mock(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      beginCritical();
+      onBeforeExit(hook);
+      requestRestart("t", 20);
+      expect(hook).not.toHaveBeenCalled();
+      await Bun.sleep(60);
+      expect(hook).toHaveBeenCalledTimes(1);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 

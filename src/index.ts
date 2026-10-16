@@ -21,8 +21,10 @@ import {
   beginCritical,
   beginShutdown,
   endCritical,
+  onBeforeExit,
   onStopRequested,
   restartPending,
+  runExitHooks,
   withCritical,
 } from "./restart";
 import { createShutdownHandler, SHUTDOWN_GRACE_MS } from "./shutdown";
@@ -55,10 +57,10 @@ import {
   writePluginState,
 } from "./plugins/host";
 import { startHostHttp } from "./http";
-import { describeInteraction, interactionLogLine, type InteractionOutcome } from "./interactionLog";
+import { createInteractionLine, describeInteraction, type InteractionOutcome } from "./interactionLog";
 import { createTrustedProxy, PROXY_BOOT_REFRESH_TIMEOUT_MS } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
-import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
+import { editOwnMessage, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./plugins/delivery";
 import { describePlugins, readDiscovery } from "./routing/discovery";
 import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
 import { gateCommand, whereOf } from "./routing/gate";
@@ -118,7 +120,13 @@ const shutdownHandler = createShutdownHandler({
     return disposePlugins(currentLoadedPlugins, console, PLUGIN_DISPOSE_TIMEOUT_MS);
   },
   destroyClient: () => client.destroy(),
-  exit: (code) => process.exit(code),
+  // #446: the exit hooks run here, at the shutdown's exit after the drain, not at the signal -- so an
+  // interaction that finished during the drain wrote its own outcome and only one still in flight now
+  // writes `exiting` (restart.ts, onBeforeExit). The second-signal exit goes through this too.
+  exit: (code) => {
+    runExitHooks();
+    process.exit(code);
+  },
   log: console,
   graceMs: SHUTDOWN_GRACE_MS,
 });
@@ -239,8 +247,12 @@ async function activate(c: Client<true>): Promise<void> {
     // every keystroke), written once the interaction is handled. Only names and ids -- never an option
     // value, a field or a reply (src/interactionLog.ts).
     const facts = describeInteraction(interaction);
-    const started = Date.now();
     let outcome: InteractionOutcome = "answered";
+    // #446: exactly one line per interaction -- once it is handled, or from the exit hook when the handler
+    // itself ends the process (a requested restart, or the replacement stopping this container) before it
+    // returns. `line` writes at most once, whichever comes first (src/interactionLog.ts).
+    const line = createInteractionLine(facts, (l) => console.info(l));
+    const offExit = facts ? onBeforeExit(() => line("exiting")) : () => {};
     try {
       if (interaction.isChatInputCommand()) {
         // #243: a plugin's commands run only in the channels its routing lists (core commands never reach the gate).
@@ -288,11 +300,14 @@ async function activate(c: Client<true>): Promise<void> {
           log: console,
         });
       }
+      // #545: a REST error from the reply carries the interaction token in `url` and the reply in
+      // `requestBody`; withoutRequest keeps what an operator needs (code, status, method).
     } catch (err) {
       outcome = "error";
-      console.error("[interaction]", err);
+      console.error("[interaction]", withoutRequest(err));
     } finally {
-      if (facts) console.info(interactionLogLine(facts, outcome, Date.now() - started));
+      offExit();
+      line(outcome);
     }
   });
 
