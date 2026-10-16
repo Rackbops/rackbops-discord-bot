@@ -315,6 +315,14 @@ async function activate(c: Client<true>): Promise<void> {
   // A throwing activate() stays isolated inside activatePlugins (the bot never crashes on it), and
   // pluginTicks' running-gate is kept as defence in depth.
   await activatePlugins(loadResult.loaded, console);
+  // #541: a shutdown that began during activation has already disposed what was running, and the loop
+  // refused the rest. Writing state.json, draining the mailbox, binding HTTP and sending the update
+  // report-back now would record and announce a boot that never happened (the report would say "failed
+  // to start" for a plugin the shutdown refused). Stop here; the pending report survives to the next boot.
+  if (restartPending()) {
+    console.warn("[plugins] shutdown in progress — the rest of activation is skipped");
+    return;
+  }
 
   // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
   // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores

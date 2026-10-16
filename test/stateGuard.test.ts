@@ -220,11 +220,23 @@ describe("updateLeaks", () => {
 });
 
 describe("pluginHostLeaks", () => {
-  test("no write pending is no leak", async () => {
-    expect(await pluginHostLeaks({ writes: DONE })).toEqual([]);
+  const CLEAN = { writes: DONE, disposing: false, activation: DONE };
+  test("no write pending, no dispose, no activation running is no leak", async () => {
+    expect(await pluginHostLeaks(CLEAN)).toEqual([]);
   });
   test("names a write still running", async () => {
-    expect(await pluginHostLeaks({ writes: NEVER })).toEqual([expect.stringContaining("a plugin state.json write still running")]);
+    expect(await pluginHostLeaks({ ...CLEAN, writes: NEVER })).toEqual([expect.stringContaining("a plugin state.json write still running")]);
+  });
+  // #541: disposePlugins sets a flag that makes activatePlugins refuse every plugin, so a test that
+  // called it and did not put the flag back would fail every later activation in the same process.
+  test("names disposePlugins having run", async () => {
+    expect(await pluginHostLeaks({ ...CLEAN, disposing: true })).toEqual([expect.stringContaining("disposePlugins ran")]);
+  });
+  test("names an activation still running", async () => {
+    expect(await pluginHostLeaks({ ...CLEAN, activation: NEVER })).toEqual([expect.stringContaining("a plugin activation still running")]);
+  });
+  test("names every leak at once", async () => {
+    expect(await pluginHostLeaks({ writes: NEVER, disposing: true, activation: NEVER })).toHaveLength(3);
   });
 });
 
