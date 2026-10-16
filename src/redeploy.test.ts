@@ -1914,8 +1914,9 @@ describe("redeploy — cleanup always runs", () => {
     expect(handoffActive()).toBe(false);
   });
 
-  // The project-named exemption reads the bot's own labels: a container the daemon reports with none (null) is not
-  // named after a project, and `redeploy()` must refuse it like any other -next bot instead of throwing.
+  // `projectOf` reads the bot's own labels null-safely: a container the daemon reports with none (null) has no
+  // project, so `ownName` falls back to the reserved-suffix rule and `redeploy()` refuses it like any other -next
+  // bot instead of throwing.
   test("a bot named -next whose labels are null is refused, not crashed", async () => {
     stubDaemon({
       self: { ...SELF, Name: "/warbandeer-discord-next", Config: { ...SELF.Config, Labels: null as unknown as Record<string, string> } },

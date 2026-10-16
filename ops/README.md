@@ -454,7 +454,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   `<name>-next` has its `/update` refused with that restart as the advice. An install.sh instance whose
   name ends in `-next` (`install.sh next`, `canary-next`) keeps it: the bot knows its own name from its compose
   project, self-updates into `<name>-next`, and a replacement that never took its name is healed to the
-  instance's name. A compose-only deployment whose `container_name` ends in `-next` without being its
+  instance's name (unless a sibling instance owns that standby name: instances `prod` and `prod-next` cannot
+  share a daemon, #567). A compose-only deployment whose `container_name` ends in `-next` without being its
   project's, and that had already self-updated before #547, would be renamed at its next boot (an install-time
   guard against `-next` instance names is #567). (c) Neither yet: wait. An **exited** `<name>-next` blocks
   nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it

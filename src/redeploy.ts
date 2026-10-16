@@ -1136,11 +1136,14 @@ export interface HealDeps {
  * Bounded and best-effort: the boot continues on every outcome. The name it takes is `ownName`'s: the compose
  * project's when the container is that or `<project>-next` (how `ops/install.sh` names an instance, a `-next`
  * one included), otherwise the name without its `-next` suffixes.
- * The limit: that rule and the `HANDOFF_FROM` gate are all that tell a deployment's own `*-next` name from a
- * swap's replacement, so two narrow cases go the wrong way, neither reachable through install.sh: a container
- * created by `compose` alone with a `container_name` ending in `-next` that is not its project's, and had
- * already self-updated before #547, is indistinguishable from a replacement and would be renamed; and a
- * container named exactly `<project>-next` is taken for its project's replacement.
+ * The limits: that rule and the `HANDOFF_FROM` gate are all that tell a deployment's own `*-next` name from a
+ * swap's replacement, so three narrow cases go the wrong way, none reachable through a new install.sh
+ * instance: a container created by `compose` alone with a `container_name` ending in `-next` that is not its
+ * project's, and had already self-updated before #547, is indistinguishable from a replacement and would be
+ * renamed; a replacement whose name equals its project label (a hand-written compose with project `foo-next`
+ * and `container_name: foo`, so the replacement `foo-next`) is taken for its own name and not healed; and
+ * instances `X` and `X-next` on one daemon are not told apart by the sweep or by `bot-ops.sh`'s guard
+ * (#567 refuses to install the second).
  */
 export async function healOwnName(deps: HealDeps = {}, timeoutMs = RESOLVE_BOOT_MODE_TIMEOUT_MS): Promise<HealOutcome> {
   const log = deps.log ?? console;
