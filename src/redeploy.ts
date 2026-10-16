@@ -5,6 +5,7 @@
 // itself (marker, deadlines, outcome decision) is in `handoff.ts`, kept free of I/O so it
 // can be tested as pure logic.
 
+import { prefixedName } from "./commandNaming";
 import { config } from "./config";
 import {
   buildImage,
@@ -300,6 +301,8 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
   }
   const current = canonicalName(self.Name);
   if (current !== ownName(self.Name, projectOf(self))) {
+    // The command as this instance registered it (COMMAND_PREFIX), never the bare name.
+    const updateCommand = `/${prefixedName(config.commandPrefix, "update")}`;
     // #547/#492: a bot that is itself `<name>-next` (a replacement that has not taken its name, or a container
     // that merely ends in the reserved suffix) must not sweep or create under that name. Refused here, before
     // anything is built, on the name and labels alone: no daemon call beyond the self-inspect above, and nothing
@@ -307,7 +310,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
     // not refused: `ownName` knows it, and its replacement is `<name>-next`.
     return {
       error: process.env[HANDOFF_FROM_ENV]
-        ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run /update again afterwards`
+        ? `this bot is named ${current}, which is a swap's replacement name: if the swap that started it is still finishing, wait a few minutes; if it persists, the rename never landed and docker restart ${current} heals the name at boot (#547). The automatic check will not retry this sha, so run ${updateCommand} again afterwards`
         : "this container's name ends in -next, which the self-update reserves for its replacement, so it cannot self-update: give it another container_name and recreate it",
       replacement: "none",
     };
