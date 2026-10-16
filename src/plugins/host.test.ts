@@ -254,6 +254,7 @@ describe("createHostApi: delivery (#736)", () => {
     over: Partial<{
       routing: RoutingFile;
       routingFails: boolean;
+      discoveryFails: boolean;
       discovery: DiscoveryFile | null;
       sendToChannel: HostDeliveryDeps["sendToChannel"];
       sendDm: HostDeliveryDeps["sendDm"];
@@ -270,6 +271,7 @@ describe("createHostApi: delivery (#736)", () => {
       },
       readDiscovery: async () => {
         calls.push("readDiscovery");
+        if (over.discoveryFails) throw new Error("EIO: i/o error");
         return over.discovery ?? null;
       },
       sendToChannel: async (channelId, payload) => {
@@ -613,6 +615,25 @@ describe("createHostApi: delivery (#736)", () => {
     });
     expect(await host.destinations!()).toEqual([]);
     expect(logCalls).toEqual([{ level: "warn", message: "[feed] destinations: could not read routing; reporting none" }]);
+  });
+
+  // #509: discovery.json is read through readJsonOrFresh, which now rejects on a non-parse read error
+  // (EIO, EACCES); the list must survive that the way it survives an unreadable routing file.
+  test("destinations still lists the mapped servers, named by id, with a warning, when discovery cannot be read", async () => {
+    const { log, calls: logCalls } = makeLog();
+    const routing = routingWith({ feed: { servers: { [HOME]: { commands: "all", destinations: { news: CHAN } } } } });
+    const { deps } = fakeDeps({ routing, discoveryFails: true });
+    const host = createHostApi({
+      entry: entry({ name: "feed", destinations: [{ name: "news", description: "d" }] }),
+      processEnv: {},
+      dataDir: "/data",
+      baseLog: log,
+      storage: realStorage,
+      announce: async () => {},
+      delivery: deps,
+    });
+    expect(await host.destinations!()).toEqual([{ guildId: HOME, guildName: HOME, destination: "news" }]);
+    expect(logCalls).toEqual([{ level: "warn", message: "[feed] destinations: could not read discovery; naming servers by id" }]);
   });
 
   test("an old-style plugin loads and announces fine through the real loader, even though the host also carries post/dm/edit/destinations (backward compatibility)", async () => {

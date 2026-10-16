@@ -72,9 +72,10 @@ const pluginIndexResult = await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)
 // older version — rather than explicitly pinned, which needs no state — can be kept when the index
 // moves to a version declaring a different host API (all a hostApiVersion in the index describes is
 // its current version). This is a second read of the file activate() reads for installPlugins, kept
-// separate on purpose: activate()'s read sits inside its own try/catch, while this one is total —
-// pinsFromState accepts any parsed shape, and readPluginState already degrades a corrupt file to
-// fresh (moving it aside once, here, instead of in activate()).
+// separate on purpose: activate()'s read sits inside its own try/catch, while this one is not —
+// pinsFromState accepts any parsed shape, and readPluginState degrades a corrupt file to fresh (moving
+// it aside once, here, instead of in activate()), but a read that fails for another reason (EACCES, EIO)
+// is rethrown by readJsonOrFresh (#509) and fails the boot here, with the real error in the log.
 const bootStorage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
 const installedPins = pinsFromState(await readPluginState(DATA_DIR, bootStorage));
 const selectedPlugins = selectPlugins(
@@ -160,12 +161,17 @@ async function activate(c: Client<true>): Promise<void> {
   // outer try degrades ANY unexpected failure to core-only registration — a plugin never crashes boot.
   const storage: HostStorage = { readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator };
   let previousState: PluginStateFile = { hostApiVersion: HOST_API_VERSION, writtenAt: "", plugins: [] };
+  // #509: true while the read below has not succeeded. readJsonOrFresh rethrows a read that failed for a
+  // reason other than corruption, and the catch further down swallows it -- so `previousState` is then the
+  // empty default, "could not read", not "nothing there", and the boot write must not build the file from it.
+  let previousStateUnread = true;
   let installResult: InstallResult = { installed: [], skips: {}, fallbacks: {} };
   let loadResult: LoadResult = { loaded: [], errors: {} };
   let commandMap: PluginCommandMap = new Map();
   let commandBody = commandData;
   try {
     previousState = await readPluginState(DATA_DIR, storage);
+    previousStateUnread = false;
     // Per-plugin pins: the last-good installedVersion plus #104's transient targetVersion (an explicit
     // /plugins update the next boot should try, falling back to installedVersion if it can't install).
     const pins = Object.fromEntries(
@@ -378,7 +384,10 @@ async function activate(c: Client<true>): Promise<void> {
     // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
     // same route with the same body, and its result is `single` -- so the line below is unchanged.
     // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
-    // and when it is skipped), into the catch below.
+    // and when it is skipped), into the catch below. So is a routing read that fails for a reason other
+    // than a parse error (#509): `applyRouting` reads routing first, outside any try, and `readJsonOrFresh`
+    // rethrows such a fault -- it lands in the same catch, under its registration headline, with the real
+    // error printed after it.
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),
@@ -417,19 +426,23 @@ async function activate(c: Client<true>): Promise<void> {
   }
 
   try {
-    await writePluginState({
-      dataDir: DATA_DIR,
-      storage,
-      selected: selectedPlugins,
-      installed: installResult.installed,
-      installSkips: installResult.skips,
-      fallbacks: installResult.fallbacks,
-      loaded: loadResult.loaded,
-      loadErrors: loadResult.errors,
-      processEnv: process.env,
-      previous: previousState,
-      now: () => new Date(),
-    });
+    if (previousStateUnread) {
+      console.error("[plugins] data/plugins/state.json could not be read, so it is left as it is this boot (not rewritten)");
+    } else {
+      await writePluginState({
+        dataDir: DATA_DIR,
+        storage,
+        selected: selectedPlugins,
+        installed: installResult.installed,
+        installSkips: installResult.skips,
+        fallbacks: installResult.fallbacks,
+        loaded: loadResult.loaded,
+        loadErrors: loadResult.errors,
+        processEnv: process.env,
+        previous: previousState,
+        now: () => new Date(),
+      });
+    }
   } catch (err) {
     // A data/plugins/state.json write failure (a full/read-only volume) is bookkeeping for ops
     // tooling — it must not crash a bot that is otherwise up and serving.

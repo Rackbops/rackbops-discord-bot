@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, renameSync } from "node:fs";
+import { mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { resolveDataDir } from "./dataDir";
 
@@ -41,8 +41,9 @@ let tmpCounter = 0;
 // replacement are very likely the SAME small pid, both starting `tmpCounter` at zero — their first
 // writes to a shared path used to pick the identical temp name, exactly the collision #154's
 // per-process naming was meant to rule out and didn't. This token is what actually distinguishes two
-// processes that agree on both pid and counter.
-const TMP_TOKEN = randomBytes(4).toString("hex");
+// processes that agree on both pid and counter. Exported for the test that pins its shape and that two
+// processes differ; nothing else reads it.
+export const TMP_TOKEN = randomBytes(4).toString("hex");
 
 /** The temp path `writeJsonAtomic` writes to before its rename — one exported pure function so the
  *  no-collision guarantee is testable without spinning up two processes. `pid`/`token`/`counter` are
@@ -55,9 +56,9 @@ export function tmpPathFor(path: string, pid: number, token: string, counter: nu
 
 /**
  * Atomically writes `data` as JSON to `path`: a temp file in the same directory, then a rename —
- * never a bare write, which a crash mid-write could leave unparseable for the next read. Mirrors
- * `state.ts`'s `saveStateTo`, generalized so `links.ts` and `characters.ts` both call this instead
- * of each reimplementing the same three lines.
+ * never a bare write, which a crash mid-write could leave unparseable for the next read.
+ * `state.ts`'s `saveStateTo` and the plugins' storage both come here (#510): one implementation of
+ * temp+rename.
  *
  * **Not safe to call twice concurrently for the same `path` from the SAME process** — two
  * overlapping calls both write, then both rename, the winner is whichever rename lands last, and
@@ -88,17 +89,58 @@ export async function writeJsonAtomic(path: string, data: unknown): Promise<void
 export async function writeFileAtomic(path: string, text: string): Promise<void> {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = tmpPathFor(path, process.pid, TMP_TOKEN, ++tmpCounter);
-  await Bun.write(tmp, text);
-  renameSync(tmp, path);
+  try {
+    await Bun.write(tmp, text);
+    renameSync(tmp, path);
+  } catch (err) {
+    // #509: a failed write or rename must not leave the temp file behind — the counter means a retry
+    // never reuses this name, so without this each failure leaks one file for good. The cleanup's own
+    // failure (EBUSY/EPERM on Windows) must not mask the real error.
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // the original error is the one worth throwing
+    }
+    throw err;
+  }
+}
+
+/** Logs that `path` is unusable and renames it to `<path>.corrupt-<ts>`; a failed rename is logged, not
+ *  thrown. The one move-aside both `readJsonOrFresh` and `state.ts`'s shape check use. */
+export function moveCorruptAside(path: string, label: string, reason: string): void {
+  console.error(`[${label}] ${path} is unreadable or corrupt — starting fresh: ${reason}`);
+  const corrupt = `${path}.corrupt-${Date.now()}`;
+  try {
+    renameSync(path, corrupt);
+    console.error(`[${label}] moved the corrupt file aside to ${corrupt} for inspection`);
+  } catch (renameErr) {
+    console.error(`[${label}] couldn't move the corrupt file aside: ${renameErr}`);
+  }
+}
+
+/**
+ * What a throw from `Bun.file(path).json()` means (Bun 1.4.2, probed): a `SyntaxError` is a file that
+ * parsed badly (empty, truncated, not JSON) — corrupt; `ENOENT` is a file that vanished after `exists()`
+ * — absent; anything else (EACCES, EIO, EMFILE, EISDIR) is a read that failed on a file that may be
+ * intact — an error, never a reason to move the file aside. Pure.
+ */
+export function classifyReadError(err: unknown): "corrupt" | "absent" | "error" {
+  if (err instanceof SyntaxError) return "corrupt";
+  if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "ENOENT") return "absent";
+  return "error";
 }
 
 /**
  * Reads and parses JSON at `path`, falling back to `fresh()` for an absent file (the common
- * fresh-install case). A present-but-corrupt file (truncated, empty, or otherwise unparseable —
- * a power loss or OOM-kill mid-write) is logged and moved aside to `<path>.corrupt-<timestamp>`
- * rather than thrown, so a bad file degrades to "this one file's history lost once" instead of
- * crashing whatever awaited it at import. `label` names which file this is, in the log line —
- * mirrors `state.ts`'s `loadStateFrom`, generalized the same way as `writeJsonAtomic` above.
+ * fresh-install case). A file that **parsed badly** (empty, truncated, not JSON — a process killed
+ * mid-write before temp+rename (#68), or a hand edit; temp+rename covers an OOM-kill, a SIGKILL or a
+ * crash, but there is no `fsync`, so a host power loss is outside it, #510) is logged and moved aside
+ * to `<path>.corrupt-<timestamp>` rather than thrown, so a bad file degrades to "this one file's
+ * history lost once" instead of crashing whatever awaited it at import. Once the file is known to
+ * exist, a read that fails for any other reason (EACCES, EIO, ...) is logged and **rethrown**:
+ * returning fresh would let the next write overwrite a file that may be intact, and moving it aside
+ * would hide an environment fault (#509). That reaches every caller, the installed plugins'
+ * `HostStorage.readJsonOrFresh` included. `label` names which file this is, in the log line.
  */
 export async function readJsonOrFresh<T>(path: string, fresh: () => T, label: string): Promise<T> {
   const file = Bun.file(path);
@@ -106,15 +148,14 @@ export async function readJsonOrFresh<T>(path: string, fresh: () => T, label: st
   try {
     return (await file.json()) as T;
   } catch (err) {
-    console.error(`[${label}] ${path} is unreadable or corrupt — starting fresh: ${err}`);
-    const corrupt = `${path}.corrupt-${Date.now()}`;
-    try {
-      renameSync(path, corrupt);
-      console.error(`[${label}] moved the corrupt file aside to ${corrupt} for inspection`);
-    } catch (renameErr) {
-      console.error(`[${label}] couldn't move the corrupt file aside: ${renameErr}`);
+    const kind = classifyReadError(err);
+    if (kind === "absent") return fresh();
+    if (kind === "corrupt") {
+      moveCorruptAside(path, label, String(err));
+      return fresh();
     }
-    return fresh();
+    console.error(`[${label}] ${path} could not be read (${err}); not treating it as corrupt`);
+    throw err;
   }
 }
 
@@ -148,16 +189,20 @@ export function createJsonWriter<T>(path: string): { save: (data: T) => Promise<
 
 /**
  * Serializes a full read-modify-write cycle per file path — not just the write. Each path gets
- * its own queue (a `Map`, populated lazily), so unrelated files' updates never wait on each
- * other; two updates to the SAME path are fully ordered, so the second's `mutate` always sees
- * the first's result, never a stale read. This is what `characters.ts` needs and `createJsonWriter`
- * alone doesn't provide: one Discord User's file can receive two pushes (two different Account
- * Labels, or a retry) close enough together that a naive read-then-write loses one of them.
+ * its own queue (a `Map`, populated lazily and emptied as queues settle, #511), so unrelated
+ * files' updates never wait on each other; two updates to the SAME path are fully ordered, so the
+ * second's `mutate` always sees the first's result, never a stale read. This is what
+ * `characters.ts` needs and `createJsonWriter` alone doesn't provide: one Discord User's file can
+ * receive two pushes (two different Account Labels, or a retry) close enough together that a naive
+ * read-then-write loses one of them.
  */
 export function createKeyedJsonMutator<T>(): {
   update: (path: string, fresh: () => T, mutate: (current: T) => T, label: string) => Promise<void>;
   /** Settles once every update queued so far has, on every path (what the test-state guard reads). */
   idle: () => Promise<void>;
+  /** Paths that still hold a queue — an entry is dropped once its last update settles (#511), so this is
+   *  the number of paths with an update in flight, not every path ever touched. */
+  pendingPaths: () => number;
 } {
   const chains = new Map<string, Promise<void>>();
   return {
@@ -165,9 +210,14 @@ export function createKeyedJsonMutator<T>(): {
       const prior = chains.get(path) ?? Promise.resolve();
       const run = () => readJsonOrFresh<T>(path, fresh, label).then((current) => writeJsonAtomic(path, mutate(current)));
       const next = prior.then(run, run);
-      chains.set(path, next.catch(() => {}));
+      const tail = next.catch(() => {});
+      chains.set(path, tail);
+      void tail.then(() => {
+        if (chains.get(path) === tail) chains.delete(path);
+      });
       return next;
     },
     idle: () => Promise.all(chains.values()).then(() => {}),
+    pendingPaths: () => chains.size,
   };
 }
