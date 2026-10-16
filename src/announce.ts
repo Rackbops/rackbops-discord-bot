@@ -378,6 +378,7 @@ export function livePluginRequestDeps(): PluginRequestDeps {
     mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
     requestRestart,
     hostApiVersion: HOST_API_VERSION,
+    adminUserIds: config.adminUserIds,
     now: () => new Date(),
     log: console,
     routing: {

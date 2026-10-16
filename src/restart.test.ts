@@ -15,6 +15,7 @@ import {
   requestRestart,
   resetForTest,
   restartPending,
+  restartRequested,
   runExitHooks,
   setExitFn,
   stateForTest,
@@ -211,6 +212,40 @@ describe("a deferred restart's deadline (#512)", () => {
     resetForTest();
     await Bun.sleep(60);
     expect(exits).toEqual([]);
+  });
+});
+
+// #419: the boot report-back waits only for an EXIT that is requested -- a handoff alone can still fail and
+// leave this process running, owing the report.
+describe("restartRequested (#419)", () => {
+  test("false when nothing is in flight", () => {
+    expect(restartRequested()).toBe(false);
+  });
+
+  test("false during a handoff alone, while restartPending() is true", () => {
+    beginHandoff("redeploy");
+    expect(restartPending()).toBe(true);
+    expect(restartRequested()).toBe(false);
+  });
+
+  test("true for a restart deferred by a critical section", () => {
+    beginCritical();
+    requestRestart("test");
+    expect(restartRequested()).toBe(true);
+    expect(exits).toEqual([]);
+  });
+
+  test("true for a restart requested while a handoff is active too", () => {
+    beginCritical();
+    beginHandoff("redeploy");
+    requestRestart("test");
+    expect(restartRequested()).toBe(true);
+    expect(exits).toEqual([]);
+  });
+
+  test("true once a shutdown has begun", () => {
+    beginShutdown("SIGTERM");
+    expect(restartRequested()).toBe(true);
   });
 });
 
