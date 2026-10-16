@@ -183,8 +183,8 @@ function shortError(error: unknown, max = 120): string | undefined {
 }
 
 /** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
- *  note, skip/snooze markers and, for a plugin that is not running this boot, that it is down with its
- *  error (#544). Uses the (freshly-fetched) index for "available" + notes. Pure. */
+ *  note, skip/snooze markers and, for a plugin that is not running this boot, that it is down with the
+ *  first error recorded for it (#544). Uses the (freshly-fetched) index for "available" + notes. Pure. */
 export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date): string {
   if (state.plugins.length === 0) return "No plugins installed.";
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
@@ -487,10 +487,11 @@ export function decidePluginReportOutcome(
   const short = shortError(entry?.error);
   const why = short ? ` (${short})` : "";
   if (entry && installed !== undefined && installed !== to) {
-    // Reverted: the target failed to install, so the previous version was reused (from cache) — or, on
-    // install.ts's last-good-failed path, nothing was. `error` names the TARGET's failure (host.ts builds it
-    // first-failure-wins), so the tail only says whether the previous version runs (#543): "still on" implies
-    // it does.
+    // Reverted: the target failed to install, so the previous version was installed again (normally from
+    // the cache) — or, on install.ts's last-good-failed path, nothing was. `error` is the FIRST failure this
+    // boot (host.ts builds it first-failure-wins), which on a reverted update is the target's install
+    // failure, not why the previous version is down; so the tail only says whether that version runs
+    // (#543): "still on" implies it does.
     return entry.active
       ? { ok: false, message: `⚠️ **${name}** could not be updated to ${to}${why} — still on ${installed}.` }
       : { ok: false, message: `⚠️ **${name}** could not be updated to ${to}${why} — and ${installed} is not running either.` };

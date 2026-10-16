@@ -73,7 +73,8 @@ export interface InstallResult {
   skips: Record<string, string>;
   /** #104: name -> {the target that failed, why}, when a `/plugins update` target-version install
    *  failed but the recorded previous version was used instead. The plugin IS installed (on its
-   *  previous version); this drives the boot report-back's "could not update … still on …" message. */
+   *  previous version); this drives the boot report-back's "could not update … still on …" message (or its
+   *  "… is not running either" variant, when that previous version then fails to load or activate, #543). */
   fallbacks: Record<string, { attempted: string; reason: string }>;
 }
 

@@ -310,7 +310,7 @@ describe("renderPluginsList", () => {
       expect(out.split("\n")[0]).toMatch(/^• \*\*p\*\* — off \(installed 1\.0\.0\)$/);
       expect(out).not.toContain("not running");
     });
-    test("many down plugins with long errors still fit Discord's cap", () => {
+    test("many down plugins with long errors still fit Discord's cap (the clamp predates #544; the marker must not break it)", () => {
       const plugins = Array.from({ length: 40 }, (_, i) => stateEntry(`p${i}`, "1.0.0", { active: false, error: "z".repeat(500) }));
       const out = renderPluginsList(state(plugins), index([]), NOW);
       expect(out.length).toBeLessThanOrEqual(2000);
@@ -758,9 +758,30 @@ describe("decidePluginReportOutcome (#104)", () => {
     const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false }));
     expect(r).toEqual({ ok: false, message: "⚠️ **a** could not be updated to 1.1.0 — and 1.0.0 is not running either." });
   });
-  test("reverted and running keeps the exact wording it always had", () => {
+  test("reverted and running keeps the exact wording it always had (for a short one-line error)", () => {
     const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: true, error: "integrity mismatch for 1.1.0" }));
     expect(r).toEqual({ ok: false, message: "⚠️ **a** could not be updated to 1.1.0 (integrity mismatch for 1.1.0) — still on 1.0.0." });
+  });
+  test("a blank error adds no empty parenthesis, in any of the three failure branches", () => {
+    for (const error of ["", "  \n "]) {
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false, error })).message).toBe(
+        "⚠️ **a** could not be updated to 1.1.0 — and 1.0.0 is not running either.",
+      );
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: true, error })).message).toBe(
+        "⚠️ **a** could not be updated to 1.1.0 — still on 1.0.0.",
+      );
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.1.0", { active: false, error })).message).toBe(
+        "⚠️ **a** updated to 1.1.0 but failed to start.",
+      );
+    }
+  });
+  // No state entry at all, or one that never recorded an installed version: neither is a "reverted" update, so
+  // neither may print "still on undefined" / "undefined is not running either".
+  test("no entry, or an entry with no installed version, is the failed-to-start message", () => {
+    const failed = "⚠️ **a** updated to 1.1.0 but failed to start.";
+    expect(decidePluginReportOutcome(report, undefined)).toEqual({ ok: false, message: failed });
+    expect(decidePluginReportOutcome(report, stateEntry("a", undefined, { active: false })).message).toBe(failed);
+    expect(decidePluginReportOutcome(report, stateEntry("a", undefined, { active: true })).message).toBe(failed);
   });
   test("a long error in the report-back is collapsed and cut like the list's", () => {
     const reverted = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false, error: `first\n${"q".repeat(300)}` }));
