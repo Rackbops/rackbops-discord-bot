@@ -26,8 +26,9 @@ describe("ownContainerShortId (#506 item 10)", () => {
     expect(ownContainerShortId({ HOSTNAME: "0123456789ab" })).toBe("0123456789ab");
   });
 
-  // Mutation: returning env.HOSTNAME unconditionally would stamp a pinned name on every marker, and the original
-  // would then take every marker the replacement writes for a stranger's.
+  // Mutation: returning env.HOSTNAME unconditionally would put a pinned name in every marker. It names no container
+  // (the original's `markerFor` accepts such a marker as-is, like an older standby's), so what a marker carries
+  // would stop meaning "the id of the container that wrote me".
   test("a hostname pinned in compose, an uppercase or too-long id, an empty one, or none at all is not an id", () => {
     expect(ownContainerShortId({ HOSTNAME: "my-pinned-host" })).toBeUndefined();
     expect(ownContainerShortId({ HOSTNAME: "0123456789AB" })).toBeUndefined();

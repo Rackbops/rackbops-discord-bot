@@ -1071,6 +1071,7 @@ describe("resolveUpdateAttempt — a rolled-back original (#558)", () => {
     const warned = q.lines.filter((l) => l.level === "warn");
     expect(warned).toHaveLength(1);
     expect(warned[0]!.text).toContain(shortSha(NEW));
+    expect(warned[0]!.text.split(shortSha(NEW)).length - 1).toBe(2); // "retired by X" and "skips X"
     expect(warned[0]!.text).toContain("rolled back by the operator");
     expect(warned[0]!.text).toContain("/update"); // config.commandPrefix is empty in this process
   });
@@ -1128,6 +1129,21 @@ describe("resolveUpdateAttempt — a rolled-back original (#558)", () => {
     expect("swapInFlight" in onDisk()).toBe(false);
   });
 
+  // Mutation: the stale-clear save as a bare `await saveState()` -- the "never throws" contract on this path.
+  test("U2: a stale record whose clearing cannot be saved is logged, still resolves none, and never throws", async () => {
+    config.gitSha = THIRD;
+    await seed({ retired: retired() });
+    const q = quiet();
+    const write = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+    try {
+      expect(await resolveUpdateAttempt({ probe: mustNotProbe as never, log: q.log })).toBe("none");
+    } finally {
+      write.mockRestore();
+    }
+    expect(q.lines.some((l) => l.level === "warn" && l.text.includes("could not save the cleared retirement record"))).toBe(true);
+    expect(state.retiredBy).toBeUndefined(); // cleared in memory
+  });
+
   test("U2: a build with no sha cannot tell: the record is cleared, not acted on", async () => {
     config.gitSha = undefined;
     await seed({ retired: retired() });
@@ -1173,6 +1189,11 @@ describe("resolveUpdateAttempt — a rolled-back original (#558)", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       expect((await checkForUpdate({}, deps)).decision).toBe("suppressed");
+      // The suppressed warning says why: a rollback, not "came back on the build it exited from ... rebuild the image".
+      const pending = warn.mock.calls.map((c: unknown[]) => String(c[0])).filter((m: string) => m.includes("still pending"));
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toContain("the last attempt failed: it landed and was rolled back by the operator");
+      expect(pending[0]).not.toContain("rebuild the image");
       expect((await checkForUpdate({ force: true }, deps)).decision).toBe("restart");
     } finally {
       warn.mockRestore();

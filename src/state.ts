@@ -217,8 +217,8 @@ export function saveState(): Promise<void> {
  * replacement, right after it has stopped the original: its own copy was loaded at import, and the original may have
  * persisted a release id (or anything else) since, which the replacement's first save would otherwise drop. An absent
  * file keeps what is in memory; a file that will not parse is moved aside by `readJsonOrFresh` (as at load, so the
- * evidence outlives the next save) and what is in memory is kept; a file that parses but is not a state object is kept
- * on disk and ignored. A reload never turns a good snapshot into an empty one.
+ * evidence outlives the next save) and what is in memory is kept; a file that parses but is not a state object is
+ * ignored (it stays where it is until the next save replaces it). A reload never turns a good snapshot into an empty one.
  */
 export async function reloadState(log: Pick<Console, "warn"> = console): Promise<"reloaded" | "kept"> {
   let raw: unknown;
@@ -243,16 +243,18 @@ export async function reloadState(log: Pick<Console, "warn"> = console): Promise
   return "reloaded";
 }
 
-/** #558: the replacement's record of the swap it just completed, from the swap record the original armed (D1a). */
+/** #558: the replacement's record of the swap it just completed, from the swap record the original armed (#450). */
 export async function recordRetirement(replacementSha: string | undefined, log: Pick<Console, "log" | "warn"> = console): Promise<void> {
   if (!replacementSha) {
     log.warn("[state] not recording the retirement: this build has no GIT_SHA");
     return;
   }
-  // A restart of this replacement during its probation: its first life recorded this already (and then resolved the
-  // swap record as landed, so there is nothing to read now). Nothing to do, nothing to say.
-  if (state.retiredBy?.sha === replacementSha) return;
   const originalSha = state.swapInFlight?.fromSha;
+  // A restart of this replacement during its probation: its first life recorded this already (and then resolved the
+  // swap record as landed, so there is usually nothing to read now; if it died before it could, the record it reads
+  // names the same original). Nothing to do, nothing to say. A swap record naming a DIFFERENT original makes what is
+  // on file a leftover of an earlier swap to this same build, and is rewritten below.
+  if (state.retiredBy?.sha === replacementSha && (originalSha === undefined || state.retiredBy.originalSha === originalSha)) return;
   if (!originalSha) {
     log.warn(
       "[state] not recording the retirement: no swap record from the original to read (it ran a build before #450, or it had already resolved the record) — if this swap is rolled back, set AUTO_UPDATE=false on the original until a newer commit lands",

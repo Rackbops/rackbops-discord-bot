@@ -564,7 +564,7 @@ export async function redeploy(latestSha: string, opts: RedeployOptions = {}): P
       // The wait polls the marker rather than sleeping blind for the whole deadline: `takeOver`
       // writes `failed` (with a reason) the moment its own retire attempt throws, and a blind
       // sleep would sit on that answer for up to `RETIREMENT_DEADLINE_MS` before ever reading it.
-      console.log(`[redeploy] replacement verified${readyMarker?.sha ? ` (${shortSha(readyMarker.sha)})` : ""} — handing over`);
+      console.log(`[redeploy] replacement verified${typeof readyMarker?.sha === "string" && readyMarker.sha ? ` (${shortSha(readyMarker.sha)})` : ""} — handing over`);
       const retirement = await awaitRetirementFailure(replacementId, opts.deadlineMs, pollMs, undefined, foreign);
       if (retirement.kind === "failed") {
         console.error("[redeploy] replacement signalled failed after verifying — reclaiming");
@@ -908,7 +908,8 @@ async function restoreOriginalRestartPolicy(): Promise<void> {
  * Runs in the *replacement*: it announces `ready` (which stops the original counting toward its
  * deadline), restores the *original's* restart policy onto itself (#160 — not best-effort, see
  * {@link TakeOverEffects}), retires the *original* — `retireOriginal` STOPS that other container,
- * never this one, and removes nothing (#548) — and clears the marker. On success this returns, and
+ * never this one, and removes nothing (#548) — re-reads `state.json` and records which build it retired (#507, #558:
+ * both best-effort, see below), and clears the marker. On success this returns, and
  * `index.ts` goes on to `activate()`; this process is the survivor that becomes the live bot.
  *
  * What happens at the login versus after probation (#548): the login is the bar for STOPPING the

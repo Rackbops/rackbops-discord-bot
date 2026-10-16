@@ -17,6 +17,7 @@ const {
   reportUpdateOutcome,
 } = await import("./updateReport");
 const { config } = await import("./config");
+const { resetUpdateForTest } = await import("./update");
 const { state, saveState } = await import("./state");
 const { shortSha, DATA_DIR } = await import("./storage");
 type PendingUpdateReport = import("./state").PendingUpdateReport;
@@ -125,6 +126,7 @@ describe("updateOutcomeMessage", () => {
     expect(msg).toContain(shortSha(TO));
     expect(msg).toContain(shortSha(FROM));
     expect(msg).toContain("landed and was then rolled back");
+    expect(msg.split(shortSha(TO)).length - 1).toBe(2); // "the update to X" and "skip X"
     expect(msg).toContain("Automatic updates skip");
     expect(msg).toContain("/update"); // config.commandPrefix is empty in this process
     expect(msg).not.toContain("did not take");
@@ -355,8 +357,10 @@ describe("reportUpdateOutcome", () => {
     config.gitSha = realGitSha;
     state.pendingUpdateReport = undefined;
     state.swapInFlight = undefined;
+    state.retiredBy = undefined;
     state.attemptedUpdateToSha = undefined;
     await saveState();
+    resetUpdateForTest(); // a rolled-back boot remembers why the build is skipped (update.ts's `lastFailure`)
   });
 
   // R2: a swap in flight leaves the report to the new build, which is about to retire this process.
@@ -464,6 +468,37 @@ describe("reportUpdateOutcome", () => {
     expect(contents[0]).toContain("landed and was then rolled back");
     expect(state.pendingUpdateReport).toBeUndefined();
     expect(onDisk().pendingUpdateReport).toBeUndefined();
+  });
+
+  // #558, the crash between resolving and delivering (as for `interrupted`): boot N resolves `rolled-back` and dies;
+  // boot N+1 finds no record at all, and the report it reads back from disk still says the swap was rolled back.
+  test("a boot that dies after resolving a rollback: the next boot still reports rolled-back", async () => {
+    const { resolveUpdateAttempt } = await import("./update");
+    config.gitSha = FROM;
+    state.retiredBy = { sha: TO, originalSha: FROM, at: 1 };
+    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    await saveState();
+    const quiet = { log: () => {}, warn: () => {} };
+    expect(await resolveUpdateAttempt({ log: quiet })).toBe("rolled-back");
+
+    // Boot N dies here. Boot N+1 reads state.json back.
+    const disk = onDisk();
+    state.retiredBy = disk.retiredBy;
+    state.attemptedUpdateToSha = disk.attemptedUpdateToSha;
+    state.pendingUpdateReport = disk.pendingUpdateReport;
+    const resolution = await resolveUpdateAttempt({ log: quiet });
+    expect(resolution).toBe("none");
+
+    const contents: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, resolution, { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+    } finally {
+      log.mockRestore();
+    }
+    expect(contents).toHaveLength(1);
+    expect(contents[0]).toContain("landed and was then rolled back");
+    expect(contents[0]).not.toContain("wasn't rebuilt");
   });
 
   // Mutation: the `resolution = "none"` default becoming "in-flight" -- every report called without one would be held.

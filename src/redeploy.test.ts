@@ -818,7 +818,8 @@ describe("takeOver", () => {
   });
 
   // R6 (#506 item 10): the markers this process writes name the container that wrote them -- but only when HOSTNAME
-  // is Docker's 12-hex short id; a pinned name would otherwise make every marker look foreign to the original.
+  // is Docker's 12-hex short id; a pinned name is not an id, so the marker then carries none (and is accepted as an
+  // older standby's is).
   test("R6: the ready write and the catch's failed write carry the container's short id, and carry none for a pinned hostname", async () => {
     const before = process.env.HOSTNAME;
     try {
@@ -3634,6 +3635,33 @@ describe("redeploy — cleanup always runs", () => {
         expect({ id, where: "wait", outcome: wait.outcome }).toEqual({ id, where: "wait", outcome: "failed" });
       }
       expect(ignored()).toEqual([]);
+    });
+
+    // Mutation: `retirement wait` not given the shared set -- the same foreign id seen in the poll and again in the wait
+    // would be said twice in one attempt.
+    test("one foreign id is said once across the poll and the retirement wait", async () => {
+      quietDaemon({ afterStart: () => writeMarker(marker("failed", FOREIGN, { error: "foreign boom" })) });
+      let reads = 0;
+      const result = await redeploy("a".repeat(40), {
+        deadlineMs: 60,
+        pollMs: 15,
+        readMarker: async () => (++reads === 1 ? marker("ready", FOREIGN) : marker("ready", OWN)),
+      });
+      expect(result.outcome).toBe("stalled"); // the foreign ready was ignored once, the own ready decided, the foreign failed was ignored
+      expect(ignored()).toHaveLength(1);
+    });
+
+    // A marker is JSON on a shared volume: a `ready` whose sha is not a string must not turn a verified handoff into a
+    // failure (the log line asked for the sha's first characters).
+    test("a ready marker whose sha is not a string is still the verdict", async () => {
+      quietDaemon();
+      const result = await redeploy("a".repeat(40), {
+        deadlineMs: 20,
+        pollMs: 15,
+        readMarker: async () => marker("ready", OWN, { sha: 12345 as unknown as string }),
+      });
+      expect(result.outcome).toBe("stalled");
+      expect(logged().filter((m) => m.startsWith("[redeploy] replacement verified"))).toEqual(["[redeploy] replacement verified — handing over"]);
     });
 
     // Mutation: dropping the sha from the line; reading it from the wrong marker (the poll's, never the late re-read's).

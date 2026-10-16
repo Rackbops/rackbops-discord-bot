@@ -365,17 +365,15 @@ describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => 
     else writeFileSync(FILE, prior);
   });
 
-  // Mutations: keeping memory when the file parses (never replacing it); replacing in a new object (every importer
-  // holds this one); leaving a key the file lacks behind.
+  // Mutations: keeping memory when the file parses (never replacing it); leaving a key the file lacks behind. (The
+  // shared object keeps its identity because `state` is a const and the reload assigns into it.)
   test("S1: re-reads the file into the shared object, in place: the longer id list, the new key, and a key the file lacks is gone", async () => {
-    const same = state;
     state.seenReleaseIds["a/b"] = [1];
     state.attemptedUpdateToSha = "z".repeat(40); // in memory only
     writeFileSync(FILE, JSON.stringify({ seenReleaseIds: { "a/b": [1, 2, 3] }, retiredBy: { sha: NEW, originalSha: OLD, at: 5 } }));
     const q = quiet();
 
     expect(await reloadState(q.log)).toBe("reloaded");
-    expect(state).toBe(same);
     expect(state.seenReleaseIds["a/b"]).toEqual([1, 2, 3]);
     expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
     expect("attemptedUpdateToSha" in state).toBe(false);
@@ -400,6 +398,24 @@ describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => 
     expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
     expect(q.warns).toHaveLength(1);
     expect(q.warns[0]).toContain("absent");
+  });
+
+  // Mutation: letting a read error that is not corruption (EACCES, EIO) escape -- `reloadState` never throws, so a
+  // caller needs no catch of its own to keep the snapshot.
+  test("S2b: a read that fails (not corruption) keeps the snapshot and says so, and never throws", async () => {
+    state.seenReleaseIds["a/b"] = [1, 2];
+    writeFileSync(FILE, "{}");
+    const q = quiet();
+    const fail = failJsonRead(new Error("EIO: i/o error"));
+    try {
+      expect(await reloadState(q.log)).toBe("kept");
+    } finally {
+      fail.restore();
+    }
+    expect(state.seenReleaseIds["a/b"]).toEqual([1, 2]);
+    expect(q.warns).toHaveLength(1);
+    expect(q.warns[0]).toContain("could not re-read");
+    expect(q.warns[0]).toContain("EIO");
   });
 
   test("S3: a file that will not parse is moved aside by readJsonOrFresh and the snapshot is kept", async () => {
@@ -469,6 +485,34 @@ describe("reloadState / recordRetirement / clearRetirement (#507, #558)", () => 
     expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: 5 });
     expect(q.warns).toEqual([]);
     expect(q.logs).toEqual([]);
+  });
+
+  // Mutation: comparing only the build (the second conjunct dropped) keeps a leftover record that names an earlier
+  // original, and the rollback of THIS swap would then be read as stale and re-update.
+  test("S4: a leftover record for the same build but another original is rewritten from the swap record; the same original is not", async () => {
+    const OLDER = "c".repeat(40);
+    state.retiredBy = { sha: NEW, originalSha: OLDER, at: 5 };
+    state.swapInFlight = { fromSha: OLD, toSha: NEW, startedAt: 1 };
+    const q = quiet();
+    await recordRetirement(NEW, q.log);
+    expect(state.retiredBy).toEqual({ sha: NEW, originalSha: OLD, at: expect.any(Number) });
+    expect(state.retiredBy!.at).not.toBe(5);
+    expect(onDisk().retiredBy.originalSha).toBe(OLD);
+
+    // the same original (this replacement died in probation before it resolved the record): nothing to do
+    const mine = { sha: NEW, originalSha: OLD, at: 7 };
+    state.retiredBy = mine;
+    const write = spyOn(Bun, "write");
+    const again = quiet();
+    try {
+      await recordRetirement(NEW, again.log);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.retiredBy).toBe(mine);
+    expect(again.warns).toEqual([]);
+    expect(again.logs).toEqual([]);
   });
 
   test("S4: a build with no GIT_SHA records nothing and says why", async () => {

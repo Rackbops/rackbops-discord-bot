@@ -520,6 +520,9 @@ export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promi
     // In place, as the `interrupted` mark is: `reportUpdateOutcome` delivers only the report object it was handed
     // (`report === owed`, identity), so a copy must not replace it.
     if (owed?.fromSha === retired!.originalSha && owed.toSha === retired!.sha) owed.rolledBack = true;
+    // So the first `suppressed` check says why (not "came back on the build it exited from ... rebuild the image").
+    lastFailure = { sha: retired!.sha, reason: "it landed and was rolled back by the operator" };
+    suppressedWarnedFor = undefined;
     log.warn(
       `[update] this container was retired by ${shortSha(retired!.sha)} and is running again — rolled back by the operator; the automatic check skips ${shortSha(retired!.sha)} until a newer commit lands, and /${prefixedName(config.commandPrefix, "update")} applies it anyway`,
     );
