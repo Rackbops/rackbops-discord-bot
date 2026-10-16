@@ -103,7 +103,7 @@ resolve_deploy_identity() {
 # swap creates, so the two cannot share a daemon; the bare name `next` is refused by the same rule (its container,
 # rackbops-discord-bot-next, could only collide with a compose-only deployment named rackbops-discord-bot). A NEW
 # install refuses; a re-run on an instance that already exists only warns, because a re-run must never take a
-# deployed instance down. The reverse -- a new `prod` beside a legacy `prod-next` -- warns too and continues.
+# deployed instance down. The reverse -- any run for `prod` while a `prod-next` exists -- warns too and continues.
 check_instance_name() {
   case "$INSTANCE" in
     next|*-next)

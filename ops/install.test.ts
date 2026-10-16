@@ -224,7 +224,7 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
 // entirely, letting an unregistered one through silently. What this scan does not check is the -p
 // itself: a registered `mktemp` with no -p passes here (verified), and putting the temp file in
 // /tmp rather than beside its destination is a separate defect — the EXDEV one #96 fixed in
-// bot-ops.sh, argued for install.sh at ops/install.sh:117-120.
+// bot-ops.sh, argued for install.sh at ops/install.sh:147-151.
 const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
 
 // The registration must name the SAME variable the mktemp assigned. Requiring only "some
@@ -337,7 +337,7 @@ async function runValidate(fileLines: string[]): Promise<Run> {
   }
 }
 
-// A shape matching what install.sh's own STACKENV heredoc actually writes (install.sh:220-226),
+// A shape matching what install.sh's own STACKENV heredoc actually writes (install.sh:339-347),
 // with BOT_OPS_CONFIG_DIR pointed at a REAL directory (validDir) so the base case is genuinely
 // valid end to end, not just absolute-looking.
 function validStackEnv(validDir: string): string[] {
@@ -1125,6 +1125,7 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
       expect(r.exitCode).toBe(1);
       expect(r.stdout.trim()).toBe("");
       expect(r.stderr).toContain("would be 'rackbops-discord-bot-prod-next', which ends in -next");
+      expect(r.stderr).toContain("the suffix the self-update reserves for its replacement (<container>-next)"); // the issue's acceptance: say WHY
       expect(r.stderr).toContain("(#567)");
     });
   });
@@ -1176,16 +1177,20 @@ describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-ne
     }
   });
 
-  test("a new prod beside a legacy prod-next (either of its directories) warns and continues", async () => {
+  test("prod beside a legacy prod-next (either of its directories) warns and continues, new or re-run", async () => {
     for (const sibling of ["config", "stack"] as const) {
-      await withInstanceDirs("prod", async (dirs) => {
-        mkdirSync(sibling === "config" ? `${dirs.configDir}-next` : `${dirs.stackDir}-next`, { recursive: true });
-        const r = await runName("prod", dirs);
-        expect(r.exitCode, sibling).toBe(0);
-        expect(r.stdout.trim(), sibling).toBe("ok prod");
-        expect(r.stderr, sibling).toContain("WARNING: an instance 'prod-next' already exists");
-        expect(r.stderr, sibling).toContain("(#567)");
-      });
+      for (const rerun of [false, true]) {
+        const label = `${sibling} sibling, ${rerun ? "re-run" : "new"}`;
+        await withInstanceDirs("prod", async (dirs) => {
+          mkdirSync(sibling === "config" ? `${dirs.configDir}-next` : `${dirs.stackDir}-next`, { recursive: true });
+          if (rerun) mkdirSync(dirs.configDir, { recursive: true }); // prod itself already exists: still warned, still continues
+          const r = await runName("prod", dirs);
+          expect(r.exitCode, label).toBe(0);
+          expect(r.stdout.trim(), label).toBe("ok prod");
+          expect(r.stderr, label).toContain("WARNING: an instance 'prod-next' already exists");
+          expect(r.stderr, label).toContain("(#567)");
+        });
+      }
     }
   });
 });

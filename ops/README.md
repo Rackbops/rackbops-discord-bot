@@ -137,7 +137,8 @@ the identical `OUT OF DATE` warning for both cases.
 
 ## Bootstrapping a fresh instance (no checkout)
 
-`ops/install.sh` sets up a new instance (`debug`, `prod`, or any other lowercase name that is not `bin`, `next` or `*-next`) on a host that has
+`ops/install.sh` sets up a new instance (`debug`, `prod`, or any other name of lowercase letters, digits and hyphens that is not `bin`, `next` or
+`*-next`) on a host that has
 nothing but `git`, `docker`, and `curl` — no clone of this repo, no Bun toolchain. It's curl-able
 directly from the public repo:
 
@@ -150,9 +151,9 @@ Full usage: `install.sh <instance> [branch] [--force-bin]`. Pass a branch as the
 (`bash -s -- debug my-branch`) to build from something other than `main`; add `--force-bin` as a
 third argument only if you need to force-install that branch's `bot-ops.sh` into the host-shared
 `bin/` despite it differing from `main`'s (see "Keeping `bot-ops.sh` and `docker-compose.yml`
-current" above, issue #230). `bin`, and any name that is `next` or ends in `-next`, is refused for a new
-instance (#567: `-next` is the suffix a self-update gives its replacement container); a re-run on an existing
-instance of that shape only warns, as does a new instance whose `-next` sibling already exists.
+current" above, issue #230). `bin` is always refused. A name that is `next` or ends in `-next` is refused for a
+new instance (#567: `-next` is the suffix a self-update gives its replacement container); a re-run on an existing
+instance of that shape only warns, as does any run for an instance whose `-next` sibling already exists.
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
 a re-run — fill in secrets there by hand). It refreshes three things that are deployment
@@ -457,8 +458,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   before #567 with a name ending in `-next` (`canary-next`) keeps it (a new one is refused): the bot knows its own
   name from its compose project, self-updates into `<name>-next`, and a replacement that never took its name is
   healed to the instance's name (unless a sibling instance owns that standby name: instances `prod` and
-  `prod-next` cannot share a daemon; `install.sh` refuses a new `prod-next` and warns a new `prod` beside a
-  legacy `prod-next`, #567). A compose-only deployment whose `container_name` ends in `-next` without being its
+  `prod-next` cannot share a daemon; `install.sh` refuses a new `prod-next` and warns any run for `prod` beside an
+  existing `prod-next`, #567). A compose-only deployment whose `container_name` ends in `-next` without being its
   project's, and that had already self-updated before #547, would be renamed at its next boot
   (`install.sh`'s guard, #567, does not reach a compose-only deployment). (c) Neither yet: wait. An **exited**
   `<name>-next` blocks nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
