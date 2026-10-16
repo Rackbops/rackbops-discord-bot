@@ -1,5 +1,5 @@
 // Child-process fixture for src/docker.test.ts (#459). Not a test file itself. The parent spawns it with
-// DOCKER_SOCKET set to the EMPTY string -- a blank `DOCKER_SOCKET=` line in the operator's .env -- and it
+// BOT_DOCKER_SOCKET set to the EMPTY string -- a blank `BOT_DOCKER_SOCKET=` line in the operator's .env -- and it
 // prints the `unix` option src/docker.ts's api() really hands to fetch.
 //
 // Why a child: src/docker.ts reads the variable once at import. `resolveDockerSocket` is pinned in-process

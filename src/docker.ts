@@ -9,19 +9,20 @@
 
 import { clampUpstreamBody } from "./github";
 
-/** The daemon socket. A TEST SEAM, not an operator knob (compare `BOT_DATA_DIR`): the compose file always
+/** The daemon socket. A TEST SEAM, not an operator knob (compare `BOT_DATA_DIR`; the `BOT_` prefix is deliberate,
+ *  so a generic `DOCKER_SOCKET` copied from another stack's `.env` cannot redirect it): the compose file always
  *  mounts the host's daemon at this path inside the container (entrypoint.sh fixes the socket's group up at
  *  the same path), so a deployment never sets it; the suite's end-to-end transport test (#459) points a
  *  child process at a socket it serves itself. Deliberately absent from `.env.example`, reserved in
  *  `bot-ops.sh` (never panel-editable, never claimable by a plugin manifest), and cleared by the test
  *  preload so an ambient value cannot change what the suite asserts. A plain environment read, like
  *  HOSTNAME's below. An EMPTY value counts as unset (as it does for `BOT_DATA_DIR` and `config.ts`'s
- *  `optional()`): the operator's whole `.env` reaches this process, and a blank `DOCKER_SOCKET=` line must
+ *  `optional()`): the operator's whole `.env` reaches this process, and a blank `BOT_DOCKER_SOCKET=` line must
  *  not turn every daemon call into a connection to nowhere. */
 export function resolveDockerSocket(env: Record<string, string | undefined> = process.env): string {
-  return env.DOCKER_SOCKET || "/var/run/docker.sock";
+  return env.BOT_DOCKER_SOCKET || "/var/run/docker.sock";
 }
-const DOCKER_SOCKET = resolveDockerSocket();
+const BOT_DOCKER_SOCKET = resolveDockerSocket();
 const BASE = "http://docker";
 
 // Every daemon call is bounded, so a genuinely hung socket (connected, far end never responds and
@@ -105,7 +106,7 @@ export interface CreateContainerSpec {
 
 /** One daemon request under a caller-supplied signal. Always called from inside `bounded`. */
 async function api(path: string, signal: AbortSignal, init: RequestInit = {}): Promise<Response> {
-  return fetch(`${BASE}${path}`, { ...init, unix: DOCKER_SOCKET, signal });
+  return fetch(`${BASE}${path}`, { ...init, unix: BOT_DOCKER_SOCKET, signal });
 }
 
 async function ok(path: string, signal: AbortSignal, init: RequestInit = {}): Promise<Response> {

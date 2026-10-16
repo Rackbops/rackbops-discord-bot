@@ -1,14 +1,14 @@
 // Child-process fixture for src/docker.test.ts's real-transport test (#459). Not a test file itself: the
-// parent spawns it with DOCKER_SOCKET pointing at a path this process serves, it drives src/docker.ts's
+// parent spawns it with BOT_DOCKER_SOCKET pointing at a path this process serves, it drives src/docker.ts's
 // REAL fetch over that socket, prints one JSON object on stdout, and exits.
 //
-// Why a child: src/docker.ts reads DOCKER_SOCKET once at import and the suite runs in one process with one
+// Why a child: src/docker.ts reads BOT_DOCKER_SOCKET once at import and the suite runs in one process with one
 // module registry, so the path cannot be changed for one test; and the point is the real `fetch(url,
 // { unix })` plus the real abort, which every in-process test stubs away. Expects from the parent:
-// DOCKER_SOCKET, and the inherited test env (src/docker.ts imports ./github, which imports ./config, so
+// BOT_DOCKER_SOCKET, and the inherited test env (src/docker.ts imports ./github, which imports ./config, so
 // DISCORD_TOKEN and ANNOUNCE_CHANNEL_ID must be set -- the preload sets them in the parent's process.env).
-const socket = process.env.DOCKER_SOCKET;
-if (!socket) throw new Error("DOCKER_SOCKET must be set by the parent");
+const socket = process.env.BOT_DOCKER_SOCKET;
+if (!socket) throw new Error("BOT_DOCKER_SOCKET must be set by the parent");
 
 const server = Bun.serve({
   unix: socket,

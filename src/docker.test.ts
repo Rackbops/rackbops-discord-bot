@@ -60,8 +60,8 @@ describe("parseContainerId", () => {
 describe("resolveDockerSocket (#459)", () => {
   test("defaults to /var/run/docker.sock when the variable is unset or empty, and otherwise takes it as given", () => {
     expect(resolveDockerSocket({})).toBe("/var/run/docker.sock");
-    expect(resolveDockerSocket({ DOCKER_SOCKET: "" })).toBe("/var/run/docker.sock");
-    expect(resolveDockerSocket({ DOCKER_SOCKET: "/srv/d.sock" })).toBe("/srv/d.sock");
+    expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "" })).toBe("/var/run/docker.sock");
+    expect(resolveDockerSocket({ BOT_DOCKER_SOCKET: "/srv/d.sock" })).toBe("/srv/d.sock");
   });
 });
 
@@ -484,7 +484,7 @@ describe("daemon calls", () => {
 // the REAL fetch from src/docker.ts in a child process (test/dockerSocketChild.ts) against a
 // `Bun.serve({ unix })` the child starts itself: the ping must answer through the socket, and a call to a
 // handler that never answers and one to a handler that sends one body byte and wedges must both be cut by
-// the bound, in well under a second. A child because src/docker.ts reads DOCKER_SOCKET once at import and
+// the bound, in well under a second. A child because src/docker.ts reads BOT_DOCKER_SOCKET once at import and
 // this process has one module registry (the preload clears the variable here, so nothing real is reachable).
 // Runs on Windows and Linux; CI's Linux run is the one that counts for the production kernel.
 describe("the real transport (#459)", () => {
@@ -498,11 +498,11 @@ describe("the real transport (#459)", () => {
     elapsedMs: number;
   }
 
-  /** Runs a fixture in a child process with `DOCKER_SOCKET` as given and returns the last stdout line, parsed. */
+  /** Runs a fixture in a child process with `BOT_DOCKER_SOCKET` as given and returns the last stdout line, parsed. */
   function runFixture<T>(fixture: string, socket: string): T {
     const child = Bun.spawnSync([process.execPath, fixture], {
       cwd: join(import.meta.dir, ".."),
-      env: { ...process.env, DOCKER_SOCKET: socket },
+      env: { ...process.env, BOT_DOCKER_SOCKET: socket },
       stdout: "pipe",
       stderr: "pipe",
       timeout: CHILD_TIMEOUT_MS,
@@ -516,16 +516,16 @@ describe("the real transport (#459)", () => {
     return JSON.parse(child.stdout.toString().trim().split("\n").at(-1) ?? "") as T;
   }
 
-  // An empty DOCKER_SOCKET is unset (the `.env` of a deployment can carry a blank line). The pure function is
+  // An empty BOT_DOCKER_SOCKET is unset (the `.env` of a deployment can carry a blank line). The pure function is
   // pinned above; this shows the module-level constant goes through it, which only a fresh import can.
-  test("a blank DOCKER_SOCKET in the environment leaves daemon calls on /var/run/docker.sock", () => {
+  test("a blank BOT_DOCKER_SOCKET in the environment leaves daemon calls on /var/run/docker.sock", () => {
     const run = runFixture<{ reachable: boolean; unix: (string | undefined)[] }>(DEFAULT_FIXTURE, "");
     expect(run.reachable).toBe(true);
     expect(run.unix).toEqual(["/var/run/docker.sock"]);
   });
 
   test(
-    "the real fetch reaches a unix socket at DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound",
+    "the real fetch reaches a unix socket at BOT_DOCKER_SOCKET, and a hanging and a wedged call are both cut by the bound",
     () => {
       // Named like the suite's own data dirs (pid included) so test/setup.ts sweeps it if a crash skips the
       // `finally`; the socket sits directly inside, short because Linux caps a socket path near 108 bytes.
