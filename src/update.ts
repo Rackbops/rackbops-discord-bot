@@ -431,7 +431,8 @@ export function decideAttemptResolution(o: {
 }
 
 /** A `swapInFlight` as written by this bot; a hand-edited or truncated one must not throw at boot. A primitive has
- *  none of these properties, so only `null` (whose property read throws) needs a leg of its own. */
+ *  none of these properties, so only `null` (whose property read throws) needs a leg of its own; `undefined` would
+ *  throw too, but `resolveUpdateAttempt` returns on it before asking. */
 function isSwapInFlight(v: unknown): v is SwapInFlight {
   return (
     v !== null &&
@@ -473,7 +474,9 @@ export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promi
   const raw: unknown = state.swapInFlight;
   if (raw === undefined) return "none";
   const swap = isSwapInFlight(raw) ? raw : undefined;
-  const needsProbe = !!swap && !!config.gitSha && !sameSha(swap.toSha, config.gitSha) && sameSha(swap.fromSha, config.gitSha);
+  // Only the build the swap left asks the daemon: a record this bot writes has `fromSha` != `toSha`, so the build it
+  // landed on (the replacement's own boot) never matches `fromSha` and makes no call.
+  const needsProbe = !!swap && !!config.gitSha && sameSha(swap.fromSha, config.gitSha);
   const probe = needsProbe ? await (deps.probe ?? probeReplacement)() : undefined;
   // The probe is the only await above. A swap that began while it ran replaced the record this boot read (and the
   // markers beside it): resolving over that would erase an attempt that is live, so leave it to its own path.
@@ -497,7 +500,7 @@ export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promi
     // equality, not `sameSha` -- a hand-edited report must not throw here), in the same save that clears the record.
     const { fromSha, toSha } = swap!;
     const owed = state.pendingUpdateReport;
-    if (owed?.fromSha === fromSha && owed.toSha === toSha) state.pendingUpdateReport = { ...owed, interrupted: true };
+    if (owed?.fromSha === fromSha && owed.toSha === toSha) owed.interrupted = true;
     // `interrupted` comes only from a probe that was asked: absent, stopped, or unknown on a record over a day old.
     log.warn(
       `[update] the swap to ${target} this container started did not take (${describeProbe(probe!)}${probe!.kind === "unknown" ? "; the record is over a day old, so nothing can still be in flight" : ""}) — cleared the attempt marker, so the next check tries it again`,

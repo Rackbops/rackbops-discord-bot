@@ -12,7 +12,7 @@ import { isReportModal, handleReportModal } from "./report";
 import { startScheduler, describeReleaseWatch, announceTo, isPluginStateReady, markPluginStateReady, livePluginRequestDeps, sendToChannel } from "./announce";
 import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
-import { reportUpdateOutcome } from "./updateReport";
+import { owedReportNow, reportUpdateOutcome } from "./updateReport";
 import { resolveUpdateAttempt } from "./update";
 import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { detectRollback, finishProbation, healOwnName, resolveBootMode, stepAside, takeOver } from "./redeploy";
@@ -287,6 +287,9 @@ async function activate(c: Client<true>): Promise<void> {
   // takeOver, like every other state write of the replacement's. Not during a shutdown (the #541 guard below is the
   // same rule for the rest of activation): the record stays for the next boot, which resolves it the same way.
   const attempt = isShuttingDown() ? "none" : await resolveUpdateAttempt();
+  // The report the boot owes, as of this moment: a `/update` taken after the handler attaches arms a newer one that
+  // belongs to its own restart, and the report-back at the end of this function must not deliver or clear that one.
+  const owedAtBoot = owedReportNow();
 
   // Attach the interaction handler and bring plugins/the scheduler live BEFORE registering slash
   // commands with Discord: neither depends on that REST round-trip (commandMap/loadResult are
@@ -546,7 +549,7 @@ async function activate(c: Client<true>): Promise<void> {
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
   // and reportUpdateOutcome already swallows every delivery failure of its own; `attempt` is what this boot made of
   // the swap record (#450).
-  reportUpdateOutcome(client, attempt).catch((err) => console.error("[updateReport]", err));
+  reportUpdateOutcome(client, attempt, undefined, owedAtBoot).catch((err) => console.error("[updateReport]", err));
 
   // #104: and the owed /plugins-update follow-up. Not awaited for the same reason; clears its marker
   // through the shared mutator (the pluginUpdates tick is live now that markPluginStateReady fired).

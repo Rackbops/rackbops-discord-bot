@@ -156,13 +156,20 @@ export function liveDeliverers(client: Client): Deliverers {
   };
 }
 
+/** The report owed right now, or `null`: what `index.ts` remembers when it resolves the swap record at boot. */
+export function owedReportNow(): PendingUpdateReport | null {
+  return state.pendingUpdateReport ?? null;
+}
+
 /**
  * Deliver the follow-up owed from a `/update`-initiated restart, if any. `resolution` is what this boot made of the
  * swap record (`resolveUpdateAttempt`, #450): `in-flight` leaves the report in place for the new build, which is
  * about to retire this process and has the same report in its own snapshot (or for this container's next boot, when
  * the probe could not tell). An `interrupted` swap needs nothing passed here: that boot marked the report itself
  * (`report.interrupted`), which `decideUpdateOutcome` reads, so the truthful outcome also survives a boot that died
- * between resolving and delivering.
+ * between resolving and delivering. `owed` is the report the boot saw when it resolved the record (`index.ts` takes it
+ * there, before the interaction handler attaches); a different one is a `/update` this process took since, and is left
+ * for its own restart. The default, the report owed at call time, is for a caller that has no such moment.
  *
  * The marker is cleared and persisted *before* delivery is attempted: a delivery that fails must not leave a report
  * that re-fires on every subsequent boot. A save that fails is logged and delivery goes ahead anyway (#506 item 12:
@@ -172,9 +179,18 @@ export async function reportUpdateOutcome(
   client: Client,
   resolution: AttemptResolution = "none",
   deliverers: Deliverers = liveDeliverers(client),
+  owed: PendingUpdateReport | null = owedReportNow(),
 ): Promise<void> {
   const report = state.pendingUpdateReport;
   if (!report) return;
+  // Only the report the boot saw (`owed`, taken where the swap record was resolved) is owed to anyone yet. One armed
+  // since — by a `/update` this process took while it finished starting — describes a restart still in progress: sending
+  // it now would say "the image wasn't rebuilt" to a requester whose build is running, and clear the report the
+  // replacement is about to deliver as "updated".
+  if (report !== owed) {
+    console.log(`[updateReport] a report for ${short(report.toSha)} was armed since this boot began — its restart reports it`);
+    return;
+  }
   const now = Date.now();
   // Age first, then the in-flight hold: a report a boot keeps leaving for "the new build or the next boot" (a probe
   // that stays unknown) must still die at 24 h, or it would survive every boot for good.

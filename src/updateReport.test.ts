@@ -13,6 +13,7 @@ const {
   reportTooOld,
   deliverUpdateReport,
   liveDeliverers,
+  owedReportNow,
   reportUpdateOutcome,
 } = await import("./updateReport");
 const { config } = await import("./config");
@@ -430,6 +431,60 @@ describe("reportUpdateOutcome", () => {
     }
     expect(contents).toHaveLength(1);
     expect(state.pendingUpdateReport).toBeUndefined();
+  });
+
+  // Mutation: holding the report on `interrupted` (or any resolution but `in-flight`) -- production passes the boot's
+  // own resolution, so a hold here would never deliver the very report the verdict exists for.
+  test("every resolution but in-flight delivers the report", async () => {
+    config.gitSha = FROM;
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      for (const resolution of ["none", "landed", "interrupted", "stale"] as const) {
+        state.pendingUpdateReport = report({ requestedAt: Date.now(), interrupted: resolution === "interrupted" ? true : undefined });
+        await saveState();
+        const contents: string[] = [];
+        await reportUpdateOutcome(client, resolution, { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+        expect({ resolution, delivered: contents.length }).toEqual({ resolution, delivered: 1 });
+        expect(state.pendingUpdateReport).toBeUndefined();
+      }
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // Mutation: dropping the `report !== owed` check. A `/update` taken after the boot resolved the swap record arms a
+  // report for a restart still in progress; sending it as "back up on the same build" would be false, and clearing
+  // it would lose the "updated" its replacement is about to send.
+  test("a report armed after the boot looked is left to its own restart", async () => {
+    config.gitSha = FROM;
+    const seen = report({ requestedAt: Date.now() });
+    const armedLater = report({ userId: "43", requestedAt: Date.now() });
+    state.pendingUpdateReport = armedLater;
+    await saveState();
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "none", forbidden, seen); // the boot saw a different report
+      await reportUpdateOutcome(client, "none", forbidden, null); // the boot saw none at all
+      expect(state.pendingUpdateReport).toBe(armedLater);
+      expect(onDisk().pendingUpdateReport.userId).toBe("43");
+      expect(log.mock.calls.filter((c) => String(c[0]).includes("armed since this boot began"))).toHaveLength(2);
+
+      // The report the boot did see is delivered, and cleared.
+      const contents: string[] = [];
+      await reportUpdateOutcome(client, "none", { ...forbidden, viaToken: async (_r, content) => void contents.push(content) }, armedLater);
+      expect(contents).toHaveLength(1);
+      expect(state.pendingUpdateReport).toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test("owedReportNow is the report owed right now, or null", async () => {
+    state.pendingUpdateReport = undefined;
+    expect(owedReportNow()).toBeNull();
+    const owed = report();
+    state.pendingUpdateReport = owed;
+    expect(owedReportNow()).toBe(owed);
   });
 
   // #450, the crash between resolving and delivering: boot N resolves `interrupted` and dies before the end of

@@ -659,7 +659,8 @@ describe("checkForUpdate — the attempt record (#450, #452, #449, #506)", () =>
       expect(pending()[2]).toContain(shortSha(NEWER));
       expect(pending()[2]).not.toContain("the last attempt failed");
       expect(pending()[2]).toContain("came back on the build it exited from");
-      expect(pending()[2]).toContain("or is still landing"); // a swap that may be in flight is not told to rebuild the image
+      expect(pending()[2]).toContain("rebuild the image"); // the exit-75 respawn case keeps its advice...
+      expect(pending()[2]).toContain("or is still landing"); // ...but a swap that may be in flight is not only told that
       expect(updateStateForTest().suppressedWarnedFor).toBe(NEWER);
 
       resetUpdateForTest();
@@ -774,7 +775,7 @@ describe("resolveUpdateAttempt (#450)", () => {
     ] as const) {
       config.gitSha = OLD;
       await seed(recorded());
-      const owed = state.pendingUpdateReport!;
+      const owed = { ...state.pendingUpdateReport! }; // a copy: the verdict is set on the stored report itself
       const q = quiet();
 
       expect(await resolveUpdateAttempt({ probe: probing(answer).probe, log: q.log })).toBe("interrupted");
