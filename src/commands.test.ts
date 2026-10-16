@@ -213,9 +213,9 @@ describe("updateReply", () => {
   // Mutations: the old text back (`I'll report` / `in a minute`); a literal `/update` for the interpolation.
   test("a second /update is refused without promising a report, naming the command as registered", () => {
     const reply = updateReply("busy", "", { commandName: "pipupdate" });
-    expect(reply).toContain("already in progress");
+    expect(reply).toContain("An update or restart is already in progress");
     expect(reply).toContain("once it has finished");
-    expect(reply).toContain("/pipupdate");
+    expect(reply).toContain("/pipupdate that started it reports back to whoever ran it");
     expect(reply).not.toContain("I'll report");
     expect(reply).not.toContain("in a minute");
     expect(reply).not.toContain("Restarting");
@@ -252,6 +252,28 @@ describe("updateReply", () => {
     });
     expect(refused).toContain("could not remove it");
     expect(refused).toContain("409");
+  });
+
+  // #505 item 7 (1c): the daemon's errors sit in front of the verdict and of the operator instruction, so each is
+  // bounded to DAEMON_ERROR_MAX (600, plus clampReply's one-character suffix) before it is interpolated: a 3000-character
+  // error and a 3000-character `replacementError` still leave a reply Discord accepts, ending on the verdict. The C2 test
+  // drives the `error` clause through the handler; this pins both clauses in every outcome. Mutations: either clamp
+  // dropped (the reply is over 3000 units); DAEMON_ERROR_MAX raised.
+  test("a long daemon error in any clause is bounded, so the verdict and the operator instruction survive", () => {
+    const long = "e".repeat(3000);
+    for (const outcome of ["failed", "timeout", "stalled"] as const) {
+      const reply = updateReply("restart", SHA, {
+        redeploy: { outcome, error: long, replacement: "remove-failed", replacementError: long },
+      });
+      expect(reply.length, outcome).toBeLessThan(1500);
+      expect(reply, outcome).toContain(`${"e".repeat(600)}…`);
+      expect(reply, outcome).not.toContain("e".repeat(601));
+      expect(reply, outcome).toContain("remove the `-next` container by hand. I stayed on the current build.");
+    }
+    const failed = updateReply("restart", SHA, {
+      redeploy: { outcome: "failed", error: long, replacement: "remove-failed", replacementError: long },
+    });
+    expect(failed.endsWith("I stayed on the current build.")).toBe(true);
   });
 });
 
