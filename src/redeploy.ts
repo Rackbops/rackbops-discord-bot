@@ -197,8 +197,9 @@ export function buildCreateSpec(
 export interface RedeployResult {
   outcome?: HandoffOutcome;
   error?: string;
-  /** What became of the `<name>-next` container (#451): never created, removed, left alone because it
-   *  restarted after the verdict (the generation guard), or still there after a failed removal. */
+  /** What became of the `<name>-next` container (#451): nothing to clean up (never created, or the daemon
+   *  had nothing by that id or name), removed, left alone because it restarted after the verdict (the
+   *  generation guard), or still there after a failed removal. */
   replacement?: ReplacementDisposition;
   /** Set with `remove-failed`: the daemon's answer. */
   replacementError?: string;
@@ -212,8 +213,8 @@ export interface RedeployOptions {
   pollMs?: number;
   /** `HANDOFF_DEADLINE_MS`: how long the original waits for a verdict. */
   handoffDeadlineMs?: number;
-  /** The clock the verdict times and the generation guard use. Not the retirement wait's, which keeps
-   *  `Date.now()`: with a fixed clock the retirement wait would never end. */
+  /** The clock the verdict times, the handoff deadline's elapsed time and the generation guard use. Not the
+   *  retirement wait's, which keeps `Date.now()`: with a fixed clock the retirement wait would never end. */
   now?: () => number;
   /** The marker reads in the handoff poll and in `redeploy()`; not the retirement wait's. */
   readMarker?: typeof readMarker;

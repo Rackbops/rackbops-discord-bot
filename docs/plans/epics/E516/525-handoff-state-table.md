@@ -7,7 +7,9 @@ filed the findings read `4ff8eef`; since then `redeploy.ts`, `handoff.ts`, `upda
 `docker.ts`, `shutdown.ts` and `docker-compose.yml` have no commit, `update.ts`/`state.ts`/`github.ts` gained
 only test hooks (`f5e7bd7`), and `index.ts`, `announce.ts`, `commands.ts` and `ops/bot-ops.sh` moved, so line
 numbers quoted in the issue bodies are stale for those four. An independent claims-vs-code audit ran against this
-file's first commit; its findings and what was done with each are in the PR body.
+file's first commit; its findings and what was done with each are in the PR body. Bundle S1 of #525 (the
+original's verdict on the swap) later changed the code rows 14, 15 and 26 describe; those rows carry the change,
+and every other row, and the "Interactions" text, still describes `c783ad0`.
 
 ## What was checked, and how
 
@@ -189,7 +191,8 @@ Every row was read against these seven. "Holds" means the finding is true as fil
   marker first": a `ready` marker with a failing inspect should never end in removal, because R is about to stop O.
   And because `redeploy.ts:344` already re-reads the marker just before the removal, the same fix should gate the
   removal on that fresh read, which also closes the deadline-race trigger (row 15) that "read the marker first"
-  does not. Fixed in bundle S1 with #431.
+  does not. Fixed in bundle S1 with #431: S1 re-reads the marker once, right after the poll decides and before the
+  generation guard's inspect (not at the removal call), so a window of that inspect plus the removal stays.
 - **#450 (self-update-handoff-3, docker-restart-7)**, rows 8, 10 and 11. Holds. Refinements: (a) the triggers are
   wider than a reboot, OOM or operator restart: a `bot-ops.sh` mutation or the panel's Apply during the build
   passes the guard (no `-next` yet) and kills the swap. (b) In row 10 the swap lands anyway, so the requester gets
@@ -242,7 +245,8 @@ Every row was read against these seven. "Holds" means the finding is true as fil
    generation guard skips the removal on the poll-error path; the fix removes that skip, and a `ready` marker
    discarded by the same `Promise.all` then lets `:374` remove R mid-retire. Separately, a `ready` written between
    the marker read and the `elapsedMs` check loses to `timeout` (row 15) whatever #431 does. One change closes
-   both: gate the removal at `redeploy.ts:374` on a fresh marker read.
+   both: gate the removal on a fresh marker read. (Bundle S1 does that with one re-read before the guard's
+   inspect, which leaves the window row 15 now names.)
 5. **No code path renames a live `-next` bot back, and #492's fix would make that dangerous** (rows 22, 23). The
    rename exists only inside `retireOriginal` (`redeploy.ts:515-523`); a normal-mode boot (`resolveBootMode` 404,
    `:731`) never re-enters it. Today the next swap from a live `<N>-next` names its R `<N>-next-next`. If #492's

@@ -196,10 +196,23 @@ describe("handoffFailureMessage", () => {
     }
   });
 
+  // The sentences join cleanly: a space after the removal clause before the socket hint, and the answers in
+  // parentheses.
+  test("the clauses are punctuated, not run together", () => {
+    const stalled = handoffFailureMessage("stalled", { targetSha: sha, replacement: "removed", error: "daemon unreachable" });
+    expect(stalled).toContain("current build. Check the daemon socket. (daemon unreachable)");
+    const refused = handoffFailureMessage("failed", {
+      targetSha: sha,
+      replacement: "remove-failed",
+      replacementError: "409 Conflict",
+    });
+    expect(refused).toContain("could not remove it (409 Conflict): remove the");
+  });
+
   // #433: a deadline spent on a daemon that would not answer is worth naming to the requester.
   test("a timeout names the last daemon error when there was one", () => {
     const withError = handoffFailureMessage("timeout", { targetSha: sha, error: "docker inspect c failed: 500" });
-    expect(withError).toContain("last daemon error: docker inspect c failed: 500");
+    expect(withError).toContain("(last daemon error: docker inspect c failed: 500)");
     expect(handoffFailureMessage("timeout", { targetSha: sha })).not.toContain("last daemon error");
   });
 });
