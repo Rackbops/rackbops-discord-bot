@@ -541,7 +541,7 @@ describe("takeOver", () => {
 // globalThis.fetch, recording call order — the same harness shape as the retireOriginal describe below.
 describe("takeOver — real daemon calls (the ordering guard for the whole hazard, #160)", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const ORIGINAL_ID = "e".repeat(64);
   let calls: { path: string; method: string; body?: string }[] = [];
 
@@ -747,7 +747,7 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
 // In every case nothing here removes or renames: that is completeTakeOver's, tested below.
 describe("retireOriginal", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const ORIGINAL_ID = "d".repeat(64);
   let calls: { path: string; method: string }[] = [];
 
@@ -1106,7 +1106,7 @@ describe("completeTakeOver", () => {
 // path and method, so dropping `force=1`, the try/catch, the rename or the right name all stayed green.
 describe("completeTakeOver — real daemon calls", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const ORIGINAL_ID = "9".repeat(64);
   let calls: { path: string; method: string; url: string }[] = [];
   const stopped: ContainerInspect = {
@@ -1359,20 +1359,20 @@ describe("detectRollback", () => {
   test("with the default inspects: a running original and a restored own policy is a rollback; a fresh standby is not", async () => {
     const realFetch = globalThis.fetch;
     const realHostname = process.env.HOSTNAME;
-    process.env.HOSTNAME = "self-container-id";
+    process.env.HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
     const seen: string[] = [];
     const daemon = (ownPolicy: string) =>
       (globalThis.fetch = (async (url: string) => {
         const { pathname } = new URL(String(url));
         seen.push(pathname);
         if (pathname === "/containers/orig/json") return new Response(JSON.stringify(running), { status: 200 });
-        if (pathname === "/containers/self-container-id/json") return new Response(JSON.stringify(selfWith(ownPolicy)), { status: 200 });
+        if (pathname === `/containers/${SELF_SHORT_ID}/json`) return new Response(JSON.stringify(selfWith(ownPolicy)), { status: 200 });
         throw new Error(`unstubbed daemon call: ${pathname}`);
       }) as unknown as typeof fetch);
     try {
       daemon("unless-stopped");
       expect(await detectRollback(ENV)).toBe(true);
-      expect(seen).toEqual(["/containers/orig/json", "/containers/self-container-id/json"]);
+      expect(seen).toEqual(["/containers/orig/json", `/containers/${SELF_SHORT_ID}/json`]);
       daemon("no");
       expect(await detectRollback(ENV)).toBe(false);
     } finally {
@@ -1423,12 +1423,12 @@ describe("stepAside", () => {
   test("by default it asks the daemon to stop this container, and waits out the 30 s grace before exiting", async () => {
     const realFetch = globalThis.fetch;
     const realHostname = process.env.HOSTNAME;
-    process.env.HOSTNAME = "self-container-id";
+    process.env.HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
     const seen: string[] = [];
     globalThis.fetch = (async (url: string, init?: RequestInit) => {
       const { pathname } = new URL(String(url));
       seen.push(`${init?.method ?? "GET"} ${pathname}`);
-      if (pathname === "/containers/self-container-id/json") return new Response(JSON.stringify(SELF), { status: 200 });
+      if (pathname === `/containers/${SELF_SHORT_ID}/json`) return new Response(JSON.stringify(SELF), { status: 200 });
       if (pathname === `/containers/${SELF_ID}/stop`) return new Response("", { status: 204 });
       throw new Error(`unstubbed daemon call: ${pathname}`);
     }) as unknown as typeof fetch;
@@ -1437,7 +1437,7 @@ describe("stepAside", () => {
     try {
       void stepAside({ exit: (c) => void exits.push(c), sleep: (ms) => ((graceAsked = ms), new Promise<void>(() => {})) });
       await Bun.sleep(30);
-      expect(seen).toEqual(["GET /containers/self-container-id/json", `POST /containers/${SELF_ID}/stop`]);
+      expect(seen).toEqual([`GET /containers/${SELF_SHORT_ID}/json`, `POST /containers/${SELF_ID}/stop`]);
       expect(graceAsked).toBe(STEP_ASIDE_GRACE_MS);
       expect(STEP_ASIDE_GRACE_MS).toBe(30_000);
       expect(exits).toEqual([]);
@@ -1472,7 +1472,7 @@ describe("stepAside", () => {
 // docker.test.ts/update.test.ts, rather than mocking the docker/handoff modules directly.
 describe("redeploy — cleanup always runs", () => {
   const realFetch = globalThis.fetch;
-  const HOSTNAME = "self-container-id";
+  const HOSTNAME = SELF_SHORT_ID; // 12 hex, a prefix of SELF.Id: inspectSelf (#512) accepts it without reading mountinfo
   const REPLACEMENT_ID = "c".repeat(64);
   let calls: { path: string; method: string; url: string; body?: string }[] = [];
   // `restartPending()` sampled at the moment of each daemon call the fix's timing hinges on.

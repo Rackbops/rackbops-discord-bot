@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
+  RESTART_DEFERRAL_MAX_MS,
   RESTART_EXIT_CODE,
   awaitCriticalIdle,
   beginCritical,
@@ -38,6 +39,12 @@ afterEach(() => {
 });
 
 describe("requestRestart", () => {
+  // README.md (the supervisor section) and .env.example publish 75 as the contract a supervisor keys on.
+  // Every exit assertion in this file compares to the imported constant, so only this pins the number (#512).
+  test("the exit code the supervisor contract publishes is 75", () => {
+    expect(RESTART_EXIT_CODE).toBe(75);
+  });
+
   test("exits immediately when idle", () => {
     requestRestart("test");
     expect(exits).toEqual([RESTART_EXIT_CODE]);
@@ -75,6 +82,133 @@ describe("requestRestart", () => {
     endCritical();
     expect(exits).toEqual([]);
     expect(restartPending()).toBe(false);
+  });
+
+  // The observable the `Math.max(0, ...)` clamp in endCritical protects: without it the unmatched close
+  // leaves the depth at -1, the next section only brings it back to 0, and a restart requested inside that
+  // section would exit at once instead of waiting for it (#512).
+  test("an unmatched endCritical never drives the depth negative", () => {
+    endCritical();
+    expect(stateForTest().critical).toBe(0);
+    beginCritical();
+    requestRestart("test");
+    expect(exits).toEqual([]);
+    endCritical();
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+  });
+});
+
+// #512: a deferred restart stops every new tick and mailbox drain (restartPending), so it must not wait
+// forever on a critical section that never closes. These use a deadline of a few ms (requestRestart's second
+// argument) and real timers, since the point is that a timer fires and does the exit.
+describe("a deferred restart's deadline (#512)", () => {
+  test("a deferred restart exits anyway once the deadline passes, and says so", async () => {
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      beginCritical();
+      requestRestart("test", 20);
+      expect(exits).toEqual([]);
+      expect(stateForTest().deferralArmed).toBe(true);
+      await Bun.sleep(60);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+      expect(stateForTest().deferralArmed).toBe(false);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const line = String(errorSpy.mock.calls[0]![0]);
+      expect(line).toContain("did not finish within 20ms");
+      expect(line).toContain("critical depth 1");
+      // the exit carries the reason the restart was requested with
+      expect(logSpy.mock.calls.some((c) => String(c[0]).includes("exiting (75): test"))).toBe(true);
+    } finally {
+      errorSpy.mockRestore();
+      logSpy.mockRestore();
+    }
+  });
+
+  test("a section that closes in time exits once and disarms the deadline", async () => {
+    beginCritical();
+    requestRestart("test", 20);
+    endCritical();
+    expect(exits).toEqual([RESTART_EXIT_CODE]);
+    expect(stateForTest().deferralArmed).toBe(false);
+    await Bun.sleep(60);
+    expect(exits).toEqual([RESTART_EXIT_CODE]); // the timer was cleared, not left to fire a second exit
+  });
+
+  test("the default deadline is the reviewed value, and is what the timer is armed with", () => {
+    expect(RESTART_DEFERRAL_MAX_MS).toBe(30 * 60_000);
+    const timerSpy = spyOn(globalThis, "setTimeout");
+    try {
+      beginCritical();
+      requestRestart("test");
+      const delays = (timerSpy.mock.calls as unknown[][]).map((c) => c[1]);
+      expect(delays).toContain(RESTART_DEFERRAL_MAX_MS);
+    } finally {
+      timerSpy.mockRestore();
+    }
+    // the file's afterEach (resetForTest) disarms the half-hour timer this left
+  });
+
+  test("the deadline elapsing under an active handoff does not exit; it waits, and fires once the handoff has ended", async () => {
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      beginCritical();
+      beginHandoff("redeploy");
+      requestRestart("test", 20);
+      await Bun.sleep(60);
+      expect(exits).toEqual([]); // the original must stay alive through a swap
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("a handoff is active"))).toBe(true);
+      expect(stateForTest().deferralArmed).toBe(true); // renewed, not dropped
+      endHandoff();
+      await Bun.sleep(60);
+      expect(exits).toEqual([RESTART_EXIT_CODE]);
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("a shutdown in progress owns the exit: a pending restart's section closing releases the drain instead of exiting", async () => {
+    beginCritical();
+    requestRestart("test");
+    beginShutdown("SIGTERM");
+    const idle = awaitCriticalIdle(1000);
+    endCritical();
+    expect(exits).toEqual([]); // not 75: the handler goes on to dispose the plugins, close the gateway and exit 0
+    expect(await idle).toBe(true);
+  });
+
+  // The reachable ordering: the SIGTERM handler has begun the shutdown and a tick, inside its section, then
+  // asks for a restart (the case with nothing open cannot happen: every caller holds a section).
+  test("a restart requested after a shutdown began, with a section open, arms no deadline and exits nothing", async () => {
+    beginCritical();
+    beginShutdown("SIGTERM");
+    requestRestart("test", 20);
+    expect(stateForTest().pending).toBe("test");
+    expect(stateForTest().deferralArmed).toBe(false);
+    await Bun.sleep(60);
+    expect(exits).toEqual([]);
+    endCritical();
+    expect(exits).toEqual([]);
+  });
+
+  test("a shutdown that begins while a deferral is armed disarms it", async () => {
+    beginCritical();
+    requestRestart("test", 20);
+    expect(stateForTest().deferralArmed).toBe(true);
+    beginShutdown("SIGTERM");
+    expect(stateForTest().deferralArmed).toBe(false);
+    await Bun.sleep(60);
+    expect(exits).toEqual([]);
+  });
+
+  test("resetForTest disarms a deferral", async () => {
+    beginCritical();
+    requestRestart("test", 20);
+    resetForTest();
+    await Bun.sleep(60);
+    expect(exits).toEqual([]);
   });
 });
 
@@ -251,6 +385,7 @@ describe("awaitCriticalIdle (the live handoff exemption, #154)", () => {
     beginCritical(); // an unrelated section that never closes within the timeout
     const idle = await awaitCriticalIdle(20);
     expect(idle).toBe(false);
+    expect(stateForTest().idleWaiters).toBe(0); // the timed-out wait took its resolver with it (#512)
     endCritical(); // clean up — nothing left listening after the timeout fired
     endCritical();
   });
@@ -306,6 +441,7 @@ describe("stateForTest (what the test-state guard reads)", () => {
       idleWaiters: 0,
       stopListeners: 0,
       stopNotified: false,
+      deferralArmed: false,
     });
   });
 
@@ -365,6 +501,7 @@ describe("onStopRequested (#248)", () => {
     beginShutdown("SIGTERM");
     requestRestart("update");
     expect(seen).toEqual(["SIGTERM"]);
+    expect(exits).toEqual([]); // the shutdown owns the exit (#512): the restart is only recorded as pending
   });
 
   test("a throwing listener is isolated: the others run and the restart still lands", () => {

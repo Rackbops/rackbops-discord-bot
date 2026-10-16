@@ -344,8 +344,8 @@ export function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
     now: () => new Date(),
     log: console,
     // #104: a due scheduled update restarts the bot. requestRestart inside the tick's withCritical
-    // defers the exit until the DM + state write settle; restartPending lets it stand down if an
-    // earlier restart (autoUpdate) already won this tick.
+    // defers the exit until the DM + state write settle (bounded by RESTART_DEFERRAL_MAX_MS, a handoff
+    // exempt, #512); restartPending lets it stand down if an earlier restart (autoUpdate) already won this tick.
     restartPending,
     requestRestart,
   };
