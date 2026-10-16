@@ -282,9 +282,12 @@ describe("fetchReleases", () => {
   });
 
   // #499 item 8: `??` falls back on null only, and an empty-string name rendered as `****` in the announcement.
-  test("an empty-string name falls back to its tag, like a null one (#499)", async () => {
-    stub(() => json([apiRelease(1, { name: "" })]));
-    expect((await fetchReleases("owner/repo"))?.[0]?.name).toBe("v1");
+  // A blank (whitespace-only) name is as nameless, and `**   **` is not a name either.
+  test("an empty or blank name falls back to its tag, like a null one (#499)", async () => {
+    for (const name of ["", "   ", "\n\t"]) {
+      stub(() => json([apiRelease(1, { name })]));
+      expect((await fetchReleases("owner/repo"))?.[0]?.name).toBe("v1");
+    }
   });
 
   // #499 item 7: the flag used to be parsed and dropped, so a v2.0.0-rc.1 announced as a plain release.
@@ -344,8 +347,20 @@ describe("fetchReleases", () => {
       await expect(fetchReleases("owner/repo")).rejects.toThrow("GitHub releases query failed for owner/repo: 403");
     });
 
-    // A reset header that is missing or not a time must not print 1970 or throw a RangeError from toISOString.
-    for (const reset of [undefined, "", "soon", "0"]) {
+    // Only a 403 or a 429 is a limit hit. GitHub answers the LAST request a window allows with a 200 and
+    // `x-ratelimit-remaining: 0`: that is a good answer, and discarding its releases as an error would lose that poll.
+    test("a 200 that spends the last request of the window is not an error: its releases come back", async () => {
+      stub(() => new Response(JSON.stringify([apiRelease(1)]), { status: 200, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": RESET_EPOCH } }));
+      expect((await fetchReleases("owner/repo"))?.map((r) => r.id)).toEqual([1]);
+    });
+    test("a 500 with x-ratelimit-remaining 0 keeps the bare message: only a 403 or 429 is the limit", async () => {
+      stub(() => limited(500, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": RESET_EPOCH }));
+      await expect(fetchReleases("owner/repo")).rejects.toThrow("GitHub releases query failed for owner/repo: 500");
+    });
+
+    // A reset header that is missing, not a time or out of Date's range must not print 1970 or throw a RangeError
+    // from toISOString ("Infinity" and "1e20" are finite-looking numbers that make an Invalid Date).
+    for (const reset of [undefined, "", "soon", "0", "Infinity", "1e20", "99999999999999"]) {
       test(`remaining 0 with reset ${JSON.stringify(reset)} says the reset time is unknown`, async () => {
         stub(() => limited(403, { "x-ratelimit-remaining": "0", ...(reset === undefined ? {} : { "x-ratelimit-reset": reset }) }));
         await expect(fetchReleases("owner/repo")).rejects.toThrow("resets at an unknown time; set GITHUB_TOKEN");

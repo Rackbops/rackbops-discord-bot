@@ -507,12 +507,14 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
   }
   const seen = state.seenReleaseIds[repo];
   // #499 item 5: one page per poll. A whole page of new releases on a repo we have polled before means older ones
-  // may exist that were never fetched and never will be (they are not recorded either). Keyed on the page size the
-  // request asked for; a page padded with drafts (dropped by fetchReleases) can slip under it, which is accepted,
-  // and the line repeats each poll while the posts below keep failing, since the list does not advance.
+  // may exist that were never fetched and never will be (they are not recorded either); with exactly a page's worth
+  // of releases in all there are none, which the poll cannot tell, so the line says "may". Keyed on the page size the
+  // request asked for; a page padded with drafts (dropped by fetchReleases) can slip under it, which is accepted.
+  // It is logged BEFORE the posts, so a failing post cannot lose it, and it repeats each poll while the OLDEST post
+  // keeps failing (the list does not advance until one succeeds; after that part of the page is seen and it stops).
   if (seen !== undefined && releases.length >= RELEASES_PER_PAGE && releases.every((r) => !seen.includes(r.id))) {
     console.warn(
-      `[release] ${repo}: every one of the ${releases.length} releases on the page is new — anything older was not fetched and will not be announced`,
+      `[release] ${repo}: every one of the ${releases.length} releases on the page is new — anything older may not have been fetched and will not be announced`,
     );
   }
   await commitReleaseAnnouncements(releases, seen, {
@@ -539,7 +541,8 @@ async function checkRepoReleases(client: Client, repo: string): Promise<void> {
  * the whole batch — a throw partway through a multi-release burst must not discard the ids of
  * releases already posted, or the next poll re-announces them. Among what remains at-least-once
  * (#499; CONTEXT.md's Behavior section lists the rest): an exit in the instant between a post and
- * its save, or a save that fails, re-posts that one release next poll.
+ * its save, or a save that fails and is followed by a restart before a later save succeeds, re-posts
+ * that one release (the id is already in memory, so the same process does not post it twice).
  */
 export async function commitReleaseAnnouncements(
   releases: Release[],

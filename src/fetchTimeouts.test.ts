@@ -137,7 +137,10 @@ describe("every GitHub call is timeout-bounded, and every HTTP fetch in src/ car
   // `client.channels.fetch(` / `users.fetch(` / `messages.fetch(` are cache reads, not HTTP calls, so a
   // `.` or word character before `fetch` keeps them out; and a line that starts as a comment is skipped
   // (docker.ts and plugins/index.ts say "fetch(" in prose), without stripping `//` globally, because the
-  // URL template strings contain it.
+  // URL template strings contain it. It is a NAME-based source heuristic, not a proof: a call spelled
+  // `globalThis.fetch(`, `Bun.fetch(`, `fetch (`, an alias (`const f = fetch`), or a new helper name is not seen
+  // at all (the count pin of eleven cannot help there), `ops/` is not scanned, and a `signal` word inside the
+  // arguments only has to appear, even in a comment or an unrelated key.
   test("no HTTP fetch anywhere in src/ is missing a signal", async () => {
     // Paren-balanced, not a regex: these calls close with `});`, and a first attempt at this
     // matching `\n\s*\);` found ZERO of them — so the loop body never ran and the test passed

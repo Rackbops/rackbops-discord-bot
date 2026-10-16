@@ -36,7 +36,7 @@ const { applyRouting, initRouting, refreshDiscovery, resetRoutingForTest, routin
 const { DATA_DIR } = await import("./storage");
 const { writeDiscovery } = await import("./routing/discovery");
 const { rmSync: removePath } = await import("node:fs");
-const { state } = await import("./state");
+const { state, saveState } = await import("./state");
 const { requestRestart, setExitFn, resetForTest: resetRestartForTest, RESTART_EXIT_CODE } = await import("./restart");
 
 describe("livePluginRequestDeps (#241)", () => {
@@ -547,6 +547,8 @@ describe("checkReleases (#342)", () => {
       await checkReleases(fakeClient, [repo]); // back: 3 and 4 were published meanwhile -> announced, oldest first
       expect(sent).toEqual(["📦 New release: **v3**\nhttps://example.test/r/3", "📦 New release: **v4**\nhttps://example.test/r/4"]);
       expect(state.seenReleaseIds[repo]).toEqual([1, 2, 3, 4]); // recorded id by id through the real persist callback
+      // ...and saved: the docs rest on "each id is persisted right after its post", so read the file back.
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "state.json"), "utf8")).seenReleaseIds[repo]).toEqual([1, 2, 3, 4]);
       // The "at most the newest 15" in the comment and CONTEXT.md is this request's page size, so pin it.
       const urls = fetchSpy.mock.calls.map(([url]) => String(url));
       expect(urls).toHaveLength(2);
@@ -570,6 +572,7 @@ describe("checkReleases (#342)", () => {
     } finally {
       config.githubToken = realToken;
       delete state.seenReleaseIds[repo]; // `state` is the shared singleton (dataIsolation.test.ts does the same)
+      await saveState(); // and the file, which the test above wrote this repo into
       fetchSpy.mockRestore();
       warnSpy.mockRestore();
       logSpy.mockRestore();
@@ -597,9 +600,18 @@ describe("checkReleases (#342)", () => {
       answer = page(17, 15);
       await checkReleases(fakeClient, [repo]);
       expect(pageWarnings()).toEqual([
-        `[release] ${repo}: every one of the 15 releases on the page is new — anything older was not fetched and will not be announced`,
+        `[release] ${repo}: every one of the 15 releases on the page is new — anything older may not have been fetched and will not be announced`,
       ]);
       expect(sent).toHaveLength(15);
+
+      // A repo seeded with zero releases keeps a DEFINED empty list (decideReleaseAnnouncements): a full page of new
+      // releases on it warns like any other. (A `seen.length > 0` guard would have exempted it.)
+      warnSpy.mockClear();
+      sent.length = 0;
+      state.seenReleaseIds[repo] = [];
+      answer = page(300, 15);
+      await checkReleases(fakeClient, [repo]);
+      expect(pageWarnings()).toHaveLength(1);
 
       // A fresh case, not a continuation: 14 new releases with ids not used above, against a re-seeded list. A page one
       // short of full is not a full page (reusing ids 17..4 against the list the case above left would pass with the
@@ -640,10 +652,38 @@ describe("checkReleases (#342)", () => {
       expect(fetchSpy).toHaveBeenCalled();
     } finally {
       delete state.seenReleaseIds[repo];
+      await saveState();
       fetchSpy.mockRestore();
       warnSpy.mockRestore();
       errorSpy.mockRestore();
       logSpy.mockRestore();
+    }
+  });
+
+  // The warning is logged before the posts, so a post that throws cannot lose it: moving it after
+  // commitReleaseAnnouncements would make a failing OLDEST post (the one that blocks the repo) suppress it for good.
+  test("the page warning is logged even when the first post fails (#499)", async () => {
+    const repo = "rackbops/page-fail-probe";
+    const failing = {
+      channels: { fetch: async () => ({ isSendable: () => true, send: async () => Promise.reject(new Error("Discord said no")) }) },
+    } as unknown as Client;
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () =>
+      new Response(JSON.stringify(Array.from({ length: 15 }, (_, i) => gh(40 - i))), { status: 200 })) as unknown as typeof fetch);
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+    state.seenReleaseIds[repo] = [1];
+    try {
+      await checkReleases(failing, [repo]); // the per-repo catch absorbs the failed post
+      expect(warnSpy.mock.calls.map((c) => String(c[0])).filter((m) => m.startsWith(`[release] ${repo}: every one of the 15`))).toHaveLength(1);
+      expect(errorSpy).toHaveBeenCalled(); // the failed post was logged, not swallowed silently
+      expect(state.seenReleaseIds[repo]).toEqual([1]); // nothing was posted, so the list did not advance
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      delete state.seenReleaseIds[repo];
+      await saveState();
+      fetchSpy.mockRestore();
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
     }
   });
 
@@ -690,6 +730,7 @@ describe("checkReleases (#342)", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     } finally {
       delete state.seenReleaseIds[repo];
+      await saveState();
       fetchSpy.mockRestore();
       for (const spy of quiet) spy.mockRestore();
     }

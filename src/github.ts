@@ -75,7 +75,10 @@ export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS)
     // (its REST docs); the unauthenticated limit is 60 requests an hour per address. Say when it resets and what
     // lifts it, instead of a bare status per repo per poll.
     const reset = Number(res.headers.get("x-ratelimit-reset"));
-    const at = Number.isFinite(reset) && reset > 0 ? new Date(reset * 1000).toISOString() : "an unknown time";
+    const resetAt = new Date(reset * 1000);
+    // A missing, non-numeric, zero or out-of-range (Infinity, 1e20: an Invalid Date, which toISOString throws on) value
+    // is "unknown", never a thrown RangeError that would swallow this message.
+    const at = reset > 0 && !Number.isNaN(resetAt.getTime()) ? resetAt.toISOString() : "an unknown time";
     throw new Error(`GitHub rate limit exhausted (releases query for ${repo}) — resets at ${at}; set GITHUB_TOKEN to raise it`);
   }
   if (!res.ok) throw new Error(`GitHub releases query failed for ${repo}: ${res.status}`);
@@ -89,8 +92,8 @@ export async function fetchReleases(repo: string, timeoutMs = GITHUB_TIMEOUT_MS)
   }[];
   return data
     .filter((r) => !r.draft)
-    // `||`, not `??` (#499): an empty-string name is as nameless as a null one, and would render as `****`.
-    .map((r) => ({ id: r.id, name: r.name || r.tag_name, tag: r.tag_name, url: r.html_url, prerelease: r.prerelease }));
+    // `||` and a trim, not `??` (#499): an empty or blank name is as nameless as a null one, and would render as `****`.
+    .map((r) => ({ id: r.id, name: r.name?.trim() || r.tag_name, tag: r.tag_name, url: r.html_url, prerelease: r.prerelease }));
 }
 
 export interface ReleaseAnnouncements {
