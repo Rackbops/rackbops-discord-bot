@@ -98,6 +98,29 @@ resolve_deploy_identity() {
   fi
 }
 
+# #567: `<container>-next` is the name a self-update gives its replacement (src/redeploy.ts, replacementName), and
+# bot-ops.sh's swap guard keys on it. An instance called `prod-next` owns the very container name instance `prod`'s
+# swap creates, so the two cannot share a daemon; the bare name `next` is refused by the same rule (its container,
+# rackbops-discord-bot-next, could only collide with a compose-only deployment named rackbops-discord-bot). A NEW
+# install refuses; a re-run on an instance that already exists only warns, because a re-run must never take a
+# deployed instance down. The reverse -- any run for `prod` while a `prod-next` exists -- warns too and continues.
+check_instance_name() {
+  case "$INSTANCE" in
+    next|*-next)
+      if [ -d "$CONFIG_DIR" ] || [ -d "$STACK_DIR" ]; then
+        echo "install: WARNING: the container '$PROJECT' ends in -next, the suffix a self-update reserves for its replacement; this existing instance is not refused, but it cannot share a daemon with an instance whose container is '${PROJECT%-next}' (#567)" >&2
+      else
+        die "the container for instance '$INSTANCE' would be '$PROJECT', which ends in -next, the suffix the self-update reserves for its replacement (<container>-next); pick another name (#567)"
+      fi
+      ;;
+    *)
+      if [ -d "${CONFIG_DIR}-next" ] || [ -d "${STACK_DIR}-next" ]; then
+        echo "install: WARNING: an instance '${INSTANCE}-next' already exists on this host; its container is the name the self-update of '$PROJECT' gives its replacement, so the two cannot share a daemon until one is renamed, and a self-update of '$PROJECT' removes '${PROJECT}-next' if that container is stopped (#567)" >&2
+      fi
+      ;;
+  esac
+}
+
 # /opt is typically root-owned, so a brand-new top-level directory needs a one-time sudo
 # bootstrap to create and chown it to the running user — same "one-time sudo, nothing after
 # needs it" convention as app-config-deployment-foundation.md's service tier. Skipped entirely
@@ -252,6 +275,8 @@ main() {
   BIN_DIR="/opt/rackbops-discord-bot/bin"
   STACK_DIR="/opt/stacks/rackbops-discord-bot-$INSTANCE"
   PROJECT="rackbops-discord-bot-$INSTANCE"
+
+  check_instance_name
 
   bootstrap_dir "$CONFIG_DIR"
   bootstrap_dir "$BIN_DIR"

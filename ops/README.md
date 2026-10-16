@@ -137,7 +137,8 @@ the identical `OUT OF DATE` warning for both cases.
 
 ## Bootstrapping a fresh instance (no checkout)
 
-`ops/install.sh` sets up a new instance (`debug`, `prod`, or any other name) on a host that has
+`ops/install.sh` sets up a new instance (`debug`, `prod`, or any other name of lowercase letters, digits and hyphens that is not `bin`, `next` or
+`*-next`) on a host that has
 nothing but `git`, `docker`, and `curl` — no clone of this repo, no Bun toolchain. It's curl-able
 directly from the public repo:
 
@@ -150,7 +151,11 @@ Full usage: `install.sh <instance> [branch] [--force-bin]`. Pass a branch as the
 (`bash -s -- debug my-branch`) to build from something other than `main`; add `--force-bin` as a
 third argument only if you need to force-install that branch's `bot-ops.sh` into the host-shared
 `bin/` despite it differing from `main`'s (see "Keeping `bot-ops.sh` and `docker-compose.yml`
-current" above, issue #230).
+current" above, issue #230). `bin` is always refused. A name that is `next` or ends in `-next` is refused for a
+new instance (#567: `-next` is the suffix a self-update gives its replacement container); a re-run on an existing
+instance of that shape only warns (an instance counts as existing when its config dir or its stack dir is
+there), as does any run for an instance whose `-next` sibling already exists, which also says that the
+instance's self-update removes that sibling's container while it is stopped.
 
 It creates `/opt/rackbops-discord-bot/<instance>/.env` from `.env.example` (never overwritten on
 a re-run — fill in secrets there by hand). It refreshes three things that are deployment
@@ -212,7 +217,7 @@ The compose file's `build.context` defaults to `.` (a local checkout, unchanged 
 running `docker compose up -d --build` from a clone) — the bootstrap command instead supplies
 `BOT_BUILD_CONTEXT=https://github.com/Rackbops/rackbops-discord-bot.git#<branch>` as a one-shot
 shell variable on that single invocation, so the Docker daemon fetches and builds the source
-itself. It is also written into the stack `.env`, as `<repo>#<branch>` (`ops/install.sh:320`), next to
+itself. It is also written into the stack `.env`, as `<repo>#<branch>` (`ops/install.sh:345`), next to
 `GIT_SHA`. `GIT_SHA` is what self-update's staleness check reads, and it is resolved via
 `git ls-remote` when `install.sh` runs, with no clone needed. Self-update's own rebuilds go through
 the Docker Engine API (`src/redeploy.ts`) and set both themselves.
@@ -451,14 +456,15 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   same compose project and service (which it removes first); with `<name>` RUNNING it leaves both alone and logs
   `two bots on one token` (stop one by hand). A compose-created container renamed to `*-next` by hand is not healed
   (its `/update` is refused with the `container_name` advice instead); a swapped-in container still named
-  `<name>-next` has its `/update` refused with that restart as the advice. An install.sh instance whose
-  name ends in `-next` (`install.sh next`, `canary-next`) keeps it: the bot knows its own name from its compose
-  project, self-updates into `<name>-next`, and a replacement that never took its name is healed to the
-  instance's name (unless a sibling instance owns that standby name: instances `prod` and `prod-next` cannot
-  share a daemon, #567). A compose-only deployment whose `container_name` ends in `-next` without being its
-  project's, and that had already self-updated before #547, would be renamed at its next boot (an install-time
-  guard against `-next` instance names is #567). (c) Neither yet: wait. An **exited** `<name>-next` blocks
-  nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
+  `<name>-next` has its `/update` refused with that restart as the advice. An install.sh instance installed
+  before #567 with a name ending in `-next` (`canary-next`) keeps it (a new one is refused): the bot knows its own
+  name from its compose project, self-updates into `<name>-next`, and a replacement that never took its name is
+  healed to the instance's name (unless a sibling instance owns that standby name: instances `prod` and
+  `prod-next` cannot share a daemon; `install.sh` refuses a new `prod-next` and warns any run for `prod` beside an
+  existing `prod-next`, #567). A compose-only deployment whose `container_name` ends in `-next` without being its
+  project's, and that had already self-updated before #547, would be renamed at its next boot
+  (`install.sh`'s guard, #567, does not reach a compose-only deployment). (c) Neither yet: wait. An **exited**
+  `<name>-next` blocks nothing: it is a leftover of a swap that was interrupted or failed, and the next self-update sweeps it
   (`docker rm <name>-next` clears it sooner).
 
 ## Enabling a panel + choosing a bot (debug/prod)
@@ -832,7 +838,7 @@ their own with the same `dm:self` grant: the plugin's `agent` command sets no de
 such a principal can DM only itself. Rod accepted that boundary on #332.
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:269-273`); Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:294-298`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -971,7 +977,7 @@ still work after such a line (the last value wins in Compose and in `bot-ops.sh`
 `grep -c '^MCP_BRIDGE_TOKEN=' /opt/rackbops-discord-bot/pip/.env` (a count, never the value) before and
 after. Leave the file ending in a newline: `add-bridge.md` section 3 appends with `>>`, which would
 otherwise fuse the new line onto the last one. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
-filled (`ops/install.sh:269-270`); leave it.
+filled (`ops/install.sh:294-295`); leave it.
 
 ### 3. What the core still does
 
@@ -986,7 +992,7 @@ the host's other interaction replies, which go only to the person who interacted
 |---|---|---|---|
 | Release watcher | Nothing: the watcher is off. | `WATCHED_REPOS=none` makes `watchedRepos` `[]` (`src/config.ts:89`, `:176`); `checkReleases` loops nothing, so no release is polled or posted, and boot logs `[release] watcher off (WATCHED_REPOS=none)`. This switches off release polling only: the Plugin Index fetch and the self-update checks are separate. | `src/announce.ts:427-431` (`describeReleaseWatch`) and `:435-443` (`checkReleases`), the tick check at `:217-222` (15-minute poll `:28`), the boot line `src/index.ts:329` |
 | Plugin-update notice | Nowhere: a log line. | With `ADMIN_USER_IDS` empty it logs `[plugins] a plugin update is available but ADMIN_USER_IDS is empty` and returns `false`; the version stays un-notified and the warning repeats each 15-minute poll. Section 2's ADMIN_USER_IDS comment says how it stops and how to move the plugin with no admin. The announce-channel fallback runs only after a DM to a configured admin failed. | `src/plugins/updates.ts:489-518` (`deliverPluginNotification`; the empty-list return at `:495-498`, the fallback at `:510-517`), `:578-605` (`checkPluginUpdates`); live deliverers `src/announce.ts:308-322` |
-| Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:439`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:497-510`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:357-359`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:428-439` (`validate`), `:497-510` |
+| Scheduled plugin update | Nowhere under this `.env` unless someone writes the request mailbox on the host (see why). In general: the bot restarts onto the update and DMs a heads-up to the Discord user who scheduled it (`src/plugins/updates.ts:653-658`). | A schedule comes only from a request: an admin's `/pipplugins` (none here) or the host-side mailbox. `bot-ops.sh plugin-request` is a `docker exec -u bun` write that validates `action`, `plugin`, `version`, `at` and `days` and never `requestedBy` (`ops/bot-ops.sh:1244-1317`, the write at `:1338`); the bot's `validate` requires only a non-empty string there (`src/plugins/requests.ts:439`) and never consults `ADMIN_USER_IDS`; `update-now` and `schedule` carry it into the state (`:497-510`), and a snowflake is DMed (`updates.ts:653-658`; after the restart, `:697-702`). So anyone in the host's docker group can make Pip's core DM any 17-20 digit user id (`isDiscordUserId`, `src/plugins/updates.ts:225`): a `schedule` DMs twice, the heads-up and the report-back, and `update-now` once, the report-back. That group is Pip's real admin set: the bot service loads the whole `.env` with `env_file` (`docker-compose.yml:36`), so `docker inspect` shows every secret (the admin sidecar's comments say what the wholesale load does, `:74-76`, and that `docker inspect` shows the container's environment, `:84-85`; `ops/install.sh:382-384`), and the group is root-equivalent on the host in itself (`docker-compose.yml:45-49` says the same of the mounted socket); `ADMIN_USER_IDS=` governs Discord-side actors only. The panel's "logged, not sent" outcome is the panel's own choice of a non-snowflake `requestedBy` (`ops/admin/server.ts:2032`), enforced nowhere else. Section 2's `ADMIN_USER_IDS` comment carries the mailbox recipe. | `src/plugins/updates.ts:615-666` (`runDueSchedules`, the DM at `:655`); `src/plugins/requests.ts:428-439` (`validate`), `:497-510` |
 | Self-update tick | Nothing. | The check does nothing unless `config.autoUpdate`, and `AUTO_UPDATE=false`. | `src/announce.ts:224-228` |
 | `/pipupdate`, `/pipplugins` | An ephemeral refusal to whoever types it: "No admins are configured". | Both set `setDefaultMemberPermissions(0)`, hiding them from members without Discord's Administrator permission (`src/commands.ts:106-107` and `:138`); the handler then refuses anyone not in `ADMIN_USER_IDS`, and with the list empty that is everyone, a server Administrator included. | `src/commands.ts:107` and `:138`; the refusal `:50-59`, called at `:109` and `:171`; the prefix `src/commandNaming.ts:15-16` |
 | `/pipreport` | An ephemeral "isn't configured" reply. | Both `REPORT_ROLE_ID` and `GITHUB_TOKEN` are blank, so it never reaches its modal. | `src/report.ts`, `handleReportCommand`'s not-configured refusal |

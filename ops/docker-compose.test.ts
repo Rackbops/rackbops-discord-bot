@@ -201,7 +201,7 @@ describe.skipIf(!runnable)("admin's BOT_OPS_PROJECT/BOT_OPS_CONTAINER resolve em
 // install.sh's printed "bring it up" step (#169) is shortened to a bare `docker compose -f
 // $STACK_DIR/docker-compose.yml -p $PROJECT up -d --build`, with none of GIT_SHA/BOT_ENV_FILE/
 // BOT_BUILD_CONTEXT/BOT_OPS_CONTAINER exported as shell prefixes any more — they're all already in
-// the generated $STACK_DIR/.env (install.sh:200-208), so dropping them relies entirely on Compose
+// the generated $STACK_DIR/.env (install.sh:339-347), so dropping them relies entirely on Compose
 // resolving its project directory (and therefore which .env it auto-loads) from the directory of
 // the file passed via -f, regardless of the invoking shell's own cwd. The test above only proves
 // that auto-load when cwd already IS the stack dir (Dockge's own invocation shape, matching this
