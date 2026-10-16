@@ -157,8 +157,8 @@ export function parseContainerId(mountinfo: string): string | undefined {
  *
  * Not covered, declined (#512 item 2): a hostname pinned to a SIBLING's 12-hex id prefix. It is
  * indistinguishable from Docker's own short id without reading mountinfo on the common path, which would
- * also turn the redeploy harnesses red for anyone running the suite inside a container. A pinned NAME
- * (the issue's usual case) is covered.
+ * also turn the redeploy harnesses red for anyone running the suite inside a container. A pinned NAME is
+ * covered.
  *
  * `readMountinfo` is injectable so a test needs no `Bun.file` swap; it is read at most once per call.
  */
@@ -189,11 +189,11 @@ export async function inspectSelf(
       const res = await api(`/containers/${encodeURIComponent(host)}/json`, s);
       if (res.ok) {
         const answer = (await res.json()) as ContainerInspect;
-        // A 200 without a string Id (a broken proxy) is a mismatch, not a TypeError.
+        // A 200 without a string Id (a broken proxy) is never self: a mismatch, not a TypeError.
         const answerId = typeof answer?.Id === "string" ? answer.Id : "";
-        const isSelf = /^[0-9a-f]{12}$/.test(host)
-          ? answerId.startsWith(host)
-          : ((await ownId()) ?? answerId) === answerId;
+        const isSelf =
+          answerId !== "" &&
+          (/^[0-9a-f]{12}$/.test(host) ? answerId.startsWith(host) : ((await ownId()) ?? answerId) === answerId);
         if (isSelf) return answer;
         console.warn(`[docker] HOSTNAME ${host} resolved to another container (${answerId.slice(0, 12)}); using mountinfo`);
       }

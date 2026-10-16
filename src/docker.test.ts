@@ -443,15 +443,18 @@ describe("daemon calls", () => {
 
     // The short-id rule is exactly 12 hex characters, anchored, and a PREFIX of the answer's id: not "any 12
     // characters", not a hex string of another length, not an id that merely contains the hostname.
-    test("a 12-character hostname that is not hex is a pinned name, checked against mountinfo", async () => {
-      process.env.HOSTNAME = "discord-bots";
-      answering({ "/containers/discord-bots/json": ID_A });
-      const mountinfo = reader(mountinfoFor(ID_A));
-      const self = await inspectSelf(1000, mountinfo.read);
-      expect(self.Id).toBe(ID_A);
-      expect(paths()).toEqual(["/containers/discord-bots/json"]); // accepted as itself: no fallback GET
-      expect(mountinfo.calls).toBe(1); // compared with mountinfo, which a short-id hostname would not have read
-    });
+    test.each(["discord-bots", "discordbotzz"])(
+      "a 12-character hostname that is not hex (%s) is a pinned name, checked against mountinfo",
+      async (host) => {
+        process.env.HOSTNAME = host;
+        answering({ [`/containers/${host}/json`]: ID_A });
+        const mountinfo = reader(mountinfoFor(ID_A));
+        const self = await inspectSelf(1000, mountinfo.read);
+        expect(self.Id).toBe(ID_A);
+        expect(paths()).toEqual([`/containers/${host}/json`]); // accepted as itself: no fallback GET
+        expect(mountinfo.calls).toBe(1); // compared with mountinfo, which a short-id hostname would not have read
+      },
+    );
 
     test.each([
       ["13 hex characters", "abcdef0123456"],
@@ -480,20 +483,42 @@ describe("daemon calls", () => {
       }
     });
 
-    test("a 200 without an Id (a broken proxy) is a mismatch, not a TypeError", async () => {
-      process.env.HOSTNAME = SHORT;
-      stub((url) =>
-        new URL(url).pathname === `/containers/${ID_A}/json`
-          ? new Response(JSON.stringify({ Id: ID_A }), { status: 200 })
-          : new Response("{}", { status: 200 }),
-      );
-      const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
-      try {
-        const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
-        expect(self.Id).toBe(ID_A);
-      } finally {
-        warnSpy.mockRestore();
-      }
+    // A 200 whose body has no string Id (a broken proxy: `{}`, `null`, a number) is never self -- a mismatch,
+    // not a TypeError, and not "accepted as before" either, for a short-id or a pinned hostname alike.
+    describe.each([
+      ["{}", "{}"],
+      ["null", "null"],
+      ["a numeric Id", '{"Id":5}'],
+    ])("a 200 whose body is %s", (_name, body) => {
+      const brokenProxy = () =>
+        stub((url) =>
+          new URL(url).pathname === `/containers/${ID_A}/json`
+            ? new Response(JSON.stringify({ Id: ID_A }), { status: 200 })
+            : new Response(body, { status: 200 }),
+        );
+
+      test.each([SHORT, "bot"])("falls back to mountinfo for hostname %s", async (host) => {
+        process.env.HOSTNAME = host;
+        brokenProxy();
+        const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          const self = await inspectSelf(1000, reader(mountinfoFor(ID_A)).read);
+          expect(self.Id).toBe(ID_A);
+        } finally {
+          warnSpy.mockRestore();
+        }
+      });
+
+      test("is the existing error, not an accepted garbage answer, when mountinfo names nothing", async () => {
+        process.env.HOSTNAME = "bot";
+        brokenProxy();
+        const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+        try {
+          await expect(inspectSelf(1000, reader("1 1 0:1 / / rw").read)).rejects.toThrow(/cannot determine own container id/);
+        } finally {
+          warnSpy.mockRestore();
+        }
+      });
     });
 
     test("a pinned hostname that resolves to a sibling is rejected when mountinfo names another id", async () => {
@@ -552,7 +577,10 @@ describe("daemon calls", () => {
       process.env.HOSTNAME = "bot";
       answering({ "/containers/bot/json": ID_F, [`/containers/${ID_A}/json`]: ID_A });
       const paths_ = [] as string[];
+      const realFile = Bun.file;
       const fileSpy = spyOn(Bun, "file").mockImplementation(((path: string) => {
+        // Only /proc/* is answered; anything else another module reads in this window is the real thing.
+        if (!String(path).startsWith("/proc/")) return realFile(path);
         paths_.push(String(path));
         return { text: async () => mountinfoFor(ID_A) };
       }) as never);
