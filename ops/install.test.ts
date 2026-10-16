@@ -1069,8 +1069,8 @@ test("docker-compose.yml's admin comment says scope, not secrecy (issue #231)", 
 });
 
 // ---------------------------------------------------------------------------
-// #567: a NEW instance named `next` or `*-next` is refused; a re-run only warns; a new `X` beside a legacy `X-next`
-// warns. `<container>-next` is the name a self-update gives its replacement (src/redeploy.ts, replacementName), so
+// #567: a NEW instance named `next` or `*-next` is refused; a re-run only warns; any run for `X` while an `X-next`
+// exists warns. `<container>-next` is the name a self-update gives its replacement (src/redeploy.ts, replacementName), so
 // instance `prod-next` owns the container name instance `prod`'s swap creates. check_instance_name is extracted from
 // the live script like resolve_deploy_identity above; the "existing instance" and "sibling" facts are real
 // directories in a temp dir, passed in as the paths main() would have derived.
