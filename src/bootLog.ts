@@ -15,8 +15,9 @@
 // `try`, after the env-file line has printed — a bad data dir costs one line and `process.exit(1)`,
 // never the env-file line. This used to be a dynamic import of `./storage` behind a top-level wait,
 // which made this module async: a later sibling import (`./config`) could then evaluate, and throw,
-// while this one was suspended, losing the data-dir line in exactly the misconfigured-boot case (#493;
-// the auditor reproduced the loss 3 of 3 runs on Bun 1.4.2). A static `import { DATA_DIR } from
+// while this one was suspended, so the data-dir line was not guaranteed in exactly the misconfigured-boot
+// case (#493: ESM does not make a later sibling wait for a module suspended on a top-level await;
+// `bootLog.test.ts` pins that this file has none). A static `import { DATA_DIR } from
 // "./storage"` would be worse: `storage.ts`'s body computes `DATA_DIR` at load and would take both
 // lines down with it — including the env-file one, the exact silent-failure-at-boot class #168 exists
 // to fix, just moved one module over. The exit is the same explicit `log + process.exit(1)` shape
