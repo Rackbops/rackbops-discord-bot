@@ -46,10 +46,32 @@ export interface SelectedPlugin {
   skipped?: string;
 }
 
+/** Discord's privileged gateway intents. An operator must enable each in the developer portal, and a
+ *  Client built with one that is not enabled is refused at login: `client.login` rejects, the process exits,
+ *  `restart: unless-stopped` loops (#493). The host never requests one -- an entry whose declared intents
+ *  carry any of these bits is skipped, by name, before `collectIntents` can see it. A mask, not a lookup:
+ *  the index only requires each intent to be a number and discord.js ORs them, so `32770` carries
+ *  MessageContent as surely as `32768` does. The bits are discord.js's `GatewayIntentBits`, spelled out
+ *  because this module imports nothing but the contract's types; `registry.test.ts` reads them off the
+ *  library. A later env knob can widen the allowed set; nothing published today declares one. */
+const PRIVILEGED_INTENT_BITS: ReadonlyArray<readonly [number, string]> = [
+  [1 << 1, "GuildMembers"],
+  [1 << 8, "GuildPresences"],
+  [1 << 15, "MessageContent"],
+];
+
+/** The privileged intents `intents` carries, by name, or `[]`. */
+function privilegedIntentsIn(intents: readonly number[]): string[] {
+  const names = new Set<string>();
+  for (const value of intents) for (const [bit, name] of PRIVILEGED_INTENT_BITS) if ((value & bit) !== 0) names.add(name);
+  return [...names];
+}
+
 /**
  * Walks `configured` (parsed `PLUGINS=` tokens, in order) against the Plugin Index, skipping a
  * plugin that isn't published, whose index entry needs a different host API than this bot's (unless
- * an older pinned or last-good version is kept — see the check below), is itself named after a
+ * an older pinned or last-good version is kept — see the check below), declares a privileged gateway
+ * intent (#493 — the host never requests one), is itself named after a
  * reserved core command (#185 — its interaction-routing prefix would collide), or whose command
  * names collide with core or an earlier-selected plugin. A skipped plugin is still returned (with
  * `skipped` set) so a caller can report why — this is what #99/#101/#102 read to build `state.json`
@@ -89,8 +111,8 @@ export function selectPlugins(
     // host than ours (assuming a plugin's host API never decreases across its versions, no older
     // version can match either); and an entry that declares intents —
     // collectIntents would union them into the whole Client for a plugin that only ever runs the
-    // older version, and a privileged intent the operator hasn't enabled is an unrecoverable login
-    // failure. So this only ever un-skips a plugin in cases that cannot change the Client's intents.
+    // older version (a privileged one is refused outright below, #493; a non-privileged one still
+    // changes the Client). So this only ever un-skips a plugin in cases that cannot change the Client's intents.
     // installPlugins' newest-cached fallback is not modelled (it needs disk access), so a plugin
     // with no pin and no state.json record stays skipped. #223: install.ts's reconcileManifest DOES
     // check a kept version's own declared hostApiVersion — against this host's HOST_API_VERSION, not
@@ -113,6 +135,20 @@ export function selectPlugins(
         entry,
         pinnedVersion: cfg.version,
         skipped: `needs host API v${entry.hostApiVersion}, this bot is v${hostApiVersion}`,
+      });
+      continue;
+    }
+
+    // #493: after the host-API check, so an entry skipped for its host API keeps that reason. A privileged
+    // intent the operator has not enabled would be refused at login and crash-loop every instance running
+    // this plugin; the host never requests one, so the entry is skipped, by name, like any other bad entry.
+    const privileged = privilegedIntentsIn(entry.intents ?? []);
+    if (privileged.length > 0) {
+      selected.push({
+        name: cfg.name,
+        entry,
+        pinnedVersion: cfg.version,
+        skipped: `declares the privileged gateway intent${privileged.length > 1 ? "s" : ""} ${privileged.join(", ")} (in [${(entry.intents ?? []).join(", ")}]), which the host never requests`,
       });
       continue;
     }

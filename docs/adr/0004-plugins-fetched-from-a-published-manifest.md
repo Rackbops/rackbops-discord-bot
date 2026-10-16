@@ -63,7 +63,13 @@ The decisions that hang off this, settled in #95 and not reopened per issue:
    plugins (warn). An unknown name, an incompatible `hostApiVersion` (decision 5 says when an older pinned version is kept instead), a download or integrity
    failure, a throwing `createPlugin`/`activate` → that plugin is skipped with the reason recorded in
    `state.json`. An invalid plugin env value skips that plugin with the same error text in the log,
-   where the baked-in connector refused to boot.
+   where the baked-in connector refused to boot. An entry that declares a privileged gateway intent
+   (`GuildMembers`, `GuildPresences`, `MessageContent`) is skipped the same way, before the `Client` is
+   built — the host never requests one, since a privileged intent the operator has not enabled is
+   refused at login and would crash-loop every instance running that plugin (#493). The guarantee
+   covers boot and every call the host makes into a plugin; work a plugin starts on its own — a timer,
+   a listener, a promise nothing awaits — is outside it (Bun exits on an unhandled rejection and the
+   host installs no process-level handler, #470; the contract says so on `activate()`).
 4. **Trust.** The host executes code the index names. Trust = whoever can publish
    `@rackbops/plugin-*` or edit `plugins.json` on the plugins repo's `main` — the same class as push
    access to `BOT_BRANCH` (`README.md`'s self-update warning). Integrity = HTTPS, an operator-pinned

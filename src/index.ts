@@ -56,7 +56,7 @@ import {
 } from "./plugins/host";
 import { startHostHttp } from "./http";
 import { describeInteraction, interactionLogLine, type InteractionOutcome } from "./interactionLog";
-import { createTrustedProxy } from "./net/clientIp";
+import { createTrustedProxy, PROXY_BOOT_REFRESH_TIMEOUT_MS } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
 import { editOwnMessage, sendPayloadDm, sendPayloadToChannel } from "./plugins/delivery";
 import { describePlugins, readDiscovery } from "./routing/discovery";
@@ -335,15 +335,18 @@ async function activate(c: Client<true>): Promise<void> {
   // the bot down.
   if (config.httpPort !== undefined) {
     try {
-      // #319: resolved (or explicitly never-trusted) before the listener binds, so the very first
-      // request sees the real address set rather than an empty one racing the first refresh.
-      const proxy = createTrustedProxy({ host: config.trustedProxyHost });
+      // #319: resolved (or explicitly never-trusted) before the listener binds, so the first request sees the
+      // real address set when the sidecar answers within the bound. #493: bounded, so a sidecar that cannot be
+      // resolved yet (a first `up`, a host reboot) delays command registration and the ready flag by at most
+      // PROXY_BOOT_REFRESH_TIMEOUT_MS, not by the resolver's own timeout; the lookup keeps running and trust
+      // lands when it does -- fail closed meanwhile. Failures and recoveries are logged by the proxy itself.
+      const proxy = createTrustedProxy({ host: config.trustedProxyHost, log: console });
       if (config.trustedProxyHost === undefined) {
         console.log(
           "[http] TRUSTED_PROXY_HOST is not set -- CF-Connecting-IP will never be trusted; every caller shares one rate-limit budget",
         );
       } else {
-        await proxy.refresh();
+        await proxy.refresh(PROXY_BOOT_REFRESH_TIMEOUT_MS);
       }
       const loaded = loadResult.loaded;
       const http = startHostHttp({
