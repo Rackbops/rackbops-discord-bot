@@ -153,7 +153,8 @@ export function parseContainerId(mountinfo: string): string | undefined {
  * with the id in this process's own mountinfo when that can be read and parsed (Docker bind-mounts
  * `/etc/hostname` from `…/containers/<id>/…`, so the id is spelled out there even under cgroup v2).
  * A mismatch, like a non-ok answer, falls through to the mountinfo leg. Where mountinfo cannot be read
- * (not Docker) or names no container (a plain host), a pinned hostname's answer stands, as before.
+ * (not Docker) or names no container (a plain host), a pinned hostname's answer stands, as before — provided
+ * it carries an Id: an answer without one is never self.
  *
  * Not covered, declined (#512 item 2): a hostname pinned to a SIBLING's 12-hex id prefix. It is
  * indistinguishable from Docker's own short id without reading mountinfo on the common path, which would
