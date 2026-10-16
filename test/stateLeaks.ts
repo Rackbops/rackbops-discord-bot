@@ -91,9 +91,17 @@ export function updateLeaks(s: { checkInFlight: boolean }): string[] {
   return s.checkInFlight ? ["an update check still in flight — the next checkForUpdate answers busy"] : [];
 }
 
-/** With no plugin state.json write pending. */
-export async function pluginHostLeaks(s: { writes: Promise<void> }): Promise<string[]> {
-  return (await settled(s.writes)) ? [] : ["a plugin state.json write still running"];
+/** Against what `resetPluginDisposingForTest()` leaves, and with no plugin state.json write pending. */
+export async function pluginHostLeaks(s: {
+  writes: Promise<void>;
+  disposing: boolean;
+  activation: Promise<void>;
+}): Promise<string[]> {
+  const leaks: string[] = [];
+  if (!(await settled(s.writes))) leaks.push("a plugin state.json write still running");
+  if (s.disposing) leaks.push("disposePlugins ran — activatePlugins now refuses every plugin");
+  if (!(await settled(s.activation))) leaks.push("a plugin activation still running");
+  return leaks;
 }
 
 /** Against what `resetPluginRequestsForTest()` and `resetPluginRequestDrainForTest()` leave. */
