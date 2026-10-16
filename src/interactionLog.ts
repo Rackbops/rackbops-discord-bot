@@ -1,7 +1,11 @@
 // #328: one log line per interaction, written by index.ts's InteractionCreate handler, so every
 // command, button press and modal submit shows in the log -- for every plugin, with no plugin
 // changing. Before this, only an exception reached the log (`[interaction]`), so a command that
-// answered normally left no trace at all.
+// answered normally left no trace at all. The line is written once the interaction is handled or, when
+// the process exits before the handler returns (`/update` and `/plugins ... update ... now` end it
+// inside their handler; so does a self-update's retire), right before that exit (#446,
+// `createInteractionLine`): never twice. An exit this process does not choose -- a crash, or the
+// daemon's SIGKILL after `docker stop`'s grace -- runs no hook and leaves no line.
 //
 // What a line may carry is deliberately narrow: the kind, the command's name (with its subcommand
 // group and subcommand, which are names from the command's own definition), or a component's or
@@ -19,9 +23,13 @@ export type InteractionKind = "command" | "component" | "modal";
  * - `gated`: the routing gate refused a plugin command in this channel (#243).
  * - `unclaimed`: nothing handles it -- no command by that name, a plugin command whose plugin is not
  *   running (#407, refused privately), or a component/modal no running plugin claims.
- * - `error`: a handler threw; the error itself is logged separately, as before.
+ * - `error`: a handler threw; the error itself is logged separately, as before (and, since #545, without
+ *   the interaction token or the reply it carried).
+ * - `exiting`: the process is exiting -- a requested restart, or a stop -- before the handler returned
+ *   (#446). Written by the exit hook index.ts registers, so `/update` and `/plugins ... update ... now`,
+ *   which end the process inside their handler, still leave a line.
  */
-export type InteractionOutcome = "answered" | "gated" | "unclaimed" | "error";
+export type InteractionOutcome = "answered" | "gated" | "unclaimed" | "error" | "exiting";
 
 /** The parts of an interaction a line is built from -- read by `describeInteraction`, nothing else. */
 export interface InteractionFacts {
@@ -107,4 +115,25 @@ export function interactionLogLine(facts: InteractionFacts, outcome: Interaction
   const where = facts.guildId === null ? "dm" : `guild:${facts.guildId}/channel:${facts.channelId ?? "?"}`;
   const took = Number.isFinite(ms) && ms >= 0 ? Math.round(ms) : 0;
   return `[interaction] ${facts.kind} ${facts.name} user=${facts.userId} where=${where} outcome=${outcome} ${took}ms`;
+}
+
+/**
+ * #328/#446: the one writer of an interaction's line. Returns `line(outcome)`, which writes
+ * `interactionLogLine(facts, outcome, now() - started)` through `write` the FIRST time it is called and
+ * nothing after -- so the exit hook and the handler's `finally` can both call it and exactly one line
+ * lands, whichever fires first. With `facts` null (autocomplete) it writes nothing. `started` is read when
+ * this is called, so call it where the handling begins.
+ */
+export function createInteractionLine(
+  facts: InteractionFacts | null,
+  write: (line: string) => void,
+  now: () => number = Date.now,
+): (outcome: InteractionOutcome) => void {
+  const started = now();
+  let logged = false;
+  return (outcome) => {
+    if (logged || facts === null) return;
+    logged = true;
+    write(interactionLogLine(facts, outcome, now() - started));
+  };
 }

@@ -57,6 +57,7 @@ const CLEAN_RESTART: RestartStateForTest = {
   stopListeners: 0,
   stopNotified: false,
   deferralArmed: false,
+  exitHooks: 0,
 };
 
 describe("restartStateLeaks", () => {
@@ -74,6 +75,7 @@ describe("restartStateLeaks", () => {
     ["stopListeners", { stopListeners: 3 }, "3 onStopRequested listener(s)"],
     ["stopNotified", { stopNotified: true }, "stop already notified"],
     ["deferralArmed", { deferralArmed: true }, "restart deferral deadline still armed"],
+    ["exitHooks", { exitHooks: 2 }, "2 onBeforeExit hook(s)"],
   ];
   for (const [field, dirty, expected] of rows) {
     test(`names ${field} when only it is dirty`, () => {
@@ -99,8 +101,9 @@ describe("restartStateLeaks", () => {
       stopListeners: 1,
       stopNotified: true,
       deferralArmed: true,
+      exitHooks: 1,
     };
-    expect(restartStateLeaks(allDirty)).toHaveLength(8);
+    expect(restartStateLeaks(allDirty)).toHaveLength(9);
   });
 });
 
