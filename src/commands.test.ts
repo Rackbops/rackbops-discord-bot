@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
-import { expectCleanedLog, printed, replyFailure, type ReplyFailure } from "../test/restError";
+import { DiscordAPIError, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import { expectCleanedLog, printed, replyFailure } from "../test/restError";
 import type { PluginCommand } from "./plugins/contract";
 import type { PluginCommandTarget } from "./plugins/host";
 
@@ -210,7 +210,8 @@ describe("updateReply", () => {
   // #449 (C1): the refused caller is never recorded (checkForUpdate answers `busy` before it reads the requester), so
   // nothing is promised to them, the wait is not called short (a build runs up to 15 minutes), and the command is
   // named as this instance registered it (`interaction.commandName`, prefix included), never a bare `/update`.
-  // Mutations: the old text back (`I'll report` / `in a minute`); a literal `/update` for the interpolation.
+  // Mutations: the old text back (`I'll report`); "or restart" or the closing clause dropped; a literal `/update` for
+  // the interpolation. (`in a minute` is the plan's guard against ever calling the wait short.)
   test("a second /update is refused without promising a report, naming the command as registered", () => {
     const reply = updateReply("busy", "", { commandName: "pipupdate" });
     expect(reply).toContain("An update or restart is already in progress");
@@ -254,24 +255,30 @@ describe("updateReply", () => {
     expect(refused).toContain("409");
   });
 
-  // #505 item 7 (1c): the daemon's errors sit in front of the verdict and of the operator instruction, so each is
-  // bounded to DAEMON_ERROR_MAX (600, plus clampReply's one-character suffix) before it is interpolated: a 3000-character
-  // error and a 3000-character `replacementError` still leave a reply Discord accepts, ending on the verdict. The C2 test
-  // drives the `error` clause through the handler; this pins both clauses in every outcome. Mutations: either clamp
-  // dropped (the reply is over 3000 units); DAEMON_ERROR_MAX raised.
+  // #505 item 7 (1c): a failed or timed-out swap's text puts the daemon's errors in front of the verdict and of the
+  // operator instruction (a stalled one's puts the error last), so each is bounded to DAEMON_ERROR_MAX (600, plus
+  // clampReply's one-character suffix) before it is interpolated: a 3000-character error and a 3000-character
+  // `replacementError` still leave a reply Discord accepts. The C2 test drives the `error` clause through the handler;
+  // this pins both clauses in every outcome, with different characters per field so a clamp reading the wrong field is
+  // caught. Mutations: either clamp dropped (the reply is over 3000 units); one reading the other field's text;
+  // DAEMON_ERROR_MAX raised or lowered.
   test("a long daemon error in any clause is bounded, so the verdict and the operator instruction survive", () => {
-    const long = "e".repeat(3000);
+    const error = "e".repeat(3000);
+    const replacementError = "r".repeat(3000);
     for (const outcome of ["failed", "timeout", "stalled"] as const) {
       const reply = updateReply("restart", SHA, {
-        redeploy: { outcome, error: long, replacement: "remove-failed", replacementError: long },
+        redeploy: { outcome, error, replacement: "remove-failed", replacementError },
       });
       expect(reply.length, outcome).toBeLessThan(1500);
       expect(reply, outcome).toContain(`${"e".repeat(600)}…`);
+      expect(reply, outcome).toContain(`${"r".repeat(600)}…`);
       expect(reply, outcome).not.toContain("e".repeat(601));
+      expect(reply, outcome).not.toContain("r".repeat(601));
       expect(reply, outcome).toContain("remove the `-next` container by hand. I stayed on the current build.");
     }
+    // `failed` (and `timeout`) put the verdict last.
     const failed = updateReply("restart", SHA, {
-      redeploy: { outcome: "failed", error: long, replacement: "remove-failed", replacementError: long },
+      redeploy: { outcome: "failed", error, replacement: "remove-failed", replacementError },
     });
     expect(failed.endsWith("I stayed on the current build.")).toBe(true);
   });
@@ -765,7 +772,17 @@ describe("handleCommand — /update", () => {
    * Admin `999`'s `/update` interaction, recording every edit and DM that LANDS and counting every attempt. The first
    * `editFails` edits reject with `failure.error` (a reply Discord refuses); the DM rejects with it when `dmFails`.
    */
-  function adminUpdate(o: { commandName?: string; failure?: ReplyFailure; editFails?: number; dmFails?: boolean } = {}) {
+  function adminUpdate(
+    o: {
+      commandName?: string;
+      failure?: { error: unknown };
+      editFails?: number;
+      dmFails?: boolean;
+      /** Make the DM take this long, and record the order of the refused edit and the DM into `events`. */
+      sendDelayMs?: number;
+      events?: string[];
+    } = {},
+  ) {
     const edits: string[] = [];
     const dms: string[] = [];
     const calls = { edit: 0, dm: 0 };
@@ -775,8 +792,11 @@ describe("handleCommand — /update", () => {
         id: "999",
         send: async (content: string) => {
           calls.dm += 1;
+          o.events?.push("dm-start");
+          if (o.sendDelayMs) await Bun.sleep(o.sendDelayMs);
           if (o.dmFails) throw o.failure!.error;
           dms.push(content);
+          o.events?.push("dm-done");
         },
       },
       channelId: "c1",
@@ -785,7 +805,10 @@ describe("handleCommand — /update", () => {
       deferReply: async () => {},
       editReply: async (content: string) => {
         calls.edit += 1;
-        if (calls.edit <= (o.editFails ?? 0)) throw o.failure!.error;
+        if (calls.edit <= (o.editFails ?? 0)) {
+          o.events?.push("edit-refused");
+          throw o.failure!.error;
+        }
         edits.push(content);
       },
     } as unknown as ChatInputCommandInteraction;
@@ -913,6 +936,91 @@ describe("handleCommand — /update", () => {
       } finally {
         warn.mockRestore();
       }
+    }
+  });
+
+  // Decision 4: the DM is the fallback for EVERY refused edit, not only Discord's "unknown interaction": a network
+  // failure, a 5xx, a rate limit or another Discord code can leave the requester without a reply just the same.
+  // Mutation: the fallback guarded on the error's Discord code (10062) or on its being a number.
+  test("a reply that fails for any reason, not only an expired token, is sent by DM", async () => {
+    const url = "https://discord.com/api/v10/webhooks/2/token-x";
+    const reasons: unknown[] = [
+      new Error("socket hang up"),
+      Object.assign(new TypeError("Unable to connect"), { code: "ConnectionRefused" }),
+      new DiscordAPIError({ message: "Invalid Webhook Token", code: 50027 }, 50027, 401, "PATCH", url, { body: {}, files: undefined }),
+      new DiscordAPIError({ message: "Service Unavailable", code: 0 }, 0, 503, "PATCH", url, { body: {}, files: undefined }),
+    ];
+    for (const error of reasons) {
+      const { interaction, edits, dms, calls } = adminUpdate({ failure: { error }, editFails: 1 });
+      const warn = spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        await asAdmin("", async () => {
+          expect(await handleCommand(interaction)).toBe("answered");
+        });
+        expect(edits).toEqual([]);
+        expect(calls).toEqual({ edit: 1, dm: 1 });
+        expect(dms).toEqual(["⚠️ Self-update is disabled — this build has no `GIT_SHA` baked in."]);
+      } finally {
+        warn.mockRestore();
+      }
+    }
+  });
+
+  // The DM carries exactly what the edit would have, at its longest: the clamped failure text (1901 units, the longest
+  // reply the handler can build). Mutation: a DM cut shorter than the clamped reply.
+  test("a refused reply goes by DM whole, at its longest", async () => {
+    const { interaction, edits, dms } = adminUpdate({ failure: replyFailure("webhook"), editFails: 1 });
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
+      throw new Error("y".repeat(3000));
+    }) as unknown as typeof fetch);
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await asAdmin(RUNNING_SHA, async () => {
+        expect(await handleCommand(interaction)).toBe("answered");
+      });
+      expect(edits).toEqual([]);
+      expect(dms).toHaveLength(1);
+      expect(dms[0]!.length).toBe(1901);
+      expect(dms[0]!.startsWith("⚠️ Update check failed: yyy")).toBe(true);
+    } finally {
+      warn.mockRestore();
+      fetchSpy.mockRestore();
+      resetUpdateForTest();
+    }
+  });
+
+  // Decision 2: with no daemon socket the restart is requested INSIDE the handler's critical section and its exit fires
+  // when that section closes, so a DM sent because the edit was refused is awaited FIRST (a delayed DM makes the order
+  // observable). Mutations: the section dropped (the exit fires at the request, before the edit); the DM not awaited.
+  test("on the exit-75 path the DM is delivered before the restart exits the process", async () => {
+    const events: string[] = [];
+    const { interaction, dms } = adminUpdate({ failure: replyFailure("webhook"), editFails: 1, events, sendDelayMs: 30 });
+    const restoreExit = setExitFn((code) => void events.push(`exit ${code}`));
+    const realFetch = globalThis.fetch;
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/commits?")) return new Response(JSON.stringify([{ sha: "2".repeat(40) }]), { status: 200 });
+      if (url.includes("/compare/")) return new Response(JSON.stringify({ status: "behind" }), { status: 200 });
+      throw new Error(`no docker daemon in this test: ${url}`); // /_ping: daemonReachable() is false, so the exit-75 fallback
+    }) as unknown as typeof fetch;
+    try {
+      await asAdmin(RUNNING_SHA, async () => {
+        expect(await handleCommand(interaction)).toBe("answered");
+      });
+      expect(events).toEqual(["edit-refused", "dm-start", "dm-done", `exit ${RESTART_EXIT_CODE}`]);
+      expect(dms).toHaveLength(1);
+      expect(dms[0]).toContain("Restarting to pick up");
+    } finally {
+      globalThis.fetch = realFetch;
+      restoreExit();
+      log.mockRestore();
+      warn.mockRestore();
+      botState.attemptedUpdateToSha = undefined;
+      botState.pendingUpdateReport = undefined;
+      resetRestartForTest();
+      resetUpdateForTest();
     }
   });
 
@@ -1310,6 +1418,9 @@ describe("commands.ts — clampReply guards every editReply (#55, #186, #503)", 
     expect(block.split("clampReply(")).toHaveLength(3);
     expect(block.split("await interaction.editReply(content)")).toHaveLength(2);
     expect(block.split("editReply(")).toHaveLength(2);
+    // Both clamps keep the default max (1900, under Discord's 2000): a tighter one would cut a real 1000-1400 unit
+    // failed-swap reply, a looser one is no clamp.
+    expect(block).not.toMatch(/clampReply\([^;]*,\s*\d[\d_.e]*\s*\)/);
   });
 
   test("/plugins list's failure edit is wrapped in clampReply", async () => {

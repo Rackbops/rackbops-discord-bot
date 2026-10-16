@@ -144,8 +144,11 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         } catch (err) {
           // #503 item 2: Discord accepts the reply for 15 minutes after the command, and a build can run that long
           // (docker.ts's BUILD_TIMEOUT_MS), so the reply to a long failed swap can arrive after the token died. The
-          // requester is known: tell them by DM. A DM that fails too rejects out of here, as the double failure did
-          // before, so index.ts logs it and the interaction line says `error`.
+          // requester is known: tell them by DM, whatever made the edit fail. A DM that fails too rejects out of here,
+          // as the double failure did before: on the swap path index.ts logs it and the interaction line says `error`;
+          // on the exit-75 path the restart's exit fires as this section closes, ahead of that catch, so nothing logs
+          // the DM's own failure there (the warn below records the refused edit) and the post-boot report is what
+          // reaches the requester.
           console.warn(
             `[update] /${interaction.commandName}: the reply was refused — sending it by DM`,
             withoutRequest(err),
@@ -406,9 +409,10 @@ async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promis
 }
 
 /**
- * The daemon's build or inspect error comes first in `handoffFailureMessage`'s text and the verdict ("I stayed on the
- * current build", the `-next` container to remove by hand) last; unbounded, a long error pushed the verdict past the
- * whole-reply clamp (#505 item 7). 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause.
+ * A failed or timed-out swap's text (`handoffFailureMessage`) puts the daemon's error ahead of the verdict ("I stayed on
+ * the current build", the `-next` container to remove by hand); unbounded, a long error pushed the verdict past the
+ * whole-reply clamp (#505 item 7). A stalled swap's text puts the error last, where the clamp only keeps the reply
+ * bounded. 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause.
  */
 const DAEMON_ERROR_MAX = 600;
 
@@ -431,8 +435,8 @@ export function updateReply(
   switch (decision) {
     case "busy":
       // #449: the refused caller is never recorded, so nothing is promised to them, and the wait is not called short
-      // (a build runs up to 15 minutes). The clause is true in every case: a /update in flight reports to its own
-      // requester; an AUTO tick, a plain check, a plugin-update restart or a shutdown have no requester.
+      // (a build runs up to 15 minutes). The clause is true whichever call is in flight: a /update reports to its own
+      // requester, and anything else that answers busy (the AUTO tick) has no requester to report to.
       return `⏳ An update or restart is already in progress — ask again once it has finished (a /${o.commandName ?? "update"} that started it reports back to whoever ran it).`;
     case "disabled":
       // Two ways to end up here, and they need different things from the operator: bake a
