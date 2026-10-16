@@ -7,7 +7,7 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +33,7 @@ function extractLine(pattern: RegExp, what: string): string {
 }
 
 const RESOLVE_DEPLOY_IDENTITY = extractFunction("resolve_deploy_identity");
+const CHECK_INSTANCE_NAME = extractFunction("check_instance_name");
 
 function resolveBash(): string | null {
   if (process.platform === "win32") {
@@ -223,7 +224,7 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
 // entirely, letting an unregistered one through silently. What this scan does not check is the -p
 // itself: a registered `mktemp` with no -p passes here (verified), and putting the temp file in
 // /tmp rather than beside its destination is a separate defect — the EXDEV one #96 fixed in
-// bot-ops.sh, argued for install.sh at ops/install.sh:117-120.
+// bot-ops.sh, argued for install.sh at ops/install.sh:147-151.
 const CODE_LINES = installShSource.split("\n").map((l) => (/^\s*#/.test(l) ? "" : l));
 
 // The registration must name the SAME variable the mktemp assigned. Requiring only "some
@@ -336,7 +337,7 @@ async function runValidate(fileLines: string[]): Promise<Run> {
   }
 }
 
-// A shape matching what install.sh's own STACKENV heredoc actually writes (install.sh:220-226),
+// A shape matching what install.sh's own STACKENV heredoc actually writes (install.sh:339-347),
 // with BOT_OPS_CONFIG_DIR pointed at a REAL directory (validDir) so the base case is genuinely
 // valid end to end, not just absolute-looking.
 function validStackEnv(validDir: string): string[] {
@@ -639,6 +640,7 @@ async function runBranchGate(branch: string, thirdArg?: string): Promise<FetchPr
     'die() { echo "install: $*" >&2; exit 1; }',
     "need() { :; }",
     "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
+    "check_instance_name() { :; }", // #567: the slice calls it; unstubbed it is a 127 that fails the four tests below for the wrong reason
     "bootstrap_dir() { :; }",
     "mkdir() { :; }", // stubbed: the real one would try to mkdir /opt/... without privileges
     "chown() { :; }",
@@ -1064,4 +1066,195 @@ test("docker-compose.yml's admin comment says scope, not secrecy (issue #231)", 
   expect(envIdx).toBeGreaterThan(adminIdx);
   const adminBlock = compose.slice(adminIdx, envIdx);
   expect(adminBlock).toContain("Scope, not secrecy");
+});
+
+// ---------------------------------------------------------------------------
+// #567: a NEW instance named `next` or `*-next` is refused; a re-run only warns; any run for `X` while an `X-next`
+// exists warns. `<container>-next` is the name a self-update gives its replacement (src/redeploy.ts, replacementName), so
+// instance `prod-next` owns the container name instance `prod`'s swap creates. check_instance_name is extracted from
+// the live script like resolve_deploy_identity above; the "existing instance" and "sibling" facts are real
+// directories in a temp dir, passed in as the paths main() would have derived.
+// ---------------------------------------------------------------------------
+const NAME_SCRIPT = [
+  "set -euo pipefail",
+  'die() { echo "install: $*" >&2; exit 1; }',
+  'INSTANCE="$PROBE_INSTANCE"',
+  'CONFIG_DIR="$PROBE_CONFIG_DIR"',
+  'STACK_DIR="$PROBE_STACK_DIR"',
+  'PROJECT="rackbops-discord-bot-$INSTANCE"',
+  CHECK_INSTANCE_NAME,
+  "check_instance_name",
+  'echo "ok $INSTANCE"',
+].join("\n");
+
+interface NameDirs {
+  configDir: string;
+  stackDir: string;
+}
+
+async function runName(instance: string, dirs: NameDirs): Promise<Run> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    PROBE_INSTANCE: instance,
+    PROBE_CONFIG_DIR: dirs.configDir,
+    PROBE_STACK_DIR: dirs.stackDir,
+  };
+  const proc = Bun.spawn([BASH!, "-c", NAME_SCRIPT], { stdout: "pipe", stderr: "pipe", env: env as Record<string, string> });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+/** A temp root with forward slashes (Git Bash on Windows reads those), and the two paths main() derives for `instance`. */
+async function withInstanceDirs(instance: string, body: (dirs: NameDirs) => Promise<void>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), "install-name-")).replaceAll("\\", "/");
+  try {
+    await body({ configDir: `${root}/config/${instance}`, stackDir: `${root}/stacks/rackbops-discord-bot-${instance}` });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh refuses a new instance named next or *-next, and warns otherwise (#567)", () => {
+  test("a new prod-next (neither directory exists) dies, naming the container and the issue", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(1);
+      expect(r.stdout.trim()).toBe("");
+      expect(r.stderr).toContain("would be 'rackbops-discord-bot-prod-next', which ends in -next");
+      expect(r.stderr).toContain("the suffix the self-update reserves for its replacement (<container>-next)"); // the issue's acceptance: say WHY
+      expect(r.stderr).toContain("pick another name");
+      expect(r.stderr).toContain("(#567)");
+    });
+  });
+
+  test("a re-run on an existing prod-next (config dir present) only warns and continues", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      mkdirSync(dirs.configDir, { recursive: true });
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe("ok prod-next");
+      expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
+      // Quoted, so the unstripped name ('...-prod-next') cannot satisfy it: this is the container it collides WITH.
+      expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+      expect(r.stderr).toContain("(#567)");
+    });
+  });
+
+  test("a re-run with only the stack dir present is an existing instance too", async () => {
+    await withInstanceDirs("prod-next", async (dirs) => {
+      mkdirSync(dirs.stackDir, { recursive: true });
+      const r = await runName("prod-next", dirs);
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe("ok prod-next");
+      expect(r.stderr).toContain("WARNING: the container 'rackbops-discord-bot-prod-next' ends in -next");
+      expect(r.stderr).toContain("container is 'rackbops-discord-bot-prod'");
+      expect(r.stderr).toContain("(#567)");
+    });
+  });
+
+  test("the bare name next is refused when new, and warned (naming rackbops-discord-bot) when it exists", async () => {
+    await withInstanceDirs("next", async (dirs) => {
+      const refused = await runName("next", dirs);
+      expect(refused.exitCode).toBe(1);
+      expect(refused.stderr).toContain("would be 'rackbops-discord-bot-next'");
+      mkdirSync(dirs.configDir, { recursive: true });
+      const rerun = await runName("next", dirs);
+      expect(rerun.exitCode).toBe(0);
+      expect(rerun.stdout.trim()).toBe("ok next");
+      expect(rerun.stderr).toContain("container is 'rackbops-discord-bot'");
+    });
+  });
+
+  // `prodnext` tells `*-next` from `*next`; `prod-nextgen` and `my-next-app` tell it from `*-next*` (the suffix, only).
+  test("only the suffix counts: prod, nextgen, prodnext, next-prod, prod-nextgen and my-next-app install silently", async () => {
+    for (const name of ["prod", "nextgen", "prodnext", "next-prod", "prod-nextgen", "my-next-app"]) {
+      await withInstanceDirs(name, async (dirs) => {
+        const r = await runName(name, dirs);
+        expect(r.exitCode, name).toBe(0);
+        expect(r.stdout.trim(), name).toBe(`ok ${name}`);
+        expect(r.stderr, name).toBe("");
+      });
+    }
+  });
+
+  test("prod beside a legacy prod-next (either of its directories) warns and continues, new or re-run", async () => {
+    for (const sibling of ["config", "stack"] as const) {
+      for (const rerun of [false, true]) {
+        const label = `${sibling} sibling, ${rerun ? "re-run" : "new"}`;
+        await withInstanceDirs("prod", async (dirs) => {
+          mkdirSync(sibling === "config" ? `${dirs.configDir}-next` : `${dirs.stackDir}-next`, { recursive: true });
+          if (rerun) mkdirSync(dirs.configDir, { recursive: true }); // prod itself already exists: still warned, still continues
+          const r = await runName("prod", dirs);
+          expect(r.exitCode, label).toBe(0);
+          expect(r.stdout.trim(), label).toBe("ok prod");
+          expect(r.stderr, label).toContain("WARNING: an instance 'prod-next' already exists");
+          // What the collision costs: a stopped X-next is what X's self-update sweeps (src/redeploy.ts, the leftover sweep).
+          expect(r.stderr, label).toContain("removes 'rackbops-discord-bot-prod-next' if that container is stopped");
+          expect(r.stderr, label).toContain("(#567)");
+        });
+      }
+    }
+  });
+});
+
+// The CONSUMER boundary: main()'s own slice (the same BRANCH_GUARD_TO_FETCH the branch-gate tests run) with the REAL
+// check_instance_name, every write stubbed to a recording line. A new `probe-next` must exit 1 before any WRITE, and a
+// plain `probe` must reach the end with its writes (so the stubs prove the slice does get that far). The CONFIG_DIR the
+// slice derives is the real /opt path, which no test machine has, so the instance is "new".
+async function runNameGate(instance: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const script = [
+    "set -euo pipefail",
+    'die() { echo "install: $*" >&2; exit 1; }',
+    "need() { :; }",
+    "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
+    CHECK_INSTANCE_NAME,
+    'bootstrap_dir() { echo "WRITE:bootstrap_dir $1"; }',
+    'mkdir() { echo "WRITE:mkdir $*"; }',
+    'chown() { echo "WRITE:chown $*"; }',
+    'sed() { echo "WRITE:sed"; }',
+    "random_token() { echo faketoken; }",
+    'fetch() { echo "WRITE:fetch $1"; }',
+    'install_shared_bin() { echo "WRITE:install_shared_bin"; }',
+    BRANCH_GUARD_TO_FETCH,
+    'echo "REACHED_END"',
+  ].join("\n");
+  const proc = Bun.spawn([BASH!, "-c", script, "_", instance], { stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+describe.skipIf(!runnable)("install.sh's main() stops a new next/*-next instance before it writes anything (#567)", () => {
+  test("control: a plain new instance reaches the end of the slice with its writes", async () => {
+    const r = await runNameGate("probe");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("WRITE:bootstrap_dir /opt/rackbops-discord-bot/probe");
+    expect(r.stdout).toContain("REACHED_END");
+  });
+
+  test("a new probe-next dies in the slice with no write at all", async () => {
+    const r = await runNameGate("probe-next");
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("would be 'rackbops-discord-bot-probe-next'");
+    expect(r.stdout).not.toContain("WRITE:");
+    expect(r.stdout).not.toContain("REACHED_END");
+  });
+});
+
+// Source check, no bash needed: main() must call it after PROJECT is set (the message names it) and before anything
+// is created (a refusal writes nothing). Searches for the call LINE, so the definition and the comments don't count.
+test("install.sh calls check_instance_name after PROJECT is set and before anything is created (#567)", () => {
+  const iProject = installShSource.indexOf('PROJECT="rackbops-discord-bot-$INSTANCE"');
+  const iBoot = installShSource.indexOf('bootstrap_dir "$CONFIG_DIR"');
+  const iCall = installShSource.search(/^ {2}check_instance_name$/m);
+  for (const [name, i] of Object.entries({ iProject, iBoot, iCall })) expect(i, `${name} present`).toBeGreaterThan(-1);
+  expect(iCall).toBeGreaterThan(iProject);
+  expect(iCall).toBeLessThan(iBoot);
 });
