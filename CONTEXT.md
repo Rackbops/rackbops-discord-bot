@@ -1229,7 +1229,11 @@ _Avoid_: server list, guild cache
   about — leaves the report in place for the new build or the next boot (the record then stays until
   that boot; `/update` does not read it), bounded two ways: the 24 h age drop runs before the
   in-flight hold, and a record a day old that the daemon still cannot be asked about resolves as
-  `interrupted`.
+  `interrupted`. It also delivers only the report the boot saw (`owed`, taken in `index.ts` right after
+  that resolve): `activate()` goes on for seconds after the interaction handler attaches (command
+  registration, the HTTP bind, the plugin mailbox drain), and a `/update` taken in that time arms a
+  newer report for a restart still in progress, which this must neither send as "same build" nor clear —
+  its replacement reports it.
 - **The interaction follow-up posts unauthenticated via raw `REST.post(Routes.webhook(...), { auth: false })`,
   not `WebhookClient`** — the webhook route is authenticated by the interaction token itself, and
   discord.js's `WebhookClient.send` typing can't set the ephemeral flag, which the follow-up needs

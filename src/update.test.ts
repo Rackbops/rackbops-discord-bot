@@ -724,6 +724,8 @@ describe("resolveUpdateAttempt (#450)", () => {
     expect(onDisk().swapInFlight).toBeUndefined();
     expect(state.attemptedUpdateToSha).toBe(NEW);
     expect(state.pendingUpdateReport).toBeDefined();
+    expect(state.pendingUpdateReport?.interrupted).toBeUndefined(); // landed is not a failed swap: nothing is marked
+    expect(onDisk().pendingUpdateReport.interrupted).toBeUndefined();
     expect(onDisk().attemptedUpdateToSha).toBe(NEW);
   });
 
