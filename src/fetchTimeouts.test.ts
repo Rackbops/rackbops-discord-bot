@@ -18,7 +18,7 @@ const { config } = await import("./config");
  * all `await res.json()` after the fetch resolves — a bound that covered only the request would
  * miss it. (It doesn't: `AbortSignal.timeout` stays armed through the body read.)
  */
-describe("every GitHub call is timeout-bounded", () => {
+describe("every GitHub call is timeout-bounded, and every fetch(/fetchFn(/fetchImpl(/deps.fetch( call in src/ carries a signal", () => {
   // Every call takes an overridable timeout so each can be driven — and mutated —
   // independently, without waiting out the real 10s bound.
   const TINY = 20;
@@ -128,18 +128,30 @@ describe("every GitHub call is timeout-bounded", () => {
 
   // The table above is a hand-maintained literal list, so a SIXTH GitHub call added later is
   // simply absent from it rather than red — the same rot mode this file exists to prevent, one
-  // level up again. This closes that: it reads the sources and requires every `fetch(` in them to
+  // level up again. This closes that: it reads the sources and requires every HTTP fetch in them to
   // carry a signal, so a new unbounded call fails here without anyone remembering to add a row.
   // Source-level for the same reason `index.test.ts` is: these modules can't be re-imported per
-  // test, and the property is syntactic anyway.
-  test("no fetch( in github.ts or update.ts is missing a signal", async () => {
+  // test, and the property is syntactic anyway. #500 item 12 widened it from github.ts and update.ts
+  // to every non-test file under src/, and from the literal `fetch(` to the injected spellings
+  // (`fetchFn(`, `fetchImpl(`, `deps.fetch(`) and to `signal` as a shorthand property. discord.js's
+  // `client.channels.fetch(` / `users.fetch(` / `messages.fetch(` are cache reads, not HTTP calls, so a
+  // `.` or word character before `fetch` keeps them out; and a line that starts as a comment is skipped
+  // (docker.ts and plugins/index.ts say "fetch(" in prose), without stripping `//` globally, because the
+  // URL template strings contain it. It is a NAME-based source heuristic, not a proof: a call spelled
+  // `globalThis.fetch(`, `Bun.fetch(`, `fetch (`, an alias (`const f = fetch`), or a new helper name is not seen
+  // at all (the count pin of eleven cannot help there), `ops/` is not scanned, and a `signal` word inside the
+  // arguments only has to appear, even in a comment or an unrelated key.
+  test("no fetch(, fetchFn(, fetchImpl( or deps.fetch( call in src/ is missing a signal", async () => {
     // Paren-balanced, not a regex: these calls close with `});`, and a first attempt at this
     // matching `\n\s*\);` found ZERO of them — so the loop body never ran and the test passed
     // vacuously while a deliberately-added unbounded sixth call sat right there. Hence the
     // explicit count assertion below: a scanner that finds nothing must fail, not pass.
+    const CALL = /(?<![.\w])(?:fetch|fetchFn|fetchImpl)\(|\bdeps\.fetch\(/g;
     const argsOfEachFetchCall = (source: string): string[] => {
       const out: string[] = [];
-      for (const m of source.matchAll(/\bfetch\(/g)) {
+      for (const m of source.matchAll(CALL)) {
+        const lineStart = source.lastIndexOf("\n", m.index!) + 1;
+        if (/^\s*(\/\/|\*|\/\*)/.test(source.slice(lineStart, m.index!))) continue;
         let depth = 1;
         let i = m.index! + m[0].length;
         for (; i < source.length && depth > 0; i++) {
@@ -151,20 +163,41 @@ describe("every GitHub call is timeout-bounded", () => {
       return out;
     };
 
-    let checked = 0;
-    for (const file of ["./github.ts", "./update.ts"]) {
-      const source = await Bun.file(new URL(file, import.meta.url)).text();
+    const { readdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const root = import.meta.dir; // the src/ directory (a URL pathname would keep %20 in a path with a space)
+    const files = readdirSync(root, { recursive: true })
+      .map((f) => String(f).replace(/\\/g, "/")) // Windows returns backslashes; sort and compare on one spelling
+      .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.endsWith(".d.ts") && !f.includes("fixtures"))
+      .sort();
+    const sites: string[] = [];
+    for (const file of files) {
+      const source = await Bun.file(join(root, file)).text();
       for (const args of argsOfEachFetchCall(source)) {
         // Thrown rather than `expect`ed so the message can name the offending call — a bare
         // toContain on the whole argument text is unreadable, and truncating it for readability
         // is what made the first version of this assertion wrong.
-        if (!args.includes("signal:")) {
-          throw new Error(`${file}: a fetch( call carries no signal — ${args.trim().slice(0, 80)}`);
+        if (!/\bsignal\b/.test(args)) {
+          throw new Error(`${file}: a fetch call carries no signal — ${args.trim().slice(0, 80)}`);
         }
-        checked++;
+        sites.push(file);
       }
     }
-    expect(checked).toBe(5); // the five known calls — a sixth must be added here deliberately
+    // The eleven known HTTP call sites — a twelfth must be added here deliberately. Named, so a miss says which.
+    expect(sites).toEqual([
+      "docker.ts",
+      "github.ts",
+      "github.ts",
+      "github.ts",
+      "plugins/index.ts",
+      "plugins/install.ts",
+      "plugins/install.ts",
+      "routing/post.ts",
+      "routing/requests.ts",
+      "update.ts",
+      "update.ts",
+    ]);
+    expect(sites).toHaveLength(11);
   });
 
   // Pinning the constant is NOT enough on its own. Every test above drives its site with TINY, so
