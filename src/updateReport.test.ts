@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { expectCleanedLog, replyFailure } from "../test/restError";
 
 // `updateReport.ts` reaches the `config` singleton, which resolves process.env at import time --
 // the required vars are primed once by test/setup.ts's bunfig preload (#136).
@@ -175,6 +176,27 @@ describe("deliverUpdateReport", () => {
     const r = report({ channelId: undefined });
     expect(await deliverUpdateReport(r, "hi", deliverers, NOW)).toBe("none");
     expect(calls).toEqual(["viaToken", "viaDm"]);
+  });
+
+  // #545: the token route posts to `/webhooks/<app>/<interaction token>`, so Discord refusing it (10015 Unknown
+  // Webhook, or a token at its 15-minute edge) is a REST error whose `url` is the /update requester's token.
+  test("a token-route delivery failure is logged without the interaction token or the reply (#545)", async () => {
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failure = replyFailure("webhook");
+      const deliverers: Deliverers = {
+        viaToken: async () => Promise.reject(failure.error),
+        viaDm: async () => {},
+        viaChannel: async () => {},
+      };
+      expect(await deliverUpdateReport(report(), "hi", deliverers, NOW)).toBe("dm");
+      expect(warn.mock.calls).toHaveLength(1);
+      const call = warn.mock.calls[0]!;
+      expect(call[0]).toBe("[updateReport] token delivery failed");
+      expectCleanedLog(call, failure);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
