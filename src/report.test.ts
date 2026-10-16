@@ -8,7 +8,7 @@ import {
 
 // report.ts pulls in the `config` singleton, which resolves process.env at import time -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
-const { handleReportCommand, handleReportModal, reportAnnouncement } = await import("./report");
+const { handleReportCommand, handleReportModal, reportAnnouncement, REPORT_DM_REFUSAL } = await import("./report");
 const { config, repoForProject } = await import("./config");
 
 // Every test in this file runs as a member of a configured instance (a role, a token), and restores the shared
@@ -207,12 +207,16 @@ describe("handleReportCommand — the role gate and the modal", () => {
     expect(without.calls.replied?.content).toBe(ROLE_REFUSAL);
   });
 
-  test("no member (a DM) is a refusal", async () => {
+  test("a DM (no member) is refused in words, not with the role message (#504)", async () => {
     const dm = fakeCommand({ member: null });
     await handleReportCommand(dm.interaction);
     expect(dm.calls.modals).toHaveLength(0);
-    expect(dm.calls.replied?.content).toBe(ROLE_REFUSAL);
+    expect(dm.calls.replied?.content).toBe(REPORT_DM_REFUSAL);
     expect(dm.calls.replied?.flags).toBe(MessageFlags.Ephemeral);
+  });
+
+  test("the DM refusal's text is pinned: never an empty reply Discord would reject (#504)", () => {
+    expect(REPORT_DM_REFUSAL).toBe("This command works only in a server channel.");
   });
 
   // Mutation: setMaxLength(1200) on the title, or dropping `required`, fails the field assertions.
