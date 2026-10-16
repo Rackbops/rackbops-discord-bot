@@ -248,6 +248,75 @@ describe("renderPluginsList", () => {
     expect(withSchedule).toContain(`⏳ update to 1.1.0 scheduled <t:${scheduledTs}:R>`);
     expect(withSchedule).not.toContain("available");
   });
+
+  // #544: a plugin that failed to install, load or activate this boot (`active: false`) says so on its
+  // first line, with its error as one short line — not only in the panel and `bot-ops.sh status`.
+  describe("a plugin that is not running (#544)", () => {
+    const firstLine = (s: PluginStateEntry, idx: PluginIndex = index([])) => renderPluginsList(state([s]), idx, NOW).split("\n")[0];
+    // The text inside the marker's parentheses.
+    const parenthesised = (line: string | undefined) => /^• \*\*a\*\* — installed 1\.0\.0 — not running \(first error: (.*)\)$/.exec(line ?? "")?.[1];
+
+    test("says so, with its error collapsed to one line and cut to 120 characters", () => {
+      const line = firstLine(stateEntry("a", "1.0.0", { active: false, error: `activate threw\n  at x.js:1\n${"y".repeat(300)}` }));
+      const shown = parenthesised(line);
+      expect(shown).toBeDefined();
+      expect(shown).toBe(`activate threw at x.js:1 ${"y".repeat(120 - "activate threw at x.js:1 ".length - 1)}…`);
+      expect(shown).toHaveLength(120);
+      expect(shown).not.toContain("\n");
+    });
+    test("the cut is at 120 characters, not 119 or 121", () => {
+      expect(parenthesised(firstLine(stateEntry("a", "1.0.0", { active: false, error: "e".repeat(120) })))).toBe("e".repeat(120));
+      const cut = parenthesised(firstLine(stateEntry("a", "1.0.0", { active: false, error: "e".repeat(121) })));
+      expect(cut).toBe(`${"e".repeat(119)}…`);
+      expect(cut).toHaveLength(120);
+    });
+    test("an emoji straddling the cut is dropped whole, never split into a lone surrogate", () => {
+      const lone = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+      // The pair's halves sit at indexes 118 and 119: the cut keeps 119 characters, so it would keep only the high half.
+      const split = parenthesised(firstLine(stateEntry("a", "1.0.0", { active: false, error: `${"x".repeat(118)}😀tail` })));
+      expect(split).toBe(`${"x".repeat(118)}…`);
+      expect(lone.test(split ?? "")).toBe(false);
+      // The pair's halves sit at indexes 117 and 118: both kept.
+      const whole = parenthesised(firstLine(stateEntry("a", "1.0.0", { active: false, error: `${"x".repeat(117)}😀${"y".repeat(20)}` })));
+      expect(whole).toBe(`${"x".repeat(117)}😀…`);
+      expect(lone.test(whole ?? "")).toBe(false);
+    });
+    test("with no usable error it says just that", () => {
+      for (const error of [undefined, "", "   \n ", 5 as unknown as string]) {
+        const line = firstLine(stateEntry("a", "1.0.0", { active: false, ...(error === undefined ? {} : { error }) }));
+        expect(line).toBe("• **a** — installed 1.0.0 — not running");
+      }
+    });
+    test("a running plugin carries no marker, configured or not", () => {
+      expect(renderPluginsList(state([stateEntry("a", "1.0.0")]), index([]), NOW)).toBe("• **a** — installed 1.0.0");
+      expect(renderPluginsList(state([stateEntry("a", "1.0.0", { configured: false, missingEnv: ["TOKEN"] })]), index([]), NOW)).not.toContain("not running");
+    });
+    test("the marker sits after the available version and before the release note", () => {
+      const idx = index([entry("a", "1.1.0", { releases: [rel("1.1.0", { notes: "shiny" })] })]);
+      const out = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e" })]), idx, NOW);
+      const lines = out.split("\n");
+      expect(lines[0]).toBe("• **a** — installed 1.0.0 → 1.1.0 available — not running (first error: e)");
+      expect(lines.slice(1).join("\n")).toContain("shiny");
+      expect(lines[0]).not.toContain("shiny");
+    });
+    test("a pending schedule still follows on its own line", () => {
+      const scheduled = { version: "1.1.0", at: "2026-09-06T00:00:00.000Z", requestedBy: "admin1" };
+      const lines = renderPluginsList(state([stateEntry("a", "1.0.0", { active: false, error: "e", scheduled })]), index([]), NOW).split("\n");
+      expect(lines[0]).toBe("• **a** — installed 1.0.0 — not running (first error: e)");
+      expect(lines[1]).toContain("⏳ update to 1.1.0 scheduled");
+    });
+    test("an off plugin that is not running still reads only off", () => {
+      const out = renderPluginsList(state([stateEntry("p", "1.0.0", { enabled: false, active: false, error: "e" })]), index([]), NOW);
+      expect(out.split("\n")[0]).toMatch(/^• \*\*p\*\* — off \(installed 1\.0\.0\)$/);
+      expect(out).not.toContain("not running");
+    });
+    test("many down plugins with long errors still fit Discord's cap (the clamp predates #544; the marker must not break it)", () => {
+      const plugins = Array.from({ length: 40 }, (_, i) => stateEntry(`p${i}`, "1.0.0", { active: false, error: "z".repeat(500) }));
+      const out = renderPluginsList(state(plugins), index([]), NOW);
+      expect(out.length).toBeLessThanOrEqual(2000);
+      expect(out).toContain("… (list truncated)");
+    });
+  });
 });
 
 describe("deliverPluginNotification", () => {
@@ -672,6 +741,56 @@ describe("decidePluginReportOutcome (#104)", () => {
   test("an off plugin reports that the update did not run", () => {
     const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { enabled: false, active: false }));
     expect(r).toEqual({ ok: false, message: "⚠️ **a** is turned off, so the update to 1.1.0 did not run." });
+  });
+  // #543: `entry.error` names the TARGET's failure (host.ts builds it first-failure-wins), and on
+  // install.ts's last-good-failed path nothing was reused at all, so the message must neither attribute the
+  // error to the previous version nor claim it was "reused": it only says the previous version is not running.
+  test("reverted to a previous version that is not running either → says so, not 'still on'", () => {
+    const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false, error: "integrity mismatch for 1.1.0" }));
+    expect(r).toEqual({
+      ok: false,
+      message: "⚠️ **a** could not be updated to 1.1.0 (integrity mismatch for 1.1.0) — and 1.0.0 is not running either.",
+    });
+    expect(r.message).not.toContain("still on");
+    expect(r.message).not.toContain("reused");
+  });
+  test("reverted and not running, with no error → the same tail without a parenthesis", () => {
+    const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false }));
+    expect(r).toEqual({ ok: false, message: "⚠️ **a** could not be updated to 1.1.0 — and 1.0.0 is not running either." });
+  });
+  test("reverted and running keeps the exact wording it always had (for a short one-line error)", () => {
+    const r = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: true, error: "integrity mismatch for 1.1.0" }));
+    expect(r).toEqual({ ok: false, message: "⚠️ **a** could not be updated to 1.1.0 (integrity mismatch for 1.1.0) — still on 1.0.0." });
+  });
+  test("a blank error adds no empty parenthesis, in any of the three failure branches", () => {
+    for (const error of ["", "  \n "]) {
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false, error })).message).toBe(
+        "⚠️ **a** could not be updated to 1.1.0 — and 1.0.0 is not running either.",
+      );
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: true, error })).message).toBe(
+        "⚠️ **a** could not be updated to 1.1.0 — still on 1.0.0.",
+      );
+      expect(decidePluginReportOutcome(report, stateEntry("a", "1.1.0", { active: false, error })).message).toBe(
+        "⚠️ **a** updated to 1.1.0 but failed to start.",
+      );
+    }
+  });
+  // No state entry at all, or one that never recorded an installed version: neither is a "reverted" update, so
+  // neither may print "still on undefined" / "undefined is not running either".
+  test("no entry, or an entry with no installed version, is the failed-to-start message", () => {
+    const failed = "⚠️ **a** updated to 1.1.0 but failed to start.";
+    expect(decidePluginReportOutcome(report, undefined)).toEqual({ ok: false, message: failed });
+    expect(decidePluginReportOutcome(report, stateEntry("a", undefined, { active: false })).message).toBe(failed);
+    expect(decidePluginReportOutcome(report, stateEntry("a", undefined, { active: true })).message).toBe(failed);
+  });
+  test("a long error in the report-back is collapsed and cut like the list's", () => {
+    const reverted = decidePluginReportOutcome(report, stateEntry("a", "1.0.0", { active: false, error: `first\n${"q".repeat(300)}` }));
+    const inParens = /\((.*)\)/.exec(reverted.message)?.[1];
+    expect(inParens).toBe(`first ${"q".repeat(120 - "first ".length - 1)}…`);
+    expect(inParens).toHaveLength(120);
+    // The installed-but-failed-to-start branch shares `why`, so its DM gets the same short error.
+    const started = decidePluginReportOutcome(report, stateEntry("a", "1.1.0", { active: false, error: `${"q".repeat(300)}` }));
+    expect(started.message).toBe(`⚠️ **a** updated to 1.1.0 but failed to start (${"q".repeat(119)}…).`);
   });
 });
 
