@@ -69,18 +69,68 @@ async function bounded<T>(ms: number, what: string, fn: (signal: AbortSignal) =>
   }
 }
 
+/**
+ * The `HostConfig` fields a self-update copies verbatim from the original onto its replacement (#491 item 10):
+ * what compose sets per service and the create API accepts unchanged. Typed `unknown` — copied, never read. The
+ * list of names is `CARRIED_HOST_CONFIG_KEYS` in redeploy.ts, which is checked against these keys at compile time.
+ */
+export interface CarriedHostConfig {
+  LogConfig?: unknown;
+  CapAdd?: unknown;
+  CapDrop?: unknown;
+  ExtraHosts?: unknown;
+  Dns?: unknown;
+  DnsSearch?: unknown;
+  DnsOptions?: unknown;
+  SecurityOpt?: unknown;
+  Ulimits?: unknown;
+  ReadonlyRootfs?: unknown;
+  Memory?: unknown;
+  MemorySwap?: unknown;
+  MemoryReservation?: unknown;
+  NanoCpus?: unknown;
+  CpuShares?: unknown;
+  PidsLimit?: unknown;
+  ShmSize?: unknown;
+  Sysctls?: unknown;
+  Devices?: unknown;
+  GroupAdd?: unknown;
+  OomKillDisable?: unknown;
+  Privileged?: unknown;
+}
+
 export interface ContainerInspect {
   Id: string;
   Name: string;
   Image: string;
   State: { Running: boolean; Status: string; ExitCode: number; StartedAt?: string };
-  Config: { Image: string; Env: string[]; Labels: Record<string, string>; User?: string };
+  Config: {
+    Image: string;
+    Env: string[];
+    Labels: Record<string, string>;
+    User?: string;
+    /** Container-only (a compose `stop_grace_period`), so it is safe to carry. */
+    StopTimeout?: number;
+    // The next five are image-merged in the inspect, like `Env`, so they are NOT carried onto a replacement (the new
+    // image's must win); they are typed only so a fixture can set them and assert exactly that.
+    WorkingDir?: string;
+    Healthcheck?: unknown;
+    StopSignal?: string;
+    Entrypoint?: string[] | string | null;
+    Cmd?: string[] | string | null;
+  };
   HostConfig: {
     Binds?: string[] | null;
     RestartPolicy?: { Name: string; MaximumRetryCount?: number };
     NetworkMode?: string;
     Init?: boolean | null;
-  };
+    /** The short form of a tmpfs mount (compose's `tmpfs:` list, `--tmpfs`): path -> options. */
+    Tmpfs?: Record<string, string> | null;
+    /** The long form (`type: tmpfs`, `--mount`): entries with their `TmpfsOptions`. Only the tmpfs ones are carried. */
+    Mounts?: { Type: string; Target?: string; Source?: string; TmpfsOptions?: unknown; [k: string]: unknown }[] | null;
+    /** Published ports: not carried (the original holds them) and warned about. */
+    PortBindings?: Record<string, unknown> | null;
+  } & CarriedHostConfig;
   Mounts: { Type: string; Name?: string; Source: string; Destination: string; RW: boolean }[];
   NetworkSettings: { Networks: Record<string, { Aliases?: string[] | null }> };
 }
@@ -92,12 +142,18 @@ export interface CreateContainerSpec {
   Labels: Record<string, string>;
   /** Carried over from the original, so the replacement can still reach the daemon socket. */
   User?: string;
+  /** Carried over from the original's `Config.StopTimeout` (a compose `stop_grace_period`). */
+  StopTimeout?: number;
   HostConfig: {
     Binds: string[];
+    /** The short tmpfs form, carried as the daemon reported it. */
+    Tmpfs?: Record<string, string>;
+    /** The long tmpfs form's entries, carried as the daemon reported them. */
+    Mounts?: unknown[];
     RestartPolicy: { Name: string };
     NetworkMode?: string;
     Init?: boolean;
-  };
+  } & CarriedHostConfig;
   /** Service aliases (e.g. compose's `bot`) the network resolves the container by, beyond its
    *  own name — dropped otherwise, since Docker never infers them from the container being
    *  recreated. */
