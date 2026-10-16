@@ -10,10 +10,15 @@ gains the channel; "a restart tries again" after the give-up was false (`notifie
 and Decision 5 are corrected; five changed lines had no mutant (the `pluginStateReady` early return, the `continue`
 after a drop, the dropped DM's snowflake guard and its `.catch`, and the `:654` pre-filter, now load-bearing against a
 state write every minute) and have tests and rows now. Also applied: `CONTEXT.md:174`'s cadence sentence, the harness's
-log capture, N8 as a composition test, #444's premise (the one-tick test already fails through the test-state guard;
-N6 pins the later admin's DM by assertion), the release validator requires only the two fields that can throw, and the
-boot blast radius of a stricter index is named with the live index checked. The implementer re-reads each anchor on
-the tree it works from. U3 (the list and report-back
+log capture, N8 as a composition test, #444's premise (the one-tick test already fails through the test-state guard,
+at the review's own sha; N6 pins the later admin's DM by assertion), the release validator requires only the two
+fields that can throw, and the boot blast radius of a stricter index is named with the live index checked. Round 2
+(same auditor, the revised steps rebuilt in its scratch copy: typecheck clean, 2092 pass): one blocker -- the
+required `version` breaks the two-argument `remindLater` call at `updates.test.ts:808` (a `tsc` error, not a test
+failure) -- and three majors applied: the `droppedFor` capture and the validator's `url`/`notes` clauses each get a
+killing test, "a scheduled rollback through the panel" is only reachable through the panel's API or
+`bot-ops.sh plugin-request` (the UI offers only the latest version), and the #444 wording no longer blames the
+guard's age. The implementer re-reads each anchor on the tree it works from. U3 (the list and report-back
 rendering: #443, #501 item 11, #502 item 13, #563, #418) follows on the same files and waits for this PR. Nothing in
 flight touches `updates.ts`, `plugins/index.ts` or the `pluginUpdates` check in `announce.ts`; D1a (#526) edits other
 parts of `announce.ts`'s neighbours (`update.ts`, `index.ts`) and `CONTEXT.md` rows this bundle does not. -->
@@ -57,10 +62,11 @@ production line mutation-tested in a scratch worktree.
 - **#444 (the no-admins test pins one tick).** `checkPluginUpdates` records a failure toward `MAX_DELIVERY_ATTEMPTS`
   (`:578`, 3) only when `deps.adminUserIds.length > 0` (`:622`), so with no admins nothing is recorded and a later
   admin still gets the notice (`deliverPluginNotification` returns `false` after a warn, `:527-530`). The test
-  (`src/plugins/updates.test.ts:479-484`) runs ONE tick. At `bfb7d19` deleting the guard is no longer silent -- the
-  test-state guard fails that test ("1 failed notice delivery count(s) kept"), because the guard's counter table
-  landed after the review -- but nothing asserts the property the test's name claims: that an admin added later gets
-  the DM, and that the third no-admin poll does not call `markNotified`. `MAX_DELIVERY_ATTEMPTS` is not exported.
+  (`src/plugins/updates.test.ts:479-484`) runs ONE tick. Deleting the guard is not silent, and was not at the
+  review's own sha either: the test-state guard fails that test ("1 failed notice delivery count(s) kept"; the
+  guard's counter row, #392, is an ancestor of `4ff8eef`), so the review's "still passes" read the assertions, not the
+  guard. What is true is that nothing asserts the property the test's name claims: that an admin added later gets the
+  DM, and that the third no-admin poll does not call `markNotified`. `MAX_DELIVERY_ATTEMPTS` is not exported.
 - **#501 item 4 (a remind after a skip is dead; a remind before the first notice is wiped).** `decidePluginUpdates`
   checks `skippedVersion` (`:110`) and `notifiedVersion` (`:111`) before `remindAt` (`:112`); `planPluginAction`'s
   remind branch (`:431-437`) requires only `hasNewer` and replies "I'll remind you", and `remindLater` (`:363-365`)
@@ -129,7 +135,8 @@ production line mutation-tested in a scratch worktree.
 ```ts
   // #440: a release element's `version` is split by compareSemver and its `publishedAt` sliced by renderNotes; one that
   // is not an object with both as strings threw a TypeError inside the whole notice pass, every poll. `url` and
-  // `notes` are only printed: strings when present, tolerated when absent (the cached index may predate them).
+  // `notes` are only printed: strings when present, tolerated when absent (an absent `notes` prints as the word
+  // "undefined" in the notice, as it does today; the live index carries both).
   if (
     !Array.isArray(e.releases) ||
     !e.releases.every((r) => {
@@ -302,9 +309,11 @@ is: `now < NaN` is false, so a `NaN` schedule already reaches the arbiter today 
 LOAD-BEARING -- without it the arbiter's `mutateState` would rewrite `state.json` every minute for every plugin with a
 pending schedule (`mutatePluginState` always writes). It gets a mutant and an assertion (M22). Two consequences of the
 drop to name in the docs and the PR: a mailbox `schedule` request to an OLDER version than installed (`validate`
-refuses only equality, `requests.ts:478`) is now dropped at fire time, so a scheduled rollback through the panel no
-longer happens; and a mailbox schedule whose time is already past (which `validate` accepts) now fires within about a
-minute instead of within 15.
+refuses only equality, `requests.ts:478`) is now dropped at fire time -- reachable only through the panel's API
+(`ops/admin/server.ts:1296` accepts any version) or `bot-ops.sh plugin-request`, since the panel's UI offers only a
+plugin's latest version (`ops/admin/public/index.html:2986`, `:3019`) -- so a scheduled rollback asked for that way no
+longer happens; and a mailbox schedule whose time is already past (which `validate` accepts, `requests.ts:454-456`)
+now fires within about a minute instead of within 15.
 
 ### Step 4 -- `src/announce.ts`
 
@@ -348,14 +357,18 @@ still holds: the early return is first.
 ### Step 6 -- tests
 
 **`src/plugins/index.test.ts`:** in the `#496` describe (beside the env case, `:138-144`; there is no existing
-"releases is not a list" case), three new rejections (a `null` element; a release with a numeric `version`; one with
-a non-string `publishedAt`) each producing a reason containing `releases is not a list of releases with a string
-version and publishedAt` and naming the entry, and two acceptances (a full release; a release with no `url`/`notes`).
+"releases is not a list" case), five new rejections (a `null` element; a release with a numeric `version`; one with
+a non-string `publishedAt`; one with `url: 5`; one with `notes: null`) each producing a reason containing
+`releases is not a list of releases with a string version and publishedAt` and naming the entry, and two acceptances
+(a full release; a release with no `url`/`notes`).
 
-**`src/plugins/updates.test.ts`** (the harness at `:376-420` gains `rescheduleRace?: { version?: string; at?: string }`,
+**`src/plugins/updates.test.ts`** (the harness at `:376-420` gains `rescheduleRace?: { version?: string; at?: string; requestedBy?: string }`,
 applied like `cancelRace` before the first mutate; `mutateStateError?: (call: number) => Error | undefined`; and it
 RECORDS the log: `warns: string[]`, `errors: string[]` filled by the `log` seam and returned, since N1, N3, N5 and N7
-assert on their text):
+assert on their text). One existing call changes shape: `:808` `remindLater("a", "2026-02-02T00:00:00Z")(seed())` in
+"skipVersion / scheduleUpdate / remindLater pin the given values" gains a third argument (`"1.1.0"`) and the test
+asserts the `notifiedVersion` it now writes -- without it `bun run check` fails (TS2554), while the test itself still
+passes at runtime.
 
 - **N1 (#440, isolation):** two plugins with newer versions; `mutateStateError` rejects the FIRST mutate (plugin a's
   `markNotified`) -> plugin b is still DMed and recorded notified; `errors` has one line naming `a`.
@@ -395,7 +408,10 @@ assert on their text):
   (`toEqual({ version, at, requestedBy: "admin1" })`) gains `channelId: "chan1"`, since `base()` carries that channel.
 - **N10 (#502 item 14):** `rescheduleRace: { version: "1.2.0" }` -> no restart, `scheduled.version === "1.2.0"` kept,
   `targetVersion` undefined; `rescheduleRace: { at: "2026-09-05T18:00:00.000Z" }` (later than NOW) -> no restart,
-  schedule kept.
+  schedule kept. **N10b (the dropped DM's recipient):** a moot schedule (installed `1.1.0`, scheduled `1.1.0`) whose
+  `rescheduleRace: { requestedBy: "300000000000000000" }` swaps the requester before the arbiter runs -> the dropped
+  DM goes to the NEW requester and to nobody else (`dms` is exactly `["300000000000000000"]`): the arbiter's view
+  of the schedule, not the pre-read one, names the recipient.
 - **N11 (#442, announce.ts):** in `src/announce.test.ts`, beside the #460 tests (`:819-825`): write
   `data/plugins/state.json` under the test `DATA_DIR` (the shape `readPluginState` reads; `host.ts`'s
   `writePluginState`/`readPluginState` and L1's T3b in `commands.test.ts` show how) with a plugin whose `scheduled.at`
@@ -419,7 +435,7 @@ git -C /s/repos/rackbops-discord-bot worktree add --detach /s/Repos/_wt/rdb-527-
 cd /s/Repos/_wt/rdb-527-U2-mut && bun install --frozen-lockfile
 ```
 
-Run `bun test src/plugins/updates.test.ts src/plugins/index.test.ts src/announce.test.ts src/plugins/contract.test.ts` per mutant.
+Run `bun test src/plugins/updates.test.ts src/plugins/index.test.ts src/plugins/requests.test.ts src/announce.test.ts src/plugins/contract.test.ts src/commandNaming.test.ts` per mutant (M23's killer is in `requests.test.ts`; the bare-text mutant of the give-up line is the scan's).
 
 | # | Mutation (production line, after the steps) | Test that must fail |
 |---|---|---|
@@ -445,14 +461,16 @@ Run `bun test src/plugins/updates.test.ts src/plugins/index.test.ts src/announce
 | M20 | 3h: `isDiscordUserId(droppedFor)` -> `true` | N3c (a DM to an email identity) |
 | M21 | 3h: the dropped DM's `.catch(() => {})` removed | N3d (`checkPluginUpdates` rejects; b never fires) |
 | M22 | `:654`: the pre-filter deleted (every schedule reaches the arbiter) | N12 (`mutations` not empty) |
-| M23 | 3d: `requests.ts:512` passes no version (or `remindLater` ignores it) | the new `requests.test.ts` case, and `:505` as flipped |
+| M23 | 3d: `remindLater` ignores its `version` (passing none at `requests.ts:512` is a `tsc` error now, not a runtime mutant) | the new `requests.test.ts` case, and `:505` as flipped |
+| M24 | 3h: `droppedFor = cur.scheduled.requestedBy` -> the pre-read `sched.requestedBy` | N10b (the DM goes to the old requester) |
+| M25 | step 1: the `url`/`notes` "string when present" clauses -> `true` | index.test.ts's `url: 5` and `notes: null` rejections |
 
 ### Coverage table
 
 | Bullet | Step(s) | Test | Mutation that fails it |
 |---|---|---|---|
-| #440: a malformed release is refused at the index; one plugin's failed notice does not stop the others; a due schedule fires after a failed notice pass | 1, 3g | index.test.ts, N1, N2 | M1, M2, M3 |
-| #441: a fired schedule already installed is dropped (and a Discord requester told, best-effort); the walk goes on; an update-now drops the schedule | 3b, 3h | N3, N3b, N3c, N3d, N4 | M5, M6, M7, M16, M17, M19, M20, M21 |
+| #440: a malformed release is refused at the index; one plugin's failed notice does not stop the others; a due schedule fires after a failed notice pass | 1, 3g | index.test.ts, N1, N2 | M1, M2, M3, M25 |
+| #441: a fired schedule already installed is dropped (and the Discord requester the arbiter saw told, best-effort); the walk goes on; an update-now drops the schedule | 3b, 3h | N3, N3b, N3c, N3d, N4, N10b | M5, M6, M7, M16, M17, M19, M20, M21, M24 |
 | #442: a schedule fires within a minute, only once the boot write has landed and only when due; README and CONTEXT say so; a non-date `at` is dropped; a past ISO time is refused | 3a, 3h, 4, 5 | N11, N11b, N12, N5 | M4, M8, M9, M18, M22 |
 | #444: the no-admins exemption is pinned across the cap, and the later admin's DM asserted | 3f, N6 | N6 | M10 |
 | #501-4: a remind acknowledges its version and clears a skip, on the command and the mailbox path | 3d | N8, the `requests.test.ts` case and the flipped `:505` | M15, M23 |
@@ -475,8 +493,10 @@ bun test
 
 `requests.test.ts` is in the list because `remindLater`/`scheduleUpdate` changed shape and one of its expectations
 flips; `commands.test.ts` because `/plugins remind` goes through `planPluginAction`; `commandNaming.test.ts` must be
-run too (the give-up text names the plugins command through `deps.pluginsCommand`). The `README.md:124` and
-`CONTEXT.md:174` substrings: Grep each before editing (one hit) and after (none). The full `bun test` is slow here (about 8 minutes); run it in the
+run too (the give-up text names the plugins command through `deps.pluginsCommand`). The `README.md:124` substring:
+Grep before editing (one hit) and after (none; the sentence is replaced). The `CONTEXT.md:174` anchor
+`execute a due scheduled update` stays after the edit (the new clause is appended after it): Grep before (one hit)
+and after (still one, now followed by the new parenthesis). The full `bun test` is slow here (about 8 minutes); run it in the
 background and paste its tail. Not verifiable here: a real Discord DM refusal's message text (the warn prints whatever
 discord.js throws).
 
@@ -494,9 +514,10 @@ discord.js throws).
 
 - Title: `fix(plugins): validate index releases, isolate one plugin's notice, run due schedules every minute and after a failed pass, drop a schedule already installed, pin the no-admins exemption, and name a DM failure (#440, #441, #442, #444, #501, #502)`.
 - Body: one line per item, Decisions 1-8 (Decision 7 under its own "contract.ts" heading; Decision 1's blast radius
-  and the live-index check; the two behaviour notes from 3h: a scheduled rollback through the panel no longer fires,
-  and a past-time mailbox schedule fires within a minute), the two existing expectations that flip and why
-  (`updates.test.ts:642`, `requests.test.ts:505`), the typecheck + test output, the mutation table. End with
+  and the live-index check; the two behaviour notes from 3h: a scheduled rollback asked for through the panel's API
+  or `bot-ops.sh plugin-request` no longer fires, and a past-time mailbox schedule fires within a minute), the three
+  existing expectations that change and why (`updates.test.ts:642` and `:808`, `requests.test.ts:505`), the typecheck
+  + test output, the mutation table. End with
   `Closes #440. Closes #441. Closes #442. Closes #444.`; #501 and #502 "Part of".
 - After merge: tick #440 #441 #442 #444 on #527; comments on #501/#502.
 
