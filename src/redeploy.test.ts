@@ -56,6 +56,13 @@ const SELF: ContainerInspect = {
   NetworkSettings: { Networks: { wbd_default: { Aliases: ["bot", SELF_SHORT_ID] } } },
 };
 
+/** Polls `done` until it holds (at most `ms`), so a slow runner delays a test that waits on an un-awaited call
+ *  instead of failing it. */
+async function until(done: () => boolean, ms = 2000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!done() && Date.now() < end) await Bun.sleep(5);
+}
+
 describe("naming", () => {
   test("canonicalName strips docker's leading slash", () => {
     expect(canonicalName("/warbandeer-discord")).toBe("warbandeer-discord");
@@ -626,7 +633,7 @@ describe("takeOver — real daemon calls (the ordering guard for the whole hazar
       exit: (code) => void exits.push(code),
       stepAsideDeps: { exit: (code) => void exits.push(code), sleep: (ms) => (slept.push(ms), new Promise<void>(() => {})) },
     });
-    await Bun.sleep(40);
+    await until(() => slept.length > 0);
     expect(slept).toEqual([STEP_ASIDE_GRACE_MS]);
     expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       `GET /containers/${ORIGINAL_ID}/json`,
@@ -999,8 +1006,8 @@ describe("completeTakeOver", () => {
     expect(order).toEqual(["inspect", "tag", "remove", "inspect", "rename:warbandeer-discord"]);
   });
 
-  // A SIGTERM aborts the first tick, so probation "ends" while this container is being stopped -- `docker stop
-  // <name>-next` is the rollback recipe. Completing then would remove the original the operator is about to start.
+  // A SIGTERM starts the shutdown drain, which lets the first tick finish, so probation "ends" while this
+  // container is being stopped -- `docker stop <name>-next` is the rollback recipe. Completing then would remove the original the operator is about to start.
   test("a process that is shutting down leaves the stopped original alone: no tag, no removal, no rename", async () => {
     const order: string[] = [];
     await completeTakeOver(ORIGINAL, effects(order, { shuttingDown: () => true }));
@@ -1209,7 +1216,7 @@ describe("completeTakeOver — real daemon calls", () => {
     void completeTakeOver(ORIGINAL_ID, {
       stepAsideDeps: { exit: (c) => void exits.push(c), sleep: (ms) => (slept.push(ms), new Promise<void>(() => {})) },
     });
-    await Bun.sleep(30);
+    await until(() => slept.length > 0);
     // Mutation: a default that drops `stepAsideDeps` leaves the real grace wait and `process.exit(1)` armed.
     expect(slept).toEqual([STEP_ASIDE_GRACE_MS]);
     expect(calls.filter((c) => c.method === "POST" && c.path === `/containers/${SELF_ID}/stop`)).toHaveLength(1);
@@ -1220,7 +1227,8 @@ describe("completeTakeOver — real daemon calls", () => {
   });
 
   // The DEFAULT shutdown check (restart.ts's isShuttingDown): `docker stop <name>-next` is the rollback recipe, and
-  // its SIGTERM settles the first tick, so probation looks over while this container is on its way out.
+  // its SIGTERM starts a drain in which the first tick can settle, so probation looks over while this
+  // container is on its way out.
   test("after a SIGTERM the default completion leaves the original alone: no tag, no DELETE, no rename", async () => {
     stubDaemon();
     beginShutdown("test SIGTERM");
@@ -1409,12 +1417,12 @@ describe("stepAside", () => {
     const exits: number[] = [];
     // The stop goes out and the grace wait is pending: no exit yet.
     void stepAside({ inspectSelf: async () => SELF, stop: async (id) => void stopped.push(id), exit: (c) => void exits.push(c), sleep: () => new Promise<void>(() => {}) });
-    await Bun.sleep(10);
+    await until(() => stopped.length > 0);
     expect(stopped).toEqual([SELF_ID]);
     expect(exits).toEqual([]);
     // With the grace elapsed and no SIGTERM, it gives up and exits 1.
     void stepAside({ inspectSelf: async () => SELF, stop: async () => {}, exit: (c) => void exits.push(c), sleep: async () => {} });
-    await Bun.sleep(10);
+    await until(() => exits.length > 0);
     expect(exits).toEqual([1]);
   });
 
@@ -1436,7 +1444,7 @@ describe("stepAside", () => {
     let graceAsked = -1;
     try {
       void stepAside({ exit: (c) => void exits.push(c), sleep: (ms) => ((graceAsked = ms), new Promise<void>(() => {})) });
-      await Bun.sleep(30);
+      await until(() => graceAsked >= 0);
       expect(seen).toEqual([`GET /containers/${SELF_SHORT_ID}/json`, `POST /containers/${SELF_ID}/stop`]);
       expect(graceAsked).toBe(STEP_ASIDE_GRACE_MS);
       expect(STEP_ASIDE_GRACE_MS).toBe(30_000);
@@ -1459,7 +1467,7 @@ describe("stepAside", () => {
       exit: (c) => void exits.push(c),
       sleep: async () => void (slept = true),
     });
-    await Bun.sleep(10);
+    await until(() => exits.length > 0);
     expect(exits).toEqual([1]);
     expect(slept).toBe(false);
     expect(errors).toHaveLength(2); // the "stepping aside" line, then why it exits instead

@@ -370,14 +370,14 @@ declare -A RESERVED_KEYS=(
 # remaining steps (tag :latest, remove, rename) are completeTakeOver's, run only after the new build
 # has finished activate() and its first tick, and are best-effort and non-fatal on failure. So:
 # refuse only while "-next" exists AND the canonical name still resolves to a RUNNING container. A
-# gap remains between that stop and the end of that probation (seconds to a minute, no longer
-# milliseconds) where this allows through, because the canonical name is the stopped original then;
+# gap remains between that stop and the end of that probation (the rest of the replacement's
+# start-up plus up to 60 s for its first tick, no longer milliseconds) where this allows through, because the canonical name is the stopped original then;
 # the guard's LOGIC is untouched here (#490 item 2 makes it refuse while a RUNNING "-next" exists). In
 # that gap :latest still names the OLD image (tagLatest now runs AFTER the stop, in completeTakeOver),
 # so a `recreate`/`env-set` landing there starts a NEW container (a new id, which the replacement's
 # HANDOFF_FROM no longer names) on the old build beside the live replacement: two live bots, and
-# nothing steps aside — the same outcome as the window above, now seconds to a minute wide until that
-# follow-up lands. Only the operator's `docker start <name>` (the same container id) is a case the
+# nothing steps aside — the same outcome as the window above, now that wide until that follow-up
+# lands. Only the operator's `docker start <name>` (the same container id) is a case the
 # replacement notices and steps aside for.
 #
 # Formerly a known, DECLINED residual risk (tracked on #85, now HANDLED by #160, not by this

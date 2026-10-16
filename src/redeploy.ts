@@ -808,12 +808,14 @@ export interface CompleteTakeOverEffects {
  * which gives the original a new id (see {@link takeOver}).
  *
  * A process that is already shutting down at either check (before the tag, before the removal) does none
- * of the rest: a SIGTERM aborts the first tick, so probation looks over, and completing then would remove
- * the original while the operator is stopping this container to roll back (`docker stop <name>-next`,
- * then `docker start <name>`). A SIGTERM that lands DURING the tag call or the removal call is not seen:
- * the tag may then name the build being rolled back (the gap above), and a removal already in flight
- * removes the original — milliseconds against a healthy daemon. A stopped replacement that is later restarted boots as a standby beside the
- * kept original and completes the swap itself. (A shutdown only — not a pending restart or a handoff of
+ * of the rest: a SIGTERM starts the shutdown drain, which lets the first tick finish (plugin ticks are told
+ * to stop, the core checks run on) inside its 8 s grace, so probation can look over while this container is
+ * on its way out, and completing then would remove the original while the operator is stopping this
+ * container to roll back (`docker stop <name>-next`, then `docker start <name>`). A SIGTERM that lands
+ * DURING the tag call or the removal call is not seen: the tag may then name the build being rolled back
+ * (the gap above), and a removal already in flight removes the original — milliseconds against a healthy
+ * daemon. A stopped replacement that is later restarted boots as a standby beside the kept original and
+ * completes the swap itself. (A shutdown only — not a pending restart or a handoff of
  * this process's own: those leave the swap to complete, and the next boot or the next replacement
  * converges the names.)
  *
