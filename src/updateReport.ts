@@ -4,6 +4,7 @@ import { state, saveState, type PendingUpdateReport } from "./state";
 import { sameSha } from "./update";
 import { sendToChannel } from "./announce";
 import { shortSha as short } from "./storage";
+import { withoutRequest } from "./plugins/delivery";
 
 // The other half of /update: the command says what it's *trying* to become, this says what it
 // actually became. Without it the dangerous failure — a container recreated without --build,
@@ -108,7 +109,9 @@ export async function deliverUpdateReport(
       await send();
       return route;
     } catch (err) {
-      console.warn(`[updateReport] ${route} delivery failed`, err);
+      // #545: the `token` route posts to `/webhooks/<app>/<interaction token>`, so a REST error from it
+      // carries the /update requester's token in `url`; withoutRequest keeps code/status/method.
+      console.warn(`[updateReport] ${route} delivery failed`, withoutRequest(err));
     }
   }
   return "none";

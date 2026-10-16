@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { replyFailure } from "../test/restError";
 import { installJsonConsole, jsonLogLine, logFormatFrom } from "./logFormat";
+import { withoutRequest } from "./plugins/delivery";
 
 const AT = new Date("2026-09-29T12:00:00.000Z");
 
@@ -38,6 +40,27 @@ describe("jsonLogLine (#324)", () => {
     expect(msg).toContain("boom");
     expect(msg).toContain("\n"); // the stack, escaped in the line and restored by the parse
   });
+
+  // #545: the interaction handler's catch logs `withoutRequest(err)`. Under LOG_FORMAT=json the line is built by
+  // util.format, which prints a REST error's `url` (the interaction token) in full, and its `requestBody` too when
+  // the body is flat (a webhook route's; a callback's nested body folds past util.format's depth).
+  for (const route of ["callback", "webhook"] as const) {
+    test(`a cleaned REST error's line names its code and status, never the url or the body (#545, ${route})`, () => {
+      const { token, marker, error } = replyFailure(route);
+      const dirty = jsonLogLine("error", ["[interaction]", error], AT);
+      // the control: the uncleaned error prints the token, and the reply too when the body is flat
+      expect(dirty).toContain(token);
+      if (route === "webhook") expect(dirty).toContain(marker);
+      const clean = jsonLogLine("error", ["[interaction]", withoutRequest(error)], AT);
+      expect(clean).not.toContain(token);
+      expect(clean).not.toContain(marker);
+      const msg = JSON.parse(clean).msg as string;
+      expect(msg).toContain("DiscordAPIError[10062]");
+      expect(msg).toContain("code: 10062");
+      expect(msg).toContain("status: 404");
+      expect(msg).toContain("method: 'POST'");
+    });
+  }
 });
 
 describe("installJsonConsole (#324)", () => {

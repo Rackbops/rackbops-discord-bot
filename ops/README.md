@@ -700,14 +700,22 @@ works (`fromjson?` skips any line that is not JSON). Left plain: `console.trace/
 `process.emitWarning` and anything written straight to stdout or stderr. A crash is plain too: an
 uncaught exception or unhandled rejection that ends the process is printed by Bun itself.
 
-Every command, button press and modal submit writes one line once it is handled (#328), e.g.
+Every command, button press and modal submit writes one line once it is handled (#328) -- or, when the
+process exits before the handler returns (`/update` on the exit-75 path, `/plugins … update … now`, a
+successful self-update's retire), right before it exits (#446; a crash or a SIGKILL leaves none) -- e.g.
 `[interaction] command /web user=<id> where=dm outcome=answered 212ms`: the kind, the command (with
 its subcommand) or the customId's plugin prefix, the user's Discord id, `dm` or
-`guild:<id>/channel:<id>`, the outcome (`answered`, `gated` by the routing gate, `unclaimed`, or
-`error`, next to the error's own `[interaction]`, `[plugins] <name> command /<command> failed` or
+`guild:<id>/channel:<id>`, the outcome (`answered`, `gated` by the routing gate, `unclaimed`,
+`exiting`, when the process was exiting -- a requested restart or a stop -- before the handler returned,
+or `error`, next to the error's own `[interaction]`, `[plugins] <name> command /<command> failed` or
 `[plugins] <name> interaction failed` line; a plugin command refused because its plugin is not running
 is `unclaimed`, next to a `[plugins] <name>: /<command> refused — the plugin is not running` line) and
-how long it took. It never carries an option value, a
+how long it took. Since #545 an error's own line keeps the error's name, message, code, status and
+method but leaves out the request: the URL (it holds the interaction token), the request body (the reply)
+and Discord's raw answer. That holds for a Discord REST error, for a network failure that never reached
+Discord, and for either as the `cause` (or a member of the `errors`) of another error, up to five levels
+deep (anything below that is cut off); an error that cannot be inspected safely is replaced by a fixed placeholder error, and an error a plugin wraps any other way is logged as the plugin hands it over. The interaction line
+itself never carries an option value, a
 modal field or what the bot answered, so a `/web` sign-in link or a reminder's text never reaches
 the log. `docker logs rackbops-discord-bot-clerk 2>&1 | jq -rR 'fromjson? | .msg | select(test("^\\[interaction\\] (command|component|modal) "))'`
 lists them (the `[interaction]` error and "no handler" lines share the tag, so the filter names the

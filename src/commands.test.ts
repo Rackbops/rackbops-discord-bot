@@ -1,5 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { MessageFlags, type ChatInputCommandInteraction } from "discord.js";
+import { expectCleanedLog, printed, replyFailure } from "../test/restError";
 import type { PluginCommand } from "./plugins/contract";
 import type { PluginCommandTarget } from "./plugins/host";
 
@@ -566,6 +567,64 @@ describe("handleCommand — the plugin's running gate and a throwing handler (#4
       expect(await handleCommand(interaction, () => target(command))).toBe("error");
       expect(replies).toEqual([{ content: "Something went wrong.", flags: MessageFlags.Ephemeral }]);
       expect(logs.error.mock.calls).toEqual([["[plugins] demo command /hello failed", boom]]);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  // #545: a command whose reply Discord refuses (10062, 40060) throws a REST error whose `url` is the
+  // interaction's token and whose `requestBody` is the reply -- neither belongs in the log, in either format.
+  test("a REST error from the reply is logged without the interaction token or the reply (#545)", async () => {
+    const logs = quiet();
+    try {
+      const failure = replyFailure();
+      expect(printed([failure.error]).join("\n")).toContain(failure.token); // the control: the uncleaned error prints the token
+      const command = { name: "hello", handle: async () => Promise.reject(failure.error) } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      expect(replies).toEqual([{ content: "Something went wrong.", flags: MessageFlags.Ephemeral }]);
+      expect(logs.error.mock.calls).toHaveLength(1);
+      const call = logs.error.mock.calls[0]!;
+      expect(call[0]).toBe("[plugins] demo command /hello failed");
+      expectCleanedLog(call, failure);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  // The same on Bun when the reply never reached Discord: a bare TypeError whose `path` is the request URL.
+  test("a network failure from the reply is logged without the interaction token either (#545)", async () => {
+    const logs = quiet();
+    try {
+      const { token } = replyFailure();
+      const failure = Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), {
+        code: "ConnectionRefused",
+        path: `https://discord.com/api/v10/interactions/1/${token}/callback`,
+      });
+      expect(printed([failure]).join("\n")).toContain(token); // the control
+      const command = { name: "hello", handle: async () => Promise.reject(failure) } as unknown as PluginCommand;
+      const { interaction } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      const call = logs.error.mock.calls[0]!;
+      expect(printed(call).join("\n")).not.toContain(token);
+      expect((call[1] as { code?: string }).code).toBe("ConnectionRefused");
+    } finally {
+      logs.restore();
+    }
+  });
+
+  // The cleaner runs inside this catch: an error it cannot even read must not cost the user's reply.
+  test("a handler that throws an error with a throwing accessor is still isolated, logged and answered (#545)", async () => {
+    const logs = quiet();
+    try {
+      const hostile = new Error("hostile");
+      Object.defineProperty(hostile, "cause", { get: () => { throw new Error("accessor"); } });
+      const command = { name: "hello", handle: async () => Promise.reject(hostile) } as unknown as PluginCommand;
+      const { interaction, replies } = chatInput();
+      expect(await handleCommand(interaction, () => target(command))).toBe("error");
+      expect(replies).toEqual([{ content: "Something went wrong.", flags: MessageFlags.Ephemeral }]);
+      expect(logs.error.mock.calls).toHaveLength(1);
+      expect(String((logs.error.mock.calls[0]![1] as Error).message)).toContain("could not be inspected safely");
     } finally {
       logs.restore();
     }

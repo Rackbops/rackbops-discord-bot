@@ -38,6 +38,7 @@ export function restartStateLeaks(s: RestartStateForTest): string[] {
   if (s.stopListeners !== 0) leaks.push(`${s.stopListeners} onStopRequested listener(s) still registered`);
   if (s.stopNotified) leaks.push("stop already notified — a later onStopRequested listener would never run");
   if (s.deferralArmed) leaks.push("a restart deferral deadline still armed — it would exit the process when it fires");
+  if (s.exitHooks !== 0) leaks.push(`${s.exitHooks} onBeforeExit hook(s) still registered`);
   return leaks;
 }
 
