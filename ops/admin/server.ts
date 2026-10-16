@@ -1,7 +1,10 @@
-// A small per-instance admin panel: an authenticated, thin wrapper around ops/bot-ops.sh's five
-// subcommands (status/logs/restart/env-get/env-set). Runs as its own sidecar service (the
-// profile-gated `admin` service in docker-compose.yml) so it stays reachable independently of
-// the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
+// A small per-instance admin panel: an authenticated, thin wrapper around ops/bot-ops.sh (status,
+// logs, restart, recreate, env-get, env-set, env-schema, routing-get and the plugin request mailbox;
+// `version` once at startup) plus server-native routes of its own (/api/whoami, /api/branches,
+// /api/plugins, /api/plugins/request, /api/admins, the routing writes /api/routing, /api/webhooks and
+// /api/discovery/refresh, the admin-bundle and data-asset delivery, and the static assets). Runs as
+// its own sidecar service (the profile-gated `admin` service in docker-compose.yml) so it stays
+// reachable independently of the bot process. Two doors gate it — Cloudflare Access in front (network-level, not this
 // file's concern) and door 2 below: a verified Access JWT primarily, an ADMIN_TOKEN bearer
 // token as the fallback (OR, not AND — see authorizeRequest).
 import { timingSafeEqual } from "node:crypto";
@@ -901,13 +904,23 @@ export function parsePluginIndex(text: string): PluginIndex | null {
   if (typeof data !== "object" || data === null) return null;
   const d = data as { schemaVersion?: unknown; plugins?: unknown };
   if (d.schemaVersion !== 1 || !Array.isArray(d.plugins)) return null;
-  const ok = d.plugins.every(
-    (p) =>
-      p !== null &&
-      typeof p === "object" &&
-      typeof (p as { name?: unknown }).name === "string" &&
-      typeof (p as { version?: unknown }).version === "string",
-  );
+  const seenNames = new Set<string>();
+  const ok = d.plugins.every((p) => {
+    if (p === null || typeof p !== "object") return false;
+    const e = p as { name?: unknown; version?: unknown; env?: unknown; commands?: unknown; releases?: unknown };
+    if (typeof e.name !== "string" || typeof e.version !== "string") return false;
+    // #404: the three containers the merge iterates. A non-array one used to throw inside `mergePluginsView` and
+    // 500 the Plugins tab for the cache's lifetime. `null` merged fine before (`?? []`) and is refused now too, as the
+    // bot refuses it.
+    if (e.env !== undefined && !Array.isArray(e.env)) return false;
+    if (e.commands !== undefined && !Array.isArray(e.commands)) return false;
+    if (e.releases !== undefined && !Array.isArray(e.releases)) return false;
+    // #514 item 6: refused as the bot refuses it (src/plugins/index.ts's pluginIndexProblem): two entries under one
+    // name would otherwise feed different routes (the card, the bundle, the proxied assets).
+    if (seenNames.has(e.name)) return false;
+    seenNames.add(e.name);
+    return true;
+  });
   return ok ? (data as PluginIndex) : null;
 }
 
@@ -939,6 +952,19 @@ function releasesNewerThan(releases: PluginRelease[], installedVersion: string |
  *  bridge or draws a settings field for it. */
 export const ENV_KEY_RE = /^[A-Z][A-Z0-9_]*$/;
 
+/** The index entry for `name`: the LAST one when an index object built outside `parsePluginIndex` lists it twice
+ *  (#514 item 6; the parse itself refuses a duplicate, as the bot does), so the card, the bundle and the proxied
+ *  assets all come from the same entry. */
+function entryFor(index: PluginIndex | null, name: string): PluginIndexEntry | undefined {
+  return index?.plugins.findLast((e) => e.name === name);
+}
+
+/** A manifest container read as an array; anything else is `[]` (#404's second net: `parsePluginIndex` refuses a
+ *  non-array `env`/`commands`/`releases`, so this guards an object that never went through it). */
+function asArray<T>(v: unknown): T[] {
+  return Array.isArray(v) ? (v as T[]) : [];
+}
+
 /** Pure merge of the Plugin Index, the bot's installed state (`status.plugins`), and the current
  *  `PLUGINS` value into one per-plugin view. `index === null` → `indexError` + state-only entries,
  *  so the panel still renders what's installed. */
@@ -964,7 +990,7 @@ export function mergePluginsView(
   const plugins: PluginView[] = names.map((name) => {
     const entry = entryByName.get(name);
     const st = statusByName.get(name);
-    // Compat mirrors the bot's `validate` (requests.ts:154): an update to the index's CURRENT version
+    // Compat mirrors `validate`'s compat check in `src/plugins/requests.ts`: an update to the index's CURRENT version
     // is installable only when the entry's declared hostApiVersion EQUALS the bot's — the panel's
     // Update now pins `latestVersion` (= entry.version), which is exactly the case the bot's compat
     // check guards, so `===` suppresses Update now precisely when the bot would reject it. A plugin
@@ -981,7 +1007,7 @@ export function mergePluginsView(
       active: st?.active ?? false,
       error: st?.error,
       inIndex: entry !== undefined,
-      releases: releasesNewerThan(entry?.releases ?? [], st?.installedVersion),
+      releases: releasesNewerThan(asArray<PluginRelease>(entry?.releases), st?.installedVersion),
       skippedVersion: st?.skippedVersion,
       remindAt: st?.remindAt,
       scheduled: st?.scheduled,
@@ -991,14 +1017,14 @@ export function mergePluginsView(
       // its admin-bundle URL + version when it ships an admin tab. env is untrusted manifest JSON, so
       // guard each element before reading `.key` — and #226: a key not shaped like ENV_KEY_RE is
       // dropped here too, never reaching the bridge's scope or drawing a card field for it.
-      envKeys: (entry?.env ?? [])
+      envKeys: asArray<NonNullable<PluginIndexEntry["env"]>[number]>(entry?.env)
         .filter((e): e is { key: string } => !!e && typeof (e as { key?: unknown }).key === "string" && ENV_KEY_RE.test((e as { key: string }).key))
         .map((e) => e.key),
       // #244: the same env block, widened for the card's settings step. Guarded the same way envKeys
       // is (untrusted manifest JSON, #226's key-shape check): an element without a string `key`
       // matching ENV_KEY_RE is skipped; `description` is a string or ""; `required`/`secret` are
       // true only for a literal `true`.
-      env: (entry?.env ?? [])
+      env: asArray<NonNullable<PluginIndexEntry["env"]>[number]>(entry?.env)
         .filter(
           (e): e is { key: string; description?: string; required?: boolean; secret?: boolean } =>
             !!e && typeof (e as { key?: unknown }).key === "string" && ENV_KEY_RE.test((e as { key: string }).key),
@@ -1011,7 +1037,7 @@ export function mergePluginsView(
         })),
       // #244: the plugin's declared command names, for the closed card's summary line. Untrusted
       // manifest JSON — keep strings only.
-      commands: (entry?.commands ?? []).filter((c): c is string => typeof c === "string"),
+      commands: asArray<unknown>(entry?.commands).filter((c): c is string => typeof c === "string"),
       ...(typeof entry?.adminUrl === "string" ? { adminUrl: entry.adminUrl } : {}),
       ...(typeof entry?.adminApiVersion === "number" ? { adminApiVersion: entry.adminApiVersion } : {}),
     };
@@ -1024,8 +1050,9 @@ export function mergePluginsView(
 // ---- #124: admin-tab delivery (bundle + data-asset proxy) -------------------------------------
 
 /** The ONLY host a plugin's admin bundle / data asset may come from — the plugins' published npm
- *  package on this CDN. Both delivery routes resolve to it and nothing else, so a manifest `adminUrl`
- *  pointing elsewhere is refused and a bundle can never make the panel fetch an arbitrary origin. */
+ *  package on this CDN. Both delivery routes resolve to the requested plugin's own package on it and
+ *  nothing else (the manifest's `adminUrl` too, #465 item 8), so a manifest `adminUrl` pointing
+ *  elsewhere is refused and a bundle can never make the panel fetch an arbitrary origin. */
 export const ADMIN_ASSET_HOST = "cdn.jsdelivr.net";
 /** Cap on a fetched admin bundle / proxied asset. A plugin's admin.js is a few KB; this bounds a
  *  broken or hostile source from streaming an unbounded body into the panel. */
@@ -1061,8 +1088,9 @@ function isValidInstalledVersion(v: string | undefined): v is string {
 }
 
 /** Resolve `name` to its admin-bundle URL from the index, or null when it declares none, isn't in the
- *  index, or the URL isn't on the allowlisted host. Pure over the parsed index (no I/O), so the
- *  allowlist gate is unit-tested directly.
+ *  index, or the URL isn't under the plugin's own package on the allowlisted host (both the pinned and
+ *  the unpinned branch, #465 item 8). Pure over the parsed index (no I/O), so the allowlist gate is
+ *  unit-tested directly.
  *
  *  `installedVersion` (#165, untrusted): when given and it differs from the manifest's `entry.version`,
  *  the panel is configuring a version other than the index's current one — derive that version's own
@@ -1076,7 +1104,7 @@ export function resolveAdminBundleUrl(
   name: string,
   installedVersion?: string,
 ): string | null {
-  const entry = index?.plugins.find((e) => e.name === name);
+  const entry = entryFor(index, name);
   if (!entry || typeof entry.adminUrl !== "string") return null;
   // The manifest's own URL is a sanity gate regardless of which version we end up serving: it must be
   // https on the allowlisted host (never http, never an arbitrary origin — see the @/subdomain/userinfo
@@ -1110,6 +1138,11 @@ export function resolveAdminBundleUrl(
   // No pin, or the pin matches the manifest's current version → today's behaviour: the manifest's own
   // URL, gated by its ADMIN_API_VERSION (a server-side version gate — the client gates too, but don't
   // fetch/serve an incompatible bundle; cheap refusal, no fetch).
+  // #465 item 8: the unpinned branch is now held to the same source as the pinned one — this plugin's own published
+  // package on the CDN — not merely the host (a `/gh/...` or another package's URL on cdn.jsdelivr.net was accepted).
+  // A missing or empty `package` resolves nothing: an empty one would make the prefix `/npm/@`, which every scoped URL matches.
+  if (typeof entry.package !== "string" || entry.package === "") return null;
+  if (!manifestUrl.href.startsWith(`https://${ADMIN_ASSET_HOST}/npm/${entry.package}@`)) return null;
   if (entry.adminApiVersion !== ADMIN_API_VERSION) return null;
   return entry.adminUrl;
 }
@@ -1128,7 +1161,7 @@ export function resolvePluginProxyUrl(
   path: string,
   installedVersion?: string,
 ): string | null {
-  const entry = index?.plugins.find((e) => e.name === name);
+  const entry = entryFor(index, name);
   if (!entry || typeof entry.package !== "string" || !entry.package) return null;
   // A data-asset path is a plain relative path: no scheme, no leading slash/backslash, no backslash,
   // and NO `%` — a percent-encoded `..`/`/` (e.g. `%2e%2e`) sneaks past the literal-segment check
@@ -1226,13 +1259,22 @@ interface AssetResponse {
  *  #229: never decodes — `body` is the raw bytes handed straight to the `AdminAssetResult`, so a
  *  binary asset (a PNG, a font, `.wasm`) survives the proxy unchanged. */
 export function makeAdminAssetFetcher(
-  fetchImpl: (url: string, init: { headers: Record<string, string>; signal: AbortSignal }) => Promise<AssetResponse>,
+  fetchImpl: (
+    url: string,
+    init: { headers: Record<string, string>; signal: AbortSignal; redirect: "error" },
+  ) => Promise<AssetResponse>,
   maxBytes = ADMIN_ASSET_MAX_BYTES,
 ): (url: string) => Promise<AdminAssetResult> {
   const EMPTY = new Uint8Array(0);
   return async (assetUrl) => {
     try {
-      const res = await fetchImpl(assetUrl, { headers: { "User-Agent": "rackbops-admin-panel" }, signal: AbortSignal.timeout(5000) });
+      // #465 item 7: a 3xx from the allowlisted host would otherwise be followed anywhere and served same-origin;
+      // `fetch` rejects on it with `redirect: "error"`, which the catch below turns into a 502.
+      const res = await fetchImpl(assetUrl, {
+        headers: { "User-Agent": "rackbops-admin-panel" },
+        signal: AbortSignal.timeout(5000),
+        redirect: "error",
+      });
       if (!res.ok) return { ok: false, status: res.status, contentType: "", body: EMPTY, error: `upstream ${res.status}` };
       const declared = Number(res.headers.get("content-length"));
       if (Number.isFinite(declared) && declared > maxBytes) {
@@ -1250,7 +1292,7 @@ export function makeAdminAssetFetcher(
 }
 
 /** The five request actions the panel can POST — a subset of the bot's PluginRequest union
- *  (contract.ts:132). `requestedBy` is deliberately NOT part of this: the server fills it from the
+ *  (`PluginRequest` in `src/plugins/contract.ts`). `requestedBy` is deliberately NOT part of this: the server fills it from the
  *  verified Access identity, never the client body (a spoofed one would misattribute the audit trail
  *  and mis-target the bot's heads-up DM). */
 export type PluginRequestAction = "update-now" | "schedule" | "remind" | "skip" | "cancel";
@@ -1854,8 +1896,8 @@ type RoutingRequestBody =
  * Anything bot-ops.sh wrote (its stderr in a failure, its `queued` in a success) passes through
  * `redactWebhookUrls` before it is logged or answered: a `die "... '$url'"` in the script would otherwise
  * carry the secret straight back to the page and into `docker logs`. So does the message of an error
- * `runBotOps` itself throws (it is caught here: an unhandled rejection would reach Bun's own error output,
- * which is outside this file's control and could carry the payload).
+ * `runBotOps` itself throws (it is caught here: an unhandled rejection would reach `serve()`'s net, which
+ * logs the error object as it is, unredacted, and could carry the payload).
  */
 async function queueRoutingRequest(
   config: HandlerConfig,
@@ -1983,20 +2025,36 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
 
   // The Modify Plugins view: the Plugin Index (what's available) merged with the bot's installed
   // state (status.plugins) and the current PLUGINS selection (env-get). Server-native, authenticated
-  // like every /api/* route; a GET, so isCrossSiteWrite never applies. Always 200 — an unreachable
-  // index degrades to an indexError plus the installed plugins, so the panel still renders what's
-  // installed. (Saving happens through the existing POST /api/env, not here.)
+  // like every /api/* route; a GET, so isCrossSiteWrite never applies. 200 for any index or status SHAPE the
+  // merge can trip on — an unreachable or unmergeable index (#404) degrades to an indexError plus the
+  // installed plugins, so the panel still renders what's installed (what no merge can fix — a `runBotOps`
+  // that rejects, a view too deeply nested to serialise — is serve()'s plain 500). (Saving happens
+  // through the existing POST /api/env, not here.)
   if (req.method === "GET" && url.pathname === "/api/plugins") {
     const [statusRes, envRes] = await Promise.all([
       config.runBotOps({ args: ["status"], contentType: "application/json" }),
       config.runBotOps({ args: ["env-get"], contentType: "application/json" }),
     ]);
     const rawPlugins = safeJsonField(statusRes.stdout, "plugins");
-    const statusPlugins = Array.isArray(rawPlugins) ? (rawPlugins as PluginStatusEntry[]) : [];
+    // #404: a status entry that is not an object with a name cannot be merged (or shown); drop it rather than throw.
+    const statusPlugins = Array.isArray(rawPlugins)
+      ? rawPlugins.filter(
+          (s): s is PluginStatusEntry => !!s && typeof s === "object" && typeof (s as { name?: unknown }).name === "string",
+        )
+      : [];
     const rawPluginsValue = safeJsonField(envRes.stdout, "PLUGINS");
     const pluginsValue = typeof rawPluginsValue === "string" ? rawPluginsValue : "";
     const index = config.listPluginIndex ? await config.listPluginIndex() : null;
-    const view = mergePluginsView(index, statusPlugins, pluginsValue);
+    let view: PluginsView;
+    try {
+      view = mergePluginsView(index, statusPlugins, pluginsValue);
+    } catch (err) {
+      // #404: the merge reads untrusted manifest JSON; a shape the parse let through must degrade like an unreachable
+      // index, not 500 the tab for the cache's lifetime. (The fallback below reads no index and iterates no status
+      // field, so it cannot throw; serve()'s net is the backstop behind it.)
+      console.error("[admin] couldn't merge the Plugin Index (Modify Plugins shows installed only)", err);
+      view = { ...mergePluginsView(null, statusPlugins, pluginsValue), indexError: "the Plugin Index could not be merged" };
+    }
     // A failed state read leaves pluginsValue empty, which would look like "no plugins enabled" and
     // let an Apply wipe the real selection — surface it (distinct from indexError) so the panel can
     // disable the plugin boxes until the bot is readable again, rather than acting on a false-empty baseline.
@@ -2126,6 +2184,65 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   const stdout =
     invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.outdatedFiles ?? []) : result.stdout;
   return new Response(stdout, { headers: { "Content-Type": invocation.contentType } });
+}
+
+/** The two response headers every response the app produces carries (#466 item 14): the panel is framed only by its
+ *  own origin (nothing does today; ADR-0005 keeps a same-origin iframe open for plugin UIs), and nothing it serves —
+ *  the page, the assets, a proxied data asset with its upstream Content-Type — is sniffed into another type. (Bun's own
+ *  protocol-level replies, an `OPTIONS *` or an over-long header block, never reach `serve`.) */
+export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
+  "X-Frame-Options": "SAMEORIGIN",
+  "X-Content-Type-Options": "nosniff",
+};
+
+/** The request path for a log line; never throws (the catch it is used in must not). */
+function safePathname(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "?";
+  }
+}
+
+/** What `Bun.serve` runs (#465 item 9): `handleRequest` behind an error net (a rejection — a spawn failure, a throw a
+ *  route did not expect — is logged and answered with a plain 500, never Bun's development error page) and with the
+ *  security headers on every response. Exported so both are pinned by tests; `handleRequest` itself stays the DI'd core. */
+export async function serve(req: Request, config: HandlerConfig): Promise<Response> {
+  let res: Response;
+  try {
+    res = await handleRequest(req, config);
+  } catch (err) {
+    console.error(`[admin] ${req.method} ${safePathname(req.url)} failed`, err);
+    res = new Response("internal error", { status: 500 });
+  }
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
+  return res;
+}
+
+/** `Bun.serve`'s last resort (#465 item 9), behind `serve`'s own net: what Bun calls when the fetch handler itself
+ *  throws or rejects. Without an `error` handler Bun answers its own page — with `development` on (its default when
+ *  NODE_ENV is unset) the ~50 KB development error page (the message, local paths, source lines), with it off a bare
+ *  "Something went wrong!" — and neither carries the security headers. `serve` cannot reject through any request this
+ *  suite can build, so this is exported to be called directly. */
+export function lastResortResponse(err: unknown): Response {
+  console.error("[admin] unhandled", err);
+  return new Response("internal error", { status: 500, headers: SECURITY_HEADERS });
+}
+
+/** Everything `Bun.serve` is given (#465 item 9), as a function of the handler config and the port so the values are
+ *  pinned by tests (the entry point does not run under test): `serve` as the fetch, `development: false` (Bun's
+ *  development error page is ~50 KB of message, paths and source lines), `lastResortResponse` as the error handler.
+ *  idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long restart/env-set request out
+ *  from under the client while bot-ops.sh is still legitimately running (issue #53 item 1). See
+ *  SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin. */
+export function serveOptions(config: HandlerConfig, port: number) {
+  return {
+    port,
+    fetch: (req: Request) => serve(req, config),
+    idleTimeout: IDLE_TIMEOUT_SECONDS,
+    development: false,
+    error: lastResortResponse,
+  };
 }
 
 // Everything below only runs when this file is the actual entry point (`bun run server.ts`),
@@ -2289,9 +2406,8 @@ if (import.meta.main) {
     adminToken, indexHtml, assets, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt,
     adminStore, outdatedFiles,
   };
-  // idleTimeout is in SECONDS (Bun's unit, not ms), default 10 — that default cuts a long
-  // restart/env-set request out from under the client while bot-ops.sh is still legitimately
-  // running (issue #53 item 1). See SUBPROCESS_TIMEOUT_MS/IDLE_TIMEOUT_SECONDS above for the margin.
-  Bun.serve({ port: PORT, fetch: (req) => handleRequest(req, config), idleTimeout: IDLE_TIMEOUT_SECONDS });
+  // The options (serve as the fetch, idleTimeout, development off, the last-resort error handler) are `serveOptions`'s,
+  // so their values are tested; only this call is not.
+  Bun.serve(serveOptions(config, PORT));
   console.log(`[admin] listening on :${PORT}`);
 }

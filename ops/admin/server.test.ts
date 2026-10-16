@@ -42,6 +42,10 @@ import {
   ADMIN_ASSET_MAX_BYTES,
   resolveAdminBundleUrl,
   resolvePluginProxyUrl,
+  serve,
+  serveOptions,
+  lastResortResponse,
+  SECURITY_HEADERS,
   serveAdminBundle,
   servePluginProxy,
   makeAdminAssetFetcher,
@@ -479,8 +483,9 @@ describe("logDynamicAdminsStartup", () => {
     const { logs, errors, log, logError } = capture();
     await logDynamicAdminsStartup(file, log, logError);
     expect(errors.length).toBe(0);
-    expect(logs[0]).toContain(file);
-    expect(logs[0]).toContain("0");
+    // The whole line, with this test's own path interpolated: a substring check on the count passes whenever the
+    // random temp path happens to contain the digit (#465 item 11).
+    expect(logs).toEqual([`[admin] 0 dynamic admin(s) loaded from ${file}`]);
   });
 
   test("populated file -> logs the path and the real count", async () => {
@@ -489,8 +494,7 @@ describe("logDynamicAdminsStartup", () => {
     const { logs, errors, log, logError } = capture();
     await logDynamicAdminsStartup(file, log, logError);
     expect(errors.length).toBe(0);
-    expect(logs[0]).toContain(file);
-    expect(logs[0]).toContain("2");
+    expect(logs).toEqual([`[admin] 2 dynamic admin(s) loaded from ${file}`]);
   });
 
   test("malformed file -> logs the error via logError, names the file, never claims success", async () => {
@@ -1884,6 +1888,60 @@ describe("handleRequest", () => {
     expect(((await res.json()) as PluginsView).stateError).toBeUndefined();
   });
 
+  // #404: the merge reads untrusted manifest JSON. `releases: [null]` on a plugin that has an installed version passes
+  // `parsePluginIndex`'s container checks and `mergePluginsView`'s `asArray` net by design, and throws at
+  // `releasesNewerThan`: the route's own net must turn that into the degraded view, not a 500 cached for five minutes.
+  // Mutation: the try/catch removed (the request rejects / 500s).
+  test("/api/plugins answers 200 with a distinct indexError when the merge throws on a shape the parse let through (#404)", async () => {
+    const bad = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.1.0", releases: [null] }] } as unknown as PluginIndex;
+    const status = JSON.stringify({
+      plugins: [
+        { name: "warbandeer", enabled: true, installedVersion: "1.0.0", active: true },
+        { name: "legacy", installedVersion: "0.9.0" },
+      ],
+    });
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await handleRequest(
+        authed("/api/plugins"),
+        branchCfg({ runBotOps: pluginsBotOps(status, JSON.stringify({ PLUGINS: "warbandeer" })), listPluginIndex: async () => bad }),
+      );
+      expect(res.status).toBe(200);
+      const view = (await res.json()) as PluginsView;
+      expect(view.indexError).toBe("the Plugin Index could not be merged");
+      // The installed plugins are all still there, state-only (the unreachable-index view).
+      expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer", "legacy"]);
+      expect(view.plugins.every((p) => !p.inIndex)).toBe(true);
+      expect(view.plugins[0]).toMatchObject({ enabled: true, installedVersion: "1.0.0" });
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0]![0])).toContain("couldn't merge the Plugin Index");
+      // ... with the CAUSE (mutations: `, err` dropped from the log call; another error logged in its place): the
+      // TypeError `releasesNewerThan` threw reading `.version` of a null release.
+      const cause = err.mock.calls[0]![1] as Error;
+      expect(cause).toBeInstanceOf(TypeError);
+      expect(cause.message).toContain("version");
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  // #404: a status entry that is not an object with a string name cannot be merged (`new Map(... s.name)` throws on a
+  // null). The route drops it. Mutation: the filter removed (the merge throws, and so does the fallback).
+  test("/api/plugins drops a status entry that is not an object with a name (#404)", async () => {
+    const status = JSON.stringify({
+      plugins: [null, 5, "warbandeer", { installedVersion: "1.0.0" }, { name: 7 }, { name: "warbandeer", enabled: true, installedVersion: "1.0.0", active: true }],
+    });
+    const res = await handleRequest(
+      authed("/api/plugins"),
+      branchCfg({ runBotOps: pluginsBotOps(status, JSON.stringify({ PLUGINS: "warbandeer" })), listPluginIndex: async () => sampleIndex }),
+    );
+    expect(res.status).toBe(200);
+    const view = (await res.json()) as PluginsView;
+    expect(view.indexError).toBeUndefined();
+    expect(view.plugins.map((p) => p.name)).toEqual(["warbandeer", "raidhelper"]);
+    expect(view.plugins[0]).toMatchObject({ installedVersion: "1.0.0", enabled: true, active: true });
+  });
+
   test("/api/plugins requires auth (no token -> 401, never shells out or fetches the index)", async () => {
     let botOpsCalled = false;
     let indexCalled = false;
@@ -2146,6 +2204,55 @@ describe("handleRequest", () => {
     expect(res.status).toBe(403);
   });
 
+  // #465 item 10: the test above carries a VALID bearer, so swapping isCrossSiteWrite and authorizeRequest keeps it
+  // green. Only a request with NO credentials tells 403 from 401. Mutation: the gate moved below authorizeRequest.
+  test("an UNauthenticated cross-site POST is 403 (not 401), and no store is read and nothing is run (#465 item 10)", async () => {
+    let reads = 0;
+    let botOps = 0;
+    const store = makeStore({ holdReads: async () => void reads++ });
+    const res = await handleRequest(
+      new Request("http://x/api/admins", {
+        method: "POST",
+        headers: { Origin: "http://evil.example" },
+        body: JSON.stringify({ email: "attacker@evil.com" }),
+      }),
+      {
+        adminToken: TOKEN,
+        indexHtml: INDEX_HTML,
+        runBotOps: async () => (botOps++, { exitCode: 0, stdout: "", stderr: "" }),
+        adminStore: store,
+      },
+    );
+    expect(res.status).toBe(403);
+    expect(reads).toBe(0);
+    expect(botOps).toBe(0);
+    expect(store.dynamic.size).toBe(0);
+  });
+
+  // ... and the real attack: an ambient Access session carries the Cf-Access-Jwt-Assertion header. A verifier that
+  // WOULD authorize it must never be called, in either order's other half: the gate runs before any identity is read.
+  test("a cross-site POST that carries an Access JWT a verifier would authorize is still 403, and the verifier is never called", async () => {
+    let verified = 0;
+    const store = makeStore();
+    const res = await handleRequest(
+      new Request("http://x/api/admins", {
+        method: "POST",
+        headers: { Origin: "http://evil.example", "Cf-Access-Jwt-Assertion": "ambient-session-jwt" },
+        body: JSON.stringify({ email: "attacker@evil.com" }),
+      }),
+      {
+        adminToken: TOKEN,
+        indexHtml: INDEX_HTML,
+        runBotOps: fakeRunBotOps({ exitCode: 0, stdout: "", stderr: "" }),
+        adminStore: store,
+        verifyAccessJwt: async () => (verified++, { sub: "boss", email: "boss@x.com" }),
+      },
+    );
+    expect(res.status).toBe(403);
+    expect(verified).toBe(0);
+    expect(store.dynamic.size).toBe(0);
+  });
+
   test("a same-origin POST passes the CSRF guard", async () => {
     const store = makeStore();
     const res = await handleRequest(
@@ -2171,7 +2278,8 @@ describe("admin panel planEnvSave: only the changed keys (issue #44)", () => {
   const indexSrc = readFileSync(new URL("./public/index.html", import.meta.url), "utf8");
   const planSrc = indexSrc.match(/\/\/ ENV_SAVE_PLAN:begin\n([\s\S]*?)\n\s*\/\/ ENV_SAVE_PLAN:end/)?.[1];
   type Plan = { changes: { key: string; before: string; now: string }[]; body: string };
-  // "use strict" up front, matching the page's own IIFE (index.html:226): without it, a `Function`
+  // "use strict" up front, matching the page's own strict IIFE (the `"use strict"` at the top of its main
+  // script): without it, a `Function`
   // body silently creates a global on an assignment to an un-injected or misspelled identifier
   // instead of throwing — the real (strict-mode) page would ReferenceError there instead.
   const planEnvSave = (loaded: Record<string, string>, current: Record<string, string>): Plan =>
@@ -2528,6 +2636,44 @@ describe("parsePluginIndex (#102)", () => {
   });
   test("null when an entry is missing name or version", () => {
     expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a" }] }))).toBeNull();
+  });
+  // #404: the three containers the merge iterates. A non-array one used to pass the parse and throw inside
+  // mergePluginsView, answering 500 for the cache's lifetime; `null` merged fine before (`?? []`) and is refused now too,
+  // as the bot refuses it. Mutations: dropping a check; `!= null` for `!== undefined` (null passes) on any of the three.
+  test.each([
+    ["env as an object", { env: {} }],
+    ["env as null", { env: null }],
+    ["commands as a string", { commands: "x" }],
+    ["commands as null", { commands: null }],
+    ["releases as a string", { releases: "x" }],
+    ["releases as an object", { releases: {} }],
+    ["releases as null", { releases: null }],
+  ])("null when an entry's %s (#404)", (_label, bad) => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0", ...bad }] }))).toBeNull();
+  });
+  // Each container ALONE, valid: a check wired to the wrong field (commands tested against env, say) refuses these.
+  test.each([
+    ["env", { env: [{ key: "A_B" }] }],
+    ["commands", { commands: ["x"] }],
+    ["releases", { releases: [] }],
+  ])("an entry with only a valid %s still parses (#404)", (_label, ok) => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0", ...ok }] }))).not.toBeNull();
+  });
+  test("an entry with none of the three containers, or with all three as arrays, still parses", () => {
+    expect(parsePluginIndex(JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0" }] }))).not.toBeNull();
+    expect(
+      parsePluginIndex(
+        JSON.stringify({ schemaVersion: 1, plugins: [{ name: "a", version: "1.0.0", env: [{ key: "A_B" }], commands: ["x"], releases: [] }] }),
+      ),
+    ).not.toBeNull();
+  });
+  // #514 item 6: refused as the bot refuses it (src/plugins/index.ts's pluginIndexProblem). Mutation: dropping the check.
+  test("null when two entries share a name, as the bot's own index check refuses it (#514 item 6)", () => {
+    expect(
+      parsePluginIndex(
+        JSON.stringify({ schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.0.0" }, { name: "other", version: "1.0.0" }, { name: "warbandeer", version: "9.9.9" }] }),
+      ),
+    ).toBeNull();
   });
 });
 
@@ -2893,6 +3039,22 @@ describe("mergePluginsView (#102)", () => {
     };
     const names = mergePluginsView(dupIndex, [], "").plugins.map((p) => p.name);
     expect(names).toEqual(["warbandeer"]);
+    // #514 item 6: the card is the LAST entry's (parsePluginIndex refuses a duplicate; this object never went through it).
+    expect(mergePluginsView(dupIndex, [], "").plugins[0]!.latestVersion).toBe("9.9.9");
+  });
+
+  // #404: the second net. An index object that never went through parsePluginIndex (the lister's cache is in-process,
+  // so only a direct call reaches this) with a non-array container yields empty lists, not a throw. One field at a time
+  // so each of the three reads is guarded on its own. Mutation: any one `asArray(...)` replaced by `?? []`.
+  test.each([
+    ["env as an object", { env: {} }],
+    ["env as null", { env: null }],
+    ["commands as a string", { commands: "x" }],
+    ["releases as a string", { releases: "x" }],
+  ])("a non-array container (%s) on an unparsed index yields empty lists, not a throw (#404)", (_label, bad) => {
+    const unparsed = { schemaVersion: 1, plugins: [{ name: "warbandeer", version: "1.1.0", ...bad }] } as unknown as PluginIndex;
+    const wb = mergePluginsView(unparsed, [{ name: "warbandeer", installedVersion: "1.0.0" }], "warbandeer").plugins[0]!;
+    expect({ envKeys: wb.envKeys, env: wb.env, commands: wb.commands, releases: wb.releases }).toEqual({ envKeys: [], env: [], commands: [], releases: [] });
   });
 
   test("releases are only those newer than the installed version (latest-first prefix)", () => {
@@ -3060,7 +3222,7 @@ describe("mergePluginsView surfaces #244 card fields", () => {
 describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => {
   const entry = (over: Partial<PluginIndex["plugins"][number]> = {}): PluginIndex => ({
     schemaVersion: 1,
-    plugins: [{ name: "warbandeer", version: "1.0.0", adminApiVersion: ADMIN_API_VERSION, ...over }],
+    plugins: [{ name: "warbandeer", version: "1.0.0", package: "@rackbops/plugin-warbandeer", adminApiVersion: ADMIN_API_VERSION, ...over }],
   });
   const withAdmin = (adminUrl: string) => entry({ adminUrl });
 
@@ -3088,6 +3250,53 @@ describe("resolveAdminBundleUrl (#124 allowlist + https + version gate)", () => 
     expect(resolveAdminBundleUrl(entry(), "warbandeer")).toBeNull();
     expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/x.js"), "nope")).toBeNull();
     expect(resolveAdminBundleUrl(null, "warbandeer")).toBeNull();
+  });
+  // #465 item 8: the unpinned branch is held to the plugin's own published package on the CDN, as the pinned branch is,
+  // not merely the host. Mutations: the prefix check dropped (a /gh/ URL or another package's is accepted); the check
+  // done on the raw string instead of the normalised URL (the traversal case); the prefix without its closing `@`
+  // (a package that merely starts with this one's name).
+  test("the unpinned URL must sit under the plugin's own published package, not merely on the host (#465 item 8)", () => {
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/gh/x/y@main/a.js"), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-other@1.0.0/dist/admin.js"), "warbandeer")).toBeNull();
+    // ... including one whose name merely STARTS with this package's (the prefix ends at the `@`).
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer-evil@1.0.0/dist/admin.js"), "warbandeer")).toBeNull();
+    // A traversal out of the own package is another path once the URL is normalised.
+    expect(
+      resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/../../../gh/x/y@main/a.js"), "warbandeer"),
+    ).toBeNull();
+    const own = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.0.0/dist/admin.js";
+    expect(resolveAdminBundleUrl(withAdmin(own), "warbandeer")).toBe(own);
+    // The production path: the page always sends ?v=<installedVersion>, so for an up-to-date plugin the pin EQUALS
+    // entry.version (this helper's "1.0.0") and the request lands on this branch WITH a defined installedVersion.
+    // Mutation: the prefix check applied only when installedVersion is undefined.
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/gh/x/y@main/a.js"), "warbandeer", "1.0.0")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin("https://cdn.jsdelivr.net/npm/@rackbops/plugin-other@1.0.0/dist/admin.js"), "warbandeer", "1.0.0")).toBeNull();
+    expect(resolveAdminBundleUrl(withAdmin(own), "warbandeer", "1.0.0")).toBe(own);
+  });
+  // An empty `package` would make the prefix `/npm/@`, which every scoped URL matches; an absent one `/npm/undefined@`.
+  // Mutation: the typeof/empty guard dropped.
+  test("a missing or empty `package` resolves nothing (#465 item 8)", () => {
+    const other = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-other@1.0.0/dist/admin.js";
+    expect(resolveAdminBundleUrl(entry({ adminUrl: other, package: "" }), "warbandeer")).toBeNull();
+    expect(resolveAdminBundleUrl(entry({ adminUrl: "https://cdn.jsdelivr.net/npm/undefined@1.0.0/dist/admin.js", package: undefined }), "warbandeer")).toBeNull();
+  });
+  // #514 item 6: parsePluginIndex refuses a duplicate name, so a parsed index has none; an index OBJECT built outside it
+  // (this one) still must not feed the card, the bundle and the proxied assets from different entries. Mutation: `find`
+  // for `findLast` in the shared lookup (the bundle and the proxy come from the FIRST entry, the card from the last).
+  test("an unparsed index listing a name twice is last-wins across the card, the bundle and the proxy (#514 item 6)", () => {
+    const at = (pkg: string, version: string) => `https://cdn.jsdelivr.net/npm/${pkg}@${version}/dist/admin.js`;
+    const dup: PluginIndex = {
+      schemaVersion: 1,
+      plugins: [
+        { name: "warbandeer", version: "1.0.0", package: "@rackbops/plugin-first", adminUrl: at("@rackbops/plugin-first", "1.0.0"), adminApiVersion: ADMIN_API_VERSION },
+        { name: "warbandeer", version: "9.9.9", package: "@rackbops/plugin-second", adminUrl: at("@rackbops/plugin-second", "9.9.9"), adminApiVersion: ADMIN_API_VERSION },
+      ],
+    };
+    const card = mergePluginsView(dup, [], "").plugins[0]!;
+    expect(card.latestVersion).toBe("9.9.9");
+    expect(card.adminUrl).toBe(at("@rackbops/plugin-second", "9.9.9"));
+    expect(resolveAdminBundleUrl(dup, "warbandeer")).toBe(at("@rackbops/plugin-second", "9.9.9"));
+    expect(resolvePluginProxyUrl(dup, "warbandeer", "x.json")).toBe("https://cdn.jsdelivr.net/npm/@rackbops/plugin-second@9.9.9/x.json");
   });
   test("the host allowlist + size cap are the expected constants", () => {
     expect(ADMIN_ASSET_HOST).toBe("cdn.jsdelivr.net");
@@ -3303,6 +3512,29 @@ describe("serveAdminBundle / servePluginProxy delivery routes (#124, #165)", () 
     expect(res.headers.get("Content-Type")).toContain("text/javascript");
     expect(await res.text()).toContain("mountAdmin");
   });
+  // #465 item 8 through the route, on the path the page really takes (`?v=<entry.version>`): a /gh/ adminUrl is a 404
+  // and nothing is fetched. Mutation: the prefix check applied only without a pin.
+  test("a /gh/ adminUrl is a 404 even when the page pins the CURRENT version, and nothing is fetched (#465 item 8)", async () => {
+    let fetched = 0;
+    const gh: PluginIndex = {
+      schemaVersion: 1,
+      plugins: [
+        {
+          name: "warbandeer",
+          version: "1.1.0",
+          package: "@rackbops/plugin-warbandeer",
+          adminUrl: "https://cdn.jsdelivr.net/gh/x/y@main/a.js",
+          adminApiVersion: ADMIN_API_VERSION,
+        },
+      ],
+    };
+    const res = await serveAdminBundle(
+      bundleReq("/plugin-admin/warbandeer.js?v=1.1.0"),
+      cfg({ listPluginIndex: async () => gh, fetchAdminAsset: async () => (fetched++, okAsset("x")) }),
+    );
+    expect(res.status).toBe(404);
+    expect(fetched).toBe(0);
+  });
   test("404 when the plugin ships no admin bundle", async () => {
     expect((await serveAdminBundle(bundleReq("/plugin-admin/ghost.js"), cfg())).status).toBe(404);
   });
@@ -3464,6 +3696,41 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
     expect((await fetcher("https://cdn.jsdelivr.net/x")).ok).toBe(false);
   });
 
+  // #465 item 7: a 3xx from the allowlisted host would be followed anywhere and served same-origin. Mutation: the
+  // option dropped (this fake records the init; the real server below sees the followed redirect).
+  test("the fetch is made with redirect: \"error\" (#465 item 7)", async () => {
+    let seen: { redirect?: string } | undefined;
+    const fetcher = makeAdminAssetFetcher(async (_url, init) => {
+      seen = init;
+      return res({ bytes: 1 });
+    }, 100);
+    await fetcher("https://cdn.jsdelivr.net/x");
+    expect(seen?.redirect).toBe("error");
+  });
+
+  // ... and for real: a local server answering 302. A followed redirect would request /ok (served 200). A weaker test
+  // that redirected to a closed port would also end in a 502 (the catch), so the assertion is on what the server was ASKED.
+  // Mutation: `redirect: "error"` dropped (the target is requested and the asset served).
+  test("a real 302 is a 502 and its target is never requested (#465 item 7)", async () => {
+    const hits: string[] = [];
+    const srv = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const p = new URL(req.url).pathname;
+        hits.push(p);
+        return p === "/redir" ? new Response(null, { status: 302, headers: { Location: "/ok" } }) : new Response("ok");
+      },
+    });
+    try {
+      const r = await makeAdminAssetFetcher(fetch)(`http://127.0.0.1:${srv.port}/redir`);
+      expect(r.ok).toBe(false);
+      expect(r.status).toBe(502);
+      expect(hits).toEqual(["/redir"]); // the redirect's target was never requested
+    } finally {
+      srv.stop(true);
+    }
+  });
+
   test("returns the bytes unchanged, including bytes that are not UTF-8 (#229)", async () => {
     const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff, 0xfe]);
     const fetcher = makeAdminAssetFetcher(
@@ -3480,6 +3747,165 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
     // Mutation: decoding with `new TextDecoder().decode(buf)` (the pre-#229 bug) would turn every
     // non-UTF-8 byte here into U+FFFD instead of preserving them.
     expect(out.body).toEqual(bytes);
+  });
+});
+
+// #465 item 9 / #466 item 14: `serve` is what Bun.serve runs — handleRequest behind an error net (a rejection is logged and
+// answered with a plain 500, never Bun's development error page) and with the two security headers on every response.
+describe("serve (#465 item 9, #466 item 14)", () => {
+  const TOKEN = "serve-token";
+  const bundleUrl = "https://cdn.jsdelivr.net/npm/@rackbops/plugin-warbandeer@1.1.0/dist/admin.js";
+  const index: PluginIndex = {
+    schemaVersion: 1,
+    plugins: [{ name: "warbandeer", version: "1.1.0", package: "@rackbops/plugin-warbandeer", adminUrl: bundleUrl, adminApiVersion: ADMIN_API_VERSION }],
+  };
+  const okAsset = (contentType: string): AdminAssetResult => ({ ok: true, status: 200, contentType, body: new TextEncoder().encode("<svg/>") });
+  const cfg = (over: Partial<HandlerConfig> = {}): HandlerConfig => ({
+    adminToken: TOKEN,
+    indexHtml: "<html>panel</html>",
+    runBotOps: async () => ({ exitCode: 0, stdout: "{}", stderr: "" }),
+    assets: new Map([["/admin.css", { body: "a{}", contentType: "text/css; charset=utf-8" }]]),
+    listPluginIndex: async () => index,
+    fetchAdminAsset: async (url) => okAsset(url === bundleUrl ? "text/plain" : "image/svg+xml"),
+    ...over,
+  });
+  const authed = (path: string) => new Request(`http://x${path}`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+
+  test("SECURITY_HEADERS names exactly the two headers", () => {
+    expect(SECURITY_HEADERS).toEqual({ "X-Frame-Options": "SAMEORIGIN", "X-Content-Type-Options": "nosniff" });
+  });
+
+  // Mutation: either header dropped from SECURITY_HEADERS or from the loop that sets them.
+  test("every route family answers with both security headers", async () => {
+    const requests = [
+      new Request("http://x/"), // the page
+      new Request("http://x/admin.css"), // a static asset
+      new Request("http://x/plugin-admin/warbandeer.js"), // a plugin's admin bundle
+      authed("/api/status"), // a bot-ops route
+      authed("/api/plugin-proxy/warbandeer?path=a.json"), // a proxied data asset
+      new Request("http://x/nope"), // a 404
+      new Request("http://x/api/status"), // a 401
+    ];
+    for (const req of requests) {
+      const res = await serve(req, cfg());
+      expect({
+        url: req.url,
+        frame: res.headers.get("X-Frame-Options"),
+        sniff: res.headers.get("X-Content-Type-Options"),
+      }).toEqual({ url: req.url, frame: "SAMEORIGIN", sniff: "nosniff" });
+    }
+  });
+
+  test("the headers do not change what a route answers: the bundle is still JS, the proxy keeps its upstream Content-Type", async () => {
+    const bundle = await serve(new Request("http://x/plugin-admin/warbandeer.js"), cfg());
+    expect(bundle.status).toBe(200);
+    expect(bundle.headers.get("Content-Type")).toBe("text/javascript; charset=utf-8");
+    const proxy = await serve(authed("/api/plugin-proxy/warbandeer?path=a.json"), cfg());
+    expect(proxy.headers.get("Content-Type")).toBe("image/svg+xml");
+    const page = await serve(new Request("http://x/"), cfg());
+    expect(await page.text()).toBe("<html>panel</html>");
+    expect(page.headers.get("Content-Type")).toContain("text/html");
+  });
+
+  // Mutation: the catch rethrows (the request rejects), or the 500 carries the error's text.
+  test("a route that rejects answers a plain 500: logged, no stack or message in the body, both headers", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("spawn bash ENOENT /opt/secret/path");
+    try {
+      const res = await serve(
+        authed("/api/plugins"),
+        cfg({ runBotOps: async () => { throw boom; } }),
+      );
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("internal error");
+      expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0]![0])).toBe("[admin] GET /api/plugins failed");
+      expect(err.mock.calls[0]![1]).toBe(boom); // the cause is logged (mutation: `, err` dropped)
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  // The catch must not throw itself: a request whose URL cannot be parsed is logged with "?" for its path.
+  // Mutation: safePathname without its try/catch (serve rejects).
+  test("a request whose URL cannot be parsed is still a plain 500, logged with an unknown path", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const res = await serve({ method: "GET", url: "not a url", headers: new Headers() } as unknown as Request, cfg());
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("internal error");
+      expect(String(err.mock.calls[0]![0])).toBe("[admin] GET ? failed");
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  // The entry point does not run under test (import.meta.main), so what it hands Bun.serve is `serveOptions`, pinned BY
+  // VALUE: the port, development off (Bun's development error page is ~50 KB of message, paths and source lines), the
+  // idle timeout, `serve` as the fetch (handleRequest alone sets no headers), and a last-resort error handler.
+  // Mutations: development true or dropped; the idle timeout dropped; fetch not `serve`; the error handler dropped.
+  test("serveOptions: development off, the idle timeout, serve as the fetch, a last-resort error handler", async () => {
+    const opts = serveOptions(cfg(), 18999);
+    expect(opts.port).toBe(18999);
+    expect(opts.development).toBe(false);
+    expect(opts.idleTimeout).toBe(IDLE_TIMEOUT_SECONDS);
+    expect(opts.error).toBe(lastResortResponse);
+    const res = await opts.fetch(new Request("http://x/nope"));
+    expect(res.status).toBe(404);
+    expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN"); // it IS serve()
+  });
+
+  // `serve` cannot reject through any request this suite can build, so the last resort is called directly. Mutations: the
+  // status, the body (the error's text), the headers, or the log (the cause) changed.
+  test("lastResortResponse: a plain 500 with both headers; the cause is logged, never answered", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    const boom = new Error("boom /opt/secret/path");
+    try {
+      const res = lastResortResponse(boom);
+      expect(res.status).toBe(500);
+      expect(await res.text()).toBe("internal error");
+      expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+      expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+      expect(err).toHaveBeenCalledTimes(1);
+      expect(String(err.mock.calls[0]![0])).toBe("[admin] unhandled");
+      expect(err.mock.calls[0]![1]).toBe(boom);
+    } finally {
+      err.mockRestore();
+    }
+  });
+
+  // ... and for real: a Bun.serve given these options but a fetch that THROWS reaches the last resort. Mutation: the
+  // error handler dropped (Bun answers its own page or "Something went wrong!", with no headers). `development: false`
+  // is guarded by the by-value test above, not by this one (with a handler present, development on still answers this).
+  test("a real Bun.serve with serveOptions answers a throwing fetch with the plain 500, not Bun's development page", async () => {
+    const err = spyOn(console, "error").mockImplementation(() => {});
+    const srv = Bun.serve({
+      ...serveOptions(cfg(), 0),
+      fetch() {
+        throw new Error("boom /opt/secret/path");
+      },
+    });
+    try {
+      const r = await fetch(`http://127.0.0.1:${srv.port}/`);
+      expect(r.status).toBe(500);
+      expect(await r.text()).toBe("internal error");
+      expect(r.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+      expect(r.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    } finally {
+      srv.stop(true);
+      err.mockRestore();
+    }
+  });
+
+  // The one line the suite cannot run: the entry point hands Bun.serve `serveOptions(config, PORT)`. Read from the
+  // transpiled source, so a comment cannot satisfy it (a deliberate alias or string literal could: this catches a
+  // regression, not an evasion). Mutation: a hand-written literal, or a changed argument, back in its place.
+  test("the entry point calls Bun.serve once, with serveOptions(config, PORT)", () => {
+    const js = new Bun.Transpiler({ loader: "ts" }).transformSync(readFileSync(new URL("./server.ts", import.meta.url), "utf8"));
+    expect(js.split("Bun.serve(").length - 1).toBe(1);
+    expect(js).toContain("Bun.serve(serveOptions(config, PORT))");
   });
 });
 
@@ -3851,6 +4277,21 @@ describe("POST /api/plugins/request (#105 panel producer)", () => {
   test("a cross-site Origin -> 403 before auth, bot-ops never called", async () => {
     const bot = capturingBotOps();
     const res = await handleRequest(post({ action: "cancel", plugin: "warbandeer" }, { Origin: "http://evil.com" }), cfg(bot.run));
+    expect(res.status).toBe(403);
+    expect(bot.calls).toHaveLength(0);
+  });
+
+  // #465 item 10, the same for the plugin-request route: no credentials at all, a foreign Origin.
+  test("an UNauthenticated cross-site Origin -> 403 (not 401), bot-ops never called", async () => {
+    const bot = capturingBotOps();
+    const res = await handleRequest(
+      new Request("http://panel.example/api/plugins/request", {
+        method: "POST",
+        headers: { Origin: "http://evil.com", "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cancel", plugin: "warbandeer" }),
+      }),
+      cfg(bot.run),
+    );
     expect(res.status).toBe(403);
     expect(bot.calls).toHaveLength(0);
   });
@@ -5924,8 +6365,8 @@ describe("showToast (#300, mini-harness)", () => {
 
 // rb-theme.css is GENERATED by ops/admin/theme/build-theme.ts from the pinned @rackbops/styles and
 // committed. Its first line names the version it came from; this fails when the pin moves without a
-// rebuild (or the file is hand-edited), with no need for node_modules (CI does not install the theme
-// package).
+// rebuild (the banner alone: a hand edit below line 1 is not caught here), with no need for node_modules
+// (CI does not install the theme package).
 describe("rb-theme.css", () => {
   const themePkg = JSON.parse(readFileSync(new URL("./theme/package.json", import.meta.url), "utf8")) as {
     devDependencies?: Record<string, string>;
@@ -6532,12 +6973,12 @@ describe("page skeleton", () => {
   });
 
   test("every lifted block is still present", () => {
-    // The thirteen blocks server.test.ts lifted out of the page before #238, plus the four it added
-    // (TABS, TABS_DOM, LOGS_SCROLL, PLUGIN_BADGE_CLASSES), minus the two save blocks #257 deleted
-    // (PLUGINS_SAVE, ENV_SAVE) and plus the four it added (APPLY_PLAN, APPLY_VIEW, APPLY, TAG_SYNC).
-    // #244: PLUGIN_BADGES is gone (replaced by PLUGIN_CARD_STATE), plus PLUGIN_SETTING_LABEL and
-    // PLUGIN_EDITS. #245 adds PLUGIN_ROUTING. A rename or a deleted marker would otherwise leave a
-    // lifted `new Function` evaluating an empty string.
+    // EVERY `// NAME:begin` marker the page carries, by hand. This list is the guard: set equality with the page's own
+    // markers (below) makes a rename AND an unlisted addition fail by NAME. A scan of this FILE for the lifted names
+    // was tried and finds four of the 27, because they are lifted through regex literals and `applyBlock("NAME")`
+    // calls as well. A rename or a deleted marker would otherwise leave a lifted `new Function` evaluating an
+    // empty string. (#244: PLUGIN_BADGES is gone, replaced by PLUGIN_CARD_STATE; #257 deleted PLUGINS_SAVE and ENV_SAVE,
+    // asserted gone below.)
     const names = [
       "TIMEOUT_SIGNAL", "PLUGIN_ADMIN_HELPERS", "PLUGIN_REQUEST_HELPERS", "PLUGINS_SAVE_PLAN",
       "PLUGIN_REQUEST_SEND", "OUTDATED_BANNER_HELPERS", "RESTART", "ENV_SCHEMA", "ENV_SAVE_PLAN",
@@ -6545,8 +6986,11 @@ describe("page skeleton", () => {
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
       "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
       "TOAST", // #300
+      "CONTROL_SNAPSHOT", "DESCRIBED_BY", "APPLY_INVALID_CARRY", // lifted by name elsewhere in this file (#514 item 4)
     ];
-    expect(names.length).toBe(24);
+    expect(new Set(names).size).toBe(names.length);
+    const markers = [...indexSrc.matchAll(/^\s*\/\/ ([A-Z_][A-Z0-9_]*):begin$/gm)].map((m) => m[1]!);
+    expect([...markers].sort()).toEqual([...names].sort());
     // ... and the two that were deleted are really gone, with the buttons, message lines and functions.
     for (const gone of ["PLUGINS_SAVE", "ENV_SAVE"]) {
       expect({ gone, begin: indexSrc.split(`// ${gone}:begin\n`).length - 1 }).toEqual({ gone, begin: 0 });
@@ -7590,7 +8034,7 @@ interface ApplySpec {
   checked?: string[];
   schema?: Record<string, unknown>;
   /** What api() answers; an Error is thrown by it (a timeout, the 401 "unauthorized"). `status` defaults to
-   *  200 for `ok: true` and 502 for `ok: false` (what bot-ops.sh's failures come back as, server.ts ~1683). */
+   *  200 for `ok: true` and 502 for `ok: false` (what bot-ops.sh's failures come back as: `handleRequest`'s generic-route failure mapping, `status: 502`). */
   response?: { ok: boolean; text: string; status?: number } | Error;
   /** api() waits for this before answering: an in-flight request. */
   hold?: Promise<void>;
