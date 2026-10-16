@@ -115,6 +115,32 @@ describe("index.ts wiring", () => {
     expect(/\brestartPending\(\)/.test(code)).toBe(false);
   });
 
+  // #450: the swap record a previous life left is resolved BEFORE the interaction handler attaches (a `/update` that
+  // arrived first would arm a record the resolver then took for the dead life's) and so before the scheduler's first
+  // tick can read the attempt marker; not during a shutdown; and the in-flight verdict goes to the update report.
+  // index.ts can't run under test, so the order is pinned in the source.
+  test("activate() resolves the swap record before the interaction handler and the scheduler, skips it in a shutdown, and hands the verdict to the report (#450)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const resolve = source.indexOf('const attempt = isShuttingDown() ? "none" : await resolveUpdateAttempt();', activateFn);
+    const load = source.indexOf("loadPlugins(", activateFn);
+    const interactionOn = source.indexOf("client.on(Events.InteractionCreate", activateFn);
+    const activatePluginsCall = source.indexOf("await activatePlugins(", activateFn);
+    const scheduler = source.indexOf("firstTick = startScheduler(", activateFn);
+    for (const pos of [resolve, load, interactionOn, activatePluginsCall, scheduler]) expect(pos).toBeGreaterThan(activateFn);
+    expect(resolve).toBeGreaterThan(load); // after plugin install/load (CONTEXT.md's index.ts row says so)
+    expect(resolve).toBeLessThan(interactionOn);
+    expect(resolve).toBeLessThan(scheduler);
+    expect((source.match(/resolveUpdateAttempt\(\)/g) ?? []).length).toBe(1);
+    // The report the boot owes is taken right after the resolve and before the handler can accept a `/update`; the
+    // report-back at the end delivers only that one (a report armed since belongs to its own restart).
+    const owedTaken = source.indexOf("const owedAtBoot = owedReportNow();", activateFn);
+    expect(owedTaken).toBeGreaterThan(resolve);
+    expect(owedTaken).toBeLessThan(interactionOn);
+    expect((source.match(/reportUpdateOutcome\(client, attempt, undefined, owedAtBoot\)/g) ?? []).length).toBe(1);
+    expect(source).not.toContain("reportUpdateOutcome(client)");
+    expect(source).not.toContain("reportUpdateOutcome(client, attempt)");
+  });
+
   // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads
   // at module-eval, which nothing but the source can show.
   test("no plugin code loads at module-eval — the bundle import() is inside activate()", () => {

@@ -18,6 +18,15 @@ import type {
 const MESSAGE_LIMIT = 2000; // Discord's hard content cap (mirrors src/report.ts).
 
 /**
+ * The `scheduled` entry as this module writes it: the contract's shape plus `channelId` (#502 item 12), the channel
+ * the schedule was requested from, for the report-back's channel fallback; absent for a panel request. Host-local on
+ * purpose, not a field of `PluginStateEntry` in contract.ts: the plugins repo vendors that file byte for byte, so an
+ * edit there (a comment's included) is a cross-repo re-vendor. state.json is host-only, `buildPluginStateFile` carries
+ * `scheduled` whole across boots, and the admin panel passes it through, so the extra field survives everywhere.
+ */
+export type ScheduledEntry = NonNullable<PluginStateEntry["scheduled"]> & { channelId?: string };
+
+/**
  * Semver ordering: -1 (a<b), 0 (equal), 1 (a>b). Release parts compared numerically; a prerelease
  * ranks BELOW its release (`1.0.0-rc.1 < 1.0.0`); dotted prerelease identifiers compare numerically
  * when both are numeric, a numeric identifier ranks below an alphanumeric one, otherwise ASCII, and
@@ -136,10 +145,11 @@ function releasesBetween(entry: PluginIndexEntry, from: string, to: string): Plu
  *  wraps these notes in stays within Discord's cap — not just the notes sub-part. */
 function renderNotes(releases: PluginRelease[], maxLen = MESSAGE_LIMIT): string {
   if (releases.length === 0) return "(no release notes published)";
-  const body = releases.map((r) => `**${r.version}** (${r.publishedAt.slice(0, 10)})\n${r.notes}`).join("\n\n");
+  // `notes` may be absent (the index validator only requires it to be a string when present, #440): print nothing, not "undefined".
+  const body = releases.map((r) => `**${r.version}** (${r.publishedAt.slice(0, 10)})\n${r.notes ?? ""}`).join("\n\n");
   if (body.length <= maxLen) return body;
   const tail = `\n… full notes: ${releases[0]?.url ?? ""}`;
-  return body.slice(0, Math.max(0, maxLen - tail.length)) + tail;
+  return sliceUtf16(body, Math.max(0, maxLen - tail.length)) + tail;
 }
 
 /** The `(from, to]` release notes for a plugin, rendered + clamped. Exported for `/plugins list`. */
@@ -162,10 +172,28 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
   // silently losing the notice after retries. Same whole-message budgeting as report.ts.
   const notes = renderNotes(u.releases, MESSAGE_LIMIT - head.length - last.length - 1);
   const msg = `${head}${notes}\n${last}`;
-  // Belt-and-suspenders (mirrors renderPluginsList): the budget keeps this within the cap for any
-  // realistic input; a pathologically long plugin name (head + footer alone > cap) could still
-  // overflow, so hard-cap rather than let Discord reject the send.
-  return msg.length <= MESSAGE_LIMIT ? msg : msg.slice(0, MESSAGE_LIMIT);
+  // Belt-and-suspenders: the budget keeps this within the cap for any realistic input; a pathologically long
+  // plugin name (head + footer alone > cap) could still overflow, so hard-cap rather than let Discord reject the
+  // send, and never inside a surrogate pair (the cut can land in a version or release url, which the index only
+  // checks are strings).
+  return msg.length <= MESSAGE_LIMIT ? msg : sliceUtf16(msg, MESSAGE_LIMIT);
+}
+
+/** `s` cut to at most `n` UTF-16 units, never inside a surrogate pair: when the last kept unit would be a high
+ *  surrogate the cut backs off one unit (#563). No ellipsis -- see `cutUtf16` for the one that marks the cut.
+ *  (`github.ts` keeps its own `sliceUtf16` for its reply clamps: that module imports `config`, and this one stays
+ *  free of it.) */
+export function sliceUtf16(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const last = s.charCodeAt(n - 1);
+  return s.slice(0, n > 0 && last >= 0xd800 && last <= 0xdbff ? n - 1 : n);
+}
+
+/** `s` cut to `max` units with an ellipsis when anything was cut, surrogate-safe (`sliceUtf16`): the `shortError`
+ *  guard (#544), shared with the list's clamp (#563). Byte-identical to the old guard for every `max` >= 1. */
+export function cutUtf16(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return `${sliceUtf16(s, Math.max(0, max - 1))}…`;
 }
 
 /** #544: an entry's `error`, fit for one reply line: whitespace collapsed, cut to `max` characters with an
@@ -175,61 +203,92 @@ export function notificationMessage(u: PluginUpdateDecision, botHostApi: number,
 function shortError(error: unknown, max = 120): string | undefined {
   if (typeof error !== "string") return undefined;
   const oneLine = error.replace(/\s+/g, " ").trim();
-  if (oneLine.length <= max) return oneLine;
-  const cutAt = max - 1;
-  const code = oneLine.charCodeAt(cutAt - 1);
-  const end = code >= 0xd800 && code <= 0xdbff ? cutAt - 1 : cutAt; // do not split a surrogate pair
-  return `${oneLine.slice(0, end)}…`;
+  return cutUtf16(oneLine, max);
 }
 
-/** The `/plugins list` body: per installed plugin, its version, any newer version + first-release
- *  note, skip/snooze markers and, for a plugin that is not running this boot, that it is down with the
- *  first error recorded for it (#544). Uses the (freshly-fetched) index for "available" + notes. Pure. */
-export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date): string {
+/** #418: who asked for a pending scheduled update, fit for the list: a Discord snowflake as a mention, a panel
+ *  identity (`email:<addr>` / `token`) as text, collapsed to one line and cut to 80 units; `?` for a blank, so a
+ *  hand-edited state.json cannot break the list. An `update-now`'s requester is not shown (only the transient
+ *  pending report holds it). */
+function requesterText(by: unknown): string {
+  if (typeof by === "string" && isDiscordUserId(by)) return `<@${by}>`;
+  const text = String(by ?? "").replace(/\s+/g, " ").trim();
+  return text === "" ? "?" : cutUtf16(text, 80);
+}
+
+/** The schedule line of a pending scheduled update (#104), with its requester (#418). */
+function scheduleLine(scheduled: NonNullable<PluginStateEntry["scheduled"]>): string {
+  return `\n  ⏳ update to ${scheduled.version} scheduled ${discordTs(Date.parse(scheduled.at), "R")} (requested by ${requesterText(scheduled.requestedBy)})`;
+}
+
+/** The `/plugins list` body: per installed plugin, its version, any newer version (with "(needs a newer bot)" when
+ *  the index entry needs another host API than `hostApiVersion`, #502 item 13) + first-release note, skip/snooze
+ *  markers and, for a plugin that is not running this boot, that it is down with the first error recorded for it
+ *  (#544), and a pending schedule with its requester (#418). Uses the (freshly-fetched) index for "available" +
+ *  notes. Pure.
+ *
+ *  When the whole list exceeds Discord's cap (#563) it is clamped in three tiers. Every plugin's FIRST line (its
+ *  down marker and schedule line included) has priority over any release note: the notes are added back in list
+ *  order while they fit (one that does not fit is skipped, a later smaller one can still go in), and a tail says
+ *  the list was truncated. If the first lines alone exceed 2000 units, whole LINES from the top are kept, then the
+ *  tail (a schedule line is a line of its own, so the cut can fall between a plugin's first line and its schedule
+ *  line, and a plugin after the cut is dropped with its schedule line); and when the first lines fit in 2000 units
+ *  but not with the tail they go out bare, with no tail. No cut lands inside a surrogate pair. */
+export function renderPluginsList(state: PluginStateFile, index: PluginIndex, _now: Date, hostApiVersion: number): string {
   if (state.plugins.length === 0) return "No plugins installed.";
   const entryByName = new Map(index.plugins.map((e) => [e.name, e]));
-  const out = state.plugins
-    .map((p) => {
-      // #225: an off entry shows only that it's off and its pin — no "available", no notes, since
-      // nothing about it will change until it's turned back on. A pending schedule still shows (it's
-      // paused, not cancelled) so /plugins cancel has something visible to act on.
-      if (!p.enabled) {
-        let offLine = `• **${p.name}** — off (installed ${p.installedVersion ?? "(not installed)"})`;
-        if (p.scheduled) {
-          offLine += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
-        }
-        return offLine;
-      }
-      let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
-      let notes = "";
-      const entry = entryByName.get(p.name);
-      if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
-        line += ` → ${entry.version} available`;
-        if (p.skippedVersion === entry.version) line += " (skipped)";
-        else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
-        const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
-        if (firstBlock) notes = `\n${firstBlock.slice(0, 300)}`;
-      }
-      // #544: a plugin that failed to install, load or activate this boot says so on its first line, not
-      // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
-      if (!p.active) {
-        const why = shortError(p.error);
-        line += ` — not running${why ? ` (first error: ${why})` : ""}`;
-      }
-      line += notes;
-      // A pending scheduled update (#104) — shown regardless of whether the index still lists that
-      // version as current, so `/plugins cancel` has something visible to act on.
-      if (p.scheduled) {
-        line += `\n  ⏳ update to ${p.scheduled.version} scheduled ${discordTs(Date.parse(p.scheduled.at), "R")}`;
-      }
-      return line;
-    })
-    .join("\n");
-  // Clamp the whole reply — many plugins each with a note can exceed Discord's cap and editReply
-  // would reject it, leaving the deferred reply hanging.
-  if (out.length <= MESSAGE_LIMIT) return out;
+  const rows = state.plugins.map((p): { line: string; note: string; tail: string } => {
+    // A pending scheduled update (#104) — shown regardless of whether the index still lists that
+    // version as current, so `/plugins cancel` has something visible to act on. It FOLLOWS the note.
+    const tail = p.scheduled ? scheduleLine(p.scheduled) : "";
+    // #225: an off entry shows only that it's off and its pin — no "available", no notes, since
+    // nothing about it will change until it's turned back on. A pending schedule still shows (it's
+    // paused, not cancelled) so /plugins cancel has something visible to act on.
+    if (!p.enabled) {
+      return { line: `• **${p.name}** — off (installed ${p.installedVersion ?? "(not installed)"})`, note: "", tail };
+    }
+    let line = `• **${p.name}** — installed ${p.installedVersion ?? "(not installed)"}`;
+    let note = "";
+    const entry = entryByName.get(p.name);
+    if (p.installedVersion && entry && compareSemver(entry.version, p.installedVersion) > 0) {
+      line += ` → ${entry.version} available${entry.hostApiVersion !== hostApiVersion ? " (needs a newer bot)" : ""}`;
+      if (p.skippedVersion === entry.version) line += " (skipped)";
+      else if (p.remindAt !== undefined) line += ` (remind ${discordTs(Date.parse(p.remindAt), "R")})`;
+      const firstBlock = releaseNotesBetween(entry, p.installedVersion, entry.version).split("\n\n")[0] ?? "";
+      if (firstBlock) note = `\n${sliceUtf16(firstBlock, 300)}`;
+    }
+    // #544: a plugin that failed to install, load or activate this boot says so on its first line, not
+    // only in the panel and `bot-ops.sh status`. Off entries never reach this branch.
+    if (!p.active) {
+      const why = shortError(p.error);
+      line += ` — not running${why ? ` (first error: ${why})` : ""}`;
+    }
+    return { line, note, tail };
+  });
+  // #563: Discord's cap, in three tiers. Everything fits: as is. Else every plugin's first line (its down marker and
+  // schedule line included) has priority over any release note: the notes are added back in list order while they
+  // still fit, and the tail says some were dropped. If the first lines alone exceed 2000 units, whole lines from the
+  // top (at the last line break that fits, which can be the one before a plugin's own schedule line); if they fit in
+  // 2000 but not with the tail, they go out bare (every plugin named beats the tail); a single first line over
+  // the cap (a hostile name) is cut surrogate-safe. Without a clamp editReply would reject the reply and leave the
+  // deferred reply hanging.
   const trunc = "\n… (list truncated)";
-  return out.slice(0, Math.max(0, MESSAGE_LIMIT - trunc.length)) + trunc;
+  const full = rows.map((r) => r.line + r.note + r.tail).join("\n");
+  if (full.length <= MESSAGE_LIMIT) return full;
+  const headsOnly = rows.map((r) => r.line + r.tail).join("\n");
+  const cap = MESSAGE_LIMIT - trunc.length;
+  if (headsOnly.length > cap) {
+    if (headsOnly.length <= MESSAGE_LIMIT) return headsOnly; // every plugin named, no room for the tail
+    const lastBreak = headsOnly.lastIndexOf("\n", cap);
+    return (lastBreak > 0 ? headsOnly.slice(0, lastBreak) : cutUtf16(headsOnly, cap)) + trunc;
+  }
+  let room = cap - headsOnly.length;
+  const shown = rows.map((r) => {
+    if (r.note === "" || r.note.length > room) return r.line + r.tail;
+    room -= r.note.length;
+    return r.line + r.note + r.tail;
+  });
+  return shown.join("\n") + trunc;
 }
 
 // ---- #104: acting on an update (/plugins update|remind|skip|cancel) ------------------------------
@@ -254,8 +313,9 @@ const HHMM_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 /**
  * Parse a schedule time. `HH:MM` is the next occurrence of that wall-clock time in **UTC** (today if
  * still ahead of `now`, else tomorrow — so it always resolves to a moment in the future). An ISO-8601
- * string that carries an offset (or `Z`) is taken as-is. Anything else — including a bare ISO string
- * with no offset, which would be ambiguous — is rejected with the two accepted forms.
+ * string that carries an offset (or `Z`) is taken as-is, unless it is at or before `now`: that is refused as
+ * already passed (#442, plugin-updates-9), since it would fire at the next look. Anything else — including a
+ * bare ISO string with no offset, which would be ambiguous — is rejected with the two accepted forms.
  */
 export function parseScheduleTime(input: string, now: Date): { at: Date } | { error: string } {
   const s = input.trim();
@@ -271,7 +331,11 @@ export function parseScheduleTime(input: string, now: Date): { at: Date } | { er
   // An ISO datetime is only unambiguous with an explicit offset or Z; require one.
   if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?([+-]\d{2}:?\d{2}|Z)$/.test(s)) {
     const ms = Date.parse(s);
-    if (!Number.isNaN(ms)) return { at: new Date(ms) };
+    if (!Number.isNaN(ms)) {
+      // #442 (plugin-updates-9): a time already behind us would fire on the next look; HH:MM rolls to tomorrow instead.
+      if (ms <= now.getTime()) return { error: "That time has already passed — give a time in the future (HH:MM is the next such time)." };
+      return { at: new Date(ms) };
+    }
   }
   return {
     error:
@@ -340,28 +404,51 @@ function updateEntry(
 // share one implementation — a request must be able to pin a version even if the index has since
 // moved. Each is a plain function of the values it needs, no `ctx`/index.
 
-/** Set the transient `targetVersion` (the next boot installs it) + the boot report-back. */
+/** Set the transient `targetVersion` (the next boot installs it) + the boot report-back, and drop a pending
+ *  schedule for this version or an older one (#441): the update-now supersedes it, so a later fire cannot restart
+ *  for a version already installed. A schedule for a NEWER version is kept: it is still the admin's wish after
+ *  this update (an update-now to an older pinned version, from a stale panel page or the mailbox). */
 export function pinUpdateNow(
   name: string,
   version: string,
   report: NonNullable<PluginStateFile["pendingReport"]>,
 ): (s: PluginStateFile) => PluginStateFile {
-  return (s) => ({ ...updateEntry(s, name, (e) => ({ ...e, targetVersion: version })), pendingReport: report });
+  return (s) => ({
+    ...updateEntry(s, name, (e) => {
+      const next = { ...e, targetVersion: version };
+      if (e.scheduled && compareSemver(e.scheduled.version, version) <= 0) delete next.scheduled;
+      return next;
+    }),
+    pendingReport: report,
+  });
 }
 
-/** Queue a scheduled update — the tick fires it at `at` (ISO-8601). */
+/** Queue a scheduled update — the tick fires it at `at` (ISO-8601). `channelId` (#502 item 12) is where it was
+ *  requested from, for the report-back's channel fallback; a panel request has none. */
 export function scheduleUpdate(
   name: string,
   version: string,
   at: string,
   requestedBy: string,
+  channelId?: string,
 ): (s: PluginStateFile) => PluginStateFile {
-  return (s) => updateEntry(s, name, (e) => ({ ...e, scheduled: { version, at, requestedBy } }));
+  const scheduled: ScheduledEntry = { version, at, requestedBy, ...(channelId ? { channelId } : {}) };
+  return (s) => updateEntry(s, name, (e) => ({ ...e, scheduled }));
 }
 
-/** Snooze the update reminder until `at` (ISO-8601). */
-export function remindLater(name: string, at: string): (s: PluginStateFile) => PluginStateFile {
-  return (s) => updateEntry(s, name, (e) => ({ ...e, remindAt: at }));
+/** Snooze the update reminder for `version` until `at` (ISO-8601). The snooze acknowledges that version (#501 item 4):
+ *  `notifiedVersion` is set to it (so the next tick does not notify it and then wipe the snooze) and a skip of
+ *  THAT version is lifted (a remind after a skip is a change of mind, not a no-op). An acknowledgement is never
+ *  stepped back, and a skip of another version is left alone: a stale remind (a mailbox request naming an older
+ *  version) must not turn the snooze of a newer, already-notified version into a fresh notice. */
+export function remindLater(name: string, at: string, version: string): (s: PluginStateFile) => PluginStateFile {
+  return (s) =>
+    updateEntry(s, name, (e) => {
+      const next = { ...e, remindAt: at };
+      if (e.notifiedVersion === undefined || compareSemver(version, e.notifiedVersion) > 0) next.notifiedVersion = version;
+      if (e.skippedVersion === version) delete next.skippedVersion;
+      return next;
+    });
 }
 
 /** Skip `version` — no more notices until a newer version appears. */
@@ -432,7 +519,7 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
     const at = ctx.now.getTime() + action.days * DAY_MS;
     return {
       reply: `Okay — I'll remind you about **${name}** ${to} ${discordTs(at)} (${discordTs(at, "R")}).`,
-      mutate: remindLater(name, new Date(at).toISOString()),
+      mutate: remindLater(name, new Date(at).toISOString(), to),
     };
   }
 
@@ -445,7 +532,7 @@ export function planPluginAction(action: PluginAction, ctx: PluginActionContext)
   if (action.at) {
     return {
       reply: `Scheduled **${name}** ${to} for ${discordTs(action.at.getTime())} (${discordTs(action.at.getTime(), "R")}).`,
-      mutate: scheduleUpdate(name, to, action.at.toISOString(), ctx.requestedBy),
+      mutate: scheduleUpdate(name, to, action.at.toISOString(), ctx.requestedBy, ctx.channelId),
     };
   }
   // update now: set the transient targetVersion + the boot report-back, then the handler restarts.
@@ -536,7 +623,9 @@ export async function deliverPluginNotification(
       delivered = true;
     } catch (err) {
       anyDmFailed = true;
-      log.warn(`[plugins] couldn't DM admin ${id} about a plugin update — will try the announce channel`);
+      log.warn(
+        `[plugins] couldn't DM admin ${id} about a plugin update (${err instanceof Error ? err.message : String(err)}) — will try the announce channel`,
+      );
     }
   }
   if (anyDmFailed) {
@@ -574,8 +663,9 @@ export interface PluginUpdateDeps {
 
 // A version that fails to deliver retries next tick; give up after this many so a permanently
 // undeliverable notice (e.g. every admin has DMs closed AND no announce channel) doesn't retry
-// forever. In-memory on purpose — a restart is a fine reason to try again.
-const MAX_DELIVERY_ATTEMPTS = 3;
+// forever. In-memory on purpose — a restart below the cap tries again (after the give-up the version is recorded
+// notified in state.json, so it does not).
+export const MAX_DELIVERY_ATTEMPTS = 3;
 const deliveryFailures = new Map<string, number>();
 
 /** Test seam: clear the in-memory retry counters between cases. */
@@ -603,48 +693,79 @@ function markNotified(state: PluginStateFile, name: string, to: string): PluginS
  * The scheduler tick body. First the NOTIFICATION pass (#103): re-fetch the index, decide, and for
  * each notify/remind DM the admins the release notes — recording the version as notified ONLY after a
  * successful delivery, so a failed send retries next tick (capped at MAX_DELIVERY_ATTEMPTS). This pass
- * never installs, restarts, or moves a pin. THEN `runDueSchedules` (#104): if an admin scheduled an
- * update whose time has come, it moves the pin (`targetVersion`) and restarts — the one place this
- * tick acts on an update, and only because an admin explicitly asked it to.
+ * never installs, restarts, or moves a pin, and one plugin's failed notice is logged and the others
+ * still go out (#440). THEN, in a `finally` so a bad index or a throwing save cannot starve it,
+ * `runDuePluginSchedules` (#104): if an admin scheduled an update whose time has come, it moves the pin
+ * (`targetVersion`) and restarts — the one place this tick acts on an update, and only because an admin
+ * explicitly asked it to. The `pluginUpdates` check also runs `runDuePluginSchedules` on the ticks
+ * between index polls (#442), so a schedule fires within about a minute of its time.
  */
 export async function checkPluginUpdates(deps: PluginUpdateDeps): Promise<void> {
-  const index = await deps.loadIndex();
-  const state = await deps.readState();
-  const decisions = decidePluginUpdates(state, index, deps.hostApiVersion, deps.now());
-  for (const d of decisions) {
-    if (d.action === "none") continue; // already notified/skipped/scheduled, or a snooze not yet due
-    const message = notificationMessage(d, deps.hostApiVersion, deps.pluginsCommand);
-    const delivered = await deliverPluginNotification(message, deps.adminUserIds, deps.deliverers, deps.log);
-    const key = `${d.name}@${d.to}`;
-    if (delivered) {
-      deliveryFailures.delete(key);
-      await deps.mutateState((s) => markNotified(s, d.name, d.to));
-    } else if (deps.adminUserIds.length > 0) {
-      // A genuine delivery failure (not the no-admins case, which warned and will retry once admins
-      // exist). Retry next tick, but cap it so an undeliverable notice stops eventually.
-      const attempts = (deliveryFailures.get(key) ?? 0) + 1;
-      deliveryFailures.set(key, attempts);
-      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-        deps.log.error(
-          `[plugins] gave up notifying about ${d.name} ${d.to} after ${attempts} attempts — recording it notified`,
-        );
-        deliveryFailures.delete(key);
-        await deps.mutateState((s) => markNotified(s, d.name, d.to));
+  let passFailed = false;
+  try {
+    const index = await deps.loadIndex();
+    const state = await deps.readState();
+    const decisions = decidePluginUpdates(state, index, deps.hostApiVersion, deps.now());
+    for (const d of decisions) {
+      if (d.action === "none") continue; // already notified/skipped/scheduled, or a snooze not yet due
+      try {
+        await notifyOne(d, deps);
+      } catch (err) {
+        // #440: one plugin's failed notice (a rejecting save, a throwing deliverer) must not stop the others'.
+        deps.log.error(`[plugins] update notice for ${d.name} ${d.to} failed — continuing with the other plugins`, err);
       }
     }
+  } catch (err) {
+    passFailed = true;
+    throw err;
+  } finally {
+    // #440/#442: whatever the notice pass did (a bad index, a throwing save), a due schedule still runs. If the pass
+    // threw, ITS error is the one the caller sees: a failure here is logged instead of replacing it.
+    try {
+      await runDuePluginSchedules(deps);
+    } catch (err) {
+      if (!passFailed) throw err;
+      deps.log.error("[plugins] running the due scheduled updates failed after the notice pass did", err);
+    }
   }
-  await runDueSchedules(deps);
+}
+
+/** One decision's notice: deliver, and record it notified after a real delivery (or after the retry cap). */
+async function notifyOne(d: PluginUpdateDecision, deps: PluginUpdateDeps): Promise<void> {
+  const message = notificationMessage(d, deps.hostApiVersion, deps.pluginsCommand);
+  const delivered = await deliverPluginNotification(message, deps.adminUserIds, deps.deliverers, deps.log);
+  const key = `${d.name}@${d.to}`;
+  if (delivered) {
+    deliveryFailures.delete(key);
+    await deps.mutateState((s) => markNotified(s, d.name, d.to));
+  } else if (deps.adminUserIds.length > 0) {
+    // A genuine delivery failure (not the no-admins case, which warned and will retry once admins
+    // exist). Retry next tick, but cap it so an undeliverable notice stops eventually.
+    const attempts = (deliveryFailures.get(key) ?? 0) + 1;
+    deliveryFailures.set(key, attempts);
+    if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+      deps.log.error(
+        `[plugins] gave up notifying about ${d.name} ${d.to} after ${attempts} attempts (the causes are in the log lines above) — recording it notified so it stops retrying; /${deps.pluginsCommand} list still shows the update`,
+      );
+      deliveryFailures.delete(key);
+      await deps.mutateState((s) => markNotified(s, d.name, d.to));
+    }
+  }
 }
 
 /**
- * #104: run at most ONE due scheduled update per tick (a restart ends the process, so a second due
- * schedule waits for the next boot). The serialized `mutateState` is the sole arbiter of "did this
- * fire" — a concurrent `/plugins cancel` that clears the schedule inside the same per-path queue
- * makes `acted` stay false, so the tick never restarts onto a cancelled update. The heads-up DM is
- * best-effort (the boot report is the authoritative outcome); the actual exit is deferred by the
- * tick's own `withCritical` (announce.ts) until the DM + the state write have settled.
+ * #104: run at most ONE due scheduled update per call (a restart ends the process, so a second due
+ * schedule waits for the next boot). The every-tick entry point (#442): `checkPluginUpdates` runs it
+ * after its notice pass, and the `pluginUpdates` check runs it alone on the ticks between index polls.
+ * The serialized `mutateState` is the sole arbiter of "did this fire" — a concurrent `/plugins cancel`
+ * that clears the schedule inside the same per-path queue makes `acted` stay false, so the tick never
+ * restarts onto a cancelled update; the same turn DROPS (does not fire) a schedule whose version is
+ * already installed or older, or whose time is not a date (#441, plugin-updates-9), and tells the
+ * Discord requester it saw. The heads-up DM is best-effort (the boot report is the authoritative
+ * outcome); the actual exit is deferred by the tick's own `withCritical` (announce.ts) until the DM +
+ * the state write have settled.
  */
-async function runDueSchedules(deps: PluginUpdateDeps): Promise<void> {
+export async function runDuePluginSchedules(deps: PluginUpdateDeps): Promise<void> {
   if (deps.restartPending()) return; // an earlier restart (e.g. autoUpdate) already won this tick
   const state = await deps.readState();
   const now = deps.now();
@@ -656,18 +777,40 @@ async function runDueSchedules(deps: PluginUpdateDeps): Promise<void> {
     const to = sched.version;
     const from = p.installedVersion;
     let acted = false;
-    await deps.mutateState((s) => {
+    let dropped: string | undefined; // #441 / plugin-updates-9: why the schedule was dropped instead of fired
+    let droppedFor: string | undefined; // the requester as the arbiter saw it, not the pre-read `sched`
+    let firedFor: string | undefined; // likewise for the heads-up DM of a schedule that fires
+    const arbiter = (s: PluginStateFile): PluginStateFile => {
       const cur = s.plugins.find((x) => x.name === p.name);
       // Re-check inside the serialized turn: a cancel that landed since the read wins.
-      if (!cur?.scheduled || now.getTime() < Date.parse(cur.scheduled.at) || cur.scheduled.version !== to) {
-        return s;
+      if (!cur?.scheduled || cur.scheduled.version !== to) return s;
+      const atMs = Date.parse(cur.scheduled.at);
+      // A hand-corrupted entry is dropped, not left to throw out of compareSemver on every look.
+      if (typeof to !== "string") dropped = `its version ${JSON.stringify(to)} is not a version`;
+      else if (Number.isNaN(atMs)) dropped = `its time ${JSON.stringify(cur.scheduled.at)} is not a date`;
+      else if (now.getTime() < atMs) return s;
+      else if (cur.installedVersion !== undefined && compareSemver(to, cur.installedVersion) <= 0) {
+        // #441: an update-now, a pin or an earlier fire already installed this version or a newer one; firing would
+        // restart for nothing, or set a `targetVersion` the installer ranks above the installed version — a downgrade.
+        dropped = `${cur.installedVersion} is already installed`;
+      }
+      if (dropped !== undefined) {
+        droppedFor = cur.scheduled.requestedBy;
+        const plugins = s.plugins.map((x) => {
+          if (x.name !== p.name) return x;
+          const next = { ...x };
+          delete next.scheduled;
+          return next;
+        });
+        return { ...s, plugins };
       }
       acted = true;
+      firedFor = cur.scheduled.requestedBy;
       const report: PluginStateFile["pendingReport"] = {
         plugin: p.name,
         toVersion: to,
         userId: cur.scheduled.requestedBy,
-        channelId: undefined,
+        channelId: (cur.scheduled as ScheduledEntry).channelId, // #502 item 12
         requestedAt: now.getTime(),
       };
       const plugins = s.plugins.map((x) => {
@@ -677,15 +820,32 @@ async function runDueSchedules(deps: PluginUpdateDeps): Promise<void> {
         return next;
       });
       return { ...s, plugins, pendingReport: report };
-    });
+    };
+    try {
+      await deps.mutateState(arbiter);
+    } catch (err) {
+      // #440: one plugin's entry (or a failed save) must not starve the others' due schedules, every look.
+      deps.log.error(`[plugins] ${p.name}: running its scheduled update failed — continuing with the other plugins`, err);
+      continue;
+    }
+    if (dropped !== undefined) {
+      deps.log.warn(`[plugins] ${p.name}: dropped the scheduled update to ${to} — ${dropped}`);
+      if (droppedFor !== undefined && isDiscordUserId(droppedFor)) {
+        await deps.deliverers
+          .dmUser(droppedFor, `The scheduled update of **${p.name}** to ${to} was dropped: ${dropped}.`)
+          .catch(() => {});
+      }
+      continue; // the next plugin's schedule may still be due
+    }
     if (!acted) continue; // cancelled out from under us — leave it, try the next plugin
 
     // A panel-origin schedule's requestedBy is an identity string, not a DM-able snowflake — skip the
-    // futile fetch (the panel actor sees the result on refresh); a Discord requester gets the heads-up.
-    if (isDiscordUserId(sched.requestedBy)) {
+    // futile fetch (the panel actor sees the result on refresh); a Discord requester gets the heads-up. The
+    // requester is the arbiter's (the one the boot report-back goes to), not the pre-read `sched`'s.
+    if (firedFor !== undefined && isDiscordUserId(firedFor)) {
       try {
         await deps.deliverers.dmUser(
-          sched.requestedBy,
+          firedFor,
           `Updating **${p.name}** ${from ?? "?"} → ${to} now, as scheduled — restarting, back in a moment.`,
         );
       } catch {
@@ -711,13 +871,17 @@ export interface PluginReportDeps {
  * #104: the boot after an update, tell the requester what actually came up. Runs after
  * `writePluginState` (so the state entry reflects this boot's install/activate) and is fire-and-forget
  * from `index.ts`. Clears `pendingReport` — through the shared mutator, and BEFORE delivering — so a
- * failed send can't re-fire the report every boot (the `reportUpdateOutcome` rule). DM → channel.
+ * failed send can't re-fire the report every boot (the `reportUpdateOutcome` rule), but only the report it READ
+ * (#501 item 11): one written since is someone else's and survives to be delivered. DM → channel.
  */
 export async function reportPluginUpdateOutcome(deps: PluginReportDeps): Promise<void> {
   const state = await deps.readState();
   const report = state.pendingReport;
   if (!report) return;
   await deps.mutateState((s) => {
+    // #501 item 11: only the report read above. One written since -- by the 5 s request drain (a panel update-now),
+    // the 60 s tick (a due schedule) or a /plugins update -- is someone else's and must survive to be delivered.
+    if (s.pendingReport?.plugin !== report.plugin || s.pendingReport.requestedAt !== report.requestedAt) return s;
     const next = { ...s };
     delete next.pendingReport;
     return next;
