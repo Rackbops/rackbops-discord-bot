@@ -160,7 +160,7 @@ export function pluginRequestsStateForTest(): { undeletable: number; draining: P
 }
 
 /** Drain the request mailbox once, serialized against any concurrent drain. Rejects only when the Plugin Index load
- *  threw (the update files stay queued; the routing requests before and after them were handled), never for a file. */
+ *  or the state read threw (the update files stay queued; the routing requests before and after them were handled), never for a file. */
 export function consumePluginRequests(deps: PluginRequestDeps): Promise<void> {
   const run = draining.then(
     () => drainOnce(deps),
@@ -230,6 +230,8 @@ async function drainOnce(deps: PluginRequestDeps): Promise<void> {
         lastReaddirFailure = key;
         deps.log.warn(`[plugins] cannot list the request mailbox ${deps.requestsDir}: ${key} — panel requests are not being applied`);
       }
+    } else {
+      lastReaddirFailure = undefined; // the directory is simply absent now: a later failure is news again
     }
     return;
   }
@@ -601,7 +603,9 @@ async function removeFile(deps: PluginRequestDeps, path: string): Promise<boolea
  */
 async function reject(deps: PluginRequestDeps, path: string, file: string, reason: string, secretBearing = false): Promise<boolean> {
   // #480 item 5: a reason may carry untrusted text (an action, a thrown message); no control character reaches the log.
-  deps.log.warn(`[plugins] rejecting request ${file}: ${redactWebhookUrls(reason).replace(/[\x00-\x1f\x7f]/g, REPLACEMENT)}`);
+  // The file name too: it comes from the directory listing, so a hostile writer could put a newline in it.
+  const clean = (text: string): string => text.replace(/[\x00-\x1f\x7f]/g, REPLACEMENT);
+  deps.log.warn(`[plugins] rejecting request ${clean(file)}: ${clean(redactWebhookUrls(reason))}`);
   if (secretBearing) {
     try {
       await deps.unlink(path);

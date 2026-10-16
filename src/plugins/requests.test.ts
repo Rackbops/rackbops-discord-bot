@@ -532,6 +532,33 @@ describe("consumePluginRequests drain", () => {
     failing = true;
     await consumePluginRequests(flaky.deps);
     expect(flaky.warns).toHaveLength(2);
+
+    // a different code is logged too, and a directory that goes absent in between re-arms the warning
+    resetPluginRequestsForTest(); // the module remembers the flaky case's last EACCES
+    let current: Error = eacces;
+    const codes = harness({});
+    codes.deps.readDir = async () => {
+      throw current;
+    };
+    await consumePluginRequests(codes.deps);
+    current = Object.assign(new Error("EMFILE"), { code: "EMFILE" });
+    await consumePluginRequests(codes.deps);
+    expect(codes.warns).toHaveLength(2);
+    expect(codes.warns[1]).toContain("EMFILE");
+    current = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    await consumePluginRequests(codes.deps);
+    current = Object.assign(new Error("EMFILE"), { code: "EMFILE" });
+    await consumePluginRequests(codes.deps);
+    expect(codes.warns).toHaveLength(3);
+  });
+
+  test("Q3 (#480 item 5): a file name with control characters cannot forge a log line either", async () => {
+    const h = harness({});
+    h.fs.set("a\nFORGED line.json", "x".repeat(70_000));
+    await consumePluginRequests(h.deps);
+    expect(h.warns).toHaveLength(1);
+    expect(h.warns[0]).not.toMatch(/[\x00-\x1f\x7f]/);
+    expect(h.warns[0]).toContain("too large");
   });
 
   test("a malformed / invalid file is quarantined to rejected/, never thrown, others still apply", async () => {
