@@ -818,7 +818,7 @@ describe("handleCommand — /plugins", () => {
   });
 
   // T5: /plugins list's catch logs too. The index fetch fails (loadPluginIndex falls back and warns itself); the
-  // state read is real; the deferred reply's edit is rejected once, as an expired token would be.
+  // state read is real; the deferred reply's edit is rejected once, or twice, as an expired token would be.
   // The log comes BEFORE the failure reply: when that reply is rejected too (`rejections` 2), the line is the only
   // record of the original failure. Mutation: moving the warn below the reply loses it.
   test("a failed /plugins list is logged without the token, even when the failure reply is rejected too (#503 item 11)", async () => {
@@ -1009,7 +1009,7 @@ describe("handleCommand — /plugins driven end to end: update now (#503 item 10
   // file aside and reads it as fresh), so the failure driven here is the reply: /plugins remind mutates, no restart.
   // The log comes BEFORE the failure reply: when that reply is rejected too (`rejections` 2), the line is the only
   // record of the original failure. Mutation: moving the warn below the reply loses it.
-  test("a /plugins action whose reply Discord rejects is logged without the token, then answered with the failure", async () => {
+  test("a /plugins action whose reply Discord rejects is logged without the token, whether or not the failure reply is rejected too", async () => {
     for (const rejections of [1, 2]) {
       const edits: string[] = [];
       const failure = replyFailure("webhook");
