@@ -13,6 +13,7 @@ import { startScheduler, describeReleaseWatch, announceTo, isPluginStateReady, m
 import { startRequestDrain } from "./plugins/drain";
 import { consumePluginRequests } from "./plugins/requests";
 import { reportUpdateOutcome } from "./updateReport";
+import { resolveUpdateAttempt } from "./update";
 import { bootMode, writeMarker, HANDOFF_FROM_ENV, VERIFY_DEADLINE_MS } from "./handoff";
 import { detectRollback, finishProbation, healOwnName, resolveBootMode, stepAside, takeOver } from "./redeploy";
 import { createReadyHandler } from "./ready";
@@ -384,6 +385,12 @@ async function activate(c: Client<true>): Promise<void> {
     return;
   }
 
+  // #450: what the previous life of this container left behind — a socket-path swap it started and never finished —
+  // is resolved BEFORE the scheduler's first tick can read the attempt marker, and its verdict goes to the report
+  // below. One bounded daemon call, and only when such a record exists; an ordinary boot still never touches the
+  // socket. In standby this runs after takeOver, like every other state write of the replacement's.
+  const attempt = await resolveUpdateAttempt();
+
   // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
   // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores
   // its signal holds the stop for PLUGIN_TICK_ABORT_GRACE_MS at most. Wired before the first tick runs.
@@ -534,8 +541,9 @@ async function activate(c: Client<true>): Promise<void> {
   markPluginStateReady();
 
   // Deliberately not awaited: an owed /update follow-up must never hold up the scheduler,
-  // and reportUpdateOutcome already swallows every delivery failure of its own.
-  reportUpdateOutcome(client).catch((err) => console.error("[updateReport]", err));
+  // and reportUpdateOutcome already swallows every delivery failure of its own; `attempt` is what this boot made of
+  // the swap record (#450).
+  reportUpdateOutcome(client, attempt).catch((err) => console.error("[updateReport]", err));
 
   // #104: and the owed /plugins-update follow-up. Not awaited for the same reason; clears its marker
   // through the shared mutator (the pluginUpdates tick is live now that markPluginStateReady fired).

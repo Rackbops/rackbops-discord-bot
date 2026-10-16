@@ -19,6 +19,7 @@ const {
   imageRepo,
   latestTag,
   ownName,
+  probeReplacement,
   redeploy,
   replacementName,
   resolveBootMode,
@@ -3506,6 +3507,81 @@ describe("healOwnName", () => {
     const h = harness({ self: SELF, holder: holder() });
     await healOwnName(h.deps);
     expect(h.events.filter((e) => e.startsWith("inspect:"))).toEqual([]);
+  });
+});
+
+// #450: one bounded look at this container's replacement name, for the boot that finds a swap record. Every daemon
+// call is an injected seam (the `healOwnName` shape above).
+describe("probeReplacement", () => {
+  const NEXT_NAME = replacementName(SELF.Name, SELF.Config.Labels?.["com.docker.compose.project"]);
+  const next = (State: ContainerInspect["State"]): ContainerInspect => ({ ...SELF, Id: "f".repeat(64), Name: `/${NEXT_NAME}`, State });
+  const probing = (found: ContainerInspect | undefined, asked: string[] = []) => ({
+    inspectSelf: async () => SELF,
+    inspect: async (name: string) => {
+      asked.push(name);
+      return found;
+    },
+  });
+
+  test("the replacement's name is derived the way redeploy() derives it, and asked for once", async () => {
+    const asked: string[] = [];
+    const probe = await probeReplacement(probing(undefined, asked));
+    expect(NEXT_NAME).toBe("warbandeer-discord-next");
+    expect(asked).toEqual([NEXT_NAME]);
+    expect(probe).toEqual({ kind: "absent", name: NEXT_NAME });
+  });
+
+  // Mutation: dropping the Running leg reads a running replacement as stopped.
+  test("a running replacement is alive", async () => {
+    const probe = await probeReplacement(probing(next({ Running: true, Status: "running", ExitCode: 0 })));
+    expect(probe).toEqual({ kind: "alive", name: NEXT_NAME, status: "running" });
+  });
+
+  // Mutation: dropping the `restarting` leg reads a crash-looping replacement as stopped.
+  test("a restarting replacement is alive even though docker says it is not running", async () => {
+    const probe = await probeReplacement(probing(next({ Running: false, Status: "restarting", ExitCode: 1 })));
+    expect(probe).toEqual({ kind: "alive", name: NEXT_NAME, status: "restarting" });
+  });
+
+  test("an exited or never-started replacement is stopped: it will not take over by itself", async () => {
+    expect(await probeReplacement(probing(next({ Running: false, Status: "exited", ExitCode: 0 })))).toEqual({
+      kind: "stopped",
+      name: NEXT_NAME,
+      status: "exited",
+    });
+    expect(await probeReplacement(probing(next({ Running: false, Status: "created", ExitCode: 0 })))).toEqual({
+      kind: "stopped",
+      name: NEXT_NAME,
+      status: "created",
+    });
+  });
+
+  test("an own inspect that fails is unknown, naming the replacement generically, and never throws", async () => {
+    const probe = await probeReplacement({
+      inspectSelf: async () => {
+        throw new Error("no daemon");
+      },
+      inspect: async () => undefined,
+    });
+    expect(probe).toEqual({ kind: "unknown", name: "the replacement", error: "no daemon" });
+  });
+
+  test("an inspect by name that fails is unknown, naming the replacement", async () => {
+    const probe = await probeReplacement({
+      inspectSelf: async () => SELF,
+      inspect: async () => {
+        throw new Error("500 from the daemon");
+      },
+    });
+    expect(probe).toEqual({ kind: "unknown", name: NEXT_NAME, error: "500 from the daemon" });
+  });
+
+  test("a daemon that never answers is bounded: unknown, in well under the daemon's own 60 s", async () => {
+    const started = Date.now();
+    const probe = await probeReplacement({ inspectSelf: async () => SELF, inspect: () => new Promise(() => {}) }, 20);
+    expect(probe.kind).toBe("unknown");
+    expect((probe as { error: string }).error).toContain("timed out");
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });
 

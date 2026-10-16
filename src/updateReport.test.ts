@@ -1,4 +1,7 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { REST } from "discord.js";
 import { expectCleanedLog, replyFailure } from "../test/restError";
 
 // `updateReport.ts` reaches the `config` singleton, which resolves process.env at import time --
@@ -10,8 +13,11 @@ const {
   reportTooOld,
   deliverUpdateReport,
   liveDeliverers,
+  reportUpdateOutcome,
 } = await import("./updateReport");
-const { shortSha } = await import("./storage");
+const { config } = await import("./config");
+const { state, saveState } = await import("./state");
+const { shortSha, DATA_DIR } = await import("./storage");
 type PendingUpdateReport = import("./state").PendingUpdateReport;
 type Deliverers = import("./updateReport").Deliverers;
 
@@ -60,14 +66,43 @@ describe("decideUpdateOutcome", () => {
       "updated",
     );
   });
+
+  // R1 (#450): the boot's resolution turns a would-be noop into the truthful outcome, and only that one.
+  test("interrupted when the boot found a swap it started and never finished, and we are back on the source build", () => {
+    expect(decideUpdateOutcome({ report: report(), runningSha: FROM, resolution: "interrupted" })).toBe("interrupted");
+  });
+
+  test("an interrupted resolution does not hide an update that landed, or a third build", () => {
+    expect(decideUpdateOutcome({ report: report(), runningSha: TO, resolution: "interrupted" })).toBe("updated");
+    expect(decideUpdateOutcome({ report: report(), runningSha: THIRD, resolution: "interrupted" })).toBe("unexpected");
+  });
+
+  test("every other resolution leaves the noop alone", () => {
+    for (const resolution of ["none", "landed", "stale"] as const) {
+      expect(decideUpdateOutcome({ report: report(), runningSha: FROM, resolution })).toBe("noop");
+    }
+  });
 });
 
 describe("updateOutcomeMessage", () => {
   test("each outcome produces distinct text", () => {
-    const msgs = (["updated", "noop", "unexpected", "unknown"] as const).map((o) =>
+    const msgs = (["updated", "noop", "interrupted", "unexpected", "unknown"] as const).map((o) =>
       updateOutcomeMessage(o, report(), TO),
     );
-    expect(new Set(msgs).size).toBe(4);
+    expect(new Set(msgs).size).toBe(5);
+  });
+
+  test("interrupted names the target and the build, says the update did not take, and names the command to run again (#450)", () => {
+    const msg = updateOutcomeMessage("interrupted", report(), FROM);
+    expect(msg).toContain(shortSha(TO));
+    expect(msg).toContain(shortSha(FROM));
+    expect(msg).toContain("did not take");
+    expect(msg).toContain("/update"); // config.commandPrefix is empty in this process
+    expect(msg).not.toContain("wasn't rebuilt"); // the wrong cause the noop text names
+  });
+
+  test("unexpected admits an automatic update or a redeploy by hand may be the cause", () => {
+    expect(updateOutcomeMessage("unexpected", report(), THIRD)).toContain("automatic update");
   });
 
   test("updated names the build it came back on and the one it left", () => {
@@ -236,5 +271,144 @@ describe("liveDeliverers.viaChannel", () => {
       channels: { fetch: async () => ({ isSendable: () => false }) },
     } as unknown as import("discord.js").Client;
     await expect(liveDeliverers(fakeClient).viaChannel(report(), "x")).rejects.toThrow(/not sendable/);
+  });
+});
+
+// R4 (#452): the other two routes had no test at all (viaChannel is the one above).
+describe("liveDeliverers.viaDm and viaToken (#452)", () => {
+  test("viaDm fetches the requester and sends the content to them", async () => {
+    const sends: [string, string][] = [];
+    const fakeClient = {
+      users: { fetch: async (id: string) => ({ send: async (content: string) => void sends.push([id, content]) }) },
+    } as unknown as import("discord.js").Client;
+    await liveDeliverers(fakeClient).viaDm(report(), "hi");
+    expect(sends).toEqual([["42", "hi"]]);
+  });
+
+  // Mutation: `auth: true` would send the bot's own token to a route the interaction token already authenticates.
+  test("viaToken posts the ephemeral follow-up to the interaction's webhook, unauthenticated, mentioning nobody", async () => {
+    const post = spyOn(REST.prototype, "post").mockImplementation((async () => ({})) as never);
+    try {
+      await liveDeliverers({} as unknown as import("discord.js").Client).viaToken(report(), "hi");
+      expect(post).toHaveBeenCalledTimes(1);
+      const [route, options] = post.mock.calls[0]! as [string, { body: unknown; auth: boolean }];
+      expect(route).toBe("/webhooks/999/tok");
+      expect(options.body).toEqual({ content: "hi", flags: 64, allowed_mentions: { parse: [] } });
+      expect(options.auth).toBe(false);
+    } finally {
+      post.mockRestore();
+    }
+  });
+});
+
+// #450, #452, #506 item 12: the boot's report, driven through its injectable deliverers. State goes to the test data
+// dir (test/setup.ts's per-run BOT_DATA_DIR); every test seeds the report on disk too, or the clear-before-deliver
+// ordering could not be seen.
+describe("reportUpdateOutcome", () => {
+  const realGitSha = config.gitSha;
+  const onDisk = () => JSON.parse(readFileSync(join(DATA_DIR, "state.json"), "utf8")) as Record<string, any>;
+  const client = {} as unknown as import("discord.js").Client;
+  /** Deliverers that fail the test when they are asked to deliver. */
+  const forbidden: Deliverers = {
+    viaToken: async () => {
+      throw new Error("viaToken must not be called");
+    },
+    viaDm: async () => {
+      throw new Error("viaDm must not be called");
+    },
+    viaChannel: async () => {
+      throw new Error("viaChannel must not be called");
+    },
+  };
+
+  afterEach(async () => {
+    config.gitSha = realGitSha;
+    state.pendingUpdateReport = undefined;
+    await saveState();
+  });
+
+  // R2: a swap in flight leaves the report to the new build, which is about to retire this process.
+  test("a swap in flight leaves the report where it is and delivers nothing", async () => {
+    const owed = report({ requestedAt: Date.now() });
+    state.pendingUpdateReport = owed;
+    await saveState();
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "in-flight", forbidden);
+      expect(state.pendingUpdateReport).toBe(owed);
+      expect(onDisk().pendingUpdateReport).toBeDefined();
+      expect(log.mock.calls.some((c) => String(c[0]).includes("in flight"))).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // R2b: the age check comes BEFORE the in-flight hold, or a probe that stays `unknown` would keep a report forever.
+  test("a report older than a day is dropped even while a swap may be in flight", async () => {
+    state.pendingUpdateReport = report({ requestedAt: Date.now() - 25 * 3_600_000 });
+    await saveState();
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "in-flight", forbidden);
+      expect(state.pendingUpdateReport).toBeUndefined();
+      expect(onDisk().pendingUpdateReport).toBeUndefined();
+      expect(log.mock.calls.some((c) => String(c[0]).includes("dropping a stale report"))).toBe(true);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  // R3: cleared (memory AND disk) before it is delivered; a clear that fails is logged and delivery goes ahead.
+  test("the report is cleared in memory and on disk BEFORE delivery, and a failing save does not stop it", async () => {
+    config.gitSha = TO;
+    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    await saveState();
+    const seen: { memory?: unknown; disk?: unknown }[] = [];
+    let delivered = 0;
+    const recording: Deliverers = {
+      ...forbidden,
+      viaToken: async () => {
+        delivered += 1;
+        seen.push({ memory: state.pendingUpdateReport, disk: onDisk().pendingUpdateReport });
+      },
+    };
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "none", recording);
+      expect(seen).toEqual([{ memory: undefined, disk: undefined }]);
+      expect(log.mock.calls.some((c) => String(c[0]).includes("updated (delivered via token)"))).toBe(true);
+
+      // Second phase: the seed lands first; only THEN does the disk start refusing writes.
+      state.pendingUpdateReport = report({ requestedAt: Date.now() });
+      await saveState();
+      const write = spyOn(Bun, "write").mockImplementation((() => Promise.reject(new Error("disk full"))) as unknown as typeof Bun.write);
+      try {
+        await reportUpdateOutcome(client, "none", recording); // must not throw
+      } finally {
+        write.mockRestore();
+      }
+      expect(delivered).toBe(2);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("could not clear the pending report before delivering it"))).toBe(true);
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  test("an interrupted swap is reported as such, not as a no-op", async () => {
+    config.gitSha = FROM;
+    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    await saveState();
+    const contents: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, "interrupted", { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+    } finally {
+      log.mockRestore();
+    }
+    expect(contents).toHaveLength(1);
+    expect(contents[0]!.startsWith("⚠️ Back up on")).toBe(true);
+    expect(contents[0]).toContain("did not take");
   });
 });

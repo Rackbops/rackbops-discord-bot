@@ -115,6 +115,21 @@ describe("index.ts wiring", () => {
     expect(/\brestartPending\(\)/.test(code)).toBe(false);
   });
 
+  // #450: the swap record a previous life left is resolved BEFORE the scheduler's first tick can read the attempt
+  // marker, after the shutdown guard (a boot that never happened resolves nothing), and its verdict goes to the
+  // update report. index.ts can't run under test, so the order is pinned in the source.
+  test("activate() resolves the swap record after the shutdown guard and before the scheduler, and hands the verdict to the report (#450)", () => {
+    const activateFn = source.indexOf("async function activate(");
+    const guard = source.indexOf("if (isShuttingDown()) {", activateFn);
+    const resolve = source.indexOf("const attempt = await resolveUpdateAttempt();", activateFn);
+    const scheduler = source.indexOf("firstTick = startScheduler(", activateFn);
+    for (const pos of [guard, resolve, scheduler]) expect(pos).toBeGreaterThan(activateFn);
+    expect(resolve).toBeGreaterThan(guard);
+    expect(resolve).toBeLessThan(scheduler);
+    expect((source.match(/reportUpdateOutcome\(client, attempt\)/g) ?? []).length).toBe(1);
+    expect(source).not.toContain("reportUpdateOutcome(client)");
+  });
+
   // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads
   // at module-eval, which nothing but the source can show.
   test("no plugin code loads at module-eval — the bundle import() is inside activate()", () => {
