@@ -115,17 +115,20 @@ describe("index.ts wiring", () => {
     expect(/\brestartPending\(\)/.test(code)).toBe(false);
   });
 
-  // #450: the swap record a previous life left is resolved BEFORE the scheduler's first tick can read the attempt
-  // marker, after the shutdown guard (a boot that never happened resolves nothing), and its verdict goes to the
-  // update report. index.ts can't run under test, so the order is pinned in the source.
-  test("activate() resolves the swap record after the shutdown guard and before the scheduler, and hands the verdict to the report (#450)", () => {
+  // #450: the swap record a previous life left is resolved BEFORE the interaction handler attaches (a `/update` that
+  // arrived first would arm a record the resolver then took for the dead life's) and so before the scheduler's first
+  // tick can read the attempt marker; not during a shutdown; and the in-flight verdict goes to the update report.
+  // index.ts can't run under test, so the order is pinned in the source.
+  test("activate() resolves the swap record before the interaction handler and the scheduler, skips it in a shutdown, and hands the verdict to the report (#450)", () => {
     const activateFn = source.indexOf("async function activate(");
-    const guard = source.indexOf("if (isShuttingDown()) {", activateFn);
-    const resolve = source.indexOf("const attempt = await resolveUpdateAttempt();", activateFn);
+    const resolve = source.indexOf('const attempt = isShuttingDown() ? "none" : await resolveUpdateAttempt();', activateFn);
+    const interactionOn = source.indexOf("client.on(Events.InteractionCreate", activateFn);
+    const activatePluginsCall = source.indexOf("await activatePlugins(", activateFn);
     const scheduler = source.indexOf("firstTick = startScheduler(", activateFn);
-    for (const pos of [guard, resolve, scheduler]) expect(pos).toBeGreaterThan(activateFn);
-    expect(resolve).toBeGreaterThan(guard);
+    for (const pos of [resolve, interactionOn, activatePluginsCall, scheduler]) expect(pos).toBeGreaterThan(activateFn);
+    expect(resolve).toBeLessThan(interactionOn);
     expect(resolve).toBeLessThan(scheduler);
+    expect((source.match(/resolveUpdateAttempt\(\)/g) ?? []).length).toBe(1);
     expect((source.match(/reportUpdateOutcome\(client, attempt\)/g) ?? []).length).toBe(1);
     expect(source).not.toContain("reportUpdateOutcome(client)");
   });

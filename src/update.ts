@@ -306,15 +306,15 @@ export async function checkForUpdate(
     }
 
     if (decision === "suppressed" && suppressedWarnedFor !== latestSha) {
-      // #506 item 13 / #429: once per pending sha per process (README says "once"), and with the real cause when this
-      // process has one: a swap that failed names its reason; otherwise this process came back on the same build
-      // after exiting for it (the exit-75 path: whatever respawned it supplied no new code) or the swap did not take
-      // (#450 logs that case at boot).
+      // #506 item 13 / #429: once per pending sha per process (a new failed swap re-arms it, below), and with the real
+      // cause when this process has one: a swap that failed names its reason; otherwise this process came back on the
+      // build it exited from (the exit-75 path: whatever respawned it supplied no new code), or a swap it started did
+      // not take or is still landing (#450 logs which at boot).
       suppressedWarnedFor = latestSha;
       const why =
         lastFailure && sameSha(lastFailure.sha, latestSha)
           ? `the last attempt failed: ${lastFailure.reason}`
-          : "this process came back on the same build after exiting for it (whatever respawned it did not supply new code — rebuild the image, see README), or the swap did not take";
+          : "this process came back on the build it exited from (whatever respawned it supplied no new code — rebuild the image, see README), or a swap it started did not take or is still landing (the boot log says which)";
       console.warn(
         `[update] ${shortSha(latestSha)} is still pending — ${why}. The automatic check will not retry it until a ` +
           `newer commit lands; /${prefixedName(config.commandPrefix, "update")} retries it now. Not exiting again.`,
@@ -378,14 +378,14 @@ async function applyUpdate(
   // record (#450) is resolved here, not by a later boot. `attemptedUpdateToSha` stays set, though — it's what makes
   // decideUpdate suppress the NEXT scheduler tick for this same failing sha (#50) instead of rebuilding it every 15
   // minutes; an admin's /update (force: true) still bypasses it, and the suppressed warning names this failure.
-  if (armed !== undefined && state.pendingUpdateReport === armed) state.pendingUpdateReport = undefined;
+  // `armed` is undefined for an AUTO attempt, and an owed report is never undefined, so identity alone leaves it be.
+  if (state.pendingUpdateReport === armed) state.pendingUpdateReport = undefined;
   state.swapInFlight = undefined;
-  lastFailure = { sha: latestSha, reason: result.error ?? result.outcome ?? "failed" };
+  const reason = result.error ?? result.outcome ?? "failed";
+  lastFailure = { sha: latestSha, reason };
   suppressedWarnedFor = undefined; // a new failure re-explains itself once
   await saveState();
-  console.warn(
-    `[update] redeploy to ${shortNew} failed: ${result.error ?? result.outcome} (replacement: ${result.replacement ?? "unknown"})`,
-  );
+  console.warn(`[update] redeploy to ${shortNew} failed: ${reason} (replacement: ${result.replacement ?? "unknown"})`);
   return result;
 }
 
@@ -400,7 +400,8 @@ export type AttemptResolution =
    *  container's next boot to resolve. */
   | "in-flight"
   /** Back on `fromSha` with no live replacement: nothing took over. The record and the attempt marker are cleared and
-   *  the report says so instead of "the image wasn't rebuilt". */
+   *  the report this swap armed is marked `interrupted` in the same save, so it says so instead of "the image wasn't
+   *  rebuilt" -- even if this boot dies before delivering it. */
   | "interrupted"
   /** Neither sha is this build (a third build, no GIT_SHA, or a record of the wrong shape): the record is cleared and
    *  the markers are left to the existing paths. */
@@ -415,7 +416,7 @@ export function decideAttemptResolution(o: {
   swap?: SwapInFlight;
   runningSha?: string;
   probe?: ReplacementProbe;
-  now?: number;
+  now: number;
 }): AttemptResolution {
   if (!o.swap) return "none";
   if (!o.runningSha) return "stale";
@@ -424,15 +425,15 @@ export function decideAttemptResolution(o: {
   if (o.probe?.kind === "alive") return "in-flight";
   if (o.probe?.kind === "unknown") {
     // Leave it for the next boot — unless the record is a day old, when nothing can still be in flight.
-    return o.now !== undefined && o.now - o.swap.startedAt > SWAP_RECORD_MAX_AGE_MS ? "interrupted" : "in-flight";
+    return o.now - o.swap.startedAt > SWAP_RECORD_MAX_AGE_MS ? "interrupted" : "in-flight";
   }
   return "interrupted";
 }
 
-/** A `swapInFlight` as written by this bot; a hand-edited or truncated one must not throw at boot. */
+/** A `swapInFlight` as written by this bot; a hand-edited or truncated one must not throw at boot. A primitive has
+ *  none of these properties, so only `null` (whose property read throws) needs a leg of its own. */
 function isSwapInFlight(v: unknown): v is SwapInFlight {
   return (
-    typeof v === "object" &&
     v !== null &&
     typeof (v as SwapInFlight).fromSha === "string" &&
     typeof (v as SwapInFlight).toSha === "string" &&
@@ -446,11 +447,26 @@ export interface ResolveAttemptDeps {
   log?: Pick<Console, "log" | "warn">;
 }
 
+/** What a probe saw, for the boot log. */
+function describeProbe(p: ReplacementProbe): string {
+  switch (p.kind) {
+    case "alive":
+    case "stopped":
+      return `${p.name} is ${p.status}`;
+    case "absent":
+      return `${p.name} is gone`;
+    case "unknown":
+      return `whether ${p.name} is alive could not be told: ${p.error}`;
+  }
+}
+
 /**
- * Resolve the swap record at boot (#450): called by `index.ts`'s `activate()` before `startScheduler`, so an
- * interrupted attempt's marker is gone before the first tick can read it and the verdict reaches
- * `reportUpdateOutcome`. The daemon is asked only in the ambiguous case (back on `fromSha`), bounded like
- * `resolveBootMode`; an ordinary boot, and the replacement's own boot, make no daemon call here. Never throws.
+ * Resolve the swap record at boot (#450): called by `index.ts`'s `activate()` BEFORE the interaction handler attaches
+ * (so no `/update` can arm a fresh record for this to mistake for the dead life's) and so before `startScheduler`: an
+ * interrupted attempt's marker is gone before the first tick can read it, and the verdict is saved on the owed report
+ * (`interrupted`), which is how it reaches `reportUpdateOutcome` -- and survives a boot that dies before delivering it.
+ * The daemon is asked only in the ambiguous case (back on `fromSha`), bounded like `resolveBootMode`; an ordinary boot,
+ * and the replacement's own boot, make no daemon call here. Never throws.
  */
 export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promise<AttemptResolution> {
   const log = deps.log ?? console;
@@ -459,24 +475,32 @@ export async function resolveUpdateAttempt(deps: ResolveAttemptDeps = {}): Promi
   const swap = isSwapInFlight(raw) ? raw : undefined;
   const needsProbe = !!swap && !!config.gitSha && !sameSha(swap.toSha, config.gitSha) && sameSha(swap.fromSha, config.gitSha);
   const probe = needsProbe ? await (deps.probe ?? probeReplacement)() : undefined;
+  // The probe is the only await above. A swap that began while it ran replaced the record this boot read (and the
+  // markers beside it): resolving over that would erase an attempt that is live, so leave it to its own path.
+  if (state.swapInFlight !== raw) {
+    log.log("[update] the swap record changed while it was being resolved — a newer attempt owns it now, leaving it");
+    return "in-flight";
+  }
   const resolution = swap ? decideAttemptResolution({ swap, runningSha: config.gitSha, probe, now: Date.now() }) : "stale";
   const target = swap ? shortSha(swap.toSha) : "an unknown build";
   if (resolution === "in-flight") {
-    const seen =
-      probe?.kind === "alive"
-        ? `${probe.name} is ${probe.status}`
-        : `whether ${probe?.name ?? "the replacement"} is alive could not be told: ${probe?.kind === "unknown" ? probe.error : "no probe"}`;
+    // `in-flight` comes only from a probe that was asked (alive, or unknown and not yet a day old).
     log.log(
-      `[update] the swap to ${target} this container started may be in flight (${seen}) — leaving its record, the attempt marker and its report for the new build or the next boot`,
+      `[update] the swap to ${target} this container started may be in flight (${describeProbe(probe!)}) — leaving its record, the attempt marker and its report for the new build or the next boot`,
     );
     return resolution;
   }
   state.swapInFlight = undefined;
   if (resolution === "interrupted") {
     state.attemptedUpdateToSha = undefined;
-    const seen = probe?.kind === "absent" ? "gone" : probe?.kind === "stopped" ? probe.status : "not alive";
+    // The verdict rides on the report THIS swap armed (same shas, as written by one block in `checkForUpdate`, so
+    // equality, not `sameSha` -- a hand-edited report must not throw here), in the same save that clears the record.
+    const { fromSha, toSha } = swap!;
+    const owed = state.pendingUpdateReport;
+    if (owed?.fromSha === fromSha && owed.toSha === toSha) state.pendingUpdateReport = { ...owed, interrupted: true };
+    // `interrupted` comes only from a probe that was asked: absent, stopped, or unknown on a record over a day old.
     log.warn(
-      `[update] the swap to ${target} this container started did not take (${probe?.name ?? "the replacement"} is ${seen}) — cleared the attempt marker, so the next check tries it again`,
+      `[update] the swap to ${target} this container started did not take (${describeProbe(probe!)}${probe!.kind === "unknown" ? "; the record is over a day old, so nothing can still be in flight" : ""}) — cleared the attempt marker, so the next check tries it again`,
     );
   } else if (resolution === "landed") {
     log.log(`[update] the swap to ${target} landed — this is the new build; cleared its record`);

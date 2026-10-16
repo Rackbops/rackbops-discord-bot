@@ -67,20 +67,21 @@ describe("decideUpdateOutcome", () => {
     );
   });
 
-  // R1 (#450): the boot's resolution turns a would-be noop into the truthful outcome, and only that one.
-  test("interrupted when the boot found a swap it started and never finished, and we are back on the source build", () => {
-    expect(decideUpdateOutcome({ report: report(), runningSha: FROM, resolution: "interrupted" })).toBe("interrupted");
+  // R1 (#450): the boot's verdict rides on the report (`interrupted: true`, set and saved by `resolveUpdateAttempt`), and
+  // it turns a would-be noop into the truthful outcome, and only that one.
+  test("interrupted when the boot marked the report, and we are back on the source build", () => {
+    expect(decideUpdateOutcome({ report: report({ interrupted: true }), runningSha: FROM })).toBe("interrupted");
+    expect(decideUpdateOutcome({ report: report({ interrupted: true }), runningSha: shortSha(FROM) })).toBe("interrupted");
   });
 
-  test("an interrupted resolution does not hide an update that landed, or a third build", () => {
-    expect(decideUpdateOutcome({ report: report(), runningSha: TO, resolution: "interrupted" })).toBe("updated");
-    expect(decideUpdateOutcome({ report: report(), runningSha: THIRD, resolution: "interrupted" })).toBe("unexpected");
+  test("a marked report does not hide an update that landed, or a third build", () => {
+    expect(decideUpdateOutcome({ report: report({ interrupted: true }), runningSha: TO })).toBe("updated");
+    expect(decideUpdateOutcome({ report: report({ interrupted: true }), runningSha: THIRD })).toBe("unexpected");
+    expect(decideUpdateOutcome({ report: report({ interrupted: true }) })).toBe("unknown");
   });
 
-  test("every other resolution leaves the noop alone", () => {
-    for (const resolution of ["none", "landed", "stale"] as const) {
-      expect(decideUpdateOutcome({ report: report(), runningSha: FROM, resolution })).toBe("noop");
-    }
+  test("an unmarked report back on the source build stays a noop", () => {
+    expect(decideUpdateOutcome({ report: report(), runningSha: FROM })).toBe("noop");
   });
 });
 
@@ -324,6 +325,8 @@ describe("reportUpdateOutcome", () => {
   afterEach(async () => {
     config.gitSha = realGitSha;
     state.pendingUpdateReport = undefined;
+    state.swapInFlight = undefined;
+    state.attemptedUpdateToSha = undefined;
     await saveState();
   });
 
@@ -396,19 +399,69 @@ describe("reportUpdateOutcome", () => {
     }
   });
 
-  test("an interrupted swap is reported as such, not as a no-op", async () => {
+  test("a report the boot marked interrupted is reported as such, not as a no-op, whatever resolution the caller passes", async () => {
     config.gitSha = FROM;
-    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    state.pendingUpdateReport = report({ requestedAt: Date.now(), interrupted: true });
     await saveState();
     const contents: string[] = [];
     const log = spyOn(console, "log").mockImplementation(() => {});
     try {
-      await reportUpdateOutcome(client, "interrupted", { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+      await reportUpdateOutcome(client, "none", { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
     } finally {
       log.mockRestore();
     }
     expect(contents).toHaveLength(1);
     expect(contents[0]!.startsWith("⚠️ Back up on")).toBe(true);
     expect(contents[0]).toContain("did not take");
+    expect(contents[0]).not.toContain("wasn't rebuilt");
+  });
+
+  // Mutation: the `resolution = "none"` default becoming "in-flight" -- every report called without one would be held.
+  test("with no resolution passed the report is delivered", async () => {
+    config.gitSha = TO;
+    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    await saveState();
+    const contents: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, undefined, { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+    } finally {
+      log.mockRestore();
+    }
+    expect(contents).toHaveLength(1);
+    expect(state.pendingUpdateReport).toBeUndefined();
+  });
+
+  // #450, the crash between resolving and delivering: boot N resolves `interrupted` and dies before the end of
+  // activate(); boot N+1 finds no record at all. Its report must still say the swap did not take, not that the
+  // image was not rebuilt.
+  test("a boot that dies after resolving an interrupted swap: the next boot, with no record, still reports interrupted", async () => {
+    const { resolveUpdateAttempt } = await import("./update");
+    config.gitSha = FROM;
+    state.swapInFlight = { fromSha: FROM, toSha: TO, startedAt: Date.now() - 1000 };
+    state.attemptedUpdateToSha = TO;
+    state.pendingUpdateReport = report({ requestedAt: Date.now() });
+    await saveState();
+    const quiet = { log: () => {}, warn: () => {} };
+    expect(await resolveUpdateAttempt({ probe: async () => ({ kind: "absent", name: "bot-next" }), log: quiet })).toBe("interrupted");
+
+    // Boot N dies here. Boot N+1 reads state.json back.
+    const disk = onDisk();
+    state.swapInFlight = disk.swapInFlight;
+    state.attemptedUpdateToSha = disk.attemptedUpdateToSha;
+    state.pendingUpdateReport = disk.pendingUpdateReport;
+    const resolution = await resolveUpdateAttempt({ probe: async () => ({ kind: "absent", name: "bot-next" }), log: quiet });
+    expect(resolution).toBe("none");
+
+    const contents: string[] = [];
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await reportUpdateOutcome(client, resolution, { ...forbidden, viaToken: async (_r, content) => void contents.push(content) });
+    } finally {
+      log.mockRestore();
+    }
+    expect(contents).toHaveLength(1);
+    expect(contents[0]).toContain("did not take");
+    expect(contents[0]).not.toContain("wasn't rebuilt");
   });
 });

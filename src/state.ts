@@ -15,6 +15,10 @@ export interface PendingUpdateReport {
   applicationId?: string; // with interactionToken, addresses the follow-up webhook route
   interactionToken?: string; // valid ~15 min from the interaction
   requestedAt: number; // ms epoch, so boot can tell a fresh restart from a week-old one
+  // #450: set by the boot that found the swap this report was armed for never took over (`resolveUpdateAttempt`), in the
+  // same save that clears the swap record -- so the verdict is on disk with the report it describes, and a boot that dies
+  // before delivering it still reports `interrupted`, not the "image wasn't rebuilt" a bare `noop` would say.
+  interrupted?: true;
 }
 
 /**

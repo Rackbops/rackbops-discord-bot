@@ -28,21 +28,16 @@ export type UpdateOutcome =
   | "noop"
   /** Came back on the sha we left on because the process restarted before the new build took over, or the swap was rolled back (#450). */
   | "interrupted"
-  /** Came back on some third sha — someone else deployed in between. */
+  /** Came back on some third sha — neither the build we left nor the one we were picking up (someone deployed in between, or an automatic update landed). */
   | "unexpected"
   /** Came back without a GIT_SHA baked in — nothing to compare. */
   | "unknown";
 
-export function decideUpdateOutcome(o: {
-  report: PendingUpdateReport;
-  runningSha?: string;
-  /** What this boot made of the swap record (#450); absent means "no record". */
-  resolution?: AttemptResolution;
-}): UpdateOutcome {
+/** `report.interrupted` is the boot's verdict on the swap record (`resolveUpdateAttempt`, #450), saved with the report. */
+export function decideUpdateOutcome(o: { report: PendingUpdateReport; runningSha?: string }): UpdateOutcome {
   if (!o.runningSha) return "unknown";
   if (sameSha(o.runningSha, o.report.toSha)) return "updated";
-  if (o.resolution === "interrupted" && sameSha(o.runningSha, o.report.fromSha)) return "interrupted";
-  if (sameSha(o.runningSha, o.report.fromSha)) return "noop";
+  if (sameSha(o.runningSha, o.report.fromSha)) return o.report.interrupted ? "interrupted" : "noop";
   return "unexpected";
 }
 
@@ -165,7 +160,9 @@ export function liveDeliverers(client: Client): Deliverers {
  * Deliver the follow-up owed from a `/update`-initiated restart, if any. `resolution` is what this boot made of the
  * swap record (`resolveUpdateAttempt`, #450): `in-flight` leaves the report in place for the new build, which is
  * about to retire this process and has the same report in its own snapshot (or for this container's next boot, when
- * the probe could not tell); `interrupted` turns a would-be `noop` into the truthful outcome.
+ * the probe could not tell). An `interrupted` swap needs nothing passed here: that boot marked the report itself
+ * (`report.interrupted`), which `decideUpdateOutcome` reads, so the truthful outcome also survives a boot that died
+ * between resolving and delivering.
  *
  * The marker is cleared and persisted *before* delivery is attempted: a delivery that fails must not leave a report
  * that re-fires on every subsequent boot. A save that fails is logged and delivery goes ahead anyway (#506 item 12:
@@ -202,7 +199,7 @@ export async function reportUpdateOutcome(
     return;
   }
 
-  const outcome = decideUpdateOutcome({ report, runningSha: config.gitSha, resolution });
+  const outcome = decideUpdateOutcome({ report, runningSha: config.gitSha });
   const content = updateOutcomeMessage(outcome, report, config.gitSha);
   const route = await deliverUpdateReport(report, content, deliverers, now);
   console.log(`[updateReport] ${outcome} (delivered via ${route}): ${content}`);

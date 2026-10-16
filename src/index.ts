@@ -279,6 +279,15 @@ async function activate(c: Client<true>): Promise<void> {
     console.error("[plugins] plugin setup failed — the bot starts core-only", err);
   }
 
+  // #450: what the previous life of this container left behind — a socket-path swap it started and never finished —
+  // is resolved BEFORE the interaction handler attaches: a `/update` that arrived first would arm a fresh record
+  // that this would take for the dead life's and clear while its build runs. The verdict is saved on the owed
+  // report, which is delivered at the end of this function (`reportUpdateOutcome`). One bounded daemon call, and
+  // only when such a record exists; an ordinary boot still never touches the socket. In standby this runs after
+  // takeOver, like every other state write of the replacement's. Not during a shutdown (the #541 guard below is the
+  // same rule for the rest of activation): the record stays for the next boot, which resolves it the same way.
+  const attempt = isShuttingDown() ? "none" : await resolveUpdateAttempt();
+
   // Attach the interaction handler and bring plugins/the scheduler live BEFORE registering slash
   // commands with Discord: neither depends on that REST round-trip (commandMap/loadResult are
   // already populated above), so doing it first used to leave the bot with no interaction handler
@@ -384,12 +393,6 @@ async function activate(c: Client<true>): Promise<void> {
     console.warn("[plugins] shutdown in progress — the rest of activation is skipped");
     return;
   }
-
-  // #450: what the previous life of this container left behind — a socket-path swap it started and never finished —
-  // is resolved BEFORE the scheduler's first tick can read the attempt marker, and its verdict goes to the report
-  // below. One bounded daemon call, and only when such a record exists; an ordinary boot still never touches the
-  // socket. In standby this runs after takeOver, like every other state write of the replacement's.
-  const attempt = await resolveUpdateAttempt();
 
   // #248: each plugin tick call holds the critical section until it settles, and a restart request or a
   // shutdown aborts every pending one — so neither exits under a tick mid-write, and a tick that ignores

@@ -3583,6 +3583,67 @@ describe("probeReplacement", () => {
     expect((probe as { error: string }).error).toContain("timed out");
     expect(Date.now() - started).toBeLessThan(500);
   });
+
+  // Mutation: dropping `projectOf(self)`. SELF's name (`warbandeer-discord`) differs from its project, so the fixture
+  // above gives the same answer either way. An instance whose own name ends in `-next` (a pre-#567 one, #492) is the
+  // case it exists for: without the project the name reads as an un-renamed replacement and the probe inspects ITSELF
+  // -- always alive, so every boot would be "in flight".
+  test("an instance named x-next in project x-next probes x-next-next, never itself", async () => {
+    const selfNamedNext: ContainerInspect = {
+      ...SELF,
+      Name: "/x-next",
+      Config: { ...SELF.Config, Labels: { ...SELF.Config.Labels, "com.docker.compose.project": "x-next" } },
+    };
+    const asked: string[] = [];
+    const probe = await probeReplacement({
+      inspectSelf: async () => selfNamedNext,
+      inspect: async (name: string) => {
+        asked.push(name);
+        return undefined;
+      },
+    });
+    expect(asked).toEqual(["x-next-next"]);
+    expect(probe).toEqual({ kind: "absent", name: "x-next-next" });
+  });
+});
+
+// The probe through the REAL docker.ts calls, against a recording `fetch`: the default `inspectSelf` and
+// `tryInspectContainer` seams, which the injected-seam tests above replace.
+describe("probeReplacement — real daemon calls (#450)", () => {
+  const realFetch = globalThis.fetch;
+  const HOSTNAME = SELF_SHORT_ID;
+  let paths: string[] = [];
+
+  beforeEach(() => {
+    process.env.HOSTNAME = HOSTNAME;
+    paths = [];
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.HOSTNAME;
+  });
+
+  const stubDaemon = (replacement: ContainerInspect | undefined) => {
+    globalThis.fetch = (async (url: string) => {
+      const { pathname } = new URL(String(url));
+      paths.push(pathname);
+      const body = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { "Content-Type": "application/json" } });
+      if (pathname === `/containers/${HOSTNAME}/json`) return body(SELF);
+      if (pathname === "/containers/warbandeer-discord-next/json") return replacement ? body(replacement) : new Response("", { status: 404 });
+      throw new Error(`unstubbed daemon call: ${pathname}`);
+    }) as unknown as typeof fetch;
+  };
+
+  test("a running replacement: one inspect of itself by hostname, one of the replacement by name, and it is alive", async () => {
+    stubDaemon({ ...SELF, Id: "f".repeat(64), Name: "/warbandeer-discord-next", State: { Running: true, Status: "running", ExitCode: 0 } });
+    expect(await probeReplacement()).toEqual({ kind: "alive", name: "warbandeer-discord-next", status: "running" });
+    expect(paths).toEqual([`/containers/${HOSTNAME}/json`, "/containers/warbandeer-discord-next/json"]);
+  });
+
+  test("no replacement is absent, not unknown", async () => {
+    stubDaemon(undefined);
+    expect(await probeReplacement()).toEqual({ kind: "absent", name: "warbandeer-discord-next" });
+  });
 });
 
 // The same heal through the REAL docker.ts calls, against a recording `fetch`: the default seams (the un-forced

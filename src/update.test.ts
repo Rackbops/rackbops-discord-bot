@@ -443,7 +443,6 @@ describe("decideAttemptResolution (#450)", () => {
 
   test("a probe that cannot tell is in flight too, until the record is a day old", () => {
     expect(decideAttemptResolution({ swap, runningSha: OLD, probe: unknown, now: NOW })).toBe("in-flight");
-    expect(decideAttemptResolution({ swap, runningSha: OLD, probe: unknown })).toBe("in-flight"); // no clock: no age
     const bound = swap.startedAt + SWAP_RECORD_MAX_AGE_MS;
     expect(decideAttemptResolution({ swap, runningSha: OLD, probe: unknown, now: bound })).toBe("in-flight"); // strict
     expect(decideAttemptResolution({ swap, runningSha: OLD, probe: unknown, now: bound + 1 })).toBe("interrupted");
@@ -498,20 +497,64 @@ describe("checkForUpdate — the attempt record (#450, #452, #449, #506)", () =>
   test("the attempt, the report and the swap record are on disk before redeploy runs; a failed swap clears the record and the report it armed (#452, #450)", async () => {
     stubGitHub();
     let seen: ReturnType<typeof onDisk> | undefined;
+    const before = Date.now();
     const result = await checkForUpdate({ force: true, requester: REQUESTER }, failing((d) => (seen = d)));
+    const finished = Date.now();
 
     expect(result.decision).toBe("restart");
     expect(seen!.attemptedUpdateToSha).toBe(NEW);
     expect(seen!.pendingUpdateReport).toMatchObject({ ...REQUESTER, fromSha: OLD, toSha: NEW });
     expect(typeof seen!.pendingUpdateReport.requestedAt).toBe("number");
     expect(seen!.swapInFlight).toMatchObject({ fromSha: OLD, toSha: NEW });
-    expect(typeof seen!.swapInFlight.startedAt).toBe("number");
+    // The clock the 24 h bound reads: a 0 here would make every `unknown` probe resolve `interrupted` at once.
+    expect(seen!.swapInFlight.startedAt).toBeGreaterThanOrEqual(before);
+    expect(seen!.swapInFlight.startedAt).toBeLessThanOrEqual(finished);
 
     const after = onDisk();
     expect(after.pendingUpdateReport).toBeUndefined();
     expect(after.swapInFlight).toBeUndefined();
     expect(after.attemptedUpdateToSha).toBe(NEW); // kept on purpose (#50)
     expect(updateStateForTest().lastFailure).toEqual({ sha: NEW, reason: "boom" });
+  });
+
+  // Mutation: a second `saveState()` before the build (the record written apart from the markers) leaves a window in
+  // which a death records one without the other.
+  test("the arming is ONE save, and the failure tail is one more (#450)", async () => {
+    stubGitHub();
+    const write = spyOn(Bun, "write");
+    try {
+      await saveState();
+      const perSave = write.mock.calls.length;
+      expect(perSave).toBeGreaterThan(0);
+      write.mockClear();
+      let atRedeploy = -1;
+      await checkForUpdate(
+        { force: true, requester: REQUESTER },
+        failing(() => (atRedeploy = write.mock.calls.length)),
+      );
+      expect(atRedeploy).toBe(perSave); // the arming save, and nothing else, ran before the build
+      expect(write.mock.calls.length).toBe(2 * perSave); // plus the failure tail's
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  // Mutations: dropping the `outcome` leg or the "failed" fallback of the reason -- a timeout carries no error text,
+  // and a result with neither would log and remember `undefined`.
+  test("a failed swap's reason falls back from the error to the outcome to a plain 'failed' (#506 item 13)", async () => {
+    stubGitHub();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    const result = (r: object) => ({ redeployAvailable: async () => true, redeploy: async () => r });
+    try {
+      await checkForUpdate({ force: true }, result({ outcome: "timeout" }));
+      expect(updateStateForTest().lastFailure).toEqual({ sha: NEW, reason: "timeout" });
+      await checkForUpdate({ force: true }, result({}));
+      expect(updateStateForTest().lastFailure).toEqual({ sha: NEW, reason: "failed" });
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("failed: failed"))).toBe(true);
+      expect(warn.mock.calls.every((c) => !String(c[0]).includes("undefined"))).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("the no-socket branch arms the two markers and no swap record, and a second /update while that exit is deferred is refused (#452, #449)", async () => {
@@ -615,7 +658,8 @@ describe("checkForUpdate — the attempt record (#450, #452, #449, #506)", () =>
       expect(pending()).toHaveLength(3);
       expect(pending()[2]).toContain(shortSha(NEWER));
       expect(pending()[2]).not.toContain("the last attempt failed");
-      expect(pending()[2]).toContain("came back on the same build");
+      expect(pending()[2]).toContain("came back on the build it exited from");
+      expect(pending()[2]).toContain("or is still landing"); // a swap that may be in flight is not told to rebuild the image
       expect(updateStateForTest().suppressedWarnedFor).toBe(NEWER);
 
       resetUpdateForTest();
@@ -711,36 +755,120 @@ describe("resolveUpdateAttempt (#450)", () => {
     expect(q.lines.some((l) => l.text.includes("could not be told") && l.text.includes("timed out after 10000ms"))).toBe(true);
 
     await seed(recorded(Date.now() - SWAP_RECORD_MAX_AGE_MS - 60_000));
-    expect(await resolveUpdateAttempt({ probe: probing(unknown).probe, log: quiet().log })).toBe("interrupted");
+    const aged = quiet();
+    expect(await resolveUpdateAttempt({ probe: probing(unknown).probe, log: aged.log })).toBe("interrupted");
     expect(state.swapInFlight).toBeUndefined();
     expect(state.attemptedUpdateToSha).toBeUndefined();
-    expect(state.pendingUpdateReport).toBeDefined(); // the requester is still told
+    expect(state.pendingUpdateReport).toMatchObject({ userId: "42", interrupted: true }); // the requester is still told
+    // Nothing was learned about the replacement: the log says so, not "is not alive".
+    const warned = aged.lines.find((l) => l.level === "warn")!.text;
+    expect(warned).toContain("could not be told: timed out after 10000ms");
+    expect(warned).toContain("over a day old");
+    expect(warned).not.toContain("not alive");
   });
 
-  test("a stopped or absent replacement: interrupted, the record and the attempt marker cleared, the report kept", async () => {
-    for (const answer of [
-      { kind: "stopped", name: "bot-next", status: "exited" } as ReplacementProbe,
-      { kind: "absent", name: "bot-next" } as ReplacementProbe,
-    ]) {
+  test("a stopped or absent replacement: interrupted, the record and the attempt marker cleared, the report kept and marked", async () => {
+    for (const [answer, seen] of [
+      [{ kind: "stopped", name: "bot-next", status: "exited" } as ReplacementProbe, "bot-next is exited"],
+      [{ kind: "absent", name: "bot-next" } as ReplacementProbe, "bot-next is gone"],
+    ] as const) {
       config.gitSha = OLD;
       await seed(recorded());
+      const owed = state.pendingUpdateReport!;
       const q = quiet();
 
       expect(await resolveUpdateAttempt({ probe: probing(answer).probe, log: q.log })).toBe("interrupted");
       expect(state.swapInFlight).toBeUndefined();
       expect(state.attemptedUpdateToSha).toBeUndefined();
-      expect(state.pendingUpdateReport).toBeDefined();
+      // The verdict is the report's own field, in memory and on disk (one save), the rest of it untouched.
+      expect(state.pendingUpdateReport).toEqual({ ...owed, interrupted: true });
       const disk = onDisk();
       expect(disk.swapInFlight).toBeUndefined();
       expect(disk.attemptedUpdateToSha).toBeUndefined();
-      expect(disk.pendingUpdateReport).toBeDefined();
-      expect(q.lines.some((l) => l.level === "warn" && l.text.includes("cleared the attempt marker"))).toBe(true);
+      expect(disk.pendingUpdateReport).toEqual({ ...owed, interrupted: true });
+      const warned = q.lines.find((l) => l.level === "warn")!.text;
+      expect(warned).toContain("cleared the attempt marker");
+      expect(warned).toContain(seen);
+      expect(warned).not.toContain("over a day old");
     }
   });
 
+  // Mutations: marking whatever report is owed (drop either sha leg); throwing on a report with no shas.
+  test("only the report this swap armed is marked: another owed report, a hand-edited one, and none at all are left alone", async () => {
+    config.gitSha = OLD;
+    const absent = { kind: "absent", name: "bot-next" } as ReplacementProbe;
+    const armed = buildUpdateReport({ runningSha: OLD, latestSha: NEW, requester: REQUESTER, now: 1 })!;
+    for (const owed of [{ ...armed, toSha: "c".repeat(40) }, { ...armed, fromSha: "c".repeat(40) }, {}, undefined]) {
+      await seed(recorded());
+      state.pendingUpdateReport = owed as never;
+      expect(await resolveUpdateAttempt({ probe: probing(absent).probe, log: quiet().log })).toBe("interrupted");
+      expect(state.pendingUpdateReport).toEqual(owed as never); // not marked, not created, not thrown over
+      expect(state.attemptedUpdateToSha).toBeUndefined();
+      expect(state.swapInFlight).toBeUndefined();
+    }
+  });
+
+  // The verdict survives a boot that dies between resolving and delivering: the next boot has no record, and the
+  // report it reads carries the verdict.
+  test("the verdict is saved with the report: a boot reading it back from disk, with no record left, still sees interrupted", async () => {
+    config.gitSha = OLD;
+    await seed(recorded());
+    await resolveUpdateAttempt({ probe: probing({ kind: "absent", name: "bot-next" }).probe, log: quiet().log });
+
+    const disk = onDisk();
+    expect(disk.swapInFlight).toBeUndefined();
+    expect(disk.pendingUpdateReport.interrupted).toBe(true);
+    expect(disk.pendingUpdateReport).toMatchObject({ ...REQUESTER, fromSha: OLD, toSha: NEW });
+    // The next boot: nothing to resolve.
+    expect(await resolveUpdateAttempt({ probe: probing({ kind: "absent", name: "x" }).probe, log: quiet().log })).toBe("none");
+  });
+
+  // Mutation: dropping the `state.swapInFlight !== raw` re-check -- a /update armed while the probe ran is resolved
+  // as the dead life's swap, clearing the marker and record of a build that is running.
+  test("a record replaced while the probe is out belongs to a newer attempt: left alone, nothing written (#450)", async () => {
+    config.gitSha = OLD;
+    await seed(recorded());
+    const before = onDisk();
+    const newer: SwapInFlight = { fromSha: OLD, toSha: "c".repeat(40), startedAt: Date.now() };
+    const q = quiet();
+    const write = spyOn(Bun, "write");
+    try {
+      const resolved = await resolveUpdateAttempt({
+        probe: async () => {
+          state.swapInFlight = newer; // checkForUpdate's arming, mid-await
+          return { kind: "absent", name: "bot-next" };
+        },
+        log: q.log,
+      });
+      expect(resolved).toBe("in-flight");
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+    }
+    expect(state.swapInFlight).toBe(newer);
+    expect(state.attemptedUpdateToSha).toBe(NEW);
+    expect(state.pendingUpdateReport).toMatchObject({ userId: "42" });
+    expect(state.pendingUpdateReport?.interrupted).toBeUndefined();
+    expect(onDisk()).toEqual(before);
+    expect(q.lines.some((l) => l.text.includes("changed while it was being resolved"))).toBe(true);
+
+    // Cleared during the probe (a failed swap's tail): also not this boot's to resolve.
+    await seed(recorded());
+    expect(
+      await resolveUpdateAttempt({
+        probe: async () => {
+          state.swapInFlight = undefined;
+          return { kind: "absent", name: "bot-next" };
+        },
+        log: quiet().log,
+      }),
+    ).toBe("in-flight");
+    expect(state.attemptedUpdateToSha).toBe(NEW);
+  });
+
   test("a third build, or no sha at all: stale — the record is cleared, the markers are left, the daemon is not asked", async () => {
-    for (const sha of ["d".repeat(40), ""]) {
-      config.gitSha = sha;
+    for (const sha of ["d".repeat(40), "", undefined]) {
+      config.gitSha = sha; // undefined is what a build with no GIT_SHA really has: sameSha(…, undefined) would throw
       await seed(recorded());
       const p = probing({ kind: "alive", name: "bot-next", status: "running" });
 
@@ -752,15 +880,63 @@ describe("resolveUpdateAttempt (#450)", () => {
     }
   });
 
-  test("a malformed record is stale and never throws", async () => {
+  // One bad leg each, on a record that would otherwise name this build: dropping that leg of `isSwapInFlight` lets the
+  // record through to the probe (or, for null, throws at boot).
+  test("a malformed record is stale and never throws, whichever leg of the shape is wrong", async () => {
     config.gitSha = OLD;
-    await seed({ toSha: 5 });
-    const p = probing({ kind: "alive", name: "bot-next", status: "running" });
+    const good = recorded();
+    const bad: [string, unknown][] = [
+      ["null", null],
+      ["a string", "junk"],
+      ["a number", 42],
+      ["empty", {}],
+      ["no fromSha", { toSha: NEW, startedAt: good.startedAt }],
+      ["a numeric fromSha", { ...good, fromSha: 1 }],
+      ["no toSha", { fromSha: OLD, startedAt: good.startedAt }],
+      ["a numeric toSha", { ...good, toSha: 5 }],
+      ["no startedAt", { fromSha: OLD, toSha: NEW }],
+      ["a string startedAt", { ...good, startedAt: "yesterday" }],
+    ];
+    for (const [what, record] of bad) {
+      await seed(record);
+      const p = probing({ kind: "alive", name: "bot-next", status: "running" });
+      const q = quiet();
 
-    expect(await resolveUpdateAttempt({ probe: p.probe, log: quiet().log })).toBe("stale");
-    expect(p.asked.n).toBe(0);
-    expect(state.swapInFlight).toBeUndefined();
-    expect(onDisk().swapInFlight).toBeUndefined();
+      expect({ what, resolution: await resolveUpdateAttempt({ probe: p.probe, log: q.log }) }).toEqual({ what, resolution: "stale" });
+      expect({ what, asked: p.asked.n }).toEqual({ what, asked: 0 });
+      expect(state.swapInFlight).toBeUndefined();
+      expect(onDisk().swapInFlight).toBeUndefined();
+      expect(state.attemptedUpdateToSha).toBe(NEW); // the markers are left to the existing paths
+      expect(q.lines.some((l) => l.text.includes("belongs to another build or is malformed"))).toBe(true);
+    }
+  });
+
+  // Mutation: replacing the `deps.probe ?? probeReplacement` default with a stub. The production call passes no deps,
+  // so every seam above is bypassed; the real probe goes to the daemon (here a recording `fetch`).
+  test("with no probe seam the real probe asks the daemon, by this container's own name", async () => {
+    const realFetch = globalThis.fetch;
+    const realHostname = process.env.HOSTNAME;
+    const HOST = "abc123abc123";
+    const paths: string[] = [];
+    process.env.HOSTNAME = HOST;
+    globalThis.fetch = (async (url: string) => {
+      const { pathname } = new URL(String(url));
+      paths.push(pathname);
+      if (pathname === `/containers/${HOST}/json`) {
+        return new Response(JSON.stringify({ Id: `${HOST}${"0".repeat(52)}`, Name: "/bot", Config: { Labels: {} } }), { status: 200 });
+      }
+      return new Response("", { status: 404 }); // no `bot-next` at all
+    }) as unknown as typeof fetch;
+    try {
+      config.gitSha = OLD;
+      await seed(recorded());
+      expect(await resolveUpdateAttempt({ log: quiet().log })).toBe("interrupted");
+      expect(paths).toEqual([`/containers/${HOST}/json`, "/containers/bot-next/json"]);
+    } finally {
+      globalThis.fetch = realFetch;
+      if (realHostname === undefined) delete process.env.HOSTNAME;
+      else process.env.HOSTNAME = realHostname;
+    }
   });
 
   test("no record: none, and not a single write", async () => {
