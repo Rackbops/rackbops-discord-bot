@@ -129,8 +129,9 @@ export interface CreatedIssue {
  * at the end that mangles on the way out. Dropping that one trailing unit keeps the true
  * ≤`max`-unit bound (round 2 of #189's review: an earlier fix switched to counting *code points*
  * instead, which silently let an emoji-heavy body through roughly 2x over Discord's real cap).
+ * Exported for `report.ts`'s `reportAnnouncement` (#445): a UTF-16 slice that never ends in a high surrogate.
  */
-function sliceUtf16(text: string, max: number): string {
+export function sliceUtf16(text: string, max: number): string {
   const cut = text.slice(0, max);
   const lastUnit = cut.charCodeAt(cut.length - 1);
   return lastUnit >= 0xd800 && lastUnit <= 0xdbff ? cut.slice(0, -1) : cut;
@@ -203,15 +204,25 @@ export async function createIssue(
   return { number: data.number, url: data.html_url };
 }
 
-/** Idempotently ensure a label exists so create-issue never fails on a missing label:
- * 201 = created, 422 = already exists — both are success. Best-effort; other errors warn. */
-export async function ensureLabel(repo: string, name: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<void> {
-  if (!config.githubToken) return;
-  const res = await fetch(`https://api.github.com/repos/${repo}/labels`, {
-    method: "POST",
-    headers: githubHeaders({ write: true }),
-    body: JSON.stringify({ name, color: "ededed" }),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok && res.status !== 422) console.warn(`ensureLabel "${name}" on ${repo}: ${res.status}`);
+/** Idempotently ensure a label exists: `true` when it does afterwards (201 created; 422, which with a constant
+ *  name and colour is GitHub's "already exists" answer here), `false` when it could not be confirmed (another
+ *  status, a network error, the timeout) — logged, never thrown, so a caller can file without the label rather
+ *  than fail the report over it (#445, #503). `true` without a token too: create-issue cannot run without one
+ *  either, and the caller refuses earlier. */
+export async function ensureLabel(repo: string, name: string, timeoutMs = GITHUB_TIMEOUT_MS): Promise<boolean> {
+  if (!config.githubToken) return true;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/labels`, {
+      method: "POST",
+      headers: githubHeaders({ write: true }),
+      body: JSON.stringify({ name, color: "ededed" }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.ok || res.status === 422) return true;
+    console.warn(`ensureLabel "${name}" on ${repo}: ${res.status}`);
+    return false;
+  } catch (err) {
+    console.warn(`ensureLabel "${name}" on ${repo}: ${(err as Error).message}`);
+    return false;
+  }
 }
