@@ -1047,8 +1047,10 @@ describe("redeploy — cleanup always runs", () => {
 
   // The handoff deadline runs on the injected clock too: each reading advances it 20 s, so a 60 s deadline is
   // reached on the second poll. On the real clock it would wait out the 60 s itself and the test would time out.
+  // The injected clock starts at epoch 0, so any reading taken from the real clock instead (the start of the
+  // wait, or the elapsed time) would be 1.7e12 ms away from the others and the deadline would never be reached.
   test("the handoff deadline is measured on the injected clock", async () => {
-    let t = Date.now();
+    let t = 0;
     stubDaemon({
       pollReplacement: () => jsonRes(SELF), // running, never signalling
       removeReplacement: () => new Response("", { status: 204 }),
