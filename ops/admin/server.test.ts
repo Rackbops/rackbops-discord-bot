@@ -6495,9 +6495,11 @@ describe("form help, error and required states (#300)", () => {
       // sendRouting's OWN initiating-POST failures (never-ok, unparseable body, network catch) are a
       // sixth site alongside the plan's original five: the same failure class every sibling mutation
       // below already toasts on, so parity, not scope creep (round-1 review finding, #306).
-      ["sendRouting", slice("async function sendRouting(", "async function awaitRequestResult("), 3],
+      // #405/#406: sendRouting's "not-ready" warning is the fourth; #528's refused discovery refresh the fifth
+      // of refreshDiscovery (landed/refused/timeout/posted-error/network-catch).
+      ["sendRouting", slice("async function sendRouting(", "async function awaitRequestResult("), 4],
       ["awaitRequestResult", slice("async function awaitRequestResult(", "function isPluginActive("), 3],
-      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus("), 4],
+      ["refreshDiscovery", slice("async function refreshDiscovery(", "function renderRouteStatus("), 5],
       ["addWebhook", slice("async function addWebhook(", "async function removeWebhook("), 5],
       ["removeWebhook", slice("async function removeWebhook(", "async function pollForResult("), 5],
       ["refreshDiscoveryAll", slice("async function refreshDiscoveryAll(", "async function copyInviteLink("), 5],
@@ -10546,6 +10548,60 @@ describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
     expect(src).toContain("function routingStepModel(");
   });
 
+  // #405/#468: the merge, the clean rule and the poll time-box, pure.
+  const a3 = new Function(
+    `"use strict";\n${src}\nreturn { sameRowSelection, sameSelection, mergeSelection, routeStepClean, pollRequestTimeoutMs };`,
+  )() as {
+    sameRowSelection: (a: unknown, b: unknown) => boolean;
+    sameSelection: (a: unknown, b: unknown) => boolean;
+    mergeSelection: (base: Record<string, unknown>, mine: Record<string, unknown>, theirs: Record<string, unknown>) => Record<string, unknown>;
+    routeStepClean: (st: Record<string, unknown>) => boolean;
+    pollRequestTimeoutMs: (startedAt: number, now: number) => number;
+  };
+  const rowSel = (channels?: string[], extra: Record<string, unknown> = {}) =>
+    channels
+      ? { on: true, scope: "chosen", channels, postTo: null, destinations: {}, ...extra }
+      : { on: true, scope: "all", channels: [], postTo: null, destinations: {}, ...extra };
+
+  test("P1 (#405): mergeSelection keeps another tab's server, honours the operator's own change, and compares rows sanely", () => {
+    // Tab B added S2 (theirs has S1+S2); this tab's base was S1, mine is S1+S3 -> S1, S2, S3.
+    expect(Object.keys(a3.mergeSelection({ S1: rowSel() }, { S1: rowSel(), S3: rowSel() }, { S1: rowSel(), S2: rowSel() })).sort()).toEqual(["S1", "S2", "S3"]);
+    // This tab unticked S1 (mine {}) while theirs still has S1 -> S1 absent.
+    expect(a3.mergeSelection({ S1: rowSel() }, {}, { S1: rowSel() })).toEqual({});
+    // Both changed S1's channels -> mine wins.
+    expect(a3.mergeSelection({ S1: rowSel(["a"]) }, { S1: rowSel(["b"]) }, { S1: rowSel(["c"]) })).toEqual({ S1: rowSel(["b"]) });
+    // An untouched row follows the fresh placement (theirs dropped it -> gone).
+    expect(a3.mergeSelection({ S1: rowSel() }, { S1: rowSel() }, {})).toEqual({});
+    // sameRowSelection: channel order is irrelevant (chosen scope), an absent row is { on: false }.
+    expect(a3.sameRowSelection(rowSel(["a", "b"]), rowSel(["b", "a"]))).toBe(true);
+    expect(a3.sameRowSelection(rowSel(["a"]), rowSel(["a", "b"]))).toBe(false);
+    expect(a3.sameRowSelection(undefined, { on: false })).toBe(true);
+    expect(a3.sameRowSelection(undefined, rowSel())).toBe(false);
+    expect(a3.sameRowSelection(rowSel(), rowSel(undefined, { postTo: "x" }))).toBe(false);
+    expect(a3.sameRowSelection(rowSel(), rowSel(undefined, { destinations: { d: "1" } }))).toBe(false);
+    expect(a3.sameSelection({ S1: rowSel() }, { S1: rowSel(), S2: { on: false } })).toBe(true);
+  });
+
+  test("P2 (#405): routeStepClean is false while anything is pending and true when settled or untouched", () => {
+    const base = { S1: rowSel() };
+    const clean = { selection: base, base, sendTimer: null, inflight: null, held: false, outcome: null };
+    expect(a3.routeStepClean(clean)).toBe(true);
+    expect(a3.routeStepClean({ ...clean, outcome: { phase: "applied" } })).toBe(true);
+    expect(a3.routeStepClean({ ...clean, sendTimer: 1 })).toBe(false);
+    expect(a3.routeStepClean({ ...clean, inflight: { id: null } })).toBe(false);
+    expect(a3.routeStepClean({ ...clean, held: true })).toBe(false);
+    for (const phase of ["refused", "timeout", "posted-error"]) expect(a3.routeStepClean({ ...clean, outcome: { phase } }), phase).toBe(false);
+    expect(a3.routeStepClean({ ...clean, selection: { S1: rowSel(), S2: rowSel() } })).toBe(false); // an unsent pick no timer covers
+    expect(a3.routeStepClean({ ...clean, base: undefined })).toBe(false); // never seeded from a model
+  });
+
+  test("P3 (#468 item 8): pollRequestTimeoutMs is what is left of the 30 s window, never under a second", () => {
+    expect(a3.pollRequestTimeoutMs(1000, 1000)).toBe(30000);
+    expect(a3.pollRequestTimeoutMs(1000, 11000)).toBe(20000);
+    expect(a3.pollRequestTimeoutMs(1000, 40000)).toBe(1000);
+    expect(a3.pollRequestTimeoutMs(1000, 29500 + 1000)).toBe(1000);
+  });
+
   // Canned data matching src/routing/model.ts's shapes exactly (verified against source, not guessed).
   const HOME = "100", OTHER = "200", GONE = "999";
   const GEN_CH = "10", SP_CH = "11", AN_CH = "12", OTHER_CH = "20";
@@ -11386,7 +11442,8 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   }) {
     const posts: { path: string; body?: string }[] = [];
     const clock = makeClock();
-    const document = { createElement: makeEl, createTextNode: () => ({}) };
+    // #468 item 10: renderRouteStatus reads document.activeElement and calls getElementById to restore focus.
+    const document = { createElement: makeEl, createTextNode: () => ({}), activeElement: null, getElementById: () => null };
     const setApplyText = (el: FakeEl, text: string) => { if (el.textContent !== text) el.textContent = text; };
     const pluginsData = opts.pluginsData ?? { plugins: [{ name: "music", active: true }] };
     const apiImpl = opts.apiImpl;
@@ -11399,7 +11456,9 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       if (apiImpl) return apiImpl(path, init);
       return { ok: true, status: 200, text: async () => "" };
     };
-    const timeoutSignal = () => ({ signal: undefined, cancel: () => {} });
+    // A recorder: every ms a call asked for (#468 item 8 pins the pollers' per-read time-box on it).
+    const timeoutCallsLog: number[] = [];
+    const timeoutSignal = (ms: number) => { timeoutCallsLog.push(ms); return { signal: undefined, cancel: () => {} }; };
     // Not part of this slice (buildWhereItLivesStep and friends are browser-only DOM builders, out of
     // scope for this mini-harness) -- injected as a call-tracked stub so awaitRequestResult's reference
     // to it resolves instead of throwing (which sendRouting's own catch would otherwise swallow silently,
@@ -11422,7 +11481,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     }
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date", "showToast",
-      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
         "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate, showToast) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
@@ -11464,6 +11523,8 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       run, posts, clock, routeState: run.routeState, routingStepEls: run.routingStepEls, setRoutingData: run.setRoutingData, seed,
       refreshRoutingStepsCalls: () => refreshRoutingStepsCalls,
       advanceFakeNow: (ms: number) => { fakeNow += ms; },
+      setFakeNow: (ms: number) => { fakeNow = ms; },
+      timeoutCalls: () => timeoutCallsLog,
       toasts: () => toasts,
     };
   }
@@ -11749,11 +11810,231 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     expect(st2).toBe(st1); // same routeState entry, not a fresh one
     expect(st2.selection["100"]).toMatchObject({ on: true, scope: "all" });
     expect(st2.seeded).toBe(true);
-    // A LATER ready model must not re-seed again (an in-progress pick survives a background refresh).
+    // A LATER ready model must not re-seed a step with a pick pending (#405: a CLEAN step is re-seeded, see H4;
+    // an in-progress pick a background refresh brought in must survive it).
     const laterReadyModel = { mode: "ready", rows: [{ id: "200", on: true, commands: "all" as const, postTo: null }] };
+    (st2 as unknown as { sendTimer: unknown }).sendTimer = 1; // a debounced send is pending: the pick is the operator's, not the saved placement's
     const st3 = h.run.ensureRouteState("music", laterReadyModel);
     expect(st3.selection["100"]).toBeDefined(); // untouched
     expect(st3.selection["200"]).toBeUndefined(); // NOT re-seeded from the later model
+  });
+
+  // ---- #529 A3a: #405, #406, #468 items 8 and 10, and the refused discovery refresh (#528 follow-up) ----
+  const READY_NOW = Date.parse("2026-09-22T12:00:00.000Z"); // within the hour of the fixture's generatedAt: "ready"
+  const withMusic = (servers: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    routing: { v: 1, updatedAt: "", updatedBy: "", plugins: { music: { servers } }, webhooks: {}, results: [] as unknown[], ...extra },
+    discovery,
+  });
+  const readyModelFor = (rows: { id: string; commands: unknown }[]) => ({
+    mode: "ready",
+    rows: rows.map((r) => ({ id: r.id, on: true, commands: r.commands, postTo: null, destinations: {} })),
+  });
+  // A GET answer carrying both readers a send and a poll use (.text() for the re-read, .json() for the polls).
+  const getAnswer = (data: unknown) => ({ ok: true, status: 200, text: async () => JSON.stringify(data), json: async () => data });
+  /** A fake row of controls wired into routingStepEls, so a test can read box.disabled. */
+  const wireRow = (h: ReturnType<typeof harness>, guildId = "100") => {
+    const rowEls = { box: makeEl(), controls: makeEl(), anyRadio: makeEl(), chosenRadio: makeEl(), fieldset: makeEl(), channelChecks: new Map([["10", makeEl()]]), channelErr: makeEl(), postSelect: makeEl(), note: makeEl() };
+    h.routingStepEls.set("music", { status: makeEl(), statusActions: makeEl(), body: makeEl(), rows: new Map([[guildId, rowEls]]) });
+    return rowEls;
+  };
+  const settle = async (h: ReturnType<typeof harness>, n = 3) => { for (let i = 0; i < n; i++) await h.clock.tick(); };
+
+  test("H1 (#405): a send merges the operator's change onto the fresh placement -- another tab's server survives", async () => {
+    const stale = withMusic({ "100": { commands: "all" } });
+    const fresh = withMusic({ "100": { commands: "all" }, "200": { commands: "all" } }); // tab B added 200
+    const h = harness({
+      routingDataInit: stale,
+      apiImpl: (async (_p: string, init?: { method?: string }) =>
+        init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "m1" }) } : getAnswer(fresh)) as never,
+    });
+    h.setFakeNow(READY_NOW);
+    h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }])); // seeded: base = { 100 }
+    h.run.onRouteChange("music", "100", "scope", "chosen");
+    h.run.onRouteChange("music", "100", "channel", { id: "10", checked: true });
+    await settle(h);
+    expect(h.posts).toHaveLength(1);
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: ["10"] }, "200": { commands: "all" } } });
+  });
+
+  test("H2 (#405): a failed re-read falls back to the in-memory placement, as before", async () => {
+    const stale = withMusic({ "100": { commands: "all" } });
+    const h = harness({
+      routingDataInit: stale,
+      apiImpl: (async (_p: string, init?: { method?: string }) =>
+        init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "m2" }) } : { ok: false, status: 502, text: async () => "bad gateway" }) as never,
+    });
+    h.setFakeNow(READY_NOW);
+    h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }]));
+    h.run.onRouteChange("music", "100", "scope", "chosen");
+    h.run.onRouteChange("music", "100", "channel", { id: "10", checked: true });
+    await settle(h);
+    expect(h.posts).toHaveLength(1);
+    expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: ["10"] } } });
+  });
+
+  test("H3 (#406): no server list means nothing is sent, the picks and the controls survive, and the step is busy during the re-read", async () => {
+    let releaseGet!: (v: unknown) => void;
+    const getHeld = new Promise<unknown>((resolve) => { releaseGet = resolve; });
+    const noDiscovery = { routing: withMusic({}).routing, discovery: null };
+    const h = harness({
+      routingDataInit: withMusic({ "100": { commands: "all" } }),
+      apiImpl: (async (_p: string, init?: { method?: string }) => (init && init.method === "POST" ? { ok: true, status: 200, text: async () => "{}" } : getHeld)) as never,
+    });
+    h.setFakeNow(READY_NOW);
+    const row = wireRow(h);
+    h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }]));
+    h.run.onRouteChange("music", "100", "scope", "chosen");
+    const before = JSON.stringify(h.routeState.get("music")!.selection);
+    await h.clock.tick(); // the debounce fires; the re-read GET is pending
+    expect(h.routeState.get("music")!.inflight).not.toBeNull(); // reserved BEFORE the re-read (a render sees it busy)
+    expect(row.box.disabled).toBe(true);
+    releaseGet(getAnswer(noDiscovery));
+    await settle(h);
+    const st = h.routeState.get("music")!;
+    expect(h.posts).toHaveLength(0);
+    expect(st.inflight).toBeNull();
+    expect(JSON.stringify(st.selection)).toBe(before);
+    expect((st.outcome as { message: string }).message.startsWith("Not sent:")).toBe(true);
+    expect(h.toasts().filter((t) => t.kind === "warning")).toHaveLength(1);
+    expect(row.box.disabled).toBe(false);
+  });
+
+  test("H3 (#406): a held re-send whose re-read still has no server list posts nothing; a STALE list still posts", async () => {
+    const noDiscovery = { routing: withMusic({}).routing, discovery: null };
+    const h = harness({
+      routingDataInit: withMusic({}),
+      apiImpl: (async (_p: string, init?: { method?: string }) => (init && init.method === "POST" ? { ok: true, status: 200, text: async () => "{}" } : getAnswer(noDiscovery))) as never,
+    });
+    h.setFakeNow(READY_NOW);
+    h.run.ensureRouteState("music", readyModelFor([]));
+    h.run.onRouteChange("music", "100", "on", true);
+    h.routeState.get("music")!.held = true; // an edit was held during an earlier request
+    await h.run.sendRouting("music");
+    await settle(h);
+    expect(h.posts).toHaveLength(0);
+
+    // The fixture's generatedAt is long past (fakeNow is real now): stale, but it has its real rows -> sends.
+    const stale = harness({
+      routingDataInit: withMusic({}),
+      apiImpl: (async (_p: string, init?: { method?: string }) => (init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "s1" }) } : getAnswer(withMusic({})))) as never,
+    });
+    stale.seed("music");
+    stale.run.onRouteChange("music", "100", "on", true);
+    await settle(stale);
+    expect(stale.posts).toHaveLength(1);
+  });
+
+  test("H3b: 'Chosen' with no channel yet is refused without freezing the controls, and the pick survives a later seed", async () => {
+    const h = harness({ routingDataInit: withMusic({}) });
+    h.setFakeNow(READY_NOW);
+    const row = wireRow(h);
+    h.run.ensureRouteState("music", readyModelFor([]));
+    h.run.onRouteChange("music", "100", "on", true);
+    h.run.onRouteChange("music", "100", "scope", "chosen"); // no channel ticked -> unsendable
+    const outcome = await (h.run.sendRouting("music") as unknown as Promise<string | undefined>);
+    expect(outcome).toBe("error");
+    expect(h.posts).toHaveLength(0);
+    const st = h.routeState.get("music")!;
+    expect(st.inflight).toBeNull();
+    expect(row.box.disabled).toBe(false);
+    // H4's error-exit half: the unsent pick is not overwritten by a later ready model (no timer, no outcome).
+    const later = h.run.ensureRouteState("music", readyModelFor([]));
+    expect((later.selection["100"] as { on: boolean; scope: string }).scope).toBe("chosen");
+  });
+
+  test("H4 (#405): a clean step re-seeds from a newer ready model; a pending, held, refused or timed-out one does not", () => {
+    const h = harness({ routingDataInit: withMusic({}) });
+    const first = h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }]));
+    expect(Object.keys(first.selection)).toEqual(["100"]);
+    // Clean: the newer ready model wins.
+    const second = h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }, { id: "200", commands: "all" }]));
+    expect(Object.keys(second.selection).sort()).toEqual(["100", "200"]);
+    // An applied outcome is settled: re-seeds too.
+    (second as unknown as { outcome: unknown }).outcome = { phase: "applied" };
+    expect(Object.keys(h.run.ensureRouteState("music", readyModelFor([{ id: "300", commands: "all" }])).selection)).toEqual(["300"]);
+    for (const [label, patch] of [
+      ["sendTimer", { sendTimer: 1 }],
+      ["held", { held: true }],
+      ["refused", { outcome: { phase: "refused", reason: "x" } }],
+      ["timeout", { outcome: { phase: "timeout" } }],
+    ] as const) {
+      const hh = harness({ routingDataInit: withMusic({}) });
+      const st = hh.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }])) as unknown as Record<string, unknown>;
+      Object.assign(st, patch);
+      const after = hh.run.ensureRouteState("music", readyModelFor([{ id: "999", commands: "all" }]));
+      expect(Object.keys(after.selection), label).toEqual(["100"]);
+    }
+  });
+
+  test("H5 (#468 item 8): both pollers time-box every read to what is left of the answer window", async () => {
+    const results: unknown[] = [];
+    const live = () => withMusic({ "100": { commands: "all" } }, { results });
+    const h = harness({
+      routingDataInit: live(),
+      apiImpl: (async (_p: string, init?: { method?: string }) => (init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "d1" }) } : getAnswer(live()))) as never,
+    });
+    h.seed("music");
+    h.routeState.get("music")!.inflight = { id: "r1", sentServers: [], startedAt: Date.now() };
+    const pending = h.run.awaitRequestResult("music", "r1", [], Date.now());
+    await h.clock.tick(); // poll 1
+    await h.clock.tick(); // poll 2
+    const calls = h.timeoutCalls().slice();
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toBeGreaterThan(29000);
+    expect(calls[0]).toBeLessThanOrEqual(30000);
+    results.push({ id: "r1", action: "routing-set", ok: true, at: "t" });
+    await h.clock.tick();
+    await pending;
+
+    const d = harness({
+      routingDataInit: live(),
+      apiImpl: (async (_p: string, init?: { method?: string }) => (init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "d1" }) } : getAnswer(live()))) as never,
+    });
+    d.seed("music");
+    const refresh = d.run.refreshDiscovery("music");
+    await d.clock.tick(); // the initiating POST, then the first wait
+    const before = d.timeoutCalls().length; // the refresh's own POST signal
+    await d.clock.tick(); // poll 1
+    await d.clock.tick(); // poll 2
+    const polls = d.timeoutCalls().slice(before);
+    expect(polls.length).toBeGreaterThanOrEqual(2);
+    expect(polls[0]).toBeGreaterThan(29000);
+    expect(polls[0]).toBeLessThanOrEqual(30000);
+    d.advanceFakeNow(40000); // past the window: the loop's own timeout ends it
+    await d.clock.tick();
+    await refresh;
+  });
+
+  test("H6 (#528 follow-up): a refused discovery refresh is shown as refused, never as 'Read from Discord again'", async () => {
+    const results = [{ id: "d9", action: "discovery-refresh", ok: false, reason: "nothing changed", at: "t" }];
+    const h = harness({
+      routingDataInit: withMusic({}),
+      apiImpl: (async (_p: string, init?: { method?: string }) =>
+        init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "d9" }) } : getAnswer(withMusic({}, { results }))) as never,
+    });
+    h.seed("music");
+    const pending = h.run.refreshDiscovery("music");
+    await settle(h);
+    await pending;
+    const st = h.routeState.get("music")!;
+    expect(st.inflight).toBeNull();
+    expect(st.outcome).toEqual({ phase: "posted-error", message: "The bot refused it: nothing changed" });
+    expect(h.toasts()).toEqual([{ kind: "danger", text: "The bot refused it: nothing changed" }]);
+    expect(h.refreshRoutingStepsCalls()).toBe(0);
+  });
+
+  test("S1 (#468 item 10, source pin): focus is recorded before the controls are disabled and restored after; the DOM half is browser-only", () => {
+    const render = applyIndexSrc.slice(applyIndexSrc.indexOf("function renderRouteStatus("), applyIndexSrc.indexOf("function discoveryInviteUrl("));
+    const recorded = render.indexOf("document.activeElement");
+    const disabled = render.indexOf("refs.box.disabled = busy");
+    const restored = render.indexOf(".focus()");
+    expect(recorded).toBeGreaterThan(-1);
+    expect(recorded).toBeLessThan(disabled);
+    expect(restored).toBeGreaterThan(disabled);
+    expect(render).toContain("routeFocusId = active.id");
+    const refresh = applyIndexSrc.slice(applyIndexSrc.indexOf("function refreshRoutingSteps("), applyIndexSrc.indexOf("function clearChildren("));
+    expect(refresh).toContain("routeFocusId");
+    expect(refresh).toContain(".focus()");
   });
 
   // Round-3 review finding: refreshDiscovery's own GET/json() pair inside its poll loop was unguarded,
@@ -11840,11 +12121,15 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   // "unauthorized") which the routing code just didn't follow.
   test("a 401 mid-poll clears inflight instead of leaving the step stuck forever (round-3 finding)", async () => {
     const routingDataInit = { routing: { v: 1, updatedAt: "", updatedBy: "", plugins: {}, webhooks: {}, results: [] as { id: string; action: string; ok: boolean; at: string }[] }, discovery };
+    let posted = false;
     const h = harness({
       routingDataInit,
       apiImpl: (async (_path: string, init?: { method?: string }) => {
-        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-401" }) };
-        throw new Error("unauthorized"); // every poll GET hits an expired/rotated token
+        if (init && init.method === "POST") { posted = true; return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "req-401" }) }; }
+        // #405: the send's own re-read GET (before the POST) answers; every poll GET after it hits an
+        // expired/rotated token. (A 401 on the re-read itself ends the send before any POST: "unauthorized".)
+        if (!posted) return { ok: true, status: 200, text: async () => "" };
+        throw new Error("unauthorized");
       }) as never,
     });
     h.seed("music");
@@ -12101,7 +12386,7 @@ describe("retryRegistration end-to-end: the real routingSetBody never drops an u
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
       "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention", "showToast",
-      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routingStepEls = new Map();\n${src}\n` +
+      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
         "return { retryablePlacement, retryRegistration };",
     )(
       document, api, timeoutSignal, setApplyText, opts.pluginsData, 110000, clock.setTimeout, clock.clearTimeout,
