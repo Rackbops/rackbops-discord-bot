@@ -41,8 +41,8 @@ export const NO_PREVIOUS: PreviousScopes = { guilds: [], global: false };
  *  (`error`: whatever was there before stayed). A successful empty (`registered: 0`, no error) shows nothing is. */
 export function previousScopes(file: DiscoveryFile | null): PreviousScopes {
   if (file === null) return NO_PREVIOUS;
-  // Defensive on purpose: until R3 validates the elements, readDiscovery lets `{"guilds":[null]}` and a non-object
-  // `commands` through, and this runs BEFORE single mode's one PUT -- a damaged view must never stop it.
+  // Defensive on purpose: readDiscovery (#482) checks the guild and channel elements but not `commands`, so a
+  // non-object `commands` still comes through, and this runs BEFORE single mode's one PUT -- a damaged view must never stop it.
   const owned = (r: unknown): boolean =>
     typeof r === "object" &&
     r !== null &&

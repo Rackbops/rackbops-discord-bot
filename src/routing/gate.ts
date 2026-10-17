@@ -15,10 +15,15 @@
 // though this gate never throws: a fault it cannot judge lets the picker run, as it lets the command run);
 // a button or a modal is not -- it belongs to a message that is already in an allowed channel.
 //
+// A refusal names only the channels the bot can still see (#483): the ones `discovery.json` lists in the server
+// (it is refreshed every 15 minutes, and not at all when a refresh fails). When none of the listed channels is there any more (deleted since), the restriction
+// points nowhere, so the command runs and a `[gate]` line says so. Where the restriction is advisory -- the bot
+// cannot look at the channel, a thread's parent is unknown, or the gate fails -- the command runs too (#482).
+//
 // `whereOf` is the only function here that touches discord.js objects; everything else is data.
 
 import type { ChatInputCommandInteraction } from "discord.js";
-import type { RoutingFile } from "./model";
+import type { DiscoveryFile, RoutingFile } from "./model";
 import { commandAllowed } from "./resolve";
 
 export interface Where {
@@ -86,6 +91,26 @@ export function refusalMessage(commandName: string, channels: readonly string[])
   return `\`/${commandName}\` works in ${where} here.`;
 }
 
+/** The channels of `listed` that `discovery.json` shows in `guildId`; `undefined` when there is nothing to check
+ *  against (no dep, no file, no such server or one listed with no channels, or a read that throws -- the caller
+ *  then names them all). A listed channel the bot cannot view is not in the file, so it counts as gone. */
+async function visibleChannels(
+  listed: readonly string[],
+  guildId: string,
+  readDiscovery?: () => Promise<DiscoveryFile | null>,
+): Promise<string[] | undefined> {
+  if (readDiscovery === undefined) return undefined;
+  try {
+    const guild = (await readDiscovery())?.guilds.find((g) => g.id === guildId);
+    // A server listed with no channels at all is an outage stub or a cache not yet filled, not "every channel gone".
+    if (guild === undefined || guild.channels.length === 0) return undefined;
+    const seen = new Set(guild.channels.map((c) => c.id));
+    return listed.filter((id) => seen.has(id));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The refusal to show, or `undefined` to let the command run. `plugin` is the plugin that owns the
  * command, or `undefined` for anything else. Never throws.
@@ -102,6 +127,7 @@ export async function gateCommand(
   lookupWhere: () => Promise<Where>,
   readRouting: () => Promise<RoutingFile>,
   log: Pick<Console, "error">,
+  readDiscovery?: () => Promise<DiscoveryFile | null>,
 ): Promise<string | undefined> {
   if (plugin === undefined || here.guildId === null) return undefined;
   try {
@@ -115,7 +141,17 @@ export async function gateCommand(
       log.error(`[gate] could not tell where /${commandName} was typed (channel ${here.channelId}), so it is not refused`);
       return undefined;
     }
-    return refusalMessage(commandName, verdict.channels);
+    // #483: a listed channel the operator has since deleted would be named as `#deleted-channel`. Keep the ones the
+    // bot can still see (discovery.json, refreshed every 15 minutes, so possibly older); with none left the
+    // restriction points nowhere, so the command runs and the log says so. No file, or a file without this server, names them all, as before.
+    // The staleness cuts both ways: a channel deleted since can still be named once, and one hand-added to
+    // routing.json that is not yet in the file counts as gone.
+    const visible = await visibleChannels(verdict.channels, here.guildId, readDiscovery);
+    if (visible !== undefined && visible.length === 0) {
+      log.error(`[gate] every channel listed for /${commandName} in server ${here.guildId} is gone from what the bot can see; letting it run`);
+      return undefined;
+    }
+    return refusalMessage(commandName, visible ?? verdict.channels);
   } catch (err) {
     log.error(`[gate] could not decide whether /${commandName} may run here; letting it run`, err);
     return undefined;

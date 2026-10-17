@@ -60,9 +60,11 @@ request mailbox and applied without a restart.
    in time: a bot or panel from before #219 rebuilds each server entry from the keys it knows, so
    rolling either back drops every `destinations` mapping on its next write (they have to be picked
    again after rolling forward).
-7. **Channel restrictions are enforced by the bot at dispatch**, because a bot cannot edit
-   Discord's per-channel command permissions (that needs a user's bearer token). A command used
-   outside its channels gets a private reply naming the right ones; a thread counts as its parent.
+7. **Channel restrictions are enforced by the bot at dispatch**, where the bot can see the channel
+   (where it cannot -- a channel it has no view of, a thread whose parent is unknown -- the command runs
+   and the log says so, `gate.ts`), because a bot cannot edit Discord's per-channel command permissions
+   (that needs a user's bearer token). A command used outside its channels gets a private reply naming
+   the right ones, and only ones the bot can still see (#483); a thread counts as its parent.
 8. **The panel may set plugin-declared secret keys, write-only.** A key the Plugin Index marks
    `secret: true` can be written through `env-set`, is never returned by `env-get`, and appears in
    `env-schema` with its `pattern`, `required` and `source` plus `secret` + `isSet`, never its

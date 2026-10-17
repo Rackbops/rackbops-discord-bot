@@ -850,7 +850,10 @@ describe("consumePluginRequests drain", () => {
           calls.push(`applyRouting ${reason}`);
           return {};
         },
-        refreshDiscovery: async () => void calls.push("refreshDiscovery"),
+        refreshDiscovery: async () => {
+          calls.push("refreshDiscovery");
+          return true;
+        },
         now: () => new Date(AT),
         log: { warn() {} },
         ...over,
@@ -1973,6 +1976,7 @@ describe("consumePluginRequests drain", () => {
           order.push("first:start");
           await blocked;
           order.push("first:end");
+          return true;
         },
         applyRouting: async (reason) => {
           order.push(`second:${reason}`);

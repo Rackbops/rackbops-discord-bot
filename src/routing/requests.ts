@@ -151,7 +151,8 @@ export interface RoutingRequestDeps {
   mutateSecrets: (mutate: (current: RoutingSecretsFile) => RoutingSecretsFile) => Promise<void>;
   fetchWebhook: (id: string, token: string) => Promise<WebhookLookup>;
   applyRouting: (reason: string) => Promise<unknown>;
-  refreshDiscovery: () => Promise<void>;
+  /** `true` when discovery.json was written; `false` when nothing was refreshed (#484). */
+  refreshDiscovery: () => Promise<boolean>;
   now: () => Date;
   log: Pick<Console, "warn">;
 }
@@ -182,11 +183,12 @@ async function checkAgainstDiscovery<T>(deps: RoutingRequestDeps, check: (discov
       const first = check(before);
       if (first.ok) return first.value;
     } catch {
-      // A file damaged in a way `readDiscovery` cannot see (a guild with no channels list, say) is the
-      // same as a stale one: look again after a refresh, which rewrites it.
+      // `readDiscovery` is the first net: it rejects a file whose guild or channel elements are malformed. This is
+      // the second, for a fault it does not check (a `check` that throws on something else): treated as a stale
+      // file -- look again after a refresh, which rewrites it.
     }
   }
-  await deps.refreshDiscovery();
+  await deps.refreshDiscovery(); // the boolean is ignored: the file is re-read either way
   const after = await deps.readDiscovery();
   if (after === null) throw new RoutingRefusal("the bot has not published what it can see yet");
   const second = check(after);
@@ -196,8 +198,13 @@ async function checkAgainstDiscovery<T>(deps: RoutingRequestDeps, check: (discov
 
 /**
  * Carries out one parsed request. Resolves once it is APPLIED -- for `routing-set` that is once
- * `routing.json` is written; a server that then refuses its commands is not a failed request and shows
- * against that server in `discovery.json`. Throws `RoutingRefusal` for an expected no; anything else
+ * `routing.json` is written AND the re-registration it starts has run (one PUT per server the bot is in, plus any
+ * rate-limit wait, behind whatever is queued on routing's chain; a slow one can outlast the panel's 30 s window,
+ * which then reports a timeout for a change that did land -- the per-server outcome is in `discovery.json`). The
+ * result is deliberately recorded only then: the panel reads `discovery.json` the moment the result appears
+ * (`requestOutcome`) and offers no "Check again" in that phase, so an earlier result would show a wrong view
+ * (#484). A server that then refuses its commands is not a failed request and shows against that server in
+ * `discovery.json`. Throws `RoutingRefusal` for an expected no; anything else
  * thrown is a fault. `channelId` is the channel a webhook request landed on, so the result can name it.
  */
 export async function applyRoutingRequest(request: RoutingRequest, deps: RoutingRequestDeps): Promise<{ channelId?: string }> {
@@ -240,7 +247,7 @@ export async function applyRoutingRequest(request: RoutingRequest, deps: Routing
       await checkAgainstDiscovery(deps, (discovery) => {
         const guild = discovery.guilds.find((g) => g.id === guildId);
         if (guild === undefined) return { ok: false, reason: "that webhook posts to a server the bot is not in" };
-        if (!guild.channels.some((c) => c.id === channelId)) return { ok: false, reason: "that webhook posts to a channel the bot cannot see" };
+        if (!guild.channels.some((c) => c.id === channelId)) return { ok: false, reason: "that webhook posts to a channel the bot does not list (it lists the text and announcement channels it can see)" };
         return { ok: true, value: undefined };
       });
       // The secret first, the metadata second: routing.json never names a webhook whose URL is missing.
@@ -306,7 +313,9 @@ export async function applyRoutingRequest(request: RoutingRequest, deps: Routing
     }
 
     case "discovery-refresh":
-      await deps.refreshDiscovery();
+      if (!(await deps.refreshDiscovery())) {
+        throw new RoutingRefusal("discovery could not be refreshed (the bot has not finished starting, or its log says why)");
+      }
       return {};
   }
 }

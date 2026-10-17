@@ -99,13 +99,14 @@ function takeSnapshots(c: RoutingContext): GuildSnapshot[] | null {
 }
 
 /** Builds and writes `discovery.json`. A failure is logged and swallowed: it is a view for the panel,
- *  never a reason to fail a registration or a refresh. `why` names what was being done. */
+ *  never a reason to fail a registration or a refresh. `why` names what was being done. Resolves `true` when the
+ *  file was written, `false` when the write failed (#484: `refreshDiscovery` reports it; a registration ignores it). */
 async function writeView(
   c: RoutingContext,
   snapshots: readonly GuildSnapshot[],
   registrations: readonly GuildRegistration[],
   why: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const file = buildDiscovery({
       now: c.now(),
@@ -116,8 +117,10 @@ async function writeView(
       plugins: c.plugins,
     });
     await writeDiscovery(c.dataDir, file);
+    return true;
   } catch (err) {
     tell(c, "error", `[routing] writing discovery.json failed (${why}) -- the panel keeps the last copy it has`, err);
+    return false;
   }
 }
 
@@ -203,7 +206,9 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
  *  queues behind itself). `routing` and `snapshots` are what the job read. */
 async function fullRun(c: RoutingContext, reason: string, routing: RoutingFile, snapshots: GuildSnapshot[] | null): Promise<ApplyResult> {
   // #420: what the last published file says the bot still owns; nothing when there is none (a first boot). The
-  // file is a VIEW: a damaged or unreadable one is said and treated as none, never allowed to stop the PUT below.
+  // file is a VIEW: an unreadable one is said and treated as none, never allowed to stop the PUT below.
+  // One that parses but fails `readDiscovery`'s shape check (#482) reads as `null` WITHOUT a line, so this run skips
+  // its empties; it rewrites the file when the servers could be read, and the next run then has a valid record again.
   let previous = NO_PREVIOUS;
   try {
     previous = previousScopes(await readDiscovery(c.dataDir));
@@ -296,12 +301,15 @@ export function applyRoutingFor(guildId: string, reason: string): Promise<ApplyR
 }
 
 /** Re-snapshot the servers and rewrite `discovery.json` with the registrations already made. Before
- *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. */
-export function refreshDiscovery(): Promise<void> {
+ *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. Resolves
+ *  `true` when `discovery.json` was written; `false` before `initRouting` (no log line), when the servers could not
+ *  be read, or when the write failed (both logged) -- a `discovery-refresh` request is refused on `false` (#484). */
+export function refreshDiscovery(): Promise<boolean> {
   return enqueue(async () => {
-    if (context === undefined) return;
+    if (context === undefined) return false;
     const snapshots = takeSnapshots(context);
-    if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
+    if (snapshots === null) return false;
+    return writeView(context, snapshots, lastRegistrations, "refresh");
   });
 }
 

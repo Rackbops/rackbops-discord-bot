@@ -324,6 +324,7 @@ async function activate(c: Client<true>): Promise<void> {
               () => whereOf(chatInput, (id) => client.channels.fetch(id)),
               () => readRouting(DATA_DIR),
               console,
+              () => readDiscovery(DATA_DIR),
             ),
         );
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
@@ -352,6 +353,7 @@ async function activate(c: Client<true>): Promise<void> {
               () => whereOf(interaction, (id) => client.channels.fetch(id)),
               () => readRouting(DATA_DIR),
               { error: () => {} },
+              () => readDiscovery(DATA_DIR),
             ),
           log: console,
         });
