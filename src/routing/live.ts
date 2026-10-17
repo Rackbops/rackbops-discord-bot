@@ -99,13 +99,14 @@ function takeSnapshots(c: RoutingContext): GuildSnapshot[] | null {
 }
 
 /** Builds and writes `discovery.json`. A failure is logged and swallowed: it is a view for the panel,
- *  never a reason to fail a registration or a refresh. `why` names what was being done. */
+ *  never a reason to fail a registration or a refresh. `why` names what was being done. Resolves `true` when the
+ *  file was written, `false` when the write failed (#484: `refreshDiscovery` reports it; a registration ignores it). */
 async function writeView(
   c: RoutingContext,
   snapshots: readonly GuildSnapshot[],
   registrations: readonly GuildRegistration[],
   why: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const file = buildDiscovery({
       now: c.now(),
@@ -116,8 +117,10 @@ async function writeView(
       plugins: c.plugins,
     });
     await writeDiscovery(c.dataDir, file);
+    return true;
   } catch (err) {
     tell(c, "error", `[routing] writing discovery.json failed (${why}) -- the panel keeps the last copy it has`, err);
+    return false;
   }
 }
 
@@ -296,12 +299,15 @@ export function applyRoutingFor(guildId: string, reason: string): Promise<ApplyR
 }
 
 /** Re-snapshot the servers and rewrite `discovery.json` with the registrations already made. Before
- *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. */
-export function refreshDiscovery(): Promise<void> {
+ *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. Resolves
+ *  `true` when `discovery.json` was written; `false` before `initRouting` (no log line), when the servers could not
+ *  be read, or when the write failed (both logged) -- a `discovery-refresh` request is refused on `false` (#484). */
+export function refreshDiscovery(): Promise<boolean> {
   return enqueue(async () => {
-    if (context === undefined) return;
+    if (context === undefined) return false;
     const snapshots = takeSnapshots(context);
-    if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
+    if (snapshots === null) return false;
+    return writeView(context, snapshots, lastRegistrations, "refresh");
   });
 }
 

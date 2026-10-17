@@ -434,8 +434,15 @@ describe("index.ts wiring", () => {
       expect(handleBlock).not.toMatch(/await\s+whereOf\(/);
       // The plugin that owns the command is the one whose routing decides, and the command name shown is the registered one.
       expect(handleBlock).toMatch(
-        /gateCommand\(\s*commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*chatInput,\s*\(\)\s*=>\s*whereOf\([^]*?\),\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console,?\s*\)/,
+        /gateCommand\(\s*commandMap\.get\(bare\)\?\.entry\.name,\s*chatInput\.commandName,\s*chatInput,\s*\(\)\s*=>\s*whereOf\([^]*?\),\s*\(\)\s*=>\s*readRouting\(DATA_DIR\),\s*console,\s*\(\)\s*=>\s*readDiscovery\(DATA_DIR\),?\s*\)/,
       );
+    });
+
+    // #483: a refusal names only channels discovery.json still shows, so both gate call sites hand over the read.
+    test("both gateCommand calls pass readDiscovery(DATA_DIR) as the last argument", () => {
+      const calls = source.match(/gateCommand\([^]*?\n\s*\),/g) ?? [];
+      expect(calls.length).toBe(2);
+      for (const call of calls) expect(call).toMatch(/\(\)\s*=>\s*readDiscovery\(DATA_DIR\),?\s*\),$/);
     });
 
     test("only plugin commands reach the gate: it is an argument to handleCommand, not a check in front of it", () => {

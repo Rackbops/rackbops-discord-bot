@@ -3,8 +3,8 @@
 // channels the plugin posts to; for each one this posts through the channel's webhook when it has a
 // usable one, and as the bot when it does not.
 //
-// The governing rule: with no routing, the call is exactly today's -- one post, as the bot, to the
-// default channel, and a failure there propagates (a discord.js REST error without the request it
+// The governing rule: with no routing, one post to the default channel -- as the bot, or through the default
+// channel's webhook when one is registered (the one rule every target follows) -- and a failure there propagates (a discord.js REST error without the request it
 // carried, #508; an error with no request in it unchanged).
 //
 // A webhook URL is a secret (it is a bearer credential for the channel). It comes out of
@@ -47,8 +47,10 @@ function usableWebhook(routing: RoutingFile, channelId: string): WebhookMeta | u
  * Posts `message` for `plugin`. Every target follows the same rule, the default channel included: a
  * registered, unbroken webhook with a stored URL is posted through; otherwise the bot posts. A webhook
  * that fails, for any reason, falls back to the bot for that post; only 401/404 (`gone`) also marks it
- * broken, so the panel can say so and the next post skips it. A rate limit, a 5xx, a timeout or a
- * message that is too long is a bad moment, not a dead webhook.
+ * broken, so the panel can say so and the next post skips it. A rate limit, a 5xx or a timeout is a bad
+ * moment, not a dead webhook. A message over Discord's cap is neither: it fails through the webhook and as the
+ * bot alike (nothing here splits it), so the fallback costs one round trip and fails the same way; a plugin that
+ * produces one is the thing to fix.
  *
  * A webhook that timed out or answered 5xx may still have delivered the message, so the fallback can put
  * a second copy in the channel: a message that must arrive is worth more here than one that arrives

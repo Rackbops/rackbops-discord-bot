@@ -430,7 +430,7 @@ describe("applyRouting", () => {
 
 describe("refreshDiscovery", () => {
   test("refreshDiscovery before initRouting is a no-op", async () => {
-    await expect(refreshDiscovery()).resolves.toBeUndefined();
+    await expect(refreshDiscovery()).resolves.toBe(false);
     expect(readdirSync(dir)).toEqual([]);
   });
 
@@ -443,7 +443,7 @@ describe("refreshDiscovery", () => {
 
     // A channel appears in Discord between the boot and the refresh.
     h.world.addChannel(OTHER, textChannel("2003", "new-channel", 3));
-    await refreshDiscovery();
+    await expect(refreshDiscovery()).resolves.toBe(true);
     const after = readDiscovery();
 
     expect(after.guilds.find((g) => g.id === OTHER)!.channels.map((c) => c.name)).toEqual(["spotify", "chat", "new-channel"]);
@@ -467,7 +467,8 @@ describe("refreshDiscovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(existsSync(discoveryPath(dir))).toBe(false);
     release();
-    await Promise.all([applying, refreshing]);
+    const [, refreshed] = await Promise.all([applying, refreshing]);
+    expect(refreshed).toBe(true);
     expect(readDiscovery().guilds.find((g) => g.id === HOME)!.commands).not.toBeNull();
   });
 
@@ -486,7 +487,7 @@ describe("refreshDiscovery", () => {
     const before = readFileSync(discoveryPath(dir), "utf8");
     // The read fails for a while: the file the panel is showing is not blanked by it.
     broken = true;
-    await refreshDiscovery();
+    await expect(refreshDiscovery()).resolves.toBe(false);
     expect(readFileSync(discoveryPath(dir), "utf8")).toBe(before);
     expect(h.logs.error.at(-1)).toContain("could not read the bot's servers");
   });
@@ -498,7 +499,7 @@ describe("refreshDiscovery", () => {
     initRouting(h.ctx);
     await applyRouting("boot");
     h.logs.error.length = 0;
-    await expect(refreshDiscovery()).resolves.toBeUndefined();
+    await expect(refreshDiscovery()).resolves.toBe(false);
     expect(h.logs.error).toHaveLength(1);
     expect(h.logs.error[0]).toContain("writing discovery.json failed (refresh)");
   });

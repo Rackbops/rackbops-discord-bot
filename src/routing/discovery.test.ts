@@ -8,6 +8,7 @@ import type { Plugin, PluginCommand, PluginIndexEntry, TickCheck } from "../plug
 import { buildDiscovery, describePlugins, discoveryPath, inviteUrl, readDiscovery, snapshotGuilds, writeDiscovery } from "./discovery";
 import type { GuildSnapshot } from "./discovery";
 import type { GuildRegistration } from "./register";
+import { resetKeptCorruptForTest } from "../storage";
 
 const HOME = "111111111111111111";
 const OTHER = "222222222222222222";
@@ -21,6 +22,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  // readDiscovery keeps a file that will not parse in place and remembers it (#477); the state guard fails a leak.
+  resetKeptCorruptForTest();
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -416,10 +419,11 @@ describe("readDiscovery (#241)", () => {
   test("a malformed file reads as not published yet", async () => {
     const quiet = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // Not JSON at all -- moved aside by readJsonOrFresh, as every data file is.
+      // Not JSON at all -- a read leaves it where it is (R2's onCorrupt "keep"); writeDiscovery replaces it whole.
       writeFileSync(discoveryPath(dir), "{ not json");
       expect(await readDiscovery(dir)).toBeNull();
-      expect(readdirSync(dir).some((f) => f.startsWith("discovery.json.corrupt-"))).toBe(true);
+      expect(readdirSync(dir)).toEqual(["discovery.json"]);
+      expect(readFileSync(discoveryPath(dir), "utf8")).toBe("{ not json");
       // JSON, but not a file the bot wrote: no guilds list.
       for (const damaged of ["null", "[]", "5", '"text"', "{}", '{"v":1}', '{"guilds":null}', '{"guilds":{}}', '{"guilds":"x"}']) {
         writeFileSync(discoveryPath(dir), damaged);
@@ -427,6 +431,38 @@ describe("readDiscovery (#241)", () => {
       }
     } finally {
       quiet.mockRestore();
+    }
+  });
+
+  // #482: every element a reader indexes into is checked, so a hand-damaged file is "not published yet" here and
+  // not a TypeError in a plugin's destinations() or the mailbox's check. Every ELEMENT case carries a valid
+  // `plugins`, or it would stop at the plugins check and never reach the element check it pins.
+  test("V1: a malformed guild or channel element, or a missing or wrong plugins, reads as not published yet", async () => {
+    const cases = [
+      '{"guilds":[null],"plugins":{}}',
+      '{"guilds":[{"id":1}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":"none"}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[null]}],"plugins":{}}',
+      '{"guilds":[],"plugins":[]}',
+      '{"guilds":[]}',
+      // one field at a time (the id and name cases would otherwise mask each other)
+      '{"guilds":[{"id":"1","channels":[]}],"plugins":{}}',
+      '{"guilds":[{"name":"x","channels":[]}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[{"name":"c"}]}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[{"id":"c"}]}],"plugins":{}}',
+    ];
+    for (const damaged of cases) {
+      writeFileSync(discoveryPath(dir), damaged);
+      expect(await readDiscovery(dir), damaged).toBeNull();
+    }
+  });
+
+  test("V1b: a good file with commands null or a registration, an empty guild list and an unknown key still reads", async () => {
+    const good = (commands: unknown, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ guilds: [{ id: "1", name: "x", channels: [{ id: "c", name: "general" }], commands }], plugins: {}, ...extra });
+    for (const text of [good(null), good({ registered: 0, at: AT }), good(null, { somethingNew: 1, global: { registered: 3, at: AT } }), '{"guilds":[],"plugins":{}}']) {
+      writeFileSync(discoveryPath(dir), text);
+      expect(await readDiscovery(dir), text).not.toBeNull();
     }
   });
 
