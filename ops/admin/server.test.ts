@@ -11979,14 +11979,14 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       }) as never,
     });
     h.seed("music");
-    h.routeState.get("music")!.inflight = { id: "r1", sentServers: [], startedAt: Date.now() };
-    const pending = h.run.awaitRequestResult("music", "r1", [], Date.now());
+    h.setFakeNow(READY_NOW); // the page's clock is the harness's: the test's own Date.now() is the real one
+    h.routeState.get("music")!.inflight = { id: "r1", sentServers: [], startedAt: READY_NOW };
+    const pending = h.run.awaitRequestResult("music", "r1", [], READY_NOW);
     await h.clock.tick(); // poll 1
     await h.clock.tick(); // poll 2
     const calls = h.timeoutCalls().slice();
     expect(calls).toHaveLength(2);
-    expect(calls[0]).toBeGreaterThan(29000);
-    expect(calls[0]).toBeLessThanOrEqual(30000);
+    expect(calls[0]).toBe(30000);
     expect(getSignals.slice(0, 2)).toEqual([{ timeoutMs: calls[0] }, { timeoutMs: calls[1] }]);
     results.push({ id: "r1", action: "routing-set", ok: true, at: "t" });
     await h.clock.tick();
@@ -12002,6 +12002,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
       }) as never,
     });
     d.seed("music");
+    d.setFakeNow(READY_NOW);
     const refresh = d.run.refreshDiscovery("music");
     await d.clock.tick(); // the initiating POST, then the first wait
     const before = d.timeoutCalls().length; // the refresh's own POST signal
@@ -12009,8 +12010,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await d.clock.tick(); // poll 2
     const polls = d.timeoutCalls().slice(before);
     expect(polls.length).toBeGreaterThanOrEqual(2);
-    expect(polls[0]).toBeGreaterThan(29000);
-    expect(polls[0]).toBeLessThanOrEqual(30000);
+    expect(polls[0]).toBe(30000);
     expect(refreshSignals.slice(0, 2)).toEqual([{ timeoutMs: polls[0] }, { timeoutMs: polls[1] }]);
     d.advanceFakeNow(40000); // past the window: the loop's own timeout ends it
     await d.clock.tick();
