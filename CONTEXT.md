@@ -1877,12 +1877,15 @@ _Avoid_: server list, guild cache
   that throws stays on its own panel (`renderOwnPanel`, `READ_JSON` block) instead of blanking the cards and the
   Config editor, and every read of a discovery guild's `channels` is guarded. A successful apply (and the #47
   failed-but-wrote path) ends replace mode for the secrets it saved (`secretsReplacing`), so the card shows
-  "Saved on the server"; a refusal that wrote nothing keeps it. Every JSON read goes through `readJson`
-  (`errorBodyText`: the status when empty, "(an HTML error page)" for HTML, else the text clipped to 300) and
-  every failed fetch is described by `describeFetchError`. The token gate says "That token was not accepted"
+  "Saved on the server"; a refusal that wrote nothing keeps it. The page's JSON reads go through `readJson`
+  (`errorBodyText`: the status when empty, "(an HTML error page)" for HTML, else the text clipped to 300),
+  except four that check `ok` themselves: env-schema, `hasAccessSession`, `/api/branches` and `setEnv`'s error
+  read. The reload, Apply and poller failures are described by `describeFetchError`; the Restart button's own
+  catch still prints the raw message. The token gate says "That token was not accepted"
   after an Unlock (`unlockPending`, kept through the burst of 401s `showApp` fires; an empty `showGate()` never
   erases a shown message) and, when Lock set `LOCKED_KEY`, points an Access operator to a new tab; Lock reloads
-  the page so nothing rendered survives it. There is deliberately no one-click Access button on the gate (it
+  the page, so nothing the page rendered survives it (a browser may restore the two static inputs, token and
+  admin email, on a reload). There is deliberately no one-click Access button on the gate (it
   would make Lock a one-click no-op). A secret field in replace mode is a `<label for>`; the toast region
   (`ensureToastRegion`) is created empty and polite at load, and info/success toasts carry no role of their own.
   The queued reload starts whether the one ahead of it lands or rejects (`.then(run, run)`, round 2), so a
