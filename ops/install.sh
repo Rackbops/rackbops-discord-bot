@@ -167,6 +167,27 @@ fetch() {
   mv "$DOWNLOADED" "$3"
 }
 
+# #486: like fetch(), but when the destination is already a regular file we own, its CONTENT is replaced
+# and its inode kept. The admin service bind-mounts docker-compose.yml as that ONE file, and a mount
+# follows the inode: fetch()'s mv gives the path a new inode, so a running admin would keep reading the
+# old file until it was recreated. A `cat >` keeps the old file's mode and owner, so both are set on the
+# destination itself (chmod to $2, chown to the deploy ids). Anything else -- a first install, a symlink,
+# or a file we do not own (e.g. a root-owned leftover, which mv replaces in our own directory and a `cat >`
+# could not open) -- takes fetch()'s mv path. The trade: an in-place write is not atomic. A `docker
+# compose -f` that reads the file in that instant sees it truncated and fails (loudly, a parse error), and
+# a kill mid-write leaves a truncated file the next run rewrites. Used for the compose file only: bot-ops.sh
+# sits in a mounted DIRECTORY and the stack .env is not mounted, so both stay on the atomic mv.
+fetch_in_place() {
+  download "$@"
+  if [ -f "$3" ] && [ ! -L "$3" ] && [ -O "$3" ]; then
+    cat "$DOWNLOADED" > "$3"
+    chmod "$2" "$3"
+    chown "$DEPLOY_UID:$DEPLOY_GID" "$3"
+  else
+    mv "$DOWNLOADED" "$3"
+  fi
+}
+
 # The BOT_OPS_SCHEMA a bot-ops.sh file declares — read back from disk rather than trusted from
 # memory, so this can never itself drift from what a fetch actually wrote. Shared by the "wrote …
 # schema" summary line and install_shared_bin's refusal message below, so the two can't disagree.
@@ -226,10 +247,16 @@ random_token() { od -An -tx1 -N32 /dev/urandom | tr -d ' \n'; }
 validate_stack_env() {
   local file="$1" key value
   for key in BOT_ENV_FILE BOT_OPS_CONFIG_DIR BOT_OPS_COMPOSE_FILE; do
-    value="$(grep "^${key}=" "$file" | tail -n1 | cut -d= -f2-)"
+    # #486: a missing key makes a bare `grep` exit 1, which under pipefail would end the script with no
+    # message at all; `|| true` makes the read total so the die below can name the field. An empty value
+    # (`KEY=`) reads the same way: for a generated file both mean the render failed.
+    value="$({ grep "^${key}=" "$file" || true; } | tail -n1 | cut -d= -f2-)"
+    [ -n "$value" ] || die "$key is missing from $file"
     [[ "$value" == /* ]] || die "$key must be an absolute path, got \"$value\""
   done
-  value="$(grep '^BOT_OPS_CONFIG_DIR=' "$file" | tail -n1 | cut -d= -f2-)"
+  # Dead `|| true` (the loop above already proved this key is present and non-empty); kept so the two
+  # reads of the same file stay identical.
+  value="$({ grep '^BOT_OPS_CONFIG_DIR=' "$file" || true; } | tail -n1 | cut -d= -f2-)"
   [ -d "$value" ] || die "BOT_OPS_CONFIG_DIR does not exist"
 }
 
@@ -287,12 +314,20 @@ main() {
 
   if [ -f "$CONFIG_DIR/.env" ]; then
     echo "install: $CONFIG_DIR/.env already exists — leaving your config alone"
+    # #486: a re-run (e.g. after a --force-bin refusal further down) never reprints the token, so say
+    # where it lives. Never the value.
+    if grep -q '^ADMIN_TOKEN=.' "$CONFIG_DIR/.env"; then
+      echo "install: ADMIN_TOKEN is already set in $CONFIG_DIR/.env (read it there for the panel's unlock prompt)"
+    fi
   else
-    fetch ".env.example" 600 "$CONFIG_DIR/.env"
+    # #486: the token is patched into the TEMP file and only then moved, so the final path never holds
+    # a real-looking .env with an empty ADMIN_TOKEN= (which every later run would preserve).
+    download ".env.example" 600 "$CONFIG_DIR/.env"
     # The one secret this tooling generates itself rather than asking you to supply — it isn't
     # tied to any external account, unlike DISCORD_TOKEN/BLIZZARD_CLIENT_SECRET above.
     ADMIN_TOKEN="$(random_token)"
-    sed -i "s#^ADMIN_TOKEN=.*#ADMIN_TOKEN=$ADMIN_TOKEN#" "$CONFIG_DIR/.env"
+    sed -i "s#^ADMIN_TOKEN=.*#ADMIN_TOKEN=$ADMIN_TOKEN#" "$DOWNLOADED"
+    mv "$DOWNLOADED" "$CONFIG_DIR/.env"
     echo "install: wrote $CONFIG_DIR/.env from .env.example — fill in secrets before starting"
     echo "install: generated ADMIN_TOKEN for the admin panel — paste this into its unlock prompt:"
     echo "install:   $ADMIN_TOKEN"
@@ -303,9 +338,10 @@ main() {
   # deployment artifacts, not instance config" split from app-config-deployment-foundation.md —
   # with the one exception that bin/bot-ops.sh is shared by every instance on this HOST, so a
   # per-instance branch cannot silently put non-main content there for all of them to inherit; see
-  # install_shared_bin above (#230).
+  # install_shared_bin above (#230). The compose file is rewritten in place (#486) so a running admin,
+  # which mounts that one file, sees it.
   install_shared_bin
-  fetch "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
+  fetch_in_place "docker-compose.yml" 644 "$STACK_DIR/docker-compose.yml"
   # #178: same pattern as bot-ops.sh's schema line above — read back from the file just written, so
   # an operator can compare this against the panel's own "docker-compose.yml schema <got> (panel
   # needs <want>)" startup log line after a re-run. #295: `|| true` makes the read total the same
@@ -330,8 +366,9 @@ main() {
   # monorepo-era fallbacks — closing the gap install.sh's own printed shell-prefix commands never
   # needed in the first place. Generated, not precious — always refreshed, same as bin/bot-ops.sh
   # and the compose file above, and for the same crash-safety reason: temp file first, atomic move.
-  # GIT_SHA carries the sha just resolved above rather than blank, so a bot brought up through this
-  # fallback alone still reports accurate self-update status; BOT_BUILD_CONTEXT points at the remote
+  # GIT_SHA is the sha the branch pointed at when install.sh ran: a build from this file reports
+  # accurate self-update status only if the branch has not moved since (see ops/README.md's note on a
+  # manual `up -d --build bot`); BOT_BUILD_CONTEXT points at the remote
   # branch (not `.`) so even an accidental rebuild through this fallback has a real Dockerfile to
   # build from instead of failing on the stack dir, which holds none.
   STACK_ENV_TMP="$(mktemp -p "$STACK_DIR")"
@@ -348,7 +385,7 @@ STACKENV
   mv "$STACK_ENV_TMP" "$STACK_DIR/.env"
   chown "$DEPLOY_UID:$DEPLOY_GID" "$STACK_DIR/.env"
   # Before this write is announced or the (now-shortened) next-steps block prints — a bad render
-  # dies here, silently. Earlier steps (the config .env, bin/bot-ops.sh, docker-compose.yml) have
+  # dies here, naming the field. Earlier steps (the config .env, bin/bot-ops.sh, docker-compose.yml) have
   # already logged their own real successes by this point; this only guards what comes after it.
   validate_stack_env "$STACK_DIR/.env"
   echo "install: wrote $STACK_DIR/.env (Dockge's own interpolation source — see ops/README.md)"

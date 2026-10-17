@@ -7,7 +7,19 @@
 // subprocess with a faked `id`. Needs bash on PATH; skips loudly (not vacuously) without one, same
 // convention as ops/bot-ops.test.ts. On Windows, Git's own bash is used.
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -160,6 +172,8 @@ interface Sweep {
   leftovers: number;
   /** Whether fetch() completed its mv to the real destination. */
   destExists: boolean;
+  /** Every chown the run made, as the `$*` it was called with (#425: all must be DEPLOY_UID:DEPLOY_GID = 4242:4343). */
+  chownCalls: string[];
 }
 
 async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Sweep> {
@@ -174,10 +188,12 @@ async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Swe
       // the passing case evidence of the trap rather than of mv having already moved the file.
       o.withTrap ? CLEANUP_TRAP : "# trap deliberately omitted (mutation control)",
       // Fakes: curl is the failure injector; chown can't work on a Windows/CI checkout and isn't
-      // what's under test. chmod is real — it's harmless and keeps the extracted body honest.
+      // what's under test here. chmod is real — it's harmless and keeps the extracted body honest.
+      // #425: chown is a RECORDER, not a no-op, and the ids are distinctive, so a chown to anything but
+      // DEPLOY_UID:DEPLOY_GID (e.g. the running process's own ids) is visible to the E2 assertions below.
       `curl() { return ${o.curlExit}; }`,
-      "chown() { :; }",
-      'RAW_BASE="http://example.invalid"; BRANCH="typo"; DEPLOY_UID=1000; DEPLOY_GID=1000',
+      'chown() { echo "$*" >> chown.log; }',
+      'RAW_BASE="http://example.invalid"; BRANCH="typo"; DEPLOY_UID=4242; DEPLOY_GID=4343',
       DOWNLOAD,
       FETCH,
       'fetch "docker-compose.yml" 644 "./out.yml"',
@@ -185,7 +201,8 @@ async function runSweep(o: { withTrap: boolean; curlExit: number }): Promise<Swe
     const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
     const exitCode = await proc.exited;
     const entries = readdirSync(dir);
-    return { exitCode, leftovers: entries.filter((f) => f.startsWith("tmp.")).length, destExists: entries.includes("out.yml") };
+    const chownCalls = entries.includes("chown.log") ? readFileSync(join(dir, "chown.log"), "utf8").trim().split("\n").filter(Boolean) : [];
+    return { exitCode, leftovers: entries.filter((f) => f.startsWith("tmp.")).length, destExists: entries.includes("out.yml"), chownCalls };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -210,6 +227,16 @@ describe.skipIf(!runnable)("install.sh sweeps its temp files when a fetch aborts
     expect(r.exitCode).toBe(0);
     expect(r.destExists).toBe(true);
     expect(r.leftovers).toBe(0);
+  });
+
+  // #425 (E2 a): download()'s chown. A run that gets past curl chowns the temp file to the DEPLOY ids; a run
+  // that dies in curl (exit 22) never reaches it, so the log is empty rather than wrong.
+  test("download() chowns the file it fetched to DEPLOY_UID:DEPLOY_GID, not to the process's own ids (#425)", async () => {
+    const r = await runSweep({ withTrap: true, curlExit: 0 });
+    expect(r.chownCalls.length).toBeGreaterThanOrEqual(1);
+    for (const c of r.chownCalls) expect(c.startsWith("4242:4343 ")).toBe(true);
+    const failed = await runSweep({ withTrap: true, curlExit: 22 });
+    expect(failed.chownCalls).toEqual([]);
   });
 });
 
@@ -420,6 +447,35 @@ describe.skipIf(!runnable)("install.sh's validate_stack_env catches a bad render
       rmSync(validDir, { recursive: true, force: true });
     }
   });
+
+  // #486 item 2 (E3): a missing key line made the bare grep exit 1 under pipefail and the script ended with no
+  // message at all. Each of the three keys, dropped in turn, must exit non-zero AND name itself.
+  for (const key of ["BOT_ENV_FILE", "BOT_OPS_CONFIG_DIR", "BOT_OPS_COMPOSE_FILE"]) {
+    test(`a stack .env with no ${key} line is rejected, naming ${key} (not a silent exit)`, async () => {
+      const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+      try {
+        const lines = validStackEnv(validDir).filter((l) => !l.startsWith(`${key}=`));
+        const r = await runValidate(lines);
+        expect(r.exitCode).not.toBe(0);
+        expect(r.stderr).toContain(`install: ${key} is missing from`);
+        expect(r.stdout).not.toContain("VALID");
+      } finally {
+        rmSync(validDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("an empty value (KEY=) reads as missing too", async () => {
+    const validDir = mkdtempSync(join(tmpdir(), "install-validate-configdir-"));
+    try {
+      const lines = validStackEnv(validDir).map((l) => (l.startsWith("BOT_ENV_FILE=") ? "BOT_ENV_FILE=" : l));
+      const r = await runValidate(lines);
+      expect(r.exitCode).not.toBe(0);
+      expect(r.stderr).toContain("install: BOT_ENV_FILE is missing from");
+    } finally {
+      rmSync(validDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -446,10 +502,11 @@ async function runWriteSequence(configDir: string | null): Promise<Run> {
       'REPO_URL="https://example.invalid/repo.git"',
       "BRANCH=main",
       "GIT_SHA=deadbeef",
-      "DEPLOY_UID=1000",
-      "DEPLOY_GID=1000",
+      "DEPLOY_UID=4242",
+      "DEPLOY_GID=4343",
       "TMP_FILES=()",
-      'chown() { :; }', // real chown needs privileges/semantics this harness doesn't have or need
+      // real chown needs privileges/semantics this harness doesn't have or need; #425: it records instead, as CHOWN:<args>
+      'chown() { echo "CHOWN:$*"; }',
       'die() { echo "install: $*" >&2; exit 1; }',
       VALIDATE_STACK_ENV,
       STACK_ENV_WRITE_SEQUENCE,
@@ -475,6 +532,8 @@ describe.skipIf(!runnable)("validate_stack_env is actually wired into the real w
       expect(r.exitCode).toBe(0);
       expect(r.stdout).toContain("install: wrote");
       expect(r.stdout).toContain("POST_VALIDATE_OK");
+      // #425 (E2 a): the stack .env is chowned to the DEPLOY ids, on the final path
+      expect(r.stdout).toMatch(/^CHOWN:4242:4343 \S+\/\.env$/m);
     } finally {
       rmSync(configDir, { recursive: true, force: true });
     }
@@ -671,12 +730,14 @@ async function runBranchGate(branch: string, thirdArg?: string): Promise<FetchPr
     "need() { :; }",
     "resolve_deploy_identity() { DEPLOY_UID=1000; DEPLOY_GID=1000; }",
     "check_instance_name() { :; }", // #567: the slice calls it; unstubbed it is a 127 that fails the four tests below for the wrong reason
-    "bootstrap_dir() { :; }",
+    "bootstrap_dir() { :; }", // E2 (#425) pins bootstrap_dir's and the chowns' ids; this harness's job is the branch guard
     "mkdir() { :; }", // stubbed: the real one would try to mkdir /opt/... without privileges
     "chown() { :; }",
     "sed() { :; }", // stubbed: the real ADMIN_TOKEN rewrite targets a file that doesn't exist here
     "random_token() { echo faketoken; }",
     'fetch() { echo "FETCH:$1"; }', // the probe: records each download's src instead of doing it
+    'download() { echo "FETCH:$1"; DOWNLOADED=/dev/null; }', // #486: the .env block now downloads, patches, then moves
+    "mv() { :; }",
     'install_shared_bin() { echo "FETCH:ops/bot-ops.sh"; }', // same probe shape, for the #230 call site
     BRANCH_GUARD_TO_FETCH,
     'echo "REACHED_END"',
@@ -837,6 +898,8 @@ interface SharedBinRun {
   curlLog: string[];
   /** The forward-slash BIN_DIR this run used, so a test can assert the dest path by name. */
   binDir: string;
+  /** Every chown the run made, as the `$*` it was called with (#425: all must be 4242:4343). */
+  chownCalls: string[];
 }
 
 async function runSharedBin(o: {
@@ -882,9 +945,10 @@ async function runSharedBin(o: {
       CLEANUP_TMP_FILES,
       withTrap ? CLEANUP_TRAP : "# trap deliberately omitted (mutation control)",
       'die() { echo "install: $*" >&2; exit 1; }',
-      "chown() { :; }", // real chown needs privileges this harness doesn't have or need
+      // real chown needs privileges this harness doesn't have or need; #425: it records instead
+      `chown() { echo "$*" >> "${curlLogFile.replace("curl.log", "chown.log")}"; }`,
       fakeCurl,
-      `RAW_BASE="http://example.invalid"; BRANCH="${o.branch}"; FORCE_BIN=${o.forceBin ? 1 : 0}; DEPLOY_UID=1000; DEPLOY_GID=1000`,
+      `RAW_BASE="http://example.invalid"; BRANCH="${o.branch}"; FORCE_BIN=${o.forceBin ? 1 : 0}; DEPLOY_UID=4242; DEPLOY_GID=4343`,
       `BIN_DIR="${binDir}"`,
       DOWNLOAD,
       SCHEMA_OF,
@@ -908,6 +972,9 @@ async function runSharedBin(o: {
         ? readFileSync(join(dir, "curl.log"), "utf8").trim().split("\n").filter(Boolean)
         : [],
       binDir,
+      chownCalls: existsSync(join(dir, "chown.log"))
+        ? readFileSync(join(dir, "chown.log"), "utf8").trim().split("\n").filter(Boolean)
+        : [],
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -927,6 +994,9 @@ describe.skipIf(!runnable)("install.sh's install_shared_bin guards the host-shar
     expect(r.stdout).toContain("wrote");
     expect(r.stdout).toContain("from main (bot-ops schema 5)");
     expect(r.stdout).not.toContain("identical");
+    // #425 (E2 a): the shared bot-ops.sh's temp file is chowned to the DEPLOY ids
+    expect(r.chownCalls.length).toBeGreaterThanOrEqual(1);
+    for (const c of r.chownCalls) expect(c.startsWith("4242:4343 ")).toBe(true);
   });
 
   test("a branch whose bot-ops.sh is byte-identical to main's refreshes it and says so", async () => {
@@ -1248,6 +1318,8 @@ async function runNameGate(instance: string): Promise<{ exitCode: number; stdout
     'sed() { echo "WRITE:sed"; }',
     "random_token() { echo faketoken; }",
     'fetch() { echo "WRITE:fetch $1"; }',
+    'download() { echo "WRITE:download $1"; DOWNLOADED=/dev/null; }', // #486: the .env block downloads, patches, then moves
+    'mv() { echo "WRITE:mv $*"; }',
     'install_shared_bin() { echo "WRITE:install_shared_bin"; }',
     BRANCH_GUARD_TO_FETCH,
     'echo "REACHED_END"',
@@ -1287,4 +1359,257 @@ test("install.sh calls check_instance_name after PROJECT is set and before anyth
   for (const [name, i] of Object.entries({ iProject, iBoot, iCall })) expect(i, `${name} present`).toBeGreaterThan(-1);
   expect(iCall).toBeGreaterThan(iProject);
   expect(iCall).toBeLessThan(iBoot);
+});
+
+// ---------------------------------------------------------------------------
+// #531 O1 (#424, #425, #486): the operator's existing .env, every chown, and the in-place compose refresh.
+// ---------------------------------------------------------------------------
+const RANDOM_TOKEN = extractFunction("random_token");
+const BOOTSTRAP_DIR = extractFunction("bootstrap_dir");
+const FETCH_IN_PLACE = extractFunction("fetch_in_place");
+// From the backups/ mkdir (so the backups chown is in the slice) through the .env block's closing `fi`. Anchored on the
+// "already exists" echo, NOT on the guard's `if` line: a regex anchored on the guard would throw at import under a mutant
+// that rewrites the guard, erroring every test in the file instead of failing the one that pins it.
+const ENV_BLOCK = extractLine(
+  /^ {2}mkdir -p "\$CONFIG_DIR\/backups"[\s\S]*?already exists[\s\S]*?^ {2}fi$/m,
+  "the backups mkdir through the .env block's closing fi",
+);
+
+interface EnvBlockRun extends Run {
+  /** The .env after the run, or null if it does not exist. */
+  env: string | null;
+  mode: number | null;
+  configDir: string;
+}
+
+async function runEnvBlock(o: { existing?: string }): Promise<EnvBlockRun> {
+  const configDir = mkdtempSync(join(tmpdir(), "install-envblock-"));
+  try {
+    if (o.existing !== undefined) writeFileSync(join(configDir, ".env"), o.existing);
+    const script = [
+      "set -euo pipefail",
+      'die() { echo "install: $*" >&2; exit 1; }',
+      "TMP_FILES=()",
+      "DEPLOY_UID=4242; DEPLOY_GID=4343",
+      `CONFIG_DIR="${toMsysPath(configDir)}"`,
+      RANDOM_TOKEN,
+      // download() stand-in: writes a fixture .env.example beside the destination like the real one, applies the mode
+      // and the DEPLOY chown to that temp file, and reports itself.
+      'download() { echo "DOWNLOAD:$1"; local t; t="$(mktemp -p "$(dirname "$3")")"; printf "DISCORD_TOKEN=\\nADMIN_TOKEN=\\n" > "$t"; chmod "$2" "$t"; chown "$DEPLOY_UID:$DEPLOY_GID" "$t"; DOWNLOADED="$t"; }',
+      'chown() { echo "CHOWN:$*"; }',
+      // Reports the ADMIN_TOKEN line of whatever is being moved INTO PLACE, so a patch applied after the move is visible.
+      'mv() { echo "MV_SRC_TOKEN:$(grep "^ADMIN_TOKEN=" "$1")"; command mv "$@"; }',
+      ENV_BLOCK,
+      'echo "ENV_BLOCK_DONE"',
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const envPath = join(configDir, ".env");
+    return {
+      exitCode,
+      stdout,
+      stderr,
+      env: existsSync(envPath) ? readFileSync(envPath, "utf8") : null,
+      mode: existsSync(envPath) ? statSync(envPath).mode & 0o777 : null,
+      configDir,
+    };
+  } finally {
+    rmSync(configDir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh leaves an operator's existing .env alone and never leaves a half-written one (#424, #486 item 9)", () => {
+  test("E1 (a): an existing .env is byte-identical afterwards, nothing is downloaded, and the token is located, never printed", async () => {
+    const existing = "DISCORD_TOKEN=keep\nADMIN_TOKEN=abc\n";
+    const r = await runEnvBlock({ existing });
+    expect(r.exitCode).toBe(0);
+    expect(r.env).toBe(existing);
+    expect(r.stdout).not.toContain("DOWNLOAD:");
+    expect(r.stdout).toContain("already exists");
+    expect(r.stdout).toContain("ADMIN_TOKEN is already set");
+    expect(r.stdout).not.toContain("abc");
+    expect(r.stdout).toContain("ENV_BLOCK_DONE");
+  });
+
+  test("E1 (b): an existing .env whose ADMIN_TOKEN is empty gets no 'already set' line", async () => {
+    const existing = "DISCORD_TOKEN=keep\nADMIN_TOKEN=\n";
+    const r = await runEnvBlock({ existing });
+    expect(r.exitCode).toBe(0);
+    expect(r.env).toBe(existing);
+    expect(r.stdout).toContain("already exists");
+    expect(r.stdout).not.toContain("ADMIN_TOKEN is already set");
+  });
+
+  test("E1 (c): a new .env gets a 64-hex token, printed once, patched BEFORE the move, and chowned to the deploy ids", async () => {
+    const r = await runEnvBlock({});
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("DOWNLOAD:.env.example");
+    const token = /^ADMIN_TOKEN=([0-9a-f]{64})$/m.exec(r.env ?? "")?.[1];
+    expect(token, "the written .env carries a 64-hex ADMIN_TOKEN").toBeDefined();
+    expect(r.stdout).toContain(`install:   ${token}`);
+    // the file being moved into place already carried the token: the final path never held an empty one
+    expect(r.stdout).toContain(`MV_SRC_TOKEN:ADMIN_TOKEN=${token}`);
+    // E2 (c): the new .env's temp file is chowned to the deploy ids, and so is backups/
+    expect(r.stdout).toMatch(/^CHOWN:4242:4343 \S+\/\.env$|^CHOWN:4242:4343 \S+\/tmp\.\w+$/m);
+    expect(r.stdout).toMatch(/^CHOWN:4242:4343 \S+\/backups$/m);
+    for (const l of r.stdout.split("\n").filter((x) => x.startsWith("CHOWN:"))) expect(l.startsWith("CHOWN:4242:4343 ")).toBe(true);
+  });
+
+  test.skipIf(process.platform === "win32")("E1 (c): the new .env is mode 0600", async () => {
+    const r = await runEnvBlock({});
+    expect(r.mode).toBe(0o600);
+  });
+});
+
+describe.skipIf(!runnable)("install.sh chowns to DEPLOY_UID:DEPLOY_GID everywhere, never to the process's own ids (#425)", () => {
+  test("E2 (b): bootstrap_dir sudo-creates and chowns a missing dir to the deploy ids, and does nothing for one we own", async () => {
+    const root = mkdtempSync(join(tmpdir(), "install-bootstrap-"));
+    try {
+      const missing = `${toMsysPath(root)}/not-there`;
+      const own = toMsysPath(root);
+      const script = (dir: string) =>
+        [
+          "set -euo pipefail",
+          'die() { echo "install: $*" >&2; exit 1; }',
+          "DEPLOY_UID=4242; DEPLOY_GID=4343",
+          'sudo() { echo "SUDO:$*"; }',
+          BOOTSTRAP_DIR,
+          `bootstrap_dir "${dir}"`,
+        ].join("\n");
+      const run1 = async (dir: string) => {
+        const proc = Bun.spawn([BASH!, "-c", script(dir)], { stdout: "pipe", stderr: "pipe" });
+        const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+        return { stdout, exitCode };
+      };
+      const a = await run1(missing);
+      expect(a.exitCode).toBe(0);
+      expect(a.stdout).toContain(`SUDO:mkdir -p ${missing}`);
+      expect(a.stdout).toContain(`SUDO:chown 4242:4343 ${missing}`);
+      const b = await run1(own);
+      expect(b.exitCode).toBe(0);
+      expect(b.stdout).not.toContain("SUDO:");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- fetch_in_place (#486 item 3): the compose file keeps its inode, so the admin's single-file mount sees a re-run ----
+interface InPlaceRun extends Run {
+  dest: string;
+  chownCalls: string[];
+}
+
+/** Runs fetch_in_place for ./dest.yml in a fresh temp dir; `setup` prepares the destination first; `check` reads results before cleanup. */
+async function withInPlace<T>(
+  setup: (dir: string) => void,
+  check: (dir: string, r: InPlaceRun) => T,
+): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "install-inplace-"));
+  try {
+    setup(dir);
+    const script = [
+      "set -euo pipefail",
+      `cd "${dir.replaceAll("\\", "/")}"`,
+      'die() { echo "install: $*" >&2; exit 1; }',
+      "TMP_FILES=()",
+      'curl() { printf "%s" "$NEW_CONTENT" > "$4"; }', // curl -fsSL URL -o PATH: $4 is the output path
+      'chown() { echo "$*" >> chown.log; }',
+      'RAW_BASE="http://example.invalid"; BRANCH=main; DEPLOY_UID=4242; DEPLOY_GID=4343',
+      DOWNLOAD,
+      FETCH,
+      FETCH_IN_PLACE,
+      'fetch_in_place "docker-compose.yml" 644 "./dest.yml"',
+    ].join("\n");
+    const proc = Bun.spawn([BASH!, "-c", script], {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, NEW_CONTENT: "NEW\n" } as Record<string, string>,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const log = join(dir, "chown.log");
+    return check(dir, {
+      exitCode,
+      stdout,
+      stderr,
+      dest: join(dir, "dest.yml"),
+      chownCalls: existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean) : [],
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe.skipIf(!runnable)("install.sh refreshes the compose file in place so a running admin's mount sees it (#486 item 3)", () => {
+  test("E4 (a): an existing destination gets the new content under the SAME inode", async () => {
+    let before = 0;
+    await withInPlace(
+      (dir) => {
+        writeFileSync(join(dir, "dest.yml"), "OLD\n");
+        before = statSync(join(dir, "dest.yml")).ino;
+      },
+      (_dir, r) => {
+        expect(r.exitCode, r.stderr).toBe(0);
+        expect(readFileSync(r.dest, "utf8")).toBe("NEW\n");
+        expect(statSync(r.dest).ino).toBe(before);
+      },
+    );
+  });
+
+  test("E4 (b): no destination -> created with the content", async () => {
+    await withInPlace(
+      () => {},
+      (_dir, r) => {
+        expect(r.exitCode, r.stderr).toBe(0);
+        expect(readFileSync(r.dest, "utf8")).toBe("NEW\n");
+      },
+    );
+  });
+
+  test.skipIf(process.platform === "win32")("E4 (c): a symlink destination is replaced by a regular file; the link's target is untouched", async () => {
+    await withInPlace(
+      (dir) => {
+        writeFileSync(join(dir, "target.yml"), "TARGET\n");
+        symlinkSync("target.yml", join(dir, "dest.yml"));
+      },
+      (dir, r) => {
+        expect(r.exitCode, r.stderr).toBe(0);
+        expect(lstatSync(r.dest).isSymbolicLink()).toBe(false);
+        expect(readFileSync(r.dest, "utf8")).toBe("NEW\n");
+        expect(readFileSync(join(dir, "target.yml"), "utf8")).toBe("TARGET\n");
+      },
+    );
+  });
+
+  test.skipIf(process.platform === "win32")("E4 (d): an existing 0600 destination ends 0644 under the same inode, chowned to the deploy ids", async () => {
+    let before = 0;
+    await withInPlace(
+      (dir) => {
+        writeFileSync(join(dir, "dest.yml"), "OLD\n");
+        chmodSync(join(dir, "dest.yml"), 0o600);
+        before = statSync(join(dir, "dest.yml")).ino;
+      },
+      (_dir, r) => {
+        expect(r.exitCode, r.stderr).toBe(0);
+        expect(statSync(r.dest).mode & 0o777).toBe(0o644);
+        expect(statSync(r.dest).ino).toBe(before);
+        expect(r.chownCalls).toContain("4242:4343 ./dest.yml");
+      },
+    );
+  });
+
+  test("E4 source pin: the in-place branch is guarded by -O and a regular, non-symlink file; only the compose file uses it", () => {
+    expect(FETCH_IN_PLACE).toContain('[ -f "$3" ] && [ ! -L "$3" ] && [ -O "$3" ]');
+    expect(installShSource).toMatch(/^ {2}fetch_in_place "docker-compose\.yml" 644 "\$STACK_DIR\/docker-compose\.yml"$/m);
+    expect(installShSource).not.toMatch(/fetch_in_place "(\.env\.example|ops\/bot-ops\.sh)"/);
+    expect(installShSource).not.toMatch(/^ {2}fetch "docker-compose\.yml"/m);
+  });
 });

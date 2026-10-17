@@ -131,12 +131,13 @@ line — and a banner at the top of the panel page naming precisely which file(s
 panel still starts and serves `status`/`logs`/`restart` regardless; it just tells you rather than
 staying silent about it. The panel re-checks both files about once a minute, so a re-run of
 `ops/install.sh` clears the `bot-ops.sh` line on its own; `docker-compose.yml` is mounted into the
-admin container as a single file, which keeps the old copy until that container is recreated --
-re-run `install.sh`'s printed step 4 with `--force-recreate` added before `admin` for that (as printed,
-step 4 is `up -d --build admin`, which leaves an unchanged admin container running; and never a bare
-`--force-recreate admin`: the admin's token and Access values come from step 4's environment, see
-"frozen" below) -- and until then the panel's own Recreate also runs against the old file (#464;
-mounting the directory instead is #486's). `install.sh`'s own summary lines print the schema each file was just
+admin container as a single file; since #486 `install.sh` rewrites it in place (same inode), so a re-run
+reaches a running admin without a recreate. An admin container started before that change still holds the
+old file until it is recreated once -- re-run `install.sh`'s printed step 4 with `--force-recreate` added
+before `admin` for that (as printed, step 4 is `up -d --build admin`, which leaves an unchanged admin
+container running; and never a bare `--force-recreate admin`: the admin's token and Access values come
+from step 4's environment, see "frozen" below) -- and until then the panel's own Recreate also runs against
+the old file (#464); the banner names that remedy for exactly this case. `install.sh`'s own summary lines print the schema each file was just
 installed with, so the panel's log and install's own output are easy to compare side by side.
 
 `version` is checked deliberately WITHOUT any of the `BOT_OPS_*` config or a real `.env`/compose
