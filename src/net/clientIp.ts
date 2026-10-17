@@ -7,6 +7,7 @@
 // (`TRUSTED_PROXY_HOST`); everything else falls back to the real connection peer, so an untrusted
 // caller can never claim a fresh identity per request. Copied from Rackbops/rackbops-bot-plugins#70
 // (packages/net/clientIp.ts) rather than published as a package -- the two repos don't share one.
+// That repo owns it (Epic #269 decision 4); behaviour changes there are mirrored here by hand.
 import { isIP } from "node:net";
 import { lookup as dnsLookup } from "node:dns/promises";
 
@@ -172,19 +173,18 @@ export function createTrustedProxy(opts: {
  * `"unknown"` if the caller has no peer address to report (Bun's `requestIP` can return `null` for
  * a request over an already-closed socket).
  *
- * A repeated header collapses to one comma-joined string per the Fetch `Headers` contract; only
- * the FIRST value is honored. Cloudflare's edge sets this header exactly once for a request that
- * transited it, so a second value can only be something a caller appended. (This is not an
- * `X-Forwarded-For` chain, where the trustworthy hop is the LAST one your own proxy appended;
- * `CF-Connecting-IP` is single-valued by contract, which is why first-wins is right here and would
- * be wrong there.)
+ * A repeated header collapses to one comma-joined string per the Fetch `Headers` contract.
+ * Cloudflare's edge sets this header to exactly one value, so a header containing a comma is not
+ * something Cloudflare produced: it is distrusted outright (fall back to `peerAddress`), never
+ * parsed for a "first" or "last" value (Rackbops/rackbops-bot-plugins#181).
  */
 export function clientIpFrom(req: Request, peerAddress: string | undefined, proxy: TrustedProxy): string {
   if (peerAddress !== undefined && proxy.isTrusted(peerAddress)) {
     const header = req.headers.get("CF-Connecting-IP");
     if (header !== null) {
-      const first = (header.split(",")[0] ?? "").trim();
-      if (isIP(first) !== 0) return first;
+      // `isIP` rejects any string containing a comma, so a multi-valued header never validates.
+      const value = header.trim();
+      if (isIP(value) !== 0) return value;
     }
   }
   return peerAddress ?? "unknown";

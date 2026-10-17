@@ -369,11 +369,30 @@ describe("createTrustedProxy -- failures, logging and the boot bound (#493)", ()
 });
 
 describe("clientIpFrom", () => {
-  test("a trusted peer with a valid header is keyed by the header's first value", async () => {
+  test("a trusted peer with a single valid header value is keyed by it", async () => {
     const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5"] });
     await proxy.refresh();
-    const req = fakeRequest({ "CF-Connecting-IP": "203.0.113.9, 10.0.0.5" });
-    expect(clientIpFrom(req, "10.0.0.5", proxy)).toBe("203.0.113.9");
+    expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "203.0.113.9" }), "10.0.0.5", proxy)).toBe("203.0.113.9");
+    expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "  203.0.113.9 " }), "10.0.0.5", proxy)).toBe("203.0.113.9");
+    expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "2001:db8::1" }), "10.0.0.5", proxy)).toBe("2001:db8::1");
+  });
+
+  // Cloudflare sets the header to one value, so a multi-valued one is untrusted whole -- even when
+  // every element is a valid IP (the old behaviour returned the first).
+  test("a multi-valued header is untrusted and falls back to the peer", async () => {
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5"] });
+    await proxy.refresh();
+    for (const value of ["203.0.113.9, 10.0.0.5", "203.0.113.9,10.0.0.5", "not-an-ip, 203.0.113.9", "203.0.113.9,"]) {
+      expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": value }), "10.0.0.5", proxy)).toBe("10.0.0.5");
+    }
+  });
+
+  test("header forms that are not a bare IP literal fall back to the peer", async () => {
+    const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5"] });
+    await proxy.refresh();
+    for (const value of ["[2001:db8::1]", "203.0.113.9:8080", "", "999.1.1.1"]) {
+      expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": value }), "10.0.0.5", proxy)).toBe("10.0.0.5");
+    }
   });
 
   test("no peer address at all falls back to \"unknown\"", async () => {
