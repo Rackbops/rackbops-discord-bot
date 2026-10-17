@@ -97,9 +97,17 @@ export function updateLeaks(s: {
   checkInFlight: boolean;
   suppressedWarnedFor?: string;
   lastFailure?: { sha: string; reason: string };
+  undeterminedWarnedFor?: string;
+  autoNotifiedFor?: string;
 }): string[] {
   const leaks: string[] = [];
   if (s.checkInFlight) leaks.push("an update check still in flight — the next checkForUpdate answers busy");
+  if (s.undeterminedWarnedFor !== undefined) {
+    leaks.push(`the undetermined warning already logged for ${s.undeterminedWarnedFor} — a later check would not log it`);
+  }
+  if (s.autoNotifiedFor !== undefined) {
+    leaks.push(`an automatic update failure already notified for ${s.autoNotifiedFor} — a later one would not be sent`);
+  }
   if (s.suppressedWarnedFor !== undefined) {
     leaks.push(`the suppressed warning already logged for ${s.suppressedWarnedFor} — a later check would not log it`);
   }

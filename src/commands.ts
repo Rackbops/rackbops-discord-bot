@@ -4,7 +4,7 @@ import {
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { config, REPORT_PROJECTS } from "./config";
-import { clampReply } from "./github";
+import { clampReply, DAEMON_ERROR_MAX } from "./github";
 import { handleReportCommand } from "./report";
 import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./update";
 import { withCritical, requestRestart } from "./restart";
@@ -409,14 +409,6 @@ async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promis
 }
 
 /**
- * A failed or timed-out swap's text (`handoffFailureMessage`) puts the daemon's error ahead of the verdict ("I stayed on
- * the current build", the `-next` container to remove by hand); unbounded, a long error pushed the verdict past the
- * whole-reply clamp (#505 item 7). A stalled swap's text puts the error last, where the clamp only keeps the reply
- * bounded. 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause.
- */
-const DAEMON_ERROR_MAX = 600;
-
-/**
  * `runningSha` is passed in rather than read off the `config` singleton: config resolves
  * process.env at import time and is shared across the whole bun test process, so a formatter
  * that reaches into it can only be tested by winning a race against whichever test file
@@ -440,7 +432,8 @@ export function updateReply(
       return `⏳ An update or restart is already in progress — ask again once it has finished (a /${o.commandName ?? "update"} that started it reports back to whoever ran it).`;
     case "disabled":
       // Two ways to end up here, and they need different things from the operator: bake a
-      // GIT_SHA, versus push the branch you built from (nazumods/wow#871).
+      // GIT_SHA, versus push the branch you built from (nazumods/wow#871). Reachable from the automatic path's
+      // `UpdateCheck` only: an admin's /update overrides `unpublished` (#505).
       if (o.reason === "unpublished-sha") {
         return (
           `⚠️ Self-update is disabled — this build's commit \`${running}\` ` +
@@ -449,6 +442,10 @@ export function updateReply(
         );
       }
       return "⚠️ Self-update is disabled — this build has no `GIT_SHA` baked in.";
+    case "undetermined":
+      // Unreachable from /update (always forced, so an unknown relation acts); the automatic check never replies. Present
+      // because the switch is exhaustive (#505).
+      return `❓ I couldn't tell whether this build contains \`${short}\` (GitHub's compare failed) — try again shortly.`;
     case "current":
       return `✅ Already on the latest build (\`${running}\`).`;
     case "suppressed":

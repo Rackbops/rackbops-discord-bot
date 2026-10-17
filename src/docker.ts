@@ -7,6 +7,7 @@
 // then answers with its own current version, so this doesn't break against an older or newer
 // Docker than whichever one it was written on.
 
+import { statSync } from "node:fs";
 import { clampUpstreamBody } from "./github";
 
 /** The daemon socket. A TEST SEAM, not an operator knob (compare `BOT_DATA_DIR`; the `BOT_` prefix is deliberate,
@@ -178,6 +179,22 @@ const json = (body: unknown): RequestInit => ({
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify(body),
 });
+
+/** Whether `path` is a unix socket file (false on any stat error, a missing path included). */
+export function isSocketPath(path: string): boolean {
+  try {
+    return statSync(path).isSocket();
+  } catch {
+    return false;
+  }
+}
+
+/** #505: whether the daemon socket is MOUNTED at all (a socket file at `BOT_DOCKER_SOCKET`) — as opposed to
+ *  `daemonReachable`, which asks whether the daemon on it answers. Mounted-but-unanswering is a daemon problem to
+ *  report; not mounted is the no-socket deployment that exits 75 and lets its supervisor supply the new image. */
+export function dockerSocketMounted(): boolean {
+  return isSocketPath(BOT_DOCKER_SOCKET);
+}
 
 /** Whether the daemon socket is actually reachable — the one precondition for self-update. */
 export async function daemonReachable(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<boolean> {

@@ -250,6 +250,14 @@ describe("updateLeaks", () => {
     ]);
     expect(updateLeaks({ checkInFlight: false, suppressedWarnedFor: undefined, lastFailure: undefined })).toEqual([]);
   });
+  test("names the undetermined warning and an automatic failure notice still remembered (#505)", () => {
+    expect(updateLeaks({ checkInFlight: false, undeterminedWarnedFor: "abc" })).toEqual([
+      expect.stringContaining("the undetermined warning already logged for abc"),
+    ]);
+    expect(updateLeaks({ checkInFlight: false, autoNotifiedFor: "abc:failed" })).toEqual([
+      expect.stringContaining("an automatic update failure already notified for abc:failed"),
+    ]);
+  });
 });
 
 describe("pluginHostLeaks", () => {
