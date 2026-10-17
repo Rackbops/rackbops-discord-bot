@@ -14,7 +14,7 @@ set -e
 SOCK=/var/run/docker.sock
 
 if [ "$(id -u)" = "0" ]; then
-  # #487: setpriv changes ids only; without this the bot runs as bun with HOME=/root (mode 0700, unreadable to bun).
+  # #487: setpriv changes ids only; without this the bot runs as bun with HOME=/root, which is not bun's home.
   # bun's home is read from the passwd entry, not assumed; the fallback covers an image without getent.
   HOME="$(getent passwd bun | cut -d: -f6)"
   export HOME="${HOME:-/home/bun}"

@@ -211,7 +211,7 @@ export function selectImagesToPrune(
  * The network's own `Aliases` (e.g. compose's `bot` service alias) are carried over too — without
  * them the replacement resolves by container name only, so a client addressing the bot by its
  * `bot` alias stops resolving after the first self-update (the README's tunnel mapping targets the container name
- * for exactly that reason). Docker auto-adds a
+ * instead, because during the overlap the replacement carries the alias too). Docker auto-adds a
  * container's own short id to this same array on top of any deliberately-configured alias, so
  * that one entry is dropped — it names the OLD container specifically and means nothing on the
  * new one, unlike a real service alias which is meant to be shared.

@@ -233,7 +233,7 @@ the character-linking endpoint above) to the internet without opening any inboun
    ```
 
    `--no-deps` and the service name keep the command off the bot: `cloudflared` has `depends_on: bot`, so without
-   them Compose would also rebuild the bot from the branch tip and recreate it.
+   them Compose would also start the bot (and, with `--build`, rebuild it from the branch tip).
 
    Without `--profile tunnel`, the sidecar doesn't start — a normal `docker compose up` is unaffected and doesn't need the token.
 
