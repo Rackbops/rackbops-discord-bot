@@ -6824,6 +6824,12 @@ describe("the token gate (#468-9)", () => {
     expect(unlock.slice(0, unlock.indexOf("});"))).toMatch(/unlockPending = true;\s*clearGateMsg\(\);\s*showApp\(\)/);
   });
 
+  test("R5 source pins: the reload GETs and the logs loader read failures through readJson/errorBodyText, not a raw body", () => {
+    expect(applyIndexSrc).toContain('api("/api/plugins", { signal }).then(readJson)');
+    expect(applyIndexSrc).toContain('api("/api/env", { signal }).then(readJson)');
+    expect(applyIndexSrc.match(/if \(!res\.ok\) throw new Error\(errorBodyText\(await res\.text\(\), res\.status\)\);/g)?.length).toBe(2);
+  });
+
   test("R6/R7 source pins: the #gate-msg element is an alert in the markup, and the toast region is created at page load, after the TOAST block", () => {
     expect(applyIndexSrc).toMatch(/<p id="gate-msg"[^>]*role="alert"/);
     expect(applyIndexSrc).toMatch(/\/\/ TOAST:end\s*\n\s*ensureToastRegion\(\);/);
