@@ -444,7 +444,11 @@ _Avoid_: server list, guild cache
   old is left alone), not "at most one directory" as it used to claim: sweeping every same-prefixed
   directory unconditionally deleted a CONCURRENTLY running suite's own `BOT_DATA_DIR` out from under
   it (two agent sessions' `bun test` runs on one machine is routine, not a corner case). See
-  `test/sweep.ts` for the pure decision logic and its own tests.
+  `test/sweep.ts` for the pure decision logic and its own tests. The sweep removes real directories
+  only (`lstat`; a stray file or a planted link under the prefix is left alone), logs what it removed,
+  and a removal that fails (a dead run's dir an orphan still holds as its cwd, on Windows) is warned
+  and skipped rather than failing the run (#461); `test/setup.test.ts` runs the preload for real in a
+  child `bun test` against directories planted in a private temp root (#403).
 - **A test that leaves module-level state behind fails, in any order (the test-state guard).**
   The guard covers the module-level state of eleven modules, and for the same one-process reason as
   above every test file shares one copy of each: `restart.ts` (critical-section depth, a pending
@@ -475,8 +479,11 @@ _Avoid_: server list, guild cache
   `state` already put back under it. It has to be a second preload: `announce.ts` and the routing modules read
   the environment `test/setup.ts` primes when they load, and a static import in `setup.ts` would be
   hoisted above that priming. A side effect: `config.ts` now loads for every run, even of one file
-  that never imports it, so a value it refuses left in your shell (`HTTP_PORT=abc`, a malformed
-  `PLUGINS`, ...) stops every run before its first test — unset it. A leak made
+  that never imports it; `test/setup.ts` forces `DISCORD_TOKEN` and `ANNOUNCE_CHANNEL_ID` and clears
+  the sixteen other keys `config.ts`, `logFormat.ts` and `plugins/install.ts` read at import (#462;
+  `NODE_ENV`, `HOSTNAME`, `BOT_ENV_FILE` and the handoff keys are left alone and change no result), so
+  a shell's values for those never reach the suite or the subprocesses it spawns, and cannot
+  stop a run. A leak made
   inside a test fails that test, whatever the order — unless that test's own `afterEach` throws,
   since Bun then skips the guard for it. Such a leak, and one made outside a test — by a
   `beforeAll` or `afterAll`, or by async work that finishes after its test — is charged to
@@ -1257,11 +1264,13 @@ _Avoid_: server list, guild cache
   neither exits nor arms that deadline: the shutdown handler owns the exit.
 - Run `bun run check` (tsc) and `bun test` after changes. `.github/workflows/ci.yml` now runs
   both on every pull request (`on: pull_request` only — a direct push to `main` runs no CI)
-  (`bun install --frozen-lockfile`, `bun run check` for both projects, one
-  root `bun test`, then the same suite as `bun test --randomize` — a fresh seed each run, printed
+  (`bun install --frozen-lockfile` for both projects, the three typechecks — root, `ops/`,
+  `ops/admin` — one root `bun test`, then the same suite as `bun test --randomize` — a fresh seed each run, printed
   as ` --seed=N`, so a test-order dependency the default order hides gets a chance to surface in
   CI) — the fork's own CI, not carried over from the original monorepo's
-  path-scoped `discord-bot-test.yml` (see **Fork gotchas**). No lint beyond tsc.
+  path-scoped `discord-bot-test.yml` (see **Fork gotchas**). No lint beyond tsc. A second job,
+  `docker-build`, builds both images without pushing (#83). Both jobs run with `contents: read` and a
+  `timeout-minutes` bound, and the actions are pinned by commit (#461).
 - **`cloudflared` now has something to route to**: the `warbandeer` plugin's ingest endpoint
   (`@rackbops/plugin-warbandeer`), once `WARBANDEER_INGEST_PORT` is set. The sidecar itself is still
   opt-in (`--profile tunnel`) and unchanged in shape — it joins the bot's Compose network, so
