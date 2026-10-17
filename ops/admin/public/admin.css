@@ -562,7 +562,7 @@
   .adm-apply__actions .rb-btn {
     flex: 1 1 auto;
   }
-  /* Three tabs fit a phone, but a long localized label must scroll rather than wrap the strip. */
+  /* Four tabs fit a phone, but a long localized label must scroll rather than wrap the strip. */
   .rb-tabstrip {
     overflow-x: auto;
   }
