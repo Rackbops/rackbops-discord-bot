@@ -14,6 +14,7 @@ import type {
   PluginStateEntry,
   PluginStateFile,
 } from "./contract";
+import { deliverAdminNotice, type AdminNoticeDeliverers } from "../adminNotice";
 
 const MESSAGE_LIMIT = 2000; // Discord's hard content cap (mirrors src/report.ts).
 
@@ -587,12 +588,7 @@ export function decidePluginReportOutcome(
   return { ok: false, message: `⚠️ **${name}** updated to ${to} but failed to start${why}.` };
 }
 
-export interface PluginNotifyDeliverers {
-  /** DM a single admin. */
-  dmUser(userId: string, content: string): Promise<void>;
-  /** Post to ANNOUNCE_CHANNEL_ID (the DM fallback). */
-  postAnnounce(content: string): Promise<void>;
-}
+export type PluginNotifyDeliverers = AdminNoticeDeliverers;
 
 export interface PluginUpdateLog {
   info(message: string): void;
@@ -604,39 +600,19 @@ export interface PluginUpdateLog {
  * DM each admin the notice; if ANY DM fails, fall back to the announce channel ONCE (not per admin,
  * and only as a fallback — a clean DM run never posts publicly). No admins → warn only. Returns true
  * if it reached someone, so the caller only records the version as notified after a real delivery.
+ * The delivery itself is `deliverAdminNotice` (src/adminNotice.ts); this keeps the plugin wording.
  */
-export async function deliverPluginNotification(
+export function deliverPluginNotification(
   message: string,
   adminUserIds: string[],
   deliverers: PluginNotifyDeliverers,
   log: PluginUpdateLog,
 ): Promise<boolean> {
-  if (adminUserIds.length === 0) {
-    log.warn("[plugins] a plugin update is available but ADMIN_USER_IDS is empty — no one to notify");
-    return false;
-  }
-  let delivered = false;
-  let anyDmFailed = false;
-  for (const id of adminUserIds) {
-    try {
-      await deliverers.dmUser(id, message);
-      delivered = true;
-    } catch (err) {
-      anyDmFailed = true;
-      log.warn(
-        `[plugins] couldn't DM admin ${id} about a plugin update (${err instanceof Error ? err.message : String(err)}) — will try the announce channel`,
-      );
-    }
-  }
-  if (anyDmFailed) {
-    try {
-      await deliverers.postAnnounce(message);
-      delivered = true;
-    } catch (err) {
-      log.error("[plugins] channel fallback for a plugin update notice failed", err);
-    }
-  }
-  return delivered;
+  return deliverAdminNotice(message, adminUserIds, deliverers, log, {
+    noAdmins: "[plugins] a plugin update is available but ADMIN_USER_IDS is empty — no one to notify",
+    dmFailed: (id, reason) => `[plugins] couldn't DM admin ${id} about a plugin update (${reason}) — will try the announce channel`,
+    fallbackFailed: "[plugins] channel fallback for a plugin update notice failed",
+  });
 }
 
 export interface PluginUpdateDeps {

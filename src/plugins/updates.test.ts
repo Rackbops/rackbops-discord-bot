@@ -629,6 +629,28 @@ describe("deliverPluginNotification", () => {
     };
     expect(await deliverPluginNotification("msg", ["1"], deliverers, { info() {}, warn() {}, error() {} })).toBe(false);
   });
+
+  // #505 (U2e, M2g): the delivery moved to src/adminNotice.ts; the plugin wording is pinned in full.
+  test("logs its three strings exactly as before the extraction", async () => {
+    const warns: string[] = [];
+    const errors: string[] = [];
+    const log = { info() {}, warn: (m: string) => void warns.push(m), error: (m: string) => void errors.push(m) };
+    const failing: PluginNotifyDeliverers = {
+      dmUser: async () => {
+        throw new Error("closed DMs");
+      },
+      postAnnounce: async () => {
+        throw new Error("y");
+      },
+    };
+    await deliverPluginNotification("msg", [], failing, log);
+    await deliverPluginNotification("msg", ["42"], failing, log);
+    expect(warns).toEqual([
+      "[plugins] a plugin update is available but ADMIN_USER_IDS is empty — no one to notify",
+      "[plugins] couldn't DM admin 42 about a plugin update (closed DMs) — will try the announce channel",
+    ]);
+    expect(errors).toEqual(["[plugins] channel fallback for a plugin update notice failed"]);
+  });
 });
 
 describe("checkPluginUpdates", () => {

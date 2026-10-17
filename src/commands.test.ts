@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { DiscordAPIError, MessageFlags, type ChatInputCommandInteraction } from "discord.js";
 import { expectCleanedLog, printed, replyFailure } from "../test/restError";
+import { setDockerSocketMountedForTest } from "./docker";
 import type { PluginCommand } from "./plugins/contract";
 import type { PluginCommandTarget } from "./plugins/host";
 
@@ -1004,6 +1005,7 @@ describe("handleCommand — /update", () => {
     const realFetch = globalThis.fetch;
     const log = spyOn(console, "log").mockImplementation(() => {});
     const warn = spyOn(console, "warn").mockImplementation(() => {});
+    setDockerSocketMountedForTest(false); // a CI runner has a real docker.sock; this is the no-socket deployment (#505)
     globalThis.fetch = (async (input: string | URL | Request) => {
       const url = String(input);
       if (url.includes("/commits?")) return new Response(JSON.stringify([{ sha: "2".repeat(40) }]), { status: 200 });
@@ -1018,6 +1020,7 @@ describe("handleCommand — /update", () => {
       expect(dms).toHaveLength(1);
       expect(dms[0]).toContain("Restarting to pick up");
     } finally {
+      setDockerSocketMountedForTest(undefined);
       globalThis.fetch = realFetch;
       restoreExit();
       log.mockRestore();

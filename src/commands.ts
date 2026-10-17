@@ -4,7 +4,7 @@ import {
   type RESTPostAPIChatInputApplicationCommandsJSONBody,
 } from "discord.js";
 import { config, REPORT_PROJECTS } from "./config";
-import { clampReply } from "./github";
+import { clampReply, DAEMON_ERROR_MAX } from "./github";
 import { handleReportCommand } from "./report";
 import { checkForUpdate, type DisabledReason, type UpdateDecision } from "./update";
 import { withCritical, requestRestart } from "./restart";
@@ -115,7 +115,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         // only one through clampReply, while a failed swap's reply carries the daemon's error text unbounded.
         let content: string;
         try {
-          const { decision, latestSha, reason, redeploy } = await checkForUpdate({
+          const { decision, latestSha, reason, redeploy, daemonUnreachable } = await checkForUpdate({
             force: true,
             // Recorded so the next boot can report back what build it actually landed on.
             requester: {
@@ -130,6 +130,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
               runningSha: config.gitSha,
               reason,
               redeploy,
+              daemonUnreachable,
               commandName: interaction.commandName,
             }),
           );
@@ -409,14 +410,6 @@ async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promis
 }
 
 /**
- * A failed or timed-out swap's text (`handoffFailureMessage`) puts the daemon's error ahead of the verdict ("I stayed on
- * the current build", the `-next` container to remove by hand); unbounded, a long error pushed the verdict past the
- * whole-reply clamp (#505 item 7). A stalled swap's text puts the error last, where the clamp only keeps the reply
- * bounded. 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause.
- */
-const DAEMON_ERROR_MAX = 600;
-
-/**
  * `runningSha` is passed in rather than read off the `config` singleton: config resolves
  * process.env at import time and is shared across the whole bun test process, so a formatter
  * that reaches into it can only be tested by winning a race against whichever test file
@@ -428,7 +421,13 @@ const DAEMON_ERROR_MAX = 600;
 export function updateReply(
   decision: UpdateDecision,
   latestSha: string,
-  o: { runningSha?: string; reason?: DisabledReason; redeploy?: RedeployResult; commandName?: string } = {},
+  o: {
+    runningSha?: string;
+    reason?: DisabledReason;
+    redeploy?: RedeployResult;
+    daemonUnreachable?: boolean;
+    commandName?: string;
+  } = {},
 ): string {
   const short = shortSha(latestSha);
   const running = o.runningSha ? shortSha(o.runningSha) : undefined;
@@ -440,7 +439,8 @@ export function updateReply(
       return `⏳ An update or restart is already in progress — ask again once it has finished (a /${o.commandName ?? "update"} that started it reports back to whoever ran it).`;
     case "disabled":
       // Two ways to end up here, and they need different things from the operator: bake a
-      // GIT_SHA, versus push the branch you built from (nazumods/wow#871).
+      // GIT_SHA, versus push the branch you built from (nazumods/wow#871). Reachable from the automatic path's
+      // `UpdateCheck` only: an admin's /update overrides `unpublished` (#505).
       if (o.reason === "unpublished-sha") {
         return (
           `⚠️ Self-update is disabled — this build's commit \`${running}\` ` +
@@ -449,6 +449,10 @@ export function updateReply(
         );
       }
       return "⚠️ Self-update is disabled — this build has no `GIT_SHA` baked in.";
+    case "undetermined":
+      // Unreachable from /update (always forced, so an unknown relation acts); the automatic check never replies. Present
+      // because the switch is exhaustive (#505).
+      return `❓ I couldn't tell whether this build contains \`${short}\` (GitHub's compare failed) — try again shortly.`;
     case "current":
       return `✅ Already on the latest build (\`${running}\`).`;
     case "suppressed":
@@ -457,6 +461,11 @@ export function updateReply(
       // this process mid-await, and delivers the ✅ itself from `pendingUpdateReport`. So a
       // result present at all is a failed swap, and the reply says so instead of promising a
       // return that isn't coming (nazumods/wow#879).
+      // The daemon never answered its ping, so no replacement was created: say that, not "the replacement ... did not
+      // complete the handoff" (#505).
+      if (o.daemonUnreachable) {
+        return `⚠️ The docker daemon did not answer, so nothing was built and I stayed on \`${running}\`. Try /${o.commandName ?? "update"} again shortly.`;
+      }
       if (o.redeploy) {
         const kind =
           o.redeploy.outcome === "timeout" || o.redeploy.outcome === "stalled"
