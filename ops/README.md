@@ -113,7 +113,9 @@ artifacts** — fetched once by `install.sh`, never touched by hand, never preci
 is — but nothing re-fetches either of them on its own. **After a merge that changes either file in
 a way an instance needs to pick up — a new `bot-ops.sh` subcommand or `ALLOWED_SPEC`
 row, or a compose change like a new `environment:` entry, an image pin, a volume — re-run
-`install.sh` on each instance.** From `main`, this always refreshes both files, same as before. From
+`install.sh` on each instance.** (A running admin container sees a re-run's compose file at once since
+#486; one started before that still needs a single recreate, see below.) From `main`, this always
+refreshes both files, same as before. From
 another branch, the compose file is still always refreshed, but the host-shared `bin/bot-ops.sh` is
 refreshed only when that branch's own copy is byte-identical to `main`'s — otherwise `install.sh`
 refuses and names `--force-bin` as the override (issue #230; `bin/bot-ops.sh` is shared by every
@@ -849,7 +851,7 @@ their own with the same `dm:self` grant: the plugin's `agent` command sets no de
 such a principal can DM only itself. Rod accepted that boundary on #332.
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:294-298`); Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:330-335`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -992,7 +994,7 @@ still work after such a line (the last value wins in Compose and in `bot-ops.sh`
 `grep -c '^MCP_BRIDGE_TOKEN=' /opt/rackbops-discord-bot/pip/.env` (a count, never the value) before and
 after. Leave the file ending in a newline: `add-bridge.md` section 3 appends with `>>`, which would
 otherwise fuse the new line onto the last one. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
-filled (`ops/install.sh:294-295`); leave it.
+filled (`ops/install.sh:330-331`); leave it.
 
 ### 3. What the core still does
 

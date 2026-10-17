@@ -171,15 +171,17 @@ fetch() {
 # and its inode kept. The admin service bind-mounts docker-compose.yml as that ONE file, and a mount
 # follows the inode: fetch()'s mv gives the path a new inode, so a running admin would keep reading the
 # old file until it was recreated. A `cat >` keeps the old file's mode and owner, so both are set on the
-# destination itself (chmod to $2, chown to the deploy ids). Anything else -- a first install, a symlink,
-# or a file we do not own (e.g. a root-owned leftover, which mv replaces in our own directory and a `cat >`
-# could not open) -- takes fetch()'s mv path. The trade: an in-place write is not atomic. A `docker
+# destination itself (chmod to $2, chown to the deploy ids). "Ours" means owned by the running user, or any
+# file when we run as root (`sudo bash install.sh`, where a file left by an earlier run belongs to the deploy
+# user, not root), and writable. Anything else -- a first install, a symlink, a root-owned leftover seen
+# by a non-root run, a read-only file (which mv replaces in our own directory and a `cat >` could not open)
+# -- takes fetch()'s mv path. The trade: an in-place write is not atomic. A `docker
 # compose -f` that reads the file in that instant sees it truncated and fails (loudly, a parse error), and
 # a kill mid-write leaves a truncated file the next run rewrites. Used for the compose file only: bot-ops.sh
 # sits in a mounted DIRECTORY and the stack .env is not mounted, so both stay on the atomic mv.
 fetch_in_place() {
   download "$@"
-  if [ -f "$3" ] && [ ! -L "$3" ] && [ -O "$3" ]; then
+  if [ -f "$3" ] && [ ! -L "$3" ] && { [ -O "$3" ] || [ "$(id -u)" -eq 0 ]; } && [ -w "$3" ]; then
     cat "$DOWNLOADED" > "$3"
     chmod "$2" "$3"
     chown "$DEPLOY_UID:$DEPLOY_GID" "$3"

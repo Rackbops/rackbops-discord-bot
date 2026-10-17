@@ -1453,7 +1453,8 @@ describe.skipIf(!runnable)("install.sh leaves an operator's existing .env alone 
     expect(r.stdout).toContain(`install:   ${token}`);
     // the file being moved into place already carried the token: the final path never held an empty one
     expect(r.stdout).toContain(`MV_SRC_TOKEN:ADMIN_TOKEN=${token}`);
-    // E2 (c): the new .env's temp file is chowned to the deploy ids, and so is backups/
+    // E2 (c): backups/ is chowned to the deploy ids (the .env temp-file chown below is this harness's own download
+    // stand-in; the real download()'s chown is pinned by the sweep and shared-bin tests)
     expect(r.stdout).toMatch(/^CHOWN:4242:4343 \S+\/\.env$|^CHOWN:4242:4343 \S+\/tmp\.\w+$/m);
     expect(r.stdout).toMatch(/^CHOWN:4242:4343 \S+\/backups$/m);
     for (const l of r.stdout.split("\n").filter((x) => x.startsWith("CHOWN:"))) expect(l.startsWith("CHOWN:4242:4343 ")).toBe(true);
@@ -1607,7 +1608,7 @@ describe.skipIf(!runnable)("install.sh refreshes the compose file in place so a 
   });
 
   test("E4 source pin: the in-place branch is guarded by -O and a regular, non-symlink file; only the compose file uses it", () => {
-    expect(FETCH_IN_PLACE).toContain('[ -f "$3" ] && [ ! -L "$3" ] && [ -O "$3" ]');
+    expect(FETCH_IN_PLACE).toContain('[ -f "$3" ] && [ ! -L "$3" ] && { [ -O "$3" ] || [ "$(id -u)" -eq 0 ]; } && [ -w "$3" ]');
     expect(installShSource).toMatch(/^ {2}fetch_in_place "docker-compose\.yml" 644 "\$STACK_DIR\/docker-compose\.yml"$/m);
     expect(installShSource).not.toMatch(/fetch_in_place "(\.env\.example|ops\/bot-ops\.sh)"/);
     expect(installShSource).not.toMatch(/^ {2}fetch "docker-compose\.yml"/m);

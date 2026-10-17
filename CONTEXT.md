@@ -738,9 +738,9 @@ _Avoid_: server list, guild cache
   sooner. **#464 (A2) reverses that decline:** the banner is now re-checked about once a minute
   (`createOutdatedRefresher`), because a re-run of `install.sh` is the complete remedy for the
   `bot-ops.sh` half and a one-shot banner would stay stale right after the operator did what it says.
-  The compose half still needs the admin container recreated (it mounts that one file and keeps the
-  old inode; mounting the directory is #486's), through install.sh's printed step 4 with
-  `--force-recreate` added.
+  The compose half needs the admin container recreated once, for an admin started before #486 (it mounts
+  that one file and keeps the old inode; since #486 `install.sh` rewrites the file in place, so after that
+  a re-run is enough), through install.sh's printed step 4 with `--force-recreate` added.
 - **`cloudflared`'s `TUNNEL_TOKEN` is sourced the same way `admin`'s secrets are — named-var
   Compose interpolation, exported by hand out of `$CONFIG_DIR/.env` — not `env_file:`.**
   `env_file: ${BOT_ENV_FILE:-.env}` would load *every* secret in the instance's `.env`

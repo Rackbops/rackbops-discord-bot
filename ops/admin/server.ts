@@ -486,8 +486,8 @@ export function classifySchemas(
 /** #464: `bot-ops.sh version` again, at most once per `ttlMs` (a failed run counts: it is not retried on every call),
  *  seeded with the boot-time list, logging only when the answer changes and keeping the last answer when a run could
  *  not tell -- so a re-run of ops/install.sh clears the bot-ops.sh half of the banner without an admin restart (the
- *  compose half needs the admin container recreated through install.sh's step 4 with --force-recreate: it mounts
- *  that one file and keeps its inode). */
+ *  compose half needs the admin container recreated once, through install.sh's step 4 with --force-recreate, for an
+ *  admin started before #486: it mounts that one file and keeps its inode, which install.sh now rewrites in place). */
 export function createOutdatedRefresher(
   probe: () => Promise<{ outdated: string[] } | { unknown: string }>,
   boot: string[],
