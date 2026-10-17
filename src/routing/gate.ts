@@ -15,8 +15,8 @@
 // though this gate never throws: a fault it cannot judge lets the picker run, as it lets the command run);
 // a button or a modal is not -- it belongs to a message that is already in an allowed channel.
 //
-// A refusal names only the channels the bot can still see (#483): the ones `discovery.json` lists (it is refreshed every 15 minutes, and not at all when a refresh fails),
-// lists in the server. When none of the listed channels is there any more (deleted since), the restriction
+// A refusal names only the channels the bot can still see (#483): the ones `discovery.json` lists in the server
+// (it is refreshed every 15 minutes, and not at all when a refresh fails). When none of the listed channels is there any more (deleted since), the restriction
 // points nowhere, so the command runs and a `[gate]` line says so. Where the restriction is advisory -- the bot
 // cannot look at the channel, a thread's parent is unknown, or the gate fails -- the command runs too (#482).
 //
@@ -142,8 +142,8 @@ export async function gateCommand(
       return undefined;
     }
     // #483: a listed channel the operator has since deleted would be named as `#deleted-channel`. Keep the ones the
-    // bot can still see (discovery.json, refreshed every 15 minutes, so possibly older); with none left the restriction points nowhere, so the
-    // command runs and the log says so. No file, or a file without this server, names them all, as before.
+    // bot can still see (discovery.json, refreshed every 15 minutes, so possibly older); with none left the
+    // restriction points nowhere, so the command runs and the log says so. No file, or a file without this server, names them all, as before.
     // The staleness cuts both ways: a channel deleted since can still be named once, and one hand-added to
     // routing.json that is not yet in the file counts as gone.
     const visible = await visibleChannels(verdict.channels, here.guildId, readDiscovery);
