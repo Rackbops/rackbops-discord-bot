@@ -3,7 +3,8 @@ import { state, saveState, type PendingUpdateReport, type RetiredBy, type SwapIn
 import { restartPending, requestRestart } from "./restart";
 import { prefixedName } from "./commandNaming";
 import { probeReplacement, redeploy, redeployAvailable, type RedeployResult, type ReplacementProbe } from "./redeploy";
-import { GITHUB_TIMEOUT_MS, githubHeaders } from "./github";
+import { dockerSocketMounted } from "./docker";
+import { clampReply, DAEMON_ERROR_MAX, GITHUB_TIMEOUT_MS, githubHeaders } from "./github";
 import { shortSha } from "./storage";
 
 // Self-update detection. The bot has no releases of its own, so "am I stale?" is answered
@@ -27,7 +28,10 @@ export type UpdateDecision =
   /** Stale, but we already exited for this sha and came back unchanged. */
   | "suppressed"
   /** A handoff, another check or a pending restart is already in flight — this call refuses before touching anything (#449). */
-  | "busy";
+  | "busy"
+  /** The compare failed, so there is no verdict: the automatic check acts on nothing and asks again next time; an
+   *  admin's /update (`force`) still acts (#505). */
+  | "undetermined";
 
 /** Tolerant of short vs full shas, so GIT_SHA can be either. */
 export function sameSha(a: string, b: string): boolean {
@@ -51,7 +55,7 @@ export type ShaRelation =
   | "diverged"
   /** The running sha isn't on the remote at all — nothing to compare against. */
   | "unpublished"
-  /** The compare call failed; fall back to treating a sha mismatch as stale. */
+  /** The compare call failed: there is no verdict. The automatic check waits (`undetermined`); an admin's /update acts (#505). */
   | "unknown";
 
 /**
@@ -61,10 +65,12 @@ export type ShaRelation =
  * get wrong. `ahead` and `identical` both mean the build already contains the newest commit, so
  * both read as `current` (a fresh deploy reads `identical`; `ahead` also covers a build carrying
  * commits the compared sha lacks). Once newer code lands the ordinary stale state is `behind`.
- * `unpublished` disables rather than restarts: a build whose sha the remote has never seen
- * (an unpushed branch) can never be matched, so offering an update would be offering one that
- * can never be delivered. `unknown` — an API failure — deliberately falls through to the old
- * behaviour rather than inventing a verdict.
+ * `unpublished` disables the AUTOMATIC check: a build whose sha the remote has never seen (an unpushed branch)
+ * cannot be compared, so there is no verdict to act on. An admin's `/update` (`force`) still rebuilds the branch
+ * tip: `redeploy` builds `latestSha` and never uses the running sha, or, without the socket, exits 75 as for any
+ * restart (#505). `unknown` — an API failure — is `undetermined` for the same reason: the automatic check waits and
+ * asks again next tick instead of acting on a guess (on the socket path the swap SUCCEEDS, so a build that was
+ * `ahead` would be swapped onto an older commit and nothing would revert it); an admin's `/update` acts anyway.
  *
  * `attemptedSha` is the sha we last exited for. If we're back and still stale for
  * that same sha, the orchestrator isn't supplying new code — exiting again would
@@ -80,9 +86,10 @@ export function decideUpdate(o: {
   if (!o.runningSha) return "disabled";
   // Equality shortcut: no relation needed, so the common path spends no extra API request.
   if (sameSha(o.runningSha, o.latestSha)) return "current";
-  if (o.relation === "unpublished") return "disabled";
+  if (o.relation === "unpublished" && !o.force) return "disabled";
   if (o.relation === "identical" || o.relation === "ahead") return "current";
-  // behind | diverged | unknown | absent. `diverged` restarts with `behind`: both answer the
+  if (o.relation === "unknown" && !o.force) return "undetermined";
+  // behind | diverged | (forced) unknown or unpublished | absent. `diverged` restarts with `behind`: both answer the
   // question actually being asked — does this build contain the newest bot commit — with no.
   // A deliberate side-branch deploy points BOT_BRANCH at that branch and goes identical/ahead.
   if (!o.force && o.attemptedSha && sameSha(o.attemptedSha, o.latestSha)) return "suppressed";
@@ -139,7 +146,8 @@ export async function fetchLatestBotSha(timeoutMs = GITHUB_TIMEOUT_MS): Promise<
  *
  * Never throws. A 404 is the meaningful case — the running sha isn't on the remote, which is a
  * real answer (`unpublished`) rather than an error. Anything else that goes wrong is `unknown`,
- * so a GitHub outage degrades the check instead of taking startup down with it.
+ * so a GitHub outage makes the automatic check wait (`undetermined`, #505) instead of taking startup down
+ * with it or acting on a guess.
  */
 export async function fetchShaRelation(
   latestSha: string,
@@ -152,8 +160,9 @@ export async function fetchShaRelation(
         // per_page=1 (#506): only `status` is read; this bounds the commits list the compare endpoint attaches (30 by default).
         `${encodeURIComponent(latestSha)}...${encodeURIComponent(runningSha)}?per_page=1`,
       // A timeout here lands in the catch below as `unknown` — which `decideUpdate` resolves to
-      // `restart`, i.e. a real self-redeploy. That is why GITHUB_TIMEOUT_MS is generous: this is
-      // the one call where being too eager to give up is expensive rather than merely noisy.
+      // `undetermined` for the automatic check (it waits a tick) but to `restart` for an admin's /update, i.e. a
+      // real self-redeploy. That is why GITHUB_TIMEOUT_MS is generous: being too eager to give up still costs an
+      // admin's /update a possibly wrong swap, and the automatic check a tick.
       { headers: githubHeaders(), signal: AbortSignal.timeout(timeoutMs) },
     );
     if (res.status === 404) {
@@ -166,7 +175,7 @@ export async function fetchShaRelation(
       return "unpublished";
     }
     if (!res.ok) {
-      console.warn(`[update] compare failed: ${res.status} — treating a sha mismatch as stale`);
+      console.warn(`[update] compare failed: ${res.status} — the automatic check waits; an admin's update command still acts`);
       return "unknown";
     }
     const { status } = (await res.json()) as { status?: string };
@@ -201,6 +210,9 @@ export interface UpdateCheck {
   /** Set when `decision` is `restart` and the swap was attempted in-process (nazumods/wow#879). Present
    *  only on failure — a successful handoff never returns, since the replacement retires us. */
   redeploy?: RedeployResult;
+  /** Set (with `redeploy.outcome: "failed"`) when the docker socket is mounted but the daemon did not answer its ping:
+   *  nothing was armed or built and the bot did not exit; the next check tries again (#505). */
+  daemonUnreachable?: true;
 }
 
 /** The two docker-daemon-touching calls `applyUpdate` makes, injectable so `checkForUpdate`'s
@@ -208,9 +220,18 @@ export interface UpdateCheck {
 export interface RedeployDeps {
   redeployAvailable: typeof redeployAvailable;
   redeploy: typeof redeploy;
+  /** #505: whether the docker socket is mounted at all (a socket file at the path). Absent = `() => false` — today's
+   *  behaviour, where an unanswering daemon reads as "no socket" and exits 75. When it is true and the ping fails, the
+   *  daemon is unreachable: reported, nothing armed, no exit. */
+  socketMounted?: () => boolean;
+  /** #505: the wait before the one retry of a failed ping, only when the socket is mounted. Absent = 2000. */
+  pingRetryDelayMs?: number;
 }
 
-const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy };
+const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy, socketMounted: dockerSocketMounted };
+
+/** #505: how long to wait before asking the daemon a second time (a slow `/_ping`, a daemon mid-restart). */
+const PING_RETRY_DELAY_MS = 2000;
 
 // Closes the gap `handoffActive()` alone leaves open (#51 item 4): that flag doesn't read true
 // until `redeploy()` calls `beginHandoff()` just before creating the replacement (#130 moved it
@@ -229,14 +250,21 @@ let checkInFlight = false;
 let suppressedWarnedFor: string | undefined;
 /** #506 item 13: why the last socket-path swap this process ran failed, so the `suppressed` warning can say so. */
 let lastFailure: { sha: string; reason: string } | undefined;
+/** #505: the sha the `undetermined` warning was last logged for, so a compare outage logs once per latest sha per process. */
+let undeterminedWarnedFor: string | undefined;
+/** #505: the `<sha>:<kind>` an automatic update failure was last DMed to the admins for (only after a delivery that
+ *  reached someone), so a failing commit is reported once per process and kind. */
+let autoNotifiedFor: string | undefined;
 
 /** What `resetUpdateForTest` resets, for the test-state guard (test/stateGuard.ts). */
 export function updateStateForTest(): {
   checkInFlight: boolean;
   suppressedWarnedFor: string | undefined;
   lastFailure: { sha: string; reason: string } | undefined;
+  undeterminedWarnedFor: string | undefined;
+  autoNotifiedFor: string | undefined;
 } {
-  return { checkInFlight, suppressedWarnedFor, lastFailure };
+  return { checkInFlight, suppressedWarnedFor, lastFailure, undeterminedWarnedFor, autoNotifiedFor };
 }
 
 /** Releases the in-flight guard, as a check that finished would, and forgets what the warning remembers. */
@@ -244,6 +272,8 @@ export function resetUpdateForTest(): void {
   checkInFlight = false;
   suppressedWarnedFor = undefined;
   lastFailure = undefined;
+  undeterminedWarnedFor = undefined;
+  autoNotifiedFor = undefined;
 }
 
 /**
@@ -290,8 +320,20 @@ export async function checkForUpdate(
       force: o.force,
     });
 
+    if (decision === "undetermined") {
+      // #505: no verdict, so no action and nothing saved — the next check asks again. Once per latest sha per process.
+      if (undeterminedWarnedFor !== latestSha) {
+        undeterminedWarnedFor = latestSha;
+        console.warn(
+          `[update] could not tell whether ${shortSha(config.gitSha)} contains ${shortSha(latestSha)} ` +
+            `(the compare failed) -- not acting; the next check asks again`,
+        );
+      }
+      return { decision, latestSha };
+    }
+
     if (decision === "disabled") {
-      // Reachable only via `unpublished` here — the no-sha case returned above.
+      // Reachable only via an unforced `unpublished` here — the no-sha case returned above.
       console.warn(
         `[update] self-update is off: ${shortSha(config.gitSha)} is not on ` +
           `${config.githubRepo}, so there is nothing to compare it against.`,
@@ -326,7 +368,25 @@ export async function checkForUpdate(
       // beside the two markers (#450); the exit-75 path writes only the markers, whose meaning across its respawn
       // is unchanged. Written before the replacement starts and read by it after — never by both at once, which
       // is what keeps two containers off the same state file (nazumods/wow#879).
-      const viaSocket = await deps.redeployAvailable();
+      let viaSocket = await deps.redeployAvailable();
+      if (!viaSocket && (deps.socketMounted ?? (() => false))()) {
+        // #505: the socket IS mounted but the daemon did not answer its ping. That is not "no socket": exiting 75 would
+        // respawn the same image and the automatic check would then suppress this commit. Ask once more; if it still
+        // does not answer, report it, arm NOTHING (the cause is transient: the next tick, or the admin, just tries
+        // again) and stay up.
+        await Bun.sleep(deps.pingRetryDelayMs ?? PING_RETRY_DELAY_MS);
+        viaSocket = await deps.redeployAvailable();
+        if (!viaSocket) {
+          const error = "the docker daemon did not answer its ping (asked twice); nothing was built and nothing restarted";
+          lastFailure = { sha: latestSha, reason: error };
+          suppressedWarnedFor = undefined;
+          console.warn(
+            "[update] the docker socket is mounted but the daemon did not answer its ping (asked twice) -- not exiting, " +
+              "nothing was built; the next check tries again",
+          );
+          return { decision, latestSha, redeploy: { outcome: "failed", error }, daemonUnreachable: true };
+        }
+      }
       state.attemptedUpdateToSha = latestSha;
       const report = buildUpdateReport({ runningSha: config.gitSha, latestSha, requester: o.requester, now: Date.now() });
       // #506 item 12: an AUTO tick (no requester) must not wipe a /update follow-up still owed — the scheduler's
@@ -387,6 +447,37 @@ async function applyUpdate(
   await saveState();
   console.warn(`[update] redeploy to ${shortNew} failed: ${reason} (replacement: ${result.replacement ?? "unknown"})`);
   return result;
+}
+
+/**
+ * #505 item 2: what the admins are told when an AUTOMATIC update attempt failed, or `undefined` when there is nothing to
+ * tell (anything but a `restart` that came back with a failed swap). An admin's `/update` is not notified this way: it
+ * already gets its reply. Pure.
+ */
+export function autoUpdateFailureNotice(check: UpdateCheck, runningSha: string, updateCommand: string): string | undefined {
+  if (check.decision !== "restart" || !check.redeploy) return undefined;
+  const reason = clampReply(check.redeploy.error ?? check.redeploy.outcome ?? "failed", DAEMON_ERROR_MAX);
+  const head = `⚠️ The automatic update to \`${shortSha(check.latestSha)}\` failed: ${reason}. Still running \`${shortSha(runningSha)}\`.`;
+  return check.daemonUnreachable
+    ? `${head} The next automatic check tries again.`
+    : `${head} The automatic check will not retry this commit until a newer one lands; /${updateCommand} retries it now.`;
+}
+
+/**
+ * #505 item 2: tell the admins once per failing commit per process (and per kind: an unreachable daemon is retried every
+ * tick and must not DM every 15 minutes, but when it comes back and the BUILD then fails for the same sha, that is a
+ * different notice and is sent). `deliver` resolves true when someone was reached; only then is the notice recorded, so
+ * a delivery that reached nobody is tried again at the next failure.
+ */
+export async function notifyAutoUpdateFailure(
+  check: UpdateCheck,
+  deps: { deliver: (message: string) => Promise<boolean>; runningSha: string; updateCommand: string },
+): Promise<void> {
+  const notice = autoUpdateFailureNotice(check, deps.runningSha, deps.updateCommand);
+  if (notice === undefined) return;
+  const key = `${check.latestSha}:${check.daemonUnreachable ? "unreachable" : "failed"}`;
+  if (autoNotifiedFor === key) return;
+  if (await deps.deliver(notice)) autoNotifiedFor = key;
 }
 
 /** What a boot makes of the swap record its previous life left (#450). */

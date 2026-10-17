@@ -9,6 +9,7 @@
 
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest } from "../src/announce";
 import { configStateForTest, resetConfigForTest } from "../src/config";
+import { dockerStateForTest, resetDockerForTest } from "../src/docker";
 import { pluginHostStateForTest, resetPluginHostForTest } from "../src/plugins/host";
 import { pluginRequestsStateForTest, resetPluginRequestDrainForTest, resetPluginRequestsForTest } from "../src/plugins/requests";
 import { pluginUpdateStateForTest, resetPluginUpdateStateForTest } from "../src/plugins/updates";
@@ -22,6 +23,7 @@ import {
   announceLeaks,
   botStateLeaks,
   configLeaks,
+  dockerLeaks,
   pluginHostLeaks,
   pluginRequestLeaks,
   pluginUpdateLeaks,
@@ -56,6 +58,7 @@ export const GUARDED: readonly GuardedModule[] = [
   guarded("src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]),
   guarded("src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]),
   guarded("src/storage.ts", storageStateForTest, storageLeaks, [resetKeptCorruptForTest]),
+  guarded("src/docker.ts", dockerStateForTest, dockerLeaks, [resetDockerForTest]),
   guarded("src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]),
   guarded("src/announce.ts", announceStateForTest, announceLeaks, [
     resetTickGuardForTest,

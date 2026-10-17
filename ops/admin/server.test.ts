@@ -29,6 +29,9 @@ import {
   decideBotOpsSchema,
   decideComposeSchema,
   checkBotOpsSchemaStartup,
+  classifySchemas,
+  createOutdatedRefresher,
+  withAssetCache,
   mergeStatusOutdated,
   IDLE_TIMEOUT_SECONDS,
   isAuthorized,
@@ -413,6 +416,45 @@ test("the panel entry point resolves its paths through the guard, not from raw e
   // definitions above (which legitimately mention both) can't satisfy it.
   expect(entry).not.toMatch(/process\.env\.BOT_OPS_CONFIG_DIR\?\.trim\(\)/);
   expect(entry).not.toMatch(/\$\{configDir\}\/admins\.json/);
+});
+
+// #464 item 3: the entry point's HandlerConfig literal. Three of its keys are optional on the type, so dropping one
+// typechecks -- and fails open (no adminStore: every verified Access identity is authorized; no verifyAccessJwt: SSO
+// is off; no outdatedFiles/refreshOutdated: the drift banner is gone). Nothing can execute `import.meta.main`, so the
+// literal is pinned by source, as the store paths above are.
+describe("the panel entry point's HandlerConfig literal (#464)", () => {
+  const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
+  const entry = serverSrc.slice(serverSrc.indexOf("if (import.meta.main) {"));
+  const start = entry.indexOf("const config: HandlerConfig = {");
+  const literal = start === -1 ? "" : entry.slice(start, entry.indexOf("};", start));
+  // A shorthand, or `key:` followed by something other than `undefined`.
+  const has = (key: string) => new RegExp(`(?:^|[\\s,{])${key}\\s*(?:,|:\\s*(?!undefined\\b)\\S|\\s*$)`, "m").test(literal);
+
+  test("the literal is found (cannot pass vacuously)", () => {
+    expect(start).toBeGreaterThan(-1);
+    expect(literal.length).toBeGreaterThan(40);
+  });
+
+  test("the required keys are all set", () => {
+    for (const key of ["adminToken", "indexHtml", "assets", "listBranches", "listPluginIndex", "fetchAdminAsset", "runBotOps"]) {
+      expect(has(key), `${key} missing from the HandlerConfig literal`).toBe(true);
+    }
+  });
+
+  test("adminStore is set: without it allowedEmails is undefined and every verified Access identity is authorized", () => {
+    expect(has("adminStore")).toBe(true);
+  });
+  test("verifyAccessJwt is set: without it SSO is off", () => {
+    expect(has("verifyAccessJwt")).toBe(true);
+  });
+  test("outdatedFiles and refreshOutdated are set: without them the drift banner is gone", () => {
+    expect(has("outdatedFiles")).toBe(true);
+    expect(has("refreshOutdated")).toBe(true);
+  });
+  test("the entry wraps the asset fetcher in the cache and builds the refresher", () => {
+    expect(entry).toContain("withAssetCache(makeAdminAssetFetcher(fetch))");
+    expect(entry).toContain("createOutdatedRefresher(");
+  });
 });
 
 describe("readDynamicAdmins", () => {
@@ -1817,6 +1859,27 @@ describe("handleRequest", () => {
     expect(await res.json()).toEqual({ running: true, realmStatus: "UP", botOpsOutdated: true, outdatedFiles: ["bot-ops.sh"] });
   });
 
+  test("GET /api/status uses refreshOutdated when present (#464, M4c)", async () => {
+    const withRefresher = await handleRequest(
+      authed("/api/status"),
+      branchCfg({
+        runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }),
+        outdatedFiles: ["docker-compose.yml"],
+        refreshOutdated: async () => ["bot-ops.sh"],
+      }),
+    );
+    expect(await withRefresher.json()).toEqual({ running: true, botOpsOutdated: true, outdatedFiles: ["bot-ops.sh"] });
+    const cleared = await handleRequest(
+      authed("/api/status"),
+      branchCfg({
+        runBotOps: fakeRunBotOps({ exitCode: 0, stdout: '{"running":true}', stderr: "" }),
+        outdatedFiles: ["bot-ops.sh"],
+        refreshOutdated: async () => [],
+      }),
+    );
+    expect(await cleared.json()).toEqual({ running: true });
+  });
+
   test("GET /api/status names BOTH files when both are behind — never conflates them into one flag", async () => {
     const res = await handleRequest(
       authed("/api/status"),
@@ -2820,7 +2883,7 @@ describe("checkBotOpsSchemaStartup (#173/#178)", () => {
     // got===null even though the version call itself succeeded (a real, valid "composeSchema: null"
     // response — the pre-#178-compose case) still gets the "no schema reported" detail clause,
     // since decideComposeSchema genuinely couldn't determine a real number either way.
-    expect(errors).toEqual(["[admin] docker-compose.yml is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail (schema unknown, panel needs 1; no schema reported)"]);
+    expect(errors).toEqual(["[admin] docker-compose.yml is OUT OF DATE — re-run ops/install.sh on this instance, then its printed step 4 with --force-recreate, since the admin mounts this one file; panel features may fail (schema unknown, panel needs 1; no schema reported)"]);
   });
 
   test("both mismatch -> two OUT OF DATE lines, returns both names in order", async () => {
@@ -2878,6 +2941,140 @@ describe("checkBotOpsSchemaStartup (#173/#178)", () => {
     };
     await checkBotOpsSchemaStartup(runBotOps, 1, 1);
     expect(seen).toEqual({ args: ["version"], contentType: "application/json" });
+  });
+});
+
+// #464 item 5: the drift banner follows the files.
+describe("classifySchemas (#464)", () => {
+  const run = (o: Partial<BotOpsResult>): BotOpsResult => ({ exitCode: 0, stdout: "", stderr: "", ...o });
+  test("both current -> no outdated file", () => {
+    expect(classifySchemas(run({ stdout: '{"schema":1,"composeSchema":1}' }), 1, 1)).toEqual({ outdated: [] });
+  });
+  test("one behind -> that file only", () => {
+    expect(classifySchemas(run({ stdout: '{"schema":2,"composeSchema":1}' }), 1, 1)).toEqual({ outdated: ["bot-ops.sh"] });
+    expect(classifySchemas(run({ stdout: '{"schema":1,"composeSchema":null}' }), 1, 1)).toEqual({ outdated: ["docker-compose.yml"] });
+  });
+  test("a timed-out run is 'could not tell' (M4f)", () => {
+    expect(classifySchemas(run({ exitCode: 1, timedOut: true }), 1, 1)).toEqual({ unknown: "version timed out" });
+  });
+  test("a non-zero exit with a usage error is DRIFT of both files, never 'unknown' (a pre-#173 script; M4g)", () => {
+    expect(classifySchemas(run({ exitCode: 1, stderr: "bot-ops: usage: bot-ops.sh {status|logs}" }), 1, 1)).toEqual({
+      outdated: ["bot-ops.sh", "docker-compose.yml"],
+    });
+  });
+  test("a 0-exit with unparseable stdout is drift of both files, as at boot", () => {
+    expect(classifySchemas(run({ stdout: "not json" }), 1, 1)).toEqual({ outdated: ["bot-ops.sh", "docker-compose.yml"] });
+  });
+});
+
+describe("createOutdatedRefresher (#464)", () => {
+  function setup(boot: string[], answers: Array<{ outdated: string[] } | { unknown: string } | Error>, ttlMs?: number) {
+    let t = 1_000_000;
+    let calls = 0;
+    const logs: string[] = [];
+    const probe = async () => {
+      const a = answers[Math.min(calls, answers.length - 1)]!;
+      calls++;
+      if (a instanceof Error) throw a;
+      return a;
+    };
+    const refresh = createOutdatedRefresher(probe, boot, ttlMs, () => t, (l) => logs.push(l));
+    return {
+      refresh,
+      logs,
+      calls: () => calls,
+      advance: (ms: number) => {
+        t += ms;
+      },
+    };
+  }
+
+  test("seeded with the boot list and never probed inside the ttl (M4e)", async () => {
+    const h = setup(["docker-compose.yml"], [{ outdated: [] }]);
+    expect(await h.refresh()).toEqual(["docker-compose.yml"]);
+    h.advance(59_999);
+    expect(await h.refresh()).toEqual(["docker-compose.yml"]);
+    expect(h.calls()).toBe(0);
+  });
+
+  test("the DEFAULT ttl is 60 s, and the boundary is exactly ttlMs (M8c, M9)", async () => {
+    const h = setup([], [{ outdated: ["bot-ops.sh"] }]);
+    h.advance(59_999);
+    await h.refresh();
+    expect(h.calls()).toBe(0);
+    h.advance(1);
+    expect(await h.refresh()).toEqual(["bot-ops.sh"]);
+    expect(h.calls()).toBe(1);
+  });
+
+  test("two calls inside the ttl after a probe make ONE probe (M4)", async () => {
+    const h = setup([], [{ outdated: ["bot-ops.sh"] }], 1000);
+    h.advance(1000);
+    await h.refresh();
+    h.advance(500);
+    await h.refresh();
+    expect(h.calls()).toBe(1);
+  });
+
+  test("a changed answer logs one line, an unchanged one none", async () => {
+    const h = setup(["bot-ops.sh"], [{ outdated: [] }, { outdated: [] }], 1000);
+    h.advance(1000);
+    expect(await h.refresh()).toEqual([]);
+    expect(h.logs).toEqual(["[admin] schema drift changed: both files current"]);
+    h.advance(1000);
+    await h.refresh();
+    expect(h.calls()).toBe(2);
+    expect(h.logs.length).toBe(1);
+  });
+
+  test("an 'unknown' keeps the last answer, logs the reason once, and is not retried until the ttl passes (M4b, M4d)", async () => {
+    const h = setup(["docker-compose.yml"], [{ unknown: "version timed out" }], 60_000);
+    h.advance(60_000);
+    expect(await h.refresh()).toEqual(["docker-compose.yml"]);
+    h.advance(1000);
+    await h.refresh();
+    h.advance(1000);
+    await h.refresh();
+    expect(h.calls()).toBe(1);
+    expect(h.logs).toEqual(["[admin] schema re-check could not tell (version timed out); keeping the last answer"]);
+    h.advance(60_000);
+    await h.refresh();
+    expect(h.calls()).toBe(2);
+    expect(h.logs.length).toBe(1); // the same reason twice -> one line
+  });
+
+  test("a probe that rejects keeps the last answer, logs once, and is rate-limited too", async () => {
+    const h = setup(["bot-ops.sh"], [new Error("spawn failed")], 1000);
+    h.advance(1000);
+    expect(await h.refresh()).toEqual(["bot-ops.sh"]);
+    await h.refresh();
+    await h.refresh();
+    expect(h.calls()).toBe(1);
+    expect(h.logs).toEqual(["[admin] schema re-check failed (spawn failed); keeping the last answer"]);
+  });
+
+  test("concurrent calls share one in-flight probe", async () => {
+    const h = setup([], [{ outdated: ["bot-ops.sh"] }], 1000);
+    h.advance(1000);
+    const results = await Promise.all([h.refresh(), h.refresh(), h.refresh()]);
+    expect(results).toEqual([["bot-ops.sh"], ["bot-ops.sh"], ["bot-ops.sh"]]);
+    expect(h.calls()).toBe(1);
+  });
+
+  test("end to end: a clean boot, then a swap to a pre-#173 bot-ops.sh -> both files, one log line (M4g)", async () => {
+    let t = 0;
+    const logs: string[] = [];
+    const refresh = createOutdatedRefresher(
+      async () => classifySchemas({ exitCode: 1, stdout: "", stderr: "bot-ops: usage: ..." }, 1, 1),
+      [],
+      60_000,
+      () => t,
+      (l) => logs.push(l),
+    );
+    expect(await refresh()).toEqual([]);
+    t += 60_000;
+    expect(await refresh()).toEqual(["bot-ops.sh", "docker-compose.yml"]);
+    expect(logs).toEqual(["[admin] schema drift changed: bot-ops.sh, docker-compose.yml"]);
   });
 });
 
@@ -3658,24 +3855,78 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
     ok: o.ok ?? true,
     status: o.status ?? 200,
     headers: { get: (h: string) => (h === "content-length" ? o.contentLength ?? null : h === "content-type" ? o.contentType ?? null : null) },
-    arrayBuffer: async () => new ArrayBuffer(o.bytes ?? 0),
+    body: new Blob([new Uint8Array(o.bytes ?? 0)]).stream() as ReadableStream<Uint8Array>,
   });
 
-  test("rejects early on an oversized Content-Length — WITHOUT buffering the body", async () => {
-    let bodyRead = false;
+  // A body whose `pull` is counted. highWaterMark 0 is load-bearing: the default (1) prefetches one pull, and `pull`
+  // fires once before any reader exists, so a correct implementation would read one more than it should.
+  const countedBody = (chunkBytes: number, chunks: number) => {
+    const state = { pulls: 0, cancelled: false };
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          state.pulls++;
+          if (sent >= chunks) return controller.close();
+          sent++;
+          controller.enqueue(new Uint8Array(chunkBytes));
+        },
+        cancel() {
+          state.cancelled = true;
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    return { body, state };
+  };
+
+  test("rejects early on an oversized Content-Length — WITHOUT reading the body (M1c)", async () => {
+    const { body, state } = countedBody(10, 3);
     const fetcher = makeAdminAssetFetcher(async () => ({
       ok: true,
       status: 200,
       headers: { get: (h: string) => (h === "content-length" ? "999999999" : null) },
-      arrayBuffer: async () => {
-        bodyRead = true;
-        return new ArrayBuffer(0);
-      },
+      body,
     }), 100);
     const r = await fetcher("https://cdn.jsdelivr.net/x");
     expect(r.ok).toBe(false);
+    expect(r.error).toContain("(content-length)");
     // Mutation: dropping the Content-Length pre-check reads the (huge) body first.
-    expect(bodyRead).toBe(false);
+    expect(state.pulls).toBe(0);
+  });
+
+  test("#464: a chunked body with no Content-Length is cut at the cap as it arrives, and the stream is cancelled", async () => {
+    const { body, state } = countedBody(256 * 1024, 8);
+    const fetcher = makeAdminAssetFetcher(async () => ({ ok: true, status: 200, headers: { get: () => null }, body }), 512 * 1024);
+    const r = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(r.ok).toBe(false);
+    expect(r.status).toBe(502);
+    expect(r.error).toBe(`asset exceeds ${512 * 1024} bytes`);
+    // 256 KiB x 3 crosses 512 KiB: three pulls, never a fourth. Mutation: measuring only after the loop reads all eight.
+    expect(state.pulls).toBe(3);
+    await Bun.sleep(0);
+    expect(state.cancelled).toBe(true);
+  });
+
+  test("#464: a body under the cap arriving in several chunks is concatenated in order", async () => {
+    const parts = [new Uint8Array([1, 2]), new Uint8Array([3]), new Uint8Array([4, 5, 6])];
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const p of parts) controller.enqueue(p);
+        controller.close();
+      },
+    });
+    const fetcher = makeAdminAssetFetcher(async () => ({ ok: true, status: 200, headers: { get: () => null }, body }), 100);
+    const out = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(out.ok).toBe(true);
+    expect(Array.from(out.body)).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  test("#464: a null body is an empty asset", async () => {
+    const fetcher = makeAdminAssetFetcher(async () => ({ ok: true, status: 200, headers: { get: () => null }, body: null }), 100);
+    const out = await fetcher("https://cdn.jsdelivr.net/x");
+    expect(out.ok).toBe(true);
+    expect(out.body.byteLength).toBe(0);
   });
 
   test("rejects an oversized body when no Content-Length is declared (the byteLength backstop)", async () => {
@@ -3738,7 +3989,7 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
         ok: true,
         status: 200,
         headers: { get: () => null },
-        arrayBuffer: async () => bytes.buffer,
+        body: new Blob([bytes]).stream() as ReadableStream<Uint8Array>,
       }),
       100,
     );
@@ -3747,6 +3998,165 @@ describe("makeAdminAssetFetcher (#124 size cap)", () => {
     // Mutation: decoding with `new TextDecoder().decode(buf)` (the pre-#229 bug) would turn every
     // non-UTF-8 byte here into U+FFFD instead of preserving them.
     expect(out.body).toEqual(bytes);
+  });
+});
+
+// #464 item 6: the public bundle route stops refetching per hit.
+describe("withAssetCache (#464)", () => {
+  const okResult = (tag: string): AdminAssetResult => ({ ok: true, status: 200, contentType: "text/javascript", body: new TextEncoder().encode(tag) });
+  const failResult: AdminAssetResult = { ok: false, status: 404, contentType: "", body: new Uint8Array(0), error: "upstream 404" };
+  function harness(result: (url: string, n: number) => AdminAssetResult, opts: { ttlMs?: number; failureTtlMs?: number; maxEntries?: number } = {}, useDefaults = false) {
+    let t = 5_000_000;
+    const calls: string[] = [];
+    const upstream = async (url: string) => {
+      calls.push(url);
+      return result(url, calls.length);
+    };
+    const cached = useDefaults ? withAssetCache(upstream, { now: () => t }) : withAssetCache(upstream, { ...opts, now: () => t });
+    return { cached, calls, advance: (ms: number) => { t += ms; } };
+  }
+
+  test("two calls for one URL -> one upstream call, the same result (M2c)", async () => {
+    const h = harness(() => okResult("a"), { ttlMs: 1000 });
+    const a = await h.cached("u1");
+    const b = await h.cached("u1");
+    expect(h.calls).toEqual(["u1"]);
+    expect(b).toBe(a);
+    h.advance(1000);
+    await h.cached("u1");
+    expect(h.calls).toEqual(["u1", "u1"]);
+  });
+
+  test("a FAILURE is remembered for failureTtlMs, a success for ttlMs (M2)", async () => {
+    const h = harness((url) => (url === "bad" ? failResult : okResult("ok")), { ttlMs: 10_000, failureTtlMs: 1000 });
+    await h.cached("bad");
+    await h.cached("good");
+    h.advance(999);
+    await h.cached("bad");
+    await h.cached("good");
+    expect(h.calls).toEqual(["bad", "good"]);
+    h.advance(1); // the failure's window ends at exactly failureTtlMs; the success is far from its own
+    await h.cached("bad");
+    await h.cached("good");
+    expect(h.calls).toEqual(["bad", "good", "bad"]);
+  });
+
+  test("the DEFAULTS: a success survives 599_999 ms and not 600_000, a failure 29_999 and not 30_000 (M8)", async () => {
+    const h = harness((url) => (url === "bad" ? failResult : okResult("ok")), {}, true);
+    await h.cached("bad");
+    await h.cached("good");
+    h.advance(29_999);
+    await h.cached("bad");
+    expect(h.calls.filter((u) => u === "bad").length).toBe(1);
+    h.advance(1);
+    await h.cached("bad");
+    expect(h.calls.filter((u) => u === "bad").length).toBe(2);
+    h.advance(600_000 - 30_000 - 1);
+    await h.cached("good");
+    expect(h.calls.filter((u) => u === "good").length).toBe(1);
+    h.advance(1);
+    await h.cached("good");
+    expect(h.calls.filter((u) => u === "good").length).toBe(2);
+  });
+
+  test("the DEFAULT bound is 32 entries: the 33rd URL evicts the oldest (M2b, M8b)", async () => {
+    const h = harness(() => okResult("x"), {}, true);
+    for (let i = 1; i <= 33; i++) await h.cached(`u${i}`);
+    expect(h.calls.length).toBe(33);
+    await h.cached("u1"); // evicted -> refetched
+    expect(h.calls.length).toBe(34);
+    await h.cached("u33"); // still held
+    expect(h.calls.length).toBe(34);
+  });
+
+  test("a refetched entry moves to the newest slot (M2e)", async () => {
+    const h = harness(() => okResult("x"), { ttlMs: 1000, maxEntries: 32 });
+    for (let i = 1; i <= 32; i++) await h.cached(`u${i}`);
+    h.advance(1000);
+    await h.cached("u1"); // refetches, must become the NEWEST entry
+    const before = h.calls.length;
+    await h.cached("u33"); // evicts the oldest: u2, not u1
+    await h.cached("u1");
+    expect(h.calls.length).toBe(before + 1); // only u33 went upstream; u1 was served from the cache
+    await h.cached("u2");
+    expect(h.calls.length).toBe(before + 2); // u2 was the one evicted
+  });
+
+  test("twenty concurrent cold calls for one URL make one upstream call (M2d)", async () => {
+    const h = harness(() => okResult("x"), { ttlMs: 1000 });
+    const results = await Promise.all(Array.from({ length: 20 }, () => h.cached("u")));
+    expect(h.calls.length).toBe(1);
+    expect(new Set(results).size).toBe(1);
+  });
+
+  test("a rejecting fetcher is not cached: the rejection propagates and the next call tries again", async () => {
+    let n = 0;
+    const cached = withAssetCache(async () => {
+      n++;
+      throw new Error("boom");
+    });
+    await expect(cached("u")).rejects.toThrow("boom");
+    await expect(cached("u")).rejects.toThrow("boom");
+    expect(n).toBe(2);
+  });
+
+  test("a fetcher that throws SYNCHRONOUSLY is a rejection, not a throw out of the cache", async () => {
+    const cached = withAssetCache((() => {
+      throw new Error("sync boom");
+    }) as unknown as (url: string) => Promise<AdminAssetResult>);
+    await expect(cached("u")).rejects.toThrow("sync boom");
+  });
+});
+
+describe("createPluginIndexLister remembers a failure (#464)", () => {
+  const goodText = JSON.stringify({ schemaVersion: 1, plugins: [] });
+  function harness(deps: { failureTtlMs?: number } = {}) {
+    let t = 1_000;
+    let fetches = 0;
+    let fail = true;
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const list = createPluginIndexLister({
+      readEnvText: async () => "",
+      fetchIndexText: async () => {
+        fetches++;
+        if (fail) throw new Error("down");
+        return goodText;
+      },
+      defaultUrl: "https://example.test/index.json",
+      now: () => t,
+      ...deps,
+    });
+    return { list, fetches: () => fetches, advance: (ms: number) => { t += ms; }, heal: () => { fail = false; }, restore: () => errors.mockRestore() };
+  }
+
+  test("inside the window a failed load answers null WITHOUT refetching; after it, the fetch is retried (M3)", async () => {
+    const h = harness({ failureTtlMs: 1000 });
+    try {
+      expect(await h.list()).toBeNull();
+      expect(await h.list()).toBeNull();
+      expect(h.fetches()).toBe(1);
+      h.advance(1000);
+      h.heal();
+      expect(await h.list()).not.toBeNull();
+      expect(h.fetches()).toBe(2);
+    } finally {
+      h.restore();
+    }
+  });
+
+  test("the DEFAULT window is 30 s (M8d)", async () => {
+    const h = harness();
+    try {
+      await h.list();
+      h.advance(29_999);
+      await h.list();
+      expect(h.fetches()).toBe(1);
+      h.advance(1);
+      await h.list();
+      expect(h.fetches()).toBe(2);
+    } finally {
+      h.restore();
+    }
   });
 });
 
@@ -3936,7 +4346,7 @@ describe("describeOutdatedBanner (lifted from index.html, #173/#178)", () => {
       "bot-ops.sh is out of date on this instance — re-run ops/install.sh; panel features may fail.",
     );
     expect(describeOutdatedBanner(["docker-compose.yml"])).toBe(
-      "docker-compose.yml is out of date on this instance — re-run ops/install.sh; panel features may fail.",
+      "docker-compose.yml is out of date on this instance — re-run ops/install.sh, then its printed step 4 with --force-recreate; panel features may fail.",
     );
   });
 
@@ -3944,7 +4354,7 @@ describe("describeOutdatedBanner (lifted from index.html, #173/#178)", () => {
     // Mutation: hardcoding "bot-ops.sh" regardless of the list, or always using singular "is", both
     // turn this red.
     expect(describeOutdatedBanner(["bot-ops.sh", "docker-compose.yml"])).toBe(
-      "bot-ops.sh and docker-compose.yml are out of date on this instance — re-run ops/install.sh; panel features may fail.",
+      "bot-ops.sh and docker-compose.yml are out of date on this instance — re-run ops/install.sh, then its printed step 4 with --force-recreate; panel features may fail.",
     );
   });
 });
@@ -5709,16 +6119,35 @@ describe("Dockerfile COPY ratchet: every server.ts local import is copied into t
   const serverSrc = readFileSync(new URL("./server.ts", import.meta.url), "utf8");
   const dockerfileSrc = readFileSync(new URL("./Dockerfile", import.meta.url), "utf8");
 
-  // Static `from "./x"` / `from "./x.js"` and dynamic `import("./x")` relative specifiers, mapped
-  // to their on-disk filename (Bun resolves a `.js` specifier to the sibling `.ts` file).
-  function extractLocalImportFilenames(src: string): string[] {
+  // #464: every relative specifier in every import form -- `from "./x"` (which also covers `export ... from`), a bare
+  // `import "./x"`, `import("./x")` and `require("./x")` -- mapped to its on-disk filename (Bun resolves a `.js`
+  // specifier to the sibling `.ts` file). A `../` specifier is outside the build context, which no COPY can satisfy,
+  // so it fails by name.
+  function localImportsOf(src: string): string[] {
     const specifiers: string[] = [];
-    for (const m of src.matchAll(/from\s+["'](\.\/[^"']+)["']/g)) specifiers.push(m[1]!);
-    for (const m of src.matchAll(/import\(\s*["'](\.\/[^"']+)["']\s*\)/g)) specifiers.push(m[1]!);
+    for (const m of src.matchAll(/from\s+["'](\.\.?\/[^"']+)["']/g)) specifiers.push(m[1]!);
+    for (const m of src.matchAll(/\bimport\s+["'](\.\.?\/[^"']+)["']/g)) specifiers.push(m[1]!);
+    for (const m of src.matchAll(/\b(?:import|require)\(\s*["'](\.\.?\/[^"']+)["']\s*\)/g)) specifiers.push(m[1]!);
     return specifiers.map((spec) => {
+      if (spec.startsWith("../")) throw new Error(`"${spec}" is outside the image's build context: no COPY can satisfy it`);
       const base = spec.slice(2).replace(/\.js$/, "");
       return base.endsWith(".ts") ? base : `${base}.ts`;
     });
+  }
+
+  /** Every local file `entry` reaches, through the files it copies in turn (a visited set breaks a cycle). */
+  function transitiveLocalImports(entry: string, read: (file: string) => string): Set<string> {
+    const seen = new Set<string>([entry]);
+    const queue = [entry];
+    while (queue.length > 0) {
+      for (const f of localImportsOf(read(queue.shift()!))) {
+        if (seen.has(f)) continue;
+        seen.add(f);
+        queue.push(f);
+      }
+    }
+    seen.delete(entry);
+    return seen;
   }
 
   // Every COPY instruction's source tokens (all but the last, which is the destination);
@@ -5738,15 +6167,43 @@ describe("Dockerfile COPY ratchet: every server.ts local import is copied into t
   }
 
   test("the extractor finds at least one local import (can't pass vacuously)", () => {
-    expect(extractLocalImportFilenames(serverSrc).length).toBeGreaterThanOrEqual(1);
+    expect(localImportsOf(serverSrc).length).toBeGreaterThanOrEqual(1);
   });
 
-  test("every server.ts local import filename is among the Dockerfile's COPY sources", () => {
-    const imports = extractLocalImportFilenames(serverSrc);
+  test("every local file server.ts reaches, in any import form and through the files it copies, is among the Dockerfile's COPY sources (#464)", () => {
+    const imports = transitiveLocalImports("server.ts", (file) => readFileSync(new URL(`./${file}`, import.meta.url), "utf8"));
+    expect(imports.size).toBeGreaterThanOrEqual(1);
     const copied = extractDockerfileCopySources(dockerfileSrc);
     for (const filename of imports) {
       expect(copied).toContain(filename);
     }
+  });
+
+  // The extractor's own blind spots, pinned on fixture strings (the real tree uses only the `from` form, so only these
+  // guard the other four -- M6).
+  test.each([
+    ['import { a } from "./a";', ["a.ts"]],
+    ['export * from "./a";', ["a.ts"]],
+    ['export { x } from "./a.js";', ["a.ts"]],
+    ['import "./a";', ["a.ts"]],
+    ['const m = await import("./a");', ["a.ts"]],
+    ['const m = require("./a");', ["a.ts"]],
+    ['import { a } from "node:fs"; import b from "jose";', []],
+  ])("localImportsOf(%s)", (src, expected) => {
+    expect(localImportsOf(src)).toEqual(expected);
+  });
+
+  test("a parent-relative specifier fails by name: it is outside the build context", () => {
+    expect(() => localImportsOf('import { a } from "../a";')).toThrow("outside the image's build context");
+  });
+
+  test("the recursion follows copied files and survives a cycle (M6b)", () => {
+    const files: Record<string, string> = {
+      "entry.ts": 'import "./a";',
+      "a.ts": 'import { b } from "./b"; import { e } from "./entry";',
+      "b.ts": "export const b = 1;",
+    };
+    expect([...transitiveLocalImports("entry.ts", (f) => files[f]!)].sort()).toEqual(["a.ts", "b.ts"]);
   });
 });
 

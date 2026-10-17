@@ -6,6 +6,12 @@ import { readFileSync, writeFileSync } from "node:fs";
 /** A pin must be an exact `x.y.z` -- a range would let a fresh install build different CSS. */
 export const EXACT_VERSION_RE = /^\d+\.\d+\.\d+$/;
 
+/** Pure: why `pin` (package.json's `@rackbops/styles` devDependency) is not an exact `x.y.z`, or null when it is. */
+export function pinProblem(pin: unknown): string | null {
+  if (typeof pin === "string" && EXACT_VERSION_RE.test(pin)) return null;
+  return `the @rackbops/styles pin in package.json must be an exact x.y.z version, got ${JSON.stringify(pin)}`;
+}
+
 /** Pure: the full text of rb-theme.css. Line 1 is the banner naming the version it came from (which
  * `ops/admin/server.test.ts` compares against the pin), then the dark (obsidian) bundle, then the
  * light (parchment) bundle -- LF line endings and exactly one trailing newline whatever the
@@ -35,9 +41,8 @@ if (import.meta.main) {
   };
 
   const pin: unknown = JSON.parse(readText("./package.json")).devDependencies?.["@rackbops/styles"];
-  if (typeof pin !== "string" || !EXACT_VERSION_RE.test(pin)) {
-    fail(`the @rackbops/styles pin in package.json must be an exact x.y.z version, got ${JSON.stringify(pin)}`);
-  }
+  const problem = pinProblem(pin);
+  if (problem !== null) fail(problem);
   const version = pin as string;
   const installed: unknown = JSON.parse(readText("./node_modules/@rackbops/styles/package.json")).version;
   if (installed !== version) {

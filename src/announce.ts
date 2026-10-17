@@ -6,7 +6,8 @@ import { prefixedName } from "./commandNaming";
 import type { TickCheck } from "./plugins/contract";
 import { state, saveState } from "./state";
 import { clampReply, fetchReleases, decideReleaseAnnouncements, createReachabilityLog, RELEASES_PER_PAGE, type Release } from "./github";
-import { checkForUpdate } from "./update";
+import { checkForUpdate, notifyAutoUpdateFailure } from "./update";
+import { deliverAdminNotice, type AdminNoticeDeliverers } from "./adminNotice";
 import { restartPending, requestRestart, withCritical } from "./restart";
 import { DATA_DIR, readJsonOrFresh, writeJsonAtomic, createJsonWriter, createKeyedJsonMutator } from "./storage";
 import { loadPluginIndex } from "./plugins";
@@ -232,7 +233,7 @@ export function tickChecks(client: Client, extra: TickCheck[]): TickCheck[] {
     {
       name: "autoUpdate",
       run: async () => {
-        if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate();
+        if (config.autoUpdate && shouldPollUpdate()) await checkAutoUpdate(client);
       },
     },
     {
@@ -319,9 +320,21 @@ function shouldPollUpdate(): boolean {
   return Date.now() - lastUpdatePollAt >= UPDATE_POLL_GAP_MS;
 }
 
-async function checkAutoUpdate(): Promise<void> {
+async function checkAutoUpdate(client: Client): Promise<void> {
   lastUpdatePollAt = Date.now();
-  await checkForUpdate();
+  const check = await checkForUpdate();
+  // #505 item 2: a failed automatic update used to be one console.warn nobody reads; the admins are told once per failing
+  // commit (a /update failure already gets its own reply, so only this path notifies).
+  await notifyAutoUpdateFailure(check, {
+    deliver: (message) =>
+      deliverAdminNotice(message, config.adminUserIds, liveAdminDeliverers(client), console, {
+        noAdmins: "[update] a failed automatic update needs reporting but ADMIN_USER_IDS is empty — no one to notify",
+        dmFailed: (id, reason) => `[update] couldn't DM admin ${id} about a failed automatic update (${reason}) — will try the announce channel`,
+        fallbackFailed: "[update] channel fallback for a failed automatic update notice failed",
+      }),
+    runningSha: config.gitSha!,
+    updateCommand: prefixedName(config.commandPrefix, "update"),
+  });
 }
 
 // Flat 15-min cadence with a startup catch-up (like shouldPollReleases), so a version published
@@ -329,6 +342,18 @@ async function checkAutoUpdate(): Promise<void> {
 function shouldPollPluginUpdates(): boolean {
   if (lastPluginPollAt === 0) return true; // startup catch-up
   return Date.now() - lastPluginPollAt >= UPDATE_POLL_GAP_MS;
+}
+
+/** The two ways the bot reaches an admin — a DM, and the announce channel as the fallback — shared by the plugin update
+ *  notice and the failed-automatic-update notice (#505). */
+function liveAdminDeliverers(client: Client): AdminNoticeDeliverers {
+  return {
+    dmUser: async (userId, content) => {
+      const user = await client.users.fetch(userId);
+      await user.send(content);
+    },
+    postAnnounce: (content) => announceTo(client, config.announceChannelId, content),
+  };
 }
 
 /** Live deps for `checkPluginUpdates`, built from config + the shared storage + the Client's DM and
@@ -340,13 +365,7 @@ export function livePluginUpdateDeps(client: Client): PluginUpdateDeps {
     loadIndex: async () => (await loadPluginIndex(config.pluginIndexUrl, DATA_DIR)).index,
     readState: () => readPluginState(DATA_DIR, pluginStorage),
     mutateState: (mutate) => mutatePluginState(DATA_DIR, mutate),
-    deliverers: {
-      dmUser: async (userId, content) => {
-        const user = await client.users.fetch(userId);
-        await user.send(content);
-      },
-      postAnnounce: (content) => announceTo(client, config.announceChannelId, content),
-    },
+    deliverers: liveAdminDeliverers(client),
     adminUserIds: config.adminUserIds,
     hostApiVersion: HOST_API_VERSION,
     // The notice tells admins to run `/plugins …` — under the name it is registered as here.

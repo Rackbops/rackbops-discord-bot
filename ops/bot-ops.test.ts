@@ -82,6 +82,8 @@ interface Fixture {
   bin: string;
   envFile: string;
   compose: string;
+  /** The host file the shim reads the `-next` state from (only when setup() got nextStateFile). */
+  nextStateFile?: string;
 }
 const fixtures: Fixture[] = [];
 
@@ -97,6 +99,11 @@ function setup(
      *  "!error" makes the query itself fail (exit 1, as a down daemon would). Absent → no `-next`
      *  container at all. */
     nextState?: string;
+    /** Like nextState, but the shim `cat`s the `-next` container's state from a HOST file
+     *  (`fx.nextStateFile`, created empty) on every `-next` query (empty = no `-next` container), so a test
+     *  can change it while a call is blocked on the config-dir lock (#473). originalState applies as it
+     *  does with nextState. */
+    nextStateFile?: boolean;
     /** The simulated canonical-named container's real docker state:
      *  - "running" (the default whenever nextState is set): matches a bare `docker ps` (no `-a`) AND
      *    `docker ps -a`, same as a real running container.
@@ -111,8 +118,9 @@ function setup(
      *  call (#59/#143) — matched on the literal `{{.State}}` template text, distinct from the
      *  `{{.Names}}`-format `ps` calls `originalState` simulates (the `-next` query is answered before
      *  this one, by `nextState`). Absent → the shim
-     *  prints nothing, same as a `status` call against a container that doesn't exist. */
-    containerMeta?: { state: string; status: string; image: string };
+     *  prints nothing, same as a `status` call against a container that doesn't exist.
+     *  "!error" makes that query fail (exit 3, "Cannot connect to the Docker daemon" on stderr, #473). */
+    containerMeta?: { state: string; status: string; image: string } | "!error";
     /** Fixture JSON the fake `docker exec … cat` returns for the bot's cached Plugin Index
      *  (`/app/data/plugins/index.json` — the CachedPluginIndex wrapper `{writtenAt, index}`) and
      *  Plugin State (`/app/data/plugins/state.json`). Absent → the shim prints nothing for that
@@ -175,6 +183,8 @@ function setup(
   if (opts.pluginState !== undefined) writeFileSync(pluginStateFile, opts.pluginState);
   const routingFile = join(root, "routing.json");
   const discoveryFile = join(root, "discovery.json");
+  const nextStateFile = opts.nextStateFile ? join(root, "next-state.txt") : undefined;
+  if (nextStateFile !== undefined) writeFileSync(nextStateFile, "");
   const composeOutFile = join(root, "compose-up-output.txt");
   if (opts.routing !== undefined) writeFileSync(routingFile, opts.routing);
   if (opts.discovery !== undefined) writeFileSync(discoveryFile, opts.discovery);
@@ -242,14 +252,19 @@ function setup(
     [
       "#!/usr/bin/env bash",
       `printf '%s\\n' "docker $*" >> "$(dirname "$0")/docker.log"`,
-      opts.nextState !== undefined
+      // #473: which BOT_ENV_FILE every `docker compose` call was given, in a file of its own so the
+      // docker.log lines that tests match exactly stay as they were.
+      `if [[ "$1" == "compose" ]]; then printf '%s\\n' "\${BOT_ENV_FILE-<unset>}" >> "$(dirname "$0")/compose-env.log"; fi`,
+      opts.nextState !== undefined || nextStateFile !== undefined
         ? [
             `if [[ "$1" == "ps" ]] && [[ "$*" == *"-next"* ]]; then`,
-            ...(opts.nextState === "!error"
+            ...(nextStateFile !== undefined
+              ? [`  if [[ "$*" == *'{{.State}}'* ]]; then cat ${JSON.stringify(bashPath(nextStateFile))} 2>/dev/null || true; fi`]
+              : opts.nextState === "!error"
               ? [`  echo "Cannot connect to the Docker daemon" >&2; exit 1`]
               : [
                   `  if [[ "$*" == *'{{.State}}'* ]]; then`,
-                  ...opts.nextState
+                  ...(opts.nextState ?? "")
                     .split("\n")
                     .map((state) =>
                       ["running", "restarting", "paused"].includes(state)
@@ -270,7 +285,9 @@ function setup(
       opts.containerMeta
         ? [
             `if [[ "$1" == "ps" ]] && [[ "$*" == *'{{.State}}'* ]] && [[ "$*" != *"-next"* ]]; then`,
-            `  printf '%s\\t%s\\t%s\\n' ${JSON.stringify(opts.containerMeta.state)} ${JSON.stringify(opts.containerMeta.status)} ${JSON.stringify(opts.containerMeta.image)}`,
+            opts.containerMeta === "!error"
+              ? `  echo "Cannot connect to the Docker daemon" >&2; exit 3`
+              : `  printf '%s\\t%s\\t%s\\n' ${JSON.stringify(opts.containerMeta.state)} ${JSON.stringify(opts.containerMeta.status)} ${JSON.stringify(opts.containerMeta.image)}`,
             `fi`,
           ].join("\n")
         : "",
@@ -284,7 +301,7 @@ function setup(
   writeFileSync(compose, "services:\n  bot:\n    image: x\n");
   const envFile = join(cfg, ".env");
   writeFileSync(envFile, envText);
-  const fx = { root, cfg, bin, envFile, compose };
+  const fx: Fixture = { root, cfg, bin, envFile, compose, nextStateFile };
   fixtures.push(fx);
   return fx;
 }
@@ -298,6 +315,8 @@ interface Run {
   stdout: string;
   stderr: string;
   json: Record<string, unknown> | null;
+  /** The spawned process's pid (#473: what the backup name's suffix is compared with, on Linux). */
+  pid: number;
 }
 
 async function botOps(
@@ -338,7 +357,7 @@ async function botOps(
   } catch {
     /* not JSON — an error path, asserted on stderr/exit code instead */
   }
-  return { exitCode, stdout, stderr, json };
+  return { exitCode, stdout, stderr, json, pid: proc.pid };
 }
 
 const envGet = async (fx: Fixture): Promise<Record<string, string>> => {
@@ -378,9 +397,6 @@ async function fullBody(fx: Fixture, overrides: Record<string, string>): Promise
     .join("\n");
 }
 
-// issue #41: BOT_OPS_PROJECT/BOT_OPS_CONTAINER have no fallback — a caller that forgets either
-// must get a named, immediate die, never a silent guess. This is the precondition every other
-// subcommand depends on, so it's checked before any of them (using "status" here is arbitrary).
 // #342: source-level pins that need neither bash nor jq, so they also run on a box where the
 // subprocess tests above skip (the behavioural twins are the env-set tests under "issue #44").
 describe("bot-ops.sh WATCHED_REPOS accepts none (#342, source pins)", () => {
@@ -456,11 +472,12 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
     for (const v of PLUGINS_CORPUS) expect(re.test(v) && !repeatsAName(v), v).toBe(bootAccepts(v));
   });
 
-  test("BOT_OPS_SCHEMA is 7 with its #430 history line", () => {
-    expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=7$/m);
+  test("BOT_OPS_SCHEMA is 8 with its #430 and #473/#474 history lines", () => {
+    expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=8$/m);
     expect(src).toMatch(
       /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, no plugin in two different tokens, every env-set format judged in the C locale \(#430\)\.$/m,
     );
+    expect(src).toMatch(/^# 8: PLUGIN_INDEX_URL refuses a user:pass@ authority; status adds dockerError \(#473, #474\)\.$/m);
   });
 });
 
@@ -507,6 +524,9 @@ describe("bot-ops.sh WATCHED_REPOS row agrees with what the bot boots (#494, sou
   });
 });
 
+// issue #41: BOT_OPS_PROJECT/BOT_OPS_CONTAINER have no fallback — a caller that forgets either
+// must get a named, immediate die, never a silent guess. This is the precondition every other
+// subcommand depends on, so it's checked before any of them (using "status" here is arbitrary).
 describe.skipIf(!runnable)("bot-ops.sh requires BOT_OPS_PROJECT/BOT_OPS_CONTAINER, no fallback (issue #41)", () => {
   test("BOT_OPS_PROJECT unset dies naming it, before touching docker", async () => {
     const fx = setup("");
@@ -1054,10 +1074,49 @@ describe.skipIf(!runnable || !REAL_FLOCK)("bot-ops.sh env-set/restart/recreate s
     expect(restartIdx).toBeGreaterThan(-1);
     expect(restartIdx).toBeGreaterThan(endIdx); // restart's own compose call queued behind env-set's lock
   });
+
+  // #474 item 10: the describe's title names recreate, and no test ran it against an env-set in flight.
+  test("recreate waits for an env-set in flight", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      composeUp: { output: "Container probe-container  Started", delayMs: 1500 },
+    });
+    const envSetPromise = botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    await Bun.sleep(300); // let env-set win the lock race before recreate even starts
+    const recreate = await botOps(fx, ["recreate"]);
+    const envSet = await envSetPromise;
+    expect(envSet.exitCode).toBe(0);
+    expect(recreate.exitCode).toBe(0);
+    const log = readFileSync(join(fx.bin, "docker.log"), "utf8");
+    const starts = [...log.matchAll(/compose-up start (\d+)/g)].map((m) => Number(m[1]));
+    const ends = [...log.matchAll(/compose-up end (\d+)/g)].map((m) => Number(m[1]));
+    expect(starts).toHaveLength(2);
+    expect(ends).toHaveLength(2);
+    expect(starts[1]!).toBeGreaterThanOrEqual(ends[0]!); // recreate's own compose-up queued behind env-set's lock
+  });
+
+  // #473 item 1: the handoff guard is read once the lock is HELD. A /update that creates <container>-next
+  // while a call waits on the lock must be seen by that call, which reads the state file only at its turn.
+  test("a recreate that waited on the lock re-reads the handoff guard: a -next that appeared meanwhile refuses it", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      composeUp: { output: "Container probe-container  Started", delayMs: 1500 },
+      nextStateFile: true, // starts empty: no -next container yet
+    });
+    const envSetPromise = botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+    await Bun.sleep(300); // env-set holds the lock
+    const recreatePromise = botOps(fx, ["recreate"]); // blocks on the lock
+    await Bun.sleep(300);
+    writeFileSync(fx.nextStateFile!, "running\n"); // a /update starts the replacement during the wait
+    const [envSet, recreate] = await Promise.all([envSetPromise, recreatePromise]);
+    expect(envSet.exitCode).toBe(0);
+    expect(recreate.exitCode).not.toBe(0);
+    expect(recreate.stderr).toContain("a self-update is in progress");
+    const ups = dockerCalls(fx).filter((c) => c.includes("up -d --force-recreate"));
+    expect(ups).toHaveLength(1); // only the env-set's
+  });
 });
 
 describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on the config dir (#227)", () => {
-  test("the backup name ends in the pid, and the JSON's backup field is that file", async () => {
+  test("the backup name ends in a numeric suffix, and the JSON's backup field is that file", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).toBe(0);
@@ -1067,17 +1126,54 @@ describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on
     expect(run.json!.backup as string).toContain(backups[0]!);
   });
 
+  // #474 item 10: the shape check above passes for any digits. Where the script's `$$` is the spawned pid
+  // (not Git Bash on Windows, whose `$$` is its own MSYS pid) the suffix must BE that pid.
+  bunTest.skipIf(process.platform === "win32")(
+    "the backup name's suffix is the script's pid",
+    async () => {
+      const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+      const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
+      expect(run.exitCode).toBe(0);
+      const backups = readdirSync(join(fx.cfg, "backups"));
+      expect(backups[0]!.endsWith(`-${run.pid}`)).toBe(true);
+    },
+    60_000,
+  );
+
   // Shape chosen over rebuilding a minimal PATH without flock (the plan's other option): that shape
   // needs a real, working bash + coreutils + jq on PATH with flock specifically excluded, which is
   // fragile to construct portably and CI-only anyway (this box has no real flock to exclude in the
-  // first place) — a source pin is deterministic on every platform and directly names the exact
-  // guard ("need flock" inside the helper) the coverage table's mutant drops.
-  test("without flock on PATH, env-set refuses to run unserialised (source guard: need flock inside lock_config_dir)", () => {
+  // first place) — a source pin is deterministic on every platform. It says so in its name (#474 item 10):
+  // it pins the line, it does not run the refusal. The line must be exactly `need flock`, which
+  // `need flock || true` (a guard that cannot refuse) is not.
+  test("lock_config_dir requires flock (source pin: a bare `need flock` line inside the helper)", () => {
     const src = readFileSync(BOT_OPS_SH, "utf8");
     const helperStart = src.indexOf("lock_config_dir() {");
     expect(helperStart).toBeGreaterThan(-1);
     const helperBody = src.slice(helperStart, src.indexOf("\n}", helperStart));
-    expect(helperBody).toContain("need flock");
+    expect(helperBody).toMatch(/^\s*need flock$/m);
+  });
+
+  // #473 item 1: the handoff guard runs ONCE per command, AFTER the lock is held -- a /update may create
+  // <container>-next while the command waits for it. Running it only before the lock misses that; running
+  // it twice would double the `-next` queries every exact-docker-call test pins. (The behavioural twin is
+  // in the REAL_FLOCK describe above; this pin runs everywhere.)
+  test("restart, recreate and env-set run the handoff guard once, after lock_config_dir (source pin)", () => {
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    for (const [name, fnStart] of [
+      ["cmd_env_set", "cmd_env_set() {"],
+      ["cmd_restart", "cmd_restart() {"],
+      ["cmd_recreate", "cmd_recreate() {"],
+    ] as const) {
+      const start = src.indexOf(fnStart);
+      expect(start, name).toBeGreaterThan(-1);
+      const body = src.slice(start, src.indexOf("\n}", start));
+      const guards = [...body.matchAll(/^\s*guard_no_handoff_in_progress\b/gm)];
+      expect(guards, name).toHaveLength(1);
+      const lock = body.search(/^\s*lock_config_dir\s+\w+/m);
+      expect(lock, name).toBeGreaterThan(-1);
+      expect(guards[0]!.index!, name).toBeGreaterThan(lock);
+    }
   });
 
   test("the lock is taken once per process, never inside the recreate helper (source pin)", () => {
@@ -1743,6 +1839,124 @@ describe.skipIf(!runnable)("bot-ops.sh status reads running/status/image from on
     expect(run.exitCode).toBe(0);
     expect(run.json).toMatchObject({ running: false, status: "", image: "" });
   });
+
+  // #473 item 6: a `docker ps` that FAILS (socket unreachable, permission denied) used to read as "no
+  // container". It is still running:false with exit 0 (the panel treats a non-zero status as a failed
+  // request and would lose the rest of the page), but says so, with the exit code only.
+  test("a failing docker ps adds dockerError (the exit code only, never docker's stderr); exit stays 0", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", { containerMeta: "!error" });
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toMatchObject({ running: false, status: "", image: "", dockerError: "docker ps failed (exit 3)" });
+    expect(run.stdout).not.toContain("Cannot connect");
+  });
+
+  test("a healthy status has no dockerError key: the object is exactly today's shape", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
+      containerMeta: { state: "running", status: "Up 3 hours", image: "ghcr.io/rackbops/bot:abc123" },
+    });
+    const run = await botOps(fx, ["status"]);
+    expect(run.exitCode).toBe(0);
+    expect(run.json).toEqual({ running: true, status: "Up 3 hours", image: "ghcr.io/rackbops/bot:abc123", realmStatus: "", plugins: [] });
+  });
+});
+
+// #473 items 3 and 4: every test above matched the recreate as a SUBSTRING (`*"up -d --force-recreate"*`) and
+// read only the argv, so a trailing `--build`, or a dropped `BOT_ENV_FILE=` prefix, left the suite green.
+describe.skipIf(!runnable)("bot-ops.sh pins the compose argv and the env file it points compose at (#473)", () => {
+  const composeLines = (fx: Fixture): string[] => dockerCalls(fx).filter((c) => c.startsWith("docker compose"));
+  const envLog = (fx: Fixture): string[] => {
+    const log = join(fx.bin, "compose-env.log");
+    return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+  };
+
+  test("env-set and recreate call exactly `up -d --force-recreate`: no --build, nothing else", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect((await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n")).exitCode).toBe(0);
+    expect((await botOps(fx, ["recreate"])).exitCode).toBe(0);
+    const expected = `docker compose -f ${bashPath(fx.compose)} -p probe-project up -d --force-recreate`;
+    expect(composeLines(fx)).toEqual([expected, expected]);
+    expect(dockerCalls(fx).some((c) => c.includes("--build"))).toBe(false);
+  });
+
+  test("restart, recreate and env-set each hand compose BOT_ENV_FILE = the config dir's .env", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect((await botOps(fx, ["restart"])).exitCode).toBe(0);
+    expect((await botOps(fx, ["recreate"])).exitCode).toBe(0);
+    expect((await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n")).exitCode).toBe(0);
+    expect(envLog(fx)).toEqual([bashPath(fx.envFile), bashPath(fx.envFile), bashPath(fx.envFile)]);
+  });
+
+  test("with nothing to change, env-set makes no compose call at all (so no env file is handed out)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect((await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=11111\n")).exitCode).toBe(0);
+    expect(envLog(fx)).toEqual([]);
+  });
+});
+
+// #473 item 5: bash reads a leading 0 as octal, so `07777` was 4095 (under the cap, and docker read the 07777 as
+// 7777) and `08000` / `09999` made the `(( ))` fail, the `&&` short-circuit, and the value go unclamped.
+describe.skipIf(!runnable)("bot-ops.sh logs reads N as decimal (#473)", () => {
+  for (const [given, sent] of [
+    ["07777", "5000"],
+    ["09999", "5000"],
+    ["08000", "5000"],
+    ["00200", "200"],
+    ["200", "200"],
+  ] as const) {
+    test(`logs ${given} sends --tail ${sent}`, async () => {
+      const fx = setup("");
+      const run = await botOps(fx, ["logs", given]);
+      expect(run.exitCode).toBe(0);
+      expect(dockerCalls(fx)).toEqual([`docker logs probe-container --tail ${sent}`]);
+    });
+  }
+});
+
+// #474 item 8: PLUGIN_INDEX_URL is a static, non-secret key, so env-get hands its value to every panel user.
+describe.skipIf(!runnable)("bot-ops.sh refuses credentials in PLUGIN_INDEX_URL (#474)", () => {
+  test("a user:pass@ URL is refused at write time: the pattern's refusal naming the key, .env unchanged", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const before = envText(fx);
+    const run = await botOps(fx, ["env-set"], "PLUGIN_INDEX_URL=https://user:pw@plugins.invalid/x.json\n");
+    expect(run.exitCode).not.toBe(0);
+    expect(run.stderr).toContain("value for 'PLUGIN_INDEX_URL' is invalid");
+    expect(envText(fx)).toBe(before);
+  });
+
+  test("an @ after the authority, and a query string, are accepted (the query half is declined on purpose)", async () => {
+    for (const good of [
+      "https://plugins.invalid/a@b/x.json?v=1",
+      "https://plugins.invalid?t=a@b",
+      "https://plugins.invalid/x.json?token=abc",
+    ]) {
+      const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+      const run = await botOps(fx, ["env-set"], `PLUGIN_INDEX_URL=${good}\n`);
+      expect(run.exitCode, good).toBe(0);
+    }
+  });
+
+  test("env-schema hands the panel the stricter pattern", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    const schema = await envSchema(fx);
+    expect(schema.PLUGIN_INDEX_URL!.pattern).toBe(
+      "^(https?://[^[:space:]/?#@]+([/?#][^[:space:]]*)?|file://[^[:space:]]+|/[^[:space:]]+)$",
+    );
+  });
+});
+
+// #474 item 9: the texts the script's own header and docs state.
+describe("bot-ops.sh header says what is true (#474, source pins)", () => {
+  const head = readFileSync(BOT_OPS_SH, "utf8").split("\n").slice(0, 12).join("\n");
+  test("the header names this bot's panel, not the Warbandeer desktop apps", () => {
+    expect(head).not.toContain("Warbandeer");
+    expect(head).not.toContain("warbandeer-desktop");
+  });
+  test("the version line documents composeSchema as well as schema", () => {
+    const src = readFileSync(BOT_OPS_SH, "utf8");
+    const line = src.split("\n").find((l) => l.startsWith("#   version"));
+    expect(line).toContain("composeSchema");
+  });
 });
 
 describe.skipIf(!runnable)("bot-ops.sh degrades gracefully on a valid-JSON-but-wrong-shape index (#101, D3)", () => {
@@ -2021,7 +2235,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
@@ -2029,14 +2243,14 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=7\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=8\b/);
   });
 
-  test("version reports schema 7 (#430: PLUGINS pins match the bot)", async () => {
+  test("version reports schema 8 (#474: PLUGIN_INDEX_URL refuses userinfo, status adds dockerError)", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["version"]);
     expect(run.exitCode).toBe(0);
-    expect((run.json as { schema: number }).schema).toBe(7);
+    expect((run.json as { schema: number }).schema).toBe(8);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
@@ -2056,7 +2270,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -2069,7 +2283,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 });
 
@@ -2082,7 +2296,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 8, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -2093,7 +2307,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -2101,7 +2315,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -2109,7 +2323,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 8, composeSchema: 2 });
   });
 });
 
@@ -2134,9 +2348,6 @@ const SECRET_INDEX = wrapIndex([
 ]);
 const MUSIC_ENV = "PLUGINS=music\nANNOUNCE_CHANNEL_ID=11111\nMUSIC_MUST_KEY=abcd\n";
 
-/** Every place a value could surface after a run: both output streams, docker's logged argv, the
- *  config dir's file names and the backups listing. (A backup's CONTENT legitimately holds the
- *  previous .env, values included — it is 0600 and asserted separately.) */
 /** The sentence relay_tool_output prints in place of a message that is about the env file: it names no
  *  path, claims no cause and no remedy, and is the same whether the command failed or succeeded. */
 function withheld(lines?: string): string {
@@ -2144,6 +2355,9 @@ function withheld(lines?: string): string {
   return `docker compose's output mentioned an env file, so it is withheld: such a message can quote the file's contents.${named} Run the same command on the host to see it.`;
 }
 
+/** Every place a value could surface after a run: both output streams, docker's logged argv, the
+ *  config dir's file names and the backups listing. (A backup's CONTENT legitimately holds the
+ *  previous .env, values included — it is 0600 and asserted separately.) */
 function everythingObservable(fx: Fixture, run: Run): string {
   return [
     run.stdout,
@@ -3486,16 +3700,20 @@ describe.skipIf(!runnable)("plugin-request routing actions (#240)", () => {
     }
   });
 
-  test("the request file really is 0600 (where the platform has file modes)", async () => {
-    // Git Bash on Windows has no modes; CI on Linux runs the real `sh -c` under the fake docker.
-    if (process.platform === "win32") return;
-    for (const payload of REQUESTS) {
-      const fx = setup(ENV);
-      const run = await botOps(fx, ["plugin-request"], req(payload));
-      expect(run.exitCode, payload.action).toBe(0);
-      expect(statSync(join(mailbox(fx), String(run.json?.queued))).mode & 0o777, payload.action).toBe(0o600);
-    }
-  });
+  // Git Bash on Windows has no modes; CI on Linux runs the real `sh -c` under the fake docker. Skipped there,
+  // not returned early, so the report says it did not run (#474 item 10).
+  bunTest.skipIf(process.platform === "win32")(
+    "the request file really is 0600 (where the platform has file modes)",
+    async () => {
+      for (const payload of REQUESTS) {
+        const fx = setup(ENV);
+        const run = await botOps(fx, ["plugin-request"], req(payload));
+        expect(run.exitCode, payload.action).toBe(0);
+        expect(statSync(join(mailbox(fx), String(run.json?.queued))).mode & 0o777, payload.action).toBe(0o600);
+      }
+    },
+    60_000,
+  );
 
   test("a failed write removes the temp file and exits non-zero, never reporting queued", async () => {
     // The rename fails after the body is on disk: the temp file must not be left behind.

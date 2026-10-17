@@ -1,6 +1,6 @@
 // A small per-instance admin panel: an authenticated, thin wrapper around ops/bot-ops.sh (status,
 // logs, restart, recreate, env-get, env-set, env-schema, routing-get and the plugin request mailbox;
-// `version` once at startup) plus server-native routes of its own (/api/whoami, /api/branches,
+// `version` at startup and about once a minute after) plus server-native routes of its own (/api/whoami, /api/branches,
 // /api/plugins, /api/plugins/request, /api/admins, the routing writes /api/routing, /api/webhooks and
 // /api/discovery/refresh, the admin-bundle and data-asset delivery, and the static assets). Runs as
 // its own sidecar service (the profile-gated `admin` service in docker-compose.yml) so it stays
@@ -424,14 +424,22 @@ function logSchemaLine(
   }
   const detail =
     decision.got !== null ? undefined : result.timedOut ? "version timed out" : result.stderr.trim() || "no schema reported";
+  // #464: bot-ops.sh sits in the mounted bin/ DIRECTORY, so a re-run of install.sh is the whole remedy; the compose
+  // file is mounted as ONE file (the admin keeps its old inode), so its remedy adds install.sh's printed step 4 with
+  // --force-recreate (step 4 exports ADMIN_TOKEN and the Access values; a bare --force-recreate admin boots a token-less
+  // admin that exits in a loop).
+  const remedy =
+    fileLabel === "docker-compose.yml"
+      ? "re-run ops/install.sh on this instance, then its printed step 4 with --force-recreate, since the admin mounts this one file"
+      : "re-run ops/install.sh on this instance";
   logError(
-    `[admin] ${fileLabel} is OUT OF DATE — re-run ops/install.sh on this instance; panel features may fail ` +
+    `[admin] ${fileLabel} is OUT OF DATE — ${remedy}; panel features may fail ` +
       `(schema ${decision.got ?? "unknown"}, panel needs ${required}${detail ? `; ${detail}` : ""})`,
   );
 }
 
 /**
- * #173/#178: runs `bot-ops.sh version` once at startup and logs ONE line per file it stamps —
+ * #173/#178: runs `bot-ops.sh version` at startup (the boot list seeds `createOutdatedRefresher`, which re-checks about once a minute) and logs ONE line per file it stamps —
  * `bot-ops.sh` itself and the deployed `docker-compose.yml` (#178 extends this from one file to
  * two, per the issue's own instruction: "extend #173's mechanism rather than inventing a second
  * one"). Returns the list of file names that are out of date (empty when both are current), so
@@ -457,6 +465,70 @@ export async function checkBotOpsSchemaStartup(
   if (botOps.outdated) outdatedFiles.push("bot-ops.sh");
   if (compose.outdated) outdatedFiles.push("docker-compose.yml");
   return outdatedFiles;
+}
+
+/** #464: what one `bot-ops.sh version` run says, by the same rules as boot (`decideBotOpsSchema`/
+ *  `decideComposeSchema`: a non-zero exit or an unexpected shape is drift, #173), except that a run that timed out is
+ *  `unknown` ("could not tell"): the boot path reports that as drift of both files (an operator must see something),
+ *  the refresher keeps its last answer. */
+export function classifySchemas(
+  run: BotOpsResult,
+  requiredBotOps: number,
+  requiredCompose: number,
+): { outdated: string[] } | { unknown: string } {
+  if (run.timedOut) return { unknown: "version timed out" };
+  const outdated: string[] = [];
+  if (decideBotOpsSchema(run, requiredBotOps).outdated) outdated.push("bot-ops.sh");
+  if (decideComposeSchema(run, requiredCompose).outdated) outdated.push("docker-compose.yml");
+  return { outdated };
+}
+
+/** #464: `bot-ops.sh version` again, at most once per `ttlMs` (a failed run counts: it is not retried on every call),
+ *  seeded with the boot-time list, logging only when the answer changes and keeping the last answer when a run could
+ *  not tell -- so a re-run of ops/install.sh clears the bot-ops.sh half of the banner without an admin restart (the
+ *  compose half needs the admin container recreated once, through install.sh's step 4 with --force-recreate, for an
+ *  admin started before #486: it mounts that one file and keeps its inode, which install.sh now rewrites in place). */
+export function createOutdatedRefresher(
+  probe: () => Promise<{ outdated: string[] } | { unknown: string }>,
+  boot: string[],
+  ttlMs = 60_000,
+  now: () => number = Date.now,
+  log: (line: string) => void = console.log,
+): () => Promise<string[]> {
+  let last = { at: now(), files: boot };
+  let lastUnknown: string | undefined;
+  let inFlight: Promise<string[]> | undefined;
+  return () => {
+    if (now() - last.at < ttlMs) return Promise.resolve(last.files);
+    if (inFlight) return inFlight;
+    inFlight = probe()
+      .then((r) => {
+        if ("unknown" in r) {
+          if (r.unknown !== lastUnknown) log(`[admin] schema re-check could not tell (${r.unknown}); keeping the last answer`);
+          lastUnknown = r.unknown;
+          last = { at: now(), files: last.files };
+          return last.files;
+        }
+        lastUnknown = undefined;
+        if (r.outdated.join(",") !== last.files.join(",")) {
+          log(`[admin] schema drift changed: ${r.outdated.length === 0 ? "both files current" : r.outdated.join(", ")}`);
+        }
+        last = { at: now(), files: r.outdated };
+        return r.outdated;
+      })
+      .catch((err) => {
+        // A probe that throws is "could not tell" too, and is also rate-limited.
+        const reason = err instanceof Error ? err.message : String(err);
+        if (reason !== lastUnknown) log(`[admin] schema re-check failed (${reason}); keeping the last answer`);
+        lastUnknown = reason;
+        last = { at: now(), files: last.files };
+        return last.files;
+      })
+      .finally(() => {
+        inFlight = undefined;
+      });
+    return inFlight;
+  };
 }
 
 /**
@@ -770,8 +842,9 @@ export const HOST_API_VERSION = 1;
  *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256).
  *  5 = recreate (#277).
  *  6 = WATCHED_REPOS accepts `none` (#342).
- *  7 = PLUGINS accepts only what the bot boots, every env-set format judged in the C locale (#430). */
-export const REQUIRED_BOT_OPS_SCHEMA = 7;
+ *  7 = PLUGINS accepts only what the bot boots, every env-set format judged in the C locale (#430).
+ *  8 = PLUGIN_INDEX_URL refuses a user:pass@ authority; status adds dockerError (#473, #474). */
+export const REQUIRED_BOT_OPS_SCHEMA = 8;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed
@@ -1213,7 +1286,7 @@ export async function serveAdminBundle(url: URL, config: HandlerConfig): Promise
     return new Response("admin bundle unavailable", { status: asset.status === 404 ? 404 : 502 });
   }
   // Always served as JS regardless of what the CDN labelled it (we fetched exactly the manifest's
-  // adminUrl); the browser caches it, so no server-side cache is needed.
+  // adminUrl); the browser caches it, and `withAssetCache` caches the fetch server-side (#464).
   return new Response(asset.body, {
     headers: { "Content-Type": "text/javascript; charset=utf-8", "Cache-Control": "public, max-age=300" },
   });
@@ -1250,11 +1323,13 @@ interface AssetResponse {
   ok: boolean;
   status: number;
   headers: { get(name: string): string | null };
-  arrayBuffer(): Promise<ArrayBuffer>;
+  body: ReadableStream<Uint8Array> | null;
 }
 
 /** Builds the injected `fetchAdminAsset`: fetch `url`, reject early on a too-large Content-Length (so a
- *  hostile length can't make us buffer gigabytes), then read bytes with a hard cap and a 5 s abort.
+ *  hostile length can't make us buffer gigabytes), then read the body as a STREAM and stop at the cap (#464: at
+ *  most one transport chunk over it is held -- a chunk is the transport's size, and a gzip chunk can be most of a
+ *  megabyte), with a 5 s abort.
  *  fetch-injected + exported so the size cap is unit-tested; `import.meta.main` passes the real fetch.
  *  #229: never decodes — `body` is the raw bytes handed straight to the `AdminAssetResult`, so a
  *  binary asset (a PNG, a font, `.wasm`) survives the proxy unchanged. */
@@ -1280,14 +1355,78 @@ export function makeAdminAssetFetcher(
       if (Number.isFinite(declared) && declared > maxBytes) {
         return { ok: false, status: 502, contentType: "", body: EMPTY, error: `asset exceeds ${maxBytes} bytes (content-length)` };
       }
-      const buf = await res.arrayBuffer();
-      if (buf.byteLength > maxBytes) {
-        return { ok: false, status: 502, contentType: "", body: EMPTY, error: `asset exceeds ${maxBytes} bytes` };
+      // #464: the cap is enforced as the bytes arrive -- a chunked or compressed body has no honest Content-Length, and
+      // buffering it whole before measuring made the "hard cap" a soft one. Past the cap the stream is cancelled, so at
+      // most one chunk over it is ever held.
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      if (res.body !== null) {
+        const reader = res.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > maxBytes) {
+            // Not awaited: a cancel() that never settles would hang the request (probed: 300 ms on a stuck fake, 0 ms
+            // on a real fetch body); the 502 goes out either way.
+            void reader.cancel().catch(() => {});
+            return { ok: false, status: 502, contentType: "", body: EMPTY, error: `asset exceeds ${maxBytes} bytes` };
+          }
+          chunks.push(value);
+        }
       }
-      return { ok: true, status: 200, contentType: res.headers.get("content-type") ?? "", body: new Uint8Array(buf) };
+      const body = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        body.set(c, offset);
+        offset += c.byteLength;
+      }
+      return { ok: true, status: 200, contentType: res.headers.get("content-type") ?? "", body };
     } catch (err) {
       return { ok: false, status: 502, contentType: "", body: EMPTY, error: String(err) };
     }
+  };
+}
+
+/** #464: a bounded memory of asset fetches, keyed by the resolved URL, in front of the public bundle and proxy routes
+ *  -- a pinned-version URL is immutable on the CDN, an unpinned one changes rarely (the TTL covers it), and the routes
+ *  are public at this layer, so a loop on them must not become a loop of outbound fetches: a success is kept
+ *  `ttlMs`, a failure `failureTtlMs` (long enough to blunt a loop, short enough that a CDN blip heals itself), and
+ *  concurrent misses for one URL share one fetch. */
+export function withAssetCache(
+  fetcher: (url: string) => Promise<AdminAssetResult>,
+  opts: { ttlMs?: number; failureTtlMs?: number; maxEntries?: number; now?: () => number } = {},
+): (url: string) => Promise<AdminAssetResult> {
+  const ttlMs = opts.ttlMs ?? 10 * 60 * 1000;
+  const failureTtlMs = opts.failureTtlMs ?? 30_000;
+  const maxEntries = opts.maxEntries ?? 32;
+  const now = opts.now ?? Date.now;
+  const cache = new Map<string, { at: number; result: AdminAssetResult }>();
+  const inFlight = new Map<string, Promise<AdminAssetResult>>();
+  return (url) => {
+    const hit = cache.get(url);
+    if (hit && now() - hit.at < (hit.result.ok ? ttlMs : failureTtlMs)) return Promise.resolve(hit.result);
+    const pending = inFlight.get(url);
+    if (pending) return pending;
+    // A fetcher that throws synchronously is a rejection too, never a throw out of the cache.
+    let started: Promise<AdminAssetResult>;
+    try {
+      started = fetcher(url);
+    } catch (err) {
+      started = Promise.reject(err);
+    }
+    const p = started
+      .then((result) => {
+        cache.delete(url);
+        cache.set(url, { at: now(), result });
+        while (cache.size > maxEntries) cache.delete(cache.keys().next().value!);
+        return result;
+      })
+      .finally(() => {
+        inFlight.delete(url);
+      });
+    inFlight.set(url, p);
+    return p;
   };
 }
 
@@ -1499,6 +1638,8 @@ export interface PluginIndexListerDeps {
   defaultUrl: string;
   now?: () => number;
   ttlMs?: number;
+  /** #464: how long a failed load is remembered (default 30 s) -- inside it the lister answers null without refetching. */
+  failureTtlMs?: number;
 }
 
 /** Builds the /api/plugins index lister: on each call it reads PLUGIN_INDEX_URL from .env (falling
@@ -1509,8 +1650,13 @@ export interface PluginIndexListerDeps {
 export function createPluginIndexLister(deps: PluginIndexListerDeps): () => Promise<PluginIndex | null> {
   const now = deps.now ?? Date.now;
   const ttlMs = deps.ttlMs ?? 5 * 60 * 1000;
+  const failureTtlMs = deps.failureTtlMs ?? 30_000;
   let cache: { url: string; index: PluginIndex; at: number } | undefined;
+  let lastFailureAt: number | undefined;
   return async () => {
+    // #464: a failure is remembered for `failureTtlMs`, checked before the env read so a loop on the public bundle
+    // route costs nothing; the window simply expires (a changed URL is seen once it ends).
+    if (lastFailureAt !== undefined && now() - lastFailureAt < failureTtlMs) return null;
     try {
       const envText = await deps.readEnvText();
       const url = parseEnvValue(envText, "PLUGIN_INDEX_URL") || deps.defaultUrl;
@@ -1520,6 +1666,7 @@ export function createPluginIndexLister(deps: PluginIndexListerDeps): () => Prom
       cache = { url, index, at: now() };
       return index;
     } catch (err) {
+      lastFailureAt = now();
       console.error(`[admin] couldn't load the Plugin Index (Modify Plugins shows installed only): ${err}`);
       return null;
     }
@@ -1587,12 +1734,15 @@ export interface HandlerConfig {
    * management endpoints. Never applied to the bearer-token fallback. */
   adminStore?: AdminStore;
   /** #173/#178: which deployment files the startup `version` check found out of date — some subset
-   *  of `["bot-ops.sh", "docker-compose.yml"]`, or empty when both are current. Computed ONCE at
-   *  startup via `checkBotOpsSchemaStartup`, not per request. `/api/status`'s route merges
+   *  of `["bot-ops.sh", "docker-compose.yml"]`, or empty when both are current. Computed at startup via
+   *  `checkBotOpsSchemaStartup`; that list is the seed of `refreshOutdated` (#464), which re-checks about once a minute
+   *  and, when present, is what `/api/status` uses. `/api/status`'s route merges
    *  `botOpsOutdated: true` + `outdatedFiles` into its response only when this is non-empty, so
    *  both fields are present exactly when there's something to report — the same convention
    *  `/api/plugins`'s `indexError`/`stateError` use. */
   outdatedFiles?: string[];
+  /** #464: re-checks the two files' schemas, at most once a minute; absent, the boot-time list stands. */
+  refreshOutdated?: () => Promise<string[]>;
   /** #242: mints the id of a routing request (the id the page then looks up in `routing.results`). A test
    *  seam: absent, it is `crypto.randomUUID()`, which matches the bot's `/^[A-Za-z0-9_-]{8,64}$/`. The id
    *  is ALWAYS the server's, never the client's. */
@@ -2182,7 +2332,7 @@ export async function handleRequest(req: Request, config: HandlerConfig): Promis
   // #173: /api/status is the one route that gets a server-side augmentation on top of bot-ops.sh's
   // own stdout — everything else here still passes it straight through unmodified.
   const stdout =
-    invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.outdatedFiles ?? []) : result.stdout;
+    invocation.args[0] === "status" ? mergeStatusOutdated(result.stdout, config.refreshOutdated ? await config.refreshOutdated() : (config.outdatedFiles ?? [])) : result.stdout;
   return new Response(stdout, { headers: { "Content-Type": invocation.contentType } });
 }
 
@@ -2400,11 +2550,21 @@ if (import.meta.main) {
   // early Content-Length reject live in makeAdminAssetFetcher (tested); this just supplies the real
   // fetch. Stateless — the delivery routes still 404 without listPluginIndex to resolve a name, and
   // resolveAdminBundleUrl / resolvePluginProxyUrl already constrained the host + path.
-  const fetchAdminAsset = makeAdminAssetFetcher(fetch);
+  // #464: in front of both routes, a bounded cache (a success 10 min, a failure 30 s, concurrent misses coalesced).
+  const fetchAdminAsset = withAssetCache(makeAdminAssetFetcher(fetch));
+  const refreshOutdated = createOutdatedRefresher(
+    async () =>
+      classifySchemas(
+        await runBotOps({ args: ["version"], contentType: "application/json" }),
+        REQUIRED_BOT_OPS_SCHEMA,
+        REQUIRED_COMPOSE_SCHEMA,
+      ),
+    outdatedFiles,
+  );
 
   const config: HandlerConfig = {
     adminToken, indexHtml, assets, listBranches, listPluginIndex, fetchAdminAsset, runBotOps, verifyAccessJwt,
-    adminStore, outdatedFiles,
+    adminStore, outdatedFiles, refreshOutdated,
   };
   // The options (serve as the fetch, idleTimeout, development off, the last-resort error handler) are `serveOptions`'s,
   // so their values are tested; only this call is not.
