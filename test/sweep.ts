@@ -35,48 +35,56 @@ export const MAX_AGE_MS = 60 * 60 * 1000;
  * all (the pre-#252 format). A directory whose pid is alive and young is left alone — that is exactly
  * the concurrent run #252 exists to stop deleting. Returns the names actually removed.
  *
- * `opts.tmp` is carried through only so a caller has everything it used to build `mtimeOf`/`remove`
- * in one place to hand over; this function itself never touches the filesystem — it decides, the
- * injected seams do.
+ * Entries that are not real directories (`isDir`) are skipped before anything else is read; a `remove`
+ * that throws is handed to `onRemoveFailed` and left out of the returned list. This function itself never
+ * touches the filesystem — it decides, the injected seams do.
  */
 export function sweepStaleTestDirs(opts: {
-  tmp: string;
   entries: string[];
   now: number;
+  isDir: (name: string) => boolean;
   mtimeOf: (name: string) => number;
   isAlive: (pid: number) => boolean;
   maxAgeMs: number;
   remove: (name: string) => void;
+  onRemoveFailed: (name: string, err: unknown) => void;
 }): string[] {
   const removed: string[] = [];
   for (const entry of opts.entries) {
     if (!entry.startsWith(TEST_DATA_PREFIX)) continue;
-    const pid = parsePid(entry);
-    if (pid === null) {
-      opts.remove(entry);
-      removed.push(entry);
-      continue;
-    }
-    // Two sweeps can see the same stale entry in their `readdir` snapshot and race to remove it
-    // (the very concurrent-invocations scenario #252 exists to make safe) — `mtimeOf` reads a path
-    // `remove` may have already deleted, and an injected seam backed by `statSync` throws ENOENT
-    // for a vanished path. That is not staleness, it is nothing left to do.
-    let age: number;
+    // Two sweeps can see the same stale entry in their `readdir` snapshot and race to remove it (the very
+    // concurrent-invocations scenario #252 exists to make safe): `isDir` and `mtimeOf` read a path a sibling's
+    // `remove` may have already deleted, and a seam backed by lstat/stat throws ENOENT for a vanished path. That
+    // is not staleness, it is nothing left to do. #461: only a real directory is a run's dir -- a stray file or a
+    // link under the prefix is left alone before anything else is read.
+    let stale: boolean;
     try {
-      age = opts.now - opts.mtimeOf(entry);
+      if (!opts.isDir(entry)) continue;
+      const pid = parsePid(entry);
+      stale = pid === null || opts.now - opts.mtimeOf(entry) > opts.maxAgeMs || !opts.isAlive(pid);
     } catch (err) {
-      // Narrowed to ENOENT specifically, matching `isPidAlive`'s error-code check below — any
-      // other error (EACCES, ENOTDIR, ...) is a real problem, not "already gone," and should
-      // surface loudly rather than be swallowed as if a sibling sweep had won the race.
+      // Narrowed to ENOENT specifically, matching `isPidAlive`'s error-code check below -- any other error
+      // (EACCES, ENOTDIR, ...) is a real problem, not "already gone," and should surface loudly rather than be
+      // swallowed as if a sibling sweep had won the race.
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       continue;
     }
-    if (age > opts.maxAgeMs || !opts.isAlive(pid)) {
+    if (!stale) continue;
+    // #461: a dead run's dir an orphan still holds (EBUSY/EPERM on Windows) is reported and skipped; it must not
+    // stop every later run, and it is not "removed".
+    try {
       opts.remove(entry);
       removed.push(entry);
+    } catch (err) {
+      opts.onRemoveFailed(entry, err);
     }
   }
   return removed;
+}
+
+/** The one log line `test/setup.ts` prints for a sweep: the count, then at most ten names. */
+export function formatSwept(removed: string[]): string {
+  return `[test/setup] swept ${removed.length} stale test dir(s): ${removed.slice(0, 10).join(", ")}${removed.length > 10 ? ", ..." : ""}`;
 }
 
 /**
@@ -84,7 +92,7 @@ export function sweepStaleTestDirs(opts: {
  * `ESRCH` ("no such process") is the one error that means dead; anything else thrown (`EPERM`: a
  * real, live process this one just isn't permitted to signal) is treated as alive, since the only
  * question here is "is that pid free to be reused," and EPERM proves it isn't. Verified on this
- * Windows box (Bun 1.3.14) before relying on it: `process.kill(<this process's pid>, 0)` does not
+ * Windows box (Bun 1.4.2) before relying on it: `process.kill(<this process's pid>, 0)` does not
  * throw, and `process.kill(<a pid that just exited>, 0)` throws `ESRCH` — the decision-2 probe this
  * function's own test pins.
  */

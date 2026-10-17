@@ -42,6 +42,9 @@ function resolveBash(): string | null {
 const BASH = resolveBash();
 const JQ = Bun.which("jq");
 const runnable = BASH !== null && JQ !== null;
+// #514 (posthoc-1-2): on CI a skipped suite would pass vacuously; the runner has bash, jq and docker compose, so a
+// missing one there is a broken job, not an environment to tolerate. GitHub sets CI=true in every job.
+if (!runnable && process.env.CI) throw new Error("[bot-ops.test] bash + jq are required on CI; refusing to skip");
 if (!runnable) {
   console.warn(`[bot-ops.test] SKIPPING: needs bash (${BASH ?? "missing"}) and jq (${JQ ?? "missing"}) on PATH`);
 }

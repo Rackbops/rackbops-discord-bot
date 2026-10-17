@@ -20,6 +20,7 @@ import {
 } from "./live";
 import type { DiscoveryFile } from "./model";
 import { mutateRouting, routingPath } from "./store";
+import { resetKeptCorruptForTest } from "../storage";
 
 const HOME = "111111111111111111";
 const OTHER = "222222222222222222";
@@ -37,6 +38,8 @@ beforeEach(() => {
 // running.
 afterEach(() => {
   resetRoutingForTest();
+  // A routing file that will not parse is kept in place by a read and remembered (#477).
+  resetKeptCorruptForTest();
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -171,7 +174,7 @@ describe("applyRouting", () => {
     expect((await applyRouting("boot")).mode).toBe("single");
     expect(a.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
 
-    // ...and one that will not even parse (it is moved aside and read as fresh).
+    // ...and one that will not even parse (it is left in place and read as fresh).
     resetRoutingForTest();
     writeFileSync(routingPath(dir), "{ not json");
     const b = harness();

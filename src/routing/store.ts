@@ -1,6 +1,6 @@
 // Reading and writing `routing.json` and `routing.secrets.json`. Both READ through `storage.ts`'s
-// `readJsonOrFresh` (a corrupt file is moved aside, not thrown on; a read that fails for another reason,
-// EACCES or EIO, is rethrown, #509); `routing.json` also WRITES
+// `readJsonOrFresh` (a corrupt file is left in place and read as fresh, said once -- the next write moves it
+// aside, #477; a read that fails for another reason, EACCES or EIO, is rethrown, #509); `routing.json` also WRITES
 // through its serialized read-modify-write. `routing.secrets.json` writes itself, because it has to
 // be created owner-only and `writeJsonAtomic` gives its temp file the process default mode.
 // Nothing here reads `DATA_DIR`: every function takes the directory it is to use, so a test points
@@ -12,6 +12,7 @@
 // request mailbox; it never touches them.
 
 import { randomUUID } from "node:crypto";
+import { copyFileSync, readdirSync, unlinkSync } from "node:fs";
 import { chmod as fsChmod, mkdir, rename as fsRename, unlink, writeFile as fsWriteFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { createKeyedJsonMutator, readJsonOrFresh } from "../storage";
@@ -24,7 +25,7 @@ import {
   type RoutingFile,
   type RoutingSecretsFile,
 } from "./model";
-import { shown } from "./resolve";
+import { shown } from "./text";
 
 export function routingPath(dataDir: string): string {
   return `${dataDir}/routing.json`;
@@ -42,6 +43,14 @@ export function secretsPath(dataDir: string): string {
 // spell the directory the same way (production passes `DATA_DIR`); `d`, `d/` and `d\` are three
 // queues. `mutateSecrets` keeps its own queues, keyed the same way, for the same reason. (`let` only
 // so resetRoutingWritesForTest can start a fresh queue.)
+//
+// One writer at a time ACROSS containers rests on a single fact, not on these queues (#478): during a handoff the
+// replacement writes nothing until `takeOver` has stopped the original (`ready.ts` runs `takeOver` before `activate`,
+// and every production caller of `mutateRouting`/`mutateSecrets` -- the mailbox, `markWebhookBroken` -- is wired
+// inside `activate`: the boot mailbox drain and the gated tick both run there). The ORIGINAL's side is not a guarantee:
+// `beginHandoff` does not await in-flight work, so a `markWebhookBroken` can still write from the original during the
+// overlap, and the stop waits for criticals only up to `graceMs` before the daemon's SIGKILL -- a write cut there is
+// the `.tmp` file `sweepSecretsTemp` removes at the next boot. No cross-process lock is taken (declined).
 let routingMutator = createKeyedJsonMutator<RoutingFile>();
 
 // What `readRouting` has already said about a damaged file (#260). It is on the path of every plugin command
@@ -50,17 +59,22 @@ let routingMutator = createKeyedJsonMutator<RoutingFile>();
 // record is per process, so a problem that is fixed and then put back is not said again until a restart.)
 const said = new Set<string>();
 
+/** Paths whose file `mutateRouting` has already copied to `routing.json.before-repair-<ms>` in this process (#477). */
+const copiedBeforeRepair = new Set<string>();
+
 /** Forget what has been said, so a test can see the same problem reported again. */
 export function resetRoutingWarningsForTest(): void {
   said.clear();
+  copiedBeforeRepair.clear();
 }
 
 /** What the test-state guard (test/stateGuard.ts) reads here: the warnings said (which
  *  `resetRoutingWarningsForTest` resets), and every write queued on the routing and secrets files —
  *  `writes` settles once they all have (which `resetRoutingWritesForTest` drops). */
-export function routingStoreStateForTest(): { said: number; writes: Promise<void> } {
+export function routingStoreStateForTest(): { said: number; copied: number; writes: Promise<void> } {
   return {
     said: said.size,
+    copied: copiedBeforeRepair.size,
     writes: Promise.all([routingMutator.idle(), ...secretsQueues.values()]).then(() => {}),
   };
 }
@@ -113,8 +127,7 @@ export function sayWhatWasIgnored(raw: unknown): void {
 
 /**
  * The routing file as the bot should act on it. A missing file is fresh; an unparseable one is
- * moved aside (`routing.json.corrupt-<timestamp>`) and read as fresh, as `readJsonOrFresh` does for
- * every data file; a parseable file of the wrong shape is repaired down to whatever in it is valid.
+ * left in place and read as fresh, said once (the next write moves it aside first, `mutateRouting`, #477); a parseable file of the wrong shape is repaired down to whatever in it is valid.
  * Throws only when the read itself fails for a reason other than a parse error (EACCES, EIO:
  * `readJsonOrFresh` rethrows those, #509).
  *
@@ -125,7 +138,7 @@ export function sayWhatWasIgnored(raw: unknown): void {
  * value, exactly as before.
  */
 export async function readRouting(dataDir: string): Promise<RoutingFile> {
-  const raw = await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing");
+  const raw = await readJsonOrFresh<unknown>(routingPath(dataDir), freshRouting, "routing", { onCorrupt: "keep" });
   sayWhatWasIgnored(raw);
   return repairRouting(raw);
 }
@@ -135,14 +148,16 @@ export async function readRouting(dataDir: string): Promise<RoutingFile> {
  * `return`, say -- is refused BEFORE anything is written: repairing `undefined` would give a fresh
  * file, and writing that would erase every placement without a word.
  *
- * That is all this checks. An object of the wrong shape (an empty `{}`, a `Map`, a `Promise` from an
- * `async` callback) is still repaired down and written, so it still empties the file: the type
- * checker is what stops those, since none of them is assignable to the callback's return type. Only a
+ * A thenable (an `async` callback's Promise) is refused too, and its rejection is swallowed so it cannot surface as
+ * an unhandledRejection after the refusal (#478). The rest of the shape is the type checker's job: an object of the
+ * wrong shape (an empty `{}`, a `Map`) is still repaired down and written, so it still empties the file, and only a
  * cast or an untyped caller gets past it.
  */
 function requireFile<T>(value: T, caller: string): T {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    const got = value === null ? "null" : Array.isArray(value) ? "a list" : typeof value;
+  const thenable = typeof (value as { then?: unknown } | null)?.then === "function";
+  if (typeof value !== "object" || value === null || Array.isArray(value) || thenable) {
+    if (thenable) void (value as PromiseLike<unknown>).then(undefined, () => {});
+    const got = value === null ? "null" : Array.isArray(value) ? "a list" : thenable ? "a Promise (an async callback?)" : typeof value;
     throw new TypeError(`${caller}: mutate must return the whole file, not ${got}; nothing was written`);
   }
   return value;
@@ -156,18 +171,42 @@ function requireFile<T>(value: T, caller: string): T {
  * does NOT inspect the text of the string fields the shape does allow (`updatedAt`, `updatedBy`, a
  * webhook's `addedAt`, `addedBy` and `broken`, and a request result's `action`, `at` and `reason`): a
  * caller must not put a webhook URL in any of them.
+ *
+ * The first write in a process that would drop something the operator typed (`droppedByRepair`) keeps the file as it
+ * was at `routing.json.before-repair-<ms>` (#477), once per path; a copy that fails is said and the write goes ahead.
+ * `droppedByRepair` reports placements, not bookkeeping: a stray key, the `v` marker (rewritten as `v: 1`), `results` entries or a
+ * non-string `broken`/`updatedAt`/`updatedBy` are dropped on write with no copy. Refusing to write while something
+ * would be dropped is declined: one hand typo would block every panel change.
  */
 export async function mutateRouting(dataDir: string, mutate: (current: RoutingFile) => RoutingFile): Promise<void> {
+  const path = routingPath(dataDir);
   await routingMutator.update(
-    routingPath(dataDir),
+    path,
     freshRouting,
-    (current) => repairRouting(requireFile(mutate(repairRouting(current)), "mutateRouting")),
+    (current) => {
+      if (!copiedBeforeRepair.has(path)) {
+        try {
+          // inside the try for the same reason sayWhatWasIgnored guards it: a throw here must not block the write
+          if (droppedByRepair(current).length > 0) {
+            copiedBeforeRepair.add(path);
+            const copy = `${path}.before-repair-${Date.now()}`;
+            copyFileSync(path, copy);
+            console.warn(`[routing] routing.json held entries the repair drops; the file as it was is kept at ${copy}`);
+          }
+        } catch (err) {
+          console.warn(`[routing] routing.json held entries the repair drops, and a copy could not be kept (${describeFailure(err)})`);
+        }
+      }
+      return repairRouting(requireFile(mutate(repairRouting(current)), "mutateRouting"));
+    },
     "routing",
   );
 }
 
 export async function readSecrets(dataDir: string): Promise<RoutingSecretsFile> {
-  return repairSecrets(await readJsonOrFresh<unknown>(secretsPath(dataDir), freshSecrets, "routing-secrets"));
+  return repairSecrets(
+    await readJsonOrFresh<unknown>(secretsPath(dataDir), freshSecrets, "routing-secrets", { onCorrupt: "keep", redactReason: true }),
+  );
 }
 
 /** Owner read/write only. */
@@ -228,7 +267,7 @@ export function mutateSecrets(
   const write = io.writeFile ?? fsWriteFile;
 
   const run = async (): Promise<void> => {
-    const current = repairSecrets(await readJsonOrFresh<unknown>(path, freshSecrets, "routing-secrets"));
+    const current = repairSecrets(await readJsonOrFresh<unknown>(path, freshSecrets, "routing-secrets", { redactReason: true }));
     const next = repairSecrets(requireFile(mutate(current), "mutateSecrets"));
     await mkdir(dirname(path), { recursive: true });
     const tmp = `${path}.${randomUUID()}.tmp`;
@@ -251,4 +290,36 @@ export function mutateSecrets(
   const queued = (secretsQueues.get(path) ?? Promise.resolve()).then(run);
   secretsQueues.set(path, queued.catch(() => {}));
   return queued;
+}
+
+/**
+ * Removes every `routing.secrets.json.*.tmp` beside the secrets file and returns how many it removed (#479). A
+ * secrets write that died between its write and its rename leaves one, holding a live webhook URL that nothing else
+ * ever removes. At a normal boot, and after `takeOver`, there is no writer it could belong to. In the overlap window
+ * `README.md` documents (`docker start <name>` with the replacement still alive) the sweep can unlink the other
+ * instance's in-flight temp file, whose rename then fails with ENOENT: one failed webhook request, no data loss.
+ * `.corrupt-` copies are left alone: they are the evidence a write keeps, and owner-only when the bot wrote them.
+ * No `fsync` (#510). Never throws: it runs before `initRouting`, which a throw would skip.
+ */
+export function sweepSecretsTemp(dataDir: string): number {
+  const dir = dirname(secretsPath(dataDir));
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.startsWith("routing.secrets.json.") || !name.endsWith(".tmp")) continue;
+    try {
+      unlinkSync(`${dir}/${name}`);
+      removed += 1;
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      console.error(`[routing] could not remove a stale secrets temp file ${name}: ${typeof code === "string" ? code : "unknown error"}`);
+    }
+  }
+  if (removed > 0) console.warn(`[routing] removed ${removed} stale routing.secrets.json temp file(s)`);
+  return removed;
 }

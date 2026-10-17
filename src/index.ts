@@ -68,7 +68,7 @@ import { describePlugins, readDiscovery } from "./routing/discovery";
 import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
 import { gateCommand, whereOf } from "./routing/gate";
 import { liveExecuteWebhook, markWebhookBroken, postForPlugin, type PostDeps } from "./routing/post";
-import { readRouting, readSecrets } from "./routing/store";
+import { readRouting, readSecrets, sweepSecretsTemp } from "./routing/store";
 
 // A standby that never reaches ClientReady must say so rather than sit there: the original is
 // holding its announcements, waiting on exactly this answer. Saying it beats being timed out —
@@ -471,6 +471,8 @@ async function activate(c: Client<true>): Promise<void> {
     // than a parse error (#509): `applyRouting` reads routing first, outside any try, and `readJsonOrFresh`
     // rethrows such a fault -- it lands in the same catch, under its registration headline, with the real
     // error printed after it.
+    // #479: a temp file a secrets write left behind holds a webhook URL; at boot there is no writer it could belong to.
+    sweepSecretsTemp(DATA_DIR);
     initRouting({
       client: c,
       put: (route, body) => rest.put(route, { body }),

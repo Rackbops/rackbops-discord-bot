@@ -311,6 +311,15 @@ describe("index.ts wiring", () => {
     // elsewhere in this file, so a pin on the whole source could pass while this call is wrong.
     const initBlock = source.slice(initCall, applyCall);
 
+    // #479: a stale secrets temp file holds a webhook URL; nothing writes at boot, so it is swept right before the
+    // routing store is first used. The call sits inside activate(), immediately before initRouting.
+    test("sweepSecretsTemp(DATA_DIR) runs inside activate(), right before initRouting", () => {
+      const sweep = source.indexOf("\n    sweepSecretsTemp(DATA_DIR);", activateFn) + 5; // past "\n" and the 4-space indent, so a commented-out call does not count; at line start: a commented-out call does not count
+      expect(sweep).toBeGreaterThan(activateFn);
+      expect(sweep).toBeLessThan(initCall);
+      expect(source.slice(sweep + "sweepSecretsTemp(DATA_DIR);".length, initCall).trim()).toBe("");
+    });
+
     test("the one rest.put is the REST call it always was: the route, and the body as `{ body }`", () => {
       // Exactly one, and it is the injected `put` -- so every registration goes through the planner.
       expect((source.match(/rest\.put\(/g) ?? []).length).toBe(1);
