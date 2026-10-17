@@ -29,7 +29,9 @@
     <span class="instance-badge rb-badge rb-badge--md" title="The bot instance this panel manages">__INSTANCE_NAME__</span>
   </div>
   <p class="adm-sub">Paste the admin token to continue.</p>
-  <input id="token-input" class="rb-input" type="password" placeholder="Admin token" autocomplete="off" />
+  <p class="adm-sub" id="gate-locked-note" hidden>Locked in this tab. Paste the admin token, or open the panel in a new tab to use your Cloudflare Access session.</p>
+  <input id="token-input" class="rb-input" type="password" placeholder="Admin token" aria-label="Admin token" autocomplete="off" />
+  <p id="gate-msg" class="rb-field__error" role="alert" hidden></p>
   <div class="row">
     <button id="unlock" class="rb-btn rb-btn--primary">Unlock</button>
   </div>
@@ -135,7 +137,7 @@
       </p>
       <div id="admins-list">Loading…</div>
       <div class="row adm-actions">
-        <input id="admin-email" class="rb-input" type="email" placeholder="new-admin@example.com" autocomplete="off" style="max-width: 320px" />
+        <input id="admin-email" class="rb-input" type="email" placeholder="new-admin@example.com" aria-label="New admin's email" autocomplete="off" style="max-width: 320px" />
         <button id="add-admin" class="rb-btn rb-btn--primary">Add admin</button>
       </div>
       <div id="admins-msg" class="msg"></div>
@@ -181,7 +183,8 @@
   // quit-and-relaunch with "restore previous session" does NOT preserve sessionStorage on
   // Chrome/Edge (Firefox does), so Lock's guarantee doesn't survive that specific path while the
   // Access cookie is still valid — closing this fully needs server-side Access session
-  // revocation, which is Cloudflare's concern, not this page's.
+  // revocation, which is Cloudflare's concern, not this page's. The gate's own note (#gate-locked-note,
+  // #468-9) tells an Access operator the way out that already exists -- a new tab -- without weakening Lock.
   const LOCKED_KEY = "admin-locked";
   const gate = document.getElementById("gate");
   const app = document.getElementById("app");
@@ -192,6 +195,10 @@
 
   // Every /api/* call goes through here. A 401 means the stored token is wrong or was rotated —
   // drop it and show the unlock gate again rather than leaving the page in a half-broken state.
+  // #468-9: true from the Unlock click until any non-401 answer. showApp fires about seven calls at once, so
+  // with a wrong token EVERY one 401s; each passes the same "not accepted" message (the flag is NOT cleared by
+  // a 401), and showGate never lets an empty message erase one already shown.
+  let unlockPending = false;
   async function api(path, opts) {
     const token = getToken();
     const headers = { ...(opts && opts.headers) };
@@ -199,9 +206,10 @@
     const res = await fetch(path, { ...opts, headers });
     if (res.status === 401) {
       clearToken();
-      showGate();
+      showGate(unlockPending ? "That token was not accepted. Check it and try again." : "");
       throw new Error("unauthorized");
     }
+    unlockPending = false;
     return res;
   }
 
@@ -227,9 +235,63 @@
   // own (issue #53 item 1/2).
   const MUTATION_TIMEOUT_MS = 110000;
 
-  function showGate() {
+  // READ_JSON:begin
+  // #467-7: one way to read a JSON response and one way to describe a failed fetch. A non-ok read throws
+  // an Error naming what the server said (a 504's text body used to surface as "Unexpected token"), so
+  // every caller's existing catch shows a plain sentence. errorBodyText: just the status when the body is
+  // empty; "(an HTML error page)" when it starts with `<` (a Cloudflare/Access 502/504 page is kilobytes of
+  // HTML); else the text, clipped to 300 characters.
+  function errorBodyText(text, status) {
+    const t = String(text || "").trim();
+    if (t === "") return "HTTP " + status;
+    if (t.startsWith("<")) return "HTTP " + status + " (an HTML error page)";
+    return t.length > 300 ? t.slice(0, 299) + "…" : t;
+  }
+  async function readJson(res) {
+    if (!res.ok) throw new Error(errorBodyText(await res.text(), res.status));
+    return res.json();
+  }
+  function describeFetchError(e, timeoutMs) {
+    return e && e.name === "AbortError"
+      ? "the server did not answer within " + Math.round(timeoutMs / 1000) + " seconds"
+      : e && e.message
+        ? e.message
+        : String(e);
+  }
+  // #467-3: a secondary panel's render failing must stay on that panel -- the Servers and Needs-attention
+  // renders run in the same reload as the plugin cards and the Config editor, and a throw there used to
+  // reach the reload's catch, which overwrites both of those with the error.
+  function renderOwnPanel(fn, panelId) {
+    try {
+      fn();
+    } catch (e) {
+      console.error("[admin] " + panelId + " render failed", e);
+      const el = document.getElementById(panelId);
+      if (el) el.textContent = "Couldn't draw this panel: " + (e && e.message ? e.message : String(e));
+    }
+  }
+  // READ_JSON:end
+
+  // A non-empty `message` is shown in #gate-msg; an EMPTY one leaves an already-shown message alone (the
+  // burst of 401s above). #gate-msg is cleared only by the Unlock click and at startup (clearGateMsg).
+  // #gate-locked-note explains a Lock to the Access operator who sees a gate with nothing to paste.
+  function showGate(message) {
     gate.hidden = false;
     app.hidden = true;
+    const msg = document.getElementById("gate-msg");
+    if (message && msg) {
+      msg.textContent = message;
+      msg.hidden = false;
+    }
+    const note = document.getElementById("gate-locked-note");
+    if (note) note.hidden = !sessionStorage.getItem(LOCKED_KEY);
+  }
+  function clearGateMsg() {
+    const msg = document.getElementById("gate-msg");
+    if (msg) {
+      msg.textContent = "";
+      msg.hidden = true;
+    }
   }
 
   function showApp() {
@@ -329,7 +391,7 @@
     const el = document.getElementById("whoami");
     const grid = document.getElementById("identity-grid");
     try {
-      const who = await (await api("/api/whoami")).json();
+      const who = await readJson(await api("/api/whoami"));
       el.textContent = who.email
         ? "signed in as " + who.email
         : who.via === "jwt"
@@ -366,7 +428,7 @@
   async function loadAdmins() {
     const container = document.getElementById("admins-list");
     try {
-      const data = await (await api("/api/admins")).json();
+      const data = await readJson(await api("/api/admins"));
       const rows = [
         ...data.bootstrap.map((email) => ({ email, permanent: true })),
         ...data.dynamic.map((email) => ({ email, permanent: false })),
@@ -502,10 +564,11 @@
   // last typed there (onControlEdited's record, lastTyped) -- a value a render wrote in between (an update
   // button's reload landing during an Apply POST) is not typing (round 2). On the CARDS, keepEdits keeps everything that differs from the OLD
   // baseline at landing time (an edit made before or during the fetch); without it only what was typed
-  // between the two reads is kept. A CONFIG field is only ever kept for what was typed between the two reads
-  // (keepEdits or not -- it has no capture/reapply of its own), by rendering it with the typed value
-  // (renderEnvFields' overrides). A chip field counts its committed chips only: text still in its typing
-  // input is not part of the field's value and is lost to the render, as it always was.
+  // between the two reads is kept. A CONFIG field follows the same rule (#467-4): keepEdits keeps every field
+  // that differs from the OLD loadedEnv (diffEnvEdits), by rendering it with that value (renderEnvFields'
+  // overrides), and what was typed between the two reads is kept either way. A chip field counts its
+  // committed chips only: text still in its typing input is not part of the field's value and is lost to
+  // the render, as it always was.
   // `opts.since` replaces the first read: applyPending passes the controls as they were when its POST was
   // SENT, so what was typed while the POST was in flight ("Restarting the bot…") is kept by the re-read
   // that follows too.
@@ -550,8 +613,8 @@
         const { signal, cancel } = timeoutSignal(RELOAD_TIMEOUT_MS);
         cancelTimeout = cancel;
         const [plugins, env, schema] = await Promise.all([
-          api("/api/plugins", { signal }).then((r) => r.json()),
-          api("/api/env", { signal }).then((r) => r.json()),
+          api("/api/plugins", { signal }).then(readJson),
+          api("/api/env", { signal }).then(readJson),
           api("/api/env-schema", { signal })
             .then((r) => (r.ok ? r.json() : {}))
             .catch(() => ({})),
@@ -564,11 +627,14 @@
         // #284 round 1: the render replaces every control, so one being typed in loses focus to <body>;
         // it gets it back on its rebuilt twin (same id) below, since what was typed there is now kept.
         const focusedId = document.activeElement && document.activeElement !== document.body ? document.activeElement.id : "";
+        // #467-4: a keep-edits reload keeps every Config edit that differs from the OLD baseline, as it keeps the
+        // cards' (computed before loadedEnv moves); typed.env (what was typed between the two reads) wins.
+        const envOverrides = keepEdits ? { ...diffEnvEdits(loadedEnv, after.env), ...typed.env } : typed.env;
         pluginsData = plugins;
         loadedEnv = env;
         loadedSchema = schema && typeof schema === "object" ? schema : {};
         renderPlugins();
-        renderEnvFields(typed.env);
+        renderEnvFields(envOverrides);
         // #246: loadRouting() and reloadConfig() fire concurrently from showApp -- whichever finishes
         // LAST is the one whose renderServers() call actually has both routingData AND pluginsData
         // populated. Calling it only from loadRouting's own tail (as originally written) left the
@@ -576,8 +642,10 @@
         // slower of the two -- "No plugin lives here" on every card, found in real-Chrome verification,
         // not by any of this file's own mocked-pluginsData tests. Also covers every OTHER reloadConfig
         // caller (an update button's reload, Unlock) the same way loadRouting's own poll already does.
-        renderServers();
-        renderNeedsAttention();
+        // #467-3: a throw in either secondary render stays on its own panel instead of blanking the cards and the
+        // Config editor through the catch below.
+        renderOwnPanel(renderServers, "servers-list");
+        renderOwnPanel(renderNeedsAttention, "attention-list");
         if (captured) reapplyCardEdits(captured);
         if (focusedId && (!document.activeElement || document.activeElement === document.body)) {
           const twin = document.getElementById(focusedId);
@@ -585,10 +653,7 @@
         }
       } catch (e) {
         if (e.message !== "unauthorized") {
-          const msg =
-            e.name === "AbortError"
-              ? "Error: the server did not answer within " + RELOAD_TIMEOUT_MS / 1000 + " seconds. Reload the page to try again."
-              : "Error: " + e.message;
+          const msg = "Error: " + describeFetchError(e, RELOAD_TIMEOUT_MS) + (e && e.name === "AbortError" ? ". Reload the page to try again." : "");
           const pl = document.getElementById("plugins-list");
           if (pl) pl.textContent = msg;
           const ef = document.getElementById("env-fields");
@@ -774,7 +839,7 @@
       // actually running" is gone.
       meta: { name: plugin.name, version: plugin.installedVersion, adminApiVersion: plugin.adminApiVersion },
       async getEnv() {
-        const env = await (await api("/api/env")).json();
+        const env = await readJson(await api("/api/env"));
         return scopeToPluginKeys(env, plugin.envKeys);
       },
       async setEnv(changes) {
@@ -788,7 +853,7 @@
         return { ok: false, error: (j && j.log) || ("save failed (" + res.status + ")") };
       },
       async getState() {
-        const data = await (await api("/api/plugins")).json();
+        const data = await readJson(await api("/api/plugins"));
         return viewToState((data.plugins || []).find((p) => p.name === plugin.name) || null);
       },
       proxyFetch(path) {
@@ -965,8 +1030,25 @@
   const TOAST_KIND_CLASS = { info: "rb-toast--info", success: "rb-toast--success", warning: "rb-toast--warning", danger: "rb-toast--danger" };
   let toastRegion = null;
   const activeToasts = [];
+  // #468-11: the region is a polite live region (see ensureToastRegion), so an info/success toast needs no role
+  // of its own -- a nested role="status" inside a live region can double-announce. A danger/warning toast keeps
+  // role="alert" (assertive) inside it. "" means: set no role.
   function toastRole(kind) {
-    return kind === "danger" || kind === "warning" ? "alert" : "status";
+    return kind === "danger" || kind === "warning" ? "alert" : "";
+  }
+  // #468-11: created ONCE, EMPTY, before the first toast exists -- a live region announces insertions made after
+  // it is already in the page, so a region created in the same moment as its first toast announced nothing.
+  // Idempotent; showToast calls it, and the page calls it once at load (below the TOAST block).
+  function ensureToastRegion() {
+    if (toastRegion) return;
+    toastRegion = document.createElement("div");
+    toastRegion.className = "rb-toast-region";
+    toastRegion.setAttribute("aria-live", "polite");
+    document.getElementById("app").appendChild(toastRegion);
+    // One listener, added the first time the region exists: Escape dismisses the NEWEST toast.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && activeToasts.length > 0) dismissToast(activeToasts[activeToasts.length - 1]);
+    });
   }
   function dismissToast(el) {
     const i = activeToasts.indexOf(el);
@@ -974,19 +1056,12 @@
     if (el.parentNode) el.parentNode.removeChild(el);
   }
   function showToast(kind, text) {
-    if (!toastRegion) {
-      toastRegion = document.createElement("div");
-      toastRegion.className = "rb-toast-region";
-      document.getElementById("app").appendChild(toastRegion);
-      // One listener, added the first time the region exists: Escape dismisses the NEWEST toast.
-      document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape" && activeToasts.length > 0) dismissToast(activeToasts[activeToasts.length - 1]);
-      });
-    }
+    ensureToastRegion();
     while (activeToasts.length >= TOAST_MAX) dismissToast(activeToasts[0]);
     const toast = document.createElement("div");
     toast.className = "rb-toast " + (TOAST_KIND_CLASS[kind] || TOAST_KIND_CLASS.info);
-    toast.setAttribute("role", toastRole(kind));
+    const role = toastRole(kind);
+    if (role) toast.setAttribute("role", role);
     toast.setAttribute("data-rb-enter", "");
     const span = document.createElement("span");
     span.textContent = text;
@@ -1006,6 +1081,7 @@
     if (kind === "success" || kind === "info") setTimeout(() => dismissToast(toast), TOAST_MS);
   }
   // TOAST:end
+  ensureToastRegion(); // #468-11: the live region exists before the first toast
 
   // #244: renderPlugins() clears and rebuilds #plugins-list from pluginsData -- one buildPluginCard per
   // plugin -- the same shape loadPlugins used to build, minus the fetch (reloadConfig owns that) and
@@ -1656,7 +1732,7 @@
       const poll = timeoutSignal(pollRequestTimeoutMs(startedAt, Date.now()));
       try {
         const res = await api("/api/routing", { signal: poll.signal });
-        routingData = await res.json();
+        routingData = await readJson(res);
       } catch (e) {
         // Round-3 review finding: this branch returned without clearing inflight -- routeState survives a
         // 401 (api() only clears the token and shows the gate; showApp/loadRouting never touch routeState),
@@ -1761,7 +1837,7 @@
           const poll = timeoutSignal(pollRequestTimeoutMs(startedAt, Date.now()));
           try {
             const r = await api("/api/routing", { signal: poll.signal });
-            routingData = await r.json();
+            routingData = await readJson(r);
           } catch (e) {
             // Same fix as awaitRequestResult's identical branch: a plain return here left inflight stuck
             // (routeState outlives a 401/re-login), so this specific exit needs to clear it explicitly.
@@ -1938,8 +2014,7 @@
   // #245's own load path -- never folded into reloadConfig (see routingData's declaration comment).
   async function loadRouting() {
     try {
-      const res = await api("/api/routing");
-      routingData = await res.json();
+      routingData = await readJson(await api("/api/routing"));
     } catch (e) {
       if (e && e.message === "unauthorized") return;
       const loadError = e && e.message ? e.message : String(e);
@@ -1953,9 +2028,9 @@
     // (orchestrator round 2 -- otherwise it could outlive every action that cleared its own state).
     serverActionState.delete("copy");
     refreshRoutingSteps();
-    renderServers();
+    renderOwnPanel(renderServers, "servers-list"); // #467-3: a render error stays on its own panel
     refreshEnvPickers();
-    renderNeedsAttention();
+    renderOwnPanel(renderNeedsAttention, "attention-list");
   }
 
   // Redraws every card's step FRESH from the latest routingData (routingStepEls is rebuilt each time,
@@ -2385,7 +2460,7 @@
         // the next unrelated loadRouting.
         refreshRoutingSteps();
         const guild = routingData && routingData.discovery && routingData.discovery.guilds && routingData.discovery.guilds.find((g) => g.id === guildId);
-        const ch = guild && guild.channels.find((c) => c.id === outcome.result.channelId);
+        const ch = guild && (Array.isArray(guild.channels) ? guild.channels : []).find((c) => c.id === outcome.result.channelId);
         showToast("success", "Webhook added for #" + (ch ? ch.name : outcome.result.channelId) + ".");
       }
       renderServers();
@@ -2482,7 +2557,7 @@
       const { signal, cancel } = timeoutSignal(remaining);
       try {
         const res = await api("/api/routing", { signal });
-        routingData = await res.json();
+        routingData = await readJson(res);
       } catch (e) {
         // Round-2 review finding: this used to fold into { timeout: true }, so a 401 midway through the
         // poll -- AFTER the initiating request had already succeeded -- surfaced through every caller's
@@ -2651,18 +2726,15 @@
     }
   }
 
-  // Same open-and-focus sequence refuseApply already uses for a plugin-owned key (#244) -- forces the
-  // card open directly via cardHeaderEls' stored refs rather than a full renderPlugins, then focuses it.
+  // Opens a plugin's card (forceOpenCard, in the APPLY block, which refuseApply shares) and focuses its
+  // header. #467-6: the header is looked up AFTER the open, because opening a closed card re-renders every
+  // card -- the header refs read before it would point at nodes that render replaced.
   function openPluginCard(name) {
     const els = cardHeaderEls.get(name);
     if (!els) return;
-    if (els.body && els.body.hidden) {
-      openCards.add(name);
-      els.body.hidden = false;
-      els.head.setAttribute("aria-expanded", "true");
-      if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
-    }
-    if (els.head && els.head.focus) els.head.focus();
+    forceOpenCard(name);
+    const head = document.getElementById("plug-head-" + name);
+    if (head && head.focus) head.focus();
   }
 
   // Step 2, present whenever there is something to show: a declared setting, an admin bundle, or (with
@@ -2804,8 +2876,12 @@
   function buildSecretField(key, displayLabel, schemaRow) {
     const wrap = document.createElement("div");
     wrap.className = "rb-field";
-    const label = document.createElement("span");
+    // #468-11: in replace mode the field is a real input, so its label is a <label for> (the input was named by
+    // its placeholder only); the summary mode has no input to name and keeps the span.
+    const inputMode = !(schemaRow.isSet && !secretsReplacing.has(key));
+    const label = document.createElement(inputMode ? "label" : "span");
     label.className = "rb-label";
+    if (inputMode) label.htmlFor = "secret-" + key;
     label.textContent = displayLabel;
     if (schemaRow.required) {
       const req = document.createElement("span");
@@ -3230,15 +3306,21 @@
     if (!v) return;
     setToken(v);
     sessionStorage.removeItem(LOCKED_KEY); // an explicit unlock overrides a prior explicit lock
+    unlockPending = true;
+    clearGateMsg();
     showApp();
   });
   document.getElementById("token-input").addEventListener("keydown", (e) => {
     if (e.key === "Enter") document.getElementById("unlock").click();
   });
+  // #468-9: a reload, not just a hidden #app -- it drops every rendered value (env, logs, admin emails), typed
+  // secret, lastTyped entry and routeState with certainty, and startup already shows the gate when LOCKED_KEY
+  // is set. (Clearing each piece by hand would miss the next one added.) A Lock pressed mid-Apply abandons
+  // that POST client-side while the server finishes the recreate; there is no beforeunload guard.
   document.getElementById("lock").addEventListener("click", () => {
     clearToken();
     sessionStorage.setItem(LOCKED_KEY, "1");
-    showGate();
+    location.reload();
   });
 
   // Disables a button for the duration of its async action, so a double-click can't fire two
@@ -3272,7 +3354,7 @@
     const banner = document.getElementById("bot-ops-outdated-banner");
     try {
       const res = await api("/api/status");
-      const s = await res.json();
+      const s = await readJson(res);
       // #173/#178: outdatedFiles present exactly when non-empty (server convention, see
       // mergeStatusOutdated) — absent or empty both mean everything's up to date.
       const bannerText = describeOutdatedBanner(s.outdatedFiles);
@@ -3376,6 +3458,8 @@
       out.textContent = "Loading…";
       try {
         const res = await api("/api/logs?n=" + encodeURIComponent(n));
+        // #467-7: a failed read is an error, never the log (a 504's body used to be stored AS the log).
+        if (!res.ok) throw new Error(errorBodyText(await res.text(), res.status));
         loadedLogs = await res.text();
         renderLogs();
         // Land on the newest lines on load — but not when a filter is active, so this matches the
@@ -3881,6 +3965,17 @@
     }
     return { on, settings, secrets };
   }
+  // #467-4: the Config editor's counterpart of diffEdits -- every key whose control holds something other
+  // than the baseline (the OLD loadedEnv) value, so a keep-edits reload carries a Config edit the way it
+  // carries a card edit. `controls` is captureEnvFields' {KEY: value}; an absent baseline key reads as "".
+  // Every Config control renders the raw loadedEnv value, so this cannot revive a value nobody typed.
+  function diffEnvEdits(baselineEnv, controls) {
+    const out = {};
+    for (const key of Object.keys(controls || {})) {
+      if (controls[key] !== ((baselineEnv || {})[key] ?? "")) out[key] = controls[key];
+    }
+    return out;
+  }
   // #284: what the user typed between two reads of the controls -- `before` and `after` are each
   // { cards: {on, settings, secrets}, env: {KEY: value} } (captureControls), and `edits` is a Map of
   // control id ("env:KEY", "on:NAME", "set:KEY", "secret:KEY") -> the value the user last typed there
@@ -4028,7 +4123,7 @@
         commands: on ? entry.commands : "all",
         postTo: on && entry.postTo ? entry.postTo : null,
         destinations: on ? savedDestinations(entry.destinations) : {},
-        channels: g.channels.map((c) => {
+        channels: (Array.isArray(g.channels) ? g.channels : []).map((c) => {
           const wh = webhooks[c.id];
           return { id: c.id, name: c.name, canSend: c.canSend, webhook: !wh ? "none" : wh.broken ? "broken" : "ok" };
         }),
@@ -4233,6 +4328,9 @@
     const homeId = discovery && discovery.homeGuildId;
     const home = homeId === guild.id;
     const routed = routedMode(routing);
+    // #467-3: discovery is a file the bot writes, but a hand edit or a partial write must not throw out of
+    // the render; a guild without a channel list reads as having none (names fall back to ids).
+    const guildChannels = Array.isArray(guild.channels) ? guild.channels : [];
 
     let commands;
     if (guild.commands && guild.commands.error) {
@@ -4253,17 +4351,18 @@
       const pr = routingPlugins[p.name];
       const entry = pr && pr.servers && pr.servers[guild.id];
       if (!entry) continue;
+      // A non-array `commands` (only a hand edit makes one; the bot's own loader drops it) reads as "all".
       const scope =
-        entry.commands === "all"
+        !Array.isArray(entry.commands)
           ? "all"
           : entry.commands.map((chId) => {
-              const ch = guild.channels.find((c) => c.id === chId);
+              const ch = guildChannels.find((c) => c.id === chId);
               return ch ? ch.name : chId;
             });
       let postsTo = null;
       let webhook = "none";
       if (entry.postTo) {
-        const ch = guild.channels.find((c) => c.id === entry.postTo);
+        const ch = guildChannels.find((c) => c.id === entry.postTo);
         postsTo = ch ? ch.name : entry.postTo;
         const wh = webhooksByChannel[entry.postTo];
         webhook = !wh ? "none" : wh.broken ? "broken" : "ok";
@@ -4278,7 +4377,7 @@
         for (const [destName, channelId] of Object.entries(entry.destinations)) {
           if (typeof channelId !== "string") continue;
           const d = Array.isArray(declared) ? declared.find((x) => x && x.name === destName) : undefined;
-          const ch = guild.channels.find((c) => c.id === channelId);
+          const ch = guildChannels.find((c) => c.id === channelId);
           destinations.push({ label: (d && typeof d.description === "string" && d.description) || destName, channel: ch ? ch.name : channelId });
         }
       }
@@ -4301,7 +4400,7 @@
     const webhooks = [];
     for (const [channelId, wh] of Object.entries(webhooksByChannel)) {
       if (wh.guildId !== guild.id) continue;
-      const ch = guild.channels.find((c) => c.id === channelId);
+      const ch = guildChannels.find((c) => c.id === channelId);
       webhooks.push({ channelId, channelName: ch ? ch.name : null, addedAt: wh.addedAt, addedBy: wh.addedBy, broken: wh.broken });
     }
 
@@ -4395,7 +4494,7 @@
         });
         continue;
       }
-      const channel = guild.channels.find((c) => c.id === channelId);
+      const channel = (Array.isArray(guild.channels) ? guild.channels : []).find((c) => c.id === channelId);
       out.push({ kind: "webhook-broken", text: "#" + (channel ? channel.name : channelId) + " in " + guild.name + ": its webhook stopped working (" + wh.broken + ")", fix: { label: "Add it again", go: "servers" } });
     }
 
@@ -4432,7 +4531,7 @@
     } else {
       options.push({ value: "", label: "— default —" });
       for (const g of guilds) {
-        for (const c of g.channels) {
+        for (const c of Array.isArray(g.channels) ? g.channels : []) {
           options.push({ value: c.id, label: "#" + c.name + (c.canSend ? "" : " · the bot can't post here"), group: g.name });
         }
       }
@@ -4861,10 +4960,23 @@
   // either a plain setting (id set-KEY) or, in replace mode, a secret input (id secret-KEY) --
   // buildSettingsStep builds these fields whether or not the card is open, but a closed card's whole
   // .plug__body stays [hidden] (display:none), so the control exists but is invisible and unfocusable.
-  // Round-1 fix: force the owning card open FIRST, directly (a local DOM toggle via cardHeaderEls' stored
-  // refs, not a full renderPlugins() -- the control the rest of this function is about to focus already
-  // exists; re-rendering would only replace it out from under the focus() call below), so the id is
-  // always there to find AND visible.
+  // #467-6: force the owning card open FIRST, through forceOpenCard (the header toggle's own capture / render /
+  // reapply sequence), so the card's admin bundle mounts -- it mounts only from a render where the card was
+  // open -- and the id below resolves to the REBUILT control (a re-render after the lookup would replace it out
+  // from under the focus() call). The refusal survives that re-render: clearApplyInvalid() ran first, so
+  // forceOpenCard's refreshApplyBar() finds no applyRefused to reconcile, and aria-invalid / applyInvalid /
+  // applyRefused are only set after the lookup.
+  // Like the header toggle, the re-render remounts every open card's admin bundle, so unsaved bundle-local state
+  // in another open card is lost.
+  function forceOpenCard(name) {
+    const els = cardHeaderEls.get(name);
+    if (!els || !(els.body && els.body.hidden)) return; // unknown card (never added to openCards) or already open
+    const captured = diffEdits({ plugins: (pluginsData && pluginsData.plugins) || [], env: loadedEnv }, captureCardControls());
+    openCards.add(name);
+    renderPlugins();
+    reapplyCardEdits(captured);
+    refreshApplyBar();
+  }
   function refuseApply(bad) {
     clearApplyInvalid(); // #308: a new refusal replaces the last one, marking and all
     applyViolation = bad.message;
@@ -4873,13 +4985,7 @@
     showTab(onPluginTab ? "plugins" : "settings", false);
     if (s && s.source === "plugin") {
       const owner = settingOwners((pluginsData && pluginsData.plugins) || []).get(bad.key);
-      const els = owner ? cardHeaderEls.get(owner) : null;
-      if (els && els.body && els.body.hidden) {
-        openCards.add(owner);
-        els.body.hidden = false;
-        els.head.setAttribute("aria-expanded", "true");
-        if (els.chev) els.chev.setAttribute("class", "plug__chev plug__chev--open");
-      }
+      if (owner) forceOpenCard(owner);
     }
     const controlId =
       bad.key === "PLUGINS" ? null : s && s.source === "plugin" ? (s.secret ? "secret-" : "set-") + bad.key : "env-" + bad.key;
@@ -4939,6 +5045,10 @@
         // bot-ops.sh answers {ok:true, recreated:false} when .env already held every value: nothing restarted.
         applyNoop = !!(result && result.recreated === false);
         applyPhase = "done";
+        // #467-5: what this apply saved is saved -- its password boxes go back to "Saved on the server". A value
+        // typed into one of those boxes while the POST was in flight is dropped with the box (the key was just
+        // saved). A failed apply keeps replace mode (the operator may correct and retry).
+        for (const c of plan.changes) if (c.secret) secretsReplacing.delete(c.key);
         refreshApplyBar();
         loadStatus(); // separate and un-awaited, as before: the status grid is not part of the bar's re-read
         await rereadFromServer({ since: sent }); // awaited so withBusy keeps Apply disabled until the reads land
@@ -4958,12 +5068,15 @@
         // until its reads land the controls still hold the edits it is about to drop, so Discard and Apply are
         // busy (the bar used to offer Apply for that long, and an Apply pressed then sent a second POST).
         if (!failureWroteNothing(res.status, result, text)) {
+          // #467-5: the #47 path (a failed recreate after .env was rewritten): the secrets in this plan WERE saved.
+          for (const c of plan.changes) if (c.secret) secretsReplacing.delete(c.key);
           await rereadFromServer({ since: sent }); // awaited so withBusy keeps Apply disabled until the reads land; OK stays usable
         }
       }
       focusIfInBar(document.getElementById("apply-ok"));
     } catch (e) {
-      const message = e && e.message ? e.message : String(e);
+      // #467-7: an abort reads "the server did not answer within 110 seconds", not the raw "The operation was aborted".
+      const message = describeFetchError(e, MUTATION_TIMEOUT_MS);
       if (message === "unauthorized") {
         applyPhase = "idle"; // the gate is showing; do not leave "Restarting the bot…" behind it
         refreshApplyBar();
@@ -5040,6 +5153,7 @@
   // HAS_ACCESS_SESSION:end
 
   (async () => {
+    clearGateMsg();
     if (sessionStorage.getItem(LOCKED_KEY)) { showGate(); return; }
     if (getToken() || (await hasAccessSession())) showApp();
     else showGate();
