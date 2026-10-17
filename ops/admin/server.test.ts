@@ -11842,10 +11842,14 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   test("H1 (#405): a send merges the operator's change onto the fresh placement -- another tab's server survives", async () => {
     const stale = withMusic({ "100": { commands: "all" } });
     const fresh = withMusic({ "100": { commands: "all" }, "200": { commands: "all" } }); // tab B added 200
+    const rereadSignals: unknown[] = [];
     const h = harness({
       routingDataInit: stale,
-      apiImpl: (async (_p: string, init?: { method?: string }) =>
-        init && init.method === "POST" ? { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "m1" }) } : getAnswer(fresh)) as never,
+      apiImpl: (async (_p: string, init?: { method?: string; signal?: unknown }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "m1" }) };
+        rereadSignals.push(init && init.signal);
+        return getAnswer(fresh);
+      }) as never,
     });
     h.setFakeNow(READY_NOW);
     h.run.ensureRouteState("music", readyModelFor([{ id: "100", commands: "all" }])); // seeded: base = { 100 }
@@ -11854,6 +11858,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     await settle(h);
     expect(h.posts).toHaveLength(1);
     expect(JSON.parse(h.posts[0]!.body!)).toEqual({ plugin: "music", servers: { "100": { commands: ["10"] }, "200": { commands: "all" } } });
+    expect(rereadSignals[0]).toEqual({ timeoutMs: 10000 }); // the re-read is time-boxed to its own 10 s
   });
 
   test("H2 (#405): a failed re-read falls back to the in-memory placement, as before", async () => {
