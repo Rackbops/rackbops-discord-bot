@@ -1,5 +1,7 @@
 # Link Code + Device Token as the connector's two-stage auth
 
+> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-wow` (#107). File and line references below are as of the decision.
+
 This is the bot's first inbound HTTP surface and its first per-user auth of any kind —
 `src/wow/blizzard.ts` states plainly of its existing client-credentials access: "Neither needs
 per-user OAuth or a Battle.net account link." A single shared secret can't scope *who* owns
