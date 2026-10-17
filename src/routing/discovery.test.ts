@@ -460,7 +460,7 @@ describe("readDiscovery (#241)", () => {
   test("V1b: a good file with commands null or a registration, an empty guild list and an unknown key still reads", async () => {
     const good = (commands: unknown, extra: Record<string, unknown> = {}) =>
       JSON.stringify({ guilds: [{ id: "1", name: "x", channels: [{ id: "c", name: "general" }], commands }], plugins: {}, ...extra });
-    for (const text of [good(null), good({ registered: 0, at: AT }), good(null, { somethingNew: 1, global: { registered: 3, at: AT } }), '{"guilds":[],"plugins":{}}']) {
+    for (const text of [good(null), good({ registered: 0, at: AT }), good("not a registration"), '{"guilds":[{"id":"1","name":"x","channels":[{"id":"c","name":"n","canSend":"yes"}]}],"plugins":{}}', good(null, { somethingNew: 1, global: { registered: 3, at: AT } }), '{"guilds":[],"plugins":{}}']) {
       writeFileSync(discoveryPath(dir), text);
       expect(await readDiscovery(dir), text).not.toBeNull();
     }

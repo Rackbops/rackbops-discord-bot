@@ -206,7 +206,7 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
  *  queues behind itself). `routing` and `snapshots` are what the job read. */
 async function fullRun(c: RoutingContext, reason: string, routing: RoutingFile, snapshots: GuildSnapshot[] | null): Promise<ApplyResult> {
   // #420: what the last published file says the bot still owns; nothing when there is none (a first boot). The
-  // file is a VIEW: a damaged or unreadable one is said and treated as none, never allowed to stop the PUT below.
+  // file is a VIEW: an unreadable one is said and treated as none, never allowed to stop the PUT below. One that parses but fails `readDiscovery`'s shape check (#482) reads as `null` WITHOUT a line, so this run skips its empties; it rewrites the file, and the next run has a valid record again.
   let previous = NO_PREVIOUS;
   try {
     previous = previousScopes(await readDiscovery(c.dataDir));

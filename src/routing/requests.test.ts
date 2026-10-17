@@ -511,7 +511,7 @@ describe("applyRoutingRequest: routing-set", () => {
     expect(h.routingWrites).toEqual([]);
   });
 
-  test("a discovery.json damaged where readDiscovery cannot see is looked at again after a refresh", async () => {
+  test("a discovery.json that makes the check throw is looked at again after a refresh (the second net behind readDiscovery)", async () => {
     // A guild that is not an object: the real `readDiscovery` now rejects such a file itself (#482), so this
     // injects one past it. Validating against it throws, which is the same as a stale file -- refresh, then look again.
     const damaged = { ...bothServers(), guilds: [null as never] };

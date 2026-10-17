@@ -262,7 +262,13 @@ describe("gateCommand with discovery (#483)", () => {
   test("a thread under a gone channel is filtered the same way, through its parent's verdict", async () => {
     const thread = here({ channelId: THREAD, parentChannelId: ELSEWHERE });
     expect((await gateWith(thread, async () => discoveryWith([CHAN_1]))).result).toBe(`\`/rsetlist\` works in <#${CHAN_1}> here.`);
-    expect((await gateWith(thread, async () => discoveryWith([]))).result).toBeUndefined();
+    expect((await gateWith(thread, async () => discoveryWith([ELSEWHERE]))).result).toBeUndefined();
+  });
+
+  test("a server listed with no channels at all (an outage stub) names every listed channel and lifts nothing", async () => {
+    const { result, lines } = await gateWith(elsewhere, async () => discoveryWith([]));
+    expect(result).toBe(`\`/rsetlist\` works in <#${CHAN_1}> or <#${CHAN_2}> here.`);
+    expect(lines).toEqual([]);
   });
 
   test("an allowed command never reads discovery", async () => {

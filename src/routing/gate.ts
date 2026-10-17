@@ -15,7 +15,7 @@
 // though this gate never throws: a fault it cannot judge lets the picker run, as it lets the command run);
 // a button or a modal is not -- it belongs to a message that is already in an allowed channel.
 //
-// A refusal names only the channels the bot can still see (#483): the ones `discovery.json`, at most a tick old,
+// A refusal names only the channels the bot can still see (#483): the ones `discovery.json` lists (it is refreshed every 15 minutes, and not at all when a refresh fails),
 // lists in the server. When none of the listed channels is there any more (deleted since), the restriction
 // points nowhere, so the command runs and a `[gate]` line says so. Where the restriction is advisory -- the bot
 // cannot look at the channel, a thread's parent is unknown, or the gate fails -- the command runs too (#482).
@@ -92,7 +92,8 @@ export function refusalMessage(commandName: string, channels: readonly string[])
 }
 
 /** The channels of `listed` that `discovery.json` shows in `guildId`; `undefined` when there is nothing to check
- *  against (no dep, no file, no such server, or a read that throws -- the caller then names them all). */
+ *  against (no dep, no file, no such server or one listed with no channels, or a read that throws -- the caller
+ *  then names them all). A listed channel the bot cannot view is not in the file, so it counts as gone. */
 async function visibleChannels(
   listed: readonly string[],
   guildId: string,
@@ -101,7 +102,8 @@ async function visibleChannels(
   if (readDiscovery === undefined) return undefined;
   try {
     const guild = (await readDiscovery())?.guilds.find((g) => g.id === guildId);
-    if (guild === undefined) return undefined;
+    // A server listed with no channels at all is an outage stub or a cache not yet filled, not "every channel gone".
+    if (guild === undefined || guild.channels.length === 0) return undefined;
     const seen = new Set(guild.channels.map((c) => c.id));
     return listed.filter((id) => seen.has(id));
   } catch {
@@ -140,7 +142,7 @@ export async function gateCommand(
       return undefined;
     }
     // #483: a listed channel the operator has since deleted would be named as `#deleted-channel`. Keep the ones the
-    // bot can still see (discovery.json, at most a tick old); with none left the restriction points nowhere, so the
+    // bot can still see (discovery.json, refreshed every 15 minutes, so possibly older); with none left the restriction points nowhere, so the
     // command runs and the log says so. No file, or a file without this server, names them all, as before.
     // The staleness cuts both ways: a channel deleted since can still be named once, and one hand-added to
     // routing.json that is not yet in the file counts as gone.
