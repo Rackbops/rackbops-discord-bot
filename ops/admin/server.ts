@@ -770,8 +770,9 @@ export const HOST_API_VERSION = 1;
  *  4 = a plugin's env keys are listed and editable whether or not the plugin is on (#256).
  *  5 = recreate (#277).
  *  6 = WATCHED_REPOS accepts `none` (#342).
- *  7 = PLUGINS accepts only what the bot boots, every env-set format judged in the C locale (#430). */
-export const REQUIRED_BOT_OPS_SCHEMA = 7;
+ *  7 = PLUGINS accepts only what the bot boots, every env-set format judged in the C locale (#430).
+ *  8 = PLUGIN_INDEX_URL refuses a user:pass@ authority; status adds dockerError (#473, #474). */
+export const REQUIRED_BOT_OPS_SCHEMA = 8;
 
 /** #178: the deployed docker-compose.yml's `x-rackbops-schema:` this panel build was written
  *  against — same hand-mirror-plus-drift-pin pattern as `REQUIRED_BOT_OPS_SCHEMA` above, regexed

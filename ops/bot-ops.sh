@@ -83,7 +83,8 @@ set -euo pipefail
 # 5: adds recreate (#277).
 # 6: WATCHED_REPOS accepts `none` (#342).
 # 7: PLUGINS accepts only what the bot boots: an exact x.y.z(-pre) pin, no plugin in two different tokens, every env-set format judged in the C locale (#430).
-readonly BOT_OPS_SCHEMA=7
+# 8: PLUGIN_INDEX_URL refuses a user:pass@ authority; status adds dockerError (#473, #474).
+readonly BOT_OPS_SCHEMA=8
 
 die() { echo "bot-ops: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on the box"; }

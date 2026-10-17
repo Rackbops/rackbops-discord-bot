@@ -472,11 +472,12 @@ describe("bot-ops.sh PLUGINS row agrees with what the bot boots (#430, source pi
     for (const v of PLUGINS_CORPUS) expect(re.test(v) && !repeatsAName(v), v).toBe(bootAccepts(v));
   });
 
-  test("BOT_OPS_SCHEMA is 7 with its #430 history line", () => {
-    expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=7$/m);
+  test("BOT_OPS_SCHEMA is 8 with its #430 and #473/#474 history lines", () => {
+    expect(src).toMatch(/^readonly BOT_OPS_SCHEMA=8$/m);
     expect(src).toMatch(
       /^# 7: PLUGINS accepts only what the bot boots: an exact x\.y\.z\(-pre\) pin, no plugin in two different tokens, every env-set format judged in the C locale \(#430\)\.$/m,
     );
+    expect(src).toMatch(/^# 8: PLUGIN_INDEX_URL refuses a user:pass@ authority; status adds dockerError \(#473, #474\)\.$/m);
   });
 });
 
@@ -2234,7 +2235,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // Mutation: printing to stderr instead of stdout, or a malformed shape, both turn this red.
     // composeSchema is null here because the fixture's default compose.yml (a bare
     // "services:\n  bot:\n    image: x\n") has no x-rackbops-schema: line — #178.
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
     expect(run.stderr).toBe("");
   });
 
@@ -2242,7 +2243,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // A source-level pin distinct from the subprocess test above: this is the number the drift
     // test on the ops/admin side (ops/admin/server.test.ts) asserts REQUIRED_BOT_OPS_SCHEMA against.
     const src = readFileSync(BOT_OPS_SH, "utf8");
-    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=7\b/);
+    expect(src).toMatch(/readonly BOT_OPS_SCHEMA=8\b/);
   });
 
   test("version reports schema 7 (#430: PLUGINS pins match the bot)", async () => {
@@ -2269,7 +2270,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     });
     expect(run.exitCode).toBe(0);
     // No BOT_OPS_COMPOSE_FILE at all -> composeSchema is null, not an error (#178).
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("succeeds even with a nonexistent BOT_OPS_CONFIG_DIR/COMPOSE_FILE (the review-caught case)", async () => {
@@ -2282,7 +2283,7 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     // this red — those paths genuinely don't exist, so main() would die before reaching cmd_version.
     expect(run.exitCode).toBe(0);
     // A set-but-nonexistent BOT_OPS_COMPOSE_FILE -> composeSchema null, never an error (#178).
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 });
 
@@ -2295,7 +2296,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const realCompose = fileURLToPath(new URL("../docker-compose.yml", import.meta.url));
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: realCompose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: 1 });
+    expect(run.json).toEqual({ schema: 8, composeSchema: 1 });
   });
 
   test("a pre-#178 compose file (no x-rackbops-schema: line) -> composeSchema null", async () => {
@@ -2306,7 +2307,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
     // Mutation: dropping the null path (treating a missing key as schema 0, or crashing) turns this red.
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("a malformed x-rackbops-schema value (non-numeric) -> composeSchema null, never a crash", async () => {
@@ -2314,7 +2315,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: not-a-number\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: null });
+    expect(run.json).toEqual({ schema: 8, composeSchema: null });
   });
 
   test("a real numeric x-rackbops-schema value is reported exactly, including when it differs from 1", async () => {
@@ -2322,7 +2323,7 @@ describe.skipIf(!runnable)("bot-ops.sh version reports composeSchema (issue #178
     writeFileSync(fx.compose, "x-rackbops-schema: 2\nservices:\n  bot:\n    image: x\n");
     const run = await botOps(fx, ["version"], undefined, { BOT_OPS_COMPOSE_FILE: fx.compose });
     expect(run.exitCode).toBe(0);
-    expect(run.json).toEqual({ schema: 7, composeSchema: 2 });
+    expect(run.json).toEqual({ schema: 8, composeSchema: 2 });
   });
 });
 
