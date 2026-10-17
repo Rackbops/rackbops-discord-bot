@@ -113,7 +113,9 @@ artifacts** — fetched once by `install.sh`, never touched by hand, never preci
 is — but nothing re-fetches either of them on its own. **After a merge that changes either file in
 a way an instance needs to pick up — a new `bot-ops.sh` subcommand or `ALLOWED_SPEC`
 row, or a compose change like a new `environment:` entry, an image pin, a volume — re-run
-`install.sh` on each instance.** From `main`, this always refreshes both files, same as before. From
+`install.sh` on each instance.** (A running admin container sees a re-run's compose file at once since
+#486; one started before that still needs a single recreate, see below.) From `main`, this always
+refreshes both files, same as before. From
 another branch, the compose file is still always refreshed, but the host-shared `bin/bot-ops.sh` is
 refreshed only when that branch's own copy is byte-identical to `main`'s — otherwise `install.sh`
 refuses and names `--force-bin` as the override (issue #230; `bin/bot-ops.sh` is shared by every
@@ -131,12 +133,13 @@ line — and a banner at the top of the panel page naming precisely which file(s
 panel still starts and serves `status`/`logs`/`restart` regardless; it just tells you rather than
 staying silent about it. The panel re-checks both files about once a minute, so a re-run of
 `ops/install.sh` clears the `bot-ops.sh` line on its own; `docker-compose.yml` is mounted into the
-admin container as a single file, which keeps the old copy until that container is recreated --
-re-run `install.sh`'s printed step 4 with `--force-recreate` added before `admin` for that (as printed,
-step 4 is `up -d --build admin`, which leaves an unchanged admin container running; and never a bare
-`--force-recreate admin`: the admin's token and Access values come from step 4's environment, see
-"frozen" below) -- and until then the panel's own Recreate also runs against the old file (#464;
-mounting the directory instead is #486's). `install.sh`'s own summary lines print the schema each file was just
+admin container as a single file; since #486 `install.sh` rewrites it in place (same inode), so a re-run
+reaches a running admin without a recreate. An admin container started before that change still holds the
+old file until it is recreated once -- re-run `install.sh`'s printed step 4 with `--force-recreate` added
+before `admin` for that (as printed, step 4 is `up -d --build admin`, which leaves an unchanged admin
+container running; and never a bare `--force-recreate admin`: the admin's token and Access values come
+from step 4's environment, see "frozen" below) -- and until then the panel's own Recreate also runs against
+the old file (#464); the banner names that remedy for exactly this case. `install.sh`'s own summary lines print the schema each file was just
 installed with, so the panel's log and install's own output are easy to compare side by side.
 
 `version` is checked deliberately WITHOUT any of the `BOT_OPS_*` config or a real `.env`/compose
@@ -854,7 +857,7 @@ their own with the same `dm:self` grant: the plugin's `agent` command sets no de
 such a principal can DM only itself. Rod accepted that boundary on #332.
 
 **Secrets.** `DISCORD_TOKEN` (Pip's own bot token) and `MCP_BRIDGE_TOKEN` (the bridge's shared secret).
-On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:294-298`); Pip never starts the
+On first install `install.sh` also generates an `ADMIN_TOKEN` and prints it (`ops/install.sh:330-335`); Pip never starts the
 admin profile, so read that line in your own shell and never paste it anywhere. No tunnel, so no
 `CLOUDFLARE_TUNNEL_TOKEN`. Placeholders in angle brackets below are filled in by the operator and are
 never written into an issue, a comment or a transcript, and neither is a pairing code.
@@ -997,7 +1000,7 @@ still work after such a line (the last value wins in Compose and in `bot-ops.sh`
 `grep -c '^MCP_BRIDGE_TOKEN=' /opt/rackbops-discord-bot/pip/.env` (a count, never the value) before and
 after. Leave the file ending in a newline: `add-bridge.md` section 3 appends with `>>`, which would
 otherwise fuse the new line onto the last one. Every other key in `.env.example` stays blank except `ADMIN_TOKEN`, which `install.sh` already
-filled (`ops/install.sh:294-295`); leave it.
+filled (`ops/install.sh:330-331`); leave it.
 
 ### 3. What the core still does
 
