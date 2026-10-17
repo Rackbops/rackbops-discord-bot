@@ -1624,6 +1624,13 @@ describe.skipIf(!runnable)("install.sh refreshes the compose file in place so a 
   });
 
   test("E4 source pin: the in-place branch needs a regular non-symlink file we own (or root) that is writable; only the compose file uses it", () => {
+    // each of the four conditions on its own, so a mutant dropping any one names it (the root clause has no
+    // behavioural test: a non-root run cannot fake euid 0; -w and -L are also pinned by E4 (e) and (c) on CI Linux)
+    expect(FETCH_IN_PLACE, "regular file").toContain('[ -f "$3" ]');
+    expect(FETCH_IN_PLACE, "not a symlink").toContain('[ ! -L "$3" ]');
+    expect(FETCH_IN_PLACE, "owned by us").toContain('[ -O "$3" ]');
+    expect(FETCH_IN_PLACE, "or running as root").toContain('[ "$(id -u)" -eq 0 ]');
+    expect(FETCH_IN_PLACE, "writable").toContain('[ -w "$3" ]');
     expect(FETCH_IN_PLACE).toContain('[ -f "$3" ] && [ ! -L "$3" ] && { [ -O "$3" ] || [ "$(id -u)" -eq 0 ]; } && [ -w "$3" ]');
     expect(installShSource).toMatch(/^ {2}fetch_in_place "docker-compose\.yml" 644 "\$STACK_DIR\/docker-compose\.yml"$/m);
     expect(installShSource).not.toMatch(/fetch_in_place "(\.env\.example|ops\/bot-ops\.sh)"/);
