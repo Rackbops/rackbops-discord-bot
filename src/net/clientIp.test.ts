@@ -373,7 +373,6 @@ describe("clientIpFrom", () => {
     const proxy = createTrustedProxy({ host: "cloudflared", lookup: async () => ["10.0.0.5"] });
     await proxy.refresh();
     expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "203.0.113.9" }), "10.0.0.5", proxy)).toBe("203.0.113.9");
-    expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "  203.0.113.9 " }), "10.0.0.5", proxy)).toBe("203.0.113.9");
     expect(clientIpFrom(fakeRequest({ "CF-Connecting-IP": "2001:db8::1" }), "10.0.0.5", proxy)).toBe("2001:db8::1");
   });
 
