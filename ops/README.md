@@ -106,6 +106,16 @@ bot from before that moves such a file to `requests/rejected/` like any unknown 
 forward before the panel). `routing-get` reads
 the two files the bot writes — its routing record and what it can see — so a panel can show them.
 
+### A plugin version that installs but won't start (#542)
+
+If a pinned version installs but its `activate()` throws (a missing env key, a breaking change), `state.json`
+records it as `installedVersion` with `active: false` and the error. Removing the pin does **not** roll the plugin
+back: the next boot resolves `PLUGINS=` pin, then a `/plugins update` target, then the recorded `installedVersion`
+(`installPlugins`'s `primary` in `src/plugins/install.ts`), so the failed version stays selected. To recover, pin a
+known-good version once (`PLUGINS=name@x.y.z`, then `bot-ops.sh recreate`); it is recorded once it installs, and the
+pin can be removed afterwards. A pin that failed to *install* is different: it is never recorded, and removing it
+brings the last-good version back (#410).
+
 ## Keeping `bot-ops.sh` and `docker-compose.yml` current
 
 Both `bin/bot-ops.sh` and the stack's `docker-compose.yml` on an instance are **deployment
