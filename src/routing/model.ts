@@ -14,7 +14,10 @@
 // through nor be assigned onto a prototype (see `repoForProject` in `src/config.ts` for the failure
 // this style exists to prevent).
 
-import { shown } from "./resolve";
+import { clip, shown } from "./text";
+
+/** `clip` lives in `text.ts` (so this file and `resolve.ts` need not import each other); re-exported for its importers. */
+export { clip };
 
 export const ROUTING_VERSION = 1 as const;
 /** Same rule as `PluginIndexEntry.name` (`src/plugins/requests.ts` and `src/plugins/index.ts`). */
@@ -128,19 +131,6 @@ export function freshRouting(): RoutingFile {
 
 export function freshSecrets(): RoutingSecretsFile {
   return { v: ROUTING_VERSION, webhooks: {} };
-}
-
-/**
- * `text` cut to at most `max` UTF-16 units, as well-formed text: a cut never ends on half of a surrogate
- * pair, and a lone surrogate (a `"\ud83d"` escape in some JSON, say) becomes U+FFFD. A value that is
- * about to go into `routing.json` for the panel to read needs this: a lone surrogate makes text that
- * `encodeURIComponent` throws on.
- */
-export function clip(text: string, max: number): string {
-  let cut = text.slice(0, max);
-  const last = cut.charCodeAt(cut.length - 1);
-  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
-  return cut.toWellFormed();
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -285,12 +275,12 @@ export function repairRouting(raw: unknown): RoutingFile {
  * silent, and, like `repairRouting`, not going to throw on anything `JSON.parse` can produce: `repairRouting`
  * stays tolerant and quiet, and `readRouting` says these once.
  *
- * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and, with one
- * exception, never a value: a value can be anything a person typed. `shown` shows at most 40 characters
+ * A message names a key (a plugin name, a server id, a channel id), passed through `shown`, and, with two
+ * exceptions, never a value: a value can be anything a person typed. `shown` shows at most 40 characters
  * (a longer text is cut to its first 37 and `...`). A token starts at character 39 of a Discord webhook URL
  * at the earliest (51 or later with a real id), so a URL used as a key is cut before its token. The
- * exception is a bad `postTo`, whose value is shown (through `shown` too) so the operator can see what was
- * wrong with it. A webhook entry that carried a stray `url` or `token` key is not a dropped entry -- the
+ * exceptions are a bad `postTo` and a bad destination's channel, whose values are shown (through `shown` too)
+ * so the operator can see what was wrong with them. A webhook entry that carried a stray `url` or `token` key is not a dropped entry -- the
  * repair keeps the entry and drops the key, by design -- so it reports nothing.
  *
  * The primitives are the repair's own (`repairScope`, `repairWebhook`, `isSnowflake` and the two regexes are
@@ -299,7 +289,8 @@ export function repairRouting(raw: unknown): RoutingFile {
  * pins that this says something exactly when the repair drops one of these kinds of thing. Also said: a
  * `raw` that is not an object at all (the file holds `[]` or `"x"`: a missing file is not that,
  * `readJsonOrFresh` reads it as a fresh object), and a `plugins` or `webhooks` that is not an object. NOT
- * reported: a `results` entry (the bot's own bookkeeping, not configuration), and an `undefined` `raw`
+ * reported: a `results` entry (the bot's own bookkeeping, not configuration), a non-string `broken`, `updatedAt`
+ * or `updatedBy` (dropped silently: bookkeeping, not configuration), and an `undefined` `raw`
  * (nothing was read, which `readRouting` never hands over).
  */
 export function droppedByRepair(raw: unknown): string[] {
@@ -319,7 +310,7 @@ export function droppedByRepair(raw: unknown): string[] {
         continue;
       }
       if (!isPlainObject(entry) || !isPlainObject(entry.servers)) {
-        dropped.push(`${plugin} is not an object with a servers object`);
+        dropped.push(`${plugin} is not an object with a servers object, so it is unplaced (it lives in the home server)`);
         continue;
       }
       for (const [guildId, server] of Object.entries(entry.servers)) {

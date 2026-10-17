@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest, type AnnounceStateForTest } from "../src/announce";
@@ -11,6 +11,7 @@ import { resetForTest, stateForTest, type RestartStateForTest } from "../src/res
 import { resetRoutingForTest, resetRoutingQueueForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
+import { resetKeptCorruptForTest, storageStateForTest } from "../src/storage";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import { settleWithin } from "./settleWithin";
 import { drainQueues, findStateLeaks, GUARDED, resetAllState, type GuardedModule } from "./stateGuard";
@@ -24,6 +25,7 @@ import {
   restartStateLeaks,
   routingLeaks,
   routingStoreLeaks,
+  storageLeaks,
   settled,
   STATE_GUARD,
   stateLeakMessage,
@@ -45,6 +47,16 @@ describe("settled", () => {
 
   test("one still waiting has not", async () => {
     expect(await settled(NEVER)).toBe(false);
+  });
+
+  test("one that settles after several microtask hops has settled before any macrotask (#462)", async () => {
+    expect(
+      await settled(
+        (async () => {
+          for (let i = 0; i < 5; i++) await null;
+        })(),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -165,7 +177,7 @@ describe("routingLeaks", () => {
 });
 
 describe("routingStoreLeaks", () => {
-  const CLEAN = { said: 0, writes: DONE };
+  const CLEAN = { said: 0, copied: 0, writes: DONE };
   test("a clean state has no leaks", async () => {
     expect(await routingStoreLeaks(CLEAN)).toEqual([]);
   });
@@ -177,7 +189,16 @@ describe("routingStoreLeaks", () => {
     expect(await routingStoreLeaks({ ...CLEAN, writes: NEVER })).toEqual([expect.stringContaining("a routing or secrets write still running")]);
   });
   test("names every dirty field", async () => {
-    expect(await routingStoreLeaks({ said: 1, writes: NEVER })).toHaveLength(2);
+    expect(await routingStoreLeaks({ said: 1, copied: 1, writes: NEVER })).toHaveLength(3);
+  });
+});
+
+describe("storageLeaks", () => {
+  test("a clean state has no leaks", () => {
+    expect(storageLeaks({ kept: 0 })).toEqual([]);
+  });
+  test("names a kept-corrupt path still remembered", () => {
+    expect(storageLeaks({ kept: 1 })).toEqual([expect.stringContaining("1 kept-corrupt path(s) remembered")]);
   });
 });
 
@@ -314,6 +335,7 @@ describe("GUARDED", () => {
       ["src/restart.ts", stateForTest, restartStateLeaks, [resetForTest]],
       ["src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]],
       ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]],
+      ["src/storage.ts", storageStateForTest, storageLeaks, [resetKeptCorruptForTest]],
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
       ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest, resetRoutingQueueForTest]],
@@ -450,6 +472,10 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
         throw new Error(`fixture run was killed after ${CHILD_TIMEOUT_MS}ms:\n${child.stderr.toString()}`);
       }
       exitCode = child.exitCode;
+      // #462: a child that died before writing its report (a preload that throws) used to surface as a bare ENOENT.
+      if (!existsSync(report)) {
+        throw new Error(`fixture run wrote no report (exit ${child.exitCode}):\n${child.stderr.toString()}\n${child.stdout.toString()}`);
+      }
       cases = testcases(readFileSync(report, "utf8"));
     } finally {
       rmSync(dir, { recursive: true, force: true });

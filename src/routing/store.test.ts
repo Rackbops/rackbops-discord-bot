@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DATA_DIR } from "../storage";
+import { DATA_DIR, resetKeptCorruptForTest, storageStateForTest } from "../storage";
 import { freshRouting, freshSecrets, repairRouting, type RoutingFile, type RoutingSecretsFile } from "./model";
 import { stallBunWrite } from "../../test/stallBunWrite";
 import { settled } from "../../test/stateLeaks";
-import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, resetRoutingWritesForTest, routingPath, routingStoreStateForTest, sayWhatWasIgnored, secretsPath } from "./store";
+import { mutateRouting, mutateSecrets, readRouting, readSecrets, resetRoutingWarningsForTest, resetRoutingWritesForTest, routingPath, routingStoreStateForTest, sayWhatWasIgnored, secretsPath, sweepSecretsTemp } from "./store";
 
 const GUILD = "111111111111111111";
 const CHAN = "333333333333333331";
@@ -22,6 +22,8 @@ afterEach(() => {
   // What a damaged file's read said is remembered per process; the test-state guard
   // (test/stateGuard.ts) fails a test that leaves it behind.
   resetRoutingWarningsForTest();
+  // The same for the corrupt files a read left in place (#477).
+  resetKeptCorruptForTest();
 });
 
 /** Adds a plugin placed in one server -- the smallest change that shows up in a read. */
@@ -58,18 +60,24 @@ describe("readRouting", () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
-  test("an unparseable file reads as fresh and is moved aside", async () => {
+  test("an unparseable file reads as fresh and is left where it is; the next write moves it aside (#477)", async () => {
     const error = spyOn(console, "error").mockImplementation(() => {});
     try {
       for (const damaged of ["", "{", '{"v":1,"plugins":{"music":', "not json at all"]) {
         writeFileSync(routingPath(dir), damaged);
         expect(await readRouting(dir)).toEqual(freshRouting());
-        expect(existsSync(routingPath(dir))).toBe(false);
-        // The damaged bytes are kept for inspection, not thrown away.
+        // A plain read renames nothing: the operator's file stays where they put it.
+        expect(readFileSync(routingPath(dir), "utf8")).toBe(damaged);
+        expect(readdirSync(dir)).toEqual(["routing.json"]);
+        // The write that replaces it keeps the damaged bytes for inspection, not thrown away.
+        await mutateRouting(dir, withPlugin("music"));
         const aside = readdirSync(dir).filter((f) => f.startsWith("routing.json.corrupt-"));
         expect(aside).toHaveLength(1);
         expect(readFileSync(join(dir, aside[0]!), "utf8")).toBe(damaged);
+        expect(Object.keys(JSON.parse(readFileSync(routingPath(dir), "utf8")).plugins)).toEqual(["music"]);
         rmSync(join(dir, aside[0]!));
+        rmSync(routingPath(dir));
+        resetKeptCorruptForTest();
       }
       expect(error).toHaveBeenCalled();
     } finally {
@@ -375,6 +383,35 @@ describe("secrets", () => {
     expect(Object.keys((await readSecrets(dir)).webhooks).sort()).toEqual([CHAN, "333333333333333332"]);
   });
 
+  test("a thenable from mutate is refused for both files, a rejecting one without an unhandled rejection (#478)", async () => {
+    await mutateRouting(dir, withPlugin("music"));
+    await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
+    const routingBefore = readFileSync(routingPath(dir), "utf8");
+    const secretsBefore = readFileSync(secretsPath(dir), "utf8");
+    const unhandled: unknown[] = [];
+    const probe = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", probe);
+    try {
+      const file = await readRouting(dir);
+      await expect(mutateRouting(dir, () => Promise.resolve(file) as unknown as RoutingFile)).rejects.toThrow(/mutateRouting: .*not a Promise/);
+      await expect(mutateSecrets(dir, () => Promise.resolve(freshSecrets()) as unknown as RoutingSecretsFile, async () => {})).rejects.toThrow(
+        /mutateSecrets: .*not a Promise/,
+      );
+      // A promise that REJECTS: the refusal must also handle that rejection.
+      await expect(mutateRouting(dir, () => Promise.reject(new Error("boom")) as unknown as RoutingFile)).rejects.toThrow(/not a Promise/);
+      await expect(mutateSecrets(dir, () => Promise.reject(new Error("boom")) as unknown as RoutingSecretsFile, async () => {})).rejects.toThrow(
+        /not a Promise/,
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("unhandledRejection", probe);
+    }
+    expect(unhandled).toEqual([]);
+    expect(readFileSync(routingPath(dir), "utf8")).toBe(routingBefore);
+    expect(readFileSync(secretsPath(dir), "utf8")).toBe(secretsBefore);
+  });
+
   test("a failed rename leaves the previous secrets file intact and no temp file behind", async () => {
     await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
     const before = readFileSync(secretsPath(dir), "utf8");
@@ -465,6 +502,8 @@ describe("secrets", () => {
       writeFileSync(secretsPath(dir), '{"v":1,"webhooks":{"333333333333333331":');
       chmodSync(secretsPath(dir), 0o644);
       expect(await readSecrets(dir)).toEqual(freshSecrets());
+      expect(readdirSync(dir)).toEqual(["routing.secrets.json"]); // the read keeps it (#477)
+      await mutateSecrets(dir, (s) => s, async () => {});
       const aside = readdirSync(dir).filter((f) => f.startsWith("routing.secrets.json.corrupt-"));
       expect(aside).toHaveLength(1);
       expect(statSync(join(dir, aside[0]!)).mode & 0o777).toBe(0o644);
@@ -481,6 +520,8 @@ describe("secrets", () => {
       await mutateSecrets(dir, (s) => ({ ...s, webhooks: { [CHAN]: HOOK_URL } }), async () => {});
       writeFileSync(secretsPath(dir), '{"v":1,"webhooks":{"333333333333333331":'); // truncated in place: same inode, same mode
       expect(await readSecrets(dir)).toEqual(freshSecrets());
+      expect(readdirSync(dir)).toEqual(["routing.secrets.json"]); // the read keeps it (#477)
+      await mutateSecrets(dir, (s) => s, async () => {});
       const aside = readdirSync(dir).filter((f) => f.startsWith("routing.secrets.json.corrupt-"));
       expect(aside).toHaveLength(1);
       expect(statSync(join(dir, aside[0]!)).mode & 0o777).toBe(0o600);
@@ -806,5 +847,157 @@ describe("readRouting says what it ignored (#260)", () => {
     expect(read).toEqual(repairRouting(raw));
     // Nothing was written: reading and warning leave the file as it was.
     expect(JSON.parse(readFileSync(routingPath(dir), "utf8"))).toEqual(raw);
+  });
+});
+
+describe("a corrupt file, a repairing write and stale temp files (#477, #479)", () => {
+  beforeEach(resetRoutingWarningsForTest);
+  const BARE = "SECRETTOKEN123";
+
+  /** Runs `body` with console.error recorded (and kept off the test output). */
+  async function captureErrors(body: () => Promise<void>): Promise<string[]> {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await body();
+      return error.mock.calls.map((call) => String(call[0]));
+    } finally {
+      error.mockRestore();
+    }
+  }
+
+  test("S1: a read of an unparseable routing.json renames nothing and says so once; the write then moves it aside", async () => {
+    writeFileSync(routingPath(dir), "{ not json");
+    const lines = await captureErrors(async () => {
+      expect(await readRouting(dir)).toEqual(freshRouting());
+      expect(await readRouting(dir)).toEqual(freshRouting());
+    });
+    expect(readFileSync(routingPath(dir), "utf8")).toBe("{ not json");
+    expect(readdirSync(dir)).toEqual(["routing.json"]);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("will not parse");
+    expect(storageStateForTest().kept).toBe(1);
+
+    await captureErrors(() => mutateRouting(dir, withPlugin("music")));
+    const aside = readdirSync(dir).filter((f) => f.startsWith("routing.json.corrupt-"));
+    expect(aside).toHaveLength(1);
+    expect(readFileSync(join(dir, aside[0]!), "utf8")).toBe("{ not json");
+    expect(Object.keys(JSON.parse(readFileSync(routingPath(dir), "utf8")).plugins)).toEqual(["music"]);
+    // The write path forgot the path: a good read after it leaves nothing remembered.
+    await readRouting(dir);
+    expect(storageStateForTest().kept).toBe(0);
+  });
+
+  test("S1b: a second corruption episode is said again, also after a repairing write moved the first one aside", async () => {
+    writeFileSync(routingPath(dir), "{ not json");
+    const first = await captureErrors(async () => void (await readRouting(dir)));
+    expect(first).toHaveLength(1);
+    await captureErrors(() => mutateRouting(dir, withPlugin("music"))); // moves it aside, writes a good file
+    writeFileSync(routingPath(dir), "{ not json again");
+    const second = await captureErrors(async () => void (await readRouting(dir)));
+    expect(second).toHaveLength(1);
+    expect(second[0]).toContain("will not parse");
+  });
+
+  test("S1c: an unparseable secrets file is kept by a read and moved aside by a write, and neither line quotes it", async () => {
+    writeFileSync(secretsPath(dir), `{ "a": ${BARE} }`);
+    const keep = await captureErrors(async () => {
+      expect(await readSecrets(dir)).toEqual(freshSecrets());
+    });
+    expect(readdirSync(dir)).toEqual(["routing.secrets.json"]);
+    expect(keep).toHaveLength(1);
+    expect(keep[0]).toContain("SyntaxError");
+    expect(keep[0]).not.toContain(BARE);
+
+    const aside = await captureErrors(() => mutateSecrets(dir, (s) => s, async () => {}));
+    expect(aside.length).toBeGreaterThan(0);
+    expect(aside[0]).toContain("SyntaxError");
+    for (const line of aside) expect(line).not.toContain(BARE);
+    expect(readdirSync(dir).filter((f) => f.startsWith("routing.secrets.json.corrupt-"))).toHaveLength(1);
+  });
+
+  const BAD_SERVER = { plugins: { music: { servers: { [GUILD]: { commands: "All" } } } } };
+
+  test("S3: the first write that drops something keeps the file as it was, once; a clean file is not copied", async () => {
+    writeFileSync(routingPath(dir), JSON.stringify(BAD_SERVER));
+    const seeded = readFileSync(routingPath(dir), "utf8");
+    const warnings = await captureWarnings(() => mutateRouting(dir, withPlugin("wow")));
+    const copies = readdirSync(dir).filter((f) => f.startsWith("routing.json.before-repair-"));
+    expect(copies).toHaveLength(1);
+    expect(readFileSync(join(dir, copies[0]!), "utf8")).toBe(seeded);
+    expect(warnings.filter((w) => w.includes("is kept at") && w.includes(copies[0]!))).toHaveLength(1);
+    const written = JSON.parse(readFileSync(routingPath(dir), "utf8"));
+    expect(Object.keys(written.plugins).sort()).toEqual(["music", "wow"]);
+    expect(written.plugins.music).toEqual({ servers: {} });
+    expect(routingStoreStateForTest().copied).toBe(1);
+    // The file is clean now: a second write copies nothing.
+    await captureWarnings(() => mutateRouting(dir, withPlugin("later")));
+    expect(readdirSync(dir).filter((f) => f.startsWith("routing.json.before-repair-"))).toHaveLength(1);
+    resetRoutingWarningsForTest();
+    expect(routingStoreStateForTest().copied).toBe(0);
+  });
+
+  test("S3a: a clean file from the start is never copied", async () => {
+    await mutateRouting(dir, withPlugin("music"));
+    await mutateRouting(dir, withPlugin("wow"));
+    expect(readdirSync(dir).filter((f) => f.startsWith("routing.json.before-repair-"))).toHaveLength(0);
+    expect(routingStoreStateForTest().copied).toBe(0);
+  });
+
+  test("S3b: a file that is made bad again between two writes still gets only one copy", async () => {
+    let clock = 1000;
+    const now = spyOn(Date, "now").mockImplementation(() => clock++);
+    try {
+      writeFileSync(routingPath(dir), JSON.stringify(BAD_SERVER));
+      await captureWarnings(() => mutateRouting(dir, withPlugin("wow")));
+      writeFileSync(routingPath(dir), JSON.stringify(BAD_SERVER));
+      await captureWarnings(() => mutateRouting(dir, withPlugin("later")));
+    } finally {
+      now.mockRestore();
+    }
+    expect(readdirSync(dir).filter((f) => f.startsWith("routing.json.before-repair-"))).toHaveLength(1);
+  });
+
+  test("S3c: a copy that cannot be made is said and the write still lands", async () => {
+    writeFileSync(routingPath(dir), JSON.stringify(BAD_SERVER));
+    const now = spyOn(Date, "now").mockReturnValue(5000);
+    try {
+      mkdirSync(`${routingPath(dir)}.before-repair-5000`); // copyFileSync onto a directory throws
+      const warnings = await captureWarnings(() => mutateRouting(dir, withPlugin("wow")));
+      expect(warnings.some((w) => w.includes("a copy could not be kept"))).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+    expect(Object.keys(JSON.parse(readFileSync(routingPath(dir), "utf8")).plugins).sort()).toEqual(["music", "wow"]);
+    expect(routingStoreStateForTest().copied).toBe(1);
+  });
+
+  test("S5: the sweep removes secrets temp files and only those", () => {
+    const keep = ["routing.secrets.json.corrupt-1", "routing.json.x.tmp", "routing.secrets.json"];
+    for (const name of ["routing.secrets.json.aaaa.tmp", "routing.secrets.json.bbbb.tmp", ...keep]) writeFileSync(join(dir, name), "x");
+    const log = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(sweepSecretsTemp(dir)).toBe(2);
+      expect(log.mock.calls.map((c) => String(c[0]))).toEqual(["[routing] removed 2 stale routing.secrets.json temp file(s)"]);
+    } finally {
+      log.mockRestore();
+    }
+    expect(readdirSync(dir).sort()).toEqual([...keep].sort());
+    expect(sweepSecretsTemp(join(dir, "missing"))).toBe(0);
+  });
+
+  test("S5b: a temp file that cannot be removed is said and never thrown", () => {
+    mkdirSync(join(dir, "routing.secrets.json.x.tmp"));
+    writeFileSync(join(dir, "routing.secrets.json.x.tmp", "inner"), "x"); // unlinkSync on a non-empty directory throws on every OS
+    writeFileSync(join(dir, "routing.secrets.json.ok.tmp"), "x");
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(sweepSecretsTemp(dir)).toBe(1);
+      expect(error.mock.calls.map((c) => String(c[0])).some((l) => l.includes("could not remove a stale secrets temp file routing.secrets.json.x.tmp"))).toBe(true);
+    } finally {
+      error.mockRestore();
+      warn.mockRestore();
+    }
+    expect(existsSync(join(dir, "routing.secrets.json.ok.tmp"))).toBe(false);
   });
 });

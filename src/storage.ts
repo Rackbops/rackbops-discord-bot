@@ -130,28 +130,71 @@ export function classifyReadError(err: unknown): "corrupt" | "absent" | "error" 
   return "error";
 }
 
+export interface ReadJsonOptions {
+  /** What a file that will not parse does: moved aside and read as fresh (the default, right for a serialized
+   *  write that then replaces it), or kept in place and read as fresh, said once per path per process (right for a
+   *  plain read, which must not rename a file a write may be producing, #477/#484). */
+  onCorrupt?: "move-aside" | "keep";
+  /** Print only the error's name, never its message (a secrets file's parser error can quote its contents, #477). */
+  redactReason?: boolean;
+}
+
+/** Paths a `"keep"` read has already said will not parse; forgotten on a good parse, an absent file, or a
+ *  move-aside, so a later corruption episode is said once more. */
+const keptCorrupt = new Set<string>();
+export function resetKeptCorruptForTest(): void {
+  keptCorrupt.clear();
+}
+/** The guard's view of this module's state (`test/stateGuard.ts`). */
+export function storageStateForTest(): { kept: number } {
+  return { kept: keptCorrupt.size };
+}
+
 /**
  * Reads and parses JSON at `path`, falling back to `fresh()` for an absent file (the common
  * fresh-install case). A file that **parsed badly** (empty, truncated, not JSON — a process killed
  * mid-write before temp+rename (#68), or a hand edit; temp+rename covers an OOM-kill, a SIGKILL or a
- * crash, but there is no `fsync`, so a host power loss is outside it, #510) is logged and moved aside
+ * crash, but there is no `fsync`, so a host power loss is outside it, #510; the secrets file is not
+ * special, #479) is, by default, logged and moved aside
  * to `<path>.corrupt-<timestamp>` rather than thrown, so a bad file degrades to "this one file's
- * history lost once" instead of crashing whatever awaited it at import. Once the file is known to
+ * history lost once" instead of crashing whatever awaited it at import. With `onCorrupt: "keep"` (a plain
+ * read, not a serialized write) the file is left in place and read as fresh, said once per path per process:
+ * the next write is what replaces it (#477). `redactReason` keeps the parser's message out of the log (a
+ * secrets file). A path is forgotten again on a good parse, on an absent file and when it is moved aside,
+ * so a second corruption episode is said once more. Once the file is known to
  * exist, a read that fails for any other reason (EACCES, EIO, ...) is logged and **rethrown**:
  * returning fresh would let the next write overwrite a file that may be intact, and moving it aside
  * would hide an environment fault (#509). That reaches every caller, the installed plugins'
  * `HostStorage.readJsonOrFresh` included. `label` names which file this is, in the log line.
  */
-export async function readJsonOrFresh<T>(path: string, fresh: () => T, label: string): Promise<T> {
+export async function readJsonOrFresh<T>(path: string, fresh: () => T, label: string, options: ReadJsonOptions = {}): Promise<T> {
   const file = Bun.file(path);
-  if (!(await file.exists())) return fresh();
+  if (!(await file.exists())) {
+    keptCorrupt.delete(path);
+    return fresh();
+  }
   try {
-    return (await file.json()) as T;
+    const parsed = (await file.json()) as T;
+    keptCorrupt.delete(path);
+    return parsed;
   } catch (err) {
     const kind = classifyReadError(err);
-    if (kind === "absent") return fresh();
+    if (kind === "absent") {
+      keptCorrupt.delete(path);
+      return fresh();
+    }
     if (kind === "corrupt") {
-      moveCorruptAside(path, label, String(err));
+      const reason = options.redactReason ? (err instanceof Error ? err.name : "parse error") : String(err);
+      if (options.onCorrupt === "keep") {
+        if (!keptCorrupt.has(path)) {
+          keptCorrupt.add(path);
+          console.error(`[${label}] ${path} will not parse (${reason}); acting on a fresh ${label} until it is fixed or the next write replaces it`);
+        }
+        return fresh();
+      }
+      // The write path moved the file aside: the path is clean again, so a later corruption is said once more.
+      keptCorrupt.delete(path);
+      moveCorruptAside(path, label, reason);
       return fresh();
     }
     console.error(`[${label}] ${path} could not be read (${err}); not treating it as corrupt`);

@@ -23,8 +23,10 @@
 // poll time is reset, possibly against `config` or `state` already put back under it.
 //
 // Loading those modules here means config.ts loads for every run, even of a single file that never
-// imports it — so a value config.ts refuses, left in your shell (HTTP_PORT=abc, a malformed
-// PLUGINS, ...), stops every run before its first test. Unset it; CI sets none of them.
+// imports it. test/setup.ts forces the two keys it requires and clears every other key it reads (#462),
+// so a value left in your shell cannot stop a run; a preload that throws for any other reason still stops
+// every run before its first test, and a failure only the guard's own child run hits is reported by its
+// test with the exit code and stderr (#462).
 
 import { afterEach } from "bun:test";
 import { drainQueues, findStateLeaks, resetAllState } from "./stateGuard";

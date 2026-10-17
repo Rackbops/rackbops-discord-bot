@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   clip,
   droppedByRepair,
@@ -474,7 +476,7 @@ describe("droppedByRepair (#260)", () => {
 
   test("a plugin that is not an object with a servers object", () => {
     for (const entry of ["x", 7, null, [], { servers: [] }, { servers: "all" }, {}]) {
-      expect(droppedByRepair(withPlugin("music", entry))).toEqual(["plugin music is not an object with a servers object"]);
+      expect(droppedByRepair(withPlugin("music", entry))).toEqual(["plugin music is not an object with a servers object, so it is unplaced (it lives in the home server)"]);
     }
   });
 
@@ -563,7 +565,11 @@ describe("droppedByRepair (#260)", () => {
             [URL_WITH_TOKEN]: { commands: "all" },
             [GUILD_A]: { commands: URL_WITH_TOKEN, postTo: URL_WITH_TOKEN },
             [GUILD_B]: { commands: [URL_WITH_TOKEN] },
-            "333333333333333333": { commands: "all", postTo: URL_WITH_TOKEN },
+            "333333333333333333": {
+              commands: "all",
+              postTo: URL_WITH_TOKEN,
+              destinations: { [URL_WITH_TOKEN]: CHAN_1, news: URL_WITH_TOKEN },
+            },
           },
         },
         wow: URL_WITH_TOKEN,
@@ -575,6 +581,13 @@ describe("droppedByRepair (#260)", () => {
     // The postTo on the KEPT server is among them, so the branch that shows a value was really reached.
     const postTo = messages.filter((message) => message.includes("postTo"));
     expect(postTo).toEqual([`plugin music: server 333333333333333333: postTo ${URL_WITH_TOKEN.slice(0, 37)}... is not a channel id`]);
+    // So are the destination lines (#415): a URL as a destination NAME and as a destination VALUE (the channel, the one
+    // other value a message shows). Both reached, both clipped before the token.
+    const destination = messages.filter((message) => message.includes("destination "));
+    expect(destination).toEqual([
+      `plugin music: server 333333333333333333: destination ${URL_WITH_TOKEN.slice(0, 37)}... is not a valid name`,
+      `plugin music: server 333333333333333333: destination news -> ${URL_WITH_TOKEN.slice(0, 37)}... is not a channel id`,
+    ]);
     for (const message of messages) {
       expect(message).not.toContain(TOKEN);
       expect(message).not.toContain(URL_WITH_TOKEN);
@@ -609,7 +622,7 @@ describe("droppedByRepair (#260)", () => {
     /**
      * An oracle that does not look at droppedByRepair: what `repairRouting` LEFT OUT, worked out by comparing
      * its output with the raw file. A plugin that is gone; a server that is gone from a plugin that is kept; a
-     * postTo lost from a server that is kept; a webhook that is gone; a `plugins` or `webhooks` that was there
+     * postTo or a destination lost from a server that is kept; a webhook that is gone; a `plugins` or `webhooks` that was there
      * and came back empty because it was not an object; a whole file that was not an object. (A dropped
      * plugin's servers are not counted separately: the plugin is the thing dropped.)
      */
@@ -634,6 +647,14 @@ describe("droppedByRepair (#260)", () => {
             const keptServer = Object.hasOwn(kept.servers, id) ? kept.servers[id] : undefined;
             if (keptServer === undefined) out.push(id);
             else if (isObject(server) && server.postTo !== undefined && keptServer.postTo === undefined) out.push(id);
+            if (keptServer !== undefined && isObject(server)) {
+              const rawDestinations = server.destinations;
+              const keptDestinations = keptServer.destinations ?? {};
+              if (rawDestinations !== undefined && !isObject(rawDestinations)) out.push("destinations");
+              else if (isObject(rawDestinations)) {
+                for (const name of Object.keys(rawDestinations)) if (!Object.hasOwn(keptDestinations, name)) out.push(name);
+              }
+            }
           }
         }
       }
@@ -664,6 +685,10 @@ describe("droppedByRepair (#260)", () => {
       ["a 4-digit postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: "1234" } } } } }],
       ["a null postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: null } } } } }],
       ["a good postTo", { plugins: { music: { servers: { [A]: { commands: "all", postTo: CHAN_1 } } } } }],
+      ["a good destination", { plugins: { music: { servers: { [A]: { commands: "all", destinations: { news: CHAN_1 } } } } } }],
+      ["a destination with a bad name", { plugins: { music: { servers: { [A]: { commands: "all", destinations: { "Bad Name": CHAN_1, news: CHAN_1 } } } } } }],
+      ["a destination with a bad channel", { plugins: { music: { servers: { [A]: { commands: "all", destinations: { news: 7, alerts: "1234", ok: CHAN_1 } } } } } }],
+      ["destinations that is a list", { plugins: { music: { servers: { [A]: { commands: "all", destinations: [CHAN_1] } } } } }],
       ["a webhook with a bad key", { webhooks: { general: goodHook, [CHAN_1]: goodHook } }],
       ["a webhook keyed by a 4-digit channel id", { webhooks: { "1234": goodHook } }],
       ["a webhook keyed by a 5-digit channel id", { webhooks: { "12345": goodHook } }],
@@ -711,6 +736,21 @@ describe("droppedByRepair (#260)", () => {
     function shownKey(key: string): string {
       return key.length <= 40 ? key : `${key.slice(0, 37)}...`;
     }
+  });
+});
+
+describe("the routing modules do not import each other in a ring (#478)", () => {
+  const read = (file: string) => readFileSync(join(import.meta.dir, file), "utf8");
+  test("model.ts takes shown and clip from text.ts and imports nothing from resolve.ts", () => {
+    expect(read("model.ts")).not.toContain('from "./resolve"');
+    expect(read("model.ts")).toContain('from "./text"');
+  });
+  test("text.ts imports nothing at all", () => {
+    expect(read("text.ts")).not.toMatch(/^import /m);
+  });
+  test("shown and clip are still exported where their importers expect them", () => {
+    expect(read("resolve.ts")).toContain("export { shown }");
+    expect(read("model.ts")).toContain("export { clip }");
   });
 });
 

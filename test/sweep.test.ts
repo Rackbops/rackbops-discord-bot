@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { basename } from "node:path";
-import { isPidAlive, MAX_AGE_MS, parsePid, sweepStaleTestDirs, TEST_DATA_PREFIX } from "./sweep";
+import { formatSwept, isPidAlive, MAX_AGE_MS, parsePid, sweepStaleTestDirs, TEST_DATA_PREFIX } from "./sweep";
 
 const NOW = 1_000_000_000; // an arbitrary epoch-ms anchor; only relative deltas below matter
 const FIVE_MIN_MS = 5 * 60 * 1000;
@@ -8,19 +8,28 @@ const FIVE_MIN_MS = 5 * 60 * 1000;
 /** `sweepStaleTestDirs` with sane defaults (one directory, alive, young), overridable per test. */
 function sweep(
   entries: string[],
-  opts: Partial<{ now: number; mtimeOf: (name: string) => number; isAlive: (pid: number) => boolean; maxAgeMs: number }> = {},
-): { removedByReturn: string[]; removedByCallback: string[] } {
+  opts: Partial<{
+    now: number;
+    isDir: (name: string) => boolean;
+    mtimeOf: (name: string) => number;
+    isAlive: (pid: number) => boolean;
+    maxAgeMs: number;
+    remove: (name: string, record: (name: string) => void) => void;
+  }> = {},
+): { removedByReturn: string[]; removedByCallback: string[]; failed: string[] } {
   const removedByCallback: string[] = [];
+  const failed: string[] = [];
   const removedByReturn = sweepStaleTestDirs({
-    tmp: "/tmp",
     entries,
     now: opts.now ?? NOW,
+    isDir: opts.isDir ?? (() => true),
     mtimeOf: opts.mtimeOf ?? (() => NOW - FIVE_MIN_MS),
     isAlive: opts.isAlive ?? (() => true),
     maxAgeMs: opts.maxAgeMs ?? MAX_AGE_MS,
-    remove: (name) => removedByCallback.push(name),
+    remove: (name) => (opts.remove ? opts.remove(name, (n) => removedByCallback.push(n)) : removedByCallback.push(name)),
+    onRemoveFailed: (name) => failed.push(name),
   });
-  return { removedByReturn, removedByCallback };
+  return { removedByReturn, removedByCallback, failed };
 }
 
 describe("sweepStaleTestDirs (#252)", () => {
@@ -61,15 +70,16 @@ describe("sweepStaleTestDirs (#252)", () => {
     const name = `${TEST_DATA_PREFIX}12345-abcdef`;
     const removedByCallback: string[] = [];
     const removedByReturn = sweepStaleTestDirs({
-      tmp: "/tmp",
       entries: [name],
       now: NOW,
+      isDir: () => true,
       mtimeOf: () => {
         throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
       },
       isAlive: () => true,
       maxAgeMs: MAX_AGE_MS,
       remove: (n) => removedByCallback.push(n),
+      onRemoveFailed: () => {},
     });
     expect(removedByReturn).toEqual([]);
     expect(removedByCallback).toEqual([]);
@@ -79,9 +89,9 @@ describe("sweepStaleTestDirs (#252)", () => {
     const name = `${TEST_DATA_PREFIX}12345-abcdef`;
     expect(() =>
       sweepStaleTestDirs({
-        tmp: "/tmp",
-        entries: [name],
+          entries: [name],
         now: NOW,
+        isDir: () => true,
         mtimeOf: () => {
           throw Object.assign(new Error("permission denied"), { code: "EACCES" });
         },
@@ -90,8 +100,64 @@ describe("sweepStaleTestDirs (#252)", () => {
         remove: () => {
           throw new Error("should not be reached");
         },
+        onRemoveFailed: () => {},
       }),
     ).toThrow("permission denied");
+  });
+
+  test("#461: an entry that is not a real directory (a file, a link) is never removed", () => {
+    const name = `${TEST_DATA_PREFIX}12345-abcdef`;
+    const { removedByReturn, removedByCallback } = sweep([name], { isDir: () => false, isAlive: () => false });
+    expect(removedByReturn).toEqual([]);
+    expect(removedByCallback).toEqual([]);
+  });
+
+  test("an entry a concurrent sweep already removed (isDir throws ENOENT) is skipped", () => {
+    const name = `${TEST_DATA_PREFIX}12345-abcdef`;
+    const { removedByReturn, removedByCallback } = sweep([name], {
+      isAlive: () => false,
+      isDir: () => {
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+    });
+    expect(removedByReturn).toEqual([]);
+    expect(removedByCallback).toEqual([]);
+  });
+
+  test("a non-ENOENT error from isDir propagates", () => {
+    const name = `${TEST_DATA_PREFIX}12345-abcdef`;
+    expect(() =>
+      sweep([name], {
+        isDir: () => {
+          throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+        },
+      }),
+    ).toThrow("permission denied");
+  });
+
+  test("a no-pid (pre-#252) name never reads its mtime", () => {
+    const name = `${TEST_DATA_PREFIX}legacy`;
+    const { removedByReturn } = sweep([name], {
+      mtimeOf: () => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      },
+    });
+    expect(removedByReturn).toEqual([name]);
+  });
+
+  test("#461: a remove that throws is reported, left out of the result, and the sweep goes on", () => {
+    const first = `${TEST_DATA_PREFIX}11-a`;
+    const second = `${TEST_DATA_PREFIX}22-b`;
+    const { removedByReturn, removedByCallback, failed } = sweep([first, second], {
+      isAlive: () => false,
+      remove: (name, record) => {
+        if (name === first) throw Object.assign(new Error("busy"), { code: "EBUSY" });
+        record(name);
+      },
+    });
+    expect(failed).toEqual([first]);
+    expect(removedByReturn).toEqual([second]);
+    expect(removedByCallback).toEqual([second]);
   });
 
   test("a mix: only the stale ones are removed, the live young one survives", () => {
@@ -104,6 +170,16 @@ describe("sweepStaleTestDirs (#252)", () => {
       mtimeOf: (name) => (name === old ? NOW - 2 * MAX_AGE_MS : NOW - FIVE_MIN_MS),
     });
     expect(removedByReturn.sort()).toEqual([dead, noPid, old].sort());
+  });
+});
+
+describe("formatSwept", () => {
+  test("three names: all of them, no suffix", () => {
+    expect(formatSwept(["a", "b", "c"])).toBe("[test/setup] swept 3 stale test dir(s): a, b, c");
+  });
+  test("eleven names: the count, the first ten, then ', ...'", () => {
+    const names = Array.from({ length: 11 }, (_, i) => `d${i}`);
+    expect(formatSwept(names)).toBe(`[test/setup] swept 11 stale test dir(s): ${names.slice(0, 10).join(", ")}, ...`);
   });
 });
 
@@ -132,11 +208,11 @@ describe("setup: this run's data dir embeds this process's pid (#252)", () => {
 
 describe("isPidAlive (#252)", () => {
   // The decision-2 probe, kept as a test: process.kill(pid, 0) must distinguish live from dead on
-  // this box, or the sweep's liveness check is worthless. Confirmed on Windows (Bun 1.3.14) before
+  // this box, or the sweep's liveness check is worthless. Confirmed on Windows (Bun 1.4.2) before
   // relying on it elsewhere in this PR.
   test("this process is alive, a pid that just exited is not", async () => {
     expect(isPidAlive(process.pid)).toBe(true);
-    const proc = Bun.spawn(["bun", "-e", ""], { stdout: "ignore", stderr: "ignore" });
+    const proc = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" });
     const pid = proc.pid;
     await proc.exited;
     expect(isPidAlive(pid)).toBe(false);
