@@ -6558,6 +6558,7 @@ describe("form help, error and required states (#300)", () => {
     children: Fake300El[];
     appendChild: (c: Fake300El) => Fake300El;
     setAttribute: (n: string, v: string) => void;
+    addEventListener: (type: string, fn: () => void) => void;
     querySelector?: (selector: string) => Fake300El | null;
   }
   function make300El(tag: string): Fake300El {
@@ -6565,6 +6566,7 @@ describe("form help, error and required states (#300)", () => {
       tagName: tag.toUpperCase(), id: "", className: "", textContent: "", dataset: {}, attrs: {}, children: [],
       appendChild: (c) => (el.children.push(c), c),
       setAttribute: (n, v) => { el.attrs[n] = v; },
+      addEventListener: () => {},
       querySelector: (sel) => { const id = sel.replace(/^#/, ""); return el.children.find((c) => c.id === id) ?? null; },
     };
     return el;
@@ -6677,6 +6679,150 @@ describe("form help, error and required states (#300)", () => {
     expect(findByClass(optSecret, "rb-label__required")).toBeUndefined();
     expect(findByTag(optSecret, "input")!.required).toBeFalsy();
   });
+
+  // R7 (#468-11): in replace mode the secret's label is a real <label for>, so the password input is named by it and
+  // not by its placeholder alone; the summary mode has no input and keeps the span.
+  test("R7: a secret field in replace mode is labelled by a <label for=secret-KEY>; its saved summary keeps the span", () => {
+    const h = fieldsHarness({ loadedSchema: {} });
+    const unset = h.buildSecretField("BAR_TOKEN", "Bar token", { isSet: false, required: false });
+    const label = findByClass(unset, "rb-label")!;
+    expect(label.tagName).toBe("LABEL");
+    expect(label.htmlFor).toBe("secret-BAR_TOKEN");
+    expect(findByTag(unset, "input")!.id).toBe("secret-BAR_TOKEN");
+    const saved = h.buildSecretField("BAR_TOKEN", "Bar token", { isSet: true, required: false });
+    const span = findByClass(saved, "rb-label")!;
+    expect(span.tagName).toBe("SPAN");
+    expect(span.htmlFor).toBeUndefined();
+    expect(findByTag(saved, "input")).toBeUndefined();
+  });
+
+  test("R7 source pins: both gate/admin inputs carry an aria-label", () => {
+    expect(applyIndexSrc).toMatch(/<input id="token-input"[^>]*aria-label="Admin token"/);
+    expect(applyIndexSrc).toMatch(/<input id="admin-email"[^>]*aria-label="New admin's email"/);
+  });
+});
+
+// R5 (#467-7): one way to read JSON, one way to describe a failed fetch.
+describe("READ_JSON (#467-7)", () => {
+  const { readJson, errorBodyText, describeFetchError } = new Function(
+    "document",
+    `"use strict";\n${applyBlock("READ_JSON")}\nreturn { readJson, errorBodyText, describeFetchError };`,
+  )({}) as {
+    readJson: (res: unknown) => Promise<unknown>;
+    errorBodyText: (text: string, status: number) => string;
+    describeFetchError: (e: unknown, ms: number) => string;
+  };
+  const fail = (status: number, body: string) => ({ ok: false, status, text: async () => body, json: async () => { throw new Error("Unexpected token"); } });
+
+  test("a non-ok read rejects with what the server said, never the JSON parser's 'Unexpected token'", async () => {
+    await expect(readJson(fail(504, "bot-ops.sh timed out"))).rejects.toThrow("bot-ops.sh timed out");
+  });
+  test("an empty body is just the status; an HTML page is named, not dumped", async () => {
+    await expect(readJson(fail(504, "  "))).rejects.toThrow("HTTP 504");
+    await expect(readJson(fail(502, "<html><body>Bad gateway</body></html>"))).rejects.toThrow("HTTP 502 (an HTML error page)");
+    expect(errorBodyText("<!DOCTYPE html>", 504)).toBe("HTTP 504 (an HTML error page)");
+  });
+  test("a long body is clipped to 300 characters", async () => {
+    const msg = errorBodyText("x".repeat(2000), 500);
+    expect(msg.length).toBe(300);
+    expect(msg.startsWith("xxx")).toBe(true);
+    expect(errorBodyText("y".repeat(300), 500)).toBe("y".repeat(300)); // exactly 300 is not clipped
+  });
+  test("an ok read returns the parsed body", async () => {
+    await expect(readJson({ ok: true, status: 200, json: async () => ({ a: 1 }) })).resolves.toEqual({ a: 1 });
+  });
+  test("describeFetchError: an abort names the wait; anything else is its message or string", () => {
+    expect(describeFetchError({ name: "AbortError", message: "The operation was aborted." }, 110000)).toBe("the server did not answer within 110 seconds");
+    expect(describeFetchError({ name: "AbortError" }, 30000)).toBe("the server did not answer within 30 seconds");
+    expect(describeFetchError(new Error("nope"), 30000)).toBe("nope");
+    expect(describeFetchError("plain", 30000)).toBe("plain");
+  });
+});
+
+// R6 (#468-9): the token gate explains itself. api() and showGate are sliced from the page (outside any lifted block).
+describe("the token gate (#468-9)", () => {
+  const apiSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("  // #468-9: true from the Unlock click"), applyIndexSrc.indexOf("  // TIMEOUT_SIGNAL:begin"));
+  const gateSrc = applyIndexSrc.slice(applyIndexSrc.indexOf("  // A non-empty `message` is shown in #gate-msg"), applyIndexSrc.indexOf("  function showApp()"));
+
+  function gateHarness(statuses: number[], locked = false) {
+    const el = () => ({ hidden: true, textContent: "" });
+    const els: Record<string, { hidden: boolean; textContent: string }> = { "gate-msg": el(), "gate-locked-note": el() };
+    const gate = { hidden: true };
+    const app = { hidden: false };
+    const document = { getElementById: (id: string) => els[id] ?? null };
+    const store = new Map<string, string>(locked ? [["admin-locked", "1"]] : []);
+    const sessionStorage = { getItem: (k: string) => store.get(k) ?? null };
+    let cleared = 0;
+    let i = 0;
+    const fetch = async () => ({ status: statuses[Math.min(i++, statuses.length - 1)], ok: true });
+    const fns = new Function(
+      "document", "gate", "app", "sessionStorage", "fetch", "getToken", "clearToken", "LOCKED_KEY",
+      `"use strict";\n${gateSrc}\n${apiSrc}\nreturn { api, showGate, clearGateMsg, setPending: (v) => { unlockPending = v; }, isPending: () => unlockPending };`,
+    )(document, gate, app, sessionStorage, fetch, () => "tok", () => void cleared++, "admin-locked") as {
+      api: (path: string) => Promise<unknown>;
+      showGate: (m?: string) => void;
+      clearGateMsg: () => void;
+      setPending: (v: boolean) => void;
+      isPending: () => boolean;
+    };
+    return { ...fns, els, gate, app, cleared: () => cleared };
+  }
+  const NOT_ACCEPTED = "That token was not accepted. Check it and try again.";
+
+  test("R6: a burst of THREE concurrent 401s after Unlock leaves the not-accepted message shown (the second 401 must not erase the first)", async () => {
+    const h = gateHarness([401, 401, 401]);
+    h.setPending(true);
+    const results = await Promise.allSettled([h.api("/a"), h.api("/b"), h.api("/c")]);
+    expect(results.every((r) => r.status === "rejected")).toBe(true);
+    expect(h.els["gate-msg"]!.textContent).toBe(NOT_ACCEPTED);
+    expect(h.els["gate-msg"]!.hidden).toBe(false);
+    expect(h.gate.hidden).toBe(false);
+    expect(h.app.hidden).toBe(true);
+    expect(h.isPending()).toBe(true); // a 401 does not clear the flag: every 401 of the burst passes the same message
+  });
+
+  test("R6: an ok answer clears the pending flag; a later 401 then passes no message and leaves #gate-msg as it was", async () => {
+    const h = gateHarness([200, 401]);
+    h.setPending(true);
+    await h.api("/ok");
+    expect(h.isPending()).toBe(false);
+    h.els["gate-msg"]!.textContent = "kept";
+    h.els["gate-msg"]!.hidden = false;
+    await expect(h.api("/rotated")).rejects.toThrow("unauthorized");
+    expect(h.els["gate-msg"]!.textContent).toBe("kept"); // an empty message never erases
+    expect(h.els["gate-msg"]!.hidden).toBe(false);
+  });
+
+  test("R6: with no Unlock pending a 401 shows the gate but no message; clearGateMsg hides and empties it", async () => {
+    const h = gateHarness([401]);
+    await expect(h.api("/x")).rejects.toThrow("unauthorized");
+    expect(h.gate.hidden).toBe(false);
+    expect(h.els["gate-msg"]!.hidden).toBe(true);
+    h.showGate(NOT_ACCEPTED);
+    h.clearGateMsg();
+    expect(h.els["gate-msg"]!).toEqual({ hidden: true, textContent: "" });
+  });
+
+  test("R6: #gate-locked-note is shown exactly when LOCKED_KEY is set", () => {
+    const locked = gateHarness([200], true);
+    locked.showGate();
+    expect(locked.els["gate-locked-note"]!.hidden).toBe(false);
+    const open = gateHarness([200], false);
+    open.showGate();
+    expect(open.els["gate-locked-note"]!.hidden).toBe(true);
+  });
+
+  test("R6 source pins: Lock reloads the page (nothing rendered survives it); there is no one-click Access button on the gate", () => {
+    const lockClick = applyIndexSrc.slice(applyIndexSrc.indexOf('document.getElementById("lock").addEventListener("click"'));
+    const lockBody = lockClick.slice(0, lockClick.indexOf("});"));
+    expect(lockBody).toContain("location.reload()");
+    expect(lockBody).not.toContain("showGate");
+    expect(applyIndexSrc).not.toContain("gate-access");
+    expect(applyIndexSrc).toContain('id="gate-locked-note"');
+    // Unlock marks itself pending and clears the old message before showApp fires its burst of calls
+    const unlock = applyIndexSrc.slice(applyIndexSrc.indexOf('document.getElementById("unlock").addEventListener("click"'));
+    expect(unlock.slice(0, unlock.indexOf("});"))).toMatch(/unlockPending = true;\s*clearGateMsg\(\);\s*showApp\(\)/);
+  });
 });
 
 // #300 (std-lib #211): showToast, tested against the real TOAST:begin/:end block via the same
@@ -6684,13 +6830,13 @@ describe("form help, error and required states (#300)", () => {
 describe("showToast (#300, mini-harness)", () => {
   const toastSrc = applyBlock("TOAST");
 
-  test("toastRole: danger and warning are alert, success and info are status", () => {
+  test("toastRole: danger and warning are alert; success and info carry no role of their own (the polite region announces them, #468-11)", () => {
     const fn = new Function(`"use strict";\n${toastSrc}\nreturn { toastRole };`);
     const { toastRole } = fn() as { toastRole: (kind: string) => string };
     expect(toastRole("danger")).toBe("alert");
     expect(toastRole("warning")).toBe("alert");
-    expect(toastRole("success")).toBe("status");
-    expect(toastRole("info")).toBe("status");
+    expect(toastRole("success")).toBe("");
+    expect(toastRole("info")).toBe("");
   });
 
   interface FakeToastEl {
@@ -6760,7 +6906,7 @@ describe("showToast (#300, mini-harness)", () => {
     expect(toasts.length).toBe(1);
     const toast = toasts[0]!;
     expect(toast.className).toBe("rb-toast rb-toast--success");
-    expect(toast.attrs.role).toBe("status");
+    expect(toast.attrs.role).toBeUndefined(); // #468-11: no nested role="status" inside the polite live region
     expect(toast.attrs["data-rb-enter"]).toBe("");
     expect(toast.children.some((c) => c.textContent === "Saved.")).toBe(true);
     const closeBtn = toast.children.find((c) => c.className === "rb-toast__close");
@@ -6771,6 +6917,36 @@ describe("showToast (#300, mini-harness)", () => {
     expect(h.app.children.some((c) => c.className === "rb-toast-region")).toBe(true);
     h.flushRaf();
     expect(toast.attrs["data-rb-enter"]).toBeUndefined();
+  });
+
+  // R7 (#468-11): the live region exists, empty, BEFORE the first toast, and is polite.
+  test("R7: ensureToastRegion twice makes ONE empty polite region and ONE Escape listener; the first toast then lands in it", () => {
+    const src = toastSrc;
+    const app = makeToastEl("main");
+    const docListeners: Record<string, ((e: unknown) => void)[]> = {};
+    const document = {
+      createElement: (tag: string) => makeToastEl(tag),
+      getElementById: (id: string) => (id === "app" ? app : null),
+      addEventListener: (type: string, f: (e: unknown) => void) => { (docListeners[type] ??= []).push(f); },
+    };
+    const run = new Function(
+      "document", "requestAnimationFrame", "setTimeout", "clearTimeout",
+      `"use strict";
+${src}
+return { ensureToastRegion, showToast, getRegion: () => toastRegion };`,
+    )(document, () => 1, () => 1, () => {}) as { ensureToastRegion: () => void; showToast: (k: string, t: string) => void; getRegion: () => FakeToastEl | null };
+    run.ensureToastRegion();
+    run.ensureToastRegion();
+    const regions = app.children.filter((c) => c.className === "rb-toast-region");
+    expect(regions.length).toBe(1);
+    expect(regions[0]!.attrs["aria-live"]).toBe("polite");
+    expect(regions[0]!.children.length).toBe(0); // empty: nothing is announced by creating it
+    expect(docListeners.keydown?.length).toBe(1);
+    run.showToast("info", "hello");
+    expect(app.children.filter((c) => c.className === "rb-toast-region").length).toBe(1); // showToast reuses it
+    expect(regions[0]!.children.length).toBe(1);
+    expect(docListeners.keydown?.length).toBe(1);
+    expect(regions[0]!.children[0]!.attrs.role).toBeUndefined(); // the region announces it; no nested role
   });
 
   test("danger/warning toasts carry role=alert; a danger/warning kind never sets an auto-dismiss timer", () => {
@@ -7445,6 +7621,7 @@ describe("page skeleton", () => {
       "APPLY_PLAN", "APPLY_VIEW", "APPLY", "TAG_SYNC",
       "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_EDITS", "PLUGIN_ROUTING", "SERVERS_TAB",
       "TOAST", // #300
+      "READ_JSON", // #467 item 7
       "CONTROL_SNAPSHOT", "DESCRIBED_BY", "APPLY_INVALID_CARRY", // lifted by name elsewhere in this file (#514 item 4)
     ];
     expect(new Set(names).size).toBe(names.length);
@@ -7663,13 +7840,22 @@ const { applyBarView, describeApplyFailure, failureWroteNothing } = new Function
 // compilePattern, from ENV_SCHEMA, already lifted above for planApply).
 interface DiffCaptured { on: Record<string, boolean>; settings: Record<string, string>; secrets: Record<string, string> }
 interface Snapshot { cards: DiffCaptured; env: Record<string, string> }
-const { diffEdits, diffSnapshots, validateSecretChanges } = new Function(
-  `"use strict";\n${applyBlock("ENV_SCHEMA")}\n${applyBlock("PLUGIN_EDITS")}\nreturn { diffEdits, diffSnapshots, validateSecretChanges };`,
+const { diffEdits, diffEnvEdits, diffSnapshots, validateSecretChanges } = new Function(
+  `"use strict";\n${applyBlock("ENV_SCHEMA")}\n${applyBlock("PLUGIN_EDITS")}\nreturn { diffEdits, diffEnvEdits, diffSnapshots, validateSecretChanges };`,
 )() as {
+  diffEnvEdits: (baselineEnv: Record<string, string>, controls: Record<string, string>) => Record<string, string>;
   diffEdits: (baseline: { plugins: { name: string; enabled?: boolean }[]; env: Record<string, string> }, controls: DiffCaptured) => DiffCaptured;
   diffSnapshots: (before: Snapshot, after: Snapshot, edits: Map<string, string | boolean>) => { cards: DiffCaptured; env: Record<string, string> };
   validateSecretChanges: (schema: Record<string, unknown>, changes: ApplyChange[], labelOf: (key: string) => string) => { key: string; message: string } | null;
 };
+
+describe("diffEnvEdits (#467-4)", () => {
+  test("R2: every key whose control differs from the baseline (an absent baseline key reads as empty); equal and empty-vs-absent are not edits", () => {
+    expect(diffEnvEdits({ A: "1", B: "" }, { A: "2", B: "", C: "x" })).toEqual({ A: "2", C: "x" });
+    expect(diffEnvEdits({}, { A: "", B: "v" })).toEqual({ B: "v" });
+    expect(diffEnvEdits({ A: "1" }, {})).toEqual({});
+  });
+});
 
 describe("planApply (#257)", () => {
   const W = { checkedNames: ["warbandeer", "raidhelper"], currentValue: "warbandeer", manifestOrder: ["warbandeer", "raidhelper"] };
@@ -7897,6 +8083,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     holds?: Partial<Record<"/api/plugins" | "/api/env" | "/api/env-schema", Promise<void>>>;
     /** Round 2: the first refreshApplyBar() throws (reloadConfig's finally then rejects that reload). */
     refreshThrowsOnce?: boolean;
+    /** #467-3: renderServers() throws. */
+    renderServersThrows?: boolean;
   }
   function harness(
     oldEnv: Record<string, string>,
@@ -7920,6 +8108,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     const apiCalls: string[] = [];
     const plugsListEl = errEl();
     const envFieldsEl = errEl();
+    const serversListEl = errEl();
+    const attentionListEl = errEl();
     const document = {
       querySelectorAll: (selector: string) => {
         if (selector === "#plugins-list input[type=checkbox][data-plugin]") return boxEls;
@@ -7928,7 +8118,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
         if (selector === "#env-fields [data-key]") return configEls;
         throw new Error("unexpected selector " + selector);
       },
-      getElementById: (id: string) => (id === "plugins-list" ? plugsListEl : id === "env-fields" ? envFieldsEl : null),
+      getElementById: (id: string) =>
+        id === "plugins-list" ? plugsListEl : id === "env-fields" ? envFieldsEl : id === "servers-list" ? serversListEl : id === "attention-list" ? attentionListEl : null,
     };
     const api = async (path: string, opts?: { signal?: AbortSignal }) => {
       apiCalls.push(path);
@@ -7942,8 +8133,8 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
           void hold.then(resolve);
         });
       }
-      if (path === "/api/plugins") return { json: async () => ({ plugins: freshPlugins }) };
-      if (path === "/api/env") return { json: async () => freshEnv };
+      if (path === "/api/plugins") return { ok: true, json: async () => ({ plugins: freshPlugins }) };
+      if (path === "/api/env") return { ok: true, json: async () => freshEnv };
       return { ok: true, json: async () => ({}) };
     };
     // #282: the page's timeoutSignal, injected: the test fires the timeout itself (no real 30 s wait).
@@ -7980,11 +8171,14 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     // the Servers tab from loadRouting's own tail left it drawn against a still-null pluginsData
     // whenever reloadConfig's fetch was the slower of the two) needs this call pinned here, since no
     // OTHER test in this file drives reloadConfig with a populated pluginsData/routingData pair.
-    const renderServers = () => { calls.renderServers++; };
+    const renderServers = () => {
+      calls.renderServers++;
+      if (extra.renderServersThrows) throw new Error("servers render failed");
+    };
     const renderNeedsAttention = () => { calls.renderNeedsAttention++; };
     const { reloadConfig, setRereading, noteControlEdited } = new Function(
       "document", "api", "loadBranches", "renderPlugins", "renderEnvFields", "refreshApplyBar", "pluginsData", "loadedEnv", "loadedSchema", "renderServers", "renderNeedsAttention", "timeoutSignal",
-      `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${src}\n` +
+      `"use strict";\nlet applyRereading = false;\n${applyBlock("PLUGIN_EDITS")}\n${applyBlock("READ_JSON")}\n${src}\n` +
         "return { reloadConfig, setRereading: (v) => { applyRereading = v; }, noteControlEdited };",
     )(document, api, loadBranches, renderPlugins, renderEnvFields, refreshApplyBar, { plugins: oldPlugins }, oldEnv, {}, renderServers, renderNeedsAttention, timeoutSignal) as {
       reloadConfig: (opts?: { keepEdits?: boolean }) => Promise<void>;
@@ -7999,7 +8193,7 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     };
     return {
       reloadConfig, setRereading, type, settingEls: () => settingEls, boxEls: () => boxEls, configEls: () => configEls,
-      calls, plugsListEl, envFieldsEl, timer, apiCalls, overridesSeen,
+      calls, plugsListEl, envFieldsEl, serversListEl, timer, apiCalls, overridesSeen,
     };
   }
 
@@ -8035,6 +8229,36 @@ describe("reloadConfig keepEdits (#244, plan patch item 5: one test, two runs, s
     await dropped.reloadConfig();
     expect(dropped.plugsListEl.textContent).toBe("");
     expect(dropped.envFieldsEl.textContent).toBe("");
+  });
+
+  test("R2 (#467-4): a keep-edits reload renders an edited Config field with the typed value; a Discard-like re-read drops it", async () => {
+    const kept = harness({ K: "old" }, [], { K: "old" }, [], { configKeys: ["K"] });
+    kept.type(kept.configEls()[0]!, "typed"); // edited BEFORE the reload is asked for: not "typed between the two reads"
+    await kept.reloadConfig();
+    expect(kept.overridesSeen[0]).toEqual({ K: "typed" });
+    expect(kept.configEls()[0]!.value).toBe("typed");
+
+    const dropped = harness({ K: "old" }, [], { K: "old" }, [], { configKeys: ["K"] });
+    dropped.type(dropped.configEls()[0]!, "typed");
+    dropped.setRereading(true); // a Discard's re-read
+    await dropped.reloadConfig();
+    expect(dropped.overridesSeen[0]).toEqual({});
+    expect(dropped.configEls()[0]!.value).toBe("old");
+  });
+
+  test("R1 (#467-3): a throwing Servers render stays on its own panel; the plugin cards and the Config editor are not blanked", async () => {
+    const h = harness({ A: "1" }, [], { A: "2" }, [], { renderServersThrows: true });
+    const real = console.error;
+    console.error = () => {};
+    try {
+      await h.reloadConfig();
+    } finally {
+      console.error = real;
+    }
+    expect(h.plugsListEl.textContent).toBe("");
+    expect(h.envFieldsEl.textContent).toBe("");
+    expect(h.serversListEl.textContent).toBe("Couldn't draw this panel: servers render failed");
+    expect(h.calls.renderNeedsAttention).toBe(1); // the next render still ran
   });
 
   test("a call while one is already in flight joins it (one fetch, one render), never doubling up", async () => {
@@ -8563,6 +8787,10 @@ function runApply(spec: ApplySpec) {
     cancels: 0,
     timeouts: [] as number[],
     selectors: [] as string[],
+    /** #467-6: the order of the page's renders and control lookups: "renderPlugins", "reapply", "get:<control id>". */
+    order: [] as string[],
+    /** #467-6: what forceOpenCard handed reapplyCardEdits (the non-real mode's stub). */
+    reapplied: [] as unknown[],
   };
   const state: { active: StubEl | null } = { active: null };
   let barEl: StubEl | null = null; // set once the bar exists, below
@@ -8677,6 +8905,7 @@ function runApply(spec: ApplySpec) {
     getElementById: (id: string): StubEl => {
       const el = byId.get(id);
       if (!el) throw new Error(`harness: the page asked for an element it was not given: #${id}`);
+      if (/^(env|set|secret)-/.test(id)) log.order.push("get:" + id);
       return el;
     },
     querySelectorAll: (selector: string): StubEl[] => {
@@ -8775,6 +9004,7 @@ function runApply(spec: ApplySpec) {
     }
   };
   const renderPlugins = () => {
+    log.order.push("renderPlugins");
     for (const b of boxes) {
       rebuilt(b);
       b.checked = serverTicked().includes(b.dataset.plugin!);
@@ -8796,22 +9026,30 @@ function runApply(spec: ApplySpec) {
   // now also head/body/chev, for refuseApply's card-opening) before calling
   // refreshApplyBar()/discardPending()/applyPending(). openCards is returned for the same reason --
   // round-1's refuseApply fix adds the owning card's name to it, mirroring what a real toggle-click does.
-  const blocks = ["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY"];
+  const blocks = ["ENV_SCHEMA", "PLUGINS_SAVE_PLAN", "ENV_SAVE_PLAN", "APPLY_PLAN", "PLUGIN_SETTING_LABEL", "PLUGIN_CARD_STATE", "PLUGIN_BADGE_CLASSES", "PLUGIN_EDITS", "APPLY_VIEW", "APPLY", "READ_JSON"];
+  // #467-5: secretsReplacing is declared outside every lifted block on the page; applyPending's success path now
+  // deletes from it, so without this prelude every 200 secret apply would throw inside applyPending's try (the
+  // catch hides it). Exposed in the return so a test can seed it and read it back.
+  const SECRETS_REPLACING = "let secretsReplacing = new Set();";
   const run = (real
     ? new Function(
         "document", "confirm", "api", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
         "loadBranches", "renderPlugins", "renderEnvFields", "renderServers", "renderNeedsAttention",
         // The reloadConfig slice (with the aliases and CONTROL_SNAPSHOT inside it), exactly as the reloadConfig
         // harness lifts it.
-        `"use strict";\n${blocks.map(applyBlock).join("\n")}\n${applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"))}\n` +
-          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards, loadPlugins, loadEnv };",
+        `"use strict";\n${SECRETS_REPLACING}\n${blocks.map(applyBlock).join("\n")}\n${applyIndexSrc.slice(applyIndexSrc.indexOf("let reloadConfigPromise = null;"), applyIndexSrc.indexOf("// ---- #124: per-plugin admin tabs"))}\n` +
+          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards, loadPlugins, loadEnv, secretsReplacing };",
       )(document, confirm, api, loadStatus, showTab, { ...spec.loadedEnv }, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal,
         async () => {}, renderPlugins, renderEnvFields, () => {}, () => {})
     : new Function(
         "document", "confirm", "api", "loadEnv", "loadPlugins", "loadStatus", "showTab", "loadedEnv", "loadedSchema", "pluginsData", "MUTATION_TIMEOUT_MS", "timeoutSignal",
-        `"use strict";\n${[...blocks.slice(0, 8), "CONTROL_SNAPSHOT", ...blocks.slice(8)].map(applyBlock).join("\n")}\n` +
-          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards };",
-      )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal)) as {
+        // #467-6: forceOpenCard (inside APPLY) renders and reapplies: recording stubs, in the order they are called.
+        "renderPlugins", "reapplyCardEdits",
+        `"use strict";\n${SECRETS_REPLACING}\n${[...blocks.slice(0, 8), "CONTROL_SNAPSHOT", ...blocks.slice(8)].map(applyBlock).join("\n")}\n` +
+          "return { applyPending, discardPending, refreshApplyBar, onControlEdited, dismissApplyResult, collectPending, cardHeaderEls, openCards, secretsReplacing };",
+      )(document, confirm, api, loadEnv, loadPlugins, loadStatus, showTab, spec.loadedEnv, spec.schema ?? APPLY_SCHEMA, pluginsData, 110000, timeoutSignal,
+        () => void log.order.push("renderPlugins"),
+        (captured: unknown) => { log.order.push("reapply"); log.reapplied.push(captured); })) as {
     loadPlugins?: (opts?: unknown) => Promise<void>;
     loadEnv?: (opts?: unknown) => Promise<void>;
     applyPending: () => Promise<void>;
@@ -8822,6 +9060,7 @@ function runApply(spec: ApplySpec) {
     collectPending: () => ApplyPlanInput;
     cardHeaderEls: Map<string, { badge: StubEl; summary: StubEl; head?: StubEl; body?: StubEl; chev?: StubEl }>;
     openCards: Set<string>;
+    secretsReplacing: Set<string>;
   };
   refreshAfterLoad = () => run.refreshApplyBar();
 
@@ -9182,7 +9421,7 @@ describe("applyPending (#257)", () => {
     const aborted = Object.assign(new Error("The operation was aborted."), { name: "AbortError" });
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, WATCHED_REPOS: "eu" }, response: aborted });
     await page.run.applyPending();
-    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: The operation was aborted.", ok: true });
+    expect(page.view()).toMatchObject({ tone: "danger", title: "Couldn't apply: the server did not answer within 110 seconds", ok: true }); // #467-7: not the raw abort text
     expect(page.log.cancels).toBe(1);
   });
 
@@ -9469,53 +9708,96 @@ describe("applyPending with a card (#244)", () => {
     expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]);
   });
 
+  // R3 (#467-5): a successful apply ends replace mode for the secrets it saved, so the card re-renders on "Saved on
+  // the server" instead of an empty password box. A refusal that wrote nothing keeps replace mode (the operator
+  // corrects and retries); a failure that DID write (the #47 recreate failure) ends it too.
+  describe("R3: replace mode after an apply (#467-5)", () => {
+    const secretSchema = { ...APPLY_SCHEMA, SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: true } };
+    const run = async (response: { ok: boolean; text: string; status?: number } | undefined) => {
+      const page = runApply({ loadedEnv: APPLY_ENV, secrets: { SPOTIFY_CLIENT_SECRET: "abcdefghij0123" }, schema: secretSchema, response });
+      page.run.secretsReplacing.add("SPOTIFY_CLIENT_SECRET");
+      page.run.secretsReplacing.add("OTHER_SECRET_NOT_IN_THIS_APPLY");
+      await page.run.applyPending();
+      return page;
+    };
+
+    test("a 200 apply ends replace mode for the secret it saved, and only for that one", async () => {
+      const page = await run(undefined);
+      expect(page.log.posts).toHaveLength(1);
+      expect([...page.run.secretsReplacing]).toEqual(["OTHER_SECRET_NOT_IN_THIS_APPLY"]);
+    });
+
+    test("a refusal that wrote nothing (502, env-set's own line) keeps replace mode", async () => {
+      const page = await run({ ok: false, status: 502, text: "bot-ops: env-set: SPOTIFY_CLIENT_SECRET is not allowed" });
+      expect(page.view()).toMatchObject({ tone: "danger" });
+      expect(page.run.secretsReplacing.has("SPOTIFY_CLIENT_SECRET")).toBe(true);
+    });
+
+    test("a failure that DID write (502 + JSON, the #47 path) ends replace mode: the value is stored", async () => {
+      const page = await run({ ok: false, status: 502, text: JSON.stringify({ ok: false, changed: ["SPOTIFY_CLIENT_SECRET"], log: "recreate failed" }) });
+      expect(page.view()).toMatchObject({ tone: "danger" });
+      expect(page.run.secretsReplacing.has("SPOTIFY_CLIENT_SECRET")).toBe(false);
+    });
+  });
+
   // Round-1 review finding: buildSettingsStep builds a card's fields whether or not the card is open, but
   // buildPluginCard still hides the whole .plug__body ([hidden] is display:none) when it's closed -- so a
   // refusal that marks and focuses a field on a CLOSED card was silently inert (invisible, unfocusable).
-  // The fix opens the owning card directly (cardHeaderEls' stored head/body/chev refs), which the harness
-  // proves by seeding cardHeaderEls itself -- buildPluginCard (browser-only) is never called here.
-  test("a refusal on a plugin-owned key opens its CLOSED card, so the marked/focused field is not left hidden (round-1 finding)", async () => {
-    const miniEl = (id: string): StubEl =>
-      ({
-        id, hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
-        classes: new Set(), attrs: new Map(), classList: { toggle: () => false },
-        setAttribute(name: string, value: string) { this.attrs.set(name, value); },
-        removeAttribute() {}, getAttribute() { return null; }, focus() {}, contains: () => false, closest: () => null,
-      }) as StubEl;
-    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
-    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
-    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
-    const head = miniEl("plug-head-music");
+  // #467-6: the card is opened through forceOpenCard -- the header toggle's own capture / render / reapply
+  // sequence -- so its admin bundle mounts (it mounts only from a render where the card was open). The
+  // harness seeds cardHeaderEls itself (buildPluginCard, browser-only, is never called here) and records the
+  // order of the page's renders and control lookups.
+  const miniEl = (id: string): StubEl =>
+    ({
+      id, hidden: false, disabled: false, textContent: "", value: "", checked: false, dataset: {},
+      classes: new Set(), attrs: new Map(), classList: { toggle: () => false },
+      setAttribute(name: string, value: string) { this.attrs.set(name, value); },
+      removeAttribute() {}, getAttribute() { return null; }, focus() {}, contains: () => false, closest: () => null,
+    }) as StubEl;
+  const musicPlugins = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
+  const spotifySchema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
+
+  test("a refusal on a plugin-owned key force-opens its CLOSED card by a re-render BEFORE the control lookup, and keeps the typing (R4, #467-6)", async () => {
+    const page = runApply({ loadedEnv: {}, pluginsData: musicPlugins, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema: spotifySchema });
     const body = miniEl("plug-body-music");
-    const chev = miniEl("chev-music");
     body.hidden = true; // the card starts closed, as it would after a page load with nothing expanded
-    page.run.cardHeaderEls.set("music", { badge: miniEl("b"), summary: miniEl("s"), head, body, chev });
+    page.run.cardHeaderEls.set("music", { badge: miniEl("b"), summary: miniEl("s"), head: miniEl("plug-head-music"), body, chev: miniEl("chev-music") });
     await page.run.applyPending();
     expect(page.log.posts).toEqual([]); // still refused: this is only about the card becoming reachable
-    expect(body.hidden).toBe(false);
-    expect(head.attrs.get("aria-expanded")).toBe("true");
-    expect(chev.attrs.get("class")).toBe("plug__chev plug__chev--open");
     expect(page.run.openCards.has("music")).toBe(true);
+    // the render (and the reapply of what was typed on the cards) happen BEFORE the id is looked up and focused
+    expect(page.log.order.slice(0, 3)).toEqual(["renderPlugins", "reapply", "get:secret-SPOTIFY_CLIENT_SECRET"]);
+    // the typed (and refused) secret rides through the re-render via the reapply stub's argument
+    expect(page.log.reapplied[0]).toMatchObject({ secrets: { SPOTIFY_CLIENT_SECRET: "short!!" } });
     expect(page.log.focused).toEqual(["secret-SPOTIFY_CLIENT_SECRET"]); // the now-visible field still gets focus
   });
 
-  test("a refusal on a card that is ALREADY open never touches cardHeaderEls (no redundant DOM writes)", async () => {
-    let bodyHiddenWrites = 0;
-    const pluginsData = { plugins: [{ name: "music", env: [{ key: "SPOTIFY_CLIENT_SECRET" }] }], pluginsValue: "music" };
-    const schema = { SPOTIFY_CLIENT_SECRET: { pattern: "^[A-Za-z0-9]{10,}$", required: false, source: "plugin", secret: true, isSet: false } };
-    const page = runApply({ loadedEnv: {}, pluginsData, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema });
-    const headAttrs = new Map<string, string>();
-    const head = { id: "plug-head-music", attrs: headAttrs, setAttribute: (name: string, value: string) => void headAttrs.set(name, value) } as unknown as StubEl;
-    const body = {
-      id: "plug-body-music",
-      get hidden() { return false; },
-      set hidden(_v: boolean) { bodyHiddenWrites++; },
-    } as unknown as StubEl;
-    page.run.cardHeaderEls.set("music", { badge: {} as StubEl, summary: {} as StubEl, head, body });
+  test("a refusal on a card that is ALREADY open does not re-render anything (forceOpenCard is a no-op)", async () => {
+    const page = runApply({ loadedEnv: {}, pluginsData: musicPlugins, checked: ["music"], secrets: { SPOTIFY_CLIENT_SECRET: "short!!" }, schema: spotifySchema });
+    page.run.cardHeaderEls.set("music", { badge: miniEl("b"), summary: miniEl("s"), head: miniEl("plug-head-music"), body: miniEl("plug-body-music") });
     await page.run.applyPending();
-    expect(bodyHiddenWrites).toBe(0);
-    expect(head.attrs.size).toBe(0);
+    expect(page.log.order).not.toContain("renderPlugins");
     expect(page.run.openCards.has("music")).toBe(false);
+  });
+
+  test("openPluginCard on an unknown name adds nothing to openCards and renders nothing; a known one opens it, then focuses the REBUILT header (R4)", () => {
+    const text = applyIndexSrc.slice(applyIndexSrc.indexOf("function openPluginCard(name) {"), applyIndexSrc.indexOf("// Step 2, present whenever there is something to show"));
+    const calls: string[] = [];
+    const focused: string[] = [];
+    const cardHeaderEls = new Map<string, unknown>([["music", {}]]);
+    const document = { getElementById: (id: string) => ({ focus: () => void focused.push(id) }) };
+    const openPluginCard = new Function(
+      "cardHeaderEls", "forceOpenCard", "document",
+      `"use strict";
+${text}
+return openPluginCard;`,
+    )(cardHeaderEls, (name: string) => void calls.push("open:" + name), document) as (name: string) => void;
+    openPluginCard("nope");
+    expect(calls).toEqual([]);
+    expect(focused).toEqual([]);
+    openPluginCard("music");
+    expect(calls).toEqual(["open:music"]);
+    expect(focused).toEqual(["plug-head-music"]);
   });
 
   test("after a refusal that wrote nothing (#272) nothing is re-rendered and the typed secret is still in its field", async () => {
@@ -10165,24 +10447,26 @@ describe("the Apply bar over the real reloadConfig (#282, #284)", () => {
     });
   }
 
-  // Round 2: a reload that keeps edits (a plugin action button, Unlock) landing DURING the POST renders the old stored
-  // values over the controls; that is a render, not typing, so the re-read after the POST must not keep it -- it used
-  // to, leaving a successful Apply offering the old value back as a pending change.
-  test("#284 round 2: a reload landing during the Apply POST does not make the re-read keep the old value it rendered", async () => {
+  // Round 2 (rewritten for #467-4): a reload that keeps edits (a plugin action button, Unlock) landing DURING the
+  // POST used to render the OLD stored values over the Config fields, so the re-read after the POST had nothing
+  // typed to keep. A keeping reload now keeps every Config edit, as it always kept the cards': the controls hold
+  // what the user typed through the reload, the value typed during the POST is still typing to the re-read that
+  // follows, and what the POST sent is the new baseline (not offered back).
+  test("#467-4 (was #284 round 2): a keeping reload landing during the Apply POST keeps the Config edits, and the re-read keeps what was typed during the POST", async () => {
     let releasePost!: () => void;
     const hold = new Promise<void>((resolve) => (releasePost = resolve));
     const page = runApply({ loadedEnv: APPLY_ENV, fields: edited, hold, realReload: { envAfterPost: { ...edited, REPORT_ROLE_ID: "stormrage" } } });
     const applying = page.run.applyPending();
     await nextTask();
-    typed(page, "REPORT_ROLE_ID", "typed-then-overwritten"); // typed during the POST ...
-    await page.run.loadPlugins!(); // ... then a keeping reload lands, rendering the old stored values over both fields
-    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "us", REPORT_ROLE_ID: "stormrage" });
+    typed(page, "REPORT_ROLE_ID", "typed-during-post"); // typed during the POST ...
+    await page.run.loadPlugins!(); // ... then a keeping reload lands: the edits survive it (they differ from the old baseline)
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "eu", REPORT_ROLE_ID: "typed-during-post" });
     releasePost();
     await applying;
-    // the posted value is what shows, and nothing is offered back
-    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "eu", REPORT_ROLE_ID: "stormrage" });
+    // what the POST sent is the baseline now; what was typed while it was in flight is kept, and offered as a change
+    expect(page.run.collectPending().fields).toMatchObject({ WATCHED_REPOS: "eu", REPORT_ROLE_ID: "typed-during-post" });
     page.run.dismissApplyResult();
-    expect(page.view().hidden).toBe(true);
+    expect(page.view()).toMatchObject({ hidden: false, title: "1 change needs a restart" });
   });
 
   test("#284 round 1: the field being typed in during a re-read keeps focus once the re-read rebuilds it", async () => {
@@ -11003,6 +11287,53 @@ describe("SERVERS_TAB (#246): pure parts", () => {
     });
   });
 
+  // R1 (#467-3): bad discovery / routing data must not throw out of any of these renders -- a throw in the Servers or
+  // Needs-attention render used to reach startReload's catch and blank the plugin cards and the Config editor.
+  test("R1: serverCardModel tolerates a guild without a channel list and a non-array `commands`: no throw, names fall back to ids", () => {
+    const bare = { id: HOME, name: "Home" }; // no `channels`, no `commands`
+    const m = fns.serverCardModel(bare, routingData, pluginsData);
+    const music = m.plugins.find((p) => p.name === "music")!;
+    expect(music.scope).toEqual([SP_CH]); // the id, with no channel list to name it
+    expect(music.postsTo).toBe(AN_CH);
+    expect(m.webhooks.map((w) => w.channelName)).toEqual([null, null]); // AN_CH and GEN_CH in HOME, unnamed
+    // a corrupt `commands` (only a hand edit makes one) reads as "all"
+    const corrupt = { routing: { ...routing, plugins: { music: { servers: { [HOME]: { commands: {} } } } } }, discovery };
+    expect(fns.serverCardModel(discovery.guilds[0], corrupt, pluginsData).plugins.find((p) => p.name === "music")!.scope).toBe("all");
+    expect(() => fns.serverCardModel(discovery.guilds[0], { routing: { ...routing, plugins: { music: { servers: { [HOME]: {} } } } }, discovery }, pluginsData)).not.toThrow();
+  });
+
+  test("R1: pickerOptions and needsAttention tolerate a guild without a channel list", () => {
+    expect(() => fns.pickerOptions("channel", { guilds: [{ id: "1", name: "g" }] }, "")).not.toThrow();
+    expect(fns.pickerOptions("channel", { guilds: [{ id: "1", name: "g" }] }, "")).toEqual([{ value: "", label: "— default —" }]);
+    const channelless = { ...discovery, guilds: [{ id: HOME, name: "Home" }] };
+    const items = fns.needsAttention({
+      status: statusClean, plugins: [], routingData: { routing, discovery: channelless }, env: {}, schema: {}, labelOf: (k: string) => k,
+    });
+    // the broken GEN_CH webhook in HOME still gets its item, naming the channel by id
+    expect(items.find((i) => i.kind === "webhook-broken" && i.text.includes(GEN_CH))).toBeTruthy();
+  });
+
+  test("R1: renderOwnPanel keeps a render's error on that panel and lets nothing propagate", () => {
+    const panel = { textContent: "" };
+    const logged: unknown[][] = [];
+    const real = console.error;
+    console.error = (...a: unknown[]) => void logged.push(a);
+    try {
+      const { renderOwnPanel } = new Function("document", `"use strict";\n${applyBlock("READ_JSON")}\nreturn { renderOwnPanel };`)({
+        getElementById: (id: string) => (id === "servers-list" ? panel : null),
+      }) as { renderOwnPanel: (fn: () => void, id: string) => void };
+      renderOwnPanel(() => { throw new Error("boom"); }, "servers-list");
+      expect(panel.textContent).toBe("Couldn't draw this panel: boom");
+      expect(() => renderOwnPanel(() => { throw new Error("x"); }, "no-such-panel")).not.toThrow(); // a missing panel is tolerated too
+      let ran = 0;
+      renderOwnPanel(() => void ran++, "servers-list");
+      expect(ran).toBe(1);
+      expect(logged.length).toBe(2);
+    } finally {
+      console.error = real;
+    }
+  });
+
   // Orchestrator finding (minor 1): the required-core-key loop (as opposed to a plugin's OWN missingEnv,
   // already covered above) had no test driving it at all.
   test("needsAttention: a required core key left blank is its own missing-setting item", () => {
@@ -11366,7 +11697,7 @@ describe("loadRouting preserves the last good snapshot (#245 follow-up)", () => 
       serverActionState,
       run: new Function(
         "api", "refreshRoutingSteps", "renderServers", "refreshEnvPickers", "renderNeedsAttention", "serverActionState",
-        `"use strict";\nlet routingData = ${JSON.stringify(initial)};\n${src}\nreturn { loadRouting, getRoutingData: () => routingData };`,
+        `"use strict";\n${applyBlock("READ_JSON")}\nlet routingData = ${JSON.stringify(initial)};\n${src}\nreturn { loadRouting, getRoutingData: () => routingData };`,
       )(api, refreshRoutingSteps, renderServers, refreshEnvPickers, renderNeedsAttention, serverActionState) as {
         loadRouting: () => Promise<void>;
         getRoutingData: () => unknown;
@@ -11481,7 +11812,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     }
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout", "refreshRoutingSteps", "Date", "showToast",
-      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
+      `"use strict";\n${applyBlock("READ_JSON")}\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
         "return { onRouteChange, scheduleRoutingSend, sendRouting, awaitRequestResult, resetToSaved, checkAgain, refreshDiscovery, ensureRouteState, routeState, routingStepEls, setRoutingData: (v) => { routingData = v; } };",
     )(document, api, timeoutSignal, setApplyText, pluginsData, 110000, clock.setTimeout, clock.clearTimeout, refreshRoutingSteps, FakeDate, showToast) as {
       onRouteChange: (plugin: string, guildId: string, what: string, value: unknown) => void;
@@ -12460,7 +12791,7 @@ describe("retryRegistration end-to-end: the real routingSetBody never drops an u
     const run = new Function(
       "document", "api", "timeoutSignal", "setApplyText", "pluginsData", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
       "refreshRoutingSteps", "serverActionState", "renderServers", "renderNeedsAttention", "showToast",
-      `"use strict";\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
+      `"use strict";\n${applyBlock("READ_JSON")}\nlet routingData = ${JSON.stringify(opts.routingDataInit)};\nlet routeState = new Map();\nlet routeFocusId = null;\nlet routingStepEls = new Map();\n${src}\n` +
         "return { retryablePlacement, retryRegistration };",
     )(
       document, api, timeoutSignal, setApplyText, opts.pluginsData, 110000, clock.setTimeout, clock.clearTimeout,
@@ -13045,7 +13376,7 @@ describe("addWebhook / pollForResult (#246, mini-harness)", () => {
     const run = new Function(
       "document", "api", "timeoutSignal", "MUTATION_TIMEOUT_MS", "setTimeout", "clearTimeout",
       "ROUTING_POLL_MS", "ROUTING_ANSWER_TIMEOUT_MS", "serverActionState", "renderServers", "renderNeedsAttention", "loadRouting", "refreshRoutingSteps", "showToast",
-      `"use strict";\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
+      `"use strict";\n${applyBlock("READ_JSON")}\nlet routingData = ${JSON.stringify(routingDataInit)};\n${clearUnauthorizedServerActionSrc}\n${pollForResultSrc}\n${addWebhookSrc}\n${refreshDiscoveryAllSrc}\n` +
         "return { addWebhook, pollForResult, refreshDiscoveryAll, getRoutingData: () => routingData };",
     )(
       document, api, timeoutSignal, 110000, clock.setTimeout, clock.clearTimeout, 2000, 30000, serverActionState, renderServers, renderNeedsAttention, loadRouting, refreshRoutingSteps, showToast,
@@ -13551,20 +13882,20 @@ describe("APPLY_INVALID_CARRY (#308): a refusal and a field's marks survive a re
 describe("a refusal across the real reloadConfig (#308)", () => {
   const nextTask = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-  test("a keep-edits reload that puts the stored value back drops the refusal: the field is not marked and the bar stops quoting it", async () => {
+  test("a keep-edits reload keeps the refused Config value (#467-4), so the refusal stands: the field stays marked and the bar still quotes it", async () => {
     // The reviewer's scenario: a refused Config value typed before the reload, then an update button's keep-edits
-    // reload, which keeps only what was typed DURING it (#284) and so renders the stored value back.
+    // reload. Before #467-4 it kept only what was typed DURING the reload and rendered the stored value back,
+    // dropping the refusal; it now keeps the edit (as it keeps a card's), so the refusal has not stopped being true.
     const page = runApply({ loadedEnv: APPLY_ENV, fields: { ...APPLY_ENV, ANNOUNCE_CHANNEL_ID: "", WATCHED_REPOS: "eu" }, realReload: {} });
     await page.run.applyPending();
     const control = page.control("ANNOUNCE_CHANNEL_ID");
     expect(page.view().hint).toBe("ANNOUNCE_CHANNEL_ID is required and cannot be blank.");
     expect(control.attrs.get("aria-invalid")).toBe("true");
-    await page.run.loadPlugins!(); // keep-edits: the render puts ANNOUNCE_CHANNEL_ID's stored "11111" back
+    await page.run.loadPlugins!(); // keep-edits: the blank ANNOUNCE_CHANNEL_ID differs from the stored "11111" and is kept
     await nextTask();
-    expect(control.value).toBe("11111");
-    expect(control.attrs.has("aria-invalid")).toBe(false);
-    expect(page.view().hint).not.toContain("ANNOUNCE_CHANNEL_ID");
-    expect(page.view().tone).toBe("");
+    expect(control.value).toBe("");
+    expect(control.attrs.get("aria-invalid")).toBe("true");
+    expect(page.view().hint).toContain("ANNOUNCE_CHANNEL_ID");
   });
 
   test("a refused plugin setting a keep-edits reload keeps stands: re-marked though the rebuild dropped the mark, and the bar still says it", async () => {

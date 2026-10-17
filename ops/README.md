@@ -1432,6 +1432,11 @@ knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance
    until the admin container is recreated (re-run `ops/install.sh`'s step 4 with the new
    `ADMIN_TOKEN` exported). If this token has leaked, editing `.env` alone is not enough: the
    leaked token keeps working until that recreate happens.
+   After an Unlock the gate says when a token was not accepted. **Lock** clears the token and reloads the page,
+   so nothing rendered (config values, logs, admin emails, typed secrets) survives it; a Lock pressed while an
+   Apply is in flight abandons that request in the browser while the server finishes the recreate. An operator
+   signed in through Cloudflare Access who sees the gate after a Lock opens the panel in a new tab (the gate
+   says so); it has no one-click Access button, because that would undo Lock in one click.
 
 **What it exposes — `bot-ops.sh`'s operations plus a few server-native routes of its own
 (some of which write):** `GET /api/status`, `GET /api/logs?n=`, `POST /api/restart` (routed but unused
