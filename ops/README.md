@@ -217,14 +217,13 @@ both files from one answer file would give up the property that lets `install.sh
 and self-update stay independent of this file (`docker-compose.yml`'s compose file is fetched
 verbatim from the target branch, not rendered) — see #169's own body for the full option table.
 
-The compose file's `build.context` defaults to `.` (a local checkout, unchanged for anyone
-running `docker compose up -d --build` from a clone) — the bootstrap command instead supplies
-`BOT_BUILD_CONTEXT=https://github.com/Rackbops/rackbops-discord-bot.git#<branch>` as a one-shot
-shell variable on that single invocation, so the Docker daemon fetches and builds the source
-itself. It is also written into the stack `.env`, as `<repo>#<branch>` (`ops/install.sh:345`), next to
-`GIT_SHA`. `GIT_SHA` is what self-update's staleness check reads, and it is resolved via
-`git ls-remote` when `install.sh` runs, with no clone needed. Self-update's own rebuilds go through
-the Docker Engine API (`src/redeploy.ts`) and set both themselves.
+The compose file's `build.context` defaults to `.` (a local checkout, unchanged for anyone running
+`docker compose up -d --build` from a clone). A deployed instance's stack `.env` sets
+`BOT_BUILD_CONTEXT=<repo>#<branch>` (written by `install.sh`, the stack `.env` heredoc, `STACKENV`), next to
+`GIT_SHA`, so the printed `up -d --build` and Dockge rebuild from the branch with no clone. `GIT_SHA` is what
+self-update's staleness check reads, and it is resolved via `git ls-remote` when `install.sh` runs, with no
+clone needed. Self-update's own rebuilds go through the Docker Engine API (`src/redeploy.ts`) and set both
+themselves.
 
 **A manual `up -d --build bot` after `main` has moved** builds the new `main` but bakes the stack
 `.env`'s old `GIT_SHA`, so the bot reports itself stale. Either re-run `install.sh` first, or pin both
@@ -1660,6 +1659,6 @@ It runs as its own sidecar, independent of the bot process's lifecycle — if th
 stays up to show that and let you restart it. No published host port: it's reached over the
 network via nucbox's own pre-existing, host-level Cloudflare tunnel (an ingress rule pointed at
 this service — see "Two doors" above), **not** via this compose file's own opt-in `cloudflared`
-sidecar (that one is a separate tunnel dedicated to `WARBANDEER_INGEST_PORT` — see the Cloudflare
-Tunnel section in the root README) — so until nucbox's tunnel has an ingress rule for it, bringing
+sidecar (that one is a separate, opt-in tunnel for the bot's own HTTP endpoints, `HTTP_PORT` or the warbandeer plugin's
+`WARBANDEER_INGEST_PORT` — see the Cloudflare Tunnel section in the root README) — so until nucbox's tunnel has an ingress rule for it, bringing
 the profile up just starts a service nothing outside the compose network can reach.

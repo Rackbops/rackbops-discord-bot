@@ -438,8 +438,8 @@ describe("buildCreateSpec", () => {
   });
 
   // #51 item 6: without this the replacement resolves by container name only, so
-  // `http://bot:<port>` (README's documented tunnel mapping) stops resolving after the first
-  // self-update. #491 item 11: the alias is attached at create, so for the seconds before the standby's HTTP router
+  // a client addressing the bot by its `bot` alias stops resolving after the first
+  // self-update (the README's tunnel mapping targets the container name instead, because during the overlap the replacement carries the alias too). #491 item 11: the alias is attached at create, so for the seconds before the standby's HTTP router
   // is up (started inside `activate()`, after its login) Docker DNS may hand `bot` to a container that refuses the
   // connection; attaching it at the takeover would need a disconnect/connect of the live standby's network — declined.
   test("carries the network's deliberately-configured service alias over", () => {

@@ -64,7 +64,9 @@ from it. **This repo deviates from that letter on purpose (decided 2026-09-08, i
   `ops/install.sh` run, holds only non-secret params (container name, paths, build context, the
   resolved commit). Compose's own `${VAR}` interpolation source.
 - `/opt/rackbops-discord-bot/<instance>/.env` -- hand-edited from `.env.example` once, holds
-  secrets (`DISCORD_TOKEN` and friends), never touched again by anything but the operator.
+  secrets (`DISCORD_TOKEN` and friends), never overwritten by `ops/install.sh` (it writes the one generated
+  `ADMIN_TOKEN` line when it creates the file); after that only the operator changes it, by hand or through the
+  panel's saves (`bot-ops.sh env-set`, which backs it up first).
 
 **Why the override is still allowed:** the personal rule exists to guarantee three things, and all
 three hold here without merging the files -- no deployment param lives in the operator's head or
