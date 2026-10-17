@@ -1,6 +1,6 @@
 # HTTP ingest for the Warbandeer connector, behind the existing Cloudflare Tunnel
 
-> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-warbandeer` (#100). File and line references below are as of the decision.
+> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-warbandeer` (#100). File and line references below are as of the decision. Link Codes have since grown to 13 characters from a 30-symbol alphabet, about 64 bits (plugins #69).
 
 The bot has zero inbound network surface today, deliberately — but `docker-compose.yml`'s
 `cloudflared` sidecar (`profiles: [tunnel]`) was already staged for exactly this, per its own

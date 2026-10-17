@@ -176,7 +176,7 @@ redeemed; without `PLUGINS=warbandeer`, `/link` and `/unlink` aren't registered 
 Unlike the admin panel's tunnel use, this endpoint has **no Cloudflare Access login wall** —
 arbitrary guild members have no Access identity to check against, which is the whole reason
 `/link`'s code + Device Token model exists as its own auth layer. Once enabled and mapped to a
-public hostname, `POST /link` is reachable by anyone who can guess or intercept an 8-character
+public hostname, `POST /link` is reachable by anyone who can guess or intercept a 13-character
 code within its 10-minute window; a per-IP rate limit is the only other barrier. See
 [`docs/adr/0001`](docs/adr/0001-http-ingest-behind-cloudflare-tunnel.md)'s Consequences section.
 
