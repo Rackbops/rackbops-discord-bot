@@ -12056,7 +12056,11 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
   test("H7 (review): a 401 on the send's re-read ends the send before any POST and frees the step", async () => {
     const h = harness({
       routingDataInit: withMusic({}),
-      apiImpl: (async () => { throw new Error("unauthorized"); }) as never,
+      // Only the re-read GET throws; a POST would succeed, so "no POST" proves the re-read's 401 ended the send.
+      apiImpl: (async (_p: string, init?: { method?: string }) => {
+        if (init && init.method === "POST") return { ok: true, status: 200, text: async () => JSON.stringify({ ok: true, id: "u1" }) };
+        throw new Error("unauthorized");
+      }) as never,
     });
     h.setFakeNow(READY_NOW);
     h.run.ensureRouteState("music", readyModelFor([]));
@@ -12081,6 +12085,9 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const st = h.routeState.get("music") as unknown as { base: Record<string, unknown>; selection: Record<string, unknown> };
     expect(Object.keys(st.base).sort()).toEqual(["100", "200"]); // the imported 200 is no longer "mine"
     expect(Object.keys(st.selection).sort()).toEqual(["100", "200"]);
+    // base is the FRESH placement, not the merged picks: the operator's own change to 100 still differs from it.
+    expect((st.base["100"] as { scope: string }).scope).toBe("all");
+    expect((st.selection["100"] as { scope: string }).scope).toBe("chosen");
   });
 
   test("retryRegistration says why a send was not ready (source pin; the function is browser-only)", () => {
@@ -12101,7 +12108,7 @@ describe("scheduleRoutingSend / sendRouting / awaitRequestResult (#245)", () => 
     const refresh = applyIndexSrc.slice(applyIndexSrc.indexOf("function refreshRoutingSteps("), applyIndexSrc.indexOf("function clearChildren("));
     expect(refresh).toContain("routeFocusId");
     expect(refresh).toMatch(/!target\.disabled\) \{\s*target\.focus\(\);\s*routeFocusId = null;/); // kept while still disabled
-    expect(render).toMatch(/!busy && routeFocusId !== null[\s\S]*?target\.focus\(\);/); // the !busy path restores
+    expect(render).toMatch(/if \(!busy && routeFocusId !== null[^\n]*\{[\s\S]{0,600}?target\.focus\(\);/); // the !busy path restores
   });
 
   // Round-3 review finding: refreshDiscovery's own GET/json() pair inside its poll loop was unguarded,
