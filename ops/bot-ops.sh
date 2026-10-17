@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# bot-ops.sh — the ONLY privileged surface for the Warbandeer bot admin panels (debug or prod).
+# bot-ops.sh — the ONLY privileged surface for this bot's admin panel (ops/admin/, debug or prod).
 #
-# The desktop Ops panels (apps/warbandeer-desktop, and roshne's wow-companion) never run docker or
-# edit the bot's .env themselves: they invoke this script over SSH, one subcommand at a time, and
-# pass BOT_OPS_PROJECT / BOT_OPS_CONTAINER to pick which bot. Keeping the whitelist and the apply
-# logic here — versioned and reviewable — means bot secrets never leave the box, and the panels can
-# only do the fixed set of operations below.
+# The panel never runs docker or edits the bot's .env itself: it invokes this script, one subcommand
+# at a time (and an operator can run it by hand over SSH), passing BOT_OPS_PROJECT / BOT_OPS_CONTAINER
+# to pick which bot. Keeping the whitelist and the apply logic here — versioned and reviewable —
+# means bot secrets never leave the box, and the panel can only do the fixed set of operations below.
 #
 # Subcommands:
-#   status        Print JSON: container running?, status line, image, realm status.
-#   logs [N]      Print the last N (default 200, max 5000) container log lines, raw.
+#   status        Print JSON: container running?, status line, image, realm status; plus dockerError
+#                 when `docker ps` itself failed (#473), so that is not read as "no container".
+#   logs [N]      Print the last N (default 200, max 5000) container log lines, raw. N is decimal (#473).
 #   restart       Restart the bot process in place (docker compose restart). No env reload. SSH-only
 #                 since #277: the admin panel's Restart button calls recreate instead.
 #   recreate      `up -d --force-recreate` so the bot picks up whatever is currently in .env, without
@@ -31,8 +31,10 @@
 #                 see, read from its data dir. A missing or corrupt file is null (#240).
 #   plugin-request  Read one request JSON on stdin and queue it for the bot's mailbox — a plugin
 #                 update action (#105) or a routing / webhook / discovery action (#240).
-#   version       Print JSON: {"schema": N} — this script's BOT_OPS_SCHEMA, so a caller (the admin
-#                 panel) can tell an outdated deployed copy from the one it was built against (#173).
+#   version       Print JSON: {"schema": N, "composeSchema": M|null} — this script's BOT_OPS_SCHEMA, so a
+#                 caller (the admin panel) can tell an outdated deployed copy from the one it was built
+#                 against (#173); composeSchema is the deployed compose file's own x-rackbops-schema
+#                 stamp, null when it is unset, missing or malformed (#178).
 #
 # Design notes:
 #   - The compose project + container come from BOT_OPS_PROJECT / BOT_OPS_CONTAINER (the caller
@@ -223,13 +225,14 @@ ALLOWED_SPEC=(
   'PLUGINS|^[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?(,[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?)*$'
   # Where the bot fetches the Plugin Index from: an http(s) URL, a file:// URL, or a bare absolute
   # path (config.ts accepts all three; empty clears back to the published default).
-  'PLUGIN_INDEX_URL|^(https?://[^[:space:]]+|file://[^[:space:]]+|/[^[:space:]]+)$'
+  'PLUGIN_INDEX_URL|^(https?://[^[:space:]/?#@]+([/?#][^[:space:]]*)?|file://[^[:space:]]+|/[^[:space:]]+)$'
 )
 
 # Derived once, here, from ALLOWED_SPEC above — never hand-declared. Split on the FIRST "|" only
 # (AUTO_UPDATE's and PLUGIN_INDEX_URL's regexes both DO contain "|" today, as alternation — the
 # split still cuts at the first "|", the one separating the key from its regex, leaving every later
-# "|" alone as part of the regex value): ALLOWED is the KEY->regex lookup every validation site
+# "|" alone as part of the regex value; PLUGIN_INDEX_URL's allows no "@" in the authority -- #474: no
+# `user:pass@` in a value every panel user sees; a query string is allowed, and documented as visible): ALLOWED is the KEY->regex lookup every validation site
 # below already expects;
 # ENV_KEY_ORDER is env-get's display order, in the exact sequence ALLOWED_SPEC lists — named to
 # match PLUGIN_KEY_ORDER's own convention below.
@@ -376,6 +379,8 @@ declare -A RESERVED_KEYS=(
 # History: #51 item 5 added the guard; #160 closed the lost-stop-response window (retireOriginal
 # re-inspects the original) and stopped Docker's own restart policy from resurrecting an unverified
 # standby, so refusing while the replacement is alive is no longer racing those failure modes.
+# Callers run it only once they hold the config-dir lock (#473), so a self-update that began while
+# they waited for it is seen.
 guard_no_handoff_in_progress() {
   local states alive
   # One `ps -a` with `{{.State}}` (not `{{.Names}}`): the question is whether the replacement is ALIVE,
@@ -618,8 +623,11 @@ cmd_status() {
   # calls, not just reads alongside them. `.Status` (kept as-is) is the human uptime string
   # (ops/admin/public/index.html renders it verbatim as "Container") that `.State` does NOT carry,
   # so it's not dropped as "redundant" the way #59 originally suggested (#59/#143).
+  local ps_rc=0 docker_error=""
   ps_line="$(docker ps -a --filter "name=^/${CONTAINER}$" \
-              --format '{{.State}}'$'\t''{{.Status}}'$'\t''{{.Image}}' 2>/dev/null || true)"
+              --format '{{.State}}'$'\t''{{.Status}}'$'\t''{{.Image}}' 2>/dev/null)" || ps_rc=$?
+  # #473: a failed `docker ps` is not "no container": say so, with the exit code only (never docker's stderr).
+  [ "$ps_rc" -eq 0 ] || { ps_line=""; docker_error="docker ps failed (exit $ps_rc)"; }
   IFS=$'\t' read -r ps_state status image <<<"$ps_line"
   [ "$ps_state" = "running" ] && running=true || running=false
   # Best-effort: the persisted last-observed realm status. Since #107 the wow plugin owns it in its own
@@ -637,8 +645,9 @@ cmd_status() {
   [ -n "$plugins" ] || plugins='[]'
   jq -n --argjson running "${running:-false}" \
         --arg status "$status" --arg image "$image" --arg realm "$realm" \
-        --argjson plugins "$plugins" \
-        '{running: $running, status: $status, image: $image, realmStatus: $realm, plugins: $plugins}'
+        --argjson plugins "$plugins" --arg dockerError "$docker_error" \
+        '{running: $running, status: $status, image: $image, realmStatus: $realm, plugins: $plugins}
+         + (if $dockerError == "" then {} else {dockerError: $dockerError} end)'
 }
 
 cmd_logs() {
@@ -649,14 +658,15 @@ cmd_logs() {
   # `0 > LOGS_MAX` = false), so the value would sail through uncapped to `docker logs --tail`,
   # which dockerd then treats as "all lines" (issue #53 item 4).
   [[ "$n" =~ ^[0-9]{1,5}$ ]] || die "logs: N must be a number"
+  n=$((10#$n))   # #473: decimal; a leading 0 is not octal
   (( n > LOGS_MAX )) && n="$LOGS_MAX"
   docker logs "$CONTAINER" --tail "$n" 2>&1
 }
 
 cmd_restart() {
   need docker
-  guard_no_handoff_in_progress
   lock_config_dir restart
+  guard_no_handoff_in_progress   # #473: after the lock -- a /update may start during the wait
   # BOT_ENV_FILE is compose-YAML interpolation only (env_file: ${BOT_ENV_FILE:-.env}) — a
   # different mechanism from the container's own runtime env, which env_file: itself supplies
   # once that interpolation resolves.
@@ -684,8 +694,8 @@ cmd_restart() {
 # can never drift.
 cmd_recreate() {
   need docker; need jq
-  guard_no_handoff_in_progress
   lock_config_dir recreate
+  guard_no_handoff_in_progress   # #473: after the lock -- a /update may start during the wait
   local rc=0
   recreate_bot || rc=$?
   jq -n --argjson ok "$([ "$rc" -eq 0 ] && echo true || echo false)" --arg log "$RECREATE_LOG" \
@@ -991,8 +1001,8 @@ plugins_name_repeated() {
 
 cmd_env_set() {
   need docker; need jq
-  guard_no_handoff_in_progress
   lock_config_dir env-set
+  guard_no_handoff_in_progress   # #473: after the lock -- a /update may start during the wait
   [ -f "$ENV_FILE" ] || die "env-set: $ENV_FILE not found"
 
   # Every REQUIRED key must also be an ALLOWED one — REQUIRED is a separate, hand-maintained set
@@ -1134,8 +1144,8 @@ cmd_env_set() {
   chown "$target_owner" "$CONFIG_DIR/backups" \
     || echo "bot-ops: warning: couldn't set backups/ ownership to $target_owner" >&2
 
-  # #227: the pid suffix means the name can never collide — with the lock two saves can no longer
-  # share a second, but the name is the record of what was replaced and must never depend on timing.
+  # #227: the pid suffix makes a collision very unlikely (two saves would need the same second AND the
+  # same pid); the name is the record of what was replaced, so it does not lean on the lock's timing either.
   local backup="$CONFIG_DIR/backups/.env.bak.$(date +%Y%m%d-%H%M%S)-$$"
   # Pin the backup to 0600 rather than inheriting .env's mode. `cp` would copy that mode, which is
   # only safe while .env is itself owner-only — and a .env recreated by hand or by a fresh deploy
