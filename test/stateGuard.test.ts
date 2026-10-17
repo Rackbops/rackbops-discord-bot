@@ -13,12 +13,14 @@ import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreSta
 import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
 import { resetKeptCorruptForTest, storageStateForTest } from "../src/storage";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
+import { dockerStateForTest, resetDockerForTest, setDockerSocketMountedForTest } from "../src/docker";
 import { settleWithin } from "./settleWithin";
 import { drainQueues, findStateLeaks, GUARDED, resetAllState, type GuardedModule } from "./stateGuard";
 import {
   announceLeaks,
   botStateLeaks,
   configLeaks,
+  dockerLeaks,
   pluginHostLeaks,
   pluginRequestLeaks,
   pluginUpdateLeaks,
@@ -234,6 +236,25 @@ describe("configLeaks", () => {
   });
 });
 
+describe("dockerLeaks (#505)", () => {
+  test("an unset override is no leak; a forced true or false is named", () => {
+    expect(dockerLeaks({ mountedOverride: undefined })).toEqual([]);
+    expect(dockerLeaks({ mountedOverride: false })).toEqual([expect.stringContaining("dockerSocketMounted forced to false")]);
+    expect(dockerLeaks({ mountedOverride: true })).toEqual([expect.stringContaining("dockerSocketMounted forced to true")]);
+  });
+
+  test("the real seam: a test that forgets to restore it is found, and the reset clears it", async () => {
+    try {
+      setDockerSocketMountedForTest(false);
+      expect(dockerStateForTest()).toEqual({ mountedOverride: false });
+      expect((await findStateLeaks()).map((f) => f.module)).toContain("src/docker.ts");
+    } finally {
+      resetDockerForTest();
+    }
+    expect((await findStateLeaks()).map((f) => f.module)).not.toContain("src/docker.ts");
+  });
+});
+
 describe("updateLeaks", () => {
   test("no check in flight is no leak", () => {
     expect(updateLeaks({ checkInFlight: false })).toEqual([]);
@@ -249,6 +270,14 @@ describe("updateLeaks", () => {
       expect.stringContaining("a failed swap remembered"),
     ]);
     expect(updateLeaks({ checkInFlight: false, suppressedWarnedFor: undefined, lastFailure: undefined })).toEqual([]);
+  });
+  test("names the undetermined warning and an automatic failure notice still remembered (#505)", () => {
+    expect(updateLeaks({ checkInFlight: false, undeterminedWarnedFor: "abc" })).toEqual([
+      expect.stringContaining("the undetermined warning already logged for abc"),
+    ]);
+    expect(updateLeaks({ checkInFlight: false, autoNotifiedFor: "abc:failed" })).toEqual([
+      expect.stringContaining("an automatic update failure already notified for abc:failed"),
+    ]);
   });
 });
 
@@ -336,6 +365,7 @@ describe("GUARDED", () => {
       ["src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]],
       ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]],
       ["src/storage.ts", storageStateForTest, storageLeaks, [resetKeptCorruptForTest]],
+      ["src/docker.ts", dockerStateForTest, dockerLeaks, [resetDockerForTest]],
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
       ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest, resetRoutingQueueForTest]],

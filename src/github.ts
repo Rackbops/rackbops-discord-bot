@@ -33,12 +33,12 @@ import { config } from "./config";
  * under `BUILD_TIMEOUT_MS`. A tick's genuine worst case exceeds the watchdog at any repo count.
  *
  * Not tighter than 10s: a timed-out `fetchShaRelation` degrades to `relation: "unknown"`, which
- * `decideUpdate` resolves to **`"restart"`** — a real self-redeploy. On the exit-75 fallback the
- * `attemptedUpdateToSha` marker suppresses the repeat, but on the socket-mounted path the swap
- * *succeeds*, and since `redeploy` builds the exact compared sha, a running build that was `ahead`
- * gets swapped onto an OLDER commit — after which the replacement reads `current` and clears the
- * marker, so nothing reverts it. Pre-existing (any compare 5xx did this too), but it is why this
- * value should stay generous.
+ * makes the AUTOMATIC check wait (`undetermined`, #505) but still lets an admin's `/update` act on it
+ * (`"restart"`) — a real self-redeploy. On the socket-mounted path the swap *succeeds*, and since
+ * `redeploy` builds the exact compared sha, a running build that was `ahead` gets swapped onto an
+ * OLDER commit — after which the replacement reads `current` and clears the marker, so nothing
+ * reverts it. Only the admin's explicit `/update` can still do that now, which is why this value
+ * should stay generous.
  */
 export const GITHUB_TIMEOUT_MS = 10_000;
 
@@ -181,6 +181,15 @@ export function clampUpstreamBody(text: string, max = 300): string {
   const line = (text.split("\n")[0] ?? "").trim();
   return line.length > max ? `${sliceUtf16(line, max)}…` : line;
 }
+
+/**
+ * A failed or timed-out swap's text (`handoffFailureMessage`) puts the daemon's error ahead of the verdict ("I stayed on
+ * the current build", the `-next` container to remove by hand); unbounded, a long error pushed the verdict past the
+ * whole-reply clamp (#505 item 7). A stalled swap's text puts the error last, where the clamp only keeps the reply
+ * bounded. 600 UTF-16 units leave room for the head, the tail and a `remove-failed` clause. Lives here, not in
+ * `commands.ts`, because `update.ts` (the failed-automatic-update notice) needs it too and `commands.ts` imports `update.ts`.
+ */
+export const DAEMON_ERROR_MAX = 600;
 
 /**
  * Defensive clamp for anything about to go into an `editReply` failure path. `clampUpstreamBody`

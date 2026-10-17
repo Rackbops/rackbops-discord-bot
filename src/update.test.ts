@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ReplacementProbe } from "./redeploy";
 import type { PendingUpdateReport, RetiredBy, SwapInFlight } from "./state";
@@ -7,8 +8,10 @@ import type { PendingUpdateReport, RetiredBy, SwapInFlight } from "./state";
 // `update.ts` pulls in the `config` singleton, which resolves process.env at import time -- the
 // required vars are primed once by test/setup.ts's bunfig preload (#136).
 const {
+  autoUpdateFailureNotice,
   checkForUpdate,
   decideAttemptResolution,
+  notifyAutoUpdateFailure,
   decideRetirement,
   decideUpdate,
   isRetiredBy,
@@ -149,18 +152,21 @@ describe("decideUpdate ancestry", () => {
     ).toBe("disabled");
   });
 
-  test("force cannot turn an unpublished sha into a restart", () => {
+  // #505 item 6: `redeploy` builds `latestSha` and never uses the running sha, so an admin's /update can deliver.
+  test("force turns an unpublished sha into a restart (#505 item 6, M4)", () => {
     expect(
       decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unpublished", force: true }),
-    ).toBe("disabled");
+    ).toBe("restart");
+    expect(decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unpublished" })).toBe("disabled");
   });
 
-  // An API failure must not invent a verdict — it degrades to the pre-nazumods/wow#871 behaviour.
-  test("unknown falls back to treating a sha mismatch as stale", () => {
-    expect(decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unknown" })).toBe("restart");
+  // #505 item 4: an API failure must not invent a verdict. The automatic check waits; an admin's /update acts.
+  test("unknown is undetermined for the automatic check, restart for a forced one (#505 item 4, M3, M3b)", () => {
+    expect(decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unknown" })).toBe("undetermined");
     expect(
       decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unknown", attemptedSha: NEW }),
-    ).toBe("suppressed");
+    ).toBe("undetermined");
+    expect(decideUpdate({ runningSha: OLD, latestSha: NEW, relation: "unknown", force: true })).toBe("restart");
   });
 
   // The shortcut is what keeps the common path at one request: matching shas never consult it.
@@ -666,7 +672,13 @@ describe("checkForUpdate — the attempt record (#450, #452, #449, #506)", () =>
       expect(updateStateForTest().suppressedWarnedFor).toBe(NEWER);
 
       resetUpdateForTest();
-      expect(updateStateForTest()).toEqual({ checkInFlight: false, suppressedWarnedFor: undefined, lastFailure: undefined });
+      expect(updateStateForTest()).toEqual({
+        checkInFlight: false,
+        suppressedWarnedFor: undefined,
+        lastFailure: undefined,
+        undeterminedWarnedFor: undefined,
+        autoNotifiedFor: undefined,
+      });
     } finally {
       warn.mockRestore();
     }
@@ -1197,6 +1209,338 @@ describe("resolveUpdateAttempt — a rolled-back original (#558)", () => {
       expect((await checkForUpdate({ force: true }, deps)).decision).toBe("restart");
     } finally {
       warn.mockRestore();
+    }
+  });
+});
+
+// #505 (D3): a mounted socket whose daemon does not answer, a failed automatic update told to the admins, a failed
+// compare, and /update overriding `unpublished`.
+describe("checkForUpdate — D3 (#505)", () => {
+  const realFetch = globalThis.fetch;
+  const realGitSha = config.gitSha;
+  const clearDisk = async () => {
+    state.attemptedUpdateToSha = undefined;
+    state.pendingUpdateReport = undefined;
+    state.swapInFlight = undefined;
+    await saveState();
+  };
+  /** GitHub answering with the newest commit, and `compare` answering `compare`. */
+  const stubCompare = (compare: () => Response) => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes("/commits?")) return new Response(JSON.stringify([{ sha: NEW }]), { status: 200 });
+      if (url.includes("/compare/")) return compare();
+      throw new Error(`unmocked fetch in test: ${url}`);
+    }) as typeof fetch;
+  };
+
+  beforeEach(async () => {
+    config.gitSha = OLD;
+    await clearDisk();
+  });
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    config.gitSha = realGitSha;
+    await clearDisk();
+    resetUpdateForTest();
+    resetRestartForTest();
+  });
+
+  test("U1: a mounted socket whose daemon fails its ping twice is reported, not an exit 75, and nothing is armed (M1, M1b, M1c)", async () => {
+    stubGitHub();
+    const exits: number[] = [];
+    const restoreExit = setExitFn((code) => void exits.push(code));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    let pings = 0;
+    const deps = {
+      redeployAvailable: async () => {
+        pings++;
+        return false;
+      },
+      socketMounted: () => true,
+      pingRetryDelayMs: 0,
+      redeploy: async () => {
+        throw new Error("redeploy must not run when the daemon does not answer");
+      },
+    };
+    try {
+      const result = await checkForUpdate({ force: true, requester: REQUESTER }, deps);
+      expect(result.decision).toBe("restart");
+      expect(result.daemonUnreachable).toBe(true);
+      expect(result.redeploy?.outcome).toBe("failed");
+      expect(result.redeploy?.error).toContain("did not answer");
+      expect(pings).toBe(2);
+      expect(restartPending()).toBe(false);
+      expect(exits).toEqual([]);
+      expect(state.attemptedUpdateToSha).toBeUndefined();
+      // The failure is remembered (as a failed swap's is), so a later suppressed warning for this sha can name it (M7).
+      expect(updateStateForTest().lastFailure?.sha).toBe(NEW);
+      expect(updateStateForTest().lastFailure?.reason).toContain("did not answer");
+      const disk = onDisk();
+      expect(disk.attemptedUpdateToSha).toBeUndefined();
+      expect(disk.pendingUpdateReport).toBeUndefined();
+      expect(disk.swapInFlight).toBeUndefined();
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("the docker socket is mounted but the daemon did not answer"))).toBe(true);
+
+      // Nothing was armed, so the next UNFORCED check tries again rather than being suppressed.
+      const next = await checkForUpdate({}, deps);
+      expect(next.decision).toBe("restart");
+      expect(next.daemonUnreachable).toBe(true);
+      expect(pings).toBe(4);
+    } finally {
+      warn.mockRestore();
+      resetRestartForTest();
+      restoreExit();
+    }
+  });
+
+  test("U1b: the second ping answering proceeds as an ordinary socket swap (M1b)", async () => {
+    stubGitHub();
+    let pings = 0;
+    let redeployCalls = 0;
+    let during: ReturnType<typeof onDisk> | undefined;
+    const deps = {
+      redeployAvailable: async () => ++pings === 2,
+      socketMounted: () => true,
+      pingRetryDelayMs: 0,
+      redeploy: async () => {
+        redeployCalls++;
+        during = onDisk();
+        return { outcome: "failed" as const, error: "boom" };
+      },
+    };
+    const result = await checkForUpdate({ force: true, requester: REQUESTER }, deps);
+    expect(result.daemonUnreachable).toBeUndefined();
+    expect(pings).toBe(2);
+    expect(redeployCalls).toBe(1);
+    expect(during!.attemptedUpdateToSha).toBe(NEW);
+    expect(during!.swapInFlight).toMatchObject({ fromSha: OLD, toSha: NEW });
+  });
+
+  test("U1e: a first ping that answers makes no second ping", async () => {
+    stubGitHub();
+    let pings = 0;
+    await checkForUpdate(
+      { force: true },
+      {
+        redeployAvailable: async () => {
+          pings++;
+          return true;
+        },
+        socketMounted: () => true,
+        pingRetryDelayMs: 0,
+        redeploy: async () => ({ outcome: "failed" as const, error: "boom" }),
+      },
+    );
+    expect(pings).toBe(1);
+  });
+
+  test("U3: a failed compare makes the automatic check wait: no action, nothing saved, one warning per sha (M3)", async () => {
+    stubCompare(() => new Response("{}", { status: 500 }));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    let redeployCalled = false;
+    const deps = {
+      redeployAvailable: async () => true,
+      redeploy: async () => {
+        redeployCalled = true;
+        return { outcome: "failed" as const };
+      },
+    };
+    try {
+      const first = await checkForUpdate({}, deps);
+      expect(first.decision).toBe("undetermined");
+      expect(first.latestSha).toBe(NEW);
+      expect(redeployCalled).toBe(false);
+      expect(state.attemptedUpdateToSha).toBeUndefined();
+      expect(onDisk().attemptedUpdateToSha).toBeUndefined();
+      await checkForUpdate({}, deps);
+      const lines = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("could not tell whether"));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`${shortSha(OLD)} contains ${shortSha(NEW)}`);
+      expect(updateStateForTest().undeterminedWarnedFor).toBe(NEW);
+
+      // An admin's /update acts on it anyway.
+      const forced = await checkForUpdate({ force: true }, deps);
+      expect(forced.decision).toBe("restart");
+      expect(redeployCalled).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("U4: an admin's /update rebuilds the branch tip for an unpublished running sha; the automatic check stays off (M4)", async () => {
+    stubCompare(() => new Response(JSON.stringify({ message: "Not Found" }), { status: 404 }));
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    let redeployCalled = false;
+    const deps = {
+      redeployAvailable: async () => true,
+      redeploy: async () => {
+        redeployCalled = true;
+        return { outcome: "failed" as const };
+      },
+    };
+    try {
+      const auto = await checkForUpdate({}, deps);
+      expect(auto.decision).toBe("disabled");
+      expect(auto.reason).toBe("unpublished-sha");
+      expect(redeployCalled).toBe(false);
+      const forced = await checkForUpdate({ force: true }, deps);
+      expect(forced.decision).toBe("restart");
+      expect(redeployCalled).toBe(true);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+});
+
+describe("the failed-automatic-update notice (#505 item 2)", () => {
+  const failed = (over: Record<string, unknown> = {}) => ({
+    decision: "restart" as const,
+    latestSha: NEW,
+    redeploy: { outcome: "failed" as const, error: "build exploded" },
+    ...over,
+  });
+
+  afterEach(() => resetUpdateForTest());
+
+  test("U2(a): a failed swap names both shas, the reason and the 'will not retry ... /update' tail (M2d)", () => {
+    const text = autoUpdateFailureNotice(failed(), OLD, "update")!;
+    expect(text).toContain(shortSha(NEW));
+    expect(text).toContain(shortSha(OLD));
+    expect(text).toContain("build exploded");
+    expect(text).toContain("will not retry this commit until a newer one lands; /update retries it now");
+    expect(text).not.toContain("The next automatic check tries again");
+  });
+
+  test("U2(b): an unreachable daemon says the next check tries again", () => {
+    const text = autoUpdateFailureNotice(failed({ daemonUnreachable: true }), OLD, "update")!;
+    expect(text).toContain("The next automatic check tries again.");
+    expect(text).not.toContain("will not retry");
+  });
+
+  test("U2(c): nothing to tell for current, suppressed, undetermined, or a restart without a failed swap", () => {
+    for (const decision of ["current", "suppressed", "undetermined", "busy", "disabled"] as const) {
+      expect(autoUpdateFailureNotice({ decision, latestSha: NEW, redeploy: { outcome: "failed" } }, OLD, "update")).toBeUndefined();
+    }
+    expect(autoUpdateFailureNotice({ decision: "restart", latestSha: NEW }, OLD, "update")).toBeUndefined();
+  });
+
+  test("U2(d): the reason is clamped", () => {
+    const text = autoUpdateFailureNotice(failed({ redeploy: { outcome: "failed", error: "x".repeat(3000) } }), OLD, "update")!;
+    expect(text.length).toBeLessThan(1000);
+  });
+
+  test("U2(e): the reason falls back from the error to the outcome to 'failed'", () => {
+    expect(autoUpdateFailureNotice(failed({ redeploy: { outcome: "timeout" } }), OLD, "update")).toContain("failed: timeout.");
+    expect(autoUpdateFailureNotice(failed({ redeploy: {} }), OLD, "update")).toContain("failed: failed.");
+  });
+
+  test("U2b: once per failing commit and kind; a delivery that reached nobody is retried (M2, M2e, M2f)", async () => {
+    const delivered: string[] = [];
+    const mk = (result: boolean) => ({
+      deliver: async (m: string) => {
+        delivered.push(m);
+        return result;
+      },
+      runningSha: OLD,
+      updateCommand: "update",
+    });
+    await notifyAutoUpdateFailure(failed(), mk(true));
+    await notifyAutoUpdateFailure(failed(), mk(true));
+    expect(delivered).toHaveLength(1);
+
+    await notifyAutoUpdateFailure(failed({ latestSha: "c".repeat(40) }), mk(true)); // a new commit
+    expect(delivered).toHaveLength(2);
+
+    await notifyAutoUpdateFailure({ decision: "current", latestSha: NEW }, mk(true)); // not a failure
+    expect(delivered).toHaveLength(2);
+
+    resetUpdateForTest();
+    delivered.length = 0;
+    await notifyAutoUpdateFailure(failed({ daemonUnreachable: true }), mk(true)); // unreachable ...
+    await notifyAutoUpdateFailure(failed(), mk(true)); // ... then the build fails for the SAME sha: a different notice
+    expect(delivered).toHaveLength(2);
+
+    resetUpdateForTest();
+    delivered.length = 0;
+    await notifyAutoUpdateFailure(failed(), mk(false)); // reached nobody
+    await notifyAutoUpdateFailure(failed(), mk(true)); // so it is tried again
+    await notifyAutoUpdateFailure(failed(), mk(true)); // and now recorded
+    expect(delivered).toHaveLength(2);
+  });
+
+  test("U2c: checkAutoUpdate hands checkForUpdate's result to the notice, and the tick passes the client", () => {
+    const src = readFileSync(join(import.meta.dir, "announce.ts"), "utf8");
+    const body = src.slice(src.indexOf("async function checkAutoUpdate("), src.indexOf("// Flat 15-min cadence"));
+    expect(body).toContain("const check = await checkForUpdate();");
+    expect(body).toContain("notifyAutoUpdateFailure(check,");
+    expect(src).toContain("await checkAutoUpdate(client)");
+  });
+});
+
+describe("updateReply for the new decision (#505 item 4)", () => {
+  test("U3: 'undetermined' says it could not tell", async () => {
+    const { updateReply } = await import("./commands");
+    expect(updateReply("undetermined", NEW, { runningSha: OLD })).toContain("couldn't tell");
+  });
+
+  test("U1f: an unreachable daemon is not described as a replacement that failed its handoff", async () => {
+    const { updateReply } = await import("./commands");
+    const reply = updateReply("restart", NEW, {
+      runningSha: OLD,
+      redeploy: { outcome: "failed", error: "x" },
+      daemonUnreachable: true,
+      commandName: "update",
+    });
+    expect(reply).toContain("did not answer");
+    expect(reply).not.toContain("replacement");
+    expect(reply).toContain("/update again");
+  });
+
+  test("U1f: the /update handler passes daemonUnreachable from checkForUpdate to updateReply", () => {
+    const commands = readFileSync(join(import.meta.dir, "commands.ts"), "utf8");
+    expect(commands).toContain("redeploy, daemonUnreachable } = await checkForUpdate(");
+    expect(commands).toMatch(/redeploy,\s*daemonUnreachable,\s*commandName: interaction\.commandName/);
+  });
+});
+
+describe("the production wiring of the unreachable-daemon branch (#505 item 1)", () => {
+  // `checkForUpdate`'s tests inject `socketMounted`; nothing else ties the REAL deps to the real stat. Without these a
+  // deleted wiring line leaves the suite green while production goes back to arming and exiting 75 (M8, M9).
+  test("liveRedeployDeps passes dockerSocketMounted, and dockerSocketMounted stats the daemon socket path", () => {
+    const update = readFileSync(join(import.meta.dir, "update.ts"), "utf8");
+    expect(update).toContain("const liveRedeployDeps: RedeployDeps = { redeployAvailable, redeploy, socketMounted: dockerSocketMounted };");
+    const docker = readFileSync(join(import.meta.dir, "docker.ts"), "utf8");
+    expect(docker).toContain("return isSocketPath(BOT_DOCKER_SOCKET);");
+  });
+});
+
+describe("isSocketPath (#505 item 1)", () => {
+  test("U1d: a missing path and a regular file are not a socket (M1d)", async () => {
+    const { isSocketPath } = await import("./docker");
+    const dir = mkdtempSync(join(tmpdir(), "d3-sock-"));
+    try {
+      const file = join(dir, "regular");
+      writeFileSync(file, "x");
+      expect(isSocketPath(join(dir, "nope"))).toBe(false);
+      expect(isSocketPath(file)).toBe(false);
+      expect(isSocketPath(dir)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // CI-only: unix sockets via Bun.listen({ unix }) are not available on win32.
+  test.skipIf(process.platform === "win32")("U1d: a real unix socket is one (M1d)", async () => {
+    const { isSocketPath } = await import("./docker");
+    const dir = mkdtempSync(join(tmpdir(), "d3-sock-"));
+    const path = join(dir, "s.sock");
+    const server = Bun.listen({ unix: path, socket: { data() {} } });
+    try {
+      expect(isSocketPath(path)).toBe(true);
+    } finally {
+      server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
