@@ -7,3 +7,10 @@ data/
 Dockerfile
 docker-compose.yml
 **/*.test.ts
+
+# #487: the Dockerfile COPYs named paths only (package.json, bun.lock, src, entrypoint.sh), so this file bounds what a
+# local `up --build` SENDS to the daemon, not what the image holds. The history, nested node_modules and every .env variant stay out.
+.git
+**/node_modules
+**/.env
+.env.*

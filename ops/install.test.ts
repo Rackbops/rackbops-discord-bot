@@ -513,7 +513,10 @@ async function renderNextSteps(): Promise<string> {
     'REPO_URL="https://github.com/Rackbops/rackbops-discord-bot.git"',
     NEXT_STEPS_BLOCK,
   ].join("\n");
-  const proc = Bun.spawn([BASH!, "-c", script], { stdout: "pipe", stderr: "pipe" });
+  // The script goes in on stdin (`bash -s`), not as a `-c` argument: on Windows Bun's argv quoting halves every `\`
+  // in a `-c` argument, which spliced the heredoc's `\` continuations and misled an old NOTE here into blaming bash
+  // itself (#486 item 8). stdin carries the script byte for byte on both platforms.
+  const proc = Bun.spawn([BASH!, "-s"], { stdin: new Blob([script]), stdout: "pipe", stderr: "pipe" });
   const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   expect(exitCode).toBe(0);
   return stdout;
@@ -528,17 +531,41 @@ describe.skipIf(!runnable)("install.sh's printed step 2 no longer carries the fo
     }
     expect(step2).toContain("docker compose -f /opt/stacks/rackbops-discord-bot-debug/docker-compose.yml -p rackbops-discord-bot-debug up -d --build");
     // Not vacuous: step 3 (bot-ops.sh — a plain script, not Compose, so it has no auto-.env-load
-    // to lean on) is untouched by #169 and must still carry its own prefix vars. NOTE (found while
-    // writing this test, out of #169's scope, unrelated to this change): bash's unquoted `<<EOF`
-    // heredoc splices every `\<newline>` in its body per the manual ("the character sequence
-    // \newline is ignored"), confirmed with a two-line repro — so steps 3/4/5's own backslash
-    // continuations, unchanged here, already collapse onto one run-on line with the source's
-    // indentation left behind as inline whitespace, not the multi-line block the source layout
-    // visually suggests. Still a valid single command to copy-paste (word-splitting doesn't care
-    // whether words are separated by a newline+indent or a run of spaces), so not asserted as
-    // multi-line here — just that step 3's prefix vars are still present, unlike step 2's.
+    // to lean on) is untouched by #169 and must still carry its own prefix vars. The source writes `\` before each
+    // newline; an unquoted heredoc prints that as ONE backslash and keeps the newline, so the continuations stay
+    // multi-line (N2 below asserts every one). The splice an earlier NOTE here described was Windows argv halving
+    // under `bash -c`, fixed by feeding the script on stdin.
     const step3 = out.slice(out.indexOf("3. Day-2 ops"), out.indexOf("4. Optional"));
     expect(step3).toContain("BOT_OPS_CONTAINER=rackbops-discord-bot-debug");
+  });
+
+  // #486 item 8: every continuation of step 3's command prints as ` \` + newline, not spliced onto one line.
+  test("N2: each of step 3's four prefix lines ends with a backslash continuation, and steps 4 and 5 keep theirs", async () => {
+    const out = await renderNextSteps();
+    const step3 = out.slice(out.indexOf("3. Day-2 ops"), out.indexOf("4. Optional"));
+    const lines3 = step3.split("\n");
+    for (const key of ["BOT_OPS_CONFIG_DIR=", "BOT_OPS_COMPOSE_FILE=", "BOT_OPS_PROJECT=", "BOT_OPS_CONTAINER="]) {
+      const line = lines3.find((l) => l.trimStart().startsWith(key));
+      expect(line, key).toBeDefined();
+      expect(line!.endsWith(" \\"), `${key} line ends with a continuation`).toBe(true);
+    }
+    const step4 = out.slice(out.indexOf("4. Optional"), out.indexOf("5. Optional"));
+    const step5 = out.slice(out.indexOf("5. Optional"));
+    for (const [name, step] of [["step 4", step4], ["step 5", step5]] as const) {
+      const lines = step.split("\n");
+      expect(lines.some((l, n) => l.endsWith(" \\") && (lines[n + 1] ?? "").startsWith(" ")), `${name} keeps a continued line`).toBe(true);
+    }
+  });
+
+  // #422: the printed tunnel step names the cloudflared service and passes --no-deps, so it can never build,
+  // start or recreate the bot (cloudflared's depends_on would otherwise pull it in).
+  test("N1: step 5 starts cloudflared with --no-deps and never builds; step 4 still ends up -d --build admin", async () => {
+    const out = await renderNextSteps();
+    const step4 = out.slice(out.indexOf("4. Optional"), out.indexOf("5. Optional"));
+    const step5 = out.slice(out.indexOf("5. Optional"));
+    expect(step5).toContain("--profile tunnel up -d --no-deps cloudflared");
+    expect(step5).not.toContain("--build");
+    expect(step4.trimEnd().endsWith("up -d --build admin")).toBe(true);
   });
 });
 
