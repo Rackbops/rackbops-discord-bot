@@ -3169,7 +3169,10 @@
   function describeOutdatedBanner(outdatedFiles) {
     if (!outdatedFiles || outdatedFiles.length === 0) return null;
     const verb = outdatedFiles.length > 1 ? "are" : "is";
-    return outdatedFiles.join(" and ") + " " + verb + " out of date on this instance — re-run ops/install.sh; panel features may fail.";
+    const remedy = outdatedFiles.includes("docker-compose.yml")
+      ? "re-run ops/install.sh, then its printed step 4 with --force-recreate"
+      : "re-run ops/install.sh";
+    return outdatedFiles.join(" and ") + " " + verb + " out of date on this instance — " + remedy + "; panel features may fail.";
   }
   // OUTDATED_BANNER_HELPERS:end
 
@@ -4253,7 +4256,7 @@
     }
 
     for (const file of (status && status.outdatedFiles) || []) {
-      out.push({ kind: "outdated-files", text: file + " is out of date on this instance", fix: { label: "Re-run ops/install.sh", go: "none" } });
+      out.push({ kind: "outdated-files", text: file + " is out of date on this instance", fix: { label: file === "docker-compose.yml" ? "Re-run ops/install.sh, then step 4 with --force-recreate" : "Re-run ops/install.sh", go: "none" } });
     }
 
     return out;
