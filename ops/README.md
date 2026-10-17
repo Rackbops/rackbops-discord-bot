@@ -1132,7 +1132,7 @@ env, which is what `src/plugins/host.ts:85` hands the plugin) and never prints i
 `{"dm":true,...}` says the listener is up, the token the plugin loaded is the one the container was created
 with (a file edited since then needs a recreate), and DMs are enabled
 (`plugins/mcp/src/http.ts:191-200`). It costs no lockout budget: a valid bearer records no failure, and
-the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:182-191`),
+the lockout is keyed by peer address anyway (`plugins/mcp/src/auth.ts:63`, `src/net/clientIp.ts:181-191`),
 so it may run in a loop. The failing answers below do count toward that lockout (a bad bearer records a
 failure, `auth.ts:66-67`; more than ten in a minute answers `429`, `auth.ts:8-12`), so read them by hand
 rather than looping. Any other answer:
