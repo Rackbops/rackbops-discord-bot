@@ -6823,6 +6823,11 @@ describe("the token gate (#468-9)", () => {
     const unlock = applyIndexSrc.slice(applyIndexSrc.indexOf('document.getElementById("unlock").addEventListener("click"'));
     expect(unlock.slice(0, unlock.indexOf("});"))).toMatch(/unlockPending = true;\s*clearGateMsg\(\);\s*showApp\(\)/);
   });
+
+  test("R6/R7 source pins: the #gate-msg element is an alert in the markup, and the toast region is created at page load, after the TOAST block", () => {
+    expect(applyIndexSrc).toMatch(/<p id="gate-msg"[^>]*role="alert"/);
+    expect(applyIndexSrc).toMatch(/\/\/ TOAST:end\s*\n\s*ensureToastRegion\(\);/);
+  });
 });
 
 // #300 (std-lib #211): showToast, tested against the real TOAST:begin/:end block via the same
@@ -10935,6 +10940,13 @@ describe("PLUGIN_ROUTING (#245): pure parts of 'Choose where it lives'", () => {
     expect(fns.routingStepModel("music", { routing, discovery: fresh }, NOW).mode).toBe("ready");
     const badDate = { ...discovery, generatedAt: "not a date" };
     expect(fns.routingStepModel("music", { routing, discovery: badDate }, NOW).mode).toBe("stale");
+  });
+
+  test("routingStepModel: a guild with no channels array yields a row with no channels instead of throwing (#467-3)", () => {
+    const bare = { ...discovery, guilds: [{ id: HOME, name: "Home", commands: null }] } as unknown as typeof discovery;
+    const m = fns.routingStepModel("music", { routing, discovery: bare }, NOW);
+    expect(m.rows.map((r) => r.id)).toEqual([HOME]);
+    expect(m.rows[0]!.channels).toEqual([]);
   });
 
   test("routingStepModel: rows follow discovery order with the saved placement folded in; a placed server the bot has left is unavailable; posts comes from discovery", () => {
