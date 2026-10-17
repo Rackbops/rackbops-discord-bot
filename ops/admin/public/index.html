@@ -1573,7 +1573,13 @@
         showToast("warning", st.outcome.message);
         return "not-ready";
       }
-      if (st.base) st.selection = mergeSelection(st.base, st.selection, selectionFromModel(model));
+      if (st.base) {
+        const theirs = selectionFromModel(model);
+        st.selection = mergeSelection(st.base, st.selection, theirs);
+        // The fresh placement is the new base: a row the merge imported is then not "mine" on a retry after
+        // a failed send, so it keeps following the saved placement while the operator's own changes stay.
+        st.base = JSON.parse(JSON.stringify(theirs));
+      }
       const planned = routingSetBody(plugin, st.selection, model);
       if (planned.error) {
         // Pick at least one channel for <server>. -- find which row is the culprit (the one in "chosen"
@@ -1587,7 +1593,9 @@
             if (refs) showChannelError(refs, "Pick at least one channel for " + row.name + ".");
           }
         }
-        st.outcome = previousOutcome; // nothing was sent: what the step said before still stands
+        // Nothing was sent: what the step said before still stands -- except "applied", which would make
+        // the step look clean (routeStepClean) and let a re-seed wipe the very pick that just failed to plan.
+        st.outcome = previousOutcome && previousOutcome.phase !== "applied" ? previousOutcome : null;
         release();
         return "error";
       }
@@ -1963,8 +1971,13 @@
     // #468 item 10: the rebuilt step has new elements; put focus back on the control that had it.
     if (routeFocusId !== null) {
       const target = document.getElementById(routeFocusId);
-      if (target && !target.disabled) target.focus();
-      routeFocusId = null;
+      // Keep the record while the rebuilt control is still disabled (a busy step rebuilt by a background
+      // refresh): its last, non-busy render restores focus. Drop it when the control is gone.
+      if (!target) routeFocusId = null;
+      else if (!target.disabled) {
+        target.focus();
+        routeFocusId = null;
+      }
     }
   }
 
