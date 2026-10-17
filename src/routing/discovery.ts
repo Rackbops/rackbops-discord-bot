@@ -120,7 +120,8 @@ export function describePlugins(
 /**
  * The file, from plain data. A server's `commands` is the registration made in it, or `null` when
  * there is none -- which, when nothing is placed, is every server except the home one (and every
- * server when registration is global, since that outcome belongs to no one server).
+ * server when registration is global, since that outcome belongs to no one server). That global outcome
+ * is recorded in the file's `global` slot instead (#482).
  */
 export function buildDiscovery(opts: {
   now: Date;
@@ -131,6 +132,7 @@ export function buildDiscovery(opts: {
   plugins: readonly PluginSummary[];
 }): DiscoveryFile {
   const { now, bot, homeGuildId, snapshots, registrations, plugins } = opts;
+  const globalRegistration = registrations.find((r) => r.guildId === "global");
   return {
     v: 1,
     generatedAt: now.toISOString(),
@@ -153,6 +155,15 @@ export function buildDiscovery(opts: {
               },
       };
     }),
+    ...(globalRegistration === undefined
+      ? {}
+      : {
+          global: {
+            registered: globalRegistration.registered,
+            ...(globalRegistration.error !== undefined ? { error: globalRegistration.error } : {}),
+            at: globalRegistration.at,
+          },
+        }),
     // `Object.fromEntries` creates own data properties, so a plugin named like an inherited key
     // (`constructor` is a legal plugin name) is an ordinary entry.
     plugins: Object.fromEntries(

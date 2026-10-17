@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -268,9 +268,20 @@ describe("applyRouting", () => {
     await applyRouting("boot");
     // Both servers were tried and no empty put followed: the global list is all they have.
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
-    expect(h.logs.error.at(-1)).toBe(
-      "[routing] the global command list was not emptied (not attempted: no server accepted its commands), so commands may show twice",
-    );
+    // No server took a list, so the global one is the only one: nothing shows twice (#482).
+    expect(h.logs.error.at(-1)).toBe("[routing] the global command list was left as it is: no server accepted its commands");
+    expect(h.logs.error.join("\n")).not.toContain("show twice");
+    expect(readDiscovery().global).toEqual({ registered: 0, error: "not attempted: no server accepted its commands", at: expect.any(String) });
+  });
+
+  test("L8: a failed empty reads \"was not emptied ... show twice\" and is recorded in discovery's global slot", async () => {
+    await placeMusicInOther();
+    const globalRoute = `/applications/${APP}/commands`;
+    const h = harness({ homeGuildId: undefined, failures: { [globalRoute]: new Error("nope") } });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.logs.error.join("\n")).toContain("show twice");
+    expect(readDiscovery().global).toEqual({ registered: 0, error: "Error: nope", at: expect.any(String) });
   });
 
   test("routed mode with no home server does not empty the global scope when the servers could not be read", async () => {
@@ -345,16 +356,17 @@ describe("applyRouting", () => {
     expect(h.logs.error).toEqual([]);
   });
 
-  test("a single-mode failure of the global scope is rethrown, and discovery has no place for it", async () => {
+  test("a single-mode failure of the global scope is rethrown, and discovery records it in the global slot", async () => {
     // With no home server the one PUT goes to the global scope, which belongs to no server's entry.
-    // discovery.json is still written, and the failure reaches the operator through index.ts's message.
+    // discovery.json is still written, and the failure also reaches the operator through index.ts's message.
     const failure = new Error("boom");
     const h = harness({ homeGuildId: undefined, failures: { [`/applications/${APP}/commands`]: failure } });
     initRouting(h.ctx);
     await expect(applyRouting("boot")).rejects.toBe(failure);
     const file = readDiscovery();
     expect(file.guilds.map((g) => g.commands)).toEqual([null, null]);
-    expect(JSON.stringify(file)).not.toContain("boom");
+    // The global scope has a slot now (#482): the failure is recorded there, not on a server.
+    expect(file.global).toEqual({ registered: 0, error: "Error: boom", at: expect.any(String) });
     expect(h.logs.error).toEqual([]);
   });
 
@@ -531,7 +543,7 @@ describe("guildJoined / guildLeft (#259)", () => {
   const handleJoin = (guild: { id: string; name: string }) => withinDeadline(guildJoined(guild), `guildJoined(${guild.name})`);
   const handleLeave = (guild: { id: string; name: string }) => withinDeadline(guildLeft(guild), `guildLeft(${guild.name})`);
 
-  test("a join in routed mode registers again, the new server included, and discovery lists it with its outcome", async () => {
+  test("L6: a join in routed mode registers the joined server ALONE, merged into the last full run's record", async () => {
     await placeMusicInOther();
     const h = harness();
     leaveOther(h);
@@ -539,19 +551,144 @@ describe("guildJoined / guildLeft (#259)", () => {
     await applyRouting("boot");
     expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
     expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME]);
+    const homeAt = readDiscovery().guilds[0]!.commands!.at;
 
     h.puts.length = 0;
     joinOther(h);
     await handleJoin(OTHER_GUILD);
 
-    // One run, the whole registration: every server, in name order, the new one with its commands.
-    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
-    expect(names(h.puts[1]!.body)).toEqual([...CORE, ...MUSIC]);
-    // Discovery, written after registering, lists it with what it was told.
-    const other = readDiscovery().guilds.find((g) => g.id === OTHER)!;
+    // ONE put, to the new server, with its commands (#482 item 5): not one per server the bot is in.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+    expect(names(h.puts[0]!.body)).toEqual([...CORE, ...MUSIC]);
+    // Discovery, written after registering, lists it with what it was told, and HOME's earlier record is intact.
+    const file = readDiscovery();
+    const other = file.guilds.find((g) => g.id === OTHER)!;
     expect(other.commands).toMatchObject({ registered: CORE.length + MUSIC.length });
     expect(other.commands?.error).toBeUndefined();
+    expect(file.guilds.find((g) => g.id === HOME)!.commands).toMatchObject({ registered: CORE.length + WOW.length, at: homeAt });
     expect(h.logs.log).toContain(`[routing] joined Other (${OTHER})`);
+    expect(h.logs.log).toContain(`Registered commands in 1 server (Other: ${CORE.length + MUSIC.length})`);
+  });
+
+  test("L6e: a join retries a global empty the last full run could not do (and not one that succeeded)", async () => {
+    await placeMusicInOther();
+    const globalRoute = `/applications/${APP}/commands`;
+    // Only the global empty fails at boot, so it is recorded with an error while the servers took their lists.
+    const h = harness({ homeGuildId: undefined, failures: { [globalRoute]: new Error("nope") } });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(readDiscovery().global?.error).toContain("nope");
+    h.puts.length = 0;
+    await handleJoin(OTHER_GUILD);
+    // The narrow join registers OTHER and retries the global empty (it fails again here: still recorded).
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER), globalRoute]);
+    expect(readDiscovery().global?.error).toContain("nope");
+
+    // A global empty that succeeded is not retried by a join.
+    resetRoutingForTest();
+    const ok = harness({ homeGuildId: undefined });
+    initRouting(ok.ctx);
+    await applyRouting("boot");
+    expect(readDiscovery().global).toMatchObject({ registered: 0 });
+    expect(readDiscovery().global?.error).toBeUndefined();
+    ok.puts.length = 0;
+    await handleJoin(OTHER_GUILD);
+    expect(ok.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+    // A second join of the same server REPLACES its record rather than adding a second one beside it.
+    const before = readDiscovery().guilds.find((g) => g.id === OTHER)!.commands!.at;
+    await handleJoin(OTHER_GUILD);
+    expect(readDiscovery().guilds.find((g) => g.id === OTHER)!.commands!.at).not.toBe(before);
+  });
+
+  test("L6b: a join while routing places nobody is the full single-mode run", async () => {
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    h.puts.length = 0;
+    await mutateRouting(dir, (c) => ({ ...c, plugins: {} }));
+    await handleJoin(HOME_GUILD); // the home server: single mode's one call IS its registration
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+    expect(names(h.puts[0]!.body)).toEqual([...CORE, ...MUSIC, ...WOW]);
+  });
+
+  test("L6c: a join of a server that is not in the snapshot falls back to the full run, never an undefined body", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    h.puts.length = 0;
+    await handleJoin({ id: "333333333333333333", name: "Ghost" }); // the fake world does not hold it
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    for (const p of h.puts) expect(Array.isArray(p.body)).toBe(true);
+  });
+
+  test("L6d: a join after a boot that could not read the servers is the full run, and the file keeps every record", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    const real = h.ctx.client;
+    let broken = true;
+    const flaky = {
+      user: real.user,
+      get guilds() {
+        if (broken) throw new Error("cache exploded");
+        return real.guilds;
+      },
+    } as unknown as Client<true>;
+    initRouting({ ...h.ctx, client: flaky });
+    await applyRouting("boot");
+    expect(h.puts).toEqual([]);
+    broken = false;
+    await handleJoin(OTHER_GUILD);
+    // The full run: HOME and OTHER both registered, and the file holds both (not one record and a null).
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect(readDiscovery().guilds.map((g) => g.commands !== null)).toEqual([true, true]);
+    // A second join is now narrow.
+    h.puts.length = 0;
+    await handleJoin(OTHER_GUILD);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+  });
+
+  test("L7: a routed run that could not read the servers keeps the last registrations (#484 item 5)", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    const real = h.ctx.client;
+    let broken = false;
+    const flaky = {
+      user: real.user,
+      get guilds() {
+        if (broken) throw new Error("cache exploded");
+        return real.guilds;
+      },
+    } as unknown as Client<true>;
+    initRouting({ ...h.ctx, client: flaky });
+    await applyRouting("boot");
+    broken = true;
+    h.puts.length = 0;
+    await applyRouting("again");
+    expect(h.puts).toEqual([]);
+    broken = false;
+    await refreshDiscovery();
+    // The boot's registrations survive the failed run: not null for every server.
+    expect(readDiscovery().guilds.every((g) => g.commands !== null && g.commands.registered > 0)).toBe(true);
+  });
+
+  test("L7b: single mode with an unreadable server cache still makes its put and records it", async () => {
+    const h = harness();
+    const real = h.ctx.client;
+    let broken = true;
+    const flaky = {
+      user: real.user,
+      get guilds() {
+        if (broken) throw new Error("cache exploded");
+        return real.guilds;
+      },
+    } as unknown as Client<true>;
+    initRouting({ ...h.ctx, client: flaky });
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+    broken = false;
+    await refreshDiscovery();
+    expect(readDiscovery().guilds.find((g) => g.id === HOME)!.commands).toMatchObject({ registered: CORE.length + MUSIC.length + WOW.length });
   });
 
   test("a join in single mode makes no registration call and refreshes discovery", async () => {
@@ -641,9 +778,10 @@ describe("guildJoined / guildLeft (#259)", () => {
     const h = harness();
     await placeMusicInOther();
     await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
-    // The boot registration that follows snapshots a cache that already holds the server.
-    expect(h.puts).toEqual([]);
-    expect(h.logs.log).toEqual([]);
+    // The boot registration that follows snapshots a cache that already holds the server. (`h` was never passed
+    // to initRouting, so its puts and logs could not have been touched either way; what can be seen is that no
+    // discovery file was written.)
+    void h;
     expect(existsSync(discoveryPath(dir))).toBe(false);
   });
 
@@ -673,8 +811,9 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(sawDiscovery).toEqual([false]);
     held.open();
     await Promise.all([boot, joined]);
-    // The boot's two puts come before discovery is written, the join's two after it.
-    expect(sawDiscovery).toEqual([false, false, true, true]);
+    // The boot's two puts come before discovery is written, the join's ONE (it registers its server alone) after it.
+    expect(sawDiscovery).toEqual([false, false, true]);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), guildRoute(OTHER)]);
   });
 
   test("two joins are applied one after the other", async () => {
@@ -688,9 +827,13 @@ describe("guildJoined / guildLeft (#259)", () => {
     });
     initRouting(h.ctx);
     await Promise.all([handleJoin(OTHER_GUILD), handleJoin(HOME_GUILD)]);
-    // Each run puts to two servers; the second run's first put comes after the first run's discovery write.
-    expect(sawDiscovery).toEqual([false, false, true, true]);
-    expect(h.puts).toHaveLength(4);
+    // No boot ran, so the first join is the fallback full run (two puts) and the second registers its server
+    // alone (one); that put comes after the first run's discovery write. The `await sleep(20)` in onPut is what
+    // lets the test observe the ordering of the two discovery writes -- it is not a race guard.
+    expect(sawDiscovery).toEqual([false, false, true]);
+    // (Which join queues first depends on when each routing read settles, so only the shape is pinned.)
+    expect(h.puts.map((p) => p.route).slice(0, 2)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect([guildRoute(HOME), guildRoute(OTHER)]).toContain(h.puts[2]!.route);
   });
 
   test("a join whose registration fails is logged, not thrown", async () => {
@@ -705,9 +848,9 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(h.logs.error.some((line) => line.includes("Missing Access"))).toBe(true);
   });
 
-  test("a join whose registration rejects in routed mode is logged, not thrown", async () => {
-    // Routed mode does not throw either -- unless something around it does: here the logger throws while the
-    // run reports what it registered, which rejects applyRouting. Nothing depends on timing.
+  test("L5 (#421): a logger that throws while the run reports what it registered does not reject a routed registration", async () => {
+    // Routed mode never throws once routing has been read: the logger's failure is swallowed (`tell`), and the
+    // PUTs and the discovery write stand.
     await placeMusicInOther();
     const errors: string[] = [];
     const h = harness({
@@ -720,9 +863,33 @@ describe("guildJoined / guildLeft (#259)", () => {
       },
     });
     initRouting(h.ctx);
+    await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "routed" });
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect(readDiscovery().guilds.map((g) => g.id)).toEqual([HOME, OTHER]);
+    // ... and a join resolves with no "handling the join ... failed" line.
     await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
-    expect(errors.some((line) => line.includes(`[routing] handling the join of Other (${OTHER}) failed`))).toBe(true);
-    expect(errors.some((line) => line.includes("the logger broke"))).toBe(true);
+    expect(errors.some((line) => line.includes("handling the join"))).toBe(false);
+  });
+
+  test("L5b/L5c (#421): a logger whose error() throws does not reject a run whose discovery write or server read failed", async () => {
+    await placeMusicInOther();
+    const broken = () => {
+      throw new Error("logger broke");
+    };
+    // L5b: the discovery WRITE fails (a directory where the file goes) and the logger's error() throws.
+    mkdirSync(discoveryPath(dir));
+    const b = harness({ log: { log: () => {}, warn: () => {}, error: broken } });
+    initRouting(b.ctx);
+    await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "routed" });
+    resetRoutingForTest();
+    rmSync(discoveryPath(dir), { recursive: true, force: true });
+    // L5c: the server cache cannot be read and the logger's error() throws.
+    const c = harness({
+      client: { user: b.world.client.user, get guilds(): never { throw new Error("cache exploded"); } } as unknown as Client<true>,
+      log: { log: () => {}, warn: () => {}, error: broken },
+    });
+    initRouting(c.ctx);
+    await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "routed" });
   });
 
   test("a logger that always throws does not make a join or a leave reject", async () => {
@@ -754,7 +921,7 @@ describe("guildJoined / guildLeft (#259)", () => {
     h.puts.length = 0;
     joinOther(h);
     await expect(handleJoin(OTHER_GUILD)).resolves.toBeUndefined();
-    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]); // the joined server alone
     await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
   });
 
@@ -816,8 +983,8 @@ describe("guildJoined / guildLeft (#259)", () => {
     await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
     expect(existsSync(discoveryPath(dir))).toBe(false);
     expect(readFileSync(routingPath(dir)).equals(before)).toBe(true);
-    expect(h.puts).toEqual([]);
-    expect(h.logs.log).toEqual([]);
+    // `h` was never passed to initRouting, so asserting on its puts or logs would be vacuous (#485 item 9).
+    void h;
   });
 
   test("a leave whose refresh fails is logged, not thrown", async () => {
@@ -830,31 +997,22 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(failing.logs.error.some((line) => line.includes("writing discovery.json failed (refresh)"))).toBe(true);
     resetRoutingForTest();
 
-    // The refresh itself rejects (here because the logger throws once, while it reports the unreadable
-    // server cache): the leave logs that and resolves, so nothing reaches the emitter.
+    // The refresh itself rejects (here because the context's log GETTER throws once, while it reports the
+    // unreadable server cache; `tell` reads `c.log` outside its try on purpose, #421): the leave logs that and
+    // resolves, so nothing reaches the emitter.
     const world = fakeWorld();
-    let logged = false;
+    let reads = 0;
     const errors: string[] = [];
-    const h = harness({
-      client: {
-        user: world.client.user,
-        get guilds(): never {
-          throw new Error("cache exploded");
-        },
-      } as unknown as Client<true>,
-      log: {
-        log: () => {},
-        warn: () => {},
-        error: (...a: unknown[]) => {
-          if (!logged) {
-            logged = true;
-            throw new Error("the logger broke");
-          }
-          errors.push(a.map(String).join(" "));
-        },
+    const h = harness({ client: { user: world.client.user, get guilds(): never { throw new Error("cache exploded"); } } as unknown as Client<true> });
+    const ctx: RoutingContext = {
+      ...h.ctx,
+      get log() {
+        reads += 1;
+        if (reads === 1) throw new Error("the logger broke");
+        return { log: () => {}, warn: () => {}, error: (...a: unknown[]) => void errors.push(a.map(String).join(" ")) };
       },
-    });
-    initRouting(h.ctx);
+    };
+    initRouting(ctx);
     await expect(handleLeave(OTHER_GUILD)).resolves.toBeUndefined();
     expect(errors.some((line) => line.includes(`[routing] handling the departure from Other (${OTHER}) failed`))).toBe(true);
   });
@@ -1130,5 +1288,214 @@ describe("routingStateForTest (what the test-state guard reads)", () => {
     } finally {
       resetRoutingQueueForTest(); // the stuck job would otherwise fail this test through the guard
     }
+  });
+});
+
+// #420: leaving routed mode (or a global past) empties what the previous discovery.json says the bot owned.
+describe("registration transitions (#420)", () => {
+  const globalRoute = `/applications/${APP}/commands`;
+  const unplace = () => mutateRouting(dir, (c) => ({ ...c, plugins: {} }));
+  const ALL = CORE.length + MUSIC.length + WOW.length;
+
+  test("L1: routed -> single-guild empties the other server once, then not again", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts).toHaveLength(2);
+    await unplace();
+    h.puts.length = 0;
+    await applyRouting("boot");
+    // OTHER is emptied FIRST, then HOME gets the full body.
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER), guildRoute(HOME)]);
+    expect(h.puts[0]!.body).toEqual([]);
+    expect(names(h.puts[1]!.body)).toHaveLength(ALL);
+    const file = readDiscovery();
+    expect(file.guilds.find((g) => g.id === OTHER)!.commands).toMatchObject({ registered: 0 });
+    expect(file.guilds.find((g) => g.id === OTHER)!.commands?.error).toBeUndefined();
+    expect(file.guilds.find((g) => g.id === HOME)!.commands).toMatchObject({ registered: ALL });
+    expect(file.global).toBeUndefined();
+    // The empty is recorded, so OTHER is no longer a candidate: ONE put now.
+    h.puts.length = 0;
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+  });
+
+  test("L2: routed (no home) -> single-global empties both servers, and the global slot records the registration", async () => {
+    await placeMusicInOther();
+    const h = harness({ homeGuildId: undefined });
+    initRouting(h.ctx);
+    await applyRouting("boot"); // HOME, OTHER, global []
+    await unplace();
+    h.puts.length = 0;
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), globalRoute]);
+    expect(h.puts[0]!.body).toEqual([]);
+    expect(h.puts[1]!.body).toEqual([]);
+    expect(names(h.puts[2]!.body)).toHaveLength(ALL);
+    const file = readDiscovery();
+    expect(file.global).toMatchObject({ registered: ALL });
+    expect(file.guilds.map((g) => g.commands?.registered)).toEqual([0, 0]);
+  });
+
+  test("L3: routed mode with a home server empties a global list an earlier global run left", async () => {
+    const g = harness({ homeGuildId: undefined });
+    initRouting(g.ctx);
+    await applyRouting("boot"); // single-global: discovery.global.registered = ALL
+    expect(readDiscovery().global).toMatchObject({ registered: ALL });
+    resetRoutingForTest();
+
+    await placeMusicInOther();
+    const h = harness({ homeGuildId: HOME });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), globalRoute]);
+    expect(h.puts[2]!.body).toEqual([]);
+    expect(readDiscovery().global).toMatchObject({ registered: 0 });
+    // The next routed run makes no global call.
+    h.puts.length = 0;
+    await applyRouting("again");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
+  });
+
+  test("L4: a first boot with no discovery.json makes exactly one put", async () => {
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+  });
+
+  test("L4/L4b: a failed empty is recorded and said; the primary put still happens and resolves", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    await unplace();
+    resetRoutingForTest();
+    const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const h2 = harness({ failures: { [guildRoute(OTHER)]: refusal } });
+    initRouting(h2.ctx);
+    // A clear's error is NOT rethrown as the primary's.
+    await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "single" });
+    expect(h2.puts.map((p) => p.route)).toEqual([guildRoute(OTHER), guildRoute(HOME)]);
+    expect(readDiscovery().guilds.find((g) => g.id === OTHER)!.commands).toMatchObject({ registered: 0, error: "Missing Access (50001)" });
+    expect(h2.logs.error).toHaveLength(1);
+    expect(h2.logs.error[0]).toContain("could not empty the stale command list of Other");
+  });
+
+  test("L4: a failed empty of the global scope is said too, in single mode", async () => {
+    const g = harness({ homeGuildId: undefined });
+    initRouting(g.ctx);
+    await applyRouting("boot");
+    resetRoutingForTest();
+    const h = harness({ homeGuildId: HOME, failures: { [globalRoute]: new Error("nope") } });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(h.puts.map((p) => p.route)).toEqual([globalRoute, guildRoute(HOME)]);
+    expect(h.logs.error.some((l) => l.includes("could not empty the stale command list of the global scope"))).toBe(true);
+  });
+
+  test("L4b: the primary put failing in single mode still rejects with that very error, after discovery is written", async () => {
+    const boom = Object.assign(new Error("Missing Access"), { code: 50001 });
+    const h = harness({ failures: { [guildRoute(HOME)]: boom } });
+    initRouting(h.ctx);
+    await expect(applyRouting("boot")).rejects.toBe(boom);
+    expect(readDiscovery().guilds.find((g) => g.id === HOME)!.commands).toMatchObject({ registered: 0, error: "Missing Access (50001)" });
+  });
+
+  test("L4c: a discovery.json holding a null guild never stops single mode's put, and says nothing", async () => {
+    writeFileSync(discoveryPath(dir), JSON.stringify({ guilds: [null], plugins: [], generatedAt: "x" }));
+    const h = harness();
+    initRouting(h.ctx);
+    await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "single" });
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+    expect(h.logs.error).toEqual([]);
+  });
+
+  test("L4c-fault: a previous discovery.json that cannot be read is said, and the put still happens", async () => {
+    const real = Bun.file.bind(Bun);
+    const spy = spyOn(Bun, "file").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.endsWith("discovery.json")) {
+        return {
+          exists: async () => true,
+          json: async () => {
+            throw Object.assign(new Error("EIO: i/o error"), { code: "EIO" });
+          },
+        } as unknown as ReturnType<typeof Bun.file>;
+      }
+      return (real as (...a: unknown[]) => unknown)(path, ...rest) as ReturnType<typeof Bun.file>;
+    }) as typeof Bun.file);
+    try {
+      const h = harness();
+      initRouting(h.ctx);
+      await expect(applyRouting("boot")).resolves.toMatchObject({ mode: "single" });
+      expect(h.puts.map((p) => p.route)).toEqual([guildRoute(HOME)]);
+      const said = h.logs.error.filter((l) => l.includes("could not read the previous discovery.json"));
+      expect(said).toHaveLength(1);
+      expect(said[0]).toContain("EIO");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+// #485 item 8: a server's name in a log line is one bounded line.
+describe("server names in log lines (#485)", () => {
+  const ESC = String.fromCharCode(0x1b);
+  const EVIL = `Evil\nforged [routing] line${ESC}`;
+  const OTHER_EVIL = { id: OTHER, name: EVIL };
+  const FFFD = String.fromCharCode(0xfffd);
+
+  test("L9: a join and a leave name the server on one line, with the controls replaced and the name clipped", async () => {
+    await placeMusicInOther();
+    const h = harness();
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    h.world.guilds.get(OTHER)!.name = EVIL;
+    await guildJoined(OTHER_EVIL);
+    await guildLeft(OTHER_EVIL);
+    const lines = [...h.logs.log, ...h.logs.error].filter((l) => l.includes("Evil"));
+    expect(lines.length).toBeGreaterThan(0);
+    for (const l of lines) {
+      expect(l).not.toContain("\n");
+      expect(l).not.toContain(ESC);
+      expect(l).toContain(FFFD);
+    }
+    await guildJoined({ id: OTHER, name: "x".repeat(300) });
+    expect(h.logs.log.some((l) => l.includes(`${"x".repeat(80)} (${OTHER})`) && !l.includes("x".repeat(81)))).toBe(true);
+  });
+
+  // The join REASON reaches a log line only when the discovery write fails (writeView's catch prints it).
+  const failingWrite = async (join: (h: ReturnType<typeof harness>) => Promise<void>) => {
+    mkdirSync(discoveryPath(dir)); // a directory where the file goes: the write fails
+    const h = harness();
+    h.world.guilds.get(OTHER)!.name = EVIL;
+    h.world.guilds.get(HOME)!.name = EVIL;
+    initRouting(h.ctx);
+    await join(h);
+    const line = h.logs.error.find((l) => l.includes("writing discovery.json failed (joined"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain(ESC);
+    expect(line).toContain(FFFD);
+  };
+
+  test("L9b: the join reason is one line on the narrow path, the fallback path and a single-mode home join", async () => {
+    await placeMusicInOther();
+    // the fallback path: no full run has completed in this process
+    await failingWrite(() => guildJoined(OTHER_EVIL));
+    resetRoutingForTest();
+    rmSync(discoveryPath(dir), { recursive: true, force: true });
+    // the narrow path: a full run completed (its own discovery write fails, which is fine), then the join
+    await failingWrite(async (h) => {
+      await applyRouting("boot");
+      h.logs.error.length = 0;
+      await guildJoined(OTHER_EVIL);
+    });
+    resetRoutingForTest();
+    rmSync(discoveryPath(dir), { recursive: true, force: true });
+    // a single-mode join of the home server
+    await mutateRouting(dir, (c) => ({ ...c, plugins: {} }));
+    await failingWrite(() => guildJoined({ id: HOME, name: EVIL }));
   });
 });

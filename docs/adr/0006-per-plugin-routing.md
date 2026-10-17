@@ -36,7 +36,10 @@ request mailbox and applied without a restart.
    only server" and becomes "the home server": a plugin with no entry in `routing.json` registers
    there and posts to `ANNOUNCE_CHANNEL_ID`, exactly as before. With no `routing.json` at all the
    bot makes byte-for-byte the registration call it makes today — to the home server when
-   `DISCORD_SERVER_ID` is set, globally when it is not.
+   `DISCORD_SERVER_ID` is set, globally when it is not. *Amended by #420:* plus, once, the empties a
+   routed past requires — the servers whose `discovery.json` record shows a list of their own, and a
+   global list an earlier run registered — because a PUT replaces one scope's list and a scope the run
+   does not write keeps what it had.
 4. **The bot publishes what it can see, as `data/discovery.json`.** Its servers, their text
    channels and whether it can post in each, the outcome of the last command registration per
    server, and an invite URL carrying the `applications.commands` scope. The panel reads that file
