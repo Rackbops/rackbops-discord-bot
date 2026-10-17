@@ -1483,6 +1483,25 @@ describe("updateReply for the new decision (#505 item 4)", () => {
     const { updateReply } = await import("./commands");
     expect(updateReply("undetermined", NEW, { runningSha: OLD })).toContain("couldn't tell");
   });
+
+  test("U1f: an unreachable daemon is not described as a replacement that failed its handoff", async () => {
+    const { updateReply } = await import("./commands");
+    const reply = updateReply("restart", NEW, {
+      runningSha: OLD,
+      redeploy: { outcome: "failed", error: "x" },
+      daemonUnreachable: true,
+      commandName: "update",
+    });
+    expect(reply).toContain("did not answer");
+    expect(reply).not.toContain("replacement");
+    expect(reply).toContain("/update again");
+  });
+
+  test("U1f: the /update handler passes daemonUnreachable from checkForUpdate to updateReply", () => {
+    const commands = readFileSync(join(import.meta.dir, "commands.ts"), "utf8");
+    expect(commands).toContain("redeploy, daemonUnreachable } = await checkForUpdate(");
+    expect(commands).toMatch(/redeploy,\s*daemonUnreachable,\s*commandName: interaction\.commandName/);
+  });
 });
 
 describe("the production wiring of the unreachable-daemon branch (#505 item 1)", () => {

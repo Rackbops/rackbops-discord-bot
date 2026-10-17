@@ -115,7 +115,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
         // only one through clampReply, while a failed swap's reply carries the daemon's error text unbounded.
         let content: string;
         try {
-          const { decision, latestSha, reason, redeploy } = await checkForUpdate({
+          const { decision, latestSha, reason, redeploy, daemonUnreachable } = await checkForUpdate({
             force: true,
             // Recorded so the next boot can report back what build it actually landed on.
             requester: {
@@ -130,6 +130,7 @@ export const CORE_COMMANDS: readonly CoreCommand[] = [
               runningSha: config.gitSha,
               reason,
               redeploy,
+              daemonUnreachable,
               commandName: interaction.commandName,
             }),
           );
@@ -420,7 +421,13 @@ async function refuseUnclaimed(interaction: ChatInputCommandInteraction): Promis
 export function updateReply(
   decision: UpdateDecision,
   latestSha: string,
-  o: { runningSha?: string; reason?: DisabledReason; redeploy?: RedeployResult; commandName?: string } = {},
+  o: {
+    runningSha?: string;
+    reason?: DisabledReason;
+    redeploy?: RedeployResult;
+    daemonUnreachable?: boolean;
+    commandName?: string;
+  } = {},
 ): string {
   const short = shortSha(latestSha);
   const running = o.runningSha ? shortSha(o.runningSha) : undefined;
@@ -454,6 +461,11 @@ export function updateReply(
       // this process mid-await, and delivers the ✅ itself from `pendingUpdateReport`. So a
       // result present at all is a failed swap, and the reply says so instead of promising a
       // return that isn't coming (nazumods/wow#879).
+      // The daemon never answered its ping, so no replacement was created: say that, not "the replacement ... did not
+      // complete the handoff" (#505).
+      if (o.daemonUnreachable) {
+        return `⚠️ The docker daemon did not answer, so nothing was built and I stayed on \`${running}\`. Try /${o.commandName ?? "update"} again shortly.`;
+      }
       if (o.redeploy) {
         const kind =
           o.redeploy.outcome === "timeout" || o.redeploy.outcome === "stalled"

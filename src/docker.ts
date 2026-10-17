@@ -193,7 +193,15 @@ export function isSocketPath(path: string): boolean {
  *  `daemonReachable`, which asks whether the daemon on it answers. Mounted-but-unanswering is a daemon problem to
  *  report; not mounted is the no-socket deployment that exits 75 and lets its supervisor supply the new image. */
 export function dockerSocketMounted(): boolean {
+  if (mountedForTest !== undefined) return mountedForTest;
   return isSocketPath(BOT_DOCKER_SOCKET);
+}
+
+/** Test seam: `BOT_DOCKER_SOCKET` is read once at import, and a CI runner has a real `/var/run/docker.sock`, so a
+ *  test of the no-socket (exit 75) path must say the socket is absent. Pass `undefined` to restore the real stat. */
+let mountedForTest: boolean | undefined;
+export function setDockerSocketMountedForTest(v: boolean | undefined): void {
+  mountedForTest = v;
 }
 
 /** Whether the daemon socket is actually reachable — the one precondition for self-update. */
