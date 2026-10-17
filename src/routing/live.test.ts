@@ -594,6 +594,10 @@ describe("guildJoined / guildLeft (#259)", () => {
     ok.puts.length = 0;
     await handleJoin(OTHER_GUILD);
     expect(ok.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+    // A second join of the same server REPLACES its record rather than adding a second one beside it.
+    const before = readDiscovery().guilds.find((g) => g.id === OTHER)!.commands!.at;
+    await handleJoin(OTHER_GUILD);
+    expect(readDiscovery().guilds.find((g) => g.id === OTHER)!.commands!.at).not.toBe(before);
   });
 
   test("L6b: a join while routing places nobody is the full single-mode run", async () => {
