@@ -1607,7 +1607,23 @@ describe.skipIf(!runnable)("install.sh refreshes the compose file in place so a 
     );
   });
 
-  test("E4 source pin: the in-place branch is guarded by -O and a regular, non-symlink file; only the compose file uses it", () => {
+  test.skipIf(process.platform === "win32")("E4 (e): an owned but read-only (0444) destination is replaced via mv, not aborted on (CI Linux)", async () => {
+    let before = 0;
+    await withInPlace(
+      (dir) => {
+        writeFileSync(join(dir, "dest.yml"), "OLD\n");
+        chmodSync(join(dir, "dest.yml"), 0o444);
+        before = statSync(join(dir, "dest.yml")).ino;
+      },
+      (_dir, r) => {
+        expect(r.exitCode, r.stderr).toBe(0);
+        expect(readFileSync(r.dest, "utf8")).toBe("NEW\n");
+        expect(statSync(r.dest).ino).not.toBe(before); // the mv branch: a new inode
+      },
+    );
+  });
+
+  test("E4 source pin: the in-place branch needs a regular non-symlink file we own (or root) that is writable; only the compose file uses it", () => {
     expect(FETCH_IN_PLACE).toContain('[ -f "$3" ] && [ ! -L "$3" ] && { [ -O "$3" ] || [ "$(id -u)" -eq 0 ]; } && [ -w "$3" ]');
     expect(installShSource).toMatch(/^ {2}fetch_in_place "docker-compose\.yml" 644 "\$STACK_DIR\/docker-compose\.yml"$/m);
     expect(installShSource).not.toMatch(/fetch_in_place "(\.env\.example|ops\/bot-ops\.sh)"/);
