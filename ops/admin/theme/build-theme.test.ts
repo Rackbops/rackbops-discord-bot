@@ -4,7 +4,7 @@ import { composeThemeCss, EXACT_VERSION_RE, pinProblem } from "./build-theme";
 describe("the pin check the build entry point runs", () => {
   test("B1: an exact x.y.z is accepted; a range, a short or pre-release version and a non-string name the value", () => {
     expect(pinProblem("1.2.3")).toBeNull();
-    for (const bad of ["^1.2.3", "1.2", "1.2.3-beta", 1, undefined] as const) {
+    for (const bad of ["^1.2.3", "1.2", "1.2.3-beta", 1, undefined, ["1.2.3"]] as const) {
       const message = pinProblem(bad);
       expect(message, String(bad)).not.toBeNull();
       expect(message, String(bad)).toContain("must be an exact x.y.z version");
