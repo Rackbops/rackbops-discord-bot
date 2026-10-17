@@ -298,6 +298,14 @@ describe("buildDiscovery", () => {
   test("a global registration belongs to no one server, so every server reads null", () => {
     const file = build({ registrations: [{ guildId: "global", registered: 7, at: AT }] });
     expect(file.guilds.map((g) => g.commands)).toEqual([null, null]);
+    // ...and it is recorded in the file's `global` slot instead (#482).
+    expect(file.global).toEqual({ registered: 7, at: AT });
+  });
+
+  test("the global slot carries the error of a failed or skipped empty, and is absent when the scope was not touched (#482)", () => {
+    const failed = build({ registrations: [{ guildId: "global", registered: 0, error: "Unknown application (10002)", at: AT }] });
+    expect(failed.global).toEqual({ registered: 0, error: "Unknown application (10002)", at: AT });
+    expect(Object.hasOwn(build({ registrations: [{ guildId: HOME, registered: 7, at: AT }] }), "global")).toBe(false);
   });
 
   test("homeGuildId is null when unset", () => {
@@ -315,6 +323,17 @@ describe("buildDiscovery", () => {
   test("the file has exactly the documented top-level shape", () => {
     const file = build();
     expect(Object.keys(file).sort()).toEqual(["bot", "generatedAt", "guilds", "homeGuildId", "inviteUrl", "plugins", "v"]);
+    // `global` is the one optional key (#482): present only once the global scope has an outcome.
+    expect(Object.keys(build({ registrations: [{ guildId: "global", registered: 1, at: AT }] })).sort()).toEqual([
+      "bot",
+      "generatedAt",
+      "global",
+      "guilds",
+      "homeGuildId",
+      "inviteUrl",
+      "plugins",
+      "v",
+    ]);
     expect(file.v).toBe(1);
     expect(file.generatedAt).toBe(NOW.toISOString());
     expect(file.bot).toEqual(BOT);
@@ -415,6 +434,12 @@ describe("readDiscovery (#241)", () => {
     const file = build({ registrations: [{ guildId: HOME, registered: 7, at: AT }] });
     await writeDiscovery(dir, file);
     expect(await readDiscovery(dir)).toEqual(file);
+  });
+
+  test("a file with a global slot is read back unchanged (#482)", async () => {
+    const file = build({ registrations: [{ guildId: "global", registered: 3, at: AT }] });
+    await writeDiscovery(dir, file);
+    expect((await readDiscovery(dir))!.global).toEqual({ registered: 3, at: AT });
   });
 
   test("a file with an empty guilds list is a file: the bot published that it is in no server", async () => {
