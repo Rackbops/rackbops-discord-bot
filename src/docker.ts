@@ -204,6 +204,16 @@ export function setDockerSocketMountedForTest(v: boolean | undefined): void {
   mountedForTest = v;
 }
 
+/** The test-state guard's snapshot (test/stateGuard.ts): the override a test left set. */
+export function dockerStateForTest(): { mountedOverride: boolean | undefined } {
+  return { mountedOverride: mountedForTest };
+}
+
+/** Puts `dockerSocketMounted` back on the real stat. */
+export function resetDockerForTest(): void {
+  mountedForTest = undefined;
+}
+
 /** Whether the daemon socket is actually reachable — the one precondition for self-update. */
 export async function daemonReachable(timeoutMs = DEFAULT_TIMEOUT_MS): Promise<boolean> {
   try {

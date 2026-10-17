@@ -92,6 +92,13 @@ export function configLeaks(s: { changedKeys: string[] }): string[] {
   return s.changedKeys.length === 0 ? [] : [`config changed since it was resolved: ${s.changedKeys.join(", ")}`];
 }
 
+/** Against what `resetDockerForTest()` leaves. */
+export function dockerLeaks(s: { mountedOverride: boolean | undefined }): string[] {
+  return s.mountedOverride === undefined
+    ? []
+    : [`dockerSocketMounted forced to ${s.mountedOverride} — every later update check would skip the real socket stat`];
+}
+
 /** Against what `resetUpdateForTest()` leaves. */
 export function updateLeaks(s: {
   checkInFlight: boolean;
