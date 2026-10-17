@@ -1774,7 +1774,8 @@ _Avoid_: server list, guild cache
   it, edit the pin, `bun install` and `bun run build` in `ops/admin/theme/`, and commit the
   regenerated CSS with `package.json` and `bun.lock` — never hand-edit it. `server.test.ts`'s "is
   stamped with the version pinned…" compares the file's first line with the banner `composeThemeCss`
-  writes for the pin, so a bump without a rebuild (or a hand-edit of the banner) fails; it needs no
+  writes for the pin, so a bump without a rebuild fails; it checks the banner line only, so a hand edit
+  below it is not caught (hence never hand-edit); it needs no
   `node_modules`, and CI installs none for the theme package (only the root and `ops/admin`), so no
   test may import `@rackbops/styles`. (2) The page's `<link rel="stylesheet">`s are answered by
   `handleRequest` from `HandlerConfig.assets`, a `Map` keyed by the exact request path and built at

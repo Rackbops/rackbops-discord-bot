@@ -9,9 +9,9 @@ it: `src/warbandeer/links.ts:215` is an unconditional top-level `await` reached 
 `src/commands.ts:23` and `src/index.ts:10`, so a bot with the connector *disabled* still reads
 `data/links.json` at every boot; and a self-update replacement snapshots `links` at module load —
 before `takeOver()` — while the original keeps serving `/link`, `/unlink` and the ingest endpoint
-(`beginHandoff()`, `src/restart.ts:71-74`, only quiesces the scheduler via `restartPending()`,
-`src/announce.ts:217`, and refuses a second `/update` via `handoffActive()`) for the length of the
-handoff — bounded by `VERIFY_DEADLINE_MS` (`src/handoff.ts:22`; since #492 it counts from the module top, so
+(`beginHandoff()` in `src/restart.ts` only quiesces the scheduler via the `restartPending()` check
+in `src/announce.ts`'s `onTick`, and refuses a second `/update` the same way, via `restartPending()` in `src/update.ts`) for the length of the
+handoff — bounded by `VERIFY_DEADLINE_MS` (`src/handoff.ts`; since #492 it counts from the module top, so
 boot-mode resolution is inside it) and the retire step — so the replacement's first whole-file `saveLinks()` overwrites whatever the original
 wrote in that window.
 
