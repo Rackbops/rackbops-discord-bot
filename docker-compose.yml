@@ -11,13 +11,12 @@ x-rackbops-schema: 1
 services:
   bot:
     build:
-      # Defaults to the local checkout, unchanged for `docker compose up -d --build` here.
-      # A deployed instance instead supplies BOT_BUILD_CONTEXT as a shell var on the build
-      # invocation itself (e.g. https://github.com/Rackbops/rackbops-discord-bot.git#main) so the
-      # daemon fetches and builds the source itself — no checkout needed on that host at all.
-      # NOT persisted in .env: nothing rebuilds via `docker compose --build` after the initial
-      # bring-up (self-update's own rebuilds go through the Docker Engine API directly, in
-      # src/redeploy.ts, independent of this file). See ops/install.sh and ops/README.md.
+      # Defaults to the local checkout (.) for `docker compose up -d --build` there. A deployed
+      # instance's stack .env, written by ops/install.sh (#169), sets BOT_BUILD_CONTEXT to
+      # <repo-url>#<branch> (e.g. https://github.com/Rackbops/rackbops-discord-bot.git#main), so
+      # the printed `up -d --build` (and Dockge's buttons) rebuild from the branch with no checkout
+      # on the host. Self-update's own rebuilds go through the Docker Engine API (src/redeploy.ts),
+      # not this file. See ops/install.sh and ops/README.md.
       context: ${BOT_BUILD_CONTEXT:-.}
       args:
         # Pass the commit so the bot can tell when it's stale. In a local checkout:
@@ -40,9 +39,9 @@ services:
     # #547 would be renamed at its next boot.
     container_name: ${BOT_OPS_CONTAINER:-warbandeer-discord}
     # Defaults to a file beside this compose file (local dev, unchanged). A deployed
-    # instance's config dir lives elsewhere (/opt/rackbops-discord-bot/<instance>/.env,
-    # see ops/README.md), so ops/bot-ops.sh and ops/install.sh both export BOT_ENV_FILE
-    # to point here at its absolute path.
+    # instance's stack .env sets BOT_ENV_FILE to the config dir's .env
+    # (/opt/rackbops-discord-bot/<instance>/.env, see ops/README.md; written by ops/install.sh,
+    # #169); ops/bot-ops.sh also passes it on its restart and recreate calls.
     env_file: ${BOT_ENV_FILE:-.env}
     # #60 item 2 / #168: tell the bot which file it actually got, so src/bootLog.ts can log it on
     # every boot. Same interpolation as env_file: above (${BOT_ENV_FILE:-.env}), so the two can never
@@ -74,7 +73,7 @@ services:
   # port — reached over the network via nucbox's own pre-existing, host-level Cloudflare tunnel
   # (an ingress rule pointed at this service, external to this compose file), gated by Cloudflare
   # Access — NOT via the `cloudflared` sidecar below, which is a separate, opt-in tunnel
-  # dedicated to WARBANDEER_INGEST_PORT (see its own comment). See ops/README.md's Admin panel
+  # for the bot's own endpoints (see its own comment). See ops/README.md's Admin panel
   # section for the full two-door auth model (Access + door 2 — a verified Access JWT primarily,
   # the ADMIN_TOKEN bearer check as a fallback — both baked into the panel itself).
   admin:
@@ -129,12 +128,14 @@ services:
     profiles:
       - admin
 
-  # Opt-in: exposes the bot's local API (the Warbandeer character-linking endpoint,
-  # WARBANDEER_INGEST_PORT — see README's "Character linking" section) to the internet
-  # without opening inbound firewall ports. TUNNEL_TOKEN below is Compose interpolation, not
+  # Opt-in: exposes the bot's own HTTP endpoints (HTTP_PORT, ADR-0007; or the warbandeer
+  # plugin's WARBANDEER_INGEST_PORT, see README's "Character linking" section) through a
+  # Cloudflare tunnel, without opening inbound firewall ports. Point the tunnel at the bot's
+  # container name, not the `bot` alias (README's Cloudflare Tunnel section). TUNNEL_TOKEN below is Compose interpolation, not
   # env_file: — same mechanism as the admin service's secrets above — so CLOUDFLARE_TUNNEL_TOKEN
   # must be exported into the invoking shell (out of $CONFIG_DIR/.env; see ops/install.sh's
-  # printed instructions), not just set "in .env" generically. Start with:
+  # printed instructions), not just set "in .env" generically. On a deployed instance start it with
+  # ops/install.sh's printed step 5 (`--no-deps`, so the bot is never touched); in a local checkout:
   #   docker compose --profile tunnel up -d --build
   cloudflared:
     # Pinned, not :latest — a floating tag pulls whatever cloudflared shipped that day on every

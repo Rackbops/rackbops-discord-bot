@@ -206,11 +206,12 @@ enforces) is written up in [`docs/adr/`](docs/adr/) — 0001 through 0003.
 
 ## Cloudflare Tunnel
 
-An opt-in sidecar exposing the bot's local API (currently: the character-linking endpoint above)
-to the internet without opening any inbound firewall ports.
+An opt-in sidecar exposing the bot's own HTTP endpoints (the plugin router on `HTTP_PORT`, ADR-0007, or
+the character-linking endpoint above) to the internet without opening any inbound firewall ports.
 
 1. In the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/), go to **Networks → Tunnels**, create a tunnel, choose the **Docker** connector, and copy the token it gives you.
-2. Set `CLOUDFLARE_TUNNEL_TOKEN`, `PLUGINS=warbandeer`, and `WARBANDEER_INGEST_PORT` in `.env`.
+2. Set `CLOUDFLARE_TUNNEL_TOKEN`, `PLUGINS=warbandeer`, and `WARBANDEER_INGEST_PORT` (or `HTTP_PORT`, for a plugin
+   served by the bot's own HTTP router) in `.env`.
 3. Start it alongside the bot:
 
    **Local dev** (a checkout's own `.env` beside `docker-compose.yml` is Compose's interpolation
@@ -228,13 +229,19 @@ to the internet without opening any inbound firewall ports.
    ```
    CLOUDFLARE_TUNNEL_TOKEN=$(grep '^CLOUDFLARE_TUNNEL_TOKEN=' /opt/rackbops-discord-bot/<instance>/.env | cut -d= -f2-) \
      docker compose -f /opt/stacks/rackbops-discord-bot-<instance>/docker-compose.yml \
-       -p rackbops-discord-bot-<instance> --profile tunnel up -d --build cloudflared
+       -p rackbops-discord-bot-<instance> --profile tunnel up -d --no-deps cloudflared
    ```
+
+   `--no-deps` and the service name keep the command off the bot: `cloudflared` has `depends_on: bot`, so without
+   them Compose would also rebuild the bot from the branch tip and recreate it.
 
    Without `--profile tunnel`, the sidecar doesn't start — a normal `docker compose up` is unaffected and doesn't need the token.
 
-Map a public hostname to `http://bot:<WARBANDEER_INGEST_PORT>` in the tunnel's **Public Hostname**
-settings in the dashboard.
+Map a public hostname, in the tunnel's **Public Hostname** settings, to the bot's container NAME --
+`http://rackbops-discord-bot-<instance>:<port>` on a deployed instance (`warbandeer-discord` in a local
+checkout), never the `bot` alias, which a self-update's replacement also carries for a while -- and the port the
+endpoint listens on: `HTTP_PORT` for a plugin served by the bot's own HTTP router (under `/<plugin-name>/`,
+ADR-0007), or `WARBANDEER_INGEST_PORT` for the warbandeer plugin's own ingest server.
 
 ## Behavior notes
 
