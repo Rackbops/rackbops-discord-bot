@@ -6,8 +6,8 @@ core plus feature plugins installed from a published Plugin Index. **Forked with
 [Nazuraki](https://github.com/nazumods)** -- full credit for the original bot and its documented
 gotchas. The direction here is a **generic, modular bot core** with the WoW-specific pieces as plugins
 rather than the whole bot: character linking is already its own plugin (`@rackbops/plugin-warbandeer`,
-#100), with DMF, realm status and transmog still in the core and headed the same way -- see
-[`PURPOSE.md`](PURPOSE.md).
+#100), and the WoW commands (DMF, realm status, transmog) already moved to `@rackbops/plugin-wow`
+(#107); the core holds no WoW code -- see [`PURPOSE.md`](PURPOSE.md).
 
 My personal `~/.codex/AGENTS.md` governs *how I work* -- the review gate, escalation, git &
 shipping, commit mechanics, search-tool routing, and shell choice. It is **not restated here**; this
@@ -64,7 +64,9 @@ from it. **This repo deviates from that letter on purpose (decided 2026-09-08, i
   `ops/install.sh` run, holds only non-secret params (container name, paths, build context, the
   resolved commit). Compose's own `${VAR}` interpolation source.
 - `/opt/rackbops-discord-bot/<instance>/.env` -- hand-edited from `.env.example` once, holds
-  secrets (`DISCORD_TOKEN` and friends), never touched again by anything but the operator.
+  secrets (`DISCORD_TOKEN` and friends), never overwritten by `ops/install.sh` (it writes the one generated
+  `ADMIN_TOKEN` line when it creates the file); after that only the operator changes it, by hand or through the
+  panel's saves (`bot-ops.sh env-set`, which backs it up first).
 
 **Why the override is still allowed:** the personal rule exists to guarantee three things, and all
 three hold here without merging the files -- no deployment param lives in the operator's head or

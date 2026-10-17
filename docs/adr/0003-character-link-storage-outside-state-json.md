@@ -1,5 +1,7 @@
 # Character-link storage lives outside state.json
 
+> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-warbandeer` (#100). File and line references below are as of the decision.
+
 `src/state.ts`'s `BotState` is small announcement-dedup state — dozens of bytes to a few KB,
 loaded whole into memory at import and rewritten whole on every `saveState()`. A Character
 Snapshot per Linked Account is orders of magnitude bigger, changes on an unrelated cadence (a

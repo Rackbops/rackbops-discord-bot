@@ -1,5 +1,7 @@
 # Plugins are bundles fetched from a published manifest
 
+> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-warbandeer` (#100). File and line references below are as of the decision. Its `src/index.ts`, `src/commands.ts`, `src/config.ts` and `src/redeploy.ts` line numbers describe PR #92's pre-plugin state.
+
 `PURPOSE.md` states the direction — "a generic bot core with the WoW-specific pieces ... as one
 plugin among others" — but the first candidate shipped the other way. PR #92 (issue #3) hand-wired
 the Warbandeer connector into `src/index.ts:10,76-92`, `src/commands.ts:23-24,82-94,200-207`,

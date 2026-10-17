@@ -1,5 +1,7 @@
 # HTTP ingest for the Warbandeer connector, behind the existing Cloudflare Tunnel
 
+> **Note (2026-10):** some of the code this ADR cites has since moved to `@rackbops/plugin-warbandeer` (#100). File and line references below are as of the decision. Link Codes have since grown to 13 characters from a 30-symbol alphabet, about 64 bits (plugins #69).
+
 The bot has zero inbound network surface today, deliberately — but `docker-compose.yml`'s
 `cloudflared` sidecar (`profiles: [tunnel]`) was already staged for exactly this, per its own
 comment and `CONTEXT.md`'s gotcha ("pure plumbing for now... once a future local server exists").
@@ -32,7 +34,8 @@ reports the feature disabled rather than minting a Link Code redeemable nowhere.
 
 **Enabling the tunnel profile makes this endpoint genuinely public**, unlike the admin panel's
 own tunnel use. `ops/admin/`'s panel sits behind Cloudflare Access — a login wall — in front of
-its own bearer-token door 2. This connector has no Access gate at all: an arbitrary guild member
+its own door 2 (a verified Access JWT, with the `ADMIN_TOKEN` bearer token as the
+fallback). This connector has no Access gate at all: an arbitrary guild member
 has no Access identity to check, which is exactly why ADR-0002 exists as its own auth layer
 rather than reusing Access. Once a public hostname is mapped to it, `POST /link` is reachable by
 anyone on the internet, gated only by an 8-hex-character Link Code (a 32-bit space, and

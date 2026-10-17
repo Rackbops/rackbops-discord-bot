@@ -219,8 +219,10 @@ hand-edited `$CONFIG_DIR/.env` (secrets — `DISCORD_TOKEN` and friends) are two
 one. The rule's actual *purpose* still holds through all three of its own tests: no deployment
 param lives in the operator's head or shell history (it's in the generated file); a generated file
 is never hand-edited (`install.sh` always refreshes the stack `.env`, same as `bot-ops.sh` and the
-compose file); and the one precious, operator-edited file is never touched by anything but the
-operator (`$CONFIG_DIR/.env`, created once from `.env.example` and left alone on every later run).
+compose file); and the one precious, operator-edited file is never changed on its own
+(`$CONFIG_DIR/.env`, created once from `.env.example`: `install.sh` writes only the one generated
+`ADMIN_TOKEN` line when it creates the file and leaves it alone on every later run; after that only the
+operator changes it, by hand or through the panel's saves, `bot-ops.sh env-set`, which backs it up first).
 Promoting the stack `.env` to hold secrets too (so a single file covered both) would need migrating
 live secrets on every already-deployed instance for no behaviour change; a full renderer that emits
 both files from one answer file would give up the property that lets `install.sh` be safely re-run
@@ -559,8 +561,7 @@ curl -fsSL https://raw.githubusercontent.com/Rackbops/rackbops-discord-bot/main/
 It needs its **own** Discord application/token — create one at
 <https://discord.com/developers/applications>, same as any fresh bot (see the main
 [README](../README.md#setup)) — since it's a genuinely separate deployment, not a clone of
-debug's identity. Once bootstrapped, give it an `ops.json` target once the panel gap above is
-closed; until then, manage it directly (the fetched `/opt/rackbops-discord-bot/bin/bot-ops.sh`
+debug's identity. Once bootstrapped, give it an `ops.json` target, or manage it directly (the fetched `/opt/rackbops-discord-bot/bin/bot-ops.sh`
 over SSH, or `ops/install.sh`'s own
 printed commands).
 
@@ -1365,9 +1366,8 @@ was rehearsed on this deployment (section 9); the `unregister`, the stop and the
 
 A small per-instance web panel (`ops/admin/`) — an authenticated wrapper around this
 script's own operations, plus a few server-native routes of its own, some of which write (see "What it
-exposes" below). Built primarily to sidestep the `ops.json` gap
-above rather than fix it: reachable from anywhere, not just wherever the desktop app is
-installed, and scoped to its own instance by the four `BOT_OPS_*` values its container is started with
+exposes" below). Built so it is reachable
+from anywhere, not just wherever the desktop app is installed, and scoped to its own instance by the four `BOT_OPS_*` values its container is started with
 (not structurally: the container mounts the Docker socket and the host-shared `bin/`, so it is those
 values and `bot-ops.sh`'s checks of them that keep it to one instance; it only ever
 knows its own `BOT_OPS_CONFIG_DIR`/`BOT_OPS_COMPOSE_FILE`, baked in per-instance).
