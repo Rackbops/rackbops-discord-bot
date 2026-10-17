@@ -2246,11 +2246,11 @@ describe.skipIf(!runnable)("bot-ops.sh version (issue #173)", () => {
     expect(src).toMatch(/readonly BOT_OPS_SCHEMA=8\b/);
   });
 
-  test("version reports schema 7 (#430: PLUGINS pins match the bot)", async () => {
+  test("version reports schema 8 (#474: PLUGIN_INDEX_URL refuses userinfo, status adds dockerError)", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["version"]);
     expect(run.exitCode).toBe(0);
-    expect((run.json as { schema: number }).schema).toBe(7);
+    expect((run.json as { schema: number }).schema).toBe(8);
   });
 
   // #173 round 3: `version` needs no instance config at all — a real review-caught bug had it
