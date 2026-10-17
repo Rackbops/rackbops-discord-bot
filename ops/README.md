@@ -24,8 +24,8 @@ time, not silently written.
 
 | Command | Does |
 |---|---|
-| `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none) |
-| `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw |
+| `status` | JSON: container running?, status line, image, last-observed realm status, and `plugins` (the bot's recorded plugin state — `[]` when none); plus `dockerError` (`"docker ps failed (exit N)"`, the exit code only) when `docker ps` itself failed, so that is not read as "no container" — the exit status stays 0 (#473) |
+| `logs [N]` | Last `N` container log lines (default 200, capped 5000), raw; `N` is read as decimal, so `07777` is 7777 and is capped (#473) |
 | `restart` | Restart the bot process in place (`docker compose restart`) — no env reload. **SSH-only since #277**: the admin panel's Restart button calls `recreate` instead. Compose's output is relayed the way `env-set`'s `log` is (#240): withheld if it is about the env file, scrubbed otherwise — so it is printed when compose has finished, not as it goes; a failed restart prints it, exits with compose's status, and does not say `restarted`. **#227:** holds the same config-dir lock `env-set`/`recreate` do for its whole run, so it queues behind one already in progress rather than overlapping it |
 | `recreate` | `up -d --force-recreate` on its own, with no value submitted first — the same recreate `env-set` runs after a save, exposed as its own subcommand (#277) so a recreate a previous `env-set` started but the panel never saw finish (a kill, a 504) can be re-attempted from the panel with one click. `{"ok": bool, "recreated": true, "log": string}`, `log` relayed the same way `restart`'s and `env-set`'s are; exits with compose's status. Refused while a `<name>-next` container is alive (running, restarting, paused, removing or created); an exited leftover does not block it (#490), and `restart` and `env-set` follow the same rule (see *A refused `restart`, `env-set` or `recreate`*, under Safety notes) |
 | `env-get` | JSON of the **non-secret** editable env keys and their *effective* values (`.env` read the way compose's `env_file:` loader reads it — see the safety notes), followed by the non-secret env keys of every plugin in the cached Plugin Index, whether or not the plugin is in `PLUGINS` (#256) |
@@ -363,7 +363,10 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   secret key that
   collides with a static key is ignored (the static key wins). A panel admin who can set
   `PLUGIN_INDEX_URL` controls that index — and the plugin code the bot installs from it — so this
-  protects against the panel, its logs and screens, not against whoever owns the index. The
+  protects against the panel, its logs and screens, not against whoever owns the index.
+  `PLUGIN_INDEX_URL` itself is a static, non-secret key: `env-get` shows its value to every panel
+  user, so it must not hold a credential. A `user:pass@` URL is refused (#474); a query string is
+  allowed, and is shown. The
   backup `env-set` writes still holds the previous `.env` — secrets included — which is why it is
   `0600`. A **webhook URL** in a `plugin-request` is treated the same way: it travels on stdin only,
   no message echoes any part of it (the new actions' messages name the field only; an update
@@ -403,9 +406,11 @@ them, so the panel can set them whenever the cached index offers `wow`.)
 - **`env-set` rebuilds `.env` line-by-line** (no `sed`), so a value can never inject into the
   file, and comment/blank/secret lines are preserved verbatim. A timestamped
   `<config-dir>/backups/.env.bak.<stamp>-<pid>` is written before any change (the pid suffix is
-  #227's: with the lock, two saves can no longer land in the same second, but the name is the
-  record of what was replaced and must never depend on timing regardless); a no-op (new value
-  equals current) does nothing and does **not** restart the bot.
+  #227's: a collision needs the same second AND the same pid, which is very unlikely, and the name
+  is the record of what was replaced, so it does not lean on the lock's timing either); a no-op
+  (new value equals current) does nothing and does **not** restart the bot. **Backups are kept until
+  you remove them** (#474: nothing prunes the config dir, which is operator data), and each holds
+  every secret in `.env` at `0600`. To keep the newest ten: ``ls -1 <config-dir>/backups/.env.bak.* | sort | head -n -10 | xargs -r rm --``.
 - **`env-set` diffs before it validates, and only what changes is validated** (issue #44). A
   stored value the bot accepts but a whitelist regex rejects — a hand-quoted realm, a CRLF-saved
   file, `1, 2` in `ADMIN_USER_IDS` — used to fail every save that echoed it back, naming a key the
@@ -434,7 +439,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   (the next bullet).
 - **A refused `restart`, `env-set` or `recreate`** (#490). All three refuse while a `<name>-next` container
   is **alive** (running, restarting, paused, removing or created), because a recreate then may start a second
-  bot on the one Discord token (not verified without a daemon). If `<name>` itself is running the message says
+  bot on the one Discord token (not verified without a daemon). The check runs once the call holds the
+  config-dir lock (#473), so a refusal can wait up to `BOT_OPS_LOCK_WAIT_SECONDS` behind another save. If `<name>` itself is running the message says
   *in progress*: a swap is under way, so retry once it completes. If it persists and the `-next` container is
   *created*, a process died between its create and its start (or the start failed and so did the cleanup):
   `docker rm <name>-next` clears it. If `<name>`
