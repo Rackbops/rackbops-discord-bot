@@ -897,10 +897,11 @@ and never touches again. The rules are the Clerk runbook's step 3 for comments (
 jobs. **Complete the block below before the first `up`** (section 5). The seeded
 placeholders pass the core's `required()` check (`src/config.ts:61-65`), so a token-only edit boots; with
 `DISCORD_SERVER_ID` blank that boot registers `/update`, `/plugins` and `/report` **globally and
-unprefixed**, and once the server is set single-server mode issues its one guild-scoped PUT and never
-clears the global list (`src/routing/register.ts:43`, `:72`, `:143`: `clearGlobal` exists only in routed
-mode). The recovery is one authenticated `PUT []` to `/applications/<app>/commands`, which section 9
-records having to do. `MCP_BRIDGE_TOKEN` is the one key missing from the block on purpose: section 4's
+unprefixed**, and once the server is set single-server mode issues its guild-scoped PUT and empties
+the global list only if the previous `discovery.json` records one (its `global` slot, written by a build
+that has #420; `planRegistration`'s `previous` in `src/routing/register.ts`). A global list registered
+by an earlier build left no such record, so that case still needs the recovery: one authenticated `PUT []`
+to `/applications/<app>/commands`, which section 9 records having to do. `MCP_BRIDGE_TOKEN` is the one key missing from the block on purpose: section 4's
 runbook writes it.
 
 ```sh
@@ -917,8 +918,9 @@ DISCORD_TOKEN=<Pip's bot token>
 ANNOUNCE_CHANNEL_ID=<channel id>
 RELEASE_ANNOUNCE_CHANNEL_ID=
 # The one approved server: registration is one guild-scoped PUT there and nowhere else
-# (src/routing/register.ts:56-59, :128-131, reached from src/index.ts:391-406). Set it before the
-# first up (see above): single-server mode never clears a global list an earlier boot left behind.
+# (`planRegistration` and `registerPlan` in src/routing/register.ts, reached from src/index.ts:391-406).
+# Set it before the first up (see above): single-server mode empties a global list only when the
+# previous discovery.json recorded one, which a boot before this build did not.
 DISCORD_SERVER_ID=<server id>
 # Every command is prefixed, core ones included (src/commandNaming.ts:15-16, used at :22-23;
 # src/commands.ts:61-67): /pipagent register|pair|unregister, /pipupdate, /pipplugins, /pipreport.
@@ -1200,7 +1202,7 @@ Registered 4 slash commands
 The first boot ran before the `.env` edit (token only): plain-text logs, `0 selected`, and `Registered 3
 slash commands` **globally**. It was corrected by editing the `.env` and `bot-ops.sh recreate`, and the
 global list was then emptied with one authenticated `PUT [] /applications/<app>/commands` -> `200`,
-because single-server mode never clears it itself (`src/routing/register.ts:43-44`). **Set the `.env`
+because single-server mode did not clear it itself at that build (it does only when the previous `discovery.json` records a global list, #420). **Set the `.env`
 before the first `up`.** Four distinct bot ids across the instances (pip `15...391`, prod `15...246`,
 debug `15...424`, clerk `15...121`).
 
