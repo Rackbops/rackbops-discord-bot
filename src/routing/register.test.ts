@@ -3,7 +3,17 @@ import { DiscordAPIError, Routes, type RESTPostAPIChatInputApplicationCommandsJS
 import type { PluginCommand, PluginIndexEntry } from "../plugins/contract";
 import type { PluginCommandMap } from "../plugins/host";
 import { freshRouting, type PluginRouting, type RoutingFile } from "./model";
-import { describeError, ownerOf, planRegistration, registerPlan, type RegistrationPlan } from "./register";
+import type { DiscoveryFile } from "./model";
+import {
+  describeError,
+  NO_PREVIOUS,
+  ownerOf,
+  planRegistration,
+  previousScopes,
+  registerPlan,
+  type PreviousScopes,
+  type RegistrationPlan,
+} from "./register";
 
 const HOME = "111111111111111111";
 const OTHER = "222222222222222222";
@@ -41,6 +51,7 @@ function plan(overrides: Partial<Parameters<typeof planRegistration>[0]> & { rou
     loaded: w.loaded,
     guildIds: [HOME, OTHER],
     homeGuildId: HOME,
+    previous: NO_PREVIOUS,
     ...overrides,
   });
 }
@@ -235,6 +246,7 @@ describe("planRegistration", () => {
         loaded: ["constructor"],
         guildIds: [HOME, OTHER],
         homeGuildId: HOME,
+        previous: NO_PREVIOUS,
       }),
     );
     expect(names(bodies.get(OTHER))).toContain("conf");
@@ -262,7 +274,8 @@ describe("registerPlan in single mode", () => {
   test("single mode issues exactly one put, to the guild route", async () => {
     const w = world();
     const { calls, put } = fakePut();
-    const results = await registerPlan(put, APP, plan({ routing: freshRouting() }), now);
+    const { results, failure } = await registerPlan(put, APP, plan({ routing: freshRouting() }), now);
+    expect(failure).toBeUndefined();
     // Exactly the call the bot always made: one PUT, to the home guild's commands, with every command.
     expect(calls).toHaveLength(1);
     expect(calls[0]!.route).toBe(guildRoute(HOME));
@@ -273,7 +286,7 @@ describe("registerPlan in single mode", () => {
   test("single mode issues exactly one put, to the global route", async () => {
     const w = world();
     const { calls, put } = fakePut();
-    const results = await registerPlan(put, APP, plan({ routing: freshRouting(), homeGuildId: undefined }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: freshRouting(), homeGuildId: undefined }), now);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.route).toBe(GLOBAL_ROUTE);
     expect(calls[0]!.body).toEqual(w.fullBody);
@@ -292,11 +305,115 @@ describe("registerPlan in single mode", () => {
     }
   });
 
-  test("single mode lets a failure throw", async () => {
+  test("single mode returns a failure of its primary call (P3), and the thrown value as it was", async () => {
     const boom = Object.assign(new Error("Missing Access"), { code: 50001 });
     const { put } = fakePut({ [guildRoute(HOME)]: boom });
-    // The caller keeps today's catch and its long operator message, so the error must reach it as it was.
-    await expect(registerPlan(put, APP, plan({ routing: freshRouting() }), now)).rejects.toBe(boom);
+    // The caller rethrows it once discovery is written, so index.ts's catch and long operator message see it as it was.
+    const out = await registerPlan(put, APP, plan({ routing: freshRouting() }), now);
+    expect(out.failure?.error).toBe(boom);
+    expect(out.results).toEqual([{ guildId: HOME, registered: 0, error: "Missing Access (50001)", at: NOW.toISOString() }]);
+  });
+
+  test("P3b: a primary that rejects with undefined is still a failure", async () => {
+    const { put } = fakePut({ [guildRoute(HOME)]: undefined });
+    const out = await registerPlan(put, APP, plan({ routing: freshRouting() }), now);
+    expect(out.failure).toEqual({ error: undefined });
+    expect(out.failure).toBeDefined();
+  });
+});
+
+const prevAll: PreviousScopes = { guilds: [HOME, OTHER, THIRD], global: true };
+
+describe("previousScopes (#420)", () => {
+  const file = (over: Partial<DiscoveryFile>): DiscoveryFile => ({
+    v: 1,
+    generatedAt: "",
+    bot: { id: APP, username: "b" },
+    inviteUrl: "",
+    homeGuildId: null,
+    guilds: [],
+    plugins: {},
+    ...over,
+  });
+  const g = (id: string, commands: DiscoveryFile["guilds"][number]["commands"]) => ({ id, name: id, channels: [], commands });
+  const at = NOW.toISOString();
+
+  test("P1: null is none; a record shows a list when registered or failed; a successful empty shows none", () => {
+    expect(previousScopes(null)).toBe(NO_PREVIOUS);
+    const f = file({
+      guilds: [g(HOME, { registered: 5, at }), g(OTHER, { registered: 0, at }), g(THIRD, { registered: 0, error: "x", at }), g("444444444444444444", null)],
+      global: { registered: 3, at },
+    });
+    expect(previousScopes(f)).toEqual({ guilds: [HOME, THIRD], global: true });
+    expect(previousScopes(file({ global: { registered: 0, at } })).global).toBe(false);
+    expect(previousScopes(file({})).global).toBe(false);
+  });
+
+  test("P1c: a guild listed twice is listed once (it must not be emptied twice)", () => {
+    const f = file({ guilds: [g(HOME, { registered: 2, at }), g(OTHER, { registered: 1, at }), g(HOME, { registered: 2, at })] });
+    expect(previousScopes(f).guilds).toEqual([HOME, OTHER]);
+  });
+
+  test("P1b: a damaged file is read defensively and never throws", () => {
+    const bad = { guilds: [null, { id: HOME, commands: "x" }, { id: OTHER, commands: { registered: 2 } }] } as unknown as DiscoveryFile;
+    expect(previousScopes(bad)).toEqual({ guilds: [OTHER], global: false });
+    expect(previousScopes({ guilds: "nope" } as unknown as DiscoveryFile)).toEqual({ guilds: [], global: false });
+  });
+});
+
+describe("planRegistration with a previous record (#420)", () => {
+  const placed = routing({ music: { servers: { [OTHER]: { commands: "all" } } } });
+
+  test("P2: single-guild clears the other candidates in the snapshot and the global scope", () => {
+    const p = plan({ routing: freshRouting(), previous: prevAll });
+    if (p.mode !== "single" || p.scope !== "guild") throw new Error("expected single/guild");
+    // not HOME (the target), not THIRD (not in the snapshot)
+    expect(p.clears).toEqual([OTHER]);
+    expect(p.clearGlobal).toBe(true);
+  });
+
+  test("P2: single-global clears every candidate server; routed clears the global scope when there is no home or it is a candidate", () => {
+    const g = plan({ routing: freshRouting(), previous: prevAll, homeGuildId: undefined });
+    if (g.mode !== "single" || g.scope !== "global") throw new Error("expected single/global");
+    expect(g.clears).toEqual([HOME, OTHER]);
+    expect(g.clearGlobal).toBe(false);
+    const r1 = plan({ routing: placed, previous: prevAll });
+    if (r1.mode !== "routed") throw new Error("expected routed");
+    expect(r1.clearGlobal).toBe(true);
+    const r2 = plan({ routing: placed, previous: { guilds: [], global: false } });
+    if (r2.mode !== "routed") throw new Error("expected routed");
+    expect(r2.clearGlobal).toBe(false);
+    const r3 = plan({ routing: placed, previous: NO_PREVIOUS, homeGuildId: undefined });
+    if (r3.mode !== "routed") throw new Error("expected routed");
+    expect(r3.clearGlobal).toBe(true);
+    expect(r3.clears).toEqual([]);
+  });
+
+  test("P2: with no previous record the plans are today's, with no empties", () => {
+    const s = plan({ routing: freshRouting() });
+    if (s.mode !== "single") throw new Error("expected single");
+    expect(s.clears).toEqual([]);
+    expect(s.clearGlobal).toBe(false);
+  });
+});
+
+describe("registerPlan order and records (#420)", () => {
+  test("P3: empties come first, each recorded, the primary last; no failure", async () => {
+    const { calls, put } = fakePut();
+    const out = await registerPlan(put, APP, plan({ routing: freshRouting(), previous: prevAll }), now);
+    expect(calls.map((c) => c.route)).toEqual([guildRoute(OTHER), GLOBAL_ROUTE, guildRoute(HOME)]);
+    expect(calls[0]!.body).toEqual([]);
+    expect(calls[1]!.body).toEqual([]);
+    expect(out.results.map((r) => [r.guildId, r.registered])).toEqual([[OTHER, 0], ["global", 0], [HOME, CORE.length + MUSIC.length + WOW.length]]);
+    expect(out.failure).toBeUndefined();
+  });
+
+  test("P3: a failed empty is recorded with its error, the primary still happens, and it is not the failure", async () => {
+    const { calls, put } = fakePut({ [guildRoute(OTHER)]: Object.assign(new Error("Missing Access"), { code: 50001 }) });
+    const out = await registerPlan(put, APP, plan({ routing: freshRouting(), previous: prevAll }), now);
+    expect(calls.map((c) => c.route)).toContain(guildRoute(HOME));
+    expect(out.results[0]).toEqual({ guildId: OTHER, registered: 0, error: "Missing Access (50001)", at: NOW.toISOString() });
+    expect(out.failure).toBeUndefined();
   });
 });
 
@@ -305,7 +422,7 @@ describe("registerPlan in routed mode", () => {
 
   test("routed mode puts once per server, in order", async () => {
     const { calls, put } = fakePut();
-    const results = await registerPlan(put, APP, plan({ routing: placed, guildIds: [HOME, OTHER, THIRD] }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed, guildIds: [HOME, OTHER, THIRD] }), now);
     expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), guildRoute(THIRD)]);
     expect(calls.map((c) => names(c.body).length)).toEqual([CORE.length + WOW.length, CORE.length + MUSIC.length, CORE.length]);
     expect(results).toEqual([
@@ -332,7 +449,7 @@ describe("registerPlan in routed mode", () => {
   test("a refusal in one server is recorded and the rest still register", async () => {
     const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
     const { calls, put } = fakePut({ [guildRoute(OTHER)]: refusal });
-    const results = await registerPlan(put, APP, plan({ routing: placed, guildIds: [HOME, OTHER, THIRD] }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed, guildIds: [HOME, OTHER, THIRD] }), now);
     // All three were attempted, in order, despite the middle one being refused...
     expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), guildRoute(THIRD)]);
     // ...and only that one carries an error.
@@ -346,7 +463,7 @@ describe("registerPlan in routed mode", () => {
   test("every server refused still resolves, with an error against each", async () => {
     const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
     const { put } = fakePut({ [guildRoute(HOME)]: refusal, [guildRoute(OTHER)]: refusal });
-    const results = await registerPlan(put, APP, plan({ routing: placed }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed }), now);
     expect(results.map((r) => r.error)).toEqual(["Missing Access (50001)", "Missing Access (50001)"]);
   });
 
@@ -361,14 +478,14 @@ describe("registerPlan in routed mode", () => {
       { body: undefined, files: undefined },
     );
     const { put } = fakePut({ [guildRoute(OTHER)]: real });
-    const results = await registerPlan(put, APP, plan({ routing: placed }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed }), now);
     expect(results.find((r) => r.guildId === OTHER)!.error).toBe("Missing Access (50001)");
   });
 
   test("a long error is clipped", async () => {
     const { put } = fakePut({ [guildRoute(HOME)]: new Error("x".repeat(1000)) });
-    const results = await registerPlan(put, APP, plan({ routing: placed }), now);
-    const error = results.find((r) => r.guildId === HOME)!.error!;
+    const { results } = await registerPlan(put, APP, plan({ routing: placed }), now);
+    const error =results.find((r) => r.guildId === HOME)!.error!;
     expect(error).toHaveLength(200);
     expect(error.endsWith("...")).toBe(true);
     expect(error.startsWith("Error: xxxx")).toBe(true);
@@ -379,16 +496,22 @@ describe("registerPlan in routed mode", () => {
 
     // Asked to, it makes one last put to the global route with an empty list -- and reports nothing.
     const ok = fakePut();
-    const okResults = await registerPlan(ok.put, APP, noHome, now);
+    const { results: okResults } = await registerPlan(ok.put, APP, noHome, now);
     expect(ok.calls.at(-1)).toEqual({ route: GLOBAL_ROUTE, body: [] });
     expect(ok.calls).toHaveLength(3);
-    expect(okResults.map((r) => r.guildId)).toEqual([HOME, OTHER]);
+    // The empty is recorded (#420): that record is what tells the next run the global scope is clean.
+    expect(okResults.map((r) => [r.guildId, r.registered, r.error])).toEqual([
+      [HOME, CORE.length + WOW.length, undefined],
+      [OTHER, CORE.length + MUSIC.length + WOW.length, undefined], // no home server: unplaced wow is in every server
+      ["global", 0, undefined],
+    ]);
 
     // A failure there is recorded against "global", and does not throw.
     const failing = fakePut({ [GLOBAL_ROUTE]: Object.assign(new Error("Unknown application"), { code: 10002 }) });
-    const failResults = await registerPlan(failing.put, APP, noHome, now);
+    const { results: failResults } = await registerPlan(failing.put, APP, noHome, now);
     expect(failResults.at(-1)).toEqual({ guildId: "global", registered: 0, error: "Unknown application (10002)", at: NOW.toISOString() });
     expect(failResults.slice(0, -1).every((r) => r.error === undefined)).toBe(true);
+    expect(failResults).toHaveLength(3);
   });
 
   test("routed mode leaves the global scope alone when there is a home server", async () => {
@@ -401,17 +524,17 @@ describe("registerPlan in routed mode", () => {
     // Nothing would replace the global list, so it is left alone -- and there is nothing to report:
     // a bot in no server has no one to show a command twice.
     const none = fakePut();
-    expect(await registerPlan(none.put, APP, plan({ routing: placed, guildIds: [] }), now)).toEqual([]);
+    expect((await registerPlan(none.put, APP, plan({ routing: placed, guildIds: [] }), now)).results).toEqual([]);
     expect(none.calls).toEqual([]);
     const asked = fakePut();
-    expect(await registerPlan(asked.put, APP, plan({ routing: placed, guildIds: [], homeGuildId: undefined }), now)).toEqual([]);
+    expect((await registerPlan(asked.put, APP, plan({ routing: placed, guildIds: [], homeGuildId: undefined }), now)).results).toEqual([]);
     expect(asked.calls).toEqual([]);
   });
 
   test("routed mode leaves the global scope alone when every server refused, and says so", async () => {
     const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
     const { calls, put } = fakePut({ [guildRoute(HOME)]: refusal, [guildRoute(OTHER)]: refusal });
-    const results = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
     // Both servers were tried; the empty put to the global scope was not sent.
     expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER)]);
     // The skip is recorded against "global", after the servers' own results.
@@ -425,11 +548,11 @@ describe("registerPlan in routed mode", () => {
   test("routed mode empties the global scope once one server took its commands, even if another refused", async () => {
     const refusal = Object.assign(new Error("Missing Access"), { code: 50001 });
     const { calls, put } = fakePut({ [guildRoute(HOME)]: refusal });
-    const results = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
+    const { results } = await registerPlan(put, APP, plan({ routing: placed, homeGuildId: undefined }), now);
     expect(calls.map((c) => c.route)).toEqual([guildRoute(HOME), guildRoute(OTHER), GLOBAL_ROUTE]);
     expect(calls.at(-1)!.body).toEqual([]);
-    // A successful empty adds nothing to the results.
-    expect(results.map((r) => r.guildId)).toEqual([HOME, OTHER]);
+    // A successful empty is recorded as such (#420).
+    expect(results.map((r) => r.guildId)).toEqual([HOME, OTHER, "global"]);
   });
 });
 

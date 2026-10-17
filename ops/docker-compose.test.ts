@@ -7,7 +7,7 @@
 // `compose` plugin — GitHub Actions' ubuntu-latest runners ship both, so CI is where this runs
 // for real.
 import { afterEach, describe, expect, test } from "bun:test";
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,10 @@ const COMPOSE_SRC = fileURLToPath(new URL("../docker-compose.yml", import.meta.u
 // (see the env_file assertion below) rather than a specific key, since Compose's own normalization
 // of `env_file:` isn't stable/documented enough to assert an exact shape against.
 interface ComposeConfig {
-  services: Record<string, { container_name?: string } & Record<string, unknown>>;
+  services: Record<
+    string,
+    { container_name?: string; build?: { context?: string; args?: Record<string, string> } } & Record<string, unknown>
+  >;
 }
 
 // The exact keys ops/install.sh writes into a stack directory's own .env (its compose-project
@@ -149,6 +152,10 @@ describe.skipIf(!runnable)("docker-compose.yml interpolation resolves per-instan
     const botServiceJson = JSON.stringify(json!.services.bot);
     expect(botServiceJson).toContain("BOT_ENV_FILE");
     expect(botServiceJson).toContain(botEnvFile);
+    // #426: the build context and the commit the stack .env carries reach the bot's `build:` too (the printed
+    // `up -d --build` rebuilds from them); this also settles that `#main` survives Compose's dotenv parsing.
+    expect(json!.services.bot!.build!.context).toBe("https://example.invalid/repo.git#main");
+    expect(json!.services.bot!.build!.args!.GIT_SHA).toBe("deadbeef");
   });
 
   test("a bare stack dir with a plain local .env (no BOT_OPS_* keys) keeps the local-dev default", async () => {
@@ -241,6 +248,71 @@ describe.skipIf(!runnable)("an absolute -f path resolves its OWN directory's .en
     expect(json.services.bot!.container_name).toBe("probe-abs-cwd-instance");
     expect(json.services.bot!.container_name).not.toBe("warbandeer-discord");
     expect(JSON.stringify(json.services.bot)).toContain("absolute-path-cwd-probe");
+    // #426: the same two build values, from an absolute -f path run from an unrelated cwd.
+    expect(json.services.bot!.build!.context).toBe("https://example.invalid/repo.git#main");
+    expect(json.services.bot!.build!.args!.GIT_SHA).toBe("deadbeef");
+  });
+});
+
+// #487 item 13: the invariants the comments and .env.example document, pinned against the rendered config.
+describe.skipIf(!runnable)("the documented compose invariants hold (#487)", () => {
+  test("no published ports, a pinned cloudflared tag, the state volume, and the restart/init policies", async () => {
+    const dir = makeStack("DISCORD_TOKEN=unused-in-this-test\n");
+    // Both opt-in profiles active so admin and cloudflared render (the #135 test above renders admin with no
+    // ops/admin/ directory in the fixture, green on CI, so no build-context workaround is needed).
+    const { exitCode, json } = await composeConfig(dir, { COMPOSE_PROFILES: "admin,tunnel" });
+    expect(exitCode).toBe(0);
+    for (const name of ["bot", "admin", "cloudflared"]) {
+      const service = json!.services[name]!;
+      expect(service, name).toBeDefined();
+      expect((service.ports as unknown[] | undefined) ?? [], `${name} publishes no host port`).toEqual([]);
+    }
+    expect(json!.services.cloudflared!.image).toMatch(/^cloudflare\/cloudflared:\d{4}\.\d+\.\d+$/);
+    const volumes = json!.services.bot!.volumes as { source?: string; target?: string }[];
+    expect(volumes.some((v) => v.target === "/app/data" && v.source === "state")).toBe(true);
+    expect(json!.services.bot!.restart).toBe("unless-stopped");
+    expect(json!.services.bot!.init).toBe(true);
+    expect(json!.services.admin!.restart).toBe("unless-stopped");
+    expect(json!.services.cloudflared!.restart).toBe("unless-stopped");
+  });
+});
+
+// Source pins: these only read files, so they run on a box without `docker compose` too (the module-level CI throw
+// above still guards CI, where compose is present).
+describe("the compose, entrypoint, dockerignore and README texts say what they do (#422, #423, #487)", () => {
+  const repoFile = (name: string) => readFileSync(fileURLToPath(new URL(`../${name}`, import.meta.url)), "utf8");
+
+  test("S1: the root branch of entrypoint.sh exports bun's HOME before it drops privileges (#487 item 11)", () => {
+    const script = repoFile("entrypoint.sh");
+    const root = script.indexOf('if [ "$(id -u)" = "0" ]; then');
+    expect(root).toBeGreaterThan(-1);
+    const block = script.slice(root, script.indexOf("\nfi\n", root));
+    const exportHome = block.indexOf("export HOME");
+    expect(exportHome).toBeGreaterThan(-1);
+    expect(exportHome).toBeLessThan(block.indexOf("exec setpriv"));
+    expect(block).toContain("getent passwd bun");
+    expect(block).toContain("/home/bun");
+  });
+
+  test("S2: .dockerignore keeps the history, nested node_modules and every .env variant out of the build context (#487 item 14)", () => {
+    const lines = repoFile(".dockerignore").split(/\r?\n/);
+    for (const line of [".git", "**/node_modules", "**/.env", ".env.*"]) expect(lines, line).toContain(line);
+  });
+
+  test("S3: the compose file no longer says the build context is not persisted in .env (#423)", () => {
+    const compose = repoFile("docker-compose.yml");
+    expect(compose).not.toContain("NOT persisted in .env");
+    expect(compose).not.toContain("both export BOT_ENV_FILE");
+    const build = compose.indexOf("    build:\n");
+    const context = compose.indexOf("      context:", build);
+    expect(build).toBeGreaterThan(-1);
+    expect(compose.slice(build, context)).toContain("stack .env");
+  });
+
+  test("S4: the README's deployed-instance tunnel command is --no-deps on cloudflared, never --build (#422)", () => {
+    const readme = repoFile("README.md");
+    expect(readme).toContain("--profile tunnel up -d --no-deps cloudflared");
+    expect(readme).not.toMatch(/up -d --build cloudflared/);
   });
 });
 

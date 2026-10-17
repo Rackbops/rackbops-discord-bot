@@ -9,23 +9,30 @@
 // the first.
 //
 // A server the bot joins or leaves after boot (#259) goes through the same chain: `guildJoined`
-// registers again (routed mode, or a join of the home server) or only refreshes discovery (single mode),
-// `guildLeft` refreshes discovery.
+// registers the joined server alone (routed mode, `applyRoutingFor`, #482), runs the full registration for a
+// join of the home server, or only refreshes discovery (single mode), `guildLeft` refreshes discovery.
 //
 // Registration stays inside the bot's existing contract that a failure never takes it down: in
 // `single` mode (today's behaviour) the error is rethrown once `discovery.json` has been written (it
 // is not written when the bot's servers could not be read), so `index.ts` reaches its own long
-// `catch`; in `routed` mode nothing here throws once routing has been read (a routing read that fails for
-// a reason other than a parse error rejects, #509). The failure is written against the home
-// server's entry -- when the bot can see that server. A failure of the global scope (no home server)
-// has no entry to go on, and `DiscoveryFile` has no other slot for it, so that one reaches the
-// operator through `index.ts`'s message only.
+// `catch`; in `routed` mode nothing here throws once routing and the previous discovery have been read (a read
+// that fails for a reason other than a parse error rejects, #509; a logger that throws is swallowed by `tell`).
+// The failure is written against the home server's entry -- when the bot can see that server -- and a
+// failure of the global scope (no home server) in the file's `global` slot (#482).
 
 import type { Client, RESTPostAPIChatInputApplicationCommandsJSONBody as CommandJson } from "discord.js";
 import type { PluginCommandMap } from "../plugins/host";
-import { buildDiscovery, snapshotGuilds, writeDiscovery, type GuildSnapshot, type PluginSummary } from "./discovery";
-import type { RoutingFile } from "./model";
-import { describeError, planRegistration, registerPlan, type GuildRegistration } from "./register";
+import { buildDiscovery, readDiscovery, snapshotGuilds, writeDiscovery, type GuildSnapshot, type PluginSummary } from "./discovery";
+import { clip, type RoutingFile } from "./model";
+import {
+  NOT_EMPTIED,
+  NO_PREVIOUS,
+  planRegistration,
+  previousScopes,
+  registerPlan,
+  type GuildRegistration,
+  type RegistrationPlan,
+} from "./register";
 import { hasPlacements, isPlaced, shown } from "./resolve";
 import { readRouting } from "./store";
 
@@ -49,6 +56,10 @@ export type ApplyResult = { mode: "single" | "routed"; results: GuildRegistratio
 
 let context: RoutingContext | undefined;
 let lastRegistrations: GuildRegistration[] = [];
+// Whether a FULL registration run has completed in this process (#482): a join registers the joined server alone
+// only on top of one, else it would rewrite `discovery.json` with that one record and erase what `previousScopes`
+// depends on. A routed run that could not read the servers, or none at all, leaves it false.
+let fullRunDone = false;
 let chain: Promise<unknown> = Promise.resolve();
 // What `applyRouting` has already said about the home server (#260): every join, leave-and-return and
 // routing change registers again, so the same problem would otherwise be said each time.
@@ -58,6 +69,7 @@ const said = new Set<string>();
 export function initRouting(ctx: RoutingContext): void {
   context = ctx;
   lastRegistrations = [];
+  fullRunDone = false;
 }
 
 function required(): RoutingContext {
@@ -81,19 +93,20 @@ function takeSnapshots(c: RoutingContext): GuildSnapshot[] | null {
   try {
     return snapshotGuilds(c.client);
   } catch (err) {
-    c.log.error("[routing] could not read the bot's servers from Discord's cache", err);
+    tell(c, "error", "[routing] could not read the bot's servers from Discord's cache", err);
     return null;
   }
 }
 
 /** Builds and writes `discovery.json`. A failure is logged and swallowed: it is a view for the panel,
- *  never a reason to fail a registration or a refresh. `why` names what was being done. */
+ *  never a reason to fail a registration or a refresh. `why` names what was being done. Resolves `true` when the
+ *  file was written, `false` when the write failed (#484: `refreshDiscovery` reports it; a registration ignores it). */
 async function writeView(
   c: RoutingContext,
   snapshots: readonly GuildSnapshot[],
   registrations: readonly GuildRegistration[],
   why: string,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const file = buildDiscovery({
       now: c.now(),
@@ -104,30 +117,43 @@ async function writeView(
       plugins: c.plugins,
     });
     await writeDiscovery(c.dataDir, file);
+    return true;
   } catch (err) {
-    c.log.error(`[routing] writing discovery.json failed (${why}) -- the panel keeps the last copy it has`, err);
+    tell(c, "error", `[routing] writing discovery.json failed (${why}) -- the panel keeps the last copy it has`, err);
+    return false;
   }
 }
 
-/** The routed-mode log lines. ASCII only in what this code writes; a server's name is whatever
- *  Discord calls it. */
+/** The routed-mode log lines, all through `tell` so a logger that throws cannot reject a finished registration (#421).
+ *  ASCII only in what this code writes; a server's name is whatever Discord calls it, made one bounded line. */
 function logRouted(c: RoutingContext, snapshots: readonly GuildSnapshot[], results: readonly GuildRegistration[]): void {
   const names = new Map(snapshots.map((s) => [s.id, s.name]));
-  const nameOf = (id: string): string => names.get(id) ?? id;
+  const nameOf = (id: string): string => logName(names.get(id) ?? id);
   const servers = results.filter((r) => r.guildId !== "global");
   const done = servers.filter((r) => r.error === undefined);
-  c.log.log(
+  tell(
+    c,
+    "log",
     `Registered commands in ${done.length} server${done.length === 1 ? "" : "s"}` +
       (done.length > 0 ? ` (${done.map((r) => `${nameOf(r.guildId)}: ${r.registered}`).join(", ")})` : ""),
   );
   for (const r of servers) {
-    if (r.error !== undefined) c.log.error(`[routing] couldn't register commands in ${nameOf(r.guildId)} (${r.guildId}): ${r.error}`);
+    if (r.error !== undefined) tell(c, "error", `[routing] couldn't register commands in ${nameOf(r.guildId)} (${r.guildId}): ${r.error}`);
   }
   for (const r of results) {
-    if (r.guildId === "global" && r.error !== undefined) {
-      c.log.error(`[routing] the global command list was not emptied (${r.error}), so commands may show twice`);
+    if (r.guildId !== "global" || r.error === undefined) continue;
+    if (r.error === NOT_EMPTIED) {
+      // No server took a list, so the global one is the only one and nothing shows twice.
+      tell(c, "error", `[routing] the global command list was left as it is: no server accepted its commands`);
+    } else {
+      tell(c, "error", `[routing] the global command list was not emptied (${r.error}), so commands may show twice`);
     }
   }
+}
+
+/** A record that was one of the plan's EMPTIES (never the primary call; routed mode's global empty is logRouted's). */
+function isClear(plan: RegistrationPlan, id: string): boolean {
+  return (plan.clears as readonly string[]).includes(id) || (id === "global" && plan.mode === "single" && plan.clearGlobal);
 }
 
 /**
@@ -153,8 +179,8 @@ function warnHomeServerMissing(c: RoutingContext, routing: RoutingFile, snapshot
     c.log.warn(message);
     said.add(message);
   } catch {
-    /* A logger that throws must not turn a finished registration into a failure (`logRouted` above is not
-       guarded, and that is not changed here); it is not recorded as said, so the next registration tries again. */
+    /* A logger that throws must not turn a finished registration into a failure (`logRouted` goes through `tell`
+       for the same reason); it is not recorded as said, so the next registration tries again. */
   }
 }
 
@@ -163,11 +189,81 @@ function warnHomeServerMissing(c: RoutingContext, routing: RoutingFile, snapshot
  * `reason` says why it ran (it names the trigger in a discovery write failure). Resolves with the mode
  * the plan took, so `index.ts` prints today's `Registered N slash commands` line only for `single`.
  *
- * `single` mode registers exactly as before routing existed and rethrows a failure once discovery has
- * been written (against the home server's entry when the bot can see it -- see the header for what it
- * cannot record); `routed` mode throws only if reading routing does (#509).
+ * `single` mode registers as before routing existed -- plus, once, the empties a routed past requires
+ * (#420) -- and rethrows a failure of its primary call once discovery has been written (against the home
+ * server's entry when the bot can see it, or in `global` for the global scope); `routed` mode throws only if
+ * reading routing does (#509).
  */
 export function applyRouting(reason: string): Promise<ApplyResult> {
+  return enqueue(async () => {
+    const c = required();
+    const routing = await readRouting(c.dataDir);
+    return fullRun(c, reason, routing, takeSnapshots(c));
+  });
+}
+
+/** The body of `applyRouting`, run inside a queued job (never call the exported `applyRouting` from one: it
+ *  queues behind itself). `routing` and `snapshots` are what the job read. */
+async function fullRun(c: RoutingContext, reason: string, routing: RoutingFile, snapshots: GuildSnapshot[] | null): Promise<ApplyResult> {
+  // #420: what the last published file says the bot still owns; nothing when there is none (a first boot). The
+  // file is a VIEW: an unreadable one is said and treated as none, never allowed to stop the PUT below.
+  // One that parses but fails `readDiscovery`'s shape check (#482) reads as `null` WITHOUT a line, so this run skips
+  // its empties; it rewrites the file when the servers could be read, and the next run then has a valid record again.
+  let previous = NO_PREVIOUS;
+  try {
+    previous = previousScopes(await readDiscovery(c.dataDir));
+  } catch (err) {
+    tell(
+      c,
+      "error",
+      "[routing] could not read the previous discovery.json; registering as if there were none (a server an earlier routed run owned keeps its list until the next run that can read it)",
+      err,
+    );
+  }
+  const plan = planRegistration({
+    routing,
+    fullBody: c.fullBody,
+    prefix: c.prefix,
+    commandMap: c.commandMap,
+    loaded: c.plugins.map((p) => p.name),
+    guildIds: (snapshots ?? []).map((s) => s.id),
+    homeGuildId: c.homeGuildId,
+    previous,
+  });
+  const { results, failure } = await registerPlan(c.put, c.appId, plan, c.now);
+  // A failed EMPTY is said, in both modes (nothing logged it in single mode; in routed mode logRouted names the
+  // global one itself, so isClear excludes routed's global). The primary call is never a clear.
+  for (const r of results) {
+    if (r.error !== undefined && isClear(plan, r.guildId)) {
+      const who = r.guildId === "global" ? "the global scope" : label(snapshots?.find((s) => s.id === r.guildId) ?? { id: r.guildId, name: r.guildId });
+      tell(c, "error", `[routing] could not empty the stale command list of ${who}: ${r.error} (it is tried again at the next registration run)`);
+    }
+  }
+  // #484 item 5: a routed run that could not read the servers registered nowhere and learned nothing; keep what the
+  // last run that did knew. Single mode's one call needs no server list and did happen.
+  if (plan.mode === "single" || snapshots !== null) {
+    lastRegistrations = results;
+    fullRunDone = true;
+  }
+  // After registering, not before: the file carries what each server was actually told.
+  if (snapshots !== null) await writeView(c, snapshots, results, reason);
+  if (plan.mode === "routed") {
+    logRouted(c, snapshots ?? [], results);
+    warnHomeServerMissing(c, routing, snapshots);
+  }
+  if (failure !== undefined) throw failure.error;
+  return { mode: plan.mode, results };
+}
+
+/**
+ * A server the bot has joined, in routed mode (#482 item 5): registers THAT server alone and merges its outcome
+ * into what the last full run recorded, then rewrites `discovery.json`. Falls back to the full run, in the same
+ * job, when it cannot be narrow: no full run has completed in this process yet, nothing is placed (single mode),
+ * the servers could not be read, or the guild is not among them. A server whose earlier PUT failed is therefore
+ * retried at the next full run (a boot, or a panel `routing-set`), no longer at the next join; a global empty that
+ * the last full run could not do is still retried here.
+ */
+export function applyRoutingFor(guildId: string, reason: string): Promise<ApplyResult> {
   return enqueue(async () => {
     const c = required();
     const routing = await readRouting(c.dataDir);
@@ -180,52 +276,54 @@ export function applyRouting(reason: string): Promise<ApplyResult> {
       loaded: c.plugins.map((p) => p.name),
       guildIds: (snapshots ?? []).map((s) => s.id),
       homeGuildId: c.homeGuildId,
+      previous: NO_PREVIOUS,
     });
-
-    let results: GuildRegistration[];
-    let failure: { error: unknown } | undefined;
-    if (plan.mode === "single") {
-      try {
-        results = await registerPlan(c.put, c.appId, plan, c.now);
-      } catch (err) {
-        failure = { error: err };
-        results = [
-          {
-            guildId: plan.scope === "guild" ? plan.guildId : "global",
-            registered: 0,
-            error: describeError(err),
-            at: c.now().toISOString(),
-          },
-        ];
-      }
-    } else {
-      results = await registerPlan(c.put, c.appId, plan, c.now);
+    const body = plan.mode === "routed" ? plan.bodies.get(guildId) : undefined;
+    if (!fullRunDone || plan.mode !== "routed" || snapshots === null || body === undefined) {
+      return fullRun(c, reason, routing, snapshots);
     }
-
-    lastRegistrations = results;
-    // After registering, not before: the file carries what each server was actually told.
-    if (snapshots !== null) await writeView(c, snapshots, results, reason);
-    if (plan.mode === "routed") {
-      logRouted(c, snapshots ?? [], results);
-      warnHomeServerMissing(c, routing, snapshots);
-    }
-    if (failure !== undefined) throw failure.error;
-    return { mode: plan.mode, results };
+    // A global empty the last full run could not do (it failed, or no server took a list) is retried here: the
+    // joined server may be the first to take one, and its own list on top of a leftover global one shows twice.
+    // registerPlan still empties only once a server has taken its commands.
+    const globalPending = lastRegistrations.some((r) => r.guildId === "global" && r.error !== undefined);
+    const { results } = await registerPlan(
+      c.put,
+      c.appId,
+      { mode: "routed", bodies: new Map([[guildId, body]]), clears: [], clearGlobal: globalPending },
+      c.now,
+    );
+    // Each new record replaces the earlier one for its scope (the joined server's, and the global one if retried).
+    lastRegistrations = [...lastRegistrations.filter((r) => !results.some((n) => n.guildId === r.guildId)), ...results];
+    await writeView(c, snapshots, lastRegistrations, reason);
+    logRouted(c, snapshots, results);
+    return { mode: "routed" as const, results };
   });
 }
 
 /** Re-snapshot the servers and rewrite `discovery.json` with the registrations already made. Before
- *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. */
-export function refreshDiscovery(): Promise<void> {
+ *  `initRouting` there is nothing to describe yet, so it does nothing. Serialized on the same chain. Resolves
+ *  `true` when `discovery.json` was written; `false` before `initRouting` (no log line), when the servers could not
+ *  be read, or when the write failed (both logged) -- a `discovery-refresh` request is refused on `false` (#484). */
+export function refreshDiscovery(): Promise<boolean> {
   return enqueue(async () => {
-    if (context === undefined) return;
+    if (context === undefined) return false;
     const snapshots = takeSnapshots(context);
-    if (snapshots !== null) await writeView(context, snapshots, lastRegistrations, "refresh");
+    if (snapshots === null) return false;
+    return writeView(context, snapshots, lastRegistrations, "refresh");
   });
 }
 
+// U+FFFD, built from its code point (the form resolve.ts uses; a typed escape is normalised by the editing tools).
+const REPLACEMENT = String.fromCharCode(0xfffd);
+
+/** A name from Discord as one bounded line (#485 item 8): at most 80 units, every control character (C0, DEL, C1)
+ *  replaced, so a server named with a newline and a forged `[routing]` line cannot start a second line. Total. */
+function logName(value: unknown): string {
+  return clip(String(value), 80).replace(/\p{Cc}/gu, REPLACEMENT);
+}
+
 /** A server as it is named in a log line. Total, so a malformed argument cannot make a catch block throw. */
-const label = (guild: { id: string; name: string }): string => `${guild?.name} (${guild?.id})`;
+const label = (guild: { id: string; name: string }): string => `${logName(guild?.name)} (${guild?.id})`;
 
 /**
  * Writes through the context's logger. A logger that throws must neither hold up the work nor turn a join
@@ -236,7 +334,8 @@ const label = (guild: { id: string; name: string }): string => `${guild?.name} (
 function tell(c: RoutingContext, level: "log" | "error", message: string, err?: unknown): void {
   const log = c.log;
   try {
-    if (level === "error") log.error(message, err);
+    // `err` only when there is one: `log.error(message, undefined)` prints a trailing " undefined".
+    if (level === "error") err === undefined ? log.error(message) : log.error(message, err);
     else log.log(message);
   } catch {
     /* the logger is broken too */
@@ -245,9 +344,10 @@ function tell(c: RoutingContext, level: "log" | "error", message: string, err?: 
 
 /**
  * The bot has joined a server (discord.js `guildCreate`). In routed mode the new server has no commands
- * until something registers there, so this registers again -- the whole run, through `applyRouting`, the
- * one path that is already serialized, recorded and tested -- which also rewrites `discovery.json`, so the
- * file the panel reads lists the server within seconds.
+ * until something registers there, so this registers THAT server alone (`applyRoutingFor`, #482; the full run
+ * when it cannot be narrow) on the already serialized chain, and rewrites `discovery.json`, so the file the
+ * panel reads lists the server within seconds. The price: a server whose earlier PUT failed is retried at the
+ * next full run (a boot, or a panel routing change), no longer at the next join.
  *
  * In single mode registration goes to ONE place, the home server's guild (or everywhere, when there is no
  * home server), and a join does not change where; only discovery is refreshed. The exception is a join OF
@@ -266,9 +366,9 @@ function tell(c: RoutingContext, level: "log" | "error", message: string, err?: 
  * already holds the new server.
  *
  * Never rejects. It is called from an event listener, where a rejection is a process-level event, and
- * `applyRouting` CAN reject here: single mode rethrows a failed registration, and this run is a single-mode
- * one when nothing is placed (a join of the home server with no placements, or a last placement removed
- * between the read and the call).
+ * `applyRouting` (and `applyRoutingFor`, which falls back to the same full run) CAN reject here: single mode
+ * rethrows a failed registration, and this run is a single-mode one when nothing is placed (a join of the home
+ * server with no placements, or a last placement removed between the read and the call).
  */
 export async function guildJoined(guild: { id: string; name: string }): Promise<void> {
   const c = context;
@@ -276,7 +376,10 @@ export async function guildJoined(guild: { id: string; name: string }): Promise<
   try {
     tell(c, "log", `[routing] joined ${label(guild)}`);
     const routing = await readRouting(c.dataDir);
-    if (hasPlacements(routing) || guild.id === c.homeGuildId) await applyRouting(`joined ${guild.name}`);
+    // Routed: only the joined server is registered (#482). A join of the home server in single mode is the full
+    // run: single mode's one call IS that registration.
+    if (hasPlacements(routing)) await applyRoutingFor(guild.id, `joined ${logName(guild.name)}`);
+    else if (guild.id === c.homeGuildId) await applyRouting(`joined ${logName(guild.name)}`);
     else await refreshDiscovery();
   } catch (err) {
     tell(c, "error", `[routing] handling the join of ${label(guild)} failed`, err);
@@ -313,6 +416,7 @@ export function routingIdleForTest(): Promise<void> {
 export function resetRoutingForTest(): void {
   context = undefined;
   lastRegistrations = [];
+  fullRunDone = false;
   said.clear();
 }
 

@@ -404,16 +404,19 @@ install: next steps for '$INSTANCE'
      BOT_OPS_CONTAINER=$PROJECT \\
      docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile admin up -d --build admin
 
-  5. Optional: expose the bot's local API (currently just the character-linking endpoint — see
-     README.md's Character linking section) to the internet via Cloudflare Tunnel, without
-     opening any inbound firewall ports. Only useful once WARBANDEER_INGEST_PORT and
-     CLOUDFLARE_TUNNEL_TOKEN are set in .env (see README.md's Cloudflare Tunnel section for how
-     to create the tunnel and get a token). CLOUDFLARE_TUNNEL_TOKEN is read out of .env just for
-     this one command, same as ADMIN_TOKEN above — the cloudflared container never gets the rest
-     of your secrets:
+  5. Optional: expose the bot's own HTTP endpoints (HTTP_PORT, docs/adr/0007, or the warbandeer
+     plugin's WARBANDEER_INGEST_PORT) through a Cloudflare tunnel, without opening any inbound
+     firewall ports. Point the tunnel's public hostname at this bot's container name, $PROJECT,
+     not the "bot" alias (see README.md's Cloudflare Tunnel section). Only useful once the port
+     and CLOUDFLARE_TUNNEL_TOKEN are set in .env (see README.md's Cloudflare Tunnel section for
+     how to create the tunnel and get a token). CLOUDFLARE_TUNNEL_TOKEN is read out of .env just
+     for this one command, same as ADMIN_TOKEN above — the cloudflared container never gets the rest
+     of your secrets. The command names the cloudflared service and passes --no-deps, so it never
+     builds, starts or recreates the running bot container (cloudflared's depends_on would
+     otherwise pull the bot in):
 
      CLOUDFLARE_TUNNEL_TOKEN=\$(grep '^CLOUDFLARE_TUNNEL_TOKEN=' $CONFIG_DIR/.env | cut -d= -f2-) \\
-     docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile tunnel up -d --build cloudflared
+     docker compose -f $STACK_DIR/docker-compose.yml -p $PROJECT --profile tunnel up -d --no-deps cloudflared
 EOF
 }
 

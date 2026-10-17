@@ -8,6 +8,7 @@ import type { Plugin, PluginCommand, PluginIndexEntry, TickCheck } from "../plug
 import { buildDiscovery, describePlugins, discoveryPath, inviteUrl, readDiscovery, snapshotGuilds, writeDiscovery } from "./discovery";
 import type { GuildSnapshot } from "./discovery";
 import type { GuildRegistration } from "./register";
+import { resetKeptCorruptForTest } from "../storage";
 
 const HOME = "111111111111111111";
 const OTHER = "222222222222222222";
@@ -21,6 +22,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  // readDiscovery keeps a file that will not parse in place and remembers it (#477); the state guard fails a leak.
+  resetKeptCorruptForTest();
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -298,6 +301,14 @@ describe("buildDiscovery", () => {
   test("a global registration belongs to no one server, so every server reads null", () => {
     const file = build({ registrations: [{ guildId: "global", registered: 7, at: AT }] });
     expect(file.guilds.map((g) => g.commands)).toEqual([null, null]);
+    // ...and it is recorded in the file's `global` slot instead (#482).
+    expect(file.global).toEqual({ registered: 7, at: AT });
+  });
+
+  test("the global slot carries the error of a failed or skipped empty, and is absent when the scope was not touched (#482)", () => {
+    const failed = build({ registrations: [{ guildId: "global", registered: 0, error: "Unknown application (10002)", at: AT }] });
+    expect(failed.global).toEqual({ registered: 0, error: "Unknown application (10002)", at: AT });
+    expect(Object.hasOwn(build({ registrations: [{ guildId: HOME, registered: 7, at: AT }] }), "global")).toBe(false);
   });
 
   test("homeGuildId is null when unset", () => {
@@ -315,6 +326,17 @@ describe("buildDiscovery", () => {
   test("the file has exactly the documented top-level shape", () => {
     const file = build();
     expect(Object.keys(file).sort()).toEqual(["bot", "generatedAt", "guilds", "homeGuildId", "inviteUrl", "plugins", "v"]);
+    // `global` is the one optional key (#482): present only once the global scope has an outcome.
+    expect(Object.keys(build({ registrations: [{ guildId: "global", registered: 1, at: AT }] })).sort()).toEqual([
+      "bot",
+      "generatedAt",
+      "global",
+      "guilds",
+      "homeGuildId",
+      "inviteUrl",
+      "plugins",
+      "v",
+    ]);
     expect(file.v).toBe(1);
     expect(file.generatedAt).toBe(NOW.toISOString());
     expect(file.bot).toEqual(BOT);
@@ -397,10 +419,11 @@ describe("readDiscovery (#241)", () => {
   test("a malformed file reads as not published yet", async () => {
     const quiet = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // Not JSON at all -- moved aside by readJsonOrFresh, as every data file is.
+      // Not JSON at all -- a read leaves it where it is (R2's onCorrupt "keep"); writeDiscovery replaces it whole.
       writeFileSync(discoveryPath(dir), "{ not json");
       expect(await readDiscovery(dir)).toBeNull();
-      expect(readdirSync(dir).some((f) => f.startsWith("discovery.json.corrupt-"))).toBe(true);
+      expect(readdirSync(dir)).toEqual(["discovery.json"]);
+      expect(readFileSync(discoveryPath(dir), "utf8")).toBe("{ not json");
       // JSON, but not a file the bot wrote: no guilds list.
       for (const damaged of ["null", "[]", "5", '"text"', "{}", '{"v":1}', '{"guilds":null}', '{"guilds":{}}', '{"guilds":"x"}']) {
         writeFileSync(discoveryPath(dir), damaged);
@@ -411,10 +434,48 @@ describe("readDiscovery (#241)", () => {
     }
   });
 
+  // #482: every element a reader indexes into is checked, so a hand-damaged file is "not published yet" here and
+  // not a TypeError in a plugin's destinations() or the mailbox's check. Every ELEMENT case carries a valid
+  // `plugins`, or it would stop at the plugins check and never reach the element check it pins.
+  test("V1: a malformed guild or channel element, or a missing or wrong plugins, reads as not published yet", async () => {
+    const cases = [
+      '{"guilds":[null],"plugins":{}}',
+      '{"guilds":[{"id":1}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":"none"}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[null]}],"plugins":{}}',
+      '{"guilds":[],"plugins":[]}',
+      '{"guilds":[]}',
+      // one field at a time (the id and name cases would otherwise mask each other)
+      '{"guilds":[{"id":"1","channels":[]}],"plugins":{}}',
+      '{"guilds":[{"name":"x","channels":[]}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[{"name":"c"}]}],"plugins":{}}',
+      '{"guilds":[{"id":"1","name":"x","channels":[{"id":"c"}]}],"plugins":{}}',
+    ];
+    for (const damaged of cases) {
+      writeFileSync(discoveryPath(dir), damaged);
+      expect(await readDiscovery(dir), damaged).toBeNull();
+    }
+  });
+
+  test("V1b: a good file with commands null or a registration, an empty guild list and an unknown key still reads", async () => {
+    const good = (commands: unknown, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ guilds: [{ id: "1", name: "x", channels: [{ id: "c", name: "general" }], commands }], plugins: {}, ...extra });
+    for (const text of [good(null), good({ registered: 0, at: AT }), good("not a registration"), '{"guilds":[{"id":"1","name":"x","channels":[{"id":"c","name":"n","canSend":"yes"}]}],"plugins":{}}', good(null, { somethingNew: 1, global: { registered: 3, at: AT } }), '{"guilds":[],"plugins":{}}']) {
+      writeFileSync(discoveryPath(dir), text);
+      expect(await readDiscovery(dir), text).not.toBeNull();
+    }
+  });
+
   test("a good file is read back as it was written", async () => {
     const file = build({ registrations: [{ guildId: HOME, registered: 7, at: AT }] });
     await writeDiscovery(dir, file);
     expect(await readDiscovery(dir)).toEqual(file);
+  });
+
+  test("a file with a global slot is read back unchanged (#482)", async () => {
+    const file = build({ registrations: [{ guildId: "global", registered: 3, at: AT }] });
+    await writeDiscovery(dir, file);
+    expect((await readDiscovery(dir))!.global).toEqual({ registered: 3, at: AT });
   });
 
   test("a file with an empty guilds list is a file: the bot published that it is in no server", async () => {

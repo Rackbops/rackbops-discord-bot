@@ -116,6 +116,10 @@ export interface DiscoveryFile {
   inviteUrl: string;
   homeGuildId: string | null;
   guilds: DiscoveryGuild[];
+  /** #482: the global scope's last recorded outcome -- `registered: N` after a single-mode global registration, `0`
+   *  after a routed run emptied it, with `error` when the empty failed or was skipped. Absent in a file written
+   *  before this, and when the global scope was never touched. */
+  global?: { registered: number; error?: string; at: string };
   /** `destinations` (#219): what the plugin's manifest declares, for the panel's pickers. Absent in a file
    *  written before #219, and read as none. */
   plugins: Record<string, { posts: boolean; commands: string[]; destinations?: { name: string; description: string }[] }>;

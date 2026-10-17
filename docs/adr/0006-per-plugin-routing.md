@@ -36,7 +36,10 @@ request mailbox and applied without a restart.
    only server" and becomes "the home server": a plugin with no entry in `routing.json` registers
    there and posts to `ANNOUNCE_CHANNEL_ID`, exactly as before. With no `routing.json` at all the
    bot makes byte-for-byte the registration call it makes today — to the home server when
-   `DISCORD_SERVER_ID` is set, globally when it is not.
+   `DISCORD_SERVER_ID` is set, globally when it is not. *Amended by #420:* plus, once, the empties a
+   routed past requires — the servers whose `discovery.json` record shows a list of their own, and a
+   global list an earlier run registered — because a PUT replaces one scope's list and a scope the run
+   does not write keeps what it had.
 4. **The bot publishes what it can see, as `data/discovery.json`.** Its servers, their text
    channels and whether it can post in each, the outcome of the last command registration per
    server, and an invite URL carrying the `applications.commands` scope. The panel reads that file
@@ -57,9 +60,11 @@ request mailbox and applied without a restart.
    in time: a bot or panel from before #219 rebuilds each server entry from the keys it knows, so
    rolling either back drops every `destinations` mapping on its next write (they have to be picked
    again after rolling forward).
-7. **Channel restrictions are enforced by the bot at dispatch**, because a bot cannot edit
-   Discord's per-channel command permissions (that needs a user's bearer token). A command used
-   outside its channels gets a private reply naming the right ones; a thread counts as its parent.
+7. **Channel restrictions are enforced by the bot at dispatch**, where the bot can see the channel
+   (where it cannot -- a channel it has no view of, a thread whose parent is unknown -- the command runs
+   and the log says so, `gate.ts`), because a bot cannot edit Discord's per-channel command permissions
+   (that needs a user's bearer token). A command used outside its channels gets a private reply naming
+   the right ones, and only ones the bot can still see (#483); a thread counts as its parent.
 8. **The panel may set plugin-declared secret keys, write-only.** A key the Plugin Index marks
    `secret: true` can be written through `env-set`, is never returned by `env-get`, and appears in
    `env-schema` with its `pattern`, `required` and `source` plus `secret` + `isSet`, never its

@@ -289,7 +289,7 @@ describe("tickChecks", () => {
   });
 
   test("a discovery refresh that rejects is logged, not left unhandled", async () => {
-    // A refresh is built not to reject; making one anyway takes a log that throws while it reports an
+    // A refresh is built not to reject; making one anyway takes a context whose log getter throws while it reports an
     // unreadable server cache. The check is no longer awaiting it, so nothing else would catch it.
     resetDiscoveryGapForTest();
     const errors = spyOn(console, "error").mockImplementation(() => {});
@@ -307,12 +307,10 @@ describe("tickChecks", () => {
         commandMap: new Map(),
         plugins: [],
         now: () => new Date(),
-        log: {
-          log: () => {},
-          warn: () => {},
-          error: () => {
-            throw new Error("log is broken");
-          },
+        // A logger that throws is swallowed by `tell` now (#421); a context whose `log` GETTER throws is what still
+        // rejects (`tell` reads `c.log` outside its try, on purpose).
+        get log(): never {
+          throw new Error("log is broken");
         },
       });
       const check = tickChecks({} as unknown as Client, []).find((c) => c.name === "discovery")!;

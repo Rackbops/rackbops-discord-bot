@@ -324,6 +324,7 @@ async function activate(c: Client<true>): Promise<void> {
               () => whereOf(chatInput, (id) => client.channels.fetch(id)),
               () => readRouting(DATA_DIR),
               console,
+              () => readDiscovery(DATA_DIR),
             ),
         );
       } else if (interaction.isModalSubmit() && isReportModal(interaction.customId)) {
@@ -352,6 +353,7 @@ async function activate(c: Client<true>): Promise<void> {
               () => whereOf(interaction, (id) => client.channels.fetch(id)),
               () => readRouting(DATA_DIR),
               { error: () => {} },
+              () => readDiscovery(DATA_DIR),
             ),
           log: console,
         });
@@ -464,8 +466,9 @@ async function activate(c: Client<true>): Promise<void> {
 
   try {
     // #239: what decides where the commands go now lives in src/routing/. With no routing.json (or
-    // one that places nobody) `applyRouting` makes EXACTLY the one PUT that used to be here, to the
-    // same route with the same body, and its result is `single` -- so the line below is unchanged.
+    // one that places nobody) `applyRouting` makes the one PUT that used to be here, to the same route
+    // with the same body -- plus, once, the empties a routed past requires (#420) -- and its result is
+    // `single`, so the line below is unchanged.
     // A `single` failure is rethrown once discovery.json is written (see live.ts for what it records
     // and when it is skipped), into the catch below. So is a routing read that fails for a reason other
     // than a parse error (#509): `applyRouting` reads routing first, outside any try, and `readJsonOrFresh`

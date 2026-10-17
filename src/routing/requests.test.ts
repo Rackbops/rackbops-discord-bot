@@ -74,6 +74,8 @@ function harness(
     routingFails?: unknown;
     /** the Nth mutateSecrets call (1-based) throws this. */
     secretsFailOnCall?: { call: number; error: unknown };
+    /** what refreshDiscovery answers: whether it wrote discovery.json (default true). */
+    refreshOk?: boolean;
   } = {},
 ) {
   let discovery = opts.discovery === undefined ? bothServers() : opts.discovery;
@@ -117,6 +119,7 @@ function harness(
     refreshDiscovery: async () => {
       events.push("refreshDiscovery");
       if (opts.afterRefresh !== undefined) discovery = opts.afterRefresh;
+      return opts.refreshOk ?? true;
     },
     now: () => NOW,
     log: { warn: (...args: unknown[]) => void warns.push(args.map(String).join(" ")) },
@@ -508,9 +511,9 @@ describe("applyRoutingRequest: routing-set", () => {
     expect(h.routingWrites).toEqual([]);
   });
 
-  test("a discovery.json damaged where readDiscovery cannot see is looked at again after a refresh", async () => {
-    // A guild that is not an object: `readDiscovery` only checks that there is a list. Validating against
-    // it throws, which is the same as a stale file -- refresh, then look again.
+  test("a discovery.json that makes the check throw is looked at again after a refresh (the second net behind readDiscovery)", async () => {
+    // A guild that is not an object: the real `readDiscovery` now rejects such a file itself (#482), so this
+    // injects one past it. Validating against it throws, which is the same as a stale file -- refresh, then look again.
     const damaged = { ...bothServers(), guilds: [null as never] };
     const h = harness({ discovery: damaged, afterRefresh: bothServers() });
     await applyRoutingRequest(setRequest(), h.deps);
@@ -646,7 +649,7 @@ describe("applyRoutingRequest: webhook-add", () => {
   test("a webhook in a channel the bot cannot see is refused", async () => {
     const h = harness({ lookup: { ok: true, id: WH_ID, channelId: "777777777777777777", guildId: HOME } });
     const reason = await refusalOf(applyRoutingRequest(addRequest(), h.deps));
-    expect(reason).toBe("that webhook posts to a channel the bot cannot see");
+    expect(reason).toBe("that webhook posts to a channel the bot does not list (it lists the text and announcement channels it can see)");
     expect(h.secretsWrites).toEqual([]);
     expect(h.routingWrites).toEqual([]);
   });
@@ -763,17 +766,41 @@ describe("applyRoutingRequest: webhook-remove and discovery-refresh", () => {
     expect(h.events).toEqual([]);
   });
 
-  test("webhook-remove looks only at the channels it holds, not at inherited keys", async () => {
+  test("a channel id that is not a snowflake is refused by the parser; a snowflake with no webhook, by the apply", async () => {
     const h = harness();
-    // "constructor" is not a snowflake so the parser refuses it first; the guard behind it is `Object.hasOwn`.
+    // The parser refuses "constructor" first (`bad channel id`); 12345 is a snowflake nobody has a webhook for.
     expect(parseRoutingRequest({ action: "webhook-remove", channelId: "constructor", requestedBy: ME })).toEqual({ ok: false, reason: "bad channel id" });
     expect(await refusalOf(applyRoutingRequest(removeRequest({ channelId: "12345" }), h.deps))).toBe("no webhook is registered for that channel");
+  });
+
+  test("Q4b: the apply looks only at the webhooks it holds, not at inherited keys (Object.hasOwn)", async () => {
+    // Bypasses the parser, so an inherited key reaches the apply: `in` would find `constructor` on the prototype.
+    const h = harness({ routing: routingWithWebhook() });
+    const request = { action: "webhook-remove", channelId: "constructor", requestedBy: ME } as const;
+    expect(await refusalOf(applyRoutingRequest(request, h.deps))).toBe("no webhook is registered for that channel");
+    expect(h.routingWrites).toEqual([]);
+    expect(h.secretsWrites).toEqual([]);
   });
 
   test("discovery-refresh refreshes", async () => {
     const h = harness();
     await expect(applyRoutingRequest(must({ action: "discovery-refresh", requestedBy: ME }), h.deps)).resolves.toEqual({});
     expect(h.events).toEqual(["refreshDiscovery"]);
+  });
+
+  test("Q2: a discovery-refresh that wrote nothing is refused, not recorded as done (#484)", async () => {
+    const h = harness({ refreshOk: false });
+    expect(await refusalOf(applyRoutingRequest(must({ action: "discovery-refresh", requestedBy: ME }), h.deps))).toBe(
+      "discovery could not be refreshed (the bot has not finished starting, or its log says why)",
+    );
+    expect(h.events).toEqual(["refreshDiscovery"]);
+  });
+
+  test("Q2b: the check against discovery re-reads after a refresh that reports false", async () => {
+    const h = harness({ discovery: homeOnly(), afterRefresh: bothServers(), refreshOk: false });
+    await applyRoutingRequest(setRequest({ servers: { [OTHER]: { commands: "all" } } }), h.deps);
+    expect(h.events).toEqual(["refreshDiscovery", "mutateRouting", "applyRouting routing-set music"]);
+    expect(h.routing.plugins.music).toBeDefined();
   });
 });
 

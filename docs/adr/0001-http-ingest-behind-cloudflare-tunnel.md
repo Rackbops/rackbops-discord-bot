@@ -39,3 +39,5 @@ anyone on the internet, gated only by an 8-hex-character Link Code (a 32-bit spa
 `links.ts`'s `mintLinkCode` now regenerates on collision so it stays that wide) plus a per-IP
 rate limit. That's the accepted security boundary here, not an oversight — worth stating plainly
 since it's easy to read "behind a tunnel" as "still contained" the way the admin panel is.
+
+Amended (#487): the tunnel targets the bot's container name, not the `bot` alias, which a self-update's replacement also carries during the overlap.

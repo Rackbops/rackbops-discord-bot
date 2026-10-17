@@ -120,7 +120,8 @@ export function describePlugins(
 /**
  * The file, from plain data. A server's `commands` is the registration made in it, or `null` when
  * there is none -- which, when nothing is placed, is every server except the home one (and every
- * server when registration is global, since that outcome belongs to no one server).
+ * server when registration is global, since that outcome belongs to no one server). That global outcome
+ * is recorded in the file's `global` slot instead (#482).
  */
 export function buildDiscovery(opts: {
   now: Date;
@@ -131,6 +132,7 @@ export function buildDiscovery(opts: {
   plugins: readonly PluginSummary[];
 }): DiscoveryFile {
   const { now, bot, homeGuildId, snapshots, registrations, plugins } = opts;
+  const globalRegistration = registrations.find((r) => r.guildId === "global");
   return {
     v: 1,
     generatedAt: now.toISOString(),
@@ -153,6 +155,15 @@ export function buildDiscovery(opts: {
               },
       };
     }),
+    ...(globalRegistration === undefined
+      ? {}
+      : {
+          global: {
+            registered: globalRegistration.registered,
+            ...(globalRegistration.error !== undefined ? { error: globalRegistration.error } : {}),
+            at: globalRegistration.at,
+          },
+        }),
     // `Object.fromEntries` creates own data properties, so a plugin named like an inherited key
     // (`constructor` is a legal plugin name) is an ordinary entry.
     plugins: Object.fromEntries(
@@ -177,15 +188,35 @@ export async function writeDiscovery(dataDir: string, file: DiscoveryFile): Prom
   await writeJsonAtomic(discoveryPath(dataDir), file);
 }
 
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** #482: the shape every reader indexes into -- a guild's `id`, `name` and `channels` (each with `id` and `name`) --
+ *  so a hand-damaged element reads as "not published yet" here, not as a TypeError in a plugin's `destinations()`
+ *  or the mailbox's check. The bot is the only writer; this is a floor, not a schema. */
+function isDiscoveryShape(raw: unknown): raw is DiscoveryFile {
+  // `plugins` is REQUIRED: the type says so and requests.ts does Object.hasOwn(discovery.plugins, plugin).
+  if (!isRecord(raw) || !Array.isArray(raw.guilds) || !isRecord(raw.plugins)) return false;
+  return raw.guilds.every(
+    (g) =>
+      isRecord(g) &&
+      typeof g.id === "string" &&
+      typeof g.name === "string" &&
+      Array.isArray(g.channels) &&
+      g.channels.every((c) => isRecord(c) && typeof c.id === "string" && typeof c.name === "string"),
+  );
+}
+
 /**
  * The published file, for the bot's own validation of a panel request (#241): null when there is none
- * to go on. A missing file is null; an unparseable one is moved aside by `readJsonOrFresh`, as every
- * data file is, and is null too; and so is anything that is not an object with a `guilds` list, so a
- * file damaged by hand reads as "not published yet" instead of throwing inside validation. Beyond that
- * the bot is the only writer and the shape is trusted.
+ * to go on. A missing file is null; an unparseable one is left where it is by this read (R2's
+ * `onCorrupt: "keep"`: `writeDiscovery` replaces it whole on the next run) and is null too; and so is anything
+ * that is not an object with a `plugins` object and a `guilds` list whose elements have a string `id` and `name`
+ * and a `channels` list of objects with a string `id` and `name`, so a file damaged by hand reads as "not
+ * published yet" instead of throwing inside validation or a plugin's `destinations()` (#482). The `commands` and
+ * `canSend` of an element are NOT checked (nothing indexes into them), nor are unknown keys (a newer bot's
+ * additions, such as the `global` record, pass). Beyond that the bot is the only writer and the shape is trusted.
  */
 export async function readDiscovery(dataDir: string): Promise<DiscoveryFile | null> {
-  const raw = await readJsonOrFresh<unknown>(discoveryPath(dataDir), () => null, "discovery");
-  if (typeof raw !== "object" || raw === null || !Array.isArray((raw as { guilds?: unknown }).guilds)) return null;
-  return raw as DiscoveryFile;
+  const raw = await readJsonOrFresh<unknown>(discoveryPath(dataDir), () => null, "discovery", { onCorrupt: "keep" });
+  return isDiscoveryShape(raw) ? raw : null;
 }
