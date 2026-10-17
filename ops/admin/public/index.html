@@ -206,8 +206,10 @@
   }
 
   // TIMEOUT_SIGNAL:begin
-  // A short-lived AbortController tied to a timeout, shared by every /api/* call this page makes
-  // that shouldn't hang forever. Before issue #53, only the Access-session probe, the realm-chooser
+  // A short-lived AbortController tied to a timeout, shared by the /api/* calls this page makes that
+  // shouldn't hang forever: the config reload, the routing send and its re-read, both routing pollers'
+  // reads, the Servers-tab actions and their poller, the plugin request send, the restart, the apply, and the
+  // 5 s Access probe. Before issue #53, only the Access-session probe, the realm-chooser
   // fetch, and the branch-chooser fetch had this; the restart and env-save POSTs had NO timeout at
   // all and could hang indefinitely behind a wedged bot-ops.sh subprocess on the server. `cancel()`
   // MUST be called once the real request settles (a `finally`), or the timer outlives the request
@@ -1244,8 +1246,11 @@
     return step;
   }
 
-  // Lazily seeds routeState from the model's OWN saved placement, once per plugin -- never re-seeded from
-  // a later model, so an in-progress pick a background loadRouting/poll brought in survives it. Round-3
+  // Lazily seeds routeState from the model's OWN saved placement. It re-seeds only while the step is clean
+  // (#405, routeStepClean: no pending timer, request or held edit, and the picks are the seed or a send just
+  // applied), so a render after a reload or poll shows the freshest saved placement, while an in-progress
+  // pick a background loadRouting/poll brought in is still never overwritten. `base` is the seed, kept for
+  // sendRouting's merge. Round-3
   // review finding: seeding used to happen on first CALL, not first READY model -- refreshDiscovery calls
   // this too (to track its own inflight/held), and in missing/stale mode model.rows is always [] (nothing
   // has a name yet), so a "Refresh from Discord" click from missing mode seeded an EMPTY selection
@@ -1261,8 +1266,9 @@
       st = { selection: {}, inflight: null, held: false, outcome: null, sendTimer: null, pollTimer: null, seeded: false };
       routeState.set(plugin, st);
     }
-    if (!st.seeded && model.mode === "ready") {
+    if (model.mode === "ready" && (!st.seeded || routeStepClean(st))) {
       st.selection = selectionFromModel(model);
+      st.base = JSON.parse(JSON.stringify(st.selection));
       st.seeded = true;
     }
     return st;
@@ -1519,41 +1525,82 @@
   // "Applying…" behind -- "held" (something for this plugin was already in flight, this call was
   // coalesced), "error" (the planned body was unsendable, e.g. an empty channel list), "posted-error"
   // (the POST itself failed -- a non-2xx, an unparseable body, a network error; the detail is on the
-  // plugin's own card via renderRouteStatus), "unauthorized" (a 401 -- the login gate is already up), or
+  // plugin's own card via renderRouteStatus), "not-ready" (#406: the bot's server list isn't available, so
+  // nothing was sent), "unauthorized" (a 401 -- the login gate is already up), or
   // "sent" once the POST was accepted and its result polled to a settled outcome. Every other caller (the
   // debounced onRouteChange path, checkAgain) already has its own row-level UI and ignores the return.
   async function sendRouting(plugin) {
     const st = routeState.get(plugin);
     if (!st) return;
     if (st.sendTimer) { clearTimeout(st.sendTimer); st.sendTimer = null; }
-    const model = routingStepModel(plugin, routingData, Date.now());
-    const planned = routingSetBody(plugin, st.selection, model);
-    const rowEls = routingStepEls.get(plugin);
-    if (planned.error) {
-      // Pick at least one channel for <server>. -- find which row is the culprit (the one in "chosen"
-      // scope with nothing ticked) and mark it, rather than a bare bar-level message.
-      for (const row of model.rows) {
-        const sel = rowSelection(st, row.id);
-        if (sel.on && sel.scope === "chosen" && sel.channels.length === 0) {
-          const refs = rowEls && rowEls.rows.get(row.id);
-          // #309: each row's own message, naming its own server (routingSetBody's names only the first).
-          if (refs) showChannelError(refs, "Pick at least one channel for " + row.name + ".");
-        }
-      }
-      return "error";
-    }
     if (st.inflight) { st.held = true; return "held"; }
     const { signal, cancel } = timeoutSignal(MUTATION_TIMEOUT_MS);
-    const sentServers = Object.keys(planned.body.servers);
-    // Reserve the in-flight slot BEFORE the POST. A slow request must disable the controls and hold a
-    // later edit instead of allowing its debounce to start a concurrent second POST. The server id is
-    // filled in once the response arrives; object identity lets error cleanup avoid clearing a newer
-    // operation if another path has superseded this reservation.
-    const reservation = { id: null, sentServers, startedAt: Date.now() };
+    // Reserve the in-flight slot BEFORE the re-read and the POST. A slow request must disable the controls
+    // and hold a later edit instead of allowing its debounce to start a concurrent second POST (and a render
+    // during the re-read must see the step busy, so the clean re-seed cannot overwrite the edit being sent).
+    // The server id is filled in once the response arrives; object identity lets error cleanup avoid
+    // clearing a newer operation if another path has superseded this reservation.
+    const reservation = { id: null, sentServers: [], startedAt: Date.now() };
+    const previousOutcome = st.outcome;
     st.inflight = reservation;
     st.outcome = null;
     renderRouteStatus(plugin, routingStepEls.get(plugin));
+    // Every early exit after the reservation releases it AND redraws, or the controls stay disabled.
+    const release = () => {
+      if (st.inflight === reservation) st.inflight = null;
+      renderRouteStatus(plugin, routingStepEls.get(plugin));
+    };
     try {
+      // #405: the freshest saved placement, so a tab that loaded before another operator's change does not
+      // post a whole placement without it. Best effort: a failed read falls back to the in-memory data.
+      const reread = timeoutSignal(ROUTING_REREAD_TIMEOUT_MS);
+      try {
+        const fresh = await api("/api/routing", { signal: reread.signal });
+        if (fresh.ok) {
+          const parsed = JSON.parse(await fresh.text());
+          if (parsed && typeof parsed === "object") routingData = parsed;
+        }
+      } catch (e) {
+        if (e && e.message === "unauthorized") throw e;
+      } finally {
+        reread.cancel();
+      }
+      const model = routingStepModel(plugin, routingData, Date.now());
+      if (model.mode === "missing") {
+        // #406: no server list means rows [] and a body of `servers: {}` -- placed nowhere. Never sent.
+        st.outcome = { phase: "posted-error", message: "Not sent: the bot's server list isn't available right now. Your picks are kept; change one again or use Refresh from Discord once it is back." };
+        release();
+        showToast("warning", st.outcome.message);
+        return "not-ready";
+      }
+      if (st.base) {
+        const theirs = selectionFromModel(model);
+        st.selection = mergeSelection(st.base, st.selection, theirs);
+        // The fresh placement is the new base: a row the merge imported is then not "mine" on a retry after
+        // a failed send, so it keeps following the saved placement while the operator's own changes stay.
+        st.base = JSON.parse(JSON.stringify(theirs));
+      }
+      const planned = routingSetBody(plugin, st.selection, model);
+      if (planned.error) {
+        // Pick at least one channel for <server>. -- find which row is the culprit (the one in "chosen"
+        // scope with nothing ticked) and mark it, rather than a bare bar-level message.
+        const rowEls = routingStepEls.get(plugin);
+        for (const row of model.rows) {
+          const sel = rowSelection(st, row.id);
+          if (sel.on && sel.scope === "chosen" && sel.channels.length === 0) {
+            const refs = rowEls && rowEls.rows.get(row.id);
+            // #309: each row's own message, naming its own server (routingSetBody's names only the first).
+            if (refs) showChannelError(refs, "Pick at least one channel for " + row.name + ".");
+          }
+        }
+        // Nothing was sent: what the step said before still stands -- except "applied", which would make
+        // the step look clean (routeStepClean) and let a re-seed wipe the very pick that just failed to plan.
+        st.outcome = previousOutcome && previousOutcome.phase !== "applied" ? previousOutcome : null;
+        release();
+        return "error";
+      }
+      const sentServers = Object.keys(planned.body.servers);
+      reservation.sentServers = sentServers;
       const res = await api("/api/routing", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(planned.body), signal });
       const text = await res.text();
       if (!res.ok) {
@@ -1604,8 +1651,11 @@
       await new Promise((resolve) => { routeState.get(plugin) ? (routeState.get(plugin).pollTimer = setTimeout(resolve, ROUTING_POLL_MS)) : resolve(); });
       const st = routeState.get(plugin);
       if (!st || !st.inflight || st.inflight.id !== id) return; // superseded
+      // #468 item 8: each read is time-boxed to what is left of the answer window, so a hung read cannot
+      // outlast the wait the loop's own timeout check (below) is meant to enforce.
+      const poll = timeoutSignal(pollRequestTimeoutMs(startedAt, Date.now()));
       try {
-        const res = await api("/api/routing");
+        const res = await api("/api/routing", { signal: poll.signal });
         routingData = await res.json();
       } catch (e) {
         // Round-3 review finding: this branch returned without clearing inflight -- routeState survives a
@@ -1616,6 +1666,8 @@
         // return (only a throw would skip it), so clearing inflight here is the only piece missing.
         if (e && e.message === "unauthorized") { st.inflight = null; return; }
         // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+      } finally {
+        poll.cancel();
       }
       const st2 = routeState.get(plugin);
       if (!st2 || !st2.inflight || st2.inflight.id !== id) return; // superseded mid-fetch
@@ -1705,14 +1757,18 @@
           // loop to the outer catch below, which left `inflight` set forever: the step stayed "Applying…"
           // with every control disabled (renderRouteStatus's busy rule) until a full page reload. Mirrors
           // awaitRequestResult: swallow and retry until the timeout, below, actually ends the wait.
+          // #468 item 8: time-boxed like awaitRequestResult's read (see pollRequestTimeoutMs).
+          const poll = timeoutSignal(pollRequestTimeoutMs(startedAt, Date.now()));
           try {
-            const r = await api("/api/routing");
+            const r = await api("/api/routing", { signal: poll.signal });
             routingData = await r.json();
           } catch (e) {
             // Same fix as awaitRequestResult's identical branch: a plain return here left inflight stuck
             // (routeState outlives a 401/re-login), so this specific exit needs to clear it explicitly.
             if (e && e.message === "unauthorized") { now.inflight = null; return; }
             // A transient read failure doesn't end the wait -- the next tick tries again, until the timeout.
+          } finally {
+            poll.cancel();
           }
           const now2 = routeState.get(plugin);
           if (!now2 || !now2.inflight || now2.inflight.id !== result.id) return; // superseded mid-fetch
@@ -1729,6 +1785,11 @@
               now2.outcome = { phase: "posted-error", message: "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up." };
               renderRouteStatus(plugin, routingStepEls.get(plugin));
               showToast("warning", "The bot did not answer within 30 seconds. It may be restarting; the change is queued and applies when it catches up.");
+            } else if (found.ok === false) {
+              // #528 (R3): the bot refuses a discovery refresh that wrote nothing -- say so, don't call it a read.
+              now2.outcome = { phase: "posted-error", message: "The bot refused it: " + (found.reason || "no reason given") };
+              renderRouteStatus(plugin, routingStepEls.get(plugin));
+              showToast("danger", now2.outcome.message);
             } else {
               refreshRoutingSteps();
               showToast("success", "Read from Discord again.");
@@ -1778,6 +1839,14 @@
     // is invisible without this). Applied unconditionally on every call, not just the "Applying..." branch below, so it clears
     // the moment inflight does (a timeout/refusal/applied outcome all fall through to here first).
     const busy = !!(st && st.inflight);
+    // #468 item 10: disabling a control drops its focus to <body>. Remember which routing control of THIS
+    // card had it; a busy render whose active element is elsewhere (already on <body>, or another card)
+    // leaves an earlier record alone, so one card's second render cannot erase the first's.
+    const focusPrefix = "route-" + plugin + "-";
+    if (busy) {
+      const active = document.activeElement;
+      if (active && typeof active.id === "string" && active.id.startsWith(focusPrefix)) routeFocusId = active.id;
+    }
     if (els.body && els.body.setAttribute) {
       if (busy) els.body.setAttribute("aria-busy", "true");
       else els.body.removeAttribute("aria-busy");
@@ -1789,6 +1858,15 @@
       for (const chBox of refs.channelChecks.values()) chBox.disabled = busy;
       if (refs.postSelect) refs.postSelect.disabled = busy;
       if (refs.destSelects) for (const destSelect of refs.destSelects.values()) destSelect.disabled = busy;
+    }
+    if (!busy && routeFocusId !== null && routeFocusId.startsWith(focusPrefix)) {
+      // Only a control of THIS step's own (still attached) body: a step being rebuilt is not in the page yet,
+      // and refreshRoutingSteps restores focus once the new one is.
+      const target = document.getElementById(routeFocusId);
+      if (target && !target.disabled && els.body && els.body.contains && els.body.contains(target)) {
+        target.focus();
+        routeFocusId = null;
+      }
     }
     els.statusActions.textContent = "";
     const addAction = (text, onClick) => {
@@ -1890,6 +1968,17 @@
       if (!mount) continue;
       mount.replaceWith(buildWhereItLivesStep(p, {}));
     }
+    // #468 item 10: the rebuilt step has new elements; put focus back on the control that had it.
+    if (routeFocusId !== null) {
+      const target = document.getElementById(routeFocusId);
+      // Keep the record while the rebuilt control is still disabled (a busy step rebuilt by a background
+      // refresh): its last, non-busy render restores focus. Drop it when the control is gone.
+      if (!target) routeFocusId = null;
+      else if (!target.disabled) {
+        target.focus();
+        routeFocusId = null;
+      }
+    }
   }
 
   // #246: never innerHTML (a server or channel name is Discord-supplied text; decision 4/7 and the
@@ -1960,6 +2049,8 @@
         serverActionState.set(key, { busy: false, message: "Held: a change on the Plugins tab is already in flight. Try again once it settles." });
       } else if (outcome === "error") {
         serverActionState.set(key, { busy: false, message: "Couldn't resend it: the saved placement needs at least one channel for one of its servers. Fix it from the Plugins tab." });
+      } else if (outcome === "not-ready") {
+        serverActionState.set(key, { busy: false, message: "The bot's server list isn't available right now — try again once it is back." });
       } else if (outcome === "posted-error") {
         // Minor 3: sendRouting used to return undefined on a failed POST, which fell into the success
         // branch below and blanked this line -- the only report then landed on the plugin's own card.
@@ -3844,6 +3935,17 @@
   const ROUTING_SEND_DEBOUNCE_MS = 1200;
   const ROUTING_POLL_MS = 2000;
   const ROUTING_ANSWER_TIMEOUT_MS = 30000;
+  // #405: the re-read a send makes of /api/routing before it posts. Short on purpose -- a stalled
+  // connection should fall back to the in-memory placement quickly, not sit on "Applying…" for 30 s.
+  const ROUTING_REREAD_TIMEOUT_MS = 10000;
+
+  // #468 item 8: how long one poll GET may take -- what is left of the 30 s answer window, never under a
+  // second. The two routing pollers check their deadline AFTER the read, so the floor gives the last read a
+  // real chance instead of an instant abort (pollForResult, the Servers tab's poller, returns before a GET
+  // once nothing is left and needs no floor).
+  function pollRequestTimeoutMs(startedAt, now) {
+    return Math.max(1000, ROUTING_ANSWER_TIMEOUT_MS - (now - startedAt));
+  }
 
   // Missing/unparseable is stale too (never "ready" on a guess); an hour is four missed 15-minute
   // discovery refreshes -- long enough that the bot is down or stuck, short enough that clock skew
@@ -4051,6 +4153,59 @@
       }
     }
     return selection;
+  }
+
+  // #405: two rows pick the same thing. An absent row and { on: false } are the same (off is off, whatever
+  // it still remembers); channels are a set (order is irrelevant) and only count in "chosen" scope; postTo and
+  // the destination map are compared as they are sent.
+  function sameRowSelection(a, b) {
+    const x = a || { on: false };
+    const y = b || { on: false };
+    if (!x.on || !y.on) return !x.on && !y.on;
+    if (x.scope !== y.scope) return false;
+    if (x.scope === "chosen") {
+      const xs = new Set(x.channels || []);
+      const ys = new Set(y.channels || []);
+      if (xs.size !== ys.size) return false;
+      for (const c of xs) if (!ys.has(c)) return false;
+    }
+    if ((x.postTo || null) !== (y.postTo || null)) return false;
+    const xd = x.destinations || {};
+    const yd = y.destinations || {};
+    const names = Object.keys(xd);
+    if (names.length !== Object.keys(yd).length) return false;
+    for (const n of names) if (xd[n] !== yd[n]) return false;
+    return true;
+  }
+  function sameSelection(a, b) {
+    const ids = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+    for (const id of ids) if (!sameRowSelection((a || {})[id], (b || {})[id])) return false;
+    return true;
+  }
+
+  // #405: a three-way merge for a send. `base` is the placement this step was seeded from, `mine` the
+  // operator's picks, `theirs` the freshest saved placement. Per server: the operator's row when it differs
+  // from `base` (they changed it), else the fresh row -- so a server another tab added survives, and the
+  // operator's own changes win where they made them. An absent row is off.
+  function mergeSelection(base, mine, theirs) {
+    const ids = new Set([...Object.keys(base || {}), ...Object.keys(mine || {}), ...Object.keys(theirs || {})]);
+    const merged = {};
+    for (const id of ids) {
+      const row = sameRowSelection((mine || {})[id], (base || {})[id]) ? (theirs || {})[id] : (mine || {})[id];
+      if (row && row.on) merged[id] = row;
+    }
+    return merged;
+  }
+
+  // #405: nothing of the operator's is pending, so the step may show the freshest saved placement. Pending
+  // = a debounce timer, a request in flight, a held edit; a refused, failed or timed-out send keeps the
+  // picks (its own buttons act on them); an applied one is settled (the fresh model equals what was sent).
+  // With no outcome the picks must still equal the seed: an unsent pick that no timer covers (a server
+  // ticked, "Chosen" clicked, no channel yet) must survive a re-render.
+  function routeStepClean(st) {
+    if (st.sendTimer || st.inflight || st.held) return false;
+    if (st.outcome) return st.outcome.phase === "applied";
+    return !!st.base && sameSelection(st.selection, st.base);
   }
   // PLUGIN_ROUTING:end
 
@@ -4424,11 +4579,14 @@
   // #245: one plugin's in-progress routing pick and its send/poll state, surviving renderPlugins exactly
   // like openCards -- a card open/close or a background reloadConfig must lose neither a half-made
   // selection nor an in-flight "Applying...". `selection` is lazily seeded from routingStepModel on a
-  // plugin's first render and never reset from a fresh model afterward (a successful apply's own fresh
-  // state matches what was just selected, so nothing visibly diverges).
-  // { [plugin]: { selection: { [guildId]: {on, scope, channels, postTo} }, inflight: {id, sentServers,
+  // plugin's first ready render; `base` is that seed. It is re-seeded from a later model only while the step
+  // is clean (routeStepClean, #405), so an in-progress pick is never overwritten.
+  // { [plugin]: { selection: { [guildId]: {on, scope, channels, postTo} }, base, inflight: {id, sentServers,
   //   startedAt} | null, held: boolean, outcome: object | null, sendTimer, pollTimer } }
   let routeState = new Map();
+  // #468 item 10: the id of the routing control that had focus when its step went busy (every control is
+  // disabled then, and an applied outcome rebuilds the whole step), so focus can go back to it afterwards.
+  let routeFocusId = null;
 
   // The planner's input, read from EXACTLY four places: the config controls (a chip field's hidden
   // carrier included), a card's plain settings, a card's typed secrets, and the plugin tick boxes. Never
