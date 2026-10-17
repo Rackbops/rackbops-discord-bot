@@ -1,5 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { composeThemeCss } from "./build-theme";
+import { composeThemeCss, EXACT_VERSION_RE, pinProblem } from "./build-theme";
+
+describe("the pin check the build entry point runs", () => {
+  test("B1: an exact x.y.z is accepted; a range, a short or pre-release version and a non-string name the value", () => {
+    expect(pinProblem("1.2.3")).toBeNull();
+    for (const bad of ["^1.2.3", "1.2", "1.2.3-beta", 1, undefined, ["1.2.3"]] as const) {
+      const message = pinProblem(bad);
+      expect(message, String(bad)).not.toBeNull();
+      expect(message, String(bad)).toContain("must be an exact x.y.z version");
+      expect(message, String(bad)).toContain(`got ${JSON.stringify(bad)}`);
+    }
+  });
+
+  test("B2: EXACT_VERSION_RE is anchored at both ends", () => {
+    expect(EXACT_VERSION_RE.test("1.2.3")).toBe(true);
+    expect(EXACT_VERSION_RE.test("1.2.3 ")).toBe(false);
+    expect(EXACT_VERSION_RE.test("v1.2.3")).toBe(false);
+  });
+});
 
 describe("composeThemeCss", () => {
   test("composeThemeCss puts the banner first, then obsidian, then parchment", () => {
