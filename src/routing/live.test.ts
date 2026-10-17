@@ -570,6 +570,32 @@ describe("guildJoined / guildLeft (#259)", () => {
     expect(h.logs.log).toContain(`Registered commands in 1 server (Other: ${CORE.length + MUSIC.length})`);
   });
 
+  test("L6e: a join retries a global empty the last full run could not do (and not one that succeeded)", async () => {
+    await placeMusicInOther();
+    const globalRoute = `/applications/${APP}/commands`;
+    // Only the global empty fails at boot, so it is recorded with an error while the servers took their lists.
+    const h = harness({ homeGuildId: undefined, failures: { [globalRoute]: new Error("nope") } });
+    initRouting(h.ctx);
+    await applyRouting("boot");
+    expect(readDiscovery().global?.error).toContain("nope");
+    h.puts.length = 0;
+    await handleJoin(OTHER_GUILD);
+    // The narrow join registers OTHER and retries the global empty (it fails again here: still recorded).
+    expect(h.puts.map((p) => p.route)).toEqual([guildRoute(OTHER), globalRoute]);
+    expect(readDiscovery().global?.error).toContain("nope");
+
+    // A global empty that succeeded is not retried by a join.
+    resetRoutingForTest();
+    const ok = harness({ homeGuildId: undefined });
+    initRouting(ok.ctx);
+    await applyRouting("boot");
+    expect(readDiscovery().global).toMatchObject({ registered: 0 });
+    expect(readDiscovery().global?.error).toBeUndefined();
+    ok.puts.length = 0;
+    await handleJoin(OTHER_GUILD);
+    expect(ok.puts.map((p) => p.route)).toEqual([guildRoute(OTHER)]);
+  });
+
   test("L6b: a join while routing places nobody is the full single-mode run", async () => {
     const h = harness();
     initRouting(h.ctx);

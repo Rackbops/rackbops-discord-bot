@@ -349,6 +349,11 @@ describe("previousScopes (#420)", () => {
     expect(previousScopes(file({})).global).toBe(false);
   });
 
+  test("P1c: a guild listed twice is listed once (it must not be emptied twice)", () => {
+    const f = file({ guilds: [g(HOME, { registered: 2, at }), g(OTHER, { registered: 1, at }), g(HOME, { registered: 2, at })] });
+    expect(previousScopes(f).guilds).toEqual([HOME, OTHER]);
+  });
+
   test("P1b: a damaged file is read defensively and never throws", () => {
     const bad = { guilds: [null, { id: HOME, commands: "x" }, { id: OTHER, commands: { registered: 2 } }] } as unknown as DiscoveryFile;
     expect(previousScopes(bad)).toEqual({ guilds: [OTHER], global: false });

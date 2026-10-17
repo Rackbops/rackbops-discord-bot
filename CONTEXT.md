@@ -110,8 +110,9 @@ corrupt copy moved aside by `readJsonOrFresh`, or the temp file of a failed writ
 under another name, and is owner-only too -- for a file the bot wrote: one put there by hand keeps
 its own mode until the bot's first write replaces it). Per plugin, never per command. #237 added the
 model (the shapes, the pure decisions in `src/routing/resolve.ts`, the store); #239 wired command
-registration to it. With no `routing.json`, or one that places no plugin, the bot registers exactly as
-it always did — to `DISCORD_SERVER_ID`, or globally when that is unset — and once a plugin is placed
+registration to it. With no `routing.json`, or one that places no plugin, the bot registers as
+it always did — to `DISCORD_SERVER_ID`, or globally when that is unset, after emptying once the scopes an
+earlier routed run owned (#420) — and once a plugin is placed
 it registers per server. #241 added the way in: a request the panel drops in the mailbox
 (`routing-set`, `webhook-add`, `webhook-remove`, `discovery-refresh`) is validated by the bot against
 what it can see and applied without a restart, and its outcome is recorded in `routing.json`'s
@@ -1656,9 +1657,9 @@ _Avoid_: server list, guild cache
   global list recorded before it is the one case only a global-mode run or a hand clear covers). Routed mode
   likewise empties a leftover global list even with a home server. Any entry that
   survives `readRouting`'s repair counts as placing, even one for a plugin that is not loaded
-  (`hasPlacements` counts the keys the repaired file has). Registration re-runs, in full, whenever
-  something asks for it: a `routing-set` from the panel (#241) and a server the bot joins (#259) both call
-  `applyRouting` (a join in routed mode registers the joined server alone, `applyRoutingFor`, and merges that one
+  (`hasPlacements` counts the keys the repaired file has). Registration re-runs whenever
+  something asks for it: a `routing-set` from the panel (#241) calls `applyRouting` (the full run) and a server
+  the bot joins (#259) calls `applyRoutingFor` (a join in routed mode registers the joined server alone, `applyRoutingFor`, and merges that one
   outcome into what the last full run recorded, #482; it falls back to the full run when no full run has
   completed in this process, when nothing is placed, when the servers could not be read or the guild is not among
   them; a hand edit of `routing.json` that places a plugin after a single-mode run is met by a join as the narrow
@@ -1667,8 +1668,8 @@ _Avoid_: server list, guild cache
   in `discovery.json` within seconds, with the outcome of that registration -- bar the gaps in the next
   gotcha.
 - **A join decides its mode OUTSIDE the chain, and the availability events are not joins (#259).**
-  `guildJoined` reads `routing.json` itself (`hasPlacements`) and only then calls `applyRouting` or
-  `refreshDiscovery`; both queue themselves on live.ts's one chain, so choosing the mode from inside a
+  `guildJoined` reads `routing.json` itself (`hasPlacements`) and only then calls `applyRoutingFor`,
+  `applyRouting` or `refreshDiscovery`; all three queue themselves on live.ts's one chain, so choosing the mode from inside a
   queued job would wait on itself forever. Between that read and `applyRouting`'s own the last placement
   may be removed, which turns the run into a single-mode one, and single mode rethrows a failed
   registration; `guildJoined` catches it, because it is called as `void guildJoined(guild)` from an event

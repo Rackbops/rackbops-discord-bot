@@ -50,9 +50,14 @@ export function previousScopes(file: DiscoveryFile | null): PreviousScopes {
       (r as { error?: unknown }).error !== undefined);
   const guilds = Array.isArray(file.guilds) ? file.guilds : [];
   return {
-    guilds: guilds
-      .filter((g): g is DiscoveryFile["guilds"][number] => typeof g === "object" && g !== null && typeof g.id === "string" && owned(g.commands))
-      .map((g) => g.id),
+    // De-duplicated: a damaged file listing a guild twice must not empty it twice.
+    guilds: [
+      ...new Set(
+        guilds
+          .filter((g): g is DiscoveryFile["guilds"][number] => typeof g === "object" && g !== null && typeof g.id === "string" && owned(g.commands))
+          .map((g) => g.id),
+      ),
+    ],
     global: owned(file.global),
   };
 }
@@ -124,7 +129,7 @@ export interface GuildRegistration {
 const MAX_ERROR_LENGTH = 200;
 
 /** What is recorded against "global" when the empty put was skipped because every server refused. */
-export const NOT_EMPTIED ="not attempted: no server accepted its commands";
+export const NOT_EMPTIED = "not attempted: no server accepted its commands";
 
 /**
  * A failure as one line of text for `discovery.json` and the log: `<message> (<code>)` for a Discord

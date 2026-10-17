@@ -255,7 +255,8 @@ async function fullRun(c: RoutingContext, reason: string, routing: RoutingFile, 
  * into what the last full run recorded, then rewrites `discovery.json`. Falls back to the full run, in the same
  * job, when it cannot be narrow: no full run has completed in this process yet, nothing is placed (single mode),
  * the servers could not be read, or the guild is not among them. A server whose earlier PUT failed is therefore
- * retried at the next full run (a boot, or a panel `routing-set`), no longer at the next join.
+ * retried at the next full run (a boot, or a panel `routing-set`), no longer at the next join; a global empty that
+ * the last full run could not do is still retried here.
  */
 export function applyRoutingFor(guildId: string, reason: string): Promise<ApplyResult> {
   return enqueue(async () => {
@@ -276,8 +277,18 @@ export function applyRoutingFor(guildId: string, reason: string): Promise<ApplyR
     if (!fullRunDone || plan.mode !== "routed" || snapshots === null || body === undefined) {
       return fullRun(c, reason, routing, snapshots);
     }
-    const { results } = await registerPlan(c.put, c.appId, { mode: "routed", bodies: new Map([[guildId, body]]), clears: [], clearGlobal: false }, c.now);
-    lastRegistrations = [...lastRegistrations.filter((r) => r.guildId !== guildId), ...results];
+    // A global empty the last full run could not do (it failed, or no server took a list) is retried here: the
+    // joined server may be the first to take one, and its own list on top of a leftover global one shows twice.
+    // registerPlan still empties only once a server has taken its commands.
+    const globalPending = lastRegistrations.some((r) => r.guildId === "global" && r.error !== undefined);
+    const { results } = await registerPlan(
+      c.put,
+      c.appId,
+      { mode: "routed", bodies: new Map([[guildId, body]]), clears: [], clearGlobal: globalPending },
+      c.now,
+    );
+    // Each new record replaces the earlier one for its scope (the joined server's, and the global one if retried).
+    lastRegistrations = [...lastRegistrations.filter((r) => !results.some((n) => n.guildId === r.guildId)), ...results];
     await writeView(c, snapshots, lastRegistrations, reason);
     logRouted(c, snapshots, results);
     return { mode: "routed" as const, results };
@@ -347,9 +358,9 @@ function tell(c: RoutingContext, level: "log" | "error", message: string, err?: 
  * already holds the new server.
  *
  * Never rejects. It is called from an event listener, where a rejection is a process-level event, and
- * `applyRouting` CAN reject here: single mode rethrows a failed registration, and this run is a single-mode
- * one when nothing is placed (a join of the home server with no placements, or a last placement removed
- * between the read and the call).
+ * `applyRouting` (and `applyRoutingFor`, which falls back to the same full run) CAN reject here: single mode
+ * rethrows a failed registration, and this run is a single-mode one when nothing is placed (a join of the home
+ * server with no placements, or a last placement removed between the read and the call).
  */
 export async function guildJoined(guild: { id: string; name: string }): Promise<void> {
   const c = context;
