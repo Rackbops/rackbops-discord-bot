@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { freshRouting, type PluginRouting, type RoutingFile } from "./model";
+import { freshRouting, type DiscoveryFile, type PluginRouting, type RoutingFile } from "./model";
 import { gateCommand, refusalMessage, whereOf, type Where } from "./gate";
 
 const HOME = "111111111111111111";
@@ -210,5 +210,74 @@ describe("whereOf", () => {
       },
     };
     expect(await whereOf(interaction({ channel: broken }), noFetch)).toEqual({ guildId: OTHER, channelId: THREAD, parentUnknown: true });
+  });
+});
+
+// #483: a refusal names only the listed channels `discovery.json` still shows in the server.
+describe("gateCommand with discovery (#483)", () => {
+  const discoveryWith = (channelIds: string[], guildId = OTHER): DiscoveryFile => ({
+    v: 1,
+    generatedAt: "2026-09-21T12:00:00.000Z",
+    bot: { id: "900000000000000000", username: "Bot" },
+    inviteUrl: "https://example.invalid",
+    homeGuildId: HOME,
+    guilds: [{ id: guildId, name: "Other", channels: channelIds.map((id) => ({ id, name: `c${id}`, canSend: true })), commands: null }],
+    plugins: {},
+  });
+
+  async function gateWith(where: Where, readDiscovery?: () => Promise<DiscoveryFile | null>) {
+    const { log, lines } = logCapture();
+    const result = await gateCommand("music", "rsetlist", where, async () => where, async () => listed, log, readDiscovery);
+    return { result, lines };
+  }
+  const elsewhere = here({ channelId: ELSEWHERE });
+
+  test("a deleted channel is not named: only the one discovery still lists", async () => {
+    const { result, lines } = await gateWith(elsewhere, async () => discoveryWith([CHAN_2, ELSEWHERE]));
+    expect(result).toBe(`\`/rsetlist\` works in <#${CHAN_2}> here.`);
+    expect(lines).toEqual([]);
+  });
+
+  test("with none of the listed channels left the command runs, and the log says so", async () => {
+    const { result, lines } = await gateWith(elsewhere, async () => discoveryWith([ELSEWHERE]));
+    expect(result).toBeUndefined();
+    expect(lines).toEqual([[`[gate] every channel listed for /rsetlist in server ${OTHER} is gone from what the bot can see; letting it run`]]);
+  });
+
+  test("no readDiscovery dep names every listed channel, as before", async () => {
+    const { result, lines } = await gateWith(elsewhere);
+    expect(result).toBe(`\`/rsetlist\` works in <#${CHAN_1}> or <#${CHAN_2}> here.`);
+    expect(lines).toEqual([]);
+  });
+
+  test("a null file, a file without this server, and a read that throws all name every listed channel, with no log line", async () => {
+    const both = `\`/rsetlist\` works in <#${CHAN_1}> or <#${CHAN_2}> here.`;
+    for (const read of [async () => null, async () => discoveryWith([], HOME), async (): Promise<DiscoveryFile | null> => { throw new Error("boom"); }]) {
+      const { result, lines } = await gateWith(elsewhere, read);
+      expect(result).toBe(both);
+      expect(lines).toEqual([]);
+    }
+  });
+
+  test("a thread under a gone channel is filtered the same way, through its parent's verdict", async () => {
+    const thread = here({ channelId: THREAD, parentChannelId: ELSEWHERE });
+    expect((await gateWith(thread, async () => discoveryWith([CHAN_1]))).result).toBe(`\`/rsetlist\` works in <#${CHAN_1}> here.`);
+    expect((await gateWith(thread, async () => discoveryWith([ELSEWHERE]))).result).toBeUndefined();
+  });
+
+  test("a server listed with no channels at all (an outage stub) names every listed channel and lifts nothing", async () => {
+    const { result, lines } = await gateWith(elsewhere, async () => discoveryWith([]));
+    expect(result).toBe(`\`/rsetlist\` works in <#${CHAN_1}> or <#${CHAN_2}> here.`);
+    expect(lines).toEqual([]);
+  });
+
+  test("an allowed command never reads discovery", async () => {
+    let reads = 0;
+    const { result } = await gateWith(here({ channelId: CHAN_1 }), async () => {
+      reads += 1;
+      return discoveryWith([]);
+    });
+    expect(result).toBeUndefined();
+    expect(reads).toBe(0);
   });
 });

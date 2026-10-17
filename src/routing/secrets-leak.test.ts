@@ -138,7 +138,7 @@ describe("a webhook url is only ever in routing.secrets.json", () => {
             results.push("applied");
             return {};
           },
-          refreshDiscovery: async () => {},
+          refreshDiscovery: async () => true,
           now: () => new Date(AT),
           log: { warn: capture },
         },
@@ -234,7 +234,7 @@ describe("a webhook url is only ever in routing.secrets.json", () => {
       expect(byId.get("req-add-03")).toMatchObject({ ok: false, reason: "Discord does not know that webhook" });
       expect(byId.get("req-add-04")).toMatchObject({ ok: false, reason: "bad webhook url" });
       expect(byId.get("req-add-07")).toMatchObject({ ok: false, reason: "apply failed — the lookup exploded for [webhook url]" });
-      expect(byId.get("req-add-09")).toMatchObject({ ok: false, reason: "that webhook posts to a channel the bot cannot see" });
+      expect(byId.get("req-add-09")).toMatchObject({ ok: false, reason: "that webhook posts to a channel the bot does not list (it lists the text and announcement channels it can see)" });
       // Request 8 was accepted (it replaced the channel's webhook), and the url in its requestedBy was
       // redacted before it could land in `addedBy` / `updatedBy`, which the panel reads.
       expect(byId.get("req-add-08")).toMatchObject({ ok: true, channelId: CH });
@@ -318,7 +318,7 @@ function liveDeps() {
       mutateSecrets: (mutate) => mutateSecrets(dataDir, mutate),
       fetchWebhook: async (id) => ({ ok: true, id, channelId: CH, guildId: HOME }),
       applyRouting: async () => ({}),
-      refreshDiscovery: async () => {},
+      refreshDiscovery: async () => true,
       now: () => new Date(AT),
       log: { warn() {} },
     },
