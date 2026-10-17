@@ -50,6 +50,9 @@ function resolveBash(): string | null {
 }
 const BASH = resolveBash();
 const runnable = BASH !== null;
+// #514 (posthoc-1-2): on CI a skipped suite would pass vacuously; the runner has bash, jq and docker compose, so a
+// missing one there is a broken job, not an environment to tolerate. GitHub sets CI=true in every job.
+if (!runnable && process.env.CI) throw new Error("[install.test] bash is required on CI; refusing to skip");
 if (!runnable) {
   console.warn(`[install.test] SKIPPING: needs bash (${BASH ?? "missing"}) on PATH`);
 }

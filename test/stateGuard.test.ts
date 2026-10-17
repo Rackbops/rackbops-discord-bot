@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { announceStateForTest, resetDiscoveryGapForTest, resetPollStateForTest, resetTickGuardForTest, type AnnounceStateForTest } from "../src/announce";
@@ -45,6 +45,16 @@ describe("settled", () => {
 
   test("one still waiting has not", async () => {
     expect(await settled(NEVER)).toBe(false);
+  });
+
+  test("one that settles after several microtask hops has settled before any macrotask (#462)", async () => {
+    expect(
+      await settled(
+        (async () => {
+          for (let i = 0; i < 5; i++) await null;
+        })(),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -450,6 +460,10 @@ describe("the guard in test/stateGuardHook.ts, run for real", () => {
         throw new Error(`fixture run was killed after ${CHILD_TIMEOUT_MS}ms:\n${child.stderr.toString()}`);
       }
       exitCode = child.exitCode;
+      // #462: a child that died before writing its report (a preload that throws) used to surface as a bare ENOENT.
+      if (!existsSync(report)) {
+        throw new Error(`fixture run wrote no report (exit ${child.exitCode}):\n${child.stderr.toString()}\n${child.stdout.toString()}`);
+      }
       cases = testcases(readFileSync(report, "utf8"));
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -293,13 +293,14 @@ describe("tickChecks", () => {
     // unreadable server cache. The check is no longer awaiting it, so nothing else would catch it.
     resetDiscoveryGapForTest();
     const errors = spyOn(console, "error").mockImplementation(() => {});
+    const dir = mkdtempSync(join(tmpdir(), "announce-refresh-test-"));
     try {
       initRouting({
         client: { user: { id: "900000000000000000" }, get guilds(): never { throw new Error("cache exploded"); } } as unknown as Client<true>,
         put: async () => undefined,
         appId: "900000000000000000",
         botUsername: "Setlist Bot",
-        dataDir: tmpdir(),
+        dataDir: dir,
         homeGuildId: undefined,
         prefix: "",
         fullBody: [],
@@ -321,6 +322,7 @@ describe("tickChecks", () => {
     } finally {
       errors.mockRestore();
       resetRoutingForTest();
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
