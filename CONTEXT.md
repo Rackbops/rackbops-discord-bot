@@ -1905,8 +1905,18 @@ _Avoid_: server list, guild cache
   request that has since superseded it. A server the routing entry names but `discovery.guilds` no longer
   lists is never sent (would make the bot refuse the WHOLE request, #259, over one server it already left)
   and is drawn as its own read-only row instead. **Placement is only ever seeded from a `ready`
-  `routingStepModel`, once (`ensureRouteState`'s `st.seeded` flag), never re-seeded from a later one — an
-  in-progress pick a background poll brought in must survive it.** This matters because `refreshDiscovery`
+  `routingStepModel` (`ensureRouteState`'s `st.seeded` flag; `st.base` keeps the seed), and re-seeded from a
+  later one only while the step is clean (`routeStepClean`: no debounce timer, request in flight or held
+  edit, and the picks are the seed or a send just applied — #405) — an in-progress pick a background poll
+  brought in must survive it.** A send first re-reads `GET /api/routing` (10 s limit; a failed read falls
+  back to the in-memory data) and merges the operator's own changes onto that fresh placement
+  (`mergeSelection(base, mine, theirs)`: per server, the operator's row where it differs from `base`, else
+  the fresh one), so another tab's server is not dropped (#405); it is never sent without a server list —
+  `mode === "missing"` is `not-ready`, a warning and no POST (#406; a `stale` list still has its rows and
+  sends). Both polls (`awaitRequestResult`, `refreshDiscovery`) time-box each read to what is left of the 30 s
+  window (`pollRequestTimeoutMs`, #468), a refused discovery refresh is shown as refused (the bot refuses
+  one that wrote nothing, #528), and the focus a busy step takes from its control is put back
+  (`routeFocusId`, #468). This matters because `refreshDiscovery`
   ("Refresh from Discord", the button `missing`/`stale` mode shows in place of any row) calls
   `ensureRouteState` too, purely to track its own `inflight`/`held`, and in `missing`/`stale` mode
   `model.rows` is always `[]` — a round-3 review catch: seeding on first CALL rather than first READY
