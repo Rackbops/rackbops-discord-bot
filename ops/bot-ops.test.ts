@@ -1115,7 +1115,7 @@ describe.skipIf(!runnable || !REAL_FLOCK)("bot-ops.sh env-set/restart/recreate s
 });
 
 describe.skipIf(!runnable)("bot-ops.sh env-set/restart/recreate hold one lock on the config dir (#227)", () => {
-  test("the backup name ends in the pid, and the JSON's backup field is that file", async () => {
+  test("the backup name ends in a numeric suffix, and the JSON's backup field is that file", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
     const run = await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n");
     expect(run.exitCode).toBe(0);
@@ -1850,7 +1850,7 @@ describe.skipIf(!runnable)("bot-ops.sh status reads running/status/image from on
     expect(run.stdout).not.toContain("Cannot connect");
   });
 
-  test("a healthy status has no dockerError key: the object is byte-for-byte today's shape", async () => {
+  test("a healthy status has no dockerError key: the object is exactly today's shape", async () => {
     const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n", {
       containerMeta: { state: "running", status: "Up 3 hours", image: "ghcr.io/rackbops/bot:abc123" },
     });
@@ -1884,6 +1884,12 @@ describe.skipIf(!runnable)("bot-ops.sh pins the compose argv and the env file it
     expect((await botOps(fx, ["recreate"])).exitCode).toBe(0);
     expect((await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=22222\n")).exitCode).toBe(0);
     expect(envLog(fx)).toEqual([bashPath(fx.envFile), bashPath(fx.envFile), bashPath(fx.envFile)]);
+  });
+
+  test("with nothing to change, env-set makes no compose call at all (so no env file is handed out)", async () => {
+    const fx = setup("ANNOUNCE_CHANNEL_ID=11111\n");
+    expect((await botOps(fx, ["env-set"], "ANNOUNCE_CHANNEL_ID=11111\n")).exitCode).toBe(0);
+    expect(envLog(fx)).toEqual([]);
   });
 });
 

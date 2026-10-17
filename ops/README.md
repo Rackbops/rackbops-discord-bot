@@ -433,7 +433,8 @@ them, so the panel can set them whenever the cached index offers `wow`.)
   (the next bullet).
 - **A refused `restart`, `env-set` or `recreate`** (#490). All three refuse while a `<name>-next` container
   is **alive** (running, restarting, paused, removing or created), because a recreate then may start a second
-  bot on the one Discord token (not verified without a daemon). If `<name>` itself is running the message says
+  bot on the one Discord token (not verified without a daemon). The check runs once the call holds the
+  config-dir lock (#473), so a refusal can wait up to `BOT_OPS_LOCK_WAIT_SECONDS` behind another save. If `<name>` itself is running the message says
   *in progress*: a swap is under way, so retry once it completes. If it persists and the `-next` container is
   *created*, a process died between its create and its start (or the start failed and so did the cleanup):
   `docker rm <name>-next` clears it. If `<name>`
