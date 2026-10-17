@@ -47,8 +47,8 @@ as the bot, contract version unchanged.
   durable record (which plugin sent which message id) that the host must keep consistent forever, for
   a boundary that `interaction.client` already lets any plugin route around. Authorship is the
   boundary the host can actually keep.
-- **Interactive buttons (`customId`) in this child.** Deferred, not rejected: `docs/host-extension.md`
-  designs them, but nothing consumes them yet (S1's bridge is link-only). `HostMessage.buttons` is
+- **Interactive buttons (`customId`) in this child.** Deferred, not rejected: nothing consumed them
+  yet (S1's bridge is link-only; see the **Update (#323)** below). `HostMessage.buttons` is
   reserved and refused — including `buttons: []` — so the shape exists without shipping the feature
   early.
   **Update (#323):** shipped once the task tracker needed them (Rackbops/Tooling#816). `buttons` is

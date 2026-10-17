@@ -6,8 +6,8 @@ core plus feature plugins installed from a published Plugin Index. **Forked with
 [Nazuraki](https://github.com/nazumods)** -- full credit for the original bot and its documented
 gotchas. The direction here is a **generic, modular bot core** with the WoW-specific pieces as plugins
 rather than the whole bot: character linking is already its own plugin (`@rackbops/plugin-warbandeer`,
-#100), with DMF, realm status and transmog still in the core and headed the same way -- see
-[`PURPOSE.md`](PURPOSE.md).
+#100), and the WoW commands (DMF, realm status, transmog) already moved to `@rackbops/plugin-wow`
+(#107); the core holds no WoW code -- see [`PURPOSE.md`](PURPOSE.md).
 
 My personal `~/.claude/CLAUDE.md` governs *how I work* -- the review gate, escalation, git &
 shipping, commit mechanics, search-tool routing, and shell choice. It is **not restated here**; this

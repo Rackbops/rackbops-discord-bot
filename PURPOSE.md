@@ -11,15 +11,15 @@
 Originally: an integration point between the in-game addon suite, the desktop app, and discord. It serves to notify users of realm
 status, facilitate cross-channel communication where possible, and provide cross-user querying.
 
-That purpose stands as-is for now — the direction from here is toward a generic bot core
-with the WoW-specific pieces (DMF, realm status, transmog) as one plugin among others,
-not the whole bot.
+That purpose stands as-is for now — the bot is a generic bot core, and the WoW-specific
+pieces (DMF, realm status, transmog) are now the `wow` plugin (#107), one plugin among
+others, not the whole bot.
 
 ## Non-goals
 
-- **Not staying WoW-specific.** DMF, realm status, and transmog are headed toward
-  becoming plugins (character linking already is, `@rackbops/plugin-warbandeer`), not
-  permanent parts of the core.
+- **Not staying WoW-specific.** DMF, realm status, and transmog are plugins
+  (`@rackbops/plugin-wow`), and so is character linking (`@rackbops/plugin-warbandeer`);
+  the core stays WoW-free.
 - **Not a monolith.** New features beyond the small host core belong in plugins
   installed from the Plugin Index, not folded into `src/`.
 - **Not free to break the plugin contract.** The Host API (`HOST_API_VERSION`,
