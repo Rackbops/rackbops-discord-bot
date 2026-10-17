@@ -11,6 +11,7 @@ import { resetForTest, stateForTest, type RestartStateForTest } from "../src/res
 import { resetRoutingForTest, resetRoutingQueueForTest, routingStateForTest } from "../src/routing/live";
 import { resetRoutingWarningsForTest, resetRoutingWritesForTest, routingStoreStateForTest } from "../src/routing/store";
 import { botStateForTest, resetBotStateForTest, resetStateWriterForTest } from "../src/state";
+import { resetKeptCorruptForTest, storageStateForTest } from "../src/storage";
 import { resetUpdateForTest, updateStateForTest } from "../src/update";
 import { settleWithin } from "./settleWithin";
 import { drainQueues, findStateLeaks, GUARDED, resetAllState, type GuardedModule } from "./stateGuard";
@@ -24,6 +25,7 @@ import {
   restartStateLeaks,
   routingLeaks,
   routingStoreLeaks,
+  storageLeaks,
   settled,
   STATE_GUARD,
   stateLeakMessage,
@@ -175,7 +177,7 @@ describe("routingLeaks", () => {
 });
 
 describe("routingStoreLeaks", () => {
-  const CLEAN = { said: 0, writes: DONE };
+  const CLEAN = { said: 0, copied: 0, writes: DONE };
   test("a clean state has no leaks", async () => {
     expect(await routingStoreLeaks(CLEAN)).toEqual([]);
   });
@@ -187,7 +189,16 @@ describe("routingStoreLeaks", () => {
     expect(await routingStoreLeaks({ ...CLEAN, writes: NEVER })).toEqual([expect.stringContaining("a routing or secrets write still running")]);
   });
   test("names every dirty field", async () => {
-    expect(await routingStoreLeaks({ said: 1, writes: NEVER })).toHaveLength(2);
+    expect(await routingStoreLeaks({ said: 1, copied: 1, writes: NEVER })).toHaveLength(3);
+  });
+});
+
+describe("storageLeaks", () => {
+  test("a clean state has no leaks", () => {
+    expect(storageLeaks({ kept: 0 })).toEqual([]);
+  });
+  test("names a kept-corrupt path still remembered", () => {
+    expect(storageLeaks({ kept: 1 })).toEqual([expect.stringContaining("1 kept-corrupt path(s) remembered")]);
   });
 });
 
@@ -324,6 +335,7 @@ describe("GUARDED", () => {
       ["src/restart.ts", stateForTest, restartStateLeaks, [resetForTest]],
       ["src/config.ts", configStateForTest, configLeaks, [resetConfigForTest]],
       ["src/state.ts", botStateForTest, botStateLeaks, [resetBotStateForTest, resetStateWriterForTest]],
+      ["src/storage.ts", storageStateForTest, storageLeaks, [resetKeptCorruptForTest]],
       ["src/update.ts", updateStateForTest, updateLeaks, [resetUpdateForTest]],
       ["src/announce.ts", announceStateForTest, announceLeaks, [resetTickGuardForTest, resetDiscoveryGapForTest, resetPollStateForTest]],
       ["src/routing/live.ts", routingStateForTest, routingLeaks, [resetRoutingForTest, resetRoutingQueueForTest]],

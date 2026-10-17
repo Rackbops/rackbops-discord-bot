@@ -66,11 +66,17 @@ export async function routingLeaks(s: RoutingStateForTest): Promise<string[]> {
 }
 
 /** Against what `resetRoutingWarningsForTest()` leaves, and with no routing or secrets write pending. */
-export async function routingStoreLeaks(s: { said: number; writes: Promise<void> }): Promise<string[]> {
+export async function routingStoreLeaks(s: { said: number; copied: number; writes: Promise<void> }): Promise<string[]> {
   const leaks: string[] = [];
   if (s.said !== 0) leaks.push(`${s.said} routing.json warning(s) already said — a later read will not say them again`);
+  if (s.copied !== 0) leaks.push(`${s.copied} before-repair copy path(s) remembered — a later repairing write will not keep a copy`);
   if (!(await settled(s.writes))) leaks.push("a routing or secrets write still running");
   return leaks;
+}
+
+/** Against what `resetKeptCorruptForTest()` leaves. */
+export function storageLeaks(s: { kept: number }): string[] {
+  return s.kept !== 0 ? [`${s.kept} kept-corrupt path(s) remembered — a later corrupt read of it will not be said`] : [];
 }
 
 /** Against `state` as it was loaded, and with no state.json write pending. */

@@ -11,9 +11,11 @@ import {
   DATA_DIR,
   moveCorruptAside,
   readJsonOrFresh,
+  resetKeptCorruptForTest,
   resolveDataDir,
   shortSha,
   SHORT_SHA_LEN,
+  storageStateForTest,
   TMP_TOKEN,
   tmpPathFor,
   writeJsonAtomic,
@@ -195,6 +197,8 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
   });
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    // The kept-corrupt record is per process; the test-state guard fails a test that leaves it behind.
+    resetKeptCorruptForTest();
   });
 
   test("absent file resolves the fresh value, not an error, and logs nothing", async () => {
@@ -243,6 +247,97 @@ describe("readJsonOrFresh / writeJsonAtomic / createJsonWriter", () => {
     }
     expect(existsSync(file)).toBe(false);
     expect(readdirSync(dir).filter((f) => f.includes(".corrupt-")).length).toBe(1);
+  });
+
+  // #477: a plain read (onCorrupt "keep") never renames; the serialized write path (the default) does.
+  describe("onCorrupt: keep and redactReason", () => {
+    const BARE = "SECRETTOKEN123";
+    /** Reads with console.error recorded, and gives back the lines. */
+    async function readKeeping(file: string, options: Parameters<typeof readJsonOrFresh>[3]): Promise<string[]> {
+      const errorSpy = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(await readJsonOrFresh(file, () => ({ n: 0 }), "test", options)).toEqual({ n: 0 });
+        return errorSpy.mock.calls.map((call) => String(call[0]));
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
+
+    test("T1: a file that will not parse is left byte-identical and said once per path", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, "{ not json");
+      const first = await readKeeping(file, { onCorrupt: "keep" });
+      expect(first).toHaveLength(1);
+      expect(first[0]).toContain("will not parse");
+      expect(first[0]).toContain(file);
+      expect(readFileSync(file, "utf8")).toBe("{ not json");
+      expect(readdirSync(dir)).toEqual(["x.json"]);
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toEqual([]);
+      resetKeptCorruptForTest();
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+    });
+
+    test("T1b: a good parse, an absent file and a move-aside each make a later corruption be said again", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+      expect(storageStateForTest().kept).toBe(1);
+      // a good parse
+      writeFileSync(file, '{"n": 1}');
+      await readJsonOrFresh(file, () => ({ n: 0 }), "test", { onCorrupt: "keep" });
+      expect(storageStateForTest().kept).toBe(0);
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+      // an absent file
+      rmSync(file);
+      await readJsonOrFresh(file, () => ({ n: 0 }), "test", { onCorrupt: "keep" });
+      expect(storageStateForTest().kept).toBe(0);
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+      // the write path moving it aside
+      expect(await readKeeping(file, {})).not.toEqual([]);
+      expect(storageStateForTest().kept).toBe(0);
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+    });
+
+    test("T1c: a file that vanishes between exists() and json() also makes a later corruption be said again", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, "{ not json");
+      expect(await readKeeping(file, { onCorrupt: "keep" })).toHaveLength(1);
+      expect(storageStateForTest().kept).toBe(1);
+      const vanishing = failJsonRead(Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" }));
+      try {
+        await readJsonOrFresh(file, () => ({ n: 0 }), "test", { onCorrupt: "keep" });
+      } finally {
+        vanishing.restore();
+      }
+      expect(storageStateForTest().kept).toBe(0);
+    });
+
+    test("T2: redactReason keeps the parser's message, which can quote the file, out of the kept-file line", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, `{ "a": ${BARE} }`);
+      const lines = await readKeeping(file, { onCorrupt: "keep", redactReason: true });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("SyntaxError");
+      expect(lines[0]).not.toContain(BARE);
+      expect(lines[0]).not.toContain("JSON Parse error");
+      // without it the message is there (the routing file's position helps)
+      resetKeptCorruptForTest();
+      expect((await readKeeping(file, { onCorrupt: "keep" }))[0]).toContain(BARE);
+    });
+
+    test("T3: redactReason on the default (move-aside) path redacts moveCorruptAside's line too", async () => {
+      const file = join(dir, "x.json");
+      writeFileSync(file, `{ "a": ${BARE} }`);
+      const lines = await readKeeping(file, { redactReason: true });
+      expect(lines.length).toBeGreaterThan(0);
+      expect(lines[0]).toContain("SyntaxError");
+      for (const line of lines) expect(line).not.toContain(BARE);
+      expect(existsSync(file)).toBe(false);
+      expect(readdirSync(dir).filter((f) => f.includes(".corrupt-"))).toHaveLength(1);
+    });
   });
 
   // #509 item 2: only a file that parsed badly is "corrupt". A read that fails for another reason may

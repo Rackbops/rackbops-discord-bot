@@ -13,6 +13,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, wr
 import { mkdir, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { inspect } from "node:util";
 import { consumePluginRequests, resetPluginRequestsForTest, type PluginRequestDeps } from "../plugins/requests";
 import { discoveryPath, readDiscovery, writeDiscovery } from "./discovery";
 import type { DiscoveryFile } from "./model";
@@ -39,6 +40,8 @@ const TOKENS = {
   bare: "BARETOKENQUOTED_Tk_0123456789abcd",
   port: "PORTFORMNOHOST_Tk_0123456789abcde",
   orphan: "ORPHANEDSECRET_Tk_0123456789abcdef",
+  probeObject: "PROBEOBJECT_Tk_0123456789abcdefg",
+  probeError: "PROBEERROR_Tk_0123456789abcdefgh",
 } as const;
 
 const urlFor = (id: string, token: string) => `https://discord.com/api/webhooks/${id}/${token}`;
@@ -82,8 +85,17 @@ describe("a webhook url is only ever in routing.secrets.json", () => {
 
     // ---- what is captured -------------------------------------------------------------------------
     const lines: string[] = [];
-    const capture = (...args: unknown[]) => void lines.push(args.map((a) => (a instanceof Error ? `${a.name}: ${a.message}` : String(a))).join(" "));
+    // util.inspect, not String(): an object argument, or an Error's own property (an `fs` error's `path`), is
+    // otherwise `[object Object]` and never searched (#478).
+    const capture = (...args: unknown[]) => void lines.push(args.map((a) => (typeof a === "string" ? a : inspect(a, { depth: 5 }))).join(" "));
     const spies = (["log", "info", "warn", "error", "debug"] as const).map((method) => spyOn(console, method).mockImplementation(capture));
+    // The capture can see both shapes it used to miss, with two distinct tokens so a capture that handles only one
+    // of them cannot pass.
+    console.error("probe", { url: urlFor(ID(9), TOKENS.probeObject) });
+    console.error(Object.assign(new Error("probe"), { path: urlFor(ID(9), TOKENS.probeError) }));
+    expect(lines.some((line) => line.includes(TOKENS.probeObject))).toBe(true);
+    expect(lines.some((line) => line.includes(TOKENS.probeError))).toBe(true);
+    lines.length = 0;
     const results: unknown[] = [];
 
     try {
