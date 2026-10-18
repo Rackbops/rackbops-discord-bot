@@ -219,8 +219,8 @@ ALLOWED_SPEC=(
   # every plugin in the cached index (whether or not it is named here, #256) are merged into this
   # whitelist at runtime by load_plugin_keys, so a plugin's own key (e.g. WARBANDEER_INGEST_PORT, a
   # static row here until #100 removed the baked-in connector) is validated with the FORMAT the Plugin
-  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (src/config.ts:116); the `@version` tail is exactly
-  # what resolveConfig accepts (src/config.ts:116: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
+  # Index carries rather than hand-mirrored per plugin. `name` is `^[a-z][a-z0-9-]*$` (the plugin-token check in `resolveConfig`, src/config.ts); the `@version` tail is exactly
+  # what resolveConfig accepts (the same check: x.y.z with an optional `-prerelease`, no `+build`), and one plugin may not
   # appear in two different tokens (plugins_name_repeated, #430), since the bot refuses either at boot and env-set would
   # otherwise recreate it into a crash loop.
   'PLUGINS|^[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?(,[a-z][a-z0-9-]*(@[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)?)*$'
@@ -981,9 +981,9 @@ format_matches() {
 }
 
 # #430: true when a PLUGINS value names one plugin in two different tokens ("foo,foo@1.0.0",
-# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (src/config.ts:121-123) and no ERE can
+# "foo@1.0.0,foo@2.0.0"). The bot refuses that at boot (`resolveConfig`'s `seenPluginNames` check, src/config.ts) and no ERE can
 # say it. An exact repeat ("foo,foo") is not one: config.ts's list() drops repeated tokens first
-# (src/config.ts:72-79), so it boots, and env-set accepts it too. Only ever called on a value the
+# (`list` inside `resolveConfig`, src/config.ts), so it boots, and env-set accepts it too. Only ever called on a value the
 # PLUGINS row already matched, so every token is non-empty and holds no glob character.
 plugins_name_repeated() {
   local -A seen_tok=() seen_name=()

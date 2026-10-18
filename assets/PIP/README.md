@@ -11,6 +11,8 @@ This folder holds Pip's avatar, companion profile banner and design artifacts fo
 - [Circular-crop inspection](qa-circular-inspection.png): a 512 × 512 review proof.
 - [Size inspection](qa-size-inspection.png): square previews at 32, 64, 128 and 256 px, plus small circular previews.
 - [Initial design prompt](prompt-canonical-v1.txt) and framing refinements [one](prompt-refine-1.txt) and [two](prompt-refine-2.txt): the saved prompts, preserved verbatim.
+- [Compact mark](pip-compact-v1.svg) (approved by roshne 2026-10-18): editable SVG source, a [16 px grid SVG](pip-compact-16-v1.svg), PNG exports at [16](pip-compact-16-v1.png), [32](pip-compact-32-v1.png), [48](pip-compact-48-v1.png), [64](pip-compact-64-v1.png), [128](pip-compact-128-v1.png), [180](pip-compact-180-v1.png), [192](pip-compact-192-v1.png), [256](pip-compact-256-v1.png) and [512](pip-compact-512-v1.png) px, and an [ICO](pip-compact-v1.ico) with 16, 32 and 48 px entries.
+- [16 px proof](qa-compact-16px-proof.png) of the compact mark, and an offline [banner-plus-avatar overlap proof](qa-banner-overlap-proof.png), and a [live Discord profile screenshot](pip-banner-profile-proof-v1.png) (checked 2026-10-18).
 - [Full design specification](pip-design-spec.md): identity, composition, finish, sampled colors, small-size use, reproduction limits and review checklist.
 - [Provenance and verification](provenance.json).
 
