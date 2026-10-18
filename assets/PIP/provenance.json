@@ -67,9 +67,9 @@
     {
       "file": "pip-design-spec.md",
       "purpose": "Comprehensive avatar and banner specification, export details and limits",
-      "bytes": 17782,
-      "sha256": "a6d005486524338d553b212dfe3467145faf6cda50fe0a036237aff05f91473b",
-      "git_blob_sha1": "3c9aadac2f3bb4abb69e1e18a14435b62a2b445c"
+      "bytes": 17978,
+      "sha256": "ef6b30ea49009c237b8b439fcb9f61e0143029027baa55034dc91bc56b775ceb",
+      "git_blob_sha1": "3f81c7f0c32184f4d437490c21949c3e231b79d7"
     }
   ],
   "banner": {
@@ -280,6 +280,19 @@
     "status": "provisional offline evidence",
     "method": "680x240 banner export with the canonical avatar at 80 px, circular, 16 px from the left edge, centred on the banner's bottom edge with a 6 px dark ring, drawn at 2x",
     "geometry_source": "approximated from the Discord profile layout; not measured from a live profile",
-    "live_profile_check": "pending: someone must inspect a real Discord profile preview and record the date here"
+    "live_profile_check": {
+      "status": "done",
+      "date": "2026-10-18",
+      "evidence": {
+        "file": "pip-banner-profile-proof-v1.png",
+        "bytes": 80815,
+        "sha256": "ee7263b93418ff5c23d9fbe3ed5616c487d59de3f8e7a7d03c491dcefacb7da8",
+        "width": 380,
+        "height": 516,
+        "color_mode": "RGBA"
+      },
+      "source": "screenshot of the live Discord profile card for the Pip application, supplied by roshne in the project thread",
+      "observation": "banner and circular avatar render together; the avatar sits over the banner's dark left area and its full crest, ears and face are inside the circle"
+    }
   }
 }
