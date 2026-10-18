@@ -17,7 +17,7 @@ The following six files are preserved from the existing design package. Their si
 
 The companion banner adds [the unmodified generated master](pip-banner-master-v1.png), [the exact 680 × 240 upload export](pip-banner-680x240-v1.png), and [its generation prompt](prompt-banner-v1.txt). Its design and export details are documented below.
 
-The README, this specification and provenance record document the assets. This package contains no editable vector master, layered painting, separate transparent cutout, animated character, alternate pose, standalone small-size avatar export, or dedicated favicon. None should be inferred from the review sheet.
+The README, this specification and provenance record document the assets. The compact mark and its proofs are described in [Compact mark and 16 px proof](#compact-mark-and-16-px-proof). Beyond that mark, this package contains no layered painting, separate transparent cutout, animated character or alternate pose, and the compact mark's SVGs are an editable source only for the mark, not for the portrait. None of those should be inferred from the review sheet.
 
 ## Character identity
 
@@ -99,7 +99,7 @@ The resize produces 680 × 301 pixels; the centered extent operation removes the
 
 For future banner variants, retain the original master, keep important detail clear of the overlapping-avatar area, and inspect the final target crop rather than relying only on the uncropped source. Avoid adding lettering or a second Pip portrait. Do not apply the avatar prompt's exclusions on scenery and glow to this separate banner: the banner prompt intentionally introduces woodland foliage and firefly light.
 
-The export's SHA-256 is `6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b`. The master's SHA-256 is `c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32`. The banner's appearance in a live Discord profile has not been verified by this asset publication.
+The export's SHA-256 is `6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b`. The master's SHA-256 is `c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32`. The banner's appearance in a live Discord profile has not been verified; see the provisional offline proof under Banner overlap proof.
 
 ## Avatar and small-size use
 
@@ -109,7 +109,28 @@ For ordinary avatar presentation, retain the full square master and let the targ
 
 For a requested raster derivative, start from the master each time, preserve aspect ratio, use a high-quality downsampling filter and inspect the result at its actual display size. Save the derivative under a distinct filename and document the dimensions and source hash. Repeatedly resaving a small preview is not an acceptable replacement for a master-derived export.
 
-No 16 px proof or purpose-drawn favicon exists in this package. A favicon would need separate simplification and review; shrinking the portrait alone has not been validated for that use. The small previews embedded in the QA sheet are not delivered as separate production PNGs.
+The full portrait has not been validated at 16 px, and its small previews in the QA sheet are not delivered as production PNGs. For favicon and other tiny uses, use the purpose-drawn compact mark below instead of shrinking the portrait.
+
+## Compact mark and 16 px proof
+
+New art, pending roshne's approval in the pull request that adds it. It is a simplified redraw of the portrait's recognition cues, not a downscale: a navy rounded tile, the ivory face with two large dark-and-amber eyes, the higher teal ear on the viewer's left with the lower ear on the right, the swept crest, a teal wrap and the gold clasp. Brows, the mouth line (kept at 64 px, dropped at 16 px) and painted texture are intentionally left out. Colors are the samples in the color table above.
+
+| File | Role |
+| --- | --- |
+| [pip-compact-v1.svg](pip-compact-v1.svg) | Editable source, 64 × 64 viewBox |
+| [pip-compact-16-v1.svg](pip-compact-16-v1.svg) | Editable source drawn on the 16 px grid |
+| `pip-compact-{32,48,64,128,180,192,256,512}-v1.png` | Rasters rendered from the 64 px SVG |
+| [pip-compact-16-v1.png](pip-compact-16-v1.png) | Raster rendered from the 16 px SVG at 1x |
+| [pip-compact-v1.ico](pip-compact-v1.ico) | 16, 32 and 48 px entries |
+| [qa-compact-16px-proof.png](qa-compact-16px-proof.png) | 16 px proof: native size and 8x nearest-neighbour, on light and dark |
+
+Visual judgment at native 16 px: the ivory face with two dark eyes, the teal crest and ear mass, and the gold clasp read; the fine details are gone by design. This is a visual judgment, not a measured recognition test. The mark was inspected only as offline renders, not in a browser tab or operating-system shortcut. Dimensions, sizes and hashes are in [provenance.json](provenance.json).
+
+## Banner overlap proof
+
+[qa-banner-overlap-proof.png](qa-banner-overlap-proof.png) places the canonical avatar at 80 px, circular, 16 px from the left edge and centred on the banner's lower edge, with a 6 px dark ring, over the 680 × 240 export. The circle sits in the banner's dark left area and covers no firefly or foliage detail. This is provisional offline evidence: the geometry is approximated from Discord's profile layout, not measured from a live profile. The live-profile check is pending until someone inspects a real preview and records the date in provenance.
+
+The banner upload screenshot's own date was not kept. It must date from on or before 2026-10-07, when the export was made from its dimensions; provenance records that as an inferred latest date, with the exact date pending.
 
 ## Accessibility and descriptive use
 

@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-label="Pip the messenger sprite">
+  <title>Pip compact mark, 16 pixel drawing</title>
+  <defs>
+    <clipPath id="tile"><rect width="16" height="16" rx="3.5"/></clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect width="16" height="16" fill="#001b3e"/>
+    <path d="M0 17 3 13.5Q8 12 13 13.5L16 17Z" fill="#006470"/>
+    <path d="M5 9C2 8.5 1 5 3 1.8 5 3.5 6.3 6 7 8.7Z" fill="#3a9a7d"/>
+    <path d="M10.5 9C12 7.5 14 7.5 16 8.3 15.4 10.6 13 11.4 10.8 11Z" fill="#3a9a7d"/>
+    <path d="M5 8C4 4 7 1.5 11.5 2.5 9.5 3.5 9.2 5.5 9.4 8.2Z" fill="#0a777a"/>
+    <ellipse cx="8" cy="9.5" rx="4.2" ry="3.8" fill="#fde1ae"/>
+    <rect x="5" y="8.5" width="2.4" height="3" rx="1" fill="#060e14"/>
+    <rect x="9" y="8.8" width="2.2" height="2.8" rx="1" fill="#060e14"/>
+    <rect x="5.4" y="9" width=".8" height=".8" fill="#fff"/>
+    <rect x="9.4" y="9.2" width=".7" height=".7" fill="#fff"/>
+    <rect x="5" y="10.9" width="2.4" height=".6" fill="#bd6d10"/>
+    <rect x="9" y="10.9" width="2.2" height=".6" fill="#bd6d10"/>
+    <circle cx="12" cy="14.2" r="1.1" fill="#fab542"/>
+  </g>
+</svg>

@@ -67,9 +67,9 @@
     {
       "file": "pip-design-spec.md",
       "purpose": "Comprehensive avatar and banner specification, export details and limits",
-      "bytes": 15311,
-      "sha256": "4f947f82f223003d21ee608bbc55967650698dfa06019b1c03991c6ce8a41197",
-      "git_blob_sha1": "5e9fd7773c606e0d32fdc910b8c69851ad818ec0"
+      "bytes": 17774,
+      "sha256": "f8f0c745628cd81965d737ee49695d9a0b1298ad8916eb80310b48309e8e936b",
+      "git_blob_sha1": "d3954c5927f6828e61091fa166004b55b16269d1"
     }
   ],
   "banner": {
@@ -126,7 +126,9 @@
         240
       ],
       "maximum_bytes_label": "10 MB",
-      "source": "User-supplied screenshot of the banner upload UI"
+      "source": "User-supplied screenshot of the banner upload UI",
+      "evidence_date_latest": "2026-10-07",
+      "evidence_date_basis": "inferred, not recorded: the screenshot's own date was not kept; it had to exist by 2026-10-07, when the 680x240 export was made from its dimensions. Exact date pending from roshne."
     },
     "verification": {
       "master_and_export_decoded": true,
@@ -138,5 +140,146 @@
     "unknowns": [
       "Exact generator model version and seed were not exposed."
     ]
+  },
+  "compact_mark": {
+    "created_date": "2026-10-18",
+    "approval": "pending: new art, roshne approves in the pull request before merge",
+    "derived_from": "pip-canonical-review-v1.png (simplified redraw of its recognition cues, not a downscale)",
+    "source_svg": [
+      {
+        "file": "pip-compact-v1.svg",
+        "bytes": 1611,
+        "sha256": "69f14b7d9b3e59775aa5e5d315aef716825e2ab8ba50467ccf35f15e199b3429",
+        "viewbox": "0 0 64 64",
+        "role": "source for the 32 px and larger exports"
+      },
+      {
+        "file": "pip-compact-16-v1.svg",
+        "bytes": 1170,
+        "sha256": "b0a482d696032f528204fd9cdee4c38cb6d7d6190e2cc5e2127ddc769bf54647",
+        "viewbox": "0 0 16 16",
+        "role": "pixel-grid drawing, source for the 16 px export"
+      }
+    ],
+    "render": "Chromium headless screenshot of each SVG at the target size, transparent outside the rounded tile; 16 px export is the 16 px SVG at 1x, 32 px and larger are the 64 px SVG",
+    "png_exports": [
+      {
+        "file": "pip-compact-16-v1.png",
+        "bytes": 703,
+        "sha256": "1e50a16739cdda324fbbc8fbf28e21249331b7773b31570eff39f3daf9926a68",
+        "width": 16,
+        "height": 16,
+        "color_mode": "RGBA",
+        "source": "pip-compact-16-v1.svg"
+      },
+      {
+        "file": "pip-compact-32-v1.png",
+        "bytes": 1552,
+        "sha256": "88c257385ca80457e73070a2c2b0054e5542451bfec46adcaf7213f855198e47",
+        "width": 32,
+        "height": 32,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-48-v1.png",
+        "bytes": 2461,
+        "sha256": "fda212899f94657723e0d8ef6bf62eafef2f79385cac9254e491e98743c9af87",
+        "width": 48,
+        "height": 48,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-64-v1.png",
+        "bytes": 3302,
+        "sha256": "fba409935032a45a9d388a72a45db42ccf87c8d1b52da466294b3abaa9e1aba9",
+        "width": 64,
+        "height": 64,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-128-v1.png",
+        "bytes": 6926,
+        "sha256": "96b1bc37a015176963e42e7a5cd9b518232b3483fbf9a08353e58e8616d28db1",
+        "width": 128,
+        "height": 128,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-180-v1.png",
+        "bytes": 10053,
+        "sha256": "4521fbd09a2aa2d3504d5ac731ca81245674e225f04c0202ab01d26c686432d7",
+        "width": 180,
+        "height": 180,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-192-v1.png",
+        "bytes": 10486,
+        "sha256": "cfc10e75735a42c99dbaca994bec067c57e4d54fd1175025304b4e99e9fe32b0",
+        "width": 192,
+        "height": 192,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-256-v1.png",
+        "bytes": 14095,
+        "sha256": "d260421e8cf81d9083f9c513150012b15510a792f50a1aba5d67a374038206bf",
+        "width": 256,
+        "height": 256,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      },
+      {
+        "file": "pip-compact-512-v1.png",
+        "bytes": 29257,
+        "sha256": "07b1d2f02f4f818907df981545eeb4a1aecf71450a8866c69632c9b6a1e7620a",
+        "width": 512,
+        "height": 512,
+        "color_mode": "RGBA",
+        "source": "pip-compact-v1.svg"
+      }
+    ],
+    "ico": {
+      "file": "pip-compact-v1.ico",
+      "bytes": 4607,
+      "sha256": "62cbec81fe177fc51289052a77a375c952dbf3fdd558db4264cd3984ee7fb489",
+      "embedded_sizes": [
+        16,
+        32,
+        48
+      ],
+      "note": "entries are the 16, 32 and 48 px PNG exports"
+    },
+    "colors": "sampled values from pip-design-spec.md (navy #001B3E, ivory #FDE1AE, teals #0A777A #3A9A7D #006470, gold #FAB542, dark eye #060E14, amber #BD6D10)",
+    "size_proof": {
+      "file": "qa-compact-16px-proof.png",
+      "bytes": 12080,
+      "sha256": "29723a42cafcbdc60c95689533ae7da76a1615662ecdc606704f22104327e553",
+      "width": 520,
+      "height": 330,
+      "color_mode": "RGB",
+      "visual_judgment": "at native 16 px the ivory face with two dark eyes, the teal crest and ear mass and the gold clasp read; brows, mouth and painted texture are dropped by design"
+    },
+    "unknowns": [
+      "Not inspected in a browser tab or OS shortcut; only the offline renders above."
+    ]
+  },
+  "banner_overlap_proof": {
+    "file": "qa-banner-overlap-proof.png",
+    "bytes": 688169,
+    "sha256": "8d60e2d97d925ff231e4dbd87f4188b09d5330fedcbc843d6076a00ab61814a2",
+    "width": 1360,
+    "height": 660,
+    "color_mode": "RGB",
+    "status": "provisional offline evidence",
+    "method": "680x240 banner export with the canonical avatar at 80 px, circular, 16 px from the left edge, centred on the banner's bottom edge with a 6 px dark ring, drawn at 2x",
+    "geometry_source": "approximated from the Discord profile layout; not measured from a live profile",
+    "live_profile_check": "pending: someone must inspect a real Discord profile preview and record the date here"
   }
 }
