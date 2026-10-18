@@ -99,7 +99,7 @@ The resize produces 680 × 301 pixels; the centered extent operation removes the
 
 For future banner variants, retain the original master, keep important detail clear of the overlapping-avatar area, and inspect the final target crop rather than relying only on the uncropped source. Avoid adding lettering or a second Pip portrait. Do not apply the avatar prompt's exclusions on scenery and glow to this separate banner: the banner prompt intentionally introduces woodland foliage and firefly light.
 
-The export's SHA-256 is `6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b`. The master's SHA-256 is `c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32`. The banner's appearance in a live Discord profile has not been verified; see the provisional offline proof under Banner overlap proof.
+The export's SHA-256 is `6a31c81e1bc906abdaeb6ac180f3dc845d84b4092d37546f7bd5ca49bb9bcb0b`. The master's SHA-256 is `c7aea5ae75942c8a8bcf43ac19f8076364d95002434f6db7b0c314ad132c5f32`. The banner's appearance in a live Discord profile was checked on 2026-10-18; see Banner overlap proof.
 
 ## Avatar and small-size use
 
@@ -128,7 +128,7 @@ Visual judgment at native 16 px: the ivory face with two dark eyes, the teal cre
 
 ## Banner overlap proof
 
-[qa-banner-overlap-proof.png](qa-banner-overlap-proof.png) places the canonical avatar at 80 px, circular, 16 px from the left edge and centred on the banner's lower edge, with a 6 px dark ring, over the 680 × 240 export. The circle sits in the banner's dark left area and covers no firefly or foliage detail. This is provisional offline evidence: the geometry is approximated from Discord's profile layout, not measured from a live profile. The live-profile check is pending until someone inspects a real preview and records the date in provenance.
+[qa-banner-overlap-proof.png](qa-banner-overlap-proof.png) places the canonical avatar at 80 px, circular, 16 px from the left edge and centred on the banner's lower edge, with a 6 px dark ring, over the 680 × 240 export. The circle sits in the banner's dark left area and covers no firefly or foliage detail. This is provisional offline evidence: the geometry is approximated from Discord's profile layout, not measured from a live profile. The live-profile check is done: [pip-banner-profile-proof-v1.png](pip-banner-profile-proof-v1.png) is a screenshot of the live Discord profile card for Pip, supplied by roshne on 2026-10-18. The banner and circular avatar render together; the avatar sits over the dark left area and the full crest, ears and face are inside the circle.
 
 The banner upload screenshot's own date was not kept. It must date from on or before 2026-10-07, when the export was made from its dimensions; provenance records that as an inferred latest date, with the exact date pending.
 
