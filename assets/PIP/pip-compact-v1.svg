@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Pip the messenger sprite">
+  <title>Pip compact mark, 64 pixel drawing</title>
+  <defs>
+    <clipPath id="tile"><rect width="64" height="64" rx="14"/></clipPath>
+  </defs>
+  <g clip-path="url(#tile)">
+    <rect width="64" height="64" fill="#001b3e"/>
+    <path d="M6 66 18 50Q32 43 46 50L58 66Z" fill="#006470"/>
+    <path d="M22 35C10 33 7 20 13 10 19 16 25 25 28 34Z" fill="#0a777a"/>
+    <path d="M17 33C13 28 12 22 13 16 18 21 22 27 24 33Z" fill="#3a9a7d"/>
+    <path d="M42 36C47 31 54 30 60 33 58 41 51 45 43 43Z" fill="#3a9a7d"/>
+    <path d="M43 37C47 34 52 34 56 35 53 39 49 41 44 41Z" fill="#0a777a"/>
+    <path d="M20 34C17 17 30 8 45 12 37 14 35 21 36 30 32 27 26 29 20 34Z" fill="#0a777a"/>
+    <path d="M25 26C26 19 32 14 39 13 35 16 34 21 34 27Z" fill="#3a9a7d"/>
+    <ellipse cx="32" cy="37" rx="14.5" ry="13" fill="#fde1ae"/>
+    <ellipse cx="26.5" cy="37.5" rx="4.6" ry="5.2" fill="#060e14"/>
+    <ellipse cx="26.5" cy="39.4" rx="3.5" ry="3.3" fill="#bd6d10"/>
+    <ellipse cx="38.5" cy="38.5" rx="4" ry="4.6" fill="#060e14"/>
+    <ellipse cx="38.5" cy="40.2" rx="3" ry="2.9" fill="#bd6d10"/>
+    <ellipse cx="26.5" cy="36.4" rx="3.2" ry="3" fill="#060e14"/>
+    <ellipse cx="38.5" cy="37.5" rx="2.7" ry="2.6" fill="#060e14"/>
+    <circle cx="28" cy="35.3" r="1.4" fill="#fff"/>
+    <circle cx="39.8" cy="36.5" r="1.2" fill="#fff"/>
+    <path d="M30 46Q33.5 48.5 37 46" fill="none" stroke="#9a5b34" stroke-width="1.2" stroke-linecap="round"/>
+    <circle cx="44" cy="55" r="2.8" fill="#fab542"/>
+  </g>
+</svg>
