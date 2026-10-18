@@ -113,7 +113,7 @@ The full portrait has not been validated at 16 px, and its small previews in the
 
 ## Compact mark and 16 px proof
 
-New art, pending roshne's approval in the pull request that adds it. It is a simplified redraw of the portrait's recognition cues, not a downscale: a navy rounded tile, the ivory face with two large dark-and-amber eyes, the higher teal ear on the viewer's left with the lower ear on the right, the swept crest, a teal wrap and the gold clasp. Brows, the mouth line (kept at 64 px, dropped at 16 px) and painted texture are intentionally left out. Colors are the samples in the color table above.
+New art, approved by roshne on 2026-10-18 in the pull request that added it. It is a simplified redraw of the portrait's recognition cues, not a downscale: a navy rounded tile, the ivory face with two large dark-and-amber eyes, the higher teal ear on the viewer's left with the lower ear on the right, the swept crest, a teal wrap and the gold clasp. Brows, the mouth line (kept at 64 px, dropped at 16 px) and painted texture are intentionally left out. Colors are the samples in the color table above.
 
 | File | Role |
 | --- | --- |

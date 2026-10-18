@@ -67,9 +67,9 @@
     {
       "file": "pip-design-spec.md",
       "purpose": "Comprehensive avatar and banner specification, export details and limits",
-      "bytes": 17774,
-      "sha256": "f8f0c745628cd81965d737ee49695d9a0b1298ad8916eb80310b48309e8e936b",
-      "git_blob_sha1": "d3954c5927f6828e61091fa166004b55b16269d1"
+      "bytes": 17782,
+      "sha256": "a6d005486524338d553b212dfe3467145faf6cda50fe0a036237aff05f91473b",
+      "git_blob_sha1": "3c9aadac2f3bb4abb69e1e18a14435b62a2b445c"
     }
   ],
   "banner": {
@@ -143,7 +143,7 @@
   },
   "compact_mark": {
     "created_date": "2026-10-18",
-    "approval": "pending: new art, roshne approves in the pull request before merge",
+    "approval": "approved by roshne on 2026-10-18 (merge request in the project thread)",
     "derived_from": "pip-canonical-review-v1.png (simplified redraw of its recognition cues, not a downscale)",
     "source_svg": [
       {
