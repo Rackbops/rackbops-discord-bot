@@ -5,11 +5,11 @@
     "": {
       "name": "rackbops-bot-admin-theme",
       "devDependencies": {
-        "@rackbops/styles": "0.2.42",
+        "@rackbops/styles": "0.2.43",
       },
     },
   },
   "packages": {
-    "@rackbops/styles": ["@rackbops/styles@0.2.42", "", {}, "sha512-tlQtBVDTQH1F/jakAhorfMCWIhRt/oQPr5yUbd41NFK/AIOCHwiZQsoKUW5AYYOcHibuEC4lmZYzQNDHtmTUWw=="],
+    "@rackbops/styles": ["@rackbops/styles@0.2.43", "", {}, "sha512-XKg3QC4zA/Moploxt2bZqx6iFyC05ySPfuPp9bXP2FW/YSqM+kTJWeX3Ta/P0sCf1XmZpFVSPI7QDOLFTGcPpg=="],
   }
 }
