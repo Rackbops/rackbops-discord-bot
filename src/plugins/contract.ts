@@ -418,8 +418,8 @@ export interface PluginDirectMessage {
   content: string;
   /** When Discord says it was sent, ISO 8601. */
   sentAt: string;
-  /** Shows "<bot> is typing..." in this DM for about 10 s, or until the bot's next message there. Best-effort:
-   *  it never rejects. */
+  /** Sends Discord's typing indicator ("<bot> is typing...") to this DM, which Discord shows for a few seconds.
+   *  Best-effort: it never rejects. */
   typing(): Promise<void>;
 }
 
@@ -481,8 +481,11 @@ export interface Plugin {
    * entry declares the `DirectMessages` intent (`1 << 12`); without that intent it is never called. Every
    * running plugin that qualifies gets every DM, so a plugin answers only what is its own to answer. The
    * host does not wait on it in order: messages may be handed over concurrently, a throw or rejection is
-   * logged and isolated, and nothing is sent on the plugin's behalf. Optional; a host from before it
-   * ignores it, and on such a host a plugin declaring the intent only widens the gateway subscription.
+   * logged and isolated, and nothing is sent on the plugin's behalf; the host logs the plugin's name and
+   * its error, so keep the message's text out of what you throw. It is not timed out and holds no critical
+   * section, as an interaction does not. A DM that arrives while the plugin is not running (a restart, a
+   * handoff, before `activate()` resolves) is dropped, unlogged, and never replayed. Optional; a host from
+   * before it ignores it, and on such a host a plugin declaring the intent only widens the gateway subscription.
    */
   directMessage?(message: PluginDirectMessage): Promise<void>;
 }

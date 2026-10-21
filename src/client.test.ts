@@ -43,6 +43,11 @@ describe("clientOptions", () => {
     expect(client.options.intents.has(GatewayIntentBits.DirectMessages)).toBe(true);
   });
 
+  test("an intent value that carries the DirectMessages bit among others counts too", () => {
+    const combined = GatewayIntentBits.DirectMessages | GatewayIntentBits.GuildMessages;
+    expect(clientOptions([GatewayIntentBits.Guilds, combined]).partials).toEqual([Partials.Channel]);
+  });
+
   test("without it the options are exactly what they were: no partials", () => {
     expect(clientOptions()).toEqual({ ...CLIENT_OPTIONS, intents: [GatewayIntentBits.Guilds] });
     expect("partials" in clientOptions([GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages])).toBe(false);

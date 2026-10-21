@@ -380,15 +380,15 @@ async function activate(c: Client<true>): Promise<void> {
   // session is being re-identified, rather than resumed, can arrive as the availability event instead of a
   // join; that gap is known and accepted, see CONTEXT.md.) `void`: neither function can reject, so nothing
   // escapes into the emitter.
+  client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
+  client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
+
   // The direct-message seam (contract.ts, `Plugin.directMessage`): a person's DM goes to every running plugin that
   // declares the DirectMessages intent and implements the hook. Listened for only when some plugin brought that
   // intent into the Client, so a bot that takes no DMs is unchanged. `void`: dispatchDirectMessage never rejects.
   if (client.options.intents.has(GatewayIntentBits.DirectMessages)) {
     client.on(Events.MessageCreate, (message) => void dispatchDirectMessage(loadResult.loaded, message, console));
   }
-
-  client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
-  client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
 
   // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
   // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
