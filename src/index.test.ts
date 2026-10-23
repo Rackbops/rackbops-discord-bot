@@ -141,6 +141,16 @@ describe("index.ts wiring", () => {
     expect(source).not.toContain("reportUpdateOutcome(client, attempt)");
   });
 
+  // The direct-message seam: a bot whose plugins declare no DirectMessages intent attaches no MessageCreate listener.
+  test("listens for MessageCreate only when the Client carries the DirectMessages intent, inside activate()", () => {
+    const gate = source.indexOf("if (client.options.intents.has(GatewayIntentBits.DirectMessages)) {");
+    const listener = source.indexOf("client.on(Events.MessageCreate");
+    expect(gate).toBeGreaterThan(source.indexOf("async function activate("));
+    expect(listener).toBeGreaterThan(gate);
+    expect(source.slice(gate, listener)).not.toContain("}");
+    expect(source.split("Events.MessageCreate").length).toBe(2);
+  });
+
   // The takeOver-before-activate ORDER is ready.test.ts's (#435); this pins only that no plugin code loads
   // at module-eval, which nothing but the source can show.
   test("no plugin code loads at module-eval — the bundle import() is inside activate()", () => {

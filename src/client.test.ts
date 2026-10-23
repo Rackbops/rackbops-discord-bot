@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { GatewayIntentBits } from "discord.js";
-import { CLIENT_OPTIONS, CORE_INTENTS, createClient } from "./client";
+import { GatewayIntentBits, Partials } from "discord.js";
+import { CLIENT_OPTIONS, CORE_INTENTS, clientOptions, createClient } from "./client";
 
 describe("CLIENT_OPTIONS", () => {
   // #48: user-controlled text (e.g. /transmog's character option) can reach a public reply.
@@ -30,5 +30,26 @@ describe("createClient", () => {
   test("still defaults to no mentions parsed regardless of the intents passed", () => {
     const client = createClient([GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages]);
     expect(client.options.allowedMentions?.parse).toEqual([]);
+  });
+});
+
+describe("clientOptions", () => {
+  // A DM's channel is usually uncached, and without the Channel partial discord.js drops its messageCreate.
+  test("the DirectMessages intent brings the Channel partial with it", () => {
+    const options = clientOptions([GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]);
+    expect(options.partials).toEqual([Partials.Channel]);
+    const client = createClient([GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages]);
+    expect(client.options.partials).toEqual([Partials.Channel]);
+    expect(client.options.intents.has(GatewayIntentBits.DirectMessages)).toBe(true);
+  });
+
+  test("an intent value that carries the DirectMessages bit among others counts too", () => {
+    const combined = GatewayIntentBits.DirectMessages | GatewayIntentBits.GuildMessages;
+    expect(clientOptions([GatewayIntentBits.Guilds, combined]).partials).toEqual([Partials.Channel]);
+  });
+
+  test("without it the options are exactly what they were: no partials", () => {
+    expect(clientOptions()).toEqual({ ...CLIENT_OPTIONS, intents: [GatewayIntentBits.Guilds] });
+    expect("partials" in clientOptions([GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages])).toBe(false);
   });
 });

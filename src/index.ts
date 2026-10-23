@@ -3,7 +3,7 @@
 // on a wrong BOT_ENV_FILE. Side-effect only; see src/bootLog.ts. Pinned by index.test.ts.
 import "./bootLog";
 import { pathToFileURL } from "node:url";
-import { Client, Events, REST } from "discord.js";
+import { Client, Events, GatewayIntentBits, REST } from "discord.js";
 import { config } from "./config";
 import { DATA_DIR, createJsonWriter, createKeyedJsonMutator, readJsonOrFresh, writeJsonAtomic } from "./storage";
 import { createClient, CORE_INTENTS } from "./client";
@@ -36,6 +36,7 @@ import { selectPlugins, collectIntents, describeSkips, pinsFromState } from "./p
 import { HOST_API_VERSION } from "./plugins/contract";
 import type { HostApi, HostStorage, PluginIndexEntry, PluginModule, PluginStateFile } from "./plugins/contract";
 import { installPlugins, tarExtract } from "./plugins/install";
+import { dispatchDirectMessage } from "./plugins/directMessages";
 import type { InstallResult } from "./plugins/install";
 import type { LoadedPlugin, LoadResult, PluginCommandMap } from "./plugins/host";
 import {
@@ -381,6 +382,13 @@ async function activate(c: Client<true>): Promise<void> {
   // escapes into the emitter.
   client.on(Events.GuildCreate, (guild) => void guildJoined(guild));
   client.on(Events.GuildDelete, (guild) => void guildLeft(guild));
+
+  // The direct-message seam (contract.ts, `Plugin.directMessage`): a person's DM goes to every running plugin that
+  // declares the DirectMessages intent and implements the hook. Listened for only when some plugin brought that
+  // intent into the Client, so a bot that takes no DMs is unchanged. `void`: dispatchDirectMessage never rejects.
+  if (client.options.intents.has(GatewayIntentBits.DirectMessages)) {
+    client.on(Events.MessageCreate, (message) => void dispatchDirectMessage(loadResult.loaded, message, console));
+  }
 
   // Activate plugins BEFORE starting the scheduler, so the first (synchronous) tick startScheduler
   // fires runs each plugin's ticks with `running` already true — preserving the boot-time announcements
