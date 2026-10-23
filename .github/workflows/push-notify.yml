@@ -51,10 +51,12 @@ jobs:
     # post, no Discord message either. Exactly the silent failure the pin exists to prevent.
     # Keep the comment to the ref alone; prose belongs in this block.
     #
-    # addon-ci cuts no tags today. If it ever does, pin the tag's COMMIT and name the tag in the
-    # comment (`@<sha> # v1`) -- a git tag is force-movable, so `@v1` in the ref position would
-    # reintroduce a mutable ref and undo the point of this pin.
-    uses: roshne/addon-ci/.github/workflows/push-notify.yml@dcb2876cb9c7a85744286ef766a102150010bad8 # main
+    # addon-ci now has a `v1` tag, which it moves deliberately to release a change (its README's
+    # Versioning section). This pin still tracks `main`; naming the tag in the comment instead
+    # (`@<sha> # v1`) would make Renovate follow the tag, and that switch is a separate decision.
+    # Either way the COMMIT stays in the ref position -- a git tag is force-movable, so `@v1` there
+    # would reintroduce a mutable ref and undo the point of this pin.
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@8adabb104dcdb382e49ad14ed7ce72b8a1c93b37 # main
     # The called workflow needs no GITHUB_TOKEN at all: it checks nothing out, calls no GitHub
     # API, and only reads `github.event.*` before curling Discord (verified at the pinned commit).
     # A called workflow inherits the caller job's permissions and can only reduce them, so an empty
