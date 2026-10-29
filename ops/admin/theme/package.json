@@ -6,6 +6,6 @@
     "build": "bun run build-theme.ts"
   },
   "devDependencies": {
-    "@rackbops/styles": "0.2.43"
+    "@rackbops/styles": "0.2.45"
   }
 }
