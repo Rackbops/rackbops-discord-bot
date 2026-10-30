@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { format } from "node:util";
 import { DiscordAPIError, HTTPError, RateLimitError, REST, Routes } from "discord.js";
-import { editOwnMessage, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./delivery";
+import { editOwnMessage, fetchMember, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./delivery";
 import type { BuiltPayload } from "./hostMessage";
 
 const payload: BuiltPayload = { content: "hi", allowedMentions: { parse: [] } };
@@ -517,5 +517,46 @@ describe("editOwnMessage", () => {
       user: { id: BOT_ID },
     } as unknown as import("discord.js").Client;
     await expect(editOwnMessage(client, "222", "333", payload)).rejects.toThrow(/not a text channel/);
+  });
+});
+
+describe("fetchMember", () => {
+  const clientWith = (memberFetch: (o: unknown) => Promise<unknown>, seen: unknown[] = []) =>
+    ({
+      guilds: {
+        fetch: async (id: string) => {
+          seen.push(id);
+          if (id === "404") throw new DiscordAPIError({ message: "Unknown Guild", code: 10004 }, 10004, 404, "GET", "https://discord.com/api/v10/guilds/404", {});
+          return { available: id !== "503", members: { fetch: async (o: unknown) => (seen.push(o), memberFetch(o)) }, roles: { cache: new Map([["r1", {}], ["r2", {}]]) } };
+        },
+      },
+    }) as unknown as import("discord.js").Client;
+
+  test("forces a fresh fetch and returns the member's and the server's role ids", async () => {
+    const seen: unknown[] = [];
+    const client = clientWith(async () => ({ roles: { cache: new Map([["r1", {}]]) } }), seen);
+    expect(await fetchMember(client, "1", "9")).toEqual({ roleIds: ["r1"], guildRoleIds: ["r1", "r2"] });
+    expect(seen).toEqual(["1", { user: "9", force: true, cache: false }]);
+  });
+
+  test("a server it cannot fetch, or one Discord reports unavailable, rejects rather than answering null", async () => {
+    const client = clientWith(async () => ({ roles: { cache: new Map() } }));
+    const unknown = (await fetchMember(client, "404", "9").catch((e: unknown) => e)) as Error & Record<string, unknown>;
+    expect(unknown.code).toBe(10004);
+    await expect(fetchMember(client, "503", "9")).rejects.toThrow("server 503 is unavailable");
+  });
+
+  test("Unknown Member and Unknown User mean not in the server: null", async () => {
+    for (const code of [10007, 10013]) {
+      const err = new DiscordAPIError({ message: "Unknown", code }, code, 404, "GET", "https://discord.com/api/v10/guilds/1/members/9", {});
+      expect(await fetchMember(clientWith(async () => { throw err; }), "1", "9")).toBeNull();
+    }
+  });
+
+  test("any other failure rejects with the cleaned error, never the request", async () => {
+    const err = new DiscordAPIError({ message: "Missing Access", code: 50001 }, 50001, 403, "GET", "https://discord.com/api/v10/guilds/1/members/9", { body: { secret: 1 } });
+    const thrown = (await fetchMember(clientWith(async () => { throw err; }), "1", "9").catch((e: unknown) => e)) as Error & Record<string, unknown>;
+    expect(thrown.code).toBe(50001);
+    expect("requestBody" in thrown).toBe(false);
   });
 });

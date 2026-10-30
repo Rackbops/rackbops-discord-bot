@@ -73,3 +73,12 @@ as the bot, contract version unchanged.
 - Live delivery (a real channel post, a real DM, the closed-DMs path, and the rendered card/buttons)
   has no unit-test substitute — it needs a running bot in a test server, named as unverified in the PR
   and checked on the next live self-update with S1's bridge as the first real caller.
+
+## Addendum: `member` (#623)
+
+A fifth optional member on the same terms (no `HOST_API_VERSION` bump, wired with the delivery
+deps): `member(guildId, userId)` returns `{ roleIds, guildRoleIds }` from a forced, uncached REST
+fetch, or null when Discord says the user is not in that server; anything else rejects without the
+request. It exists because a plugin's only other route to the `Client` is an interaction's, so after
+a restart the tracker could not check membership until someone pressed a button. Both lists include
+@everyone (the server's own id), as discord.js reports them.
