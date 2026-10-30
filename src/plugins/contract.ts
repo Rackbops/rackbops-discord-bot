@@ -126,7 +126,8 @@ export interface HostDelivery {
   messageId: string;
 }
 
-/** A server member as `HostApi.member` reads them: the role ids they hold, and every role id the server has. */
+/** A server member as `HostApi.member` reads them: the role ids they hold, and every role id the server has.
+ *  Both include the server's @everyone role, whose id is the server's own id, as discord.js reports them. */
 export interface HostMember {
   roleIds: string[];
   guildRoleIds: string[];

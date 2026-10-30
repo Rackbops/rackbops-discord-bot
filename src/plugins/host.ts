@@ -17,6 +17,7 @@ import { withoutRequest } from "./delivery";
 import { validateHostMessage, type BuiltPayload } from "./hostMessage";
 import type {
   HostApi,
+  HostMember,
   HostStorage,
   Plugin,
   PluginCommand,
@@ -73,7 +74,7 @@ export interface HostDeliveryDeps {
   sendDm(userId: string, payload: BuiltPayload): Promise<{ messageId: string; channelId: string }>;
   editOwnMessage(channelId: string, messageId: string, payload: BuiltPayload): Promise<void>;
   /** `HostApi.member`'s lookup (delivery.ts `fetchMember`): a member's roles, or null when not in that server. */
-  fetchMember(guildId: string, userId: string): Promise<{ roleIds: string[]; guildRoleIds: string[] } | null>;
+  fetchMember(guildId: string, userId: string): Promise<HostMember | null>;
   /** Whether this plugin's loaded module declares `interactions` (#323), asked at CALL time -- the
    *  HostApi is built before `createPlugin` returns, so it cannot be known when this object is. A
    *  button nobody can answer is refused rather than sent. */

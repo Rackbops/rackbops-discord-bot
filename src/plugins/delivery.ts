@@ -2,6 +2,7 @@
 // `Client`, so host.ts's decisions (destination resolution, validation, authorship) unit-test with a
 // fake and never need a live Discord connection. Wired from src/index.ts's makeHost.
 import { DiscordAPIError, type Client } from "discord.js";
+import type { HostMember } from "./contract";
 import type { BuiltPayload } from "./hostMessage";
 
 /** Discord's code for "cannot send messages to this user" (DMs closed, or the bot is blocked). */
@@ -165,12 +166,16 @@ const UNKNOWN_USER = 10013;
 /** One server member's role ids and the server's (`HostApi.member`), or null when Discord says the
  *  user is not in that server. `force: true`, so the answer is Discord's now, never discord.js's member
  *  cache (with only the Guilds intent the bot never hears that a member left). The server's roles are
- *  read from its cache, which the Guilds intent keeps. Any other failure rejects without the request. */
-export async function fetchMember(client: Client, guildId: string, userId: string): Promise<{ roleIds: string[]; guildRoleIds: string[] } | null> {
+ *  read from its cache, which the Guilds intent keeps; a server Discord reports unavailable (an
+ *  outage) rejects, since its role cache cannot be trusted then. The member is not cached (`cache:
+ *  false`): with only the Guilds intent nothing would ever evict it. Any other failure rejects
+ *  without the request, a server the bot is not in among them. */
+export async function fetchMember(client: Client, guildId: string, userId: string): Promise<HostMember | null> {
   return cleanly(async () => {
     const guild = await client.guilds.fetch(guildId);
+    if (!guild.available) throw new Error(`server ${guildId} is unavailable`);
     try {
-      const member = await guild.members.fetch({ user: userId, force: true });
+      const member = await guild.members.fetch({ user: userId, force: true, cache: false });
       return { roleIds: [...member.roles.cache.keys()], guildRoleIds: [...guild.roles.cache.keys()] };
     } catch (err) {
       if (err instanceof DiscordAPIError && (err.code === UNKNOWN_MEMBER || err.code === UNKNOWN_USER)) return null;
