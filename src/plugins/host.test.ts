@@ -375,6 +375,7 @@ describe("createHostApi: delivery (#736)", () => {
       sendToChannel: HostDeliveryDeps["sendToChannel"];
       sendDm: HostDeliveryDeps["sendDm"];
       editOwnMessage: HostDeliveryDeps["editOwnMessage"];
+      fetchMember: HostDeliveryDeps["fetchMember"];
       handlesInteractions: boolean;
     }> = {},
   ) {
@@ -402,6 +403,10 @@ describe("createHostApi: delivery (#736)", () => {
         calls.push("editOwnMessage");
         if (over.editOwnMessage) await over.editOwnMessage(channelId, messageId, payload);
       },
+      fetchMember: async (guildId, userId) => {
+        calls.push("fetchMember");
+        return over.fetchMember ? over.fetchMember(guildId, userId) : { roleIds: ["r1"], guildRoleIds: ["r1", "r2"] };
+      },
       handlesInteractions: () => over.handlesInteractions ?? true,
     };
     return { deps, calls };
@@ -420,21 +425,50 @@ describe("createHostApi: delivery (#736)", () => {
     });
   }
 
-  test("without delivery, the four members are absent", () => {
+  test("without delivery, the five members are absent", () => {
     const host = hostWith();
     expect(host.post).toBeUndefined();
     expect(host.dm).toBeUndefined();
     expect(host.edit).toBeUndefined();
     expect(host.destinations).toBeUndefined();
+    expect(host.member).toBeUndefined();
   });
 
-  test("with delivery, the four members are functions", () => {
+  test("with delivery, the five members are functions", () => {
     const { deps } = fakeDeps();
     const host = hostWith({ delivery: deps });
     expect(typeof host.post).toBe("function");
     expect(typeof host.dm).toBe("function");
     expect(typeof host.edit).toBe("function");
     expect(typeof host.destinations).toBe("function");
+    expect(typeof host.member).toBe("function");
+  });
+
+  test("member returns the lookup's roles as fresh arrays, null when not in the server, and refuses a bad id before any dep call", async () => {
+    const found = { roleIds: ["r1"], guildRoleIds: ["r1", "r2"] };
+    const seen: string[][] = [];
+    const { deps, calls } = fakeDeps({
+      fetchMember: async (guildId, userId) => {
+        seen.push([guildId, userId]);
+        return userId === "444444444" ? null : found;
+      },
+    });
+    const host = hostWith({ delivery: deps });
+    const got = await host.member!(HOME, "333333333");
+    expect(got).toEqual(found);
+    got!.roleIds.push("mutated");
+    expect(found.roleIds).toEqual(["r1"]);
+    expect(await host.member!(HOME, "444444444")).toBeNull();
+    expect(seen).toEqual([[HOME, "333333333"], [HOME, "444444444"]]);
+    calls.length = 0;
+    await expect(host.member!("not-an-id", "333333333")).rejects.toThrow("guildId is not a valid id");
+    await expect(host.member!(HOME, "x")).rejects.toThrow("userId is not a valid id");
+    expect(calls).toEqual([]);
+  });
+
+  test("member passes a lookup failure through", async () => {
+    const { deps } = fakeDeps({ fetchMember: async () => { throw new Error("Discord down"); } });
+    await expect(hostWith({ delivery: deps }).member!(HOME, "333333333")).rejects.toThrow("Discord down");
   });
 
   test("post rejects an undeclared destination before any dep call", async () => {
@@ -762,6 +796,7 @@ describe("createHostApi: delivery (#736)", () => {
       sendToChannel: unused,
       sendDm: unused,
       editOwnMessage: unused,
+      fetchMember: unused,
       handlesInteractions: () => false,
     };
     const posted: string[] = [];

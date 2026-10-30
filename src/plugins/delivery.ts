@@ -158,6 +158,27 @@ export async function sendPayloadDm(
   });
 }
 
+/** Discord's "no such member" and "no such user": the one answer `fetchMember` reads as "not in it". */
+const UNKNOWN_MEMBER = 10007;
+const UNKNOWN_USER = 10013;
+
+/** One server member's role ids and the server's (`HostApi.member`), or null when Discord says the
+ *  user is not in that server. `force: true`, so the answer is Discord's now, never discord.js's member
+ *  cache (with only the Guilds intent the bot never hears that a member left). The server's roles are
+ *  read from its cache, which the Guilds intent keeps. Any other failure rejects without the request. */
+export async function fetchMember(client: Client, guildId: string, userId: string): Promise<{ roleIds: string[]; guildRoleIds: string[] } | null> {
+  return cleanly(async () => {
+    const guild = await client.guilds.fetch(guildId);
+    try {
+      const member = await guild.members.fetch({ user: userId, force: true });
+      return { roleIds: [...member.roles.cache.keys()], guildRoleIds: [...guild.roles.cache.keys()] };
+    } catch (err) {
+      if (err instanceof DiscordAPIError && (err.code === UNKNOWN_MEMBER || err.code === UNKNOWN_USER)) return null;
+      throw err;
+    }
+  });
+}
+
 /** Edits a message this bot sent. Works for either a `post` or a `dm` delivery -- both a guild text
  *  channel and a DM channel are text-based, and `HostDelivery` already carries whichever `channelId`
  *  the original send returned, so no separate DM path is needed here. Refuses (decision 4) a message
