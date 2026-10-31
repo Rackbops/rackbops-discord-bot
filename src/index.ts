@@ -64,7 +64,7 @@ import { startHostHttp } from "./http";
 import { createInteractionLine, describeInteraction, type InteractionOutcome } from "./interactionLog";
 import { createTrustedProxy, PROXY_BOOT_REFRESH_TIMEOUT_MS } from "./net/clientIp";
 import { reportPluginUpdateOutcome } from "./plugins/updates";
-import { editOwnMessage, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./plugins/delivery";
+import { editOwnMessage, fetchMember, sendPayloadDm, sendPayloadToChannel, withoutRequest } from "./plugins/delivery";
 import { describePlugins, readDiscovery } from "./routing/discovery";
 import { applyRouting, guildJoined, guildLeft, initRouting } from "./routing/live";
 import { gateCommand, whereOf } from "./routing/gate";
@@ -255,13 +255,14 @@ async function activate(c: Client<true>): Promise<void> {
         baseLog: console,
         storage,
         announce: (message, destination) => postForPlugin(entry.name, message, postDeps, destination),
-        // #736: post/dm/edit/destinations, over the same live Client every other send path uses.
+        // #736: post/dm/edit/destinations, and member, over the same live Client every other send path uses.
         delivery: {
           readRouting: () => readRouting(DATA_DIR),
           readDiscovery: () => readDiscovery(DATA_DIR),
           sendToChannel: (channelId, payload) => sendPayloadToChannel(client, channelId, payload),
           sendDm: (userId, payload) => sendPayloadDm(client, userId, payload),
           editOwnMessage: (channelId, messageId, payload) => editOwnMessage(client, channelId, messageId, payload),
+          fetchMember: (guildId, userId) => fetchMember(client, guildId, userId),
           // #323: read at call time -- loadResult is assigned once loadPlugins returns, after this host exists.
           handlesInteractions: () =>
             typeof loadResult.loaded.find((lp) => lp.entry.name === entry.name)?.plugin.interactions === "function",

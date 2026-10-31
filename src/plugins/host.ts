@@ -17,6 +17,7 @@ import { withoutRequest } from "./delivery";
 import { validateHostMessage, type BuiltPayload } from "./hostMessage";
 import type {
   HostApi,
+  HostMember,
   HostStorage,
   Plugin,
   PluginCommand,
@@ -72,6 +73,8 @@ export interface HostDeliveryDeps {
   sendToChannel(channelId: string, payload: BuiltPayload): Promise<{ messageId: string; guildId: string | null }>;
   sendDm(userId: string, payload: BuiltPayload): Promise<{ messageId: string; channelId: string }>;
   editOwnMessage(channelId: string, messageId: string, payload: BuiltPayload): Promise<void>;
+  /** `HostApi.member`'s lookup (delivery.ts `fetchMember`): a member's roles, or null when not in that server. */
+  fetchMember(guildId: string, userId: string): Promise<HostMember | null>;
   /** Whether this plugin's loaded module declares `interactions` (#323), asked at CALL time -- the
    *  HostApi is built before `createPlugin` returns, so it cannot be known when this object is. A
    *  button nobody can answer is refused rather than sent. */
@@ -89,8 +92,8 @@ export function createHostApi(opts: {
   baseLog: BaseLog;
   storage: HostStorage;
   announce: (message: string, destination?: string) => Promise<void>;
-  /** Wires `post`/`dm`/`edit`/`destinations` onto the returned HostApi (#736). Absent — the default —
-   *  means a host that predates them: the four members are absent too, exactly as before. */
+  /** Wires `post`/`dm`/`edit`/`destinations` (#736) and `member` onto the returned HostApi. Absent —
+   *  the default — means a host that predates them: the five members are absent too, exactly as before. */
   delivery?: HostDeliveryDeps;
 }): HostApi {
   const { name } = opts.entry;
@@ -139,7 +142,7 @@ export function createHostApi(opts: {
 const MAX_DESTINATION_WARNINGS = 50;
 
 /**
- * The four optional HostApi members built only when `opts.delivery` is wired (#736) — kept as its own
+ * The optional HostApi members (`post`, `dm`, `edit`, `destinations`, and `member`) built only when `opts.delivery` is wired (#736) — kept as its own
  * function so `createHostApi` stays readable. `declared` and `log` are the same values `announce`
  * above already closes over (declared destination names, and the `[name] `-prefixed logger).
  */
@@ -148,7 +151,7 @@ function buildDeliveryApi(
   declared: ReadonlySet<string>,
   log: PluginLog,
   deps: HostDeliveryDeps,
-): Pick<HostApi, "post" | "dm" | "edit" | "destinations"> {
+): Pick<HostApi, "post" | "dm" | "edit" | "destinations" | "member"> {
   return {
     // Decision 3: `post` targets exactly the one channel mapped for `destination` in `guildId` --
     // never `announce`'s postTo/default fallback. Checked in this order: declared, then id shape,
@@ -193,6 +196,14 @@ function buildDeliveryApi(
       if (!validated.ok) throw new Error(validated.reason);
       refuseUnanswerableButtons(message, deps);
       await deps.editOwnMessage(delivery.channelId, delivery.messageId, validated.payload);
+    },
+    // Checked for id shape only: a plugin already reaches the live `Client` (and so any server the bot
+    // is in) through `interaction.client`, so limiting the servers would be no boundary.
+    async member(guildId, userId) {
+      if (!SNOWFLAKE_RE.test(guildId)) throw new Error("guildId is not a valid id");
+      if (!SNOWFLAKE_RE.test(userId)) throw new Error("userId is not a valid id");
+      const found = await deps.fetchMember(guildId, userId);
+      return found === null ? null : { roleIds: [...found.roleIds], guildRoleIds: [...found.guildRoleIds] };
     },
     async destinations() {
       let routing: RoutingFile;
