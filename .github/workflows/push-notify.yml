@@ -56,7 +56,7 @@ jobs:
     # (`@<sha> # v1`) would make Renovate follow the tag, and that switch is a separate decision.
     # Either way the COMMIT stays in the ref position -- a git tag is force-movable, so `@v1` there
     # would reintroduce a mutable ref and undo the point of this pin.
-    uses: roshne/addon-ci/.github/workflows/push-notify.yml@060b6d65ebceda1e44d0a3fe5b39fea15ede0f48 # main
+    uses: roshne/addon-ci/.github/workflows/push-notify.yml@20d319068496a5f104af5ac9fd99ee3faa792062 # main
     # The called workflow needs no GITHUB_TOKEN at all: it checks nothing out, calls no GitHub
     # API, and only reads `github.event.*` before curling Discord (verified at the pinned commit).
     # A called workflow inherits the caller job's permissions and can only reduce them, so an empty
